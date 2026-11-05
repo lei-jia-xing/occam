@@ -23,6 +23,7 @@ cabal.project.local~
 *~
 .idea/
 .vscode/
+.direnv/
 
 # Build artifacts & databases
 *.so
