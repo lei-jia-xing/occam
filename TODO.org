@@ -33,3 +33,22 @@
 ** DONE Result exporter: emit minimal.sql, reproduction command, and reduction metrics
 ** DONE Unit test suite: CST byte cutting and dependency DAG correctness
 ** DONE Integration test suite: test against simulated crash scripts
+
+* 6. Candidate Memoization & Performance Optimization
+** TODO In-memory candidate Hash memoization (prevent duplicate DB re-executions)
+** TODO Cache statistics reporting (cache hits vs oracle executions)
+
+* 7. DBMS Dialect Hardening & Native Harnesses (PostgreSQL & MySQL)
+** TODO PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)
+** TODO MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
+** TODO Native execution harnesses for local psql and mysql sockets
+
+* 8. Experimental Baselines & Benchmark Runner
+** TODO Implement Baseline 1 (Sequential statement-by-statement deletion)
+** TODO Implement Baseline 2 (Naive text/line-based ddmin without dependency graph)
+** TODO Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
+** TODO Automated report exporter: emit comparison tables in CSV and Markdown
+
+* 9. Real-World Crash Corpus Collection
+** TODO Curate 20~30 real historical crash SQL test cases (PostgreSQL BUG tracker, MySQL CVEs, SQUIRREL dataset)
+** TODO Automated regression runner for benchmarks/ corpus
