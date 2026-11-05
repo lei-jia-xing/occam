@@ -1,0 +1,35 @@
+#+TITLE: Occam: Cross-Platform Dependency-Aware SQL Crash Minimizer
+#+AUTHOR: Hunter
+#+TODO: TODO(t) IN_PROGRESS(i) | DONE(d) BLOCKED(b)
+
+* 1. Frontend & CST Surgery (Tree-sitter)
+** TODO Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
+** TODO Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
+** TODO Byte-span text surgery: cut spans, replace with literals (zero unparser / zero re-formatting)
+** TODO Multi-statement boundary detection: extract top-level statement sequence
+
+* 2. Semantic Dependency Analysis (Def/Use/Mod)
+** TODO CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)
+** TODO CST pattern matcher: extract DML references (tables/columns in SELECT, INSERT, UPDATE, DELETE)
+** TODO Construct cross-statement dependency DAG (Directed Acyclic Graph)
+** TODO Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
+
+* 3. Hierarchical Reduction Engine
+** TODO Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
+** TODO Level 2: Closure-level delta debugging (ddmin over topological DAG components)
+** TODO Level 3: Intra-statement CST pruning (remove optional clauses: WHERE, ORDER BY, unused columns)
+** TODO Level 4: Expression simplification (binary expression -> operand -> literal)
+** TODO Fixed-point scheduler: iterate levels until minimal fixed-point is reached
+
+* 4. Semantic Crash Oracle & Environment
+** TODO Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])
+** TODO Cross-platform debugger supervisor (LLDB / GDB-MI interface: structured event capture)
+** TODO Standalone JSON Oracle contract (supports external runners emitting typed crash JSON)
+** TODO Lightweight state reset: database-level DROP/CREATE or socket-level respawn
+** TODO Semantic equivalence checker: compare CrashReport equality (avoid bug slippage)
+
+* 5. CLI & Test Suite
+** TODO CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
+** TODO Result exporter: emit minimal.sql, reproduction command, and reduction metrics
+** TODO Unit test suite: CST byte cutting and dependency DAG correctness
+** TODO Integration test suite: test against simulated crash scripts
