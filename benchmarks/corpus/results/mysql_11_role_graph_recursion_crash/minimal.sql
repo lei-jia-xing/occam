@@ -7,17 +7,33 @@
 --              cyclic role grant hierarchies and default role activation.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE user_tenants (
-    tenant_id INT PRIMARY KEY,
-    tenant_name VARCHAR(64)
-);
 
 
 
 
 -- Target Reproduction Scenario: Role definition and cyclic grants
+CREATE ROLE role_ops_l1;
+CREATE ROLE role_ops_l2;
+CREATE ROLE role_ops_l3;
 
+GRANT role_ops_l1 TO role_ops_l2;
+GRANT role_ops_l2 TO role_ops_l3;
+GRANT role_ops_l3 TO role_ops_l1;
 
+CREATE TABLE secure_audit_vault (
+    vault_id INT PRIMARY KEY,
+    payload_hash VARCHAR(64) NOT NULL,
+    classification_level INT NOT NULL
+);
 
+INSERT INTO secure_audit_vault (vault_id, payload_hash, classification_level) VALUES
+    (1, 'hash_99a8b7', 3),
+    (2, 'hash_44c2d1', 2);
 
 -- Crashing Query: Privilege evaluation traversal under cyclic role definitions
+SELECT
+    vault_id,
+    payload_hash,
+    CURRENT_ROLE() AS active_roles
+FROM secure_audit_vault
+;

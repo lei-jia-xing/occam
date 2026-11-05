@@ -7,18 +7,28 @@
 --              with multiple left outer joins.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE device_telemetry (
-    reading_id INT PRIMARY KEY,
-    device_sn VARCHAR(32),
-    reading_val DOUBLE PRECISION
-);
 
 
 
 
 -- Target Reproduction Scenario: Multi-table nested lateral join relid set mismatch
+CREATE TABLE alpha_tbl (
+    a_id INT PRIMARY KEY,
+    val_a INT
+);
 
 
 
 
 -- Crashing Query: Deep nested correlated lateral subqueries with outer joins
+SELECT *
+FROM alpha_tbl a
+LEFT JOIN (
+    beta_tbl b
+    LEFT JOIN LATERAL (
+        SELECT g.c_id, g.val_c AS computed_sum
+        FROM gamma_tbl g
+        WHERE g.b_ref
+    ) lat ON TRUE
+) ON a.a_id
+;

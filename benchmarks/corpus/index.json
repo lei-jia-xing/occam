@@ -7,7 +7,9 @@
     "defect_module": "backend/utils/adt/jsonpath_exec.c",
     "bug_id": "PG-BUG-16982 / SQLancer-PG-2020-09",
     "description": "Nested JSONB path traversal null pointer dereference during jsonb_path_query evaluation with filter predicate and jsonb_strip_nulls.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "customer_profiles",
+    "trigger_pattern": "jsonb_path_query"
   },
   {
     "id": "pg_02",
@@ -17,7 +19,9 @@
     "defect_module": "backend/access/gin/ginfast.c",
     "bug_id": "PG-BUG-15424",
     "description": "GIN fastupdate pending list corruption during concurrent inserts with fastupdate enabled, leading to segfault during ginInsertCleanup.",
-    "statements": 10
+    "statements": 10,
+    "target_table": "log_batches",
+    "trigger_pattern": "@>"
   },
   {
     "id": "pg_03",
@@ -27,7 +31,9 @@
     "defect_module": "backend/executor/nodeWindowAgg.c",
     "bug_id": "PG-BUG-16298 / SQUIRREL-PG-2021-33",
     "description": "Window function frame boundary calculation with RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW on nullable expressions.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "financial_ledger",
+    "trigger_pattern": "EXCLUDE CURRENT ROW"
   },
   {
     "id": "pg_04",
@@ -37,7 +43,9 @@
     "defect_module": "backend/partitioning/partprune.c",
     "bug_id": "PG-BUG-17101",
     "description": "Run-time partition pruning assertion failure on composite range partition key with DEFAULT partition when evaluating parameterized OR clauses.",
-    "statements": 6
+    "statements": 6,
+    "target_table": "timeseries_metrics",
+    "trigger_pattern": "AVG(metric_val)"
   },
   {
     "id": "pg_05",
@@ -47,7 +55,9 @@
     "defect_module": "backend/utils/adt/enum.c",
     "bug_id": "PG-BUG-15822 / SQLancer-PG-2019-12",
     "description": "enum_range() invoked over reordered enum type elements added via ALTER TYPE causing array indexing bounds violation in enum_range_internal.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "dev_tasks",
+    "trigger_pattern": "enum_range"
   },
   {
     "id": "pg_06",
@@ -57,7 +67,9 @@
     "defect_module": "backend/executor/nodeRecursiveunion.c",
     "bug_id": "PG-BUG-17345",
     "description": "Recursive CTE cycle detection assertion failure when combining CYCLE clause with set operations and outer joins.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "graph_edges",
+    "trigger_pattern": "WITH RECURSIVE"
   },
   {
     "id": "pg_07",
@@ -67,7 +79,9 @@
     "defect_module": "backend/access/brin/brin_inclusion.c",
     "bug_id": "PG-BUG-16611",
     "description": "BRIN inclusion operator class crash during index summarization of empty and NULL ranges.",
-    "statements": 10
+    "statements": 10,
+    "target_table": "sensor_ranges",
+    "trigger_pattern": "&&"
   },
   {
     "id": "pg_08",
@@ -77,7 +91,9 @@
     "defect_module": "backend/utils/adt/xml.c",
     "bug_id": "PG-BUG-16477",
     "description": "xpath() evaluation on malformed XML entities leaking LibXML2 parser contexts leading to memory corruption in allocator.",
-    "statements": 8
+    "statements": 8,
+    "target_table": "xml_payloads",
+    "trigger_pattern": "xpath"
   },
   {
     "id": "pg_09",
@@ -87,7 +103,9 @@
     "defect_module": "backend/optimizer/path/joinpath.c",
     "bug_id": "PG-BUG-17488 / SQLancer-PG-2022-01",
     "description": "Planner crash during path reparameterization for lateral joins involving partitioned tables and outer join grouping sets.",
-    "statements": 6
+    "statements": 6,
+    "target_table": "regional_sales",
+    "trigger_pattern": "GROUPING SETS"
   },
   {
     "id": "pg_10",
@@ -97,7 +115,9 @@
     "defect_module": "backend/utils/adt/tsvector_op.c",
     "bug_id": "PG-BUG-16812",
     "description": "tsvector_strip() null pointer dereference on tsvector with empty word list and position weights when combined with ts_stat or tsvector concatenation.",
-    "statements": 8
+    "statements": 8,
+    "target_table": "corpus_articles",
+    "trigger_pattern": "tsvector_strip"
   },
   {
     "id": "pg_11",
@@ -107,7 +127,9 @@
     "defect_module": "backend/executor/execExpr.c",
     "bug_id": "PG-BUG-17029",
     "description": "Nested domain check constraint failure on composite type attributes leading to executor type confusion when evaluating CoerceViaIO in UPDATE.",
-    "statements": 10
+    "statements": 10,
+    "target_table": "location_registry",
+    "trigger_pattern": "address.zip"
   },
   {
     "id": "pg_12",
@@ -117,7 +139,9 @@
     "defect_module": "backend/optimizer/plan/subselect.c",
     "bug_id": "PG-BUG-17255 / SQLancer-PG-2021-11",
     "description": "Corrupt join relids in lateral reference when flattening nested subqueries with multiple left outer joins.",
-    "statements": 11
+    "statements": 11,
+    "target_table": "alpha_tbl",
+    "trigger_pattern": "LEFT JOIN LATERAL"
   },
   {
     "id": "pg_13",
@@ -127,7 +151,9 @@
     "defect_module": "backend/rewrite/rewriteHandler.c",
     "bug_id": "PG-BUG-16550",
     "description": "Planner crash during query rewrite when accessing generated column whose stored expression involves array slicing after column alterations.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "sensor_streams",
+    "trigger_pattern": "first_two[1]"
   },
   {
     "id": "pg_14",
@@ -137,7 +163,9 @@
     "defect_module": "backend/commands/tablecmds.c",
     "bug_id": "PG-BUG-16104",
     "description": "Catalog cache invalidation crash during ON COMMIT DROP temp table cleanup inside aborted subtransaction savepoints.",
-    "statements": 8
+    "statements": 8,
+    "target_table": "temp_batch_work",
+    "trigger_pattern": "ROLLBACK TO SAVEPOINT"
   },
   {
     "id": "pg_15",
@@ -147,7 +175,9 @@
     "defect_module": "backend/access/spgist/spgquadbox.c",
     "bug_id": "PG-BUG-16781",
     "description": "SP-GiST quad-tree inner split infinite recursion / stack overflow when indexing identical 2D box coordinates.",
-    "statements": 8
+    "statements": 8,
+    "target_table": "spatial_bounding_boxes",
+    "trigger_pattern": "box '((-1,-1),(1,1))'"
   },
   {
     "id": "pg_16",
@@ -157,7 +187,9 @@
     "defect_module": "backend/utils/adt/multirangetypes.c",
     "bug_id": "PG-BUG-17510",
     "description": "Canonical function pointer dereference crash during multirange aggregation and intersection on empty multiranges.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "staff_schedules",
+    "trigger_pattern": "range_merge"
   },
   {
     "id": "mysql_01",
@@ -167,7 +199,9 @@
     "defect_module": "sql/sql_lex.cc / sql/sql_cte.cc",
     "bug_id": "MySQL-BUG-98512 / SQUIRREL-MYSQL-2020",
     "description": "Memory corruption / SIGSEGV in CTE union materialization with window aggregates when references are evaluated across multiple subqueries.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "sales_pipeline",
+    "trigger_pattern": "WITH cte_pipeline"
   },
   {
     "id": "mysql_02",
@@ -177,7 +211,9 @@
     "defect_module": "sql/sql_resolver.cc",
     "bug_id": "MySQL-BUG-99234 / SQLancer-MYSQL-2020-05",
     "description": "Crash in derived table merge optimization when subquery contains GROUP BY and outer query contains ORDER BY with LIMIT and JOIN.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "orders",
+    "trigger_pattern": "avg_spent"
   },
   {
     "id": "mysql_03",
@@ -187,7 +223,9 @@
     "defect_module": "sql/item_json_func.cc",
     "bug_id": "MySQL-BUG-101180",
     "description": "JSON_EXTRACT with multiple wildcard selectors ($.*[*]) on deeply nested heterogeneous JSON documents resulting in out-of-bounds memory access.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "doc_registry",
+    "trigger_pattern": "JSON_EXTRACT"
   },
   {
     "id": "mysql_04",
@@ -197,7 +235,9 @@
     "defect_module": "sql/item_window_func.cc",
     "bug_id": "MySQL-BUG-97886",
     "description": "Window function LEAD/LAG with default value expression having type mismatch against partition column causing assertion failure during evaluation.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "stock_ticks",
+    "trigger_pattern": "LEAD(price_cents"
   },
   {
     "id": "mysql_05",
@@ -207,7 +247,9 @@
     "defect_module": "storage/innobase/row/row0ins.cc",
     "bug_id": "MySQL-BUG-98380",
     "description": "Multi-row INSERT ... ON DUPLICATE KEY UPDATE with multiple composite unique indexes and auto-increment leading to B-tree cursor desync.",
-    "statements": 8
+    "statements": 8,
+    "target_table": "warehouse_inventory",
+    "trigger_pattern": "ON DUPLICATE KEY UPDATE"
   },
   {
     "id": "mysql_06",
@@ -217,7 +259,9 @@
     "defect_module": "storage/innobase/gis/gis0rtree.cc",
     "bug_id": "MySQL-BUG-102555",
     "description": "R-tree spatial index corruption and segfault during page split with degenerate zero-area polygon geometries.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "geofence_zones",
+    "trigger_pattern": "MBRIntersects"
   },
   {
     "id": "mysql_07",
@@ -227,7 +271,9 @@
     "defect_module": "storage/innobase/fts/fts0fts.cc",
     "bug_id": "MySQL-BUG-96452",
     "description": "Full-text search phrase search crash on hyphenated tokens with stopword filtering enabled in boolean mode.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "knowledge_base",
+    "trigger_pattern": "MATCH(title, content_body)"
   },
   {
     "id": "mysql_08",
@@ -237,7 +283,9 @@
     "defect_module": "sql/sql_optimizer.cc",
     "bug_id": "MySQL-BUG-100800 / SQLancer-MYSQL-2020-09",
     "description": "Assertion failure during subquery materialization when outer query contains GROUP BY ... WITH ROLLUP and HAVING clauses.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "invoices",
+    "trigger_pattern": "WITH ROLLUP"
   },
   {
     "id": "mysql_09",
@@ -247,7 +295,9 @@
     "defect_module": "sql/item_func.cc",
     "bug_id": "MySQL-BUG-101450",
     "description": "CHECK constraint evaluation crash when validating bit fields BIT(N) under multi-row INSERT with bitwise arithmetic expressions.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "network_packet_rules",
+    "trigger_pattern": "b'0000000000000001'"
   },
   {
     "id": "mysql_10",
@@ -257,7 +307,9 @@
     "defect_module": "sql/item_sum.cc",
     "bug_id": "MySQL-BUG-99882",
     "description": "GROUP_CONCAT buffer reallocation overflow and crash when sorting by BLOB fields with large group_concat_max_len settings.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "asset_meta",
+    "trigger_pattern": "GROUP_CONCAT"
   },
   {
     "id": "mysql_11",
@@ -267,7 +319,9 @@
     "defect_module": "sql/auth/sql_authorization.cc",
     "bug_id": "MySQL-BUG-102201",
     "description": "Stack overflow / SIGSEGV during authorization privilege resolution with cyclic role grant hierarchies and default role activation.",
-    "statements": 11
+    "statements": 11,
+    "target_table": "secure_audit_vault",
+    "trigger_pattern": "CURRENT_ROLE()"
   },
   {
     "id": "mysql_12",
@@ -277,7 +331,9 @@
     "defect_module": "sql/hash_join_buffer.cc",
     "bug_id": "MySQL-BUG-101902",
     "description": "Hash join memory buffer spill crash when build table contains variable-length nullable JSON and long string columns.",
-    "statements": 9
+    "statements": 9,
+    "target_table": "customers_large",
+    "trigger_pattern": "JOIN orders_large"
   },
   {
     "id": "mysql_13",
@@ -287,7 +343,9 @@
     "defect_module": "sql/ha_partition.cc",
     "bug_id": "MySQL-BUG-99520",
     "description": "Server crash during ALTER TABLE ... EXCHANGE PARTITION with auto-increment counter desynchronization across range partitions.",
-    "statements": 13
+    "statements": 13,
+    "target_table": "sales_partitioned",
+    "trigger_pattern": "9999"
   },
   {
     "id": "mysql_14",
@@ -297,7 +355,9 @@
     "defect_module": "sql/sql_prepare.cc",
     "bug_id": "MySQL-BUG-103112",
     "description": "Assertion failure when re-preparing statement referencing a view after underlying base table schema alteration.",
-    "statements": 12
+    "statements": 12,
+    "target_table": "metric_entries",
+    "trigger_pattern": "EXECUTE stmt_check"
   },
   {
     "id": "mysql_15",
@@ -307,7 +367,9 @@
     "defect_module": "storage/innobase/row/row0purge.cc",
     "bug_id": "MySQL-BUG-98841",
     "description": "InnoDB background purge thread crash on secondary index defined over virtual generated column during transaction rollback.",
-    "statements": 11
+    "statements": 11,
+    "target_table": "product_catalog",
+    "trigger_pattern": "LIKE 'ELEC:%'"
   },
   {
     "id": "mysql_16",
@@ -317,6 +379,8 @@
     "defect_module": "sql/window_frame.cc",
     "bug_id": "MySQL-BUG-102877",
     "description": "Assertion failure in window frame cursor when evaluating RANGE BETWEEN temporal intervals on nullable DATETIME columns.",
-    "statements": 7
+    "statements": 7,
+    "target_table": "device_heartbeats",
+    "trigger_pattern": "RANGE BETWEEN INTERVAL"
   }
 ]

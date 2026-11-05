@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_05_multi_row_upsert_deadlock.sql (1929 bytes, 8 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh mysql_05_multi_row_upsert_deadlock
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_05_multi_row_upsert_deadlock
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   8 -> 1
-  Bytes:        1929 B -> 783 B (-59.4%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.051s
+  Statements:   8 -> 3
+  Bytes:        1929 B -> 1387 B (-28.1%)
+  Oracle Calls: 12
+  Cache Hits:   11
+  Cache Misses: 12
+  Hit Ratio:    47.8%
+  Elapsed Time: 1.192s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_05_multi_row_upsert_deadlock/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_05_multi_row_upsert_deadlock/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_05_multi_row_upsert_deadlock/stats.json

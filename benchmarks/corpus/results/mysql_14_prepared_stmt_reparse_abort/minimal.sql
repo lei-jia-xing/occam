@@ -7,21 +7,29 @@
 --              after underlying base table schema alteration.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE query_stats (
-    stat_id INT PRIMARY KEY,
-    query_digest VARCHAR(64),
-    exec_count BIGINT
-);
 
 
 
 
 -- Target Reproduction Scenario: Table, View, and Prepared Statement Reparse
+CREATE TABLE metric_entries (
+    entry_id INT PRIMARY KEY,
+    sensor_id INT NOT NULL,
+    temperature DOUBLE NOT NULL,
+    humidity DOUBLE NOT NULL
+);
 
+CREATE VIEW v_active_metrics AS
+SELECT entry_id, sensor_id, temperature
+FROM metric_entries
+;
 
 
 -- Prepare statement referencing view
+PREPARE stmt_check FROM 'SELECT entry_id, sensor_id FROM v_active_metrics WHERE sensor_id = ?';
 
+SET @sid = 101;
+EXECUTE stmt_check USING @sid;
 
 -- Invalidate schema cache by altering base table
 

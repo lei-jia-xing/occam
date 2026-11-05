@@ -9,7 +9,7 @@ An expanded corpus of 32 real-world multi-statement SQL crash reproductions targ
 ```text
 benchmarks/corpus/
 ├── index.json                  # Machine-readable catalog containing metadata for all 32 cases
-├── mock_oracle.sh              # Portable mock crash oracle (for CI and offline reduction)
+├── semantic_oracle.sh          # Portable semantic defect crash oracle (for CI and offline reduction)
 ├── run_corpus.sh               # Automated batch evaluation and reporting runner
 ├── README.md                   # Taxonomy, defect documentation, and reproduction guidelines
 ├── real_crashes/               # 32 SQL test cases with multi-statement sequences
@@ -154,9 +154,9 @@ To execute all 32 crash scenarios with automated reduction and generate consolid
 To minimize a single crash testcase:
 
 ```bash
-# Run individual PostgreSQL case with mock oracle
+# Run individual PostgreSQL case with semantic oracle
 cabal run occam -- benchmarks/corpus/real_crashes/pg_01_jsonb_subpath_crash.sql \
-    --oracle "./benchmarks/corpus/mock_oracle.sh" \
+    --oracle "./benchmarks/corpus/semantic_oracle.sh pg_01" \
     --out benchmarks/corpus/results/pg_01
 
 # Run individual case against a live PostgreSQL server

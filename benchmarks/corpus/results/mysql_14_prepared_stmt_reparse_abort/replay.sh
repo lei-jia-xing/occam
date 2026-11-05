@@ -2,4 +2,4 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "==> Replaying minimal.sql against oracle..."
-/home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh < "$DIR/minimal.sql"
+./benchmarks/corpus/semantic_oracle.sh mysql_14_prepared_stmt_reparse_abort < "$DIR/minimal.sql"

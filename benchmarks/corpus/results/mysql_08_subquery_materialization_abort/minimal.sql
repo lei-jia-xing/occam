@@ -7,19 +7,22 @@
 --              contains GROUP BY ... WITH ROLLUP and HAVING clauses.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE sales_targets (
-    target_id INT PRIMARY KEY,
-    fiscal_year INT,
-    quarter_num INT,
-    target_usd DECIMAL(12,2)
-);
 
 
 
 
 -- Target Reproduction Scenario: Invoices and line items with rollup aggregation
+CREATE TABLE invoices (
+    invoice_id INT PRIMARY KEY,
+    region_id INT NOT NULL,
+    sales_rep_id INT NOT NULL,
+    invoice_amount DECIMAL(10,2) NOT NULL
+);
 
 
 
 
 -- Crashing Query: ROLLUP query with correlated materialized IN subquery in HAVING
+
+.sales_rep_id WITH ROLLUP
+;

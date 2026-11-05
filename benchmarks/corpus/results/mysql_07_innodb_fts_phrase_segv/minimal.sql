@@ -7,16 +7,25 @@
 --              filtering enabled in boolean mode.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE author_directory (
-    author_id INT PRIMARY KEY,
-    author_name VARCHAR(64),
-    joined_date DATE
-);
 
 
 
 
 -- Target Reproduction Scenario: Table with FULLTEXT index in InnoDB
+CREATE TABLE knowledge_base (
+    article_id INT PRIMARY KEY,
+    author_id INT NOT NULL,
+    title VARCHAR(128) NOT NULL,
+    content_body TEXT NOT NULL,
+    FULLTEXT INDEX idx_kb_content (title, content_body)
+) ENGINE=InnoDB;
 
 
 -- Crashing Query: Phrase search with hyphenated terms and boolean operators
+SELECT
+    article_id,
+    title,
+    MATCH(title, content_body) AGAINST('+"in-depth" +"deep-dive"' IN BOOLEAN MODE) AS score
+FROM knowledge_base
+
+;

@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_10_group_concat_overflow.sql (1565 bytes, 7 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh mysql_10_group_concat_overflow
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   7 -> 1
-  Bytes:        1565 B -> 682 B (-56.4%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.046s
+  Statements:   7 -> 3
+  Bytes:        1565 B -> 1095 B (-30.0%)
+  Oracle Calls: 15
+  Cache Hits:   10
+  Cache Misses: 15
+  Hit Ratio:    40.0%
+  Elapsed Time: 1.418s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/stats.json

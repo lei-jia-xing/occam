@@ -7,17 +7,24 @@
 --              when indexing identical 2D box coordinates.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE geo_regions (
-    region_id INT PRIMARY KEY,
-    name VARCHAR(64)
-);
 
 
 
 
 -- Target Reproduction Scenario: SP-GiST index on box with degenerate identical bounding boxes
+CREATE TABLE spatial_bounding_boxes (
+    box_id INT PRIMARY KEY,
+    owner_id INT,
+    bounding_box BOX NOT NULL
+);
 
 
 -- Insert multiple identical zero-area and degenerate boxes to trigger leaf node split recursion
 
 -- Crashing Query: Box overlap query triggering spg_quad_box_leaf_split traversal
+SELECT
+    box_id,
+    owner_id,
+    bounding_box
+FROM spatial_bounding_boxes
+WHERE box '((-1,-1),(1,1))';

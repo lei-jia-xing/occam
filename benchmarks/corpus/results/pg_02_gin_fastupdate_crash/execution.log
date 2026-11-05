@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_02_gin_fastupdate_crash.sql (2040 bytes, 10 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_02_gin_fastupdate_crash
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_02_gin_fastupdate_crash
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   10 -> 1
-  Bytes:        2040 B -> 731 B (-64.2%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.040s
+  Statements:   10 -> 6
+  Bytes:        2040 B -> 1349 B (-33.9%)
+  Oracle Calls: 41
+  Cache Hits:   22
+  Cache Misses: 41
+  Hit Ratio:    34.9%
+  Elapsed Time: 4.010s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_02_gin_fastupdate_crash/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_02_gin_fastupdate_crash/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_02_gin_fastupdate_crash/stats.json

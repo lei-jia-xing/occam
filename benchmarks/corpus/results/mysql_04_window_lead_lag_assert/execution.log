@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_04_window_lead_lag_assert.sql (1895 bytes, 7 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh mysql_04_window_lead_lag_assert
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_04_window_lead_lag_assert
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   7 -> 1
-  Bytes:        1895 B -> 727 B (-61.6%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.055s
+  Statements:   7 -> 3
+  Bytes:        1895 B -> 1341 B (-29.2%)
+  Oracle Calls: 15
+  Cache Hits:   10
+  Cache Misses: 15
+  Hit Ratio:    40.0%
+  Elapsed Time: 1.612s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_04_window_lead_lag_assert/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_04_window_lead_lag_assert/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_04_window_lead_lag_assert/stats.json

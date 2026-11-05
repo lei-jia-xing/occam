@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_14_prepared_stmt_reparse_abort.sql (1835 bytes, 12 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh mysql_14_prepared_stmt_reparse_abort
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_14_prepared_stmt_reparse_abort
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   12 -> 1
-  Bytes:        1835 B -> 745 B (-59.4%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.038s
+  Statements:   12 -> 5
+  Bytes:        1835 B -> 1024 B (-44.2%)
+  Oracle Calls: 32
+  Cache Hits:   34
+  Cache Misses: 32
+  Hit Ratio:    51.5%
+  Elapsed Time: 3.214s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_14_prepared_stmt_reparse_abort/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_14_prepared_stmt_reparse_abort/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_14_prepared_stmt_reparse_abort/stats.json

@@ -1,1 +1,1 @@
-{"cache_hit_ratio":0.5,"cache_hits":2,"cache_misses":2,"elapsed_seconds":5.0896969e-2,"initial_bytes":1862,"initial_statements":11,"oracle_executions":2,"reduced_bytes":727,"reduced_statements":1,"reduction_ratio":60.95596133190118}
+{"cache_hit_ratio":0.42028985507246375,"cache_hits":29,"cache_misses":40,"elapsed_seconds":3.956728966,"initial_bytes":1862,"initial_statements":11,"oracle_executions":40,"reduced_bytes":871,"reduced_statements":2,"reduction_ratio":53.22234156820622}

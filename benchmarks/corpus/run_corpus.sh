@@ -178,13 +178,13 @@ for sql_file in "${sorted_files[@]}"; do
     if [[ -n "$CUSTOM_ORACLE" ]]; then
         effective_oracle="$CUSTOM_ORACLE"
     elif [[ $FORCE_MOCK -eq 1 ]]; then
-        effective_oracle="$SCRIPT_DIR/mock_oracle.sh"
+        effective_oracle="./benchmarks/corpus/semantic_oracle.sh $case_id"
     elif [[ "$dbms" == "postgresql" && $PG_ACTIVE -eq 1 ]]; then
         effective_oracle="./harness/pg_harness.sh"
     elif [[ "$dbms" == "mysql" && $MYSQL_ACTIVE -eq 1 ]]; then
         effective_oracle="./harness/mysql_harness.sh"
     else
-        effective_oracle="$SCRIPT_DIR/mock_oracle.sh"
+        effective_oracle="./benchmarks/corpus/semantic_oracle.sh $case_id"
     fi
 
     printf "[%2d/%2d] Running %-35s (%s)... " "$idx" "$total_cases" "$fname" "$dbms"

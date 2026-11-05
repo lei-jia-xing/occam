@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_12_lateral_join_corrupt.sql (1862 bytes, 11 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_12_lateral_join_corrupt
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_12_lateral_join_corrupt
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   11 -> 1
-  Bytes:        1862 B -> 727 B (-61.0%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.051s
+  Statements:   11 -> 2
+  Bytes:        1862 B -> 871 B (-53.2%)
+  Oracle Calls: 40
+  Cache Hits:   29
+  Cache Misses: 40
+  Hit Ratio:    42.0%
+  Elapsed Time: 3.957s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_12_lateral_join_corrupt/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_12_lateral_join_corrupt/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_12_lateral_join_corrupt/stats.json

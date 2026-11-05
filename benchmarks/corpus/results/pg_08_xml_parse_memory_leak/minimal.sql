@@ -7,16 +7,27 @@
 --              contexts leading to memory corruption in allocator.
 
 -- Auxiliary Setup Tables (Candidate for Dead-Table Slicing)
-CREATE TABLE app_config_blobs (
-    blob_id INT PRIMARY KEY,
-    app_name VARCHAR(64),
-    checksum CHAR(32)
-);
 
 
 
 
 -- Target Reproduction Scenario: XML documents and namespace-aware xpath evaluation
+CREATE TABLE xml_payloads (
+    payload_id INT PRIMARY KEY,
+    service_origin VARCHAR(32),
+    xml_content XML NOT NULL
+);
 
 
 -- Crashing Query: Lateral unnesting of xpath with XML namespace array across malformed entities
+SELECT
+    p.payload_id,
+    p.service_origin,
+    xpath_nodes.node_val
+FROM xml_payloads p,
+LATERAL unnest(
+    xpath(
+        '/soap:Envelope/soap:Body/item/@id',
+        p.xml_content,
+        ARRAY[ARRAY['soap', 'http://schemas.xmlsoap.org/soap/envelope/']]
+    )

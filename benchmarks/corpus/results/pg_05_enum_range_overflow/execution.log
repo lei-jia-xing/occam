@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_05_enum_range_overflow.sql (1933 bytes, 9 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_05_enum_range_overflow
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   9 -> 1
-  Bytes:        1933 B -> 709 B (-63.3%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
+  Statements:   9 -> 5
+  Bytes:        1933 B -> 1317 B (-31.9%)
+  Oracle Calls: 20
+  Cache Hits:   20
+  Cache Misses: 20
   Hit Ratio:    50.0%
-  Elapsed Time: 0.046s
+  Elapsed Time: 1.914s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/stats.json

@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_06_cte_cycle_detection.sql (2086 bytes, 9 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_06_cte_cycle_detection
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   9 -> 1
-  Bytes:        2086 B -> 681 B (-67.4%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.048s
+  Statements:   9 -> 2
+  Bytes:        2086 B -> 1206 B (-42.2%)
+  Oracle Calls: 25
+  Cache Hits:   17
+  Cache Misses: 25
+  Hit Ratio:    40.5%
+  Elapsed Time: 2.480s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/stats.json

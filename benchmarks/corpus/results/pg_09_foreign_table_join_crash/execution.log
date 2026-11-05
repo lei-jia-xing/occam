@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_09_foreign_table_join_crash.sql (2426 bytes, 6 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_09_foreign_table_join_crash
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_09_foreign_table_join_crash
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   6 -> 1
-  Bytes:        2426 B -> 656 B (-73.0%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.052s
+  Statements:   6 -> 2
+  Bytes:        2426 B -> 1931 B (-20.4%)
+  Oracle Calls: 8
+  Cache Hits:   6
+  Cache Misses: 8
+  Hit Ratio:    42.9%
+  Elapsed Time: 0.349s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_09_foreign_table_join_crash/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_09_foreign_table_join_crash/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_09_foreign_table_join_crash/stats.json

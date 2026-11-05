@@ -2,7 +2,7 @@
 Occam v0.1.0.0 starting reduction
 ======================================================================
   Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_10_tsvector_strip_segv.sql (2039 bytes, 8 stmts)
-  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Oracle Cmd:   ./benchmarks/corpus/semantic_oracle.sh pg_10_tsvector_strip_segv
   Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_10_tsvector_strip_segv
 ----------------------------------------------------------------------
 Verifying initial crash reproduction... OK (Reproduced)
@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   8 -> 1
-  Bytes:        2039 B -> 730 B (-64.2%)
-  Oracle Calls: 2
-  Cache Hits:   2
-  Cache Misses: 2
-  Hit Ratio:    50.0%
-  Elapsed Time: 0.051s
+  Statements:   8 -> 3
+  Bytes:        2039 B -> 1275 B (-37.5%)
+  Oracle Calls: 17
+  Cache Hits:   10
+  Cache Misses: 17
+  Hit Ratio:    37.0%
+  Elapsed Time: 1.368s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_10_tsvector_strip_segv/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_10_tsvector_strip_segv/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_10_tsvector_strip_segv/stats.json
