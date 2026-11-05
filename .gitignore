@@ -1,0 +1,32 @@
+# Cabal
+dist/
+dist-*
+cabal.project.local
+cabal.project.local~
+.ghc.environment.*
+
+# GHC outputs
+*.o
+*.hi
+*.hie
+*.chi
+*.chs.h
+*.dyn_o
+*.dyn_hi
+
+# Stack
+.stack-work/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Build artifacts & databases
+*.so
+*.dylib
+*.dll
+crashes/
+tmp/
