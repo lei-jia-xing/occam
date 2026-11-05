@@ -19,6 +19,7 @@ module Occam.TreeSitter (
     nodeText,
     isNullNode,
     isNamedNode,
+    collectDescendants,
     cutSpan,
     cutNode,
     replaceSpan,
@@ -26,6 +27,7 @@ module Occam.TreeSitter (
 
     -- * Multi-Statement Slicing
     extractStatements,
+    extractStatementNodes,
 ) where
 
 import Control.Exception (bracket)
@@ -212,13 +214,20 @@ replaceNode node replacement src = do
 -- Multi-Statement Slicing
 -- ----------------------------------------------------------------------------
 
-extractStatements :: Tree -> ByteString -> IO [Statement]
-extractStatements tree src = do
+-- | Recursively collect all descendant nodes satisfying a predicate.
+collectDescendants :: (Text -> Bool) -> TSNode -> IO [TSNode]
+collectDescendants predNode node = do
+    t <- nodeType node
+    children <- nodeNamedChildren node
+    subMatches <- concat <$> mapM (collectDescendants predNode) children
+    pure $ if predNode t then node : subMatches else subMatches
+
+extractStatementNodes :: Tree -> ByteString -> IO [(Statement, TSNode)]
+extractStatementNodes tree src = do
     root <- rootNode tree
     named <- nodeNamedChildren root
-    -- In tree-sitter-sql, statements are named nodes under root (program)
     stmts <- filterM isStatement named
-    mapM toStatement (zip [1 ..] stmts)
+    mapM toPair (zip [1 ..] stmts)
     where
         filterM _ [] = pure []
         filterM p (x : xs) = do
@@ -230,12 +239,17 @@ extractStatements tree src = do
             t <- nodeType n
             pure (t /= "comment")
 
-        toStatement (idx, n) = do
+        toPair (idx, n) = do
             sp@(Span start end) <- nodeSpan n
             let raw = BS.take (end - start) (BS.drop start src)
-            pure $
-                Statement
+            pure
+                ( Statement
                     { stmtId = StatementId idx
                     , stmtSpan = sp
                     , stmtRaw = raw
                     }
+                , n
+                )
+
+extractStatements :: Tree -> ByteString -> IO [Statement]
+extractStatements tree src = map fst <$> extractStatementNodes tree src

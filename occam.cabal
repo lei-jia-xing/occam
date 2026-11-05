@@ -21,6 +21,7 @@ library
     exposed-modules:  Occam
                     , Occam.Core
                     , Occam.Dependency
+                    , Occam.Reducer
                     , Occam.Slicer
                     , Occam.TreeSitter
     build-depends:    base >= 4.18 && < 5

@@ -15,11 +15,11 @@
 ** DONE Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
 
 * 3. Hierarchical Reduction Engine
-** TODO Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
-** TODO Level 2: Closure-level delta debugging (ddmin over topological DAG components)
-** TODO Level 3: Intra-statement CST pruning (remove optional clauses: WHERE, ORDER BY, unused columns)
-** TODO Level 4: Expression simplification (binary expression -> operand -> literal)
-** TODO Fixed-point scheduler: iterate levels until minimal fixed-point is reached
+** DONE Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
+** DONE Level 2: Closure-level delta debugging (ddmin over topological DAG components)
+** DONE Level 3: Intra-statement CST pruning (remove optional clauses: WHERE, ORDER BY, unused columns)
+** DONE Level 4: Expression simplification (binary expression -> operand -> literal)
+** DONE Fixed-point scheduler: iterate levels until minimal fixed-point is reached
 
 * 4. Semantic Crash Oracle & Environment
 ** TODO Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])

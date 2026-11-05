@@ -20,7 +20,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Occam.Core (StatementId (..))
-import Occam.TreeSitter (TSNode, nodeNamedChildren, nodeText, nodeType)
+import Occam.TreeSitter (TSNode, collectDescendants, nodeNamedChildren, nodeText, nodeType)
 
 type ObjectName = Text
 
@@ -73,14 +73,6 @@ isBarrierAction act =
 -- ----------------------------------------------------------------------------
 -- CST Pattern Matching & Action Extraction
 -- ----------------------------------------------------------------------------
-
--- | Recursively collect all descendant nodes satisfying a predicate.
-collectDescendants :: (Text -> Bool) -> TSNode -> IO [TSNode]
-collectDescendants predNode node = do
-    t <- nodeType node
-    children <- nodeNamedChildren node
-    subMatches <- concat <$> mapM (collectDescendants predNode) children
-    pure $ if predNode t then node : subMatches else subMatches
 
 -- | Check if any descendant node has the given type.
 hasDescendantType :: Text -> TSNode -> IO Bool
