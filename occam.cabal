@@ -53,6 +53,9 @@ executable occam
                     , occam
                     , bytestring
                     , text
+                    , directory
+                    , filepath
+                    , time
     hs-source-dirs:   app
     default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
@@ -68,3 +71,6 @@ test-suite occam-test
                     , bytestring
                     , text
                     , containers
+                    , directory
+                    , filepath
+                    , process

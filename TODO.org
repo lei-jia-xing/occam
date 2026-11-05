@@ -29,7 +29,7 @@
 ** DONE Semantic equivalence checker: compare CrashReport equality (avoid bug slippage)
 
 * 5. CLI & Test Suite
-** IN_PROGRESS CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
-** TODO Result exporter: emit minimal.sql, reproduction command, and reduction metrics
+** DONE CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
+** DONE Result exporter: emit minimal.sql, reproduction command, and reduction metrics
 ** DONE Unit test suite: CST byte cutting and dependency DAG correctness
 ** DONE Integration test suite: test against simulated crash scripts

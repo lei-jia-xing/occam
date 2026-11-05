@@ -19,7 +19,7 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isDigit)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -481,9 +481,11 @@ runExternalOracle OracleConfig {..} sql = do
                                 Just actualReport ->
                                     pure (isEquivalentCrash topN expectedReport actualReport)
                                 Nothing ->
-                                    pure (exitCode /= ExitSuccess)
+                                    pure (isCrashExitCode exitCode)
                         Nothing ->
-                            pure (exitCode /= ExitSuccess || isJust (parseCrashReportJSON stdoutBytes))
+                            case parseCrashReportJSON stdoutBytes of
+                                Just _ -> pure True
+                                Nothing -> pure (isCrashExitCode exitCode)
     where
         runProcessWithStdin = do
             (Just hIn, Just hOut, _, ph) <-
@@ -498,3 +500,7 @@ runExternalOracle OracleConfig {..} sql = do
             outBytes <- BSC.hGetContents hOut
             exitCode <- waitForProcess ph
             pure (exitCode, outBytes)
+
+isCrashExitCode :: ExitCode -> Bool
+isCrashExitCode ExitSuccess = True
+isCrashExitCode (ExitFailure code) = code < 0 || code >= 128

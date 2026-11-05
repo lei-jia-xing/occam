@@ -4,6 +4,7 @@ module Main (main) where
 
 import Control.Monad (forM_, unless, when)
 import Data.ByteString.Char8 qualified as BSC
+import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -13,18 +14,27 @@ import Occam.Oracle
 import Occam.Reducer
 import Occam.Slicer
 import Occam.TreeSitter
-import System.Exit (exitFailure)
+import System.Directory (
+    doesFileExist,
+    findExecutable,
+    removeDirectoryRecursive,
+    removeFile,
+ )
+import System.Exit (ExitCode (..), exitFailure)
+import System.FilePath ((</>))
+import System.Process (readProcessWithExitCode)
 
 main :: IO ()
 main = do
     putStrLn "=================================================="
-    putStrLn "Running Occam Test Suite (Phases 1-4)"
+    putStrLn "Running Occam Test Suite (Phases 1-5)"
     putStrLn "=================================================="
 
     testPhase1TreeSitter
     testPhase2DependencyAnalysis
     testPhase3Reducer
     testPhase4CrashOracle
+    testPhase5CLI
     putStrLn "\n=================================================="
     putStrLn "All Occam tests PASSED successfully!"
     putStrLn "=================================================="
@@ -354,3 +364,104 @@ testPhase4CrashOracle = do
         fail "runExternalOracle should have rejected mismatched crash to prevent bug slippage!"
 
     putStrLn "Phase 4: External oracle runner & bug slippage prevention passed!"
+
+getOccamBinary :: IO FilePath
+getOccamBinary = do
+    mPath <- findExecutable "occam"
+    case mPath of
+        Just p -> pure p
+        Nothing -> do
+            let localPath = "dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/x/occam/build/occam/occam"
+            exists <- doesFileExist localPath
+            if exists
+                then pure localPath
+                else pure "cabal"
+
+runOccamCLI :: [String] -> IO (ExitCode, String, String)
+runOccamCLI cliArgs = do
+    bin <- getOccamBinary
+    if bin == "cabal"
+        then readProcessWithExitCode "cabal" (["run", "-v0", "occam", "--"] ++ cliArgs) ""
+        else readProcessWithExitCode bin cliArgs ""
+
+testPhase5CLI :: IO ()
+testPhase5CLI = do
+    putStrLn "\n--- [Phase 5] CLI Interface & Artifact Packaging Verification ---"
+
+    -- 1. Test --version
+    (verExit, verOut, _) <- runOccamCLI ["--version"]
+    when (verExit /= ExitSuccess) $
+        fail "occam --version failed!"
+    unless ("Occam v" `isInfixOf` verOut) $
+        fail "occam --version output missing 'Occam v'!"
+    putStrLn "Phase 5: CLI --version passed."
+
+    -- 2. Test --help
+    (helpExit, helpOut, _) <- runOccamCLI ["--help"]
+    when (helpExit /= ExitSuccess) $
+        fail "occam --help failed!"
+    unless ("Usage:" `isInfixOf` helpOut && "occam" `isInfixOf` helpOut) $
+        fail "occam --help output missing 'Usage:' and 'occam'!"
+    putStrLn "Phase 5: CLI --help passed."
+
+    -- 3. Test non-reproducing initial input error
+    let tmpSQL = "test_cli_input.sql"
+        tmpOut = "test_cli_out"
+    BSC.writeFile tmpSQL "SELECT 1;"
+
+    (badExit, _, badErr) <- runOccamCLI [tmpSQL, "--oracle", "false", "--out", tmpOut]
+    when (badExit == ExitSuccess) $
+        fail "Expected occam to fail when initial crash does not reproduce!"
+    unless ("Error: Initial input does not reproduce target crash!" `isInfixOf` badErr) $
+        fail $
+            "Expected error message not found in stderr: " ++ badErr
+    putStrLn "Phase 5: Non-reproducing input error check passed."
+
+    -- 4. Test end-to-end reduction run with artifact verification
+    let sampleCrashSQL =
+            BSC.unlines
+                [ "CREATE TABLE t1 (a INT, b TEXT);"
+                , "CREATE TABLE t2 (c INT);"
+                , "INSERT INTO t1 VALUES (1, 'x');"
+                , "CREATE INDEX i1 ON t1 (a);"
+                , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
+                ]
+    BSC.writeFile tmpSQL sampleCrashSQL
+
+    let pythonOracle =
+            "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
+
+    (okExit, okOut, okErr) <- runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut]
+    when (okExit /= ExitSuccess) $
+        fail $
+            "occam CLI reduction failed: " ++ okErr ++ "\nStdout: " ++ okOut
+
+    -- Verify artifacts exist
+    minExists <- doesFileExist (tmpOut </> "minimal.sql")
+    unless minExists $
+        fail "Artifact minimal.sql was not created!"
+
+    replayExists <- doesFileExist (tmpOut </> "replay.sh")
+    unless replayExists $
+        fail "Artifact replay.sh was not created!"
+
+    statsExists <- doesFileExist (tmpOut </> "stats.json")
+    unless statsExists $
+        fail "Artifact stats.json was not created!"
+
+    -- Verify contents of minimal.sql
+    minSQL <- BSC.readFile (tmpOut </> "minimal.sql")
+    when (BSC.isInfixOf "t2" minSQL) $
+        fail "minimal.sql contains unpruned table t2!"
+    when (BSC.isInfixOf "ORDER BY" minSQL) $
+        fail "minimal.sql contains unpruned ORDER BY clause!"
+    when (BSC.isInfixOf "1 = 1" minSQL) $
+        fail "minimal.sql contains unsimplified expression 1 = 1!"
+    unless (BSC.isInfixOf "WHERE a > 0" minSQL) $
+        fail "minimal.sql missing required WHERE a > 0!"
+
+    -- Clean up temporary test files
+    removeFile tmpSQL
+    removeDirectoryRecursive tmpOut
+
+    putStrLn "Phase 5: CLI end-to-end reduction & artifact generation passed!"
