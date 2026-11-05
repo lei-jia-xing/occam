@@ -231,22 +231,23 @@ def run_creduce(
     test_sh = out_dir / "test.sh"
     test_content = f"""#!/usr/bin/env bash
 echo 1 >> "{calls_file.resolve()}"
-exec "{oracle_sh.resolve()}" "{sid}" "{candidate_sql.resolve()}"
+exec "{oracle_sh.resolve()}" "{sid}" "./{candidate_sql.name}"
 """
     test_sh.write_text(test_content, encoding="utf-8")
     test_sh.chmod(0o755)
 
     cmd = [
         str(creduce_bin),
+        "--not-c",
         str(test_sh),
         str(candidate_sql),
         "--n", "1",
-        "--timeout", str(int(timeout_sec)),
+        "--timeout", "10",
     ]
 
     t0 = time.time()
     try:
-        subprocess.run(cmd, check=False, cwd=out_dir, capture_output=True, timeout=timeout_sec * 5)
+        subprocess.run(cmd, check=False, cwd=out_dir, capture_output=True, timeout=min(timeout_sec, 25.0))
     except subprocess.TimeoutExpired:
         pass
     wall_time = time.time() - t0

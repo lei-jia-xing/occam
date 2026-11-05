@@ -24,9 +24,23 @@ if ! "$CONTAINER_ENGINE" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     "$CONTAINER_ENGINE" build -t "$IMAGE_NAME" -f "$ROOT_DIR/Dockerfile.benchmark" "$ROOT_DIR"
 fi
 
+# Set TTY flags based on interactive environment
+TTY_FLAG=""
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY_FLAG="-it"
+elif [ -t 0 ] || [ -t 1 ]; then
+    TTY_FLAG="-i"
+fi
+
+EXTRA_VOLUMES=()
+if [ -d "/nix/store" ]; then
+    EXTRA_VOLUMES+=("-v" "/nix/store:/nix/store:ro")
+fi
+
 # Run container
-exec "$CONTAINER_ENGINE" run --rm -it \
-    -v "$(pwd):/workspace" \
+exec "$CONTAINER_ENGINE" run --rm $TTY_FLAG \
+    -v "$ROOT_DIR:/workspace" \
+    "${EXTRA_VOLUMES[@]}" \
     --tmpfs /var/lib/postgresql:rw,size=1G \
     --tmpfs /var/lib/mysql:rw,size=1G \
     "$IMAGE_NAME" "$@"

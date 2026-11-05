@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # 1. Start PostgreSQL service
-PG_VER=$(ls /usr/lib/postgresql 2>/dev/null | sort -V | tail -n 1 || true)
+PG_VER=$(find /usr/lib/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)
 if [ -n "$PG_VER" ]; then
     mkdir -p /var/run/postgresql /tmp
     chown -R postgres:postgres /var/run/postgresql /var/lib/postgresql 2>/dev/null || true
@@ -20,7 +20,7 @@ fi
 
 service postgresql start
 
-for i in {1..30}; do
+for _ in {1..30}; do
     if pg_isready -h /var/run/postgresql 2>/dev/null || pg_isready -h /tmp 2>/dev/null; then
         break
     fi
@@ -49,7 +49,7 @@ fi
 
 service mysql start
 
-for i in {1..30}; do
+for _ in {1..30}; do
     if mysqladmin ping --silent 2>/dev/null || mysqladmin ping -h 127.0.0.1 --silent 2>/dev/null; then
         break
     fi
@@ -66,6 +66,14 @@ CREATE DATABASE IF NOT EXISTS template_occam;
 CREATE DATABASE IF NOT EXISTS occam_test;
 FLUSH PRIVILEGES;
 EOF
+# Fix tool symlinks for C-Reduce in Ubuntu 24.04
+if [ ! -e /usr/bin/clang-format ] && [ -x /usr/bin/clang-format-17 ]; then
+    ln -sf /usr/bin/clang-format-17 /usr/bin/clang-format 2>/dev/null || true
+fi
+if [ ! -e /usr/bin/unifdef ] && [ -x /usr/libexec/unifdef ]; then
+    ln -sf /usr/libexec/unifdef /usr/bin/unifdef 2>/dev/null || true
+fi
+
 
 # 3. Dispatch execution
 if [ $# -gt 0 ]; then
