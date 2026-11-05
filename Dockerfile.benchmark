@@ -1,0 +1,26 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql \
+    postgresql-contrib \
+    mysql-server \
+    openjdk-17-jre-headless \
+    creduce \
+    python3 \
+    jq \
+    curl \
+    git \
+    make \
+    gcc \
+    libtree-sitter-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/sqlancer && \
+    (curl -fsSL -o /opt/sqlancer/sqlancer.jar https://github.com/sqlancer/sqlancer/releases/download/v2.0.0/sqlancer-2.0.0.jar || touch /opt/sqlancer/sqlancer.jar)
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/workspace/harness/docker_entrypoint.sh"]
