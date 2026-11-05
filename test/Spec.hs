@@ -56,6 +56,7 @@ tests =
         , phase4Tests
         , phase5Tests
         , phase6Tests
+        , phase7Tests
         , goldenTests
         , propertyTests
         ]
@@ -472,6 +473,89 @@ phase6Tests =
             stats3 <- getStats
             assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
             assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Phase 7: Dialect Hardening
+-- ----------------------------------------------------------------------------
+
+phase7Tests :: TestTree
+phase7Tests =
+    testGroup
+        "Phase 7: Dialect Hardening"
+        [ testCase "PG schema-qualified table: public.orders" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE public.orders (id INT);"
+                        , "SELECT * FROM public.orders;"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool "SELECT should depend on CREATE TABLE public.orders" (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for PG schema test"
+                    Just () -> pure ()
+        , testCase "MySQL backticks: `items`" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE `items` (id INT);"
+                        , "INSERT INTO `items` VALUES (1);"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool "INSERT should depend on CREATE TABLE `items`" (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for MySQL backticks test"
+                    Just () -> pure ()
+        , testCase "Mixed quotes & casing: \"Customers\" vs \"customers\"" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE \"Customers\" (id INT);"
+                        , "SELECT * FROM \"customers\";"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool "SELECT should depend on CREATE TABLE \"Customers\"" (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for mixed quotes/casing test"
+                    Just () -> pure ()
+        , testCase "MySQL ON DUPLICATE KEY UPDATE records ModDep" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE `items` (id INT, val INT);"
+                        , "INSERT INTO `items` VALUES (1, 2) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`);"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let actionsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                        depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool
+                        "INSERT ... ON DUPLICATE KEY UPDATE should record ModDep on items"
+                        ( any
+                            (\act -> actionKind act == TableObject && actionType act == ModDep && actionName act == "items")
+                            actionsS2
+                        )
+                    assertBool
+                        "INSERT ... ON DUPLICATE KEY UPDATE should depend on CREATE TABLE"
+                        (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for ON DUPLICATE KEY UPDATE test"
+                    Just () -> pure ()
         ]
 
 -- ----------------------------------------------------------------------------

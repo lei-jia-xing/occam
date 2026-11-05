@@ -81,7 +81,16 @@ hasDescendantType targetType node = do
     pure (not (null matches))
 
 normalizeName :: ByteString -> Text
-normalizeName = T.toLower . T.strip . TE.decodeUtf8Lenient
+normalizeName bs =
+    let txt = T.strip (TE.decodeUtf8Lenient bs)
+        segs = filter (not . T.null) (T.splitOn "." txt)
+        rawTable = case segs of
+            [] -> txt
+            _ -> last segs
+        unquote t =
+            let s = T.strip t
+             in T.dropAround (\c -> c == '"' || c == '`' || c == '\'' || c == '[' || c == ']') s
+     in T.toLower (unquote rawTable)
 
 extractActions :: TSNode -> ByteString -> IO [ObjectAction]
 extractActions stmtNode src = do
@@ -124,7 +133,9 @@ inspectChild src node = do
         "insert" -> do
             tables <- findTableReferences node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
-        -- DML: UPDATE
+        "replace" -> do
+            tables <- findTableReferences node src
+            pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
         "update" -> do
             tables <- findTableReferences node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
@@ -161,13 +172,28 @@ inspectChild src node = do
 
 findTableReferences :: TSNode -> ByteString -> IO [ObjectName]
 findTableReferences node src = do
-    -- In tree-sitter-sql, table names appear in object_reference or relation nodes
-    refs <- collectDescendants isTableRefNode node
+    -- In tree-sitter-sql, table names appear in object_reference nodes.
+    -- We also support relation, field (e.g. schema.table), or identifier as fallbacks.
+    -- Invocations (e.g. NOW(), VALUES() in ON DUPLICATE KEY UPDATE) are pruned.
+    objRefs <- collectTableRefs (== "object_reference") node
+    refs <-
+        if null objRefs
+            then collectTableRefs isFallbackRef node
+            else pure objRefs
     names <- mapM (nodeText src) refs
     let cleaned = filter (not . T.null) $ map normalizeName names
     pure (Set.toList (Set.fromList cleaned))
     where
-        isTableRefNode nt = nt == "object_reference" || nt == "relation"
+        isFallbackRef nt = nt == "relation" || nt == "field" || nt == "identifier"
+
+        collectTableRefs predNode n = do
+            t <- nodeType n
+            if t == "invocation"
+                then pure []
+                else do
+                    children <- nodeNamedChildren n
+                    subMatches <- concat <$> mapM (collectTableRefs predNode) children
+                    pure $ if predNode t then n : subMatches else subMatches
 
 -- ----------------------------------------------------------------------------
 -- Dependency DAG Construction

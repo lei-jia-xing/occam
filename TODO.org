@@ -38,10 +38,10 @@
 ** DONE In-memory candidate Hash memoization (prevent duplicate DB re-executions)
 ** DONE Cache statistics reporting (cache hits vs oracle executions)
 
-* 7. DBMS Dialect Hardening & Native Harnesses (PostgreSQL & MySQL)
-** TODO PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)
-** TODO MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
-** TODO Native execution harnesses for local psql and mysql sockets
+* 7. DBMS Dialect Hardening & Native Harnesses (PostgreSQL & MySQL)     :ARCHIVE:
+** DONE PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)
+** DONE MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
+** DONE Native execution harnesses for local psql and mysql sockets
 
 * 8. Experimental Baselines & Benchmark Runner
 ** TODO Implement Baseline 1 (Sequential statement-by-statement deletion)
