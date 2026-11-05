@@ -67,15 +67,15 @@
 ** DONE Set up and run upstream SQLancer directly (Java JAR) for DBMS crash/logic bug generation
 ** DONE Build unified live crash capture harness capturing upstream fuzzer outputs
 
-* 12. Direct Upstream Reducer Comparison (Occam vs Upstream Reducers)
-** TODO Harness integration: call upstream SQLancer Reducer (sqlancer.reducer) directly on raw crash traces
-** TODO Harness integration: call upstream general-purpose reducers (C-Reduce / Perses / ddmin) directly
-** TODO Measure Occam vs upstream tools on identical live crash inputs (zero reimplementation bias)
+* 12. Direct Upstream Reducer Comparison (Occam vs Upstream Reducers)   :ARCHIVE:
+** DONE Harness integration: call upstream SQLancer Reducer (sqlancer.reducer) directly on raw crash traces
+** DONE Harness integration: call upstream general-purpose reducers (C-Reduce / Perses / ddmin) directly
+** DONE Measure Occam vs upstream tools on identical live crash inputs (zero reimplementation bias)
 
 * 13. End-to-End Live Fuzz-to-Reduction Pipeline                        :ARCHIVE:
 ** DONE Automated pipeline: Upstream Fuzzer (SQLsmith/SQLancer) -> Live DBMS -> Occam Reducer -> minimal.sql
 ** DONE Live reproducer verification on fresh DB (100% bug reproduction & 0 bug slippage)
 
-* 14. Empirical Evaluation & Thesis Defense Artifacts
-** TODO Multi-tool comparative benchmark: Occam vs SQLancer Native Reducer vs C-Reduce/ddmin
+* 14. Empirical Evaluation & Thesis Defense Artifacts                  :ARCHIVE:
+** DONE Multi-tool comparative benchmark: Occam vs SQLancer Native Reducer vs C-Reduce/ddmin
 ** DONE Stream comparative metrics into JSONL and format via benchmarks/report.sh
