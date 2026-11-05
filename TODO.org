@@ -22,14 +22,14 @@
 ** DONE Fixed-point scheduler: iterate levels until minimal fixed-point is reached
 
 * 4. Semantic Crash Oracle & Environment
-** TODO Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])
-** TODO Cross-platform debugger supervisor (LLDB / GDB-MI interface: structured event capture)
-** TODO Standalone JSON Oracle contract (supports external runners emitting typed crash JSON)
-** TODO Lightweight state reset: database-level DROP/CREATE or socket-level respawn
-** TODO Semantic equivalence checker: compare CrashReport equality (avoid bug slippage)
+** DONE Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])
+** DONE Cross-platform debugger supervisor (LLDB / GDB-MI interface: structured event capture)
+** DONE Standalone JSON Oracle contract (supports external runners emitting typed crash JSON)
+** DONE Lightweight state reset: database-level DROP/CREATE or socket-level respawn
+** DONE Semantic equivalence checker: compare CrashReport equality (avoid bug slippage)
 
 * 5. CLI & Test Suite
-** TODO CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
+** IN_PROGRESS CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
 ** TODO Result exporter: emit minimal.sql, reproduction command, and reduction metrics
-** TODO Unit test suite: CST byte cutting and dependency DAG correctness
-** TODO Integration test suite: test against simulated crash scripts
+** DONE Unit test suite: CST byte cutting and dependency DAG correctness
+** DONE Integration test suite: test against simulated crash scripts

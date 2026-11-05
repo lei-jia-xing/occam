@@ -21,6 +21,7 @@ library
     exposed-modules:  Occam
                     , Occam.Core
                     , Occam.Dependency
+                    , Occam.Oracle
                     , Occam.Reducer
                     , Occam.Slicer
                     , Occam.TreeSitter

@@ -6,8 +6,10 @@ import Control.Monad (forM_, unless, when)
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
+import Occam.Oracle
 import Occam.Reducer
 import Occam.Slicer
 import Occam.TreeSitter
@@ -16,12 +18,13 @@ import System.Exit (exitFailure)
 main :: IO ()
 main = do
     putStrLn "=================================================="
-    putStrLn "Running Occam Test Suite (Phase 1, 2, & 3)"
+    putStrLn "Running Occam Test Suite (Phases 1-4)"
     putStrLn "=================================================="
 
     testPhase1TreeSitter
     testPhase2DependencyAnalysis
     testPhase3Reducer
+    testPhase4CrashOracle
     putStrLn "\n=================================================="
     putStrLn "All Occam tests PASSED successfully!"
     putStrLn "=================================================="
@@ -224,3 +227,130 @@ testPhase3Reducer = do
         fail "Failed to simplify '+ 10' in expression!"
 
     putStrLn "Phase 3: Hierarchical reduction engine tests passed!"
+
+testPhase4CrashOracle :: IO ()
+testPhase4CrashOracle = do
+    putStrLn "\n--- [Phase 4] Semantic Crash Oracle & Environment Verification ---"
+
+    -- 1. Equivalence checker test
+    let frame0 = StackFrame 0 "ExecScan" (Just "execScan.c") (Just 42)
+        frame1 = StackFrame 1 "standard_ExecutorRun" (Just "execMain.c") (Just 300)
+        frame2 = StackFrame 2 "PortalRun" (Just "pquery.c") (Just 780)
+        frameAlt = StackFrame 0 "errfinish" (Just "elog.c") (Just 100)
+
+        reportA = CrashReport (SignalCrash 11) (Just 0x401000) [frame0, frame1, frame2]
+        reportB = CrashReport (SignalCrash 11) (Just 0x401050) [frame0, frame1, frame2]
+        reportDiffSig = CrashReport (SignalCrash 6) (Just 0x401000) [frame0, frame1, frame2]
+        reportDiffFrame = CrashReport (SignalCrash 11) (Just 0x401000) [frameAlt, frame1, frame2]
+
+    unless (isEquivalentCrash 3 reportA reportB) $
+        fail "Expected reportA and reportB to be equivalent (same signal, same top-3 frames)!"
+
+    when (isEquivalentCrash 3 reportA reportDiffSig) $
+        fail "Expected reportA and reportDiffSig to NOT be equivalent (different signals)!"
+
+    when (isEquivalentCrash 3 reportA reportDiffFrame) $
+        fail "Expected reportA and reportDiffFrame to NOT be equivalent (different top frame)!"
+
+    putStrLn "Phase 4: CrashReport equivalence checking passed."
+
+    -- 2. JSON contract parser test
+    let jsonPayload =
+            BSC.pack
+                "{\"kind\":\"SIGSEGV\",\"signal\":11,\"pc\":4198400,\"frames\":[\
+                \{\"index\":0,\"function\":\"ExecScan\",\"file\":\"execScan.c\",\"line\":42},\
+                \{\"index\":1,\"function\":\"standard_ExecutorRun\",\"file\":\"execMain.c\",\"line\":300}\
+                \]}"
+
+    case parseCrashReportJSON jsonPayload of
+        Nothing -> fail "Failed to parse standard crash report JSON!"
+        Just parsed -> do
+            when (reportKind parsed /= SignalCrash 11) $
+                fail "JSON parser failed to extract SignalCrash 11!"
+            when (reportPC parsed /= Just 4198400) $
+                fail "JSON parser failed to extract PC!"
+            when (length (reportFrames parsed) /= 2) $
+                fail "JSON parser failed to extract 2 frames!"
+            case reportFrames parsed of
+                (f0 : _) -> do
+                    when (frameFunction f0 /= "ExecScan") $
+                        fail "JSON parser failed to extract function name!"
+                    when (frameFile f0 /= Just "execScan.c") $
+                        fail "JSON parser failed to extract file name!"
+                    when (frameLine f0 /= Just 42) $
+                        fail "JSON parser failed to extract line number!"
+                [] -> fail "Expected non-empty frames"
+
+    -- Test JSON round-trip
+    let rtJSON = crashReportToJSON reportA
+    case parseCrashReportJSON rtJSON of
+        Nothing -> fail "Failed to parse round-tripped CrashReport JSON!"
+        Just rtReport ->
+            unless (isEquivalentCrash 3 reportA rtReport) $
+                fail "Round-tripped CrashReport did not match original!"
+
+    putStrLn "Phase 4: Structured JSON contract parsing & round-trip passed."
+
+    -- 3. GDB-MI parser test
+    let gdbMiSample =
+            T.unlines
+                [ "*stopped,reason=\"signal-received\",signal-name=\"SIGSEGV\",signal-meaning=\"Segmentation fault\",frame={level=\"0\",addr=\"0x0000000000401000\",func=\"ExecScan\",file=\"execScan.c\",line=\"42\"}"
+                , "^done,stack=[frame={level=\"0\",addr=\"0x0000000000401000\",func=\"ExecScan\",file=\"execScan.c\",line=\"42\"},frame={level=\"1\",addr=\"0x0000000000402000\",func=\"standard_ExecutorRun\",file=\"execMain.c\",line=\"300\"}]"
+                ]
+
+    case parseGdbMiOutput gdbMiSample of
+        Nothing -> fail "Failed to parse GDB-MI sample output!"
+        Just miReport -> do
+            when (reportKind miReport /= SignalCrash 11) $
+                fail "GDB-MI parser failed to extract SignalCrash 11!"
+            when (length (reportFrames miReport) /= 2) $
+                fail "GDB-MI parser failed to extract stack frames!"
+            case reportFrames miReport of
+                (f0 : _) ->
+                    when (frameFunction f0 /= "ExecScan") $
+                        fail "GDB-MI parser failed to extract top function!"
+                [] -> fail "Expected non-empty frames from GDB-MI"
+
+    putStrLn "Phase 4: GDB-MI structured output parsing passed."
+
+    -- 4. Reset mechanism test
+    resetNone <- executeReset Nothing
+    unless resetNone $
+        fail "executeReset Nothing should return True!"
+
+    resetTrue <- executeReset (Just "true")
+    unless resetTrue $
+        fail "executeReset (Just 'true') should return True!"
+
+    resetFalse <- executeReset (Just "false")
+    when resetFalse $
+        fail "executeReset (Just 'false') should return False!"
+
+    putStrLn "Phase 4: Lightweight reset mechanism passed."
+
+    -- 5. External Oracle integration test
+    let mockScript =
+            "echo '{\"kind\":\"SIGSEGV\",\"signal\":11,\"frames\":[{\"index\":0,\"function\":\"ExecScan\"},{\"index\":1,\"function\":\"standard_ExecutorRun\"},{\"index\":2,\"function\":\"PortalRun\"}]}'"
+        oracleMatchConfig =
+            OracleConfig
+                { oracleCommand = "sh"
+                , oracleArgs = ["-c", mockScript]
+                , oracleTimeoutMicros = 2000000
+                , oracleResetCommand = Nothing
+                , oracleExpectedCrash = Just (3, reportA)
+                }
+
+    matched <- runExternalOracle oracleMatchConfig "SELECT 1;"
+    unless matched $
+        fail "runExternalOracle should have succeeded with matching crash report!"
+
+    -- Mismatched expected crash (bug slippage prevention)
+    let oracleMismatchConfig =
+            oracleMatchConfig
+                { oracleExpectedCrash = Just (3, reportDiffFrame)
+                }
+    slipped <- runExternalOracle oracleMismatchConfig "SELECT 1;"
+    when slipped $
+        fail "runExternalOracle should have rejected mismatched crash to prevent bug slippage!"
+
+    putStrLn "Phase 4: External oracle runner & bug slippage prevention passed!"
