@@ -32,6 +32,7 @@ library
                     , process >= 1.6
                     , filepath >= 1.4
                     , directory >= 1.3
+                    , aeson >= 2.0
     hs-source-dirs:   src
     default-language: GHC2021
     default-extensions:
@@ -57,6 +58,7 @@ executable occam
                     , filepath
                     , time
                     , optparse-applicative
+                    , aeson >= 2.0
     hs-source-dirs:   app
     default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
@@ -78,3 +80,6 @@ test-suite occam-test
                     , optparse-applicative
                     , tasty
                     , tasty-hunit
+                    , tasty-golden
+                    , tasty-quickcheck
+                    , QuickCheck

@@ -2,7 +2,9 @@
 
 module Main (main) where
 
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as LBS
 import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -22,8 +24,22 @@ import System.Directory (
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Process (readProcessWithExitCode)
+import Test.QuickCheck (
+    Arbitrary (..),
+    Gen,
+    Positive (..),
+    Property,
+    chooseInt,
+    counterexample,
+    elements,
+    oneof,
+    sublistOf,
+ )
+import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.Tasty (TestTree, defaultMain, testGroup)
+import Test.Tasty.Golden (goldenVsString)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
+import Test.Tasty.QuickCheck (testProperty)
 
 main :: IO ()
 main = defaultMain tests
@@ -37,6 +53,8 @@ tests =
         , phase3Tests
         , phase4Tests
         , phase5Tests
+        , goldenTests
+        , propertyTests
         ]
 
 -- ----------------------------------------------------------------------------
@@ -386,4 +404,203 @@ phase5Tests =
 
             removeFile tmpSQL
             removeDirectoryRecursive tmpOut
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Golden Tests: Snapshot Testing of Reduction Outputs
+-- ----------------------------------------------------------------------------
+
+goldenTests :: TestTree
+goldenTests =
+    testGroup
+        "Golden Tests"
+        [ goldenVsString
+            "case1_dead_tables: multiple tables created, retain only crash table & query"
+            "test/golden/case1_dead_tables.golden.sql"
+            (runReduction "test/golden/case1_dead_tables.sql" oracle1)
+        , goldenVsString
+            "case2_redundant_dml: interleaved inserts/updates into unrelated tables trimmed"
+            "test/golden/case2_redundant_dml.golden.sql"
+            (runReduction "test/golden/case2_redundant_dml.sql" oracle2)
+        , goldenVsString
+            "case3_clauses_expr: optional clauses pruned and expressions simplified"
+            "test/golden/case3_clauses_expr.golden.sql"
+            (runReduction "test/golden/case3_clauses_expr.sql" oracle3)
+        , goldenVsString
+            "case4_transaction_barrier: multi-statement sequence with BEGIN...COMMIT fences"
+            "test/golden/case4_transaction_barrier.golden.sql"
+            (runReduction "test/golden/case4_transaction_barrier.sql" oracle4)
+        ]
+    where
+        runReduction path oracle = do
+            input <- BS.readFile path
+            reduced <- reduceSQL oracle input
+            pure (LBS.fromStrict reduced)
+
+        oracle1 s =
+            pure
+                ( BSC.isInfixOf "SELECT * FROM products" s
+                    && BSC.isInfixOf "price > 100" s
+                )
+
+        oracle2 s =
+            pure
+                ( BSC.isInfixOf "SELECT * FROM target_tbl" s
+                    && BSC.isInfixOf "WHERE status = 'crash'" s
+                )
+
+        oracle3 s =
+            pure
+                ( BSC.isInfixOf "CREATE TABLE t1" s
+                    && BSC.isInfixOf "INSERT INTO t1" s
+                    && BSC.isInfixOf "a" s
+                    && BSC.isInfixOf "> 0" s
+                )
+
+        oracle4 s =
+            pure
+                ( BSC.isInfixOf "SELECT * FROM t1" s
+                    && BSC.isInfixOf "val = 'tx2'" s
+                )
+
+-- ----------------------------------------------------------------------------
+-- Property Tests: Invariants of Reducer & DAG
+-- ----------------------------------------------------------------------------
+
+data ArbitraryAction = ArbitraryAction !ObjectKind !DependencyType !T.Text
+    deriving (Eq, Show)
+
+instance Arbitrary ArbitraryAction where
+    arbitrary = do
+        k <- elements [TableObject, ColumnObject, IndexObject, ViewObject, BarrierObject]
+        t <- elements [DefDep, UseDep, ModDep, BarrierDep]
+        name <- elements ["t1", "t2", "t3", "v1", "c1", "__barrier__"]
+        pure (ArbitraryAction k t name)
+
+toObjectAction :: ArbitraryAction -> ObjectAction
+toObjectAction (ArbitraryAction k t name) = ObjectAction k t name
+
+-- Prop 1: DAG Acyclicity
+prop_dagAcyclicity :: [[ArbitraryAction]] -> Property
+prop_dagAcyclicity rawActions =
+    let stmtActions =
+            [ (StatementId sid, map toObjectAction acts)
+            | (sid, acts) <- zip [1 ..] rawActions
+            ]
+        graph = buildGraph stmtActions
+        edges = Map.toList (graphEdges graph)
+        strictlyBackwards (StatementId j, preds) =
+            all (\(StatementId i) -> i < j) (Set.toList preds)
+     in counterexample
+            ("Graph edges violate acyclicity: " ++ show edges)
+            (all strictlyBackwards edges)
+
+-- Prop 2: Backward Slicing Soundness
+prop_backwardSliceSoundness :: [[ArbitraryAction]] -> Positive Int -> Property
+prop_backwardSliceSoundness rawActions (Positive targetInt) =
+    let stmtActions =
+            [ (StatementId sid, map toObjectAction acts)
+            | (sid, acts) <- zip [1 ..] rawActions
+            ]
+        graph = buildGraph stmtActions
+        targetSid = StatementId targetInt
+        slice = backwardSlice targetSid graph
+        containsSelf = Set.member targetSid slice
+        validClosure = isValidClosure graph slice
+     in counterexample
+            ("Slice: " ++ show slice ++ ", graph: " ++ show (graphEdges graph))
+            (containsSelf && validClosure)
+
+-- Prop 3: Reduction Monotonicity
+data TestOracle
+    = OracleAlwaysTrue
+    | OracleAlwaysFalse
+    | OracleContains BSC.ByteString
+    | OracleMinLength Int
+    deriving (Show)
+
+instance Arbitrary TestOracle where
+    arbitrary =
+        oneof
+            [ pure OracleAlwaysTrue
+            , pure OracleAlwaysFalse
+            , OracleContains <$> elements ["t1", "t2", "SELECT", "WHERE", "crash", "missing"]
+            , OracleMinLength <$> chooseInt (0, 100)
+            ]
+
+runTestOracle :: TestOracle -> Oracle
+runTestOracle OracleAlwaysTrue = const (pure True)
+runTestOracle OracleAlwaysFalse = const (pure False)
+runTestOracle (OracleContains needle) = \s -> pure (needle `BSC.isInfixOf` s)
+runTestOracle (OracleMinLength minLen) = \s -> pure (BS.length s >= minLen)
+
+newtype TestScript = TestScript BSC.ByteString
+    deriving (Show)
+
+instance Arbitrary TestScript where
+    arbitrary = do
+        let pool =
+                [ "CREATE TABLE t1 (a INT, b TEXT);"
+                , "CREATE TABLE t2 (c INT);"
+                , "INSERT INTO t1 VALUES (1, 'x');"
+                , "INSERT INTO t2 VALUES (2);"
+                , "SELECT * FROM t1 WHERE (a + 0) > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
+                , "SELECT * FROM t2 WHERE c > 0;"
+                , "BEGIN;\nINSERT INTO t1 VALUES (3, 'y');\nCOMMIT;"
+                ]
+        lines_ <- sublistOf pool
+        extra <- arbitrary :: Gen String
+        let full = BSC.unlines (map BSC.pack lines_ ++ [BSC.pack extra | not (null extra)])
+        pure (TestScript full)
+
+prop_reductionMonotonicity :: TestScript -> TestOracle -> Property
+prop_reductionMonotonicity (TestScript script) testOracle = monadicIO $ do
+    reduced <- run (reduceSQL (runTestOracle testOracle) script)
+    assert (BS.length reduced <= BS.length script)
+
+-- Prop 4: Byte Slicing Non-destructive
+newtype DisjointIntervals
+    = DisjointIntervals (BSC.ByteString, Int, Int, Int, Int, BSC.ByteString, BSC.ByteString)
+    deriving (Show)
+
+instance Arbitrary DisjointIntervals where
+    arbitrary = do
+        str <- arbitrary :: Gen String
+        let src = BSC.pack str
+            len = BS.length src
+        s1 <- chooseInt (0, len)
+        e1 <- chooseInt (s1, len)
+        s2 <- chooseInt (e1, len)
+        e2 <- chooseInt (s2, len)
+        r1 <- BSC.pack <$> arbitrary
+        r2 <- BSC.pack <$> arbitrary
+        pure (DisjointIntervals (src, s1, e1, s2, e2, r1, r2))
+
+prop_byteSlicingNonDestructive :: DisjointIntervals -> Property
+prop_byteSlicingNonDestructive (DisjointIntervals (src, s1, e1, s2, e2, r1, r2)) =
+    let prefix = BS.take s1 src
+        mid = BS.take (s2 - e1) (BS.drop e1 src)
+        suffix = BS.drop e2 src
+        cutResult = cutSpan s1 e1 (cutSpan s2 e2 src)
+        repResult = replaceSpan s1 e1 r1 (replaceSpan s2 e2 r2 src)
+        surroundingCutOk = cutResult == (prefix <> mid <> suffix)
+        surroundingRepOk = repResult == (prefix <> r1 <> mid <> r2 <> suffix)
+     in counterexample
+            ("prefix=" ++ show prefix ++ ", mid=" ++ show mid ++ ", suffix=" ++ show suffix)
+            (surroundingCutOk && surroundingRepOk)
+
+propertyTests :: TestTree
+propertyTests =
+    testGroup
+        "Property Tests (QuickCheck)"
+        [ testProperty "Prop 1: DAG Acyclicity (j -> i implies i < j)" prop_dagAcyclicity
+        , testProperty
+            "Prop 2: Backward Slicing Soundness (s in slice & closure valid)"
+            prop_backwardSliceSoundness
+        , testProperty
+            "Prop 3: Reduction Monotonicity (len reduced <= len initial)"
+            prop_reductionMonotonicity
+        , testProperty
+            "Prop 4: Byte Slicing Non-destructive on disjoint intervals"
+            prop_byteSlicingNonDestructive
         ]

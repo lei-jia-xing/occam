@@ -92,10 +92,12 @@ extractActions stmtNode src = do
         else do
             children <- nodeNamedChildren stmtNode
             actions <- concat <$> mapM (inspectChild src) children
-            if null actions
+            let txAction = [ObjectAction BarrierObject BarrierDep "__tx_barrier__" | sRootType == "transaction"]
+            let allActions = txAction ++ actions
+            if null allActions
                 then -- Fallback conservative rule: unparsed/unrecognized statements are barriers
                     pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
-                else pure (dedup actions)
+                else pure (dedup allActions)
     where
         dedup = Set.toList . Set.fromList
 
@@ -210,11 +212,10 @@ processStmt (state, edgeMap) (sid, actions) =
         barrierDeps = maybe Set.empty Set.singleton (lastBarrier state)
 
         -- 2. Object dependencies
-        (objDeps, state') = foldl (processAction sid) (Set.empty, state) actions
+        (objDeps, state') = foldl (processAction sid state) (Set.empty, state) actions
 
-        allDeps = Set.union barrierDeps objDeps
+        allDeps = Set.delete sid (Set.union barrierDeps objDeps)
         edgeMap' = Map.insert sid allDeps edgeMap
-
         -- Update barrier state if this statement is itself a barrier
         hasBarrier = any isBarrierAction actions
         state'' =
@@ -226,10 +227,11 @@ processStmt (state, edgeMap) (sid, actions) =
 
 processAction ::
     StatementId ->
+    ScanState ->
     (Set StatementId, ScanState) ->
     ObjectAction ->
     (Set StatementId, ScanState)
-processAction sid (deps, state) act =
+processAction sid priorState (deps, state) act =
     case actionType act of
         DefDep ->
             -- Definition: recorded in defMap
@@ -238,8 +240,8 @@ processAction sid (deps, state) act =
         UseDep ->
             -- Reading object: depends on Def(T), and depends on the latest Mod(T)
             let obj = actionName act
-                defDep = maybe Set.empty Set.singleton (Map.lookup obj (defMap state))
-                modDeps = case Map.lookup obj (modMap state) of
+                defDep = maybe Set.empty Set.singleton (Map.lookup obj (defMap priorState))
+                modDeps = case Map.lookup obj (modMap priorState) of
                     Just (latestMod : _) -> Set.singleton latestMod
                     _ -> Set.empty
                 deps' = Set.unions [deps, defDep, modDeps]
@@ -247,8 +249,8 @@ processAction sid (deps, state) act =
         ModDep ->
             -- Mutating object: depends on Def(T), and depends on prior Mod(T)
             let obj = actionName act
-                defDep = maybe Set.empty Set.singleton (Map.lookup obj (defMap state))
-                priorMods = Map.findWithDefault [] obj (modMap state)
+                defDep = maybe Set.empty Set.singleton (Map.lookup obj (defMap priorState))
+                priorMods = Map.findWithDefault [] obj (modMap priorState)
                 modDep = case priorMods of
                     (latestMod : _) -> Set.singleton latestMod
                     [] -> Set.empty
