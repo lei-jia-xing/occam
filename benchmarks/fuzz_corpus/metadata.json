@@ -1,0 +1,308 @@
+[
+  {
+    "id": "fuzz_pg_50_01",
+    "file": "fuzz_pg_50_01.sql",
+    "dialect": "postgres",
+    "statements": 50,
+    "actual_statements": 68,
+    "bytes": 11743,
+    "ast_depth": 10,
+    "seed": 5011,
+    "injected_case": "pg_01",
+    "target_tables": [
+      "customer_profiles"
+    ],
+    "trigger_pattern": "jsonb_path_query",
+    "bug_class": "SIGSEGV (Null pointer dereference)",
+    "description": "Nested JSONB path traversal null pointer dereference during jsonb_path_query evaluation with filter predicate and jsonb_strip_nulls."
+  },
+  {
+    "id": "fuzz_pg_50_02",
+    "file": "fuzz_pg_50_02.sql",
+    "dialect": "postgres",
+    "statements": 50,
+    "actual_statements": 62,
+    "bytes": 7917,
+    "ast_depth": 12,
+    "seed": 5012,
+    "injected_case": "pg_03",
+    "target_tables": [
+      "financial_ledger"
+    ],
+    "trigger_pattern": "EXCLUDE CURRENT ROW",
+    "bug_class": "SIGSEGV (Buffer underflow in tuple spool)",
+    "description": "Window function frame boundary calculation with RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW on nullable expressions."
+  },
+  {
+    "id": "fuzz_mysql_50_01",
+    "file": "fuzz_mysql_50_01.sql",
+    "dialect": "mysql",
+    "statements": 50,
+    "actual_statements": 50,
+    "bytes": 10415,
+    "ast_depth": 10,
+    "seed": 5021,
+    "injected_case": "mysql_01",
+    "target_tables": [
+      "sales_pipeline"
+    ],
+    "trigger_pattern": "WITH cte_pipeline",
+    "bug_class": "SIGSEGV (Use-after-free of Query_expression during CTE materialization)",
+    "description": "Memory corruption / SIGSEGV in CTE union materialization with window aggregates when references are evaluated across multiple subqueries."
+  },
+  {
+    "id": "fuzz_mysql_50_02",
+    "file": "fuzz_mysql_50_02.sql",
+    "dialect": "mysql",
+    "statements": 50,
+    "actual_statements": 64,
+    "bytes": 10914,
+    "ast_depth": 12,
+    "seed": 5022,
+    "injected_case": "mysql_03",
+    "target_tables": [
+      "doc_registry"
+    ],
+    "trigger_pattern": "JSON_EXTRACT",
+    "bug_class": "SIGSEGV (Heap out-of-bounds read in Json_path_cache)",
+    "description": "JSON_EXTRACT with multiple wildcard selectors ($.*[*]) on deeply nested heterogeneous JSON documents resulting in out-of-bounds memory access."
+  },
+  {
+    "id": "fuzz_pg_100_01",
+    "file": "fuzz_pg_100_01.sql",
+    "dialect": "postgres",
+    "statements": 100,
+    "actual_statements": 134,
+    "bytes": 28064,
+    "ast_depth": 14,
+    "seed": 10011,
+    "injected_case": "pg_02",
+    "target_tables": [
+      "log_batches"
+    ],
+    "trigger_pattern": "@>",
+    "bug_class": "SIGSEGV / Assertion Failure",
+    "description": "GIN fastupdate pending list corruption during concurrent inserts with fastupdate enabled, leading to segfault during ginInsertCleanup."
+  },
+  {
+    "id": "fuzz_pg_100_02",
+    "file": "fuzz_pg_100_02.sql",
+    "dialect": "postgres",
+    "statements": 100,
+    "actual_statements": 140,
+    "bytes": 17455,
+    "ast_depth": 15,
+    "seed": 10012,
+    "injected_case": "pg_04",
+    "target_tables": [
+      "timeseries_metrics"
+    ],
+    "trigger_pattern": "AVG(metric_val)",
+    "bug_class": "Assertion Failure (bms_is_member in partition pruning)",
+    "description": "Run-time partition pruning assertion failure on composite range partition key with DEFAULT partition when evaluating parameterized OR clauses."
+  },
+  {
+    "id": "fuzz_pg_100_03",
+    "file": "fuzz_pg_100_03.sql",
+    "dialect": "postgres",
+    "statements": 100,
+    "actual_statements": 135,
+    "bytes": 27775,
+    "ast_depth": 16,
+    "seed": 10013,
+    "injected_case": "pg_06",
+    "target_tables": [
+      "graph_edges"
+    ],
+    "trigger_pattern": "WITH RECURSIVE",
+    "bug_class": "Assertion Failure (cycle_data != NULL)",
+    "description": "Recursive CTE cycle detection assertion failure when combining CYCLE clause with set operations and outer joins."
+  },
+  {
+    "id": "fuzz_mysql_100_01",
+    "file": "fuzz_mysql_100_01.sql",
+    "dialect": "mysql",
+    "statements": 100,
+    "actual_statements": 127,
+    "bytes": 31087,
+    "ast_depth": 14,
+    "seed": 10021,
+    "injected_case": "mysql_02",
+    "target_tables": [
+      "orders"
+    ],
+    "trigger_pattern": "avg_spent",
+    "bug_class": "Assertion Failure (thd->is_error() || !table->is_derived())",
+    "description": "Crash in derived table merge optimization when subquery contains GROUP BY and outer query contains ORDER BY with LIMIT and JOIN."
+  },
+  {
+    "id": "fuzz_mysql_100_02",
+    "file": "fuzz_mysql_100_02.sql",
+    "dialect": "mysql",
+    "statements": 100,
+    "actual_statements": 142,
+    "bytes": 28589,
+    "ast_depth": 15,
+    "seed": 10022,
+    "injected_case": "mysql_04",
+    "target_tables": [
+      "stock_ticks"
+    ],
+    "trigger_pattern": "LEAD(price_cents",
+    "bug_class": "Assertion Failure (result_field != nullptr)",
+    "description": "Window function LEAD/LAG with default value expression having type mismatch against partition column causing assertion failure during evaluation."
+  },
+  {
+    "id": "fuzz_mysql_100_03",
+    "file": "fuzz_mysql_100_03.sql",
+    "dialect": "mysql",
+    "statements": 100,
+    "actual_statements": 133,
+    "bytes": 44122,
+    "ast_depth": 16,
+    "seed": 10023,
+    "injected_case": "mysql_05",
+    "target_tables": [
+      "warehouse_inventory"
+    ],
+    "trigger_pattern": "ON DUPLICATE KEY UPDATE",
+    "bug_class": "Assertion Failure / SIGABRT (btr_pcur_restore_position)",
+    "description": "Multi-row INSERT ... ON DUPLICATE KEY UPDATE with multiple composite unique indexes and auto-increment leading to B-tree cursor desync."
+  },
+  {
+    "id": "fuzz_pg_150_01",
+    "file": "fuzz_pg_150_01.sql",
+    "dialect": "postgres",
+    "statements": 150,
+    "actual_statements": 180,
+    "bytes": 50590,
+    "ast_depth": 16,
+    "seed": 15011,
+    "injected_case": "pg_05",
+    "target_tables": [
+      "dev_tasks"
+    ],
+    "trigger_pattern": "enum_range",
+    "bug_class": "Memory Corruption / SIGSEGV",
+    "description": "enum_range() invoked over reordered enum type elements added via ALTER TYPE causing array indexing bounds violation in enum_range_internal."
+  },
+  {
+    "id": "fuzz_pg_150_02",
+    "file": "fuzz_pg_150_02.sql",
+    "dialect": "postgres",
+    "statements": 150,
+    "actual_statements": 194,
+    "bytes": 67593,
+    "ast_depth": 18,
+    "seed": 15012,
+    "injected_case": "pg_07",
+    "target_tables": [
+      "sensor_ranges"
+    ],
+    "trigger_pattern": "&&",
+    "bug_class": "SIGABRT / Assertion Failure",
+    "description": "BRIN inclusion operator class crash during index summarization of empty and NULL ranges."
+  },
+  {
+    "id": "fuzz_mysql_150_01",
+    "file": "fuzz_mysql_150_01.sql",
+    "dialect": "mysql",
+    "statements": 150,
+    "actual_statements": 189,
+    "bytes": 49854,
+    "ast_depth": 16,
+    "seed": 15021,
+    "injected_case": "mysql_06",
+    "target_tables": [
+      "geofence_zones"
+    ],
+    "trigger_pattern": "MBRIntersects",
+    "bug_class": "SIGSEGV (Null pointer dereference in rtr_page_split_and_insert)",
+    "description": "R-tree spatial index corruption and segfault during page split with degenerate zero-area polygon geometries."
+  },
+  {
+    "id": "fuzz_mysql_150_02",
+    "file": "fuzz_mysql_150_02.sql",
+    "dialect": "mysql",
+    "statements": 150,
+    "actual_statements": 174,
+    "bytes": 54316,
+    "ast_depth": 18,
+    "seed": 15022,
+    "injected_case": "mysql_08",
+    "target_tables": [
+      "invoices"
+    ],
+    "trigger_pattern": "WITH ROLLUP",
+    "bug_class": "Assertion Failure (!tab->materialized || tab->is_materialized())",
+    "description": "Assertion failure during subquery materialization when outer query contains GROUP BY ... WITH ROLLUP and HAVING clauses."
+  },
+  {
+    "id": "fuzz_pg_200_01",
+    "file": "fuzz_pg_200_01.sql",
+    "dialect": "postgres",
+    "statements": 200,
+    "actual_statements": 252,
+    "bytes": 67274,
+    "ast_depth": 18,
+    "seed": 20011,
+    "injected_case": "pg_10",
+    "target_tables": [
+      "corpus_articles"
+    ],
+    "trigger_pattern": "tsvector_strip",
+    "bug_class": "SIGSEGV (Null pointer dereference in strip_tsvector)",
+    "description": "tsvector_strip() null pointer dereference on tsvector with empty word list and position weights when combined with ts_stat or tsvector concatenation."
+  },
+  {
+    "id": "fuzz_pg_200_02",
+    "file": "fuzz_pg_200_02.sql",
+    "dialect": "postgres",
+    "statements": 200,
+    "actual_statements": 263,
+    "bytes": 80010,
+    "ast_depth": 20,
+    "seed": 20012,
+    "injected_case": "pg_12",
+    "target_tables": [
+      "alpha_tbl"
+    ],
+    "trigger_pattern": "LEFT JOIN LATERAL",
+    "bug_class": "Assertion Failure (bms_is_subset(lateral_relids, relids))",
+    "description": "Corrupt join relids in lateral reference when flattening nested subqueries with multiple left outer joins."
+  },
+  {
+    "id": "fuzz_mysql_200_01",
+    "file": "fuzz_mysql_200_01.sql",
+    "dialect": "mysql",
+    "statements": 200,
+    "actual_statements": 265,
+    "bytes": 83318,
+    "ast_depth": 18,
+    "seed": 20021,
+    "injected_case": "mysql_10",
+    "target_tables": [
+      "asset_meta"
+    ],
+    "trigger_pattern": "GROUP_CONCAT",
+    "bug_class": "Memory Corruption / SIGSEGV (Item_func_group_concat::add)",
+    "description": "GROUP_CONCAT buffer reallocation overflow and crash when sorting by BLOB fields with large group_concat_max_len settings."
+  },
+  {
+    "id": "fuzz_mysql_200_02",
+    "file": "fuzz_mysql_200_02.sql",
+    "dialect": "mysql",
+    "statements": 200,
+    "actual_statements": 270,
+    "bytes": 88180,
+    "ast_depth": 20,
+    "seed": 20022,
+    "injected_case": "mysql_12",
+    "target_tables": [
+      "customers_large"
+    ],
+    "trigger_pattern": "JOIN orders_large",
+    "bug_class": "SIGSEGV (Invalid pointer in HashJoinRowBuffer::StoreRow)",
+    "description": "Hash join memory buffer spill crash when build table contains variable-length nullable JSON and long string columns."
+  }
+]

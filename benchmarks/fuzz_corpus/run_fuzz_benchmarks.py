@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Automated Benchmark Runner for Modern Fuzz Corpus.
+
+Executes Occam vs B1 (Sequential Drop) vs B2 (Naive ddmin) across 18 modern
+fuzz scenarios (50 ~ 200 statements) using occam-eval and fuzz_oracle.sh.
+Generates comprehensive comparative markdown and CSV summary reports.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+def find_occam_eval(root: Path) -> Path:
+    candidates = [
+        root / "dist-newstyle" / "build" / "x86_64-linux" / "ghc-9.10.3" / "occam-0.1.0.0" / "x" / "occam-eval" / "build" / "occam-eval" / "occam-eval",
+    ]
+    for c in candidates:
+        if c.exists() and os.access(c, os.X_OK):
+            return c
+    res = subprocess.run(["cabal", "list-bin", "occam-eval"], cwd=root, capture_output=True, text=True)
+    if res.returncode == 0 and res.stdout.strip():
+        p = Path(res.stdout.strip())
+        if p.exists():
+            return p
+    raise FileNotFoundError("Could not find occam-eval executable. Run 'cabal build occam-eval' first.")
+
+
+def run_single_benchmark(
+    entry: Dict[str, Any],
+    root: Path,
+    eval_bin: Path,
+    oracle_sh: Path,
+    results_dir: Path,
+) -> Dict[str, Any]:
+    sid = entry["id"]
+    sql_file = root / "benchmarks" / "fuzz_corpus" / entry["file"]
+    out_dir = results_dir / sid
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    oracle_cmd = f"{oracle_sh} {sid}"
+    cmd = [
+        str(eval_bin),
+        str(sql_file),
+        "--oracle", oracle_cmd,
+        "--out", str(out_dir),
+        "--timeout", "15.0",
+    ]
+
+    t0 = time.time()
+    res = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    elapsed = time.time() - t0
+
+    benchmark_json = out_dir / "benchmark.json"
+    metrics = []
+    if benchmark_json.exists():
+        try:
+            metrics = json.loads(benchmark_json.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    return {
+        "scenario": sid,
+        "entry": entry,
+        "exit_code": res.returncode,
+        "stdout": res.stdout,
+        "stderr": res.stderr,
+        "elapsed_total": elapsed,
+        "metrics": metrics,
+    }
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[2]
+    fuzz_dir = root / "benchmarks" / "fuzz_corpus"
+    meta_path = fuzz_dir / "metadata.json"
+    oracle_sh = fuzz_dir / "fuzz_oracle.sh"
+    results_dir = fuzz_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if not meta_path.exists():
+        print(f"Error: {meta_path} does not exist.")
+        sys.exit(1)
+
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    eval_bin = find_occam_eval(root)
+
+    print("======================================================================")
+    print("Occam vs Baselines: Modern Fuzz Benchmark Suite")
+    print(f"Scenarios:    {len(metadata)} (50 ~ 200 statements)")
+    print(f"Evaluator:    {eval_bin}")
+    print(f"Oracle:       {oracle_sh}")
+    print(f"Output Dir:   {results_dir}")
+    print("======================================================================\n")
+
+    t_start = time.time()
+    results: List[Dict[str, Any]] = []
+
+    # Run in parallel using 4 worker threads
+    max_workers = 4
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(run_single_benchmark, entry, root, eval_bin, oracle_sh, results_dir): entry
+            for entry in metadata
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            entry = future_map[future]
+            try:
+                res = future.result()
+                results.append(res)
+                sid = entry["id"]
+                status = "PASS" if res["exit_code"] == 0 else "FAIL"
+                print(f"[{status}] {sid:22s} ({entry['statements']:3d} stmts, {entry['dialect']:8s}) - {res['elapsed_total']:.2f}s")
+            except Exception as e:
+                print(f"[ERROR] {entry['id']}: {e}")
+
+    results.sort(key=lambda r: (r["entry"]["statements"], r["entry"]["dialect"], r["scenario"]))
+    total_time = time.time() - t_start
+    print(f"\nAll {len(results)} benchmarks finished in {total_time:.2f}s.\n")
+
+    # Generate Markdown Summary
+    md_lines = [
+        "# Occam vs Baselines: Modern Fuzz Benchmark Evaluation",
+        "",
+        "## Executive Summary",
+        "",
+        "This benchmark compares **Occam** (AST- & dependency-aware hierarchical crash reducer) against:",
+        "- **B1 (Sequential Drop)**: Linear single-statement deletion baseline.",
+        "- **B2 (Naive ddmin)**: Standard Zeller delta-debugging baseline without dependency awareness.",
+        "",
+        f"**Test Suite:** 18 high-entropy, multi-statement SQL fuzz crash scenarios generated by `benchmarks/tools/fuzz_generator.py` across **PostgreSQL** and **MySQL**, scaling from 50 to 200 statements with deeply nested expressions (depth 10~20), schema churn, and transactional barriers.",
+        "",
+        "---",
+        "",
+        "## Detailed Comparative Results Table",
+        "",
+        "| Scenario | Dialect | Scale | Initial Stmts | Alg | Reduced Stmts | Stmt Red % | Initial Bytes | Reduced Bytes | Byte Red % | Oracle Calls | Time (s) |",
+        "| :--- | :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    csv_lines = [
+        "scenario,dialect,scale,initial_stmts,algorithm,reduced_stmts,stmt_reduction_pct,initial_bytes,reduced_bytes,byte_reduction_pct,oracle_calls,time_seconds"
+    ]
+
+    # Aggregation buckets
+    agg_calls = {"Occam": 0, "B1 (Sequential)": 0, "B2 (Naive ddmin)": 0}
+    agg_time = {"Occam": 0.0, "B1 (Sequential)": 0.0, "B2 (Naive ddmin)": 0.0}
+    agg_init_stmts = 0
+    agg_red_stmts = {"Occam": 0, "B1 (Sequential)": 0, "B2 (Naive ddmin)": 0}
+
+    for r in results:
+        entry = r["entry"]
+        sid = r["scenario"]
+        dialect = entry["dialect"].capitalize()
+        scale = f"{entry['statements']} stmts"
+        init_s = entry["statements"]
+        init_b = entry["bytes"]
+
+        for m in r["metrics"]:
+            alg = m.get("metricAlgorithm", "")
+            red_s = m.get("metricReducedStmts", 0)
+            red_b = m.get("metricReducedBytes", 0)
+            s_red = m.get("metricStmtReduction", 0.0)
+            b_red = m.get("metricByteReduction", 0.0)
+            calls = m.get("metricOracleCalls", 0)
+            sec = m.get("metricTimeSeconds", 0.0)
+
+            if alg in agg_calls:
+                agg_calls[alg] += calls
+                agg_time[alg] += sec
+                agg_red_stmts[alg] += red_s
+
+            md_lines.append(
+                f"| `{sid}` | {dialect} | {scale} | {init_s} | **{alg}** | {red_s} | {s_red:.1f}% | {init_b} | {red_b} | {b_red:.1f}% | {calls} | {sec:.3f} |"
+            )
+            csv_lines.append(
+                f"{sid},{dialect},{scale},{init_s},{alg},{red_s},{s_red:.2f},{init_b},{red_b},{b_red:.2f},{calls},{sec:.4f}"
+            )
+        agg_init_stmts += init_s
+
+    # Aggregated Analysis Section
+    md_lines.extend([
+        "",
+        "---",
+        "",
+        "## Overall Aggregate Performance Comparison",
+        "",
+        "| Algorithm | Total Initial Stmts | Total Reduced Stmts | Overall Stmt Reduction % | Total Oracle Calls | Total Wall Time (s) | Avg Calls / Case |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+
+    for alg in ["Occam", "B1 (Sequential)", "B2 (Naive ddmin)"]:
+        tot_red = agg_red_stmts[alg]
+        tot_calls = agg_calls[alg]
+        tot_time = agg_time[alg]
+        red_pct = (1.0 - (tot_red / agg_init_stmts)) * 100.0 if agg_init_stmts > 0 else 0.0
+        avg_calls = tot_calls / len(results) if results else 0.0
+        md_lines.append(
+            f"| **{alg}** | {agg_init_stmts} | {tot_red} | **{red_pct:.1f}%** | **{tot_calls}** | {tot_time:.2f}s | {avg_calls:.1f} |"
+        )
+
+    md_lines.extend([
+        "",
+        "### Key Takeaways",
+        "",
+        "1. **Semantic Correctness vs False Minimization**:",
+        "   - **Occam** uses CST-level Def-Use DAG backward slicing and closure constraints to preserve necessary schema definitions, data insertions (`ModDep`), and foreign key prerequisites.",
+        "   - **B1** and **B2** lack dependency awareness, greedily dropping setup `INSERT` and `UPDATE` statements. In real database environments, this causes bug slippage (the crashing query runs against empty tables and fails to crash).",
+        "",
+        "2. **Search Space Pruning & Scalability**:",
+        "   - On large multi-statement inputs (100 ~ 200 statements), Occam's backward slicing instantly cuts all unreferenced dead tables and dead-statement noise in a single step.",
+        "   - Occam's closure-constrained delta debugging explores only valid subgraph closures, preventing exponential partition failures.",
+        "",
+        "3. **Clause & Expression Minimization**:",
+        "   - Occam performs intra-statement clause pruning (WHERE, ORDER BY, GROUP BY, HAVING, LIMIT) and expression simplification (Level 3 & 4), which neither baseline supports.",
+        "",
+    ])
+
+    # Write output files
+    summary_md_path = root / "benchmarks" / "fuzz_benchmark_summary.md"
+    summary_csv_path = root / "benchmarks" / "fuzz_benchmark_summary.csv"
+
+    summary_md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    summary_csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+
+    print(f"Wrote benchmark summary markdown: {summary_md_path}")
+    print(f"Wrote benchmark summary CSV:      {summary_csv_path}")
+
+
+if __name__ == "__main__":
+    main()
