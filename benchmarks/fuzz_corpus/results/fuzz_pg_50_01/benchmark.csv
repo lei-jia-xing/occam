@@ -1,4 +1,0 @@
-Algorithm,Initial Bytes,Reduced Bytes,Byte Red. %,Initial Stmts,Reduced Stmts,Stmt Red. %,Oracle Invocations,Time (s)
-Occam,11743,3867,67.07,50,17,66.00,152,1.7852
-B1 (Sequential),11743,728,93.80,50,3,94.00,54,0.8380
-B2 (Naive ddmin),11743,710,93.95,50,2,96.00,16,0.1833

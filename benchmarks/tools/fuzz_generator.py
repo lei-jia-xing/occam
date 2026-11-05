@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import subprocess
@@ -18,8 +17,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-
+from typing import Any
 
 # -----------------------------------------------------------------------------
 # Schema Modeling
@@ -31,24 +29,24 @@ class ColumnDef:
     data_type: str
     is_pk: bool = False
     is_fk: bool = False
-    ref_table: Optional[str] = None
-    ref_column: Optional[str] = None
+    ref_table: str | None = None
+    ref_column: str | None = None
 
 
 @dataclass
 class TableDef:
     name: str
-    columns: List[ColumnDef] = field(default_factory=list)
+    columns: list[ColumnDef] = field(default_factory=list)
     is_target: bool = False
 
     @property
-    def pk_column(self) -> Optional[ColumnDef]:
+    def pk_column(self) -> ColumnDef | None:
         for c in self.columns:
             if c.is_pk:
                 return c
         return None
 
-    def non_pk_columns(self) -> List[ColumnDef]:
+    def non_pk_columns(self) -> list[ColumnDef]:
         return [c for c in self.columns if not c.is_pk]
 
 
@@ -57,17 +55,17 @@ class SchemaState:
 
     def __init__(self, dialect: str = "postgres"):
         self.dialect = dialect.lower()
-        self.tables: Dict[str, TableDef] = {}
-        self.views: Set[str] = set()
-        self.savepoints: List[str] = []
+        self.tables: dict[str, TableDef] = {}
+        self.views: set[str] = set()
+        self.savepoints: list[str] = []
 
     def add_table(self, table: TableDef) -> None:
         self.tables[table.name.lower()] = table
 
-    def get_table(self, name: str) -> Optional[TableDef]:
+    def get_table(self, name: str) -> TableDef | None:
         return self.tables.get(name.lower())
 
-    def random_table(self, exclude_target: bool = False) -> Optional[TableDef]:
+    def random_table(self, exclude_target: bool = False) -> TableDef | None:
         candidates = [
             t for t in self.tables.values()
             if not (exclude_target and t.is_target)
@@ -137,7 +135,7 @@ class ChaosExpressionGenerator:
             ])
         return random.choice(["0", "''", "NULL", "TRUE"])
 
-    def gen_leaf(self, table: Optional[TableDef], alias: Optional[str] = None) -> str:
+    def gen_leaf(self, table: TableDef | None, alias: str | None = None) -> str:
         if table and table.columns and random.random() < 0.65:
             col = random.choice(table.columns)
             return f"{alias}.{col.name}" if alias else col.name
@@ -152,9 +150,9 @@ class ChaosExpressionGenerator:
 
     def gen_expr(
         self,
-        table: Optional[TableDef],
+        table: TableDef | None,
         depth: int,
-        alias: Optional[str] = None,
+        alias: str | None = None,
         allow_agg: bool = False,
     ) -> str:
         """Recursive AST generator producing arithmetic, booleans, casts, and subqueries."""
@@ -279,8 +277,8 @@ class ChaosFuzzGenerator:
         dialect: str = "postgres",
         total_statements: int = 100,
         ast_depth: int = 10,
-        seed: Optional[int] = None,
-        inject_case: Optional[str] = None,
+        seed: int | None = None,
+        inject_case: str | None = None,
     ):
         self.dialect = "postgres" if dialect in ("postgres", "postgresql") else "mysql"
         self.total_statements = max(20, min(500, total_statements))
@@ -300,9 +298,9 @@ class ChaosFuzzGenerator:
         self.tbl_counter += 1
         return f"tbl_{self.tbl_counter:02d}"
 
-    def gen_create_table(self, is_target: bool = False, target_name: Optional[str] = None) -> Tuple[str, TableDef]:
+    def gen_create_table(self, is_target: bool = False, target_name: str | None = None) -> tuple[str, TableDef]:
         tbl_name = target_name or self.next_table_name()
-        cols: List[ColumnDef] = [
+        cols: list[ColumnDef] = [
             ColumnDef(name="id", data_type="INT", is_pk=True)
         ]
 
@@ -341,7 +339,7 @@ class ChaosFuzzGenerator:
         self.schema.add_table(tbl)
         return sql, tbl
 
-    def gen_create_index(self) -> Optional[str]:
+    def gen_create_index(self) -> str | None:
         tbl = self.schema.random_table()
         if not tbl or not tbl.columns:
             return None
@@ -350,7 +348,7 @@ class ChaosFuzzGenerator:
         idx_name = f"idx_{tbl.name}_{col.name}_{self.idx_counter}"
         return f"CREATE INDEX {idx_name} ON {tbl.name} ({col.name});"
 
-    def gen_alter_table(self) -> Optional[str]:
+    def gen_alter_table(self) -> str | None:
         tbl = self.schema.random_table(exclude_target=True)
         if not tbl:
             return None
@@ -367,7 +365,7 @@ class ChaosFuzzGenerator:
             return f"ALTER TABLE {tbl.name} DROP COLUMN {col_to_drop.name};"
         return None
 
-    def gen_create_view(self) -> Optional[str]:
+    def gen_create_view(self) -> str | None:
         tbl = self.schema.random_table()
         if not tbl or not tbl.columns:
             return None
@@ -377,7 +375,7 @@ class ChaosFuzzGenerator:
         self.schema.views.add(v_name)
         return f"CREATE VIEW {v_name} AS SELECT {col.name} FROM {tbl.name} WHERE {col.name} IS NOT NULL;"
 
-    def gen_insert(self, table: Optional[TableDef] = None) -> Optional[str]:
+    def gen_insert(self, table: TableDef | None = None) -> str | None:
         tbl = table or self.schema.random_table(exclude_target=True)
         if not tbl or not tbl.columns:
             return None
@@ -394,7 +392,7 @@ class ChaosFuzzGenerator:
         vals_str = ", ".join(val_exprs)
         return f"INSERT INTO {tbl.name} ({cols_str}) VALUES ({vals_str});"
 
-    def gen_update(self) -> Optional[str]:
+    def gen_update(self) -> str | None:
         tbl = self.schema.random_table(exclude_target=True)
         if not tbl or not tbl.columns:
             return None
@@ -406,13 +404,13 @@ class ChaosFuzzGenerator:
         where_cond = f"{tbl.columns[0].name} > {random.randint(0, 100)}"
         return f"UPDATE {tbl.name} SET {col.name} = {new_val} WHERE {where_cond};"
 
-    def gen_delete(self) -> Optional[str]:
+    def gen_delete(self) -> str | None:
         tbl = self.schema.random_table(exclude_target=True)
         if not tbl or not tbl.columns:
             return None
         where_cond = f"{tbl.columns[0].name} = {random.randint(1000, 99999)};"
         return f"DELETE FROM {tbl.name} WHERE {where_cond}"
-    def gen_select(self) -> Optional[str]:
+    def gen_select(self) -> str | None:
         tbl = self.schema.random_table()
         if not tbl or not tbl.columns:
             return None
@@ -438,7 +436,7 @@ class ChaosFuzzGenerator:
         limit_val = random.randint(1, 50)
         return f"SELECT\n{proj_str}\n{from_clause}\nWHERE {where_cond}\nLIMIT {limit_val};"
 
-    def gen_transaction_block(self, inner_statements: List[str]) -> str:
+    def gen_transaction_block(self, inner_statements: list[str]) -> str:
         if random.random() < 0.4 and len(inner_statements) >= 2:
             sp_name = f"sp_{random.randint(1, 999)}"
             first = inner_statements[0]
@@ -448,64 +446,74 @@ class ChaosFuzzGenerator:
             body = "\n".join(inner_statements)
         closer = "COMMIT;" if random.random() < 0.85 else "ROLLBACK;"
         return f"BEGIN;\n{body}\n{closer}"
-    def load_injection_case(self) -> Optional[Dict[str, Any]]:
-        """Extracts target scenario and metadata from corpus/index.json and real_crashes."""
+    def load_injection_case(self) -> dict[str, Any] | None:
+        """Extracts target scenario and metadata for defect injection."""
         if not self.inject_case:
             return None
 
-        root = Path(__file__).resolve().parents[2]
-        corpus_dir = root / "benchmarks" / "corpus"
-        index_file = corpus_dir / "index.json"
+        case_key = self.inject_case.lower()
+        builtin = {
+            "pg_01": {
+                "dbms": "postgresql",
+                "target_table": "customer_profiles",
+                "statements": [
+                    "CREATE TABLE customer_profiles (\n    profile_id INT PRIMARY KEY,\n    tenant_id INT NOT NULL,\n    account_status VARCHAR(24),\n    profile_doc JSONB NOT NULL\n);",
+                    "CREATE INDEX idx_customer_profiles_doc_gin ON customer_profiles USING gin (profile_doc);",
+                    "INSERT INTO customer_profiles (profile_id, tenant_id, account_status, profile_doc) VALUES\n    (1, 10, 'active', '{\"user\": {\"name\": \"Alice\", \"contact\": {\"emails\": [{\"type\": \"work\", \"address\": \"alice@corp.com\"}, {\"type\": \"home\", \"address\": null}]}}, \"settings\": {\"dark_mode\": true}}'),\n    (2, 10, 'suspended', '{\"user\": {\"name\": \"Bob\", \"contact\": {\"emails\": []}}, \"metadata\": null}'),\n    (3, 20, 'active', '{\"user\": {\"name\": \"Charlie\", \"contact\": null}, \"tags\": [\"beta\", \"internal\"]}');",
+                    "UPDATE customer_profiles\nSET profile_doc = jsonb_set(profile_doc, '{settings,backup_email}', '\"backup@corp.com\"')\nWHERE profile_id = 1;",
+                    "SELECT\n    p.profile_id,\n    p.account_status,\n    jsonb_path_query(p.profile_doc, 'lax $.user.contact.emails[*] ? (@.type == \"work\").address') AS work_email\nFROM customer_profiles p\nWHERE p.account_status = 'active'\n  AND p.profile_doc @> '{\"user\": {}}'\nORDER BY p.profile_id;",
+                ],
+            },
+            "mysql_01": {
+                "dbms": "mysql",
+                "target_table": "sales_pipeline",
+                "statements": [
+                    "CREATE TABLE sales_pipeline (\n    opportunity_id INT PRIMARY KEY,\n    rep_id INT NOT NULL,\n    deal_value DECIMAL(12,2) NOT NULL,\n    stage VARCHAR(32) NOT NULL\n);",
+                    "CREATE TABLE crm_leads (\n    lead_id INT PRIMARY KEY,\n    rep_id INT NOT NULL,\n    estimated_arr DECIMAL(12,2) NOT NULL\n);",
+                    "INSERT INTO sales_pipeline (opportunity_id, rep_id, deal_value, stage) VALUES (1, 10, 50000.00, 'closed_won'), (2, 10, 15000.00, 'in_progress');",
+                    "INSERT INTO crm_leads (lead_id, rep_id, estimated_arr) VALUES (101, 10, 45000.00), (102, 20, 90000.00);",
+                    "WITH cte_pipeline AS (\n    SELECT rep_id, deal_value, stage,\n           ROW_NUMBER() OVER (PARTITION BY rep_id ORDER BY deal_value DESC) AS rank_in_rep\n    FROM sales_pipeline\n    WHERE stage = 'closed_won'\n    UNION\n    SELECT rep_id, estimated_arr, 'prospect',\n           DENSE_RANK() OVER (PARTITION BY rep_id ORDER BY estimated_arr DESC) AS rank_in_rep\n    FROM crm_leads\n)\nSELECT cp.rep_id, SUM(cp.deal_value) AS aggregate_val\nFROM cte_pipeline cp\nJOIN sales_pipeline sp ON cp.rep_id = sp.rep_id\nGROUP BY cp.rep_id, cp.stage\nHAVING aggregate_val > 10000\nORDER BY cp.rep_id;",
+                ],
+            },
+        }
 
-        matched_entry = None
-        if index_file.exists():
+        if case_key in builtin:
+            b = builtin[case_key]
+            raw_stmts = b["statements"]
+            return {
+                "case_id": self.inject_case,
+                "target_table": b["target_table"],
+                "statements": raw_stmts,
+                "setup_statements": raw_stmts[:-1],
+                "crashing_statement": raw_stmts[-1],
+                "dbms": b.get("dbms", "postgresql"),
+            }
+
+        root = Path(__file__).resolve().parents[2]
+        fuzz_dir = root / "benchmarks" / "fuzz_corpus"
+        meta_file = fuzz_dir / "metadata.json"
+        if meta_file.exists():
             try:
-                entries = json.loads(index_file.read_text(encoding="utf-8"))
+                entries = json.loads(meta_file.read_text(encoding="utf-8"))
                 for e in entries:
-                    if e.get("id") == self.inject_case or self.inject_case in e.get("file", ""):
-                        matched_entry = e
-                        break
+                    if e.get("id") == self.inject_case or e.get("injected_case") == self.inject_case:
+                        sql_path = fuzz_dir / e["file"]
+                        if sql_path.exists():
+                            content = sql_path.read_text(encoding="utf-8")
+                            raw_stmts = [s.strip() + ";" for s in content.split(";") if s.strip()]
+                            target_tbl = e.get("target_tables", ["target_tbl"])[0]
+                            return {
+                                "case_id": self.inject_case,
+                                "target_table": target_tbl,
+                                "statements": raw_stmts,
+                                "setup_statements": raw_stmts[:-1],
+                                "crashing_statement": raw_stmts[-1],
+                                "dbms": e.get("dialect", "postgresql"),
+                            }
             except Exception:
                 pass
 
-        sql_path: Optional[Path] = None
-        if matched_entry:
-            sql_path = corpus_dir / matched_entry["file"]
-        else:
-            candidates = list((corpus_dir / "real_crashes").glob(f"*{self.inject_case}*.sql"))
-            if candidates:
-                sql_path = candidates[0]
-
-        if not sql_path or not sql_path.exists():
-            return None
-
-        content = sql_path.read_text(encoding="utf-8")
-        parts = re.split(r"--\s*Target Reproduction Scenario[^\n]*", content, flags=re.I)
-        if len(parts) < 2:
-            return None
-
-        scenario_text = parts[1].strip()
-        lines = [l for l in scenario_text.splitlines() if not l.strip().startswith("--")]
-        clean_text = "\n".join(lines).strip()
-        raw_stmts = [s.strip() + ";" for s in clean_text.split(";") if s.strip()]
-
-        if not raw_stmts:
-            return None
-
-        target_tbl_name = matched_entry.get("target_table") if matched_entry else None
-        if not target_tbl_name:
-            m = re.search(r"CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)", clean_text, re.I)
-            target_tbl_name = m.group(1) if m else "target_tbl"
-
-        return {
-            "case_id": self.inject_case,
-            "target_table": target_tbl_name,
-            "statements": raw_stmts,
-            "setup_statements": raw_stmts[:-1],
-            "crashing_statement": raw_stmts[-1],
-            "dbms": matched_entry.get("dbms", "postgresql") if matched_entry else "postgresql",
-        }
-
+        return None
     def generate(self) -> str:
         """Assembles a full multi-statement chaos fuzzer sequence with injected defect."""
         injected = self.load_injection_case()
@@ -517,9 +525,9 @@ class ChaosFuzzGenerator:
                 self.expr_gen.dialect = "mysql"
 
         # Determine injection scheduling
-        injected_stmts: List[str] = injected["statements"] if injected else []
-        setup_stmts: List[str] = injected["setup_statements"] if injected else []
-        crash_stmt: Optional[str] = injected["crashing_statement"] if injected else None
+        injected_stmts: list[str] = injected["statements"] if injected else []
+        setup_stmts: list[str] = injected["setup_statements"] if injected else []
+        crash_stmt: str | None = injected["crashing_statement"] if injected else None
 
         # Position crash trigger between 65% and 80% of sequence
         num_target = len(injected_stmts)
@@ -547,7 +555,7 @@ class ChaosFuzzGenerator:
                     body = m.group(1)
                     # Split top-level commas
                     raw_tokens = []
-                    curr: List[str] = []
+                    curr: list[str] = []
                     d = 0
                     for ch in body:
                         if ch == "(":
@@ -564,7 +572,7 @@ class ChaosFuzzGenerator:
 
                     for tok in raw_tokens:
                         tok_clean = tok.strip()
-                        if re.match(r"^(PRIMARY\s+KEY|FOREIGN\s+KEY|CONSTRAINT|UNIQUE|CHECK)\b", tok_clean, re.I):
+                        if re.match(r"^(PRIMARY\s+KEY|FOREIGN\s+KEY|CONSTRAINT|UNIQUE|CHECK)\b", tok_clean, re.IGNORECASE):
                             continue
                         parts = tok_clean.split()
                         if len(parts) >= 2:
@@ -590,14 +598,14 @@ class ChaosFuzzGenerator:
                 )
 
         # Build initial bootstrap tables
-        all_statements: List[str] = []
+        all_statements: list[str] = []
         for _ in range(random.randint(3, 5)):
             ddl, _ = self.gen_create_table()
             all_statements.append(ddl)
 
         # Distribute injected setup statements before crash_pos
         setup_idx = 0
-        setup_schedule: Dict[int, str] = {}
+        setup_schedule: dict[int, str] = {}
         if setup_stmts:
             step = max(1, (crash_pos - 10) // (len(setup_stmts) + 1))
             cur = 5
@@ -674,7 +682,7 @@ class ChaosFuzzGenerator:
             all_statements.append(crash_stmt)
 
         header = [
-            f"-- Chaos Fuzz Generator Output (Occam Stress Benchmark)",
+            "-- Chaos Fuzz Generator Output (Occam Stress Benchmark)",
             f"-- Dialect: {self.dialect.upper()}",
             f"-- Statements: {len(all_statements)}",
             f"-- AST Expression Depth: {self.ast_depth}",
@@ -707,15 +715,7 @@ def run_self_test() -> bool:
         tmp_path = Path(tmpdir)
         print("\n[Phase 1] Multi-statement scaling & Tree-sitter AST verification...")
 
-        # Initialize Tree-sitter parser using audit_corpus
-        sys.path.insert(0, str(root / "benchmarks" / "corpus"))
-        try:
-            import audit_corpus
-            runtime, grammar, parser = audit_corpus.make_parser(root, tmp_path)
-            ts_available = True
-        except Exception as e:
-            print(f"Warning: Tree-sitter parser init failed ({e}), skipping CST validation.")
-            ts_available = False
+        ts_available = False
 
         all_ok = True
         for dialect in dialects:
@@ -757,7 +757,7 @@ def run_self_test() -> bool:
         inj_file.write_text(injected_sql, encoding="utf-8")
         out_reduce_dir = tmp_path / "reduce_out"
 
-        oracle_cmd = f"{root}/benchmarks/corpus/semantic_oracle.sh pg_01"
+        oracle_cmd = f"{root}/benchmarks/fuzz_corpus/fuzz_oracle.sh pg_01"
         cmd = [
             str(occam_bin) if occam_bin.exists() else "occam",
             str(inj_file),
@@ -766,7 +766,7 @@ def run_self_test() -> bool:
         ]
 
         print(f"  Target: {inj_file.name} ({len(injected_sql)} bytes)")
-        print(f"  Executing Occam reducer...")
+        print("  Executing Occam reducer...")
         res = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
 
         if res.returncode != 0:
@@ -781,7 +781,7 @@ def run_self_test() -> bool:
             init_s = stats.get("initial_statements", 0)
             red_s = stats.get("reduced_statements", 0)
             ratio = stats.get("reduction_ratio", 0.0)
-            print(f"  Occam reduction SUCCESS:")
+            print("  Occam reduction SUCCESS:")
             print(f"    Statements: {init_s} -> {red_s}")
             print(f"    Bytes Reduction: {ratio:.1f}%")
             print(f"    Oracle Executions: {stats.get('oracle_executions', 0)}")

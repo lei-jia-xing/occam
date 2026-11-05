@@ -33,3 +33,9 @@ crashes/
 tmp/
 __pycache__/
 *.pyc
+# Benchmark & Fuzz runtime results
+benchmarks/**/results/
+benchmarks/*.jsonl
+benchmarks/**/*.jsonl
+benchmarks/fuzz_benchmark_results.jsonl
+benchmarks/fuzz_benchmark_summary.*

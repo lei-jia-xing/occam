@@ -1,126 +1,113 @@
-# Occam Benchmark Corpus (Phase 9)
+# Occam Automated Fuzz Benchmark Suite
 
-Real-world multi-statement SQL crash reproduction corpus for evaluating SQL minimizer performance, dependency DAG slicing, and dialect hardening.
-
----
-
-## 1. Benchmark Scenarios Overview
-
-| File | DBMS Target | Statements | Key Features & Defect Focus |
-| :--- | :--- | :---: | :--- |
-| `01_pg_json_operator.sql` | **PostgreSQL** (>= 12) | 13 | GIN indexes, nested JSONB, path operators (`->>`, `#>>`, `@>`), 4 dead setup tables |
-| `02_mysql_cte_recursive.sql` | **MySQL** (>= 8.0) | 16 | Recursive CTE (`WITH RECURSIVE`), window functions (`ROW_NUMBER`, `SUM`), joins, interleaved DML |
-| `03_pg_partial_index.sql` | **PostgreSQL** (>= 11) | 17 | Partial expression indexes, schema evolution (`ALTER TABLE`), index scan defects |
-| `04_mysql_duplicate_key.sql` | **MySQL** (>= 8.0) | 11 | `ON DUPLICATE KEY UPDATE`, multiple composite unique keys, batch multi-row inserts |
-| `05_multi_table_stress.sql` | **Cross-Platform** | 25 | 5 tables, foreign keys, 2 views, transaction barriers (`BEGIN...COMMIT`), edge-case expressions |
+Authoritative automated multi-statement SQL benchmark suite evaluating **Occam** (AST- & dependency-aware hierarchical crash reducer) against standard reduction baselines:
+- **B1 (Sequential Drop)**: Linear single-statement deletion baseline.
+- **B2 (Naive ddmin)**: Standard Zeller delta debugging baseline without dependency awareness.
 
 ---
 
-## 2. Benchmark Dataset Details
+## 1. Directory Structure
 
-### 01. `01_pg_json_operator.sql`
-- **Target DBMS:** PostgreSQL
-- **Focus:** JSONB path extraction and GIN indexing corruption.
-- **Structure:**
-  - 4 irrelevant setup tables (`config_parameters`, `audit_trail`, `user_accounts`, `system_telemetry`) with interleaved data inserts.
-  - Target table `event_records` with GIN indexes on `payload` and `metadata`.
-  - Crashing query combining containment (`@>`), scalar path extraction (`->>`), and nested JSON path navigation (`#>>`).
-- **Reduction Goal:** Eliminate all 4 unreferenced tables and their DML, isolating only `event_records` and the GIN index scan.
-
-### 02. `02_mysql_cte_recursive.sql`
-- **Target DBMS:** MySQL
-- **Focus:** CTE evaluation crash with window function frame computation.
-- **Structure:**
-  - Multi-level organizational hierarchy with recursive self-referential CTE.
-  - Multi-table joins connecting recursive relations to staff and sales records.
-  - Window functions: `ROW_NUMBER() OVER (...)`, `DENSE_RANK() OVER (...)`, `SUM(...) OVER (...)`, `AVG(...) OVER (...)`.
-  - Multiple interleaved DML operations on unrelated tables (`app_session_log`, `inventory_stock`, `billing_invoices`).
-- **Reduction Goal:** Prune noise DML statements while preserving recursive CTE dependencies and join chains.
-
-### 03. `03_pg_partial_index.sql`
-- **Target DBMS:** PostgreSQL
-- **Focus:** Partial expression index match and planner predicate inference defects.
-- **Structure:**
-  - Initial table creation followed by sequential schema migrations (`ALTER TABLE accounts ADD COLUMN ...`).
-  - Expression indexes with partial predicates: `(lower(email), (flags & 7)) WHERE status = 'active' AND tier = 'enterprise'`.
-  - Queries specifically exercising the indexed expressions and WHERE conditions.
-- **Reduction Goal:** Retain the ordered migration chain and partial index definition while slicing unrelated auth tokens and audit entries.
-
-### 04. `04_mysql_duplicate_key.sql`
-- **Target DBMS:** MySQL
-- **Focus:** Deadlocks and index state corruption during concurrent multi-row upserts with multiple unique keys.
-- **Structure:**
-  - Primary key `(item_sku, warehouse_id)` alongside composite unique keys `uk_sku_channel` and `uk_warehouse_bin`.
-  - Batch multi-row `INSERT ... ON DUPLICATE KEY UPDATE` statements inducing simultaneous conflicts across distinct unique indexes.
-  - Interleaved session and audit table modifications.
-- **Reduction Goal:** Preserve the multi-row upsert statements triggering key collisions while discarding extraneous logging DML.
-
-### 05. `05_multi_table_stress.sql`
-- **Target DBMS:** Cross-Platform (PostgreSQL & MySQL compliant)
-- **Focus:** Transaction barrier preservation and deep dependency graph reduction.
-- **Structure:**
-  - Exactly 25 statements.
-  - 5 relational tables (`departments`, `employees`, `projects`, `task_assignments`, `system_journal`) connected via foreign key references.
-  - 2 aggregated views (`dept_burn_rate`, `project_cost_summary`).
-  - 2 transactional blocks bounded by `BEGIN;` and `COMMIT;` fences.
-  - Edge-case arithmetic and conditional expressions: `NULLIF(...)`, `COALESCE(...)`, `CASE WHEN ... BETWEEN ... END`, and bitwise/modulo operations.
-- **Reduction Goal:** Verify that transactional fences are never violated during closure delta debugging, and foreign key dependencies remain intact.
-
----
-
-## 3. DBMS Execution Harnesses
-
-Occam interacts with database targets through standalone JSON crash oracles located in `harness/`:
-
-- **PostgreSQL:** `./harness/pg_harness.sh`
-  - Resets state via `dropdb --if-exists` and `createdb`.
-  - Executes candidate queries with `psql -v ON_ERROR_STOP=1`.
-  - Translates crash signals (SIGSEGV = 11, SIGABRT = 6) to structured JSON reports.
-- **MySQL:** `./harness/mysql_harness.sh`
-  - Resets state via `DROP DATABASE IF EXISTS` and `CREATE DATABASE`.
-  - Executes candidate queries via `mysql` client.
-  - Detects server disconnection errors (e.g. `CR_SERVER_LOST`, `ERROR 2013`) and returns typed signal representations.
-
----
-
-## 4. Reproduction & Benchmark Commands
-
-### Running Individual Benchmarks
-
-```bash
-# Benchmark 01 (PostgreSQL)
-cabal run occam -- benchmarks/01_pg_json_operator.sql \
-    --oracle "./harness/pg_harness.sh" \
-    --out "./benchmarks/results/01_pg_json_operator"
-
-# Benchmark 02 (MySQL)
-cabal run occam -- benchmarks/02_mysql_cte_recursive.sql \
-    --oracle "./harness/mysql_harness.sh" \
-    --out "./benchmarks/results/02_mysql_cte_recursive"
-
-# Benchmark 03 (PostgreSQL)
-cabal run occam -- benchmarks/03_pg_partial_index.sql \
-    --oracle "./harness/pg_harness.sh" \
-    --out "./benchmarks/results/03_pg_partial_index"
-
-# Benchmark 04 (MySQL)
-cabal run occam -- benchmarks/04_mysql_duplicate_key.sql \
-    --oracle "./harness/mysql_harness.sh" \
-    --out "./benchmarks/results/04_mysql_duplicate_key"
-
-# Benchmark 05 (Stress)
-cabal run occam -- benchmarks/05_multi_table_stress.sql \
-    --oracle "./harness/pg_harness.sh" \
-    --out "./benchmarks/results/05_multi_table_stress"
+```text
+benchmarks/
+├── fuzz_corpus/                 # 18 automated multi-statement SQL fuzz crash scenarios
+│   ├── metadata.json            # Machine-readable catalog of scales (50~200 stmts) and defect signatures
+│   ├── fuzz_oracle.sh           # Portable crash verification oracle
+│   ├── run_fuzz_benchmarks.py   # Benchmark execution engine (emits JSONL)
+│   ├── fuzz_pg_*.sql            # PostgreSQL fuzz testcases (50, 100, 150, 200 statements)
+│   └── fuzz_mysql_*.sql         # MySQL fuzz testcases (50, 100, 150, 200 statements)
+├── tools/
+│   └── fuzz_generator.py        # Chaos SQL fuzzer & defect injection generator
+├── run_all.sh                   # Convenience batch execution script
+└── report.sh                    # Unix-native presentation tool (jq, awk, column -t)
 ```
 
-### Running the Automated Benchmark Suite
+---
 
-To execute the entire corpus sequentially:
+## 2. Benchmark Dataset & Scenarios
+
+The test suite consists of 18 high-entropy, multi-statement SQL fuzz crash scenarios generated by `benchmarks/tools/fuzz_generator.py` across **PostgreSQL** and **MySQL**, scaling from 50 to 200 statements with deeply nested expressions (depth 10~20), schema churn, and transactional barriers.
+
+| Scale | PostgreSQL Scenarios | MySQL Scenarios | Characteristics |
+| :---: | :---: | :---: | :--- |
+| **50 stmts** | `fuzz_pg_50_01`<br>`fuzz_pg_50_02` | `fuzz_mysql_50_01`<br>`fuzz_mysql_50_02` | Setup tables, GIN / CTE / JSON path expressions, transaction blocks. |
+| **100 stmts** | `fuzz_pg_100_01`<br>`fuzz_pg_100_02`<br>`fuzz_pg_100_03` | `fuzz_mysql_100_01`<br>`fuzz_mysql_100_02`<br>`fuzz_mysql_100_03` | Recursive CTEs, window aggregates (`LEAD`, `LAG`), upsert key deadlocks. |
+| **150 stmts** | `fuzz_pg_150_01`<br>`fuzz_pg_150_02` | `fuzz_mysql_150_01`<br>`fuzz_mysql_150_02` | High AST depth, domain types, spatial MBR / range operations, `WITH ROLLUP`. |
+| **200 stmts** | `fuzz_pg_200_01`<br>`fuzz_pg_200_02` | `fuzz_mysql_200_01`<br>`fuzz_mysql_200_02` | Deep dependency graphs, tsvectors, nested lateral joins, cross-table constraints. |
+
+---
+
+## 3. Running Benchmarks
+
+### Full Automated Batch Run
+
+To execute the entire 18-scenario benchmark suite across Occam, B1, and B2:
 
 ```bash
-chmod +x benchmarks/run_all.sh
 ./benchmarks/run_all.sh
 ```
 
-Reduced SQL outputs, reproduction shell scripts, and execution metrics (`stats.json`) will be emitted to `benchmarks/results/<scenario_name>/`.
+This runs `benchmarks/fuzz_corpus/run_fuzz_benchmarks.py`, writes the raw benchmark metrics into `benchmarks/fuzz_benchmark_results.jsonl`, and displays the aggregate summary via `./benchmarks/report.sh --summary`.
+
+### Running an Individual Scenario
+
+To minimize a single fuzz scenario with Occam:
+
+```bash
+# PostgreSQL 50-statement scenario
+cabal run occam -- benchmarks/fuzz_corpus/fuzz_pg_50_01.sql \
+    --oracle "./benchmarks/fuzz_corpus/fuzz_oracle.sh fuzz_pg_50_01" \
+    --out /tmp/reduce_pg_50_01
+
+# MySQL 100-statement scenario
+cabal run occam -- benchmarks/fuzz_corpus/fuzz_mysql_100_01.sql \
+    --oracle "./benchmarks/fuzz_corpus/fuzz_oracle.sh fuzz_mysql_100_01" \
+    --out /tmp/reduce_mysql_100_01
+```
+
+---
+
+## 4. Unix-Native Report Tool (`benchmarks/report.sh`)
+
+Benchmark runs stream structured records to `benchmarks/fuzz_benchmark_results.jsonl` (one JSON object per run). The Unix-native presentation tool `benchmarks/report.sh` formats the results using standard tools (`jq`, `awk`, `column -t`).
+
+### Usage Options
+
+```bash
+# 1. Aligned ASCII column table (default)
+./benchmarks/report.sh
+# or
+./benchmarks/report.sh --table
+
+# 2. Aggregated performance comparison per algorithm
+./benchmarks/report.sh --summary
+
+# 3. GitHub-flavored Markdown output on demand
+./benchmarks/report.sh --md
+
+# 4. Pipeline / Stream processing
+cat benchmarks/fuzz_benchmark_results.jsonl | ./benchmarks/report.sh --summary
+```
+
+### Aggregate Performance Output Example
+
+```text
+ALGORITHM         CASES  INIT_STMTS  RED_STMTS  STMT_RED%  TOTAL_CALLS  WALL_TIME(s)  AVG_CALLS/CASE
+Occam             18     2200        613        72.1%      5309         177.97s       294.9
+B1 (Sequential)   18     2200        47         97.9%      2259         251.2s        125.5
+B2 (Naive ddmin)  18     2200        36         98.4%      474          12.03s        26.3
+```
+
+---
+
+## 5. Chaos SQL Generator (`benchmarks/tools/fuzz_generator.py`)
+
+Generate new multi-statement chaos sequences with deep expressions and defect injection:
+
+```bash
+# Generate 100-statement PostgreSQL chaos sequence with defect injection
+python3 benchmarks/tools/fuzz_generator.py --dialect postgres --stmts 100 --depth 12 --inject pg_01 --out /tmp/chaos.sql
+
+# Run generator self-test (scaling & Occam reduction verification)
+python3 benchmarks/tools/fuzz_generator.py --self-test
+```
