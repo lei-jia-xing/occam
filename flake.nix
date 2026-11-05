@@ -2,7 +2,7 @@
   description = "Occam: Cross-Platform Dependency-Aware SQL Crash Minimizer";
 
   inputs = {
-    nixpkgs.url = "nixpkgs";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
   outputs = { self, nixpkgs }:
@@ -13,39 +13,44 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = f:
-        nixpkgs.lib.genAttrs supportedSystems (system:
-          f (import nixpkgs {
-            inherit system;
-          }));
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     in
     {
-      devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          name = "occam-dev";
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            name = "occam-dev";
 
-          packages = with pkgs; [
-            # Haskell toolchain
-            haskell.compiler.ghc910
-            cabal-install
-            haskell-language-server
-            fourmolu
-            hlint
+            # Build and development tools
+            nativeBuildInputs = with pkgs; [
+              ghc
+              cabal-install
+              haskell-language-server
+              fourmolu
+              hlint
+              pkg-config
+              gdb
+            ];
 
-            # C toolchain & Tree-sitter
-            pkg-config
-            tree-sitter
-            gcc
-            gdb
-          ];
+            # Shared C libraries
+            buildInputs = with pkgs; [
+              tree-sitter
+            ];
 
-          shellHook = ''
-            if [ -d .githooks ]; then
-              git config core.hooksPath .githooks
-            fi
-            echo "Occam dev environment ready (GHC $(ghc --numeric-version), Cabal $(cabal --numeric-version))"
-          '';
-        };
-      });
+            # Ensure dynamic loader finds C FFI shared libraries at runtime
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.tree-sitter ];
+
+            shellHook = ''
+              if [ -d .githooks ]; then
+                git config core.hooksPath .githooks
+              fi
+              echo "Occam dev environment ready (GHC $(ghc --numeric-version), Cabal $(cabal --numeric-version))"
+            '';
+          };
+        }
+      );
     };
 }
