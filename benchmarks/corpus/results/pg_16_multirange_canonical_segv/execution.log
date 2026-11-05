@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   10
   Cache Misses: 15
   Hit Ratio:    40.0%
-  Elapsed Time: 1.492s
+  Elapsed Time: 1.796s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_16_multirange_canonical_segv/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_16_multirange_canonical_segv/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_16_multirange_canonical_segv/stats.json

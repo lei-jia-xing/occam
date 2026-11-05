@@ -17,7 +17,17 @@ CREATE TABLE alpha_tbl (
     val_a INT
 );
 
+CREATE TABLE beta_tbl (
+    b_id INT PRIMARY KEY,
+    a_ref INT REFERENCES alpha_tbl(a_id),
+    val_b INT
+);
 
+CREATE TABLE gamma_tbl (
+    c_id INT PRIMARY KEY,
+    b_ref INT REFERENCES beta_tbl(b_id),
+    val_c INT
+);
 
 
 -- Crashing Query: Deep nested correlated lateral subqueries with outer joins

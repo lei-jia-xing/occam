@@ -2,20 +2,20 @@
   "total_cases": 32,
   "passed": 32,
   "failed": 0,
-  "overall_byte_reduction_pct": 37.0,
-  "overall_stmt_reduction_pct": 60.7,
+  "overall_byte_reduction_pct": 35.8,
+  "overall_stmt_reduction_pct": 58.5,
   "results": [
     {
       "id": "mysql_01_cte_union_memory_leak",
       "dbms": "mysql",
       "status": "PASSED",
       "initial_bytes": 2282,
-      "reduced_bytes": 1202,
-      "byte_reduction_pct": 47.3,
+      "reduced_bytes": 1663,
+      "byte_reduction_pct": 27.1,
       "initial_stmts": 9,
-      "reduced_stmts": 2,
-      "stmt_reduction_pct": 77.8,
-      "time_sec": 2.206
+      "reduced_stmts": 5,
+      "stmt_reduction_pct": 44.4,
+      "time_sec": 1.789
     },
     {
       "id": "mysql_02_derived_table_merge_crash",
@@ -27,7 +27,7 @@
       "initial_stmts": 9,
       "reduced_stmts": 5,
       "stmt_reduction_pct": 44.4,
-      "time_sec": 2.97
+      "time_sec": 3.672
     },
     {
       "id": "mysql_03_json_extract_wildcard_segv",
@@ -39,7 +39,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.45
+      "time_sec": 1.851
     },
     {
       "id": "mysql_04_window_lead_lag_assert",
@@ -51,7 +51,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.748
+      "time_sec": 1.977
     },
     {
       "id": "mysql_05_multi_row_upsert_deadlock",
@@ -63,7 +63,7 @@
       "initial_stmts": 8,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 62.5,
-      "time_sec": 1.308
+      "time_sec": 0.799
     },
     {
       "id": "mysql_06_spatial_index_rtree_crash",
@@ -75,7 +75,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.173
+      "time_sec": 1.491
     },
     {
       "id": "mysql_07_innodb_fts_phrase_segv",
@@ -87,19 +87,19 @@
       "initial_stmts": 7,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 71.4,
-      "time_sec": 1.299
+      "time_sec": 1.598
     },
     {
       "id": "mysql_08_subquery_materialization_abort",
       "dbms": "mysql",
       "status": "PASSED",
       "initial_bytes": 2054,
-      "reduced_bytes": 805,
-      "byte_reduction_pct": 60.8,
+      "reduced_bytes": 951,
+      "byte_reduction_pct": 53.7,
       "initial_stmts": 9,
-      "reduced_stmts": 2,
-      "stmt_reduction_pct": 77.8,
-      "time_sec": 2.916
+      "reduced_stmts": 3,
+      "stmt_reduction_pct": 66.7,
+      "time_sec": 3.968
     },
     {
       "id": "mysql_09_check_constraint_bit_field",
@@ -111,7 +111,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 71.4,
-      "time_sec": 1.206
+      "time_sec": 1.598
     },
     {
       "id": "mysql_10_group_concat_overflow",
@@ -123,7 +123,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.549
+      "time_sec": 1.97
     },
     {
       "id": "mysql_11_role_graph_recursion_crash",
@@ -135,7 +135,7 @@
       "initial_stmts": 11,
       "reduced_stmts": 7,
       "stmt_reduction_pct": 36.4,
-      "time_sec": 2.608
+      "time_sec": 3.144
     },
     {
       "id": "mysql_12_hash_join_spill_segv",
@@ -147,7 +147,7 @@
       "initial_stmts": 9,
       "reduced_stmts": 5,
       "stmt_reduction_pct": 44.4,
-      "time_sec": 2.791
+      "time_sec": 3.19
     },
     {
       "id": "mysql_13_partition_exchange_corrupt",
@@ -159,19 +159,19 @@
       "initial_stmts": 13,
       "reduced_stmts": 6,
       "stmt_reduction_pct": 53.8,
-      "time_sec": 2.332
+      "time_sec": 2.682
     },
     {
       "id": "mysql_14_prepared_stmt_reparse_abort",
       "dbms": "mysql",
       "status": "PASSED",
       "initial_bytes": 1835,
-      "reduced_bytes": 1024,
-      "byte_reduction_pct": 44.2,
+      "reduced_bytes": 930,
+      "byte_reduction_pct": 49.3,
       "initial_stmts": 12,
-      "reduced_stmts": 5,
-      "stmt_reduction_pct": 58.3,
-      "time_sec": 3.351
+      "reduced_stmts": 4,
+      "stmt_reduction_pct": 66.7,
+      "time_sec": 3.05
     },
     {
       "id": "mysql_15_virtual_index_purge_crash",
@@ -183,7 +183,7 @@
       "initial_stmts": 11,
       "reduced_stmts": 6,
       "stmt_reduction_pct": 45.5,
-      "time_sec": 3.832
+      "time_sec": 4.575
     },
     {
       "id": "mysql_16_window_frame_range_crash",
@@ -195,7 +195,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 71.4,
-      "time_sec": 1.686
+      "time_sec": 2.118
     },
     {
       "id": "pg_01_jsonb_subpath_crash",
@@ -207,7 +207,7 @@
       "initial_stmts": 9,
       "reduced_stmts": 4,
       "stmt_reduction_pct": 55.6,
-      "time_sec": 2.057
+      "time_sec": 2.469
     },
     {
       "id": "pg_02_gin_fastupdate_crash",
@@ -219,7 +219,7 @@
       "initial_stmts": 10,
       "reduced_stmts": 6,
       "stmt_reduction_pct": 40.0,
-      "time_sec": 4.129
+      "time_sec": 5.136
     },
     {
       "id": "pg_03_window_frame_segv",
@@ -231,7 +231,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.224
+      "time_sec": 1.622
     },
     {
       "id": "pg_04_partition_prune_assert",
@@ -243,7 +243,7 @@
       "initial_stmts": 6,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 66.7,
-      "time_sec": 1.265
+      "time_sec": 1.156
     },
     {
       "id": "pg_05_enum_range_overflow",
@@ -255,19 +255,19 @@
       "initial_stmts": 9,
       "reduced_stmts": 5,
       "stmt_reduction_pct": 44.4,
-      "time_sec": 2.028
+      "time_sec": 2.211
     },
     {
       "id": "pg_06_cte_cycle_detection",
       "dbms": "postgresql",
       "status": "PASSED",
       "initial_bytes": 2086,
-      "reduced_bytes": 1206,
-      "byte_reduction_pct": 42.2,
+      "reduced_bytes": 1280,
+      "byte_reduction_pct": 38.6,
       "initial_stmts": 9,
-      "reduced_stmts": 2,
-      "stmt_reduction_pct": 77.8,
-      "time_sec": 2.616
+      "reduced_stmts": 3,
+      "stmt_reduction_pct": 66.7,
+      "time_sec": 3.412
     },
     {
       "id": "pg_07_brin_inclusion_abort",
@@ -279,7 +279,7 @@
       "initial_stmts": 10,
       "reduced_stmts": 4,
       "stmt_reduction_pct": 60.0,
-      "time_sec": 2.777
+      "time_sec": 3.444
     },
     {
       "id": "pg_08_xml_parse_memory_leak",
@@ -291,7 +291,7 @@
       "initial_stmts": 8,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 75.0,
-      "time_sec": 1.437
+      "time_sec": 1.976
     },
     {
       "id": "pg_09_foreign_table_join_crash",
@@ -303,7 +303,7 @@
       "initial_stmts": 6,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 66.7,
-      "time_sec": 0.405
+      "time_sec": 1.181
     },
     {
       "id": "pg_10_tsvector_strip_segv",
@@ -315,7 +315,7 @@
       "initial_stmts": 8,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 62.5,
-      "time_sec": 1.422
+      "time_sec": 2.199
     },
     {
       "id": "pg_11_composite_domain_check",
@@ -327,19 +327,19 @@
       "initial_stmts": 10,
       "reduced_stmts": 5,
       "stmt_reduction_pct": 50.0,
-      "time_sec": 2.013
+      "time_sec": 2.557
     },
     {
       "id": "pg_12_lateral_join_corrupt",
       "dbms": "postgresql",
       "status": "PASSED",
       "initial_bytes": 1862,
-      "reduced_bytes": 871,
-      "byte_reduction_pct": 53.2,
+      "reduced_bytes": 1089,
+      "byte_reduction_pct": 41.5,
       "initial_stmts": 11,
-      "reduced_stmts": 2,
-      "stmt_reduction_pct": 81.8,
-      "time_sec": 4.085
+      "reduced_stmts": 4,
+      "stmt_reduction_pct": 63.6,
+      "time_sec": 6.876
     },
     {
       "id": "pg_13_generated_col_dependency",
@@ -351,7 +351,7 @@
       "initial_stmts": 9,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 77.8,
-      "time_sec": 2.119
+      "time_sec": 2.641
     },
     {
       "id": "pg_14_temp_table_cleanup_abort",
@@ -363,7 +363,7 @@
       "initial_stmts": 8,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 75.0,
-      "time_sec": 0.967
+      "time_sec": 1.215
     },
     {
       "id": "pg_15_spgist_box_index_crash",
@@ -375,7 +375,7 @@
       "initial_stmts": 8,
       "reduced_stmts": 2,
       "stmt_reduction_pct": 75.0,
-      "time_sec": 1.897
+      "time_sec": 2.299
     },
     {
       "id": "pg_16_multirange_canonical_segv",
@@ -387,7 +387,7 @@
       "initial_stmts": 7,
       "reduced_stmts": 3,
       "stmt_reduction_pct": 57.1,
-      "time_sec": 1.615
+      "time_sec": 1.941
     }
   ]
 }

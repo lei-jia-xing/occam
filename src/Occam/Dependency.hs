@@ -11,6 +11,7 @@ module Occam.Dependency (
     analyzeStatements,
 ) where
 
+import Control.Monad (filterM)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -100,7 +101,8 @@ extractActions stmtNode src = do
         then pure [ObjectAction BarrierObject BarrierDep "__syntax_error_barrier__"]
         else do
             children <- nodeNamedChildren stmtNode
-            actions <- concat <$> mapM (inspectChild src) children
+            cteNames <- findCTEAliases stmtNode src
+            actions <- concat <$> mapM (inspectChild cteNames src) children
             let txAction = [ObjectAction BarrierObject BarrierDep "__tx_barrier__" | sRootType == "transaction"]
             let allActions = txAction ++ actions
             if null allActions
@@ -110,82 +112,82 @@ extractActions stmtNode src = do
     where
         dedup = Set.toList . Set.fromList
 
-inspectChild :: ByteString -> TSNode -> IO [ObjectAction]
-inspectChild src node = do
+inspectChild :: Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
+inspectChild cteNames src node = do
     t <- nodeType node
     case t of
         -- DDL: CREATE TABLE
         "create_table" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject DefDep tbl | tbl <- tables]
         -- DDL: CREATE INDEX
         "create_index" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject UseDep tbl | tbl <- tables]
         -- DDL: DROP TABLE / ALTER TABLE
         "drop_table" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
         "alter_table" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
-        -- DML: INSERT
-        "insert" -> do
-            tables <- findTableReferences node src
-            pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
-        "replace" -> do
-            tables <- findTableReferences node src
-            pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
-        "update" -> do
-            tables <- findTableReferences node src
-            pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
-        -- DML: DELETE
-        "delete" -> do
-            tables <- findTableReferences node src
-            pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
+        -- DML: target mutations and source reads, including nested queries.
+        "insert" -> dmlActions <$> findTableReferences cteNames node src
+        "replace" -> dmlActions <$> findTableReferences cteNames node src
+        "update" -> dmlActions <$> findTableReferences cteNames node src
+        "delete" -> dmlActions <$> findTableReferences cteNames node src
         -- DML: SELECT / FROM
         "select" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject UseDep tbl | tbl <- tables]
         "from" -> do
-            tables <- findTableReferences node src
+            tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject UseDep tbl | tbl <- tables]
         -- Barriers: Transactions & Session configs
         "transaction" ->
             pure [ObjectAction BarrierObject BarrierDep "__tx_barrier__"]
         "set" ->
             pure [ObjectAction BarrierObject BarrierDep "__session_barrier__"]
-        -- General fallback for nested statements
-        "statement" -> do
-            subCh <- nodeNamedChildren node
-            concat <$> mapM (inspectChild src) subCh
+        -- Recurse through CTE clauses, set operations, subqueries, and wrappers.
         _ -> do
-            -- Check for transaction keywords in bare tokens
-            isTx <- hasDescendantType "transaction" node
-            isSet <- hasDescendantType "keyword_set" node
-            if isTx
-                then pure [ObjectAction BarrierObject BarrierDep "__tx_barrier__"]
-                else
-                    if isSet
-                        then pure [ObjectAction BarrierObject BarrierDep "__session_barrier__"]
-                        else pure []
+            subCh <- nodeNamedChildren node
+            concat <$> mapM (inspectChild cteNames src) subCh
+dmlActions :: [ObjectName] -> [ObjectAction]
+dmlActions tables =
+    [ ObjectAction TableObject actionType table
+    | actionType <- [UseDep, ModDep]
+    , table <- tables
+    ]
 
-findTableReferences :: TSNode -> ByteString -> IO [ObjectName]
-findTableReferences node src = do
-    -- In tree-sitter-sql, table names appear in object_reference nodes.
-    -- We also support relation, field (e.g. schema.table), or identifier as fallbacks.
-    -- Invocations (e.g. NOW(), VALUES() in ON DUPLICATE KEY UPDATE) are pruned.
-    objRefs <- collectTableRefs (== "object_reference") node
-    refs <-
-        if null objRefs
-            then collectTableRefs isFallbackRef node
-            else pure objRefs
-    names <- mapM (nodeText src) refs
-    let cleaned = filter (not . T.null) $ map normalizeName names
-    pure (Set.toList (Set.fromList cleaned))
+findCTEAliases :: TSNode -> ByteString -> IO (Set ObjectName)
+findCTEAliases node src = do
+    ctes <- collectDescendants (== "cte") node
+    names <- mapM cteName ctes
+    pure (Set.fromList (filter (not . T.null) names))
     where
-        isFallbackRef nt = nt == "relation" || nt == "field" || nt == "identifier"
+        cteName cte = do
+            children <- nodeNamedChildren cte
+            case children of
+                (nameNode : _) -> normalizeName <$> nodeText src nameNode
+                [] -> pure ""
 
+findTableReferences :: Set ObjectName -> TSNode -> ByteString -> IO [ObjectName]
+findTableReferences cteNames node src = do
+    objRefs <- collectTableRefs (== "object_reference") node
+    relations <- collectTableRefs (== "relation") node
+    standaloneRelations <- filterM (fmap not . hasDescendantType "object_reference") relations
+    names <- mapM (nodeText src) (objRefs ++ standaloneRelations)
+    let cleaned =
+            Set.fromList
+                [ name
+                | name <- map normalizeName names
+                , not (T.null name)
+                , Set.notMember name cteNames
+                ]
+    pure (Set.toList cleaned)
+    where
+        -- Invocations (e.g. NOW(), VALUES() in ON DUPLICATE KEY UPDATE) are
+        -- not table references.
         collectTableRefs predNode n = do
             t <- nodeType n
             if t == "invocation"

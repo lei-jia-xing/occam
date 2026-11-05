@@ -19,8 +19,21 @@ CREATE TABLE sales_pipeline (
     stage VARCHAR(32) NOT NULL
 );
 
+CREATE TABLE crm_leads (
+    lead_id INT PRIMARY KEY,
+    rep_id INT NOT NULL,
+    estimated_arr DECIMAL(12,2) NOT NULL
+);
 
+INSERT INTO sales_pipeline (opportunity_id, rep_id, deal_value, stage) VALUES
+    (1, 10, 50000.00, 'closed_won'),
+    (2, 10, 15000.00, 'in_progress'),
+    (3, 20, 80000.00, 'closed_won'),
+    (4, 20, 12000.00, 'discovery');
 
+INSERT INTO crm_leads (lead_id, rep_id, estimated_arr) VALUES
+    (101, 10, 25000.00),
+    (102, 20, 45000.00);
 
 -- Crashing Query: Materialized CTE union with window ranking joined back to base tables
 WITH cte_pipeline AS (

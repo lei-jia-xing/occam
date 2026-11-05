@@ -154,6 +154,45 @@ phase2Tests =
                 case res of
                     Nothing -> assertFailure "Failed to parse script for dependency test"
                     Just () -> pure ()
+        , testCase "Reads base tables through CTEs, subqueries, and UNION branches" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE base_a (id INT);"
+                        , "CREATE TABLE base_b (id INT);"
+                        , "CREATE TABLE base_c (id INT);"
+                        , "WITH cte_union AS ("
+                        , "  SELECT id FROM base_a"
+                        , "  UNION ALL"
+                        , "  SELECT id FROM base_b"
+                        , ")"
+                        , "SELECT id FROM cte_union"
+                        , "WHERE EXISTS (SELECT 1 FROM base_c WHERE base_c.id = cte_union.id);"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let queryId = StatementId 4
+                        queryActions = Map.findWithDefault [] queryId (graphActions graph)
+                        uses =
+                            Set.fromList
+                                [ actionName action
+                                | action <- queryActions
+                                , actionType action == UseDep
+                                ]
+                        deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
+                    assertEqual
+                        "Only external base tables are query reads"
+                        (Set.fromList ["base_a", "base_b", "base_c"])
+                        uses
+                    assertEqual
+                        "Query depends on each referenced base table definition"
+                        (Set.fromList (map StatementId [1, 2, 3]))
+                        deps
+                case res of
+                    Nothing -> assertFailure "Failed to parse CTE dependency test"
+                    Just () -> pure ()
         , testCase "Backward slicing from crashing statement" $ do
             let script =
                     BSC.unlines

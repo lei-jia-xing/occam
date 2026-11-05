@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   14
   Cache Misses: 29
   Hit Ratio:    32.6%
-  Elapsed Time: 2.848s
+  Elapsed Time: 3.524s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/stats.json

@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   5
   Cache Misses: 9
   Hit Ratio:    35.7%
-  Elapsed Time: 0.867s
+  Elapsed Time: 1.071s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_14_temp_table_cleanup_abort/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_14_temp_table_cleanup_abort/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_14_temp_table_cleanup_abort/stats.json

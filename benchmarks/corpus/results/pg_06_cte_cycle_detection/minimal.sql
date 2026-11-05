@@ -12,6 +12,10 @@
 
 
 -- Target Reproduction Scenario: Cyclic graph traversal with CYCLE clause
+CREATE TABLE graph_nodes (
+    node_id INT PRIMARY KEY,
+    label TEXT
+);
 
 CREATE TABLE graph_edges (
     source_id INT REFERENCES graph_nodes(node_id),

@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   9 -> 2
-  Bytes:        2086 B -> 1206 B (-42.2%)
-  Oracle Calls: 25
-  Cache Hits:   17
-  Cache Misses: 25
-  Hit Ratio:    40.5%
-  Elapsed Time: 2.480s
+  Statements:   9 -> 3
+  Bytes:        2086 B -> 1280 B (-38.6%)
+  Oracle Calls: 38
+  Cache Hits:   33
+  Cache Misses: 38
+  Hit Ratio:    46.5%
+  Elapsed Time: 3.352s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_06_cte_cycle_detection/stats.json

@@ -19,10 +19,6 @@ CREATE TABLE metric_entries (
     humidity DOUBLE NOT NULL
 );
 
-CREATE VIEW v_active_metrics AS
-SELECT entry_id, sensor_id, temperature
-FROM metric_entries
-;
 
 
 -- Prepare statement referencing view

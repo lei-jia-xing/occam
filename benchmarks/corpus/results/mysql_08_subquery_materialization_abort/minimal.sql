@@ -19,6 +19,11 @@ CREATE TABLE invoices (
     invoice_amount DECIMAL(10,2) NOT NULL
 );
 
+CREATE TABLE invoice_discounts (
+    discount_id INT PRIMARY KEY,
+    region_id INT NOT NULL,
+    min_qualifying_amount DECIMAL(10,2) NOT NULL
+);
 
 
 

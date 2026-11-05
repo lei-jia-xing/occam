@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   4
   Cache Misses: 12
   Hit Ratio:    25.0%
-  Elapsed Time: 1.099s
+  Elapsed Time: 1.455s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_09_check_constraint_bit_field/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_09_check_constraint_bit_field/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_09_check_constraint_bit_field/stats.json

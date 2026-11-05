@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   10
   Cache Misses: 15
   Hit Ratio:    40.0%
-  Elapsed Time: 1.418s
+  Elapsed Time: 1.824s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_10_group_concat_overflow/stats.json

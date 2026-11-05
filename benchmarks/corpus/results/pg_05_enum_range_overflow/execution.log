@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   20
   Cache Misses: 20
   Hit Ratio:    50.0%
-  Elapsed Time: 1.914s
+  Elapsed Time: 2.063s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_05_enum_range_overflow/stats.json

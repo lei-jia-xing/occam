@@ -31,3 +31,5 @@ cabal.project.local~
 *.dll
 crashes/
 tmp/
+__pycache__/
+*.pyc

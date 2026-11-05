@@ -18,7 +18,7 @@ Occam Reduction Summary
   Cache Hits:   13
   Cache Misses: 11
   Hit Ratio:    54.2%
-  Elapsed Time: 1.126s
+  Elapsed Time: 0.984s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_04_partition_prune_assert/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_04_partition_prune_assert/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_04_partition_prune_assert/stats.json

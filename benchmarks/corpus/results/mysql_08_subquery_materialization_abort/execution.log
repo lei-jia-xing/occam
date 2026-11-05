@@ -12,13 +12,13 @@ Reduction Complete!
 ======================================================================
 Occam Reduction Summary
 ======================================================================
-  Statements:   9 -> 2
-  Bytes:        2054 B -> 805 B (-60.8%)
-  Oracle Calls: 30
-  Cache Hits:   38
-  Cache Misses: 30
-  Hit Ratio:    55.9%
-  Elapsed Time: 2.792s
+  Statements:   9 -> 3
+  Bytes:        2054 B -> 951 B (-53.7%)
+  Oracle Calls: 38
+  Cache Hits:   39
+  Cache Misses: 38
+  Hit Ratio:    50.6%
+  Elapsed Time: 3.827s
   Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_08_subquery_materialization_abort/minimal.sql
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_08_subquery_materialization_abort/replay.sh
                 /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_08_subquery_materialization_abort/stats.json

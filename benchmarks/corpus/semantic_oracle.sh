@@ -49,8 +49,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INDEX_JSON="$SCRIPT_DIR/index.json"
+printf '%s\n' "$input_sql" | python3 -c '
 
-exec python3 -c '
 import sys, os, re, json
 
 case_id = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -67,29 +67,29 @@ case_map = {
     "pg_03": ("financial_ledger", "EXCLUDE CURRENT ROW", "backend/executor/nodeWindowAgg.c"),
     "pg_04": ("timeseries_metrics", "AVG(metric_val)", "backend/partitioning/partprune.c"),
     "pg_05": ("dev_tasks", "enum_range", "backend/utils/adt/enum.c"),
-    "pg_06": ("graph_edges", "WITH RECURSIVE", "backend/executor/nodeRecursiveunion.c"),
+    "pg_06": (["graph_edges", "graph_nodes"], "WITH RECURSIVE", "backend/executor/nodeRecursiveunion.c"),
     "pg_07": ("sensor_ranges", "&&", "backend/access/brin/brin_inclusion.c"),
     "pg_08": ("xml_payloads", "xpath", "backend/utils/adt/xml.c"),
-    "pg_09": ("regional_sales", "GROUPING SETS", "backend/optimizer/path/joinpath.c"),
+    "pg_09": (["regional_sales", "currency_rates"], "GROUPING SETS", "backend/optimizer/path/joinpath.c"),
     "pg_10": ("corpus_articles", "tsvector_strip", "backend/utils/adt/tsvector_op.c"),
     "pg_11": ("location_registry", "address.zip", "backend/executor/execExpr.c"),
-    "pg_12": ("alpha_tbl", "LEFT JOIN LATERAL", "backend/optimizer/plan/subselect.c"),
+    "pg_12": (["alpha_tbl", "beta_tbl", "gamma_tbl"], "LEFT JOIN LATERAL", "backend/optimizer/plan/subselect.c"),
     "pg_13": ("sensor_streams", "first_two[1]", "backend/rewrite/rewriteHandler.c"),
     "pg_14": ("temp_batch_work", "ROLLBACK TO SAVEPOINT", "backend/commands/tablecmds.c"),
     "pg_15": ("spatial_bounding_boxes", "box '\''((-1,-1),(1,1))'\''", "backend/access/spgist/spgquadbox.c"),
     "pg_16": ("staff_schedules", "range_merge", "backend/utils/adt/multirangetypes.c"),
-    "mysql_01": ("sales_pipeline", "WITH cte_pipeline", "sql/sql_lex.cc / sql/sql_cte.cc"),
-    "mysql_02": ("orders", "avg_spent", "sql/sql_resolver.cc"),
+    "mysql_01": (["sales_pipeline", "crm_leads"], "WITH cte_pipeline", "sql/sql_lex.cc / sql/sql_cte.cc"),
+    "mysql_02": (["orders", "customers"], "avg_spent", "sql/sql_resolver.cc"),
     "mysql_03": ("doc_registry", "JSON_EXTRACT", "sql/item_json_func.cc"),
     "mysql_04": ("stock_ticks", "LEAD(price_cents", "sql/item_window_func.cc"),
     "mysql_05": ("warehouse_inventory", "ON DUPLICATE KEY UPDATE", "storage/innobase/row/row0ins.cc"),
     "mysql_06": ("geofence_zones", "MBRIntersects", "storage/innobase/gis/gis0rtree.cc"),
     "mysql_07": ("knowledge_base", "MATCH(title, content_body)", "storage/innobase/fts/fts0fts.cc"),
-    "mysql_08": ("invoices", "WITH ROLLUP", "sql/sql_optimizer.cc"),
+    "mysql_08": (["invoices", "invoice_discounts"], "WITH ROLLUP", "sql/sql_optimizer.cc"),
     "mysql_09": ("network_packet_rules", "b'\''0000000000000001'\''", "sql/item_func.cc"),
     "mysql_10": ("asset_meta", "GROUP_CONCAT", "sql/item_sum.cc"),
     "mysql_11": ("secure_audit_vault", "CURRENT_ROLE()", "sql/auth/sql_authorization.cc"),
-    "mysql_12": ("customers_large", "JOIN orders_large", "sql/hash_join_buffer.cc"),
+    "mysql_12": (["customers_large", "orders_large"], "JOIN orders_large", "sql/hash_join_buffer.cc"),
     "mysql_13": ("sales_partitioned", "9999", "sql/ha_partition.cc"),
     "mysql_14": ("metric_entries", "EXECUTE stmt_check", "sql/sql_prepare.cc"),
     "mysql_15": ("product_catalog", "LIKE '\''ELEC:%'\''", "storage/innobase/row/row0purge.cc"),
@@ -121,20 +121,22 @@ if not resolved and index_path and os.path.exists(index_path):
 if not resolved:
     sys.exit(1)
 
-target_table, trigger_pattern, defect_module = resolved
+required_tables, trigger_pattern, defect_module = resolved
+if isinstance(required_tables, str):
+    required_tables = [required_tables]
 
 clean_lines = [l for l in input_sql.splitlines() if not l.strip().startswith("--")]
 clean_sql = "\n".join(clean_lines)
 
-# Verify target table creation DDL is present
-table_pat = rf"CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{re.escape(target_table)}\b"
-if not re.search(table_pat, clean_sql, re.IGNORECASE):
-    sys.exit(1)
+# Verify every required base table creation DDL is present.
+for table in required_tables:
+    table_pat = rf"CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{re.escape(table)}\b"
+    if not re.search(table_pat, clean_sql, re.IGNORECASE):
+        sys.exit(1)
 
 # Verify trigger operation/query pattern is present
 if trigger_pattern.lower() not in clean_sql.lower():
     sys.exit(1)
-
 # Emit typed CrashReport JSON matching Occam contract
 report = {
     "kind": "signal",
@@ -143,4 +145,4 @@ report = {
 }
 print(json.dumps(report))
 sys.exit(0)
-' "$case_id" "$INDEX_JSON" <<< "$input_sql"
+' "$case_id" "$INDEX_JSON"
