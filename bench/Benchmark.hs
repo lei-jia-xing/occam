@@ -1,12 +1,9 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
 
 module Benchmark (
     BenchmarkMetric (..),
     runComparisonBenchmark,
-    formatMarkdownTable,
-    formatCSV,
 ) where
 
 import Baseline (runNaiveDdmin, runSequentialDrop)
@@ -15,10 +12,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
-import Numeric (showFFloat)
 import Occam.Reducer (Oracle, reduceSQL)
 import Occam.TreeSitter (countStatements)
 
@@ -82,59 +77,3 @@ runComparisonBenchmark oracle sql = do
                     , metricOracleCalls = calls
                     , metricTimeSeconds = timeSecs
                     }
-
--- | Render a Markdown comparison table.
-formatMarkdownTable :: [BenchmarkMetric] -> Text
-formatMarkdownTable metrics =
-    T.unlines
-        ( [ "| Algorithm | Initial Bytes | Reduced Bytes | Byte Red. % | Initial Stmts | Reduced Stmts | Stmt Red. % | Oracle Invocations | Time (s) |"
-          , "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-          ]
-            ++ map formatRow metrics
-        )
-    where
-        formatRow BenchmarkMetric {..} =
-            "| "
-                <> T.intercalate
-                    " | "
-                    [ metricAlgorithm
-                    , showT metricInitialBytes
-                    , showT metricReducedBytes
-                    , fmtPct metricByteReduction
-                    , showT metricInitialStmts
-                    , showT metricReducedStmts
-                    , fmtPct metricStmtReduction
-                    , showT metricOracleCalls
-                    , fmtSecs metricTimeSeconds
-                    ]
-                <> " |"
-
-        showT = T.pack . show
-        fmtPct v = T.pack (showFFloat (Just 1) v "%")
-        fmtSecs v = T.pack (showFFloat (Just 3) v "")
-
--- | Emit standard CSV for plotting and data analysis.
-formatCSV :: [BenchmarkMetric] -> Text
-formatCSV metrics =
-    T.unlines
-        ( "Algorithm,Initial Bytes,Reduced Bytes,Byte Red. %,Initial Stmts,Reduced Stmts,Stmt Red. %,Oracle Invocations,Time (s)"
-            : map formatRow metrics
-        )
-    where
-        formatRow BenchmarkMetric {..} =
-            T.intercalate
-                ","
-                [ metricAlgorithm
-                , showT metricInitialBytes
-                , showT metricReducedBytes
-                , fmtPct metricByteReduction
-                , showT metricInitialStmts
-                , showT metricReducedStmts
-                , fmtPct metricStmtReduction
-                , showT metricOracleCalls
-                , fmtSecs metricTimeSeconds
-                ]
-
-        showT = T.pack . show
-        fmtPct v = T.pack (showFFloat (Just 2) v "")
-        fmtSecs v = T.pack (showFFloat (Just 4) v "")

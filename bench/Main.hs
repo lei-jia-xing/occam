@@ -2,12 +2,11 @@
 
 module Main (main) where
 
-import Benchmark (formatCSV, formatMarkdownTable, runComparisonBenchmark)
+import Benchmark (runComparisonBenchmark)
 import Control.Monad (unless)
 import Data.Aeson (encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
-import Data.Text.IO qualified as TIO
 import Occam qualified
 import Occam.Oracle (OracleConfig (..), runExternalOracle)
 import Options.Applicative (
@@ -147,22 +146,17 @@ runEval Options {..} = do
     putStrLn "Running comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)..."
     metrics <- runComparisonBenchmark (runExternalOracle baseOracleCfg) initialSQL
     createDirectoryIfMissing True optOutDir
-    let mdTable = formatMarkdownTable metrics
-        csvData = formatCSV metrics
-        jsonData = encode metrics
-    TIO.writeFile (optOutDir </> "benchmark.md") mdTable
-    TIO.writeFile (optOutDir </> "benchmark.csv") csvData
+    let jsonData = encode metrics
     BSL.writeFile (optOutDir </> "benchmark.json") jsonData
 
-    -- 3. Print results table
+    -- 3. Print results JSON
     putStrLn "----------------------------------------------------------------------"
     putStrLn "Benchmark Complete!"
     putStrLn "======================================================================"
-    putStrLn "Comparative Benchmark Results"
+    putStrLn "Comparative Benchmark Results (JSON)"
     putStrLn "======================================================================"
-    TIO.putStr mdTable
+    BSL.putStr jsonData
+    putStrLn ""
     putStrLn "======================================================================"
-    putStrLn $ "  Artifacts: " ++ (optOutDir </> "benchmark.md")
-    putStrLn $ "             " ++ (optOutDir </> "benchmark.csv")
-    putStrLn $ "             " ++ (optOutDir </> "benchmark.json")
+    putStrLn $ "  Artifact: " ++ (optOutDir </> "benchmark.json")
     putStrLn "======================================================================"

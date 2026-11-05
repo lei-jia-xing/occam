@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import subprocess
@@ -704,8 +705,23 @@ def run_self_test() -> bool:
     print("======================================================================")
 
     root = Path(__file__).resolve().parents[2]
-    audit_script = root / "benchmarks" / "corpus" / "audit_corpus.py"
-    occam_bin = root / "dist-newstyle" / "build" / "x86_64-linux" / "ghc-9.10.3" / "occam-0.1.0.0" / "x" / "occam" / "build" / "occam" / "occam"
+    occam_bin: Path | None = None
+    try:
+        res = subprocess.run(["cabal", "list-bin", "occam"], check=False, cwd=root, capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            p = Path(res.stdout.strip())
+            if p.exists() and os.access(p, os.X_OK):
+                occam_bin = p
+    except Exception:
+        pass
+    if occam_bin is None:
+        candidates = [
+            root / "dist-newstyle" / "build" / "x86_64-linux" / "ghc-9.10.3" / "occam-0.1.0.0" / "x" / "occam" / "build" / "occam" / "occam",
+        ]
+        for c in candidates:
+            if c.exists() and os.access(c, os.X_OK):
+                occam_bin = c
+                break
 
     # Step 1: Scaling tests (50, 100, 200 statements for PG and MySQL)
     dialects = ["postgres", "mysql"]
@@ -714,8 +730,6 @@ def run_self_test() -> bool:
     with tempfile.TemporaryDirectory(prefix="occam-fuzz-selftest-") as tmpdir:
         tmp_path = Path(tmpdir)
         print("\n[Phase 1] Multi-statement scaling & Tree-sitter AST verification...")
-
-        ts_available = False
 
         all_ok = True
         for dialect in dialects:
@@ -727,22 +741,6 @@ def run_self_test() -> bool:
 
                 num_stmts = sql.count(";")
                 print(f"  Generated {dialect:8s} | requested: {n:3d} stmts | output: {len(sql):6d} bytes, {num_stmts:3d} ';' stmts")
-
-                if ts_available:
-                    tree, root_node = audit_corpus.parse(runtime, parser, sql.encode("utf-8"))
-                    refs = audit_corpus.table_references(runtime, root_node, sql.encode("utf-8"))
-                    defined = audit_corpus.defined_tables(runtime, root_node, sql.encode("utf-8"))
-                    dangling = refs - defined
-                    runtime.ts_tree_delete(tree)
-                    if dangling:
-                        print(f"    ERROR: Dangling table references detected: {dangling}")
-                        all_ok = False
-                    else:
-                        print(f"    Tree-sitter AST validation: PASS (tables defined: {len(defined)}, refs: {len(refs)})")
-
-        if ts_available:
-            runtime.ts_parser_delete(parser)
-
         # Step 2: Occam End-to-End Reduction Verification on 100-stmt injected sequence
         print("\n[Phase 2] Occam reduction verification with injected defect (pg_01)...")
         injected_gen = ChaosFuzzGenerator(
@@ -759,7 +757,7 @@ def run_self_test() -> bool:
 
         oracle_cmd = f"{root}/benchmarks/fuzz_corpus/fuzz_oracle.sh pg_01"
         cmd = [
-            str(occam_bin) if occam_bin.exists() else "occam",
+            str(occam_bin) if occam_bin and occam_bin.exists() else "occam",
             str(inj_file),
             "--oracle", oracle_cmd,
             "--out", str(out_reduce_dir),

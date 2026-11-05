@@ -5,10 +5,9 @@ module Main (main) where
 import Baseline (runNaiveDdmin, runSequentialDrop)
 import Benchmark (
     BenchmarkMetric (..),
-    formatCSV,
-    formatMarkdownTable,
     runComparisonBenchmark,
  )
+import Data.Aeson (decode, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as LBS
@@ -690,7 +689,7 @@ phase8Tests =
             assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
             assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
             assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
-        , testCase "formatMarkdownTable and formatCSV output formatting" $ do
+        , testCase "BenchmarkMetric JSON serialization and roundtrip" $ do
             let sampleMetrics =
                     [ BenchmarkMetric
                         { metricAlgorithm = "Occam"
@@ -726,25 +725,14 @@ phase8Tests =
                         , metricTimeSeconds = 0.063
                         }
                     ]
-                md = formatMarkdownTable sampleMetrics
-                csv = formatCSV sampleMetrics
+                encoded = encode sampleMetrics
+                decoded = decode encoded :: Maybe [BenchmarkMetric]
+                strictBytes = LBS.toStrict encoded
+            assertEqual "JSON roundtrip preserves metrics" (Just sampleMetrics) decoded
+            assertBool "JSON output contains Occam algorithm name" (BSC.isInfixOf "Occam" strictBytes)
             assertBool
-                "Markdown table missing expected header"
-                ( T.isInfixOf
-                    "| Algorithm | Initial Bytes | Reduced Bytes | Byte Red. % | Initial Stmts | Reduced Stmts | Stmt Red. % | Oracle Invocations | Time (s) |"
-                    md
-                )
-            assertBool "Markdown table missing Occam row" (T.isInfixOf "Occam" md)
-            assertBool "Markdown table missing B1 row" (T.isInfixOf "B1 (Sequential)" md)
-            assertBool "Markdown table missing B2 row" (T.isInfixOf "B2 (Naive ddmin)" md)
-            assertBool
-                "CSV missing expected header"
-                ( T.isInfixOf
-                    "Algorithm,Initial Bytes,Reduced Bytes,Byte Red. %,Initial Stmts,Reduced Stmts,Stmt Red. %,Oracle Invocations,Time (s)"
-                    csv
-                )
-            assertBool "CSV missing Occam row data" (T.isInfixOf "Occam,200,50,75.00,5,2,60.00,8" csv)
-            assertBool "CSV missing B1 row data" (T.isInfixOf "B1 (Sequential),200,80,60.00,5,3,40.00,14" csv)
+                "JSON output contains field metricByteReduction"
+                (BSC.isInfixOf "metricByteReduction" strictBytes)
         , testCase "runComparisonBenchmark executes all 3 algorithms and produces metrics" $ do
             let script =
                     BSC.unlines
