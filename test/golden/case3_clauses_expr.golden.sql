@@ -1,3 +1,0 @@
-CREATE TABLE t1 (a INT, b TEXT);
-INSERT INTO t1 VALUES (1, 'val');
-SELECT * FROM t1 WHERE a > 0;

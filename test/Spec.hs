@@ -783,21 +783,21 @@ goldenTests =
     testGroup
         "Golden Tests"
         [ goldenVsString
-            "case1_dead_tables: multiple tables created, retain only crash table & query"
-            "test/golden/case1_dead_tables.golden.sql"
-            (runReduction "test/golden/case1_dead_tables.sql" oracle1)
+            "fuzz_golden_01_cte_subqueries: unreferenced tables pruned through complex CTE aliases"
+            "test/golden/fuzz_golden_01_cte_subqueries.golden.sql"
+            (runReduction "test/golden/fuzz_golden_01_cte_subqueries.sql" oracle1)
         , goldenVsString
-            "case2_redundant_dml: interleaved inserts/updates into unrelated tables trimmed"
-            "test/golden/case2_redundant_dml.golden.sql"
-            (runReduction "test/golden/case2_redundant_dml.sql" oracle2)
+            "fuzz_golden_02_schema_churn_tx: transaction fences & ALTER TABLE schema churn preserved"
+            "test/golden/fuzz_golden_02_schema_churn_tx.golden.sql"
+            (runReduction "test/golden/fuzz_golden_02_schema_churn_tx.sql" oracle2)
         , goldenVsString
-            "case3_clauses_expr: optional clauses pruned and expressions simplified"
-            "test/golden/case3_clauses_expr.golden.sql"
-            (runReduction "test/golden/case3_clauses_expr.sql" oracle3)
+            "fuzz_golden_03_deep_expressions: deep expression trees simplified & optional clauses pruned"
+            "test/golden/fuzz_golden_03_deep_expressions.golden.sql"
+            (runReduction "test/golden/fuzz_golden_03_deep_expressions.sql" oracle3)
         , goldenVsString
-            "case4_transaction_barrier: multi-statement sequence with BEGIN...COMMIT fences"
-            "test/golden/case4_transaction_barrier.golden.sql"
-            (runReduction "test/golden/case4_transaction_barrier.sql" oracle4)
+            "fuzz_golden_04_multitable_diamond_dag: multi-table diamond DAG relations preserved"
+            "test/golden/fuzz_golden_04_multitable_diamond_dag.golden.sql"
+            (runReduction "test/golden/fuzz_golden_04_multitable_diamond_dag.sql" oracle4)
         ]
     where
         runReduction path oracle = do
@@ -807,28 +807,38 @@ goldenTests =
 
         oracle1 s =
             pure
-                ( BSC.isInfixOf "SELECT * FROM products" s
-                    && BSC.isInfixOf "price > 100" s
+                ( BSC.isInfixOf "WITH regional_summary AS" s
+                    && BSC.isInfixOf "vip_customers AS" s
+                    && BSC.isInfixOf "target_orders" s
+                    && BSC.isInfixOf "target_customers" s
                 )
 
         oracle2 s =
             pure
-                ( BSC.isInfixOf "SELECT * FROM target_tbl" s
-                    && BSC.isInfixOf "WHERE status = 'crash'" s
+                ( BSC.isInfixOf "CREATE TABLE tx_account_ledger" s
+                    && BSC.isInfixOf "branch_code" s
+                    && BSC.isInfixOf "SELECT account_id" s
+                    && BSC.isInfixOf "balance < 10000.00" s
                 )
 
         oracle3 s =
             pure
-                ( BSC.isInfixOf "CREATE TABLE t1" s
-                    && BSC.isInfixOf "INSERT INTO t1" s
-                    && BSC.isInfixOf "a" s
-                    && BSC.isInfixOf "> 0" s
+                ( BSC.isInfixOf "CREATE TABLE expr_calc_inputs" s
+                    && BSC.isInfixOf "complex_calc" s
+                    && BSC.isInfixOf "COALESCE" s
+                    && BSC.isInfixOf "NULLIF" s
                 )
 
         oracle4 s =
             pure
-                ( BSC.isInfixOf "SELECT * FROM t1" s
-                    && BSC.isInfixOf "val = 'tx2'" s
+                ( BSC.isInfixOf "CREATE TABLE diamond_root" s
+                    && BSC.isInfixOf "CREATE TABLE diamond_branch_left" s
+                    && BSC.isInfixOf "CREATE TABLE diamond_branch_right" s
+                    && BSC.isInfixOf "CREATE TABLE diamond_sink" s
+                    && BSC.isInfixOf "diamond_sink s" s
+                    && BSC.isInfixOf "JOIN diamond_branch_left" s
+                    && BSC.isInfixOf "JOIN diamond_branch_right" s
+                    && BSC.isInfixOf "JOIN diamond_root" s
                 )
 
 -- ----------------------------------------------------------------------------
