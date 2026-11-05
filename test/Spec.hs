@@ -17,7 +17,8 @@ import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
-import Fuzz (fuzzTests)
+import Fuzz (generativeFuzzTests)
+import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
@@ -68,7 +69,8 @@ tests =
         , phase8Tests
         , goldenTests
         , propertyTests
-        , fuzzTests
+        , generativeFuzzTests
+        , mutationalFuzzTests
         ]
 
 -- ----------------------------------------------------------------------------

@@ -90,6 +90,7 @@ test-suite occam-fuzz
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     other-modules:    Fuzz
+                    , MutationalFuzz
     main-is:          FuzzMain.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
@@ -109,6 +110,7 @@ test-suite occam-test
     other-modules:    Baseline
                     , Benchmark
                     , Fuzz
+                    , MutationalFuzz
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
                     , occam

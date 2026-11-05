@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
-module Fuzz (fuzzTests, main) where
+module Fuzz (fuzzTests, generativeFuzzTests, main) where
 
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
@@ -9,6 +9,7 @@ import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import MutationalFuzz (mutationalFuzzTests)
 import Occam.Reducer (Oracle, reduceSQL)
 import Occam.TreeSitter (
     collectDescendants,
@@ -625,10 +626,10 @@ prop_heavyFuzzAllInvariants script = monadicIO $ do
 -- Test Suite Hierarchy
 -- ----------------------------------------------------------------------------
 
-fuzzTests :: TestTree
-fuzzTests =
+generativeFuzzTests :: TestTree
+generativeFuzzTests =
     testGroup
-        "Heavy Mutational Fuzzing (Tasty / QuickCheck)"
+        "Generative Fuzzing (Tasty / QuickCheck)"
         [ testProperty
             "Fuzz 1: Tree-sitter CST Validity (Zero Unparse Corruption)"
             prop_treeSitterValidity
@@ -647,5 +648,12 @@ fuzzTests =
                 prop_heavyFuzzAllInvariants
         ]
 
+fuzzTests :: TestTree
+fuzzTests =
+    testGroup
+        "Occam Fuzz Testing"
+        [ generativeFuzzTests
+        , mutationalFuzzTests
+        ]
 main :: IO ()
 main = defaultMain fuzzTests
