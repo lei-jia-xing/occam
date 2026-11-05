@@ -19,8 +19,6 @@ common warnings
 library
     import:           warnings
     exposed-modules:  Occam
-                    , Occam.Baseline
-                    , Occam.Benchmark
                     , Occam.Cache
                     , Occam.Core
                     , Occam.Dependency
@@ -67,11 +65,32 @@ executable occam
     default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
+executable occam-eval
+    import:           warnings
+    main-is:          Main.hs
+    other-modules:    Baseline
+                    , Benchmark
+    hs-source-dirs:   bench
+    build-depends:    base >= 4.18 && < 5
+                    , occam
+                    , bytestring
+                    , text
+                    , containers
+                    , directory
+                    , filepath
+                    , time
+                    , aeson
+                    , optparse-applicative
+    default-language: GHC2021
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+
 test-suite occam-test
     import:           warnings
     default-language: GHC2021
     type:             exitcode-stdio-1.0
-    hs-source-dirs:   test
+    hs-source-dirs:   test bench
+    other-modules:    Baseline
+                    , Benchmark
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
@@ -87,3 +106,5 @@ test-suite occam-test
                     , tasty-golden
                     , tasty-quickcheck
                     , QuickCheck
+                    , time
+                    , aeson

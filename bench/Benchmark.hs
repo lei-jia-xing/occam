@@ -1,12 +1,15 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
-module Occam.Benchmark (
+module Benchmark (
     BenchmarkMetric (..),
     runComparisonBenchmark,
     formatMarkdownTable,
     formatCSV,
 ) where
 
+import Baseline (runNaiveDdmin, runSequentialDrop)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -16,7 +19,6 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
-import Occam.Baseline (runNaiveDdmin, runSequentialDrop)
 import Occam.Reducer (Oracle, reduceSQL)
 import Occam.TreeSitter (countStatements)
 

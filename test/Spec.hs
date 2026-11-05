@@ -2,6 +2,13 @@
 
 module Main (main) where
 
+import Baseline (runNaiveDdmin, runSequentialDrop)
+import Benchmark (
+    BenchmarkMetric (..),
+    formatCSV,
+    formatMarkdownTable,
+    runComparisonBenchmark,
+ )
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as LBS
@@ -10,13 +17,6 @@ import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
-import Occam.Baseline (runNaiveDdmin, runSequentialDrop)
-import Occam.Benchmark (
-    BenchmarkMetric (..),
-    formatCSV,
-    formatMarkdownTable,
-    runComparisonBenchmark,
- )
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
@@ -369,6 +369,26 @@ runOccamCLI cliArgs = do
         then readProcessWithExitCode "cabal" (["run", "-v0", "occam", "--"] ++ cliArgs) ""
         else readProcessWithExitCode bin cliArgs ""
 
+getOccamEvalBinary :: IO FilePath
+getOccamEvalBinary = do
+    mPath <- findExecutable "occam-eval"
+    case mPath of
+        Just p -> pure p
+        Nothing -> do
+            let localPath =
+                    "dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/x/occam-eval/build/occam-eval/occam-eval"
+            exists <- doesFileExist localPath
+            if exists
+                then pure localPath
+                else pure "cabal"
+
+runOccamEvalCLI :: [String] -> IO (ExitCode, String, String)
+runOccamEvalCLI cliArgs = do
+    bin <- getOccamEvalBinary
+    if bin == "cabal"
+        then readProcessWithExitCode "cabal" (["run", "-v0", "occam-eval", "--"] ++ cliArgs) ""
+        else readProcessWithExitCode bin cliArgs ""
+
 phase5Tests :: TestTree
 phase5Tests =
     testGroup
@@ -383,6 +403,15 @@ phase5Tests =
             assertBool
                 "occam --help output missing 'Usage:'"
                 ("Usage:" `isInfixOf` helpOut && "occam" `isInfixOf` helpOut)
+            assertBool
+                "occam --help output should not contain '--benchmark'"
+                (not ("--benchmark" `isInfixOf` helpOut))
+        , testCase "occam-eval CLI --help output" $ do
+            (evalHelpExit, evalHelpOut, _) <- runOccamEvalCLI ["--help"]
+            assertEqual "occam-eval --help failed" ExitSuccess evalHelpExit
+            assertBool
+                "occam-eval --help output missing 'Usage:'"
+                ("Usage:" `isInfixOf` evalHelpOut && "occam-eval" `isInfixOf` evalHelpOut)
         , testCase "CLI non-reproducing input error" $ do
             let tmpSQL = "test_cli_input.sql"
                 tmpOut = "test_cli_out"

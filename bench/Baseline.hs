@@ -1,4 +1,4 @@
-module Occam.Baseline (
+module Baseline (
     runSequentialDrop,
     runNaiveDdmin,
 ) where

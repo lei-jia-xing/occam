@@ -45,7 +45,7 @@ for f in "${sql_files[@]}"; do
     echo "  Output: $out_dir"
     echo "----------------------------------------------------------------------"
 
-    if cabal run occam -- "$f" --oracle "./harness/pg_harness.sh" --out "./benchmarks/results/$(basename "$f" .sql)" --benchmark; then
+    if cabal run occam-eval -- "$f" --oracle "./harness/pg_harness.sh" --out "./benchmarks/results/$(basename "$f" .sql)"; then
         echo "[$idx/$total] SUCCESS: $bench_name"
         passed=$((passed + 1))
     else

@@ -48,6 +48,7 @@
 ** DONE Implement Baseline 2 (Naive text/line-based ddmin without dependency graph)
 ** DONE Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
 ** DONE Automated report exporter: emit comparison tables in CSV and Markdown
+** DONE Decouple baselines and benchmark runner from core Occam into standalone bench/ (occam-eval executable)
 
 * 9. Real-World Crash Corpus Collection                                  :ARCHIVE:
 ** DONE Curate 20~30 real historical crash SQL test cases (PostgreSQL BUG tracker, MySQL CVEs, SQUIRREL dataset)

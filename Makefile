@@ -10,23 +10,23 @@ test:
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
-		fourmolu -m inplace $$(find src app test -name "*.hs"); \
+		fourmolu -m inplace $$(find src app test bench -name "*.hs"); \
 	else \
-		nix develop --command fourmolu -m inplace $$(find src app test -name "*.hs"); \
+		nix develop --command fourmolu -m inplace $$(find src app test bench -name "*.hs"); \
 	fi
 
 fmt-check:
 	@if command -v fourmolu >/dev/null 2>&1; then \
-		fourmolu --mode check $$(find src app test -name "*.hs"); \
+		fourmolu --mode check $$(find src app test bench -name "*.hs"); \
 	else \
-		nix develop --command fourmolu --mode check $$(find src app test -name "*.hs"); \
+		nix develop --command fourmolu --mode check $$(find src app test bench -name "*.hs"); \
 	fi
 
 lint:
 	@if command -v hlint >/dev/null 2>&1; then \
-		hlint src app test; \
+		hlint src app test bench; \
 	else \
-		nix develop --command hlint src app test; \
+		nix develop --command hlint src app test bench; \
 	fi
 
 check: fmt-check lint test
