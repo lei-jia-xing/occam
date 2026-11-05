@@ -1,0 +1,4 @@
+# HLint configuration for Occam
+- ignore: {name: "Use record puns"}
+- ignore: {name: "Use newtype instead of data"}
+- warn: {name: "Use head"}

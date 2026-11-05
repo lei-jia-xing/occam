@@ -1,16 +1,16 @@
-module Occam.Dependency
-    ( ObjectName
-    , ObjectKind(..)
-    , DependencyType(..)
-    , ObjectAction(..)
-    , DependencyGraph(..)
-    , emptyGraph
-    ) where
+module Occam.Dependency (
+    ObjectName,
+    ObjectKind (..),
+    DependencyType (..),
+    ObjectAction (..),
+    DependencyGraph (..),
+    emptyGraph,
+) where
 
 import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
+import Data.Map.Strict qualified as Map
 import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Occam.Core (StatementId)
 
@@ -25,26 +25,32 @@ data ObjectKind
     deriving (Eq, Ord, Show)
 
 data DependencyType
-    = DefDep   -- ^ Creates an object
-    | UseDep   -- ^ Reads an object
-    | ModDep   -- ^ Alters / Mutates an object
+    = -- | Creates an object
+      DefDep
+    | -- | Reads an object
+      UseDep
+    | -- | Alters / Mutates an object
+      ModDep
     deriving (Eq, Ord, Show)
 
 data ObjectAction = ObjectAction
     { actionKind :: !ObjectKind
     , actionType :: !DependencyType
     , actionName :: !ObjectName
-    } deriving (Eq, Ord, Show)
+    }
+    deriving (Eq, Ord, Show)
 
 data DependencyGraph = DependencyGraph
-    { graphStmts   :: !(Set StatementId)
+    { graphStmts :: !(Set StatementId)
     , graphActions :: !(Map StatementId [ObjectAction])
-    , graphEdges   :: !(Map StatementId (Set StatementId)) -- stmt -> dependencies
-    } deriving (Eq, Show)
+    , graphEdges :: !(Map StatementId (Set StatementId)) -- stmt -> dependencies
+    }
+    deriving (Eq, Show)
 
 emptyGraph :: DependencyGraph
-emptyGraph = DependencyGraph
-    { graphStmts   = Set.empty
-    , graphActions = Map.empty
-    , graphEdges   = Map.empty
-    }
+emptyGraph =
+    DependencyGraph
+        { graphStmts = Set.empty
+        , graphActions = Map.empty
+        , graphEdges = Map.empty
+        }
