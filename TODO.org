@@ -53,3 +53,10 @@
 * 9. Real-World Crash Corpus Collection                                  :ARCHIVE:
 ** DONE Curate 20~30 real historical crash SQL test cases (PostgreSQL BUG tracker, MySQL CVEs, SQUIRREL dataset)
 ** DONE Automated regression runner for benchmarks/ corpus
+
+* 10. Heavy Fuzzing & Large-Scale Corpus
+** DONE Multi-statement generative & mutational SQL generator with varied schemas and constraints
+** DONE Complex programmatic crash oracle simulator with hidden non-trivial invariants
+** DONE Property-based fuzz test suite (test-suite occam-fuzz) with native QuickCheck / Tasty integration
+** DONE Invariant verification: Tree-sitter validity, Oracle soundness, monotonicity, and idempotency
+** DONE Integrated shrinking on invariant failures finding minimal failing SQL sequences

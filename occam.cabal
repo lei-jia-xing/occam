@@ -84,6 +84,23 @@ executable occam-eval
     default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
+test-suite occam-fuzz
+    import:           warnings
+    default-language: GHC2021
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    other-modules:    Fuzz
+    main-is:          FuzzMain.hs
+    build-depends:    base >= 4.18 && < 5
+                    , occam
+                    , bytestring
+                    , text
+                    , containers
+                    , tasty
+                    , tasty-quickcheck
+                    , QuickCheck >= 2.14
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+
 test-suite occam-test
     import:           warnings
     default-language: GHC2021
@@ -91,6 +108,7 @@ test-suite occam-test
     hs-source-dirs:   test bench
     other-modules:    Baseline
                     , Benchmark
+                    , Fuzz
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
