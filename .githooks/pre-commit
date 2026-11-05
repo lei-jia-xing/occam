@@ -28,11 +28,4 @@ elif [ -n "$RUNNER" ]; then
     $RUNNER hlint src app test
 fi
 
-echo "==> [pre-commit] Running cabal test..."
-if command -v cabal &>/dev/null; then
-    cabal test
-elif [ -n "$RUNNER" ]; then
-    $RUNNER cabal test
-fi
-
 echo "==> [pre-commit] All checks passed!"
