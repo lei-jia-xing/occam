@@ -159,7 +159,9 @@ isNullNode node = withNodePtr node $ \p -> do
 nodeChildren :: TSNode -> IO [TSNode]
 nodeChildren node = withNodePtr node $ \p -> do
     count <- c_node_child_count_p p
-    mapM (fetchChild p) [0 .. count - 1]
+    if count == 0
+        then pure []
+        else mapM (fetchChild p) [0 .. count - 1]
     where
         fetchChild parentPtr idx = allocNode $ \outPtr ->
             c_node_child_p parentPtr idx outPtr

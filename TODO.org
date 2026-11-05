@@ -9,10 +9,10 @@
 ** DONE Multi-statement boundary detection: extract top-level statement sequence
 
 * 2. Semantic Dependency Analysis (Def/Use/Mod)
-** TODO CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)
-** TODO CST pattern matcher: extract DML references (tables/columns in SELECT, INSERT, UPDATE, DELETE)
-** TODO Construct cross-statement dependency DAG (Directed Acyclic Graph)
-** TODO Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
+** DONE CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)
+** DONE CST pattern matcher: extract DML references (tables/columns in SELECT, INSERT, UPDATE, DELETE)
+** DONE Construct cross-statement dependency DAG (Directed Acyclic Graph)
+** DONE Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
 
 * 3. Hierarchical Reduction Engine
 ** TODO Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
