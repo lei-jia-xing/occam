@@ -2,7 +2,7 @@
 
 module Main (main) where
 
-import Benchmark (runComparisonBenchmark)
+import Benchmark (runComparisonBenchmark, runSingleAlgorithmBenchmark)
 import Control.Monad (unless)
 import Data.Aeson (encode)
 import Data.ByteString qualified as BS
@@ -43,6 +43,7 @@ data Options = Options
     , optOutDir :: !FilePath
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
+    , optBaseline :: !(Maybe Int)
     }
     deriving (Eq, Show)
 
@@ -80,7 +81,14 @@ optionsParser =
                 <> showDefault
                 <> help "Per-execution timeout in seconds"
             )
-
+        <*> optional
+            ( option
+                auto
+                ( long "baseline"
+                    <> metavar "N"
+                    <> help "Run only specific baseline (1: Sequential, 2: Naive ddmin)"
+                )
+            )
 versionOption :: Parser (a -> a)
 versionOption =
     infoOption
@@ -142,13 +150,19 @@ runEval Options {..} = do
         exitFailure
     putStrLn "OK (Reproduced)"
 
-    -- 2. Run comparative benchmark: Occam vs B1 vs B2
-    putStrLn "Running comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)..."
-    metrics <- runComparisonBenchmark (runExternalOracle baseOracleCfg) initialSQL
+    -- 2. Run benchmark: single baseline or comparative Occam vs B1 vs B2
     createDirectoryIfMissing True optOutDir
-    let jsonData = encode metrics
+    jsonData <- case optBaseline of
+        Just b -> do
+            putStrLn $ "Running baseline " ++ show b ++ " reduction..."
+            (metric, reducedSQL) <- runSingleAlgorithmBenchmark b (runExternalOracle baseOracleCfg) initialSQL
+            BS.writeFile (optOutDir </> "minimal.sql") reducedSQL
+            pure (encode [metric])
+        Nothing -> do
+            putStrLn "Running comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)..."
+            metrics <- runComparisonBenchmark (runExternalOracle baseOracleCfg) initialSQL
+            pure (encode metrics)
     BSL.writeFile (optOutDir </> "benchmark.json") jsonData
-
     -- 3. Print results JSON
     putStrLn "----------------------------------------------------------------------"
     putStrLn "Benchmark Complete!"

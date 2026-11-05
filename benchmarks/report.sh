@@ -103,22 +103,22 @@ fi
 
 render_table() {
     {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "SCENARIO" "DIALECT" "SCALE" "INIT_S" "ALGORITHM" "RED_S" "STMT_RED%" "INIT_B" "RED_B" "BYTE_RED%" "CALLS" "TIME(s)"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "SCENARIO" "TOOL" "SCALE" "INIT_S" "RED_S" "STMT_RED%" "INIT_B" "RED_B" "BYTE_RED%" "CALLS" "TIME(s)" "VALID"
         printf "%s" "$RAW_DATA" | jq -r '
             [
                 .scenario,
-                .dialect,
-                .scale,
-                (.initial_stmts | tostring),
-                .algorithm,
-                (.reduced_stmts | tostring),
-                ((.stmt_reduction_pct | tostring) + "%"),
-                (.initial_bytes | tostring),
-                (.reduced_bytes | tostring),
-                ((.byte_reduction_pct | tostring) + "%"),
-                (.oracle_calls | tostring),
-                (if .time_seconds then (.time_seconds | tostring) + "s" else "0s" end)
+                (.tool // .algorithm // "Unknown"),
+                (.scale // "N/A"),
+                ((.initial_stmts // 0) | tostring),
+                ((.reduced_stmts // 0) | tostring),
+                ((((.stmt_red_pct // .stmt_reduction_pct // 0) * 10 | round / 10 | tostring) + "%")),
+                ((.initial_bytes // 0) | tostring),
+                ((.reduced_bytes // 0) | tostring),
+                ((((.byte_red_pct // .byte_reduction_pct // 0) * 10 | round / 10 | tostring) + "%")),
+                ((.oracle_calls // 0) | tostring),
+                ((((.wall_time_sec // .time_seconds // 0) * 100 | round / 100 | tostring) + "s")),
+                (if .valid_reproducer == true then "PASS" elif .valid_reproducer == false then "FAIL" else "N/A" end)
             ] | @tsv
         '
     } | column -t -s $'\t'
@@ -126,32 +126,43 @@ render_table() {
 
 render_summary() {
     {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "ALGORITHM" "CASES" "INIT_STMTS" "RED_STMTS" "STMT_RED%" "TOTAL_CALLS" "WALL_TIME(s)" "AVG_CALLS/CASE"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "TOOL" "CASES" "INIT_STMTS" "RED_STMTS" "STMT_RED%" "TOTAL_CALLS" "WALL_TIME(s)" "AVG_CALLS/CASE" "VALID_REPROD"
         printf "%s" "$RAW_DATA" | jq -s -r '
-            (map({scenario, initial_stmts}) | unique_by(.scenario) | {count: length, init_stmts: (map(.initial_stmts) | add)}) as $meta
-            | group_by(.algorithm)
+            group_by(.tool // .algorithm)
             | map({
-                algorithm: .[0].algorithm,
-                cases: $meta.count,
-                initial_stmts: $meta.init_stmts,
-                reduced_stmts: (map(.reduced_stmts) | add),
-                reduction_pct: (if $meta.init_stmts > 0 then ((1 - ((map(.reduced_stmts) | add) / $meta.init_stmts)) * 100) else 0 end),
-                oracle_calls: (map(.oracle_calls) | add),
-                wall_time: (map(.time_seconds) | add),
-                avg_calls: (if $meta.count > 0 then ((map(.oracle_calls) | add) / $meta.count) else 0 end)
+                tool: (.[0].tool // .[0].algorithm),
+                cases: length,
+                initial_stmts: (map(.initial_stmts // 0) | add),
+                reduced_stmts: (map(.reduced_stmts // 0) | add),
+                reduction_pct: (
+                    (map(.initial_stmts // 0) | add) as $init
+                    | if $init > 0 then ((1 - ((map(.reduced_stmts // 0) | add) / $init)) * 100) else 0 end
+                ),
+                oracle_calls: (map(.oracle_calls // 0) | add),
+                wall_time: (map(.wall_time_sec // .time_seconds // 0) | add),
+                avg_calls: (if length > 0 then ((map(.oracle_calls // 0) | add) / length) else 0 end),
+                valid_cases: (map(if .valid_reproducer == true then 1 else 0 end) | add)
               })
-            | sort_by(if .algorithm == "Occam" then 0 elif .algorithm | startswith("B1") then 1 else 2 end)
+            | sort_by(
+                if ((.tool) | ascii_downcase) == "occam" then 0
+                elif ((.tool) | ascii_downcase) | contains("creduce") then 1
+                elif ((.tool) | ascii_downcase) | contains("sqlancer") then 2
+                elif ((.tool) | ascii_downcase) | contains("ddmin") then 3
+                elif ((.tool) | ascii_downcase) | startswith("b1") then 4
+                else 5 end
+              )
             | .[]
             | [
-                .algorithm,
+                .tool,
                 (.cases | tostring),
                 (.initial_stmts | tostring),
                 (.reduced_stmts | tostring),
                 ((.reduction_pct * 10 | round / 10 | tostring) + "%"),
                 (.oracle_calls | tostring),
                 ((.wall_time * 100 | round / 100 | tostring) + "s"),
-                (.avg_calls * 10 | round / 10 | tostring)
+                (.avg_calls * 10 | round / 10 | tostring),
+                ((.valid_cases | tostring) + "/" + (.cases | tostring))
               ] | @tsv
         '
     } | column -t -s $'\t'
@@ -159,27 +170,27 @@ render_summary() {
 
 render_md() {
     cat <<'EOF'
-# Occam vs Baselines: Fuzz Benchmark Evaluation
+# Multi-Tool Fuzz Crash Reduction Benchmark Evaluation
 
 ## Detailed Comparative Results Table
 
-| Scenario | Dialect | Scale | Initial Stmts | Algorithm | Reduced Stmts | Stmt Red % | Initial Bytes | Reduced Bytes | Byte Red % | Oracle Calls | Time (s) |
-| :--- | :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Scenario | Tool | Scale | Initial Stmts | Reduced Stmts | Stmt Red % | Initial Bytes | Reduced Bytes | Byte Red % | Oracle Calls | Time (s) | Reproducer Valid |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
 EOF
     printf "%s" "$RAW_DATA" | jq -r '
         [
             ("`" + .scenario + "`"),
-            .dialect,
-            .scale,
-            (.initial_stmts | tostring),
-            ("**" + .algorithm + "**"),
-            (.reduced_stmts | tostring),
-            ((.stmt_reduction_pct | tostring) + "%"),
-            (.initial_bytes | tostring),
-            (.reduced_bytes | tostring),
-            ((.byte_reduction_pct | tostring) + "%"),
-            (.oracle_calls | tostring),
-            (.time_seconds | tostring)
+            ("**" + (.tool // .algorithm // "Unknown") + "**"),
+            (.scale // "N/A"),
+            ((.initial_stmts // 0) | tostring),
+            ((.reduced_stmts // 0) | tostring),
+            ((((.stmt_red_pct // .stmt_reduction_pct // 0) * 10 | round / 10 | tostring) + "%")),
+            ((.initial_bytes // 0) | tostring),
+            ((.reduced_bytes // 0) | tostring),
+            ((((.byte_red_pct // .byte_reduction_pct // 0) * 10 | round / 10 | tostring) + "%")),
+            ((.oracle_calls // 0) | tostring),
+            ((((.wall_time_sec // .time_seconds // 0) * 100 | round / 100 | tostring) + "s")),
+            (if .valid_reproducer == true then "PASS" elif .valid_reproducer == false then "FAIL" else "N/A" end)
         ] | "| " + join(" | ") + " |"
     '
 
@@ -189,34 +200,45 @@ EOF
 
 ## Overall Aggregate Performance Comparison
 
-| Algorithm | Scenarios | Total Initial Stmts | Total Reduced Stmts | Overall Stmt Reduction % | Total Oracle Calls | Total Wall Time (s) | Avg Calls / Case |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Tool | Scenarios | Total Initial Stmts | Total Reduced Stmts | Overall Stmt Reduction % | Total Oracle Calls | Total Wall Time (s) | Avg Calls / Case | Valid / Total |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
 EOF
 
     printf "%s" "$RAW_DATA" | jq -s -r '
-        (map({scenario, initial_stmts}) | unique_by(.scenario) | {count: length, init_stmts: (map(.initial_stmts) | add)}) as $meta
-        | group_by(.algorithm)
+        group_by(.tool // .algorithm)
         | map({
-            algorithm: .[0].algorithm,
-            cases: $meta.count,
-            initial_stmts: $meta.init_stmts,
-            reduced_stmts: (map(.reduced_stmts) | add),
-            reduction_pct: (if $meta.init_stmts > 0 then ((1 - ((map(.reduced_stmts) | add) / $meta.init_stmts)) * 100) else 0 end),
-            oracle_calls: (map(.oracle_calls) | add),
-            wall_time: (map(.time_seconds) | add),
-            avg_calls: (if $meta.count > 0 then ((map(.oracle_calls) | add) / $meta.count) else 0 end)
+            tool: (.[0].tool // .[0].algorithm),
+            cases: length,
+            initial_stmts: (map(.initial_stmts // 0) | add),
+            reduced_stmts: (map(.reduced_stmts // 0) | add),
+            reduction_pct: (
+                (map(.initial_stmts // 0) | add) as $init
+                | if $init > 0 then ((1 - ((map(.reduced_stmts // 0) | add) / $init)) * 100) else 0 end
+            ),
+            oracle_calls: (map(.oracle_calls // 0) | add),
+            wall_time: (map(.wall_time_sec // .time_seconds // 0) | add),
+            avg_calls: (if length > 0 then ((map(.oracle_calls // 0) | add) / length) else 0 end),
+            valid_cases: (map(if .valid_reproducer == true then 1 else 0 end) | add)
           })
-        | sort_by(if .algorithm == "Occam" then 0 elif .algorithm | startswith("B1") then 1 else 2 end)
+        | sort_by(
+            if ((.tool) | ascii_downcase) == "occam" then 0
+            elif ((.tool) | ascii_downcase) | contains("creduce") then 1
+            elif ((.tool) | ascii_downcase) | contains("sqlancer") then 2
+            elif ((.tool) | ascii_downcase) | contains("ddmin") then 3
+            elif ((.tool) | ascii_downcase) | startswith("b1") then 4
+            else 5 end
+          )
         | .[]
         | [
-            ("**" + .algorithm + "**"),
+            ("**" + .tool + "**"),
             (.cases | tostring),
             (.initial_stmts | tostring),
             (.reduced_stmts | tostring),
             ("**" + (.reduction_pct * 10 | round / 10 | tostring) + "%**"),
             ("**" + (.oracle_calls | tostring) + "**"),
             ((.wall_time * 100 | round / 100 | tostring) + "s"),
-            (.avg_calls * 10 | round / 10 | tostring)
+            (.avg_calls * 10 | round / 10 | tostring),
+            ((.valid_cases | tostring) + "/" + (.cases | tostring))
           ] | "| " + join(" | ") + " |"
     '
 }

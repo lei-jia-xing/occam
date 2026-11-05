@@ -1,8 +1,10 @@
 # Occam Automated Fuzz Benchmark Suite
 
-Authoritative automated multi-statement SQL benchmark suite evaluating **Occam** (AST- & dependency-aware hierarchical crash reducer) against standard reduction baselines:
-- **B1 (Sequential Drop)**: Linear single-statement deletion baseline.
-- **B2 (Naive ddmin)**: Standard Zeller delta debugging baseline without dependency awareness.
+Authoritative automated multi-statement SQL benchmark suite evaluating **Occam** (AST- & dependency-aware hierarchical crash reducer) against comparative reduction tools:
+- **Occam**: AST- & dependency-aware hierarchical crash reducer.
+- **C-Reduce**: Upstream general-purpose reducer (via shell oracle).
+- **SQLancer**: Upstream Java SQLancer reducer (via `/opt/sqlancer/sqlancer.jar`).
+- **ddmin**: Standard Zeller delta debugging baseline (via `occam-eval --baseline 2`).
 
 ---
 
@@ -13,7 +15,7 @@ benchmarks/
 ├── fuzz_corpus/                 # 18 automated multi-statement SQL fuzz crash scenarios
 │   ├── metadata.json            # Machine-readable catalog of scales (50~200 stmts) and defect signatures
 │   ├── fuzz_oracle.sh           # Portable crash verification oracle
-│   ├── run_fuzz_benchmarks.py   # Benchmark execution engine (emits JSONL)
+│   ├── run_docker_benchmark.py  # Multi-tool benchmark execution engine (emits JSONL)
 │   ├── fuzz_pg_*.sql            # PostgreSQL fuzz testcases (50, 100, 150, 200 statements)
 │   └── fuzz_mysql_*.sql         # MySQL fuzz testcases (50, 100, 150, 200 statements)
 ├── tools/
@@ -41,13 +43,13 @@ The test suite consists of 18 high-entropy, multi-statement SQL fuzz crash scena
 
 ### Full Automated Batch Run
 
-To execute the entire 18-scenario benchmark suite across Occam, B1, and B2:
+To execute the multi-tool comparative benchmark suite (Occam, C-Reduce, SQLancer, ddmin):
 
 ```bash
 ./benchmarks/run_all.sh
 ```
 
-This runs `benchmarks/fuzz_corpus/run_fuzz_benchmarks.py`, writes the raw benchmark metrics into `benchmarks/fuzz_benchmark_results.jsonl`, and displays the aggregate summary via `./benchmarks/report.sh --summary`.
+This runs `benchmarks/fuzz_corpus/run_docker_benchmark.py`, writes the streaming benchmark metrics into `benchmarks/fuzz_benchmark_results.jsonl`, and displays the aggregate summary via `./benchmarks/report.sh --summary`.
 
 ### Running an Individual Scenario
 
