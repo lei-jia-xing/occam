@@ -28,6 +28,7 @@ module Occam.TreeSitter (
     -- * Multi-Statement Slicing
     extractStatements,
     extractStatementNodes,
+    countStatements,
 ) where
 
 import Control.Exception (bracket)
@@ -253,3 +254,11 @@ extractStatementNodes tree src = do
 
 extractStatements :: Tree -> ByteString -> IO [Statement]
 extractStatements tree src = map fst <$> extractStatementNodes tree src
+
+-- | Parse SQL and count the number of top-level statements.
+countStatements :: ByteString -> IO Int
+countStatements sql = withParser $ \p -> do
+    mTree <- parseSQL p sql
+    case mTree of
+        Nothing -> pure 0
+        Just tree -> length <$> extractStatements tree sql

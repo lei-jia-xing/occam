@@ -3,6 +3,8 @@ module Occam.Reducer (
     isValidClosure,
     closeSet,
     closureDdmin,
+    cutRemovedStatements,
+    partitionChunks,
     pruneClauses,
     simplifyExpressions,
     reduceSQL,

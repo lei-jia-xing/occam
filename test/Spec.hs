@@ -10,6 +10,13 @@ import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Occam.Baseline (runNaiveDdmin, runSequentialDrop)
+import Occam.Benchmark (
+    BenchmarkMetric (..),
+    formatCSV,
+    formatMarkdownTable,
+    runComparisonBenchmark,
+ )
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
@@ -57,6 +64,7 @@ tests =
         , phase5Tests
         , phase6Tests
         , phase7Tests
+        , phase8Tests
         , goldenTests
         , propertyTests
         ]
@@ -556,6 +564,142 @@ phase7Tests =
                 case res of
                     Nothing -> assertFailure "Failed to parse script for ON DUPLICATE KEY UPDATE test"
                     Just () -> pure ()
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Phase 8: Baselines & Benchmark Runner
+-- ----------------------------------------------------------------------------
+
+phase8Tests :: TestTree
+phase8Tests =
+    testGroup
+        "Phase 8: Baselines & Benchmark Runner"
+        [ testCase "B1 (Sequential Drop) removes dead statements and satisfies oracle" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "CREATE TABLE t2 (c INT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "CREATE TABLE t3 (d INT);"
+                        , "SELECT * FROM t1 WHERE a > 0;"
+                        ]
+                oracle sql = do
+                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
+                        hasIns = BSC.isInfixOf "INSERT INTO t1" sql
+                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
+                    pure (hasT1 && hasIns && hasSel)
+            reduced <- runSequentialDrop oracle script
+            ok <- oracle reduced
+            assertBool "B1 reduced SQL must satisfy oracle" ok
+            assertBool "Dead table t2 should be removed by B1" (not (BSC.isInfixOf "t2" reduced))
+            assertBool "Dead table t3 should be removed by B1" (not (BSC.isInfixOf "t3" reduced))
+            assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
+            assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
+            assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
+        , testCase "B2 (Naive ddmin) removes dead statements and satisfies oracle" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "CREATE TABLE t2 (c INT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "CREATE TABLE t3 (d INT);"
+                        , "SELECT * FROM t1 WHERE a > 0;"
+                        ]
+                oracle sql = do
+                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
+                        hasIns = BSC.isInfixOf "INSERT INTO t1" sql
+                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
+                    pure (hasT1 && hasIns && hasSel)
+            reduced <- runNaiveDdmin oracle script
+            ok <- oracle reduced
+            assertBool "B2 reduced SQL must satisfy oracle" ok
+            assertBool "Dead table t2 should be removed by B2" (not (BSC.isInfixOf "t2" reduced))
+            assertBool "Dead table t3 should be removed by B2" (not (BSC.isInfixOf "t3" reduced))
+            assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
+            assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
+            assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
+        , testCase "formatMarkdownTable and formatCSV output formatting" $ do
+            let sampleMetrics =
+                    [ BenchmarkMetric
+                        { metricAlgorithm = "Occam"
+                        , metricInitialBytes = 200
+                        , metricReducedBytes = 50
+                        , metricByteReduction = 75.0
+                        , metricInitialStmts = 5
+                        , metricReducedStmts = 2
+                        , metricStmtReduction = 60.0
+                        , metricOracleCalls = 8
+                        , metricTimeSeconds = 0.042
+                        }
+                    , BenchmarkMetric
+                        { metricAlgorithm = "B1 (Sequential)"
+                        , metricInitialBytes = 200
+                        , metricReducedBytes = 80
+                        , metricByteReduction = 60.0
+                        , metricInitialStmts = 5
+                        , metricReducedStmts = 3
+                        , metricStmtReduction = 40.0
+                        , metricOracleCalls = 14
+                        , metricTimeSeconds = 0.055
+                        }
+                    , BenchmarkMetric
+                        { metricAlgorithm = "B2 (Naive ddmin)"
+                        , metricInitialBytes = 200
+                        , metricReducedBytes = 80
+                        , metricByteReduction = 60.0
+                        , metricInitialStmts = 5
+                        , metricReducedStmts = 3
+                        , metricStmtReduction = 40.0
+                        , metricOracleCalls = 18
+                        , metricTimeSeconds = 0.063
+                        }
+                    ]
+                md = formatMarkdownTable sampleMetrics
+                csv = formatCSV sampleMetrics
+            assertBool
+                "Markdown table missing expected header"
+                ( T.isInfixOf
+                    "| Algorithm | Initial Bytes | Reduced Bytes | Byte Red. % | Initial Stmts | Reduced Stmts | Stmt Red. % | Oracle Invocations | Time (s) |"
+                    md
+                )
+            assertBool "Markdown table missing Occam row" (T.isInfixOf "Occam" md)
+            assertBool "Markdown table missing B1 row" (T.isInfixOf "B1 (Sequential)" md)
+            assertBool "Markdown table missing B2 row" (T.isInfixOf "B2 (Naive ddmin)" md)
+            assertBool
+                "CSV missing expected header"
+                ( T.isInfixOf
+                    "Algorithm,Initial Bytes,Reduced Bytes,Byte Red. %,Initial Stmts,Reduced Stmts,Stmt Red. %,Oracle Invocations,Time (s)"
+                    csv
+                )
+            assertBool "CSV missing Occam row data" (T.isInfixOf "Occam,200,50,75.00,5,2,60.00,8" csv)
+            assertBool "CSV missing B1 row data" (T.isInfixOf "B1 (Sequential),200,80,60.00,5,3,40.00,14" csv)
+        , testCase "runComparisonBenchmark executes all 3 algorithms and produces metrics" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "CREATE TABLE t2 (c INT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "SELECT * FROM t1 WHERE a > 0;"
+                        ]
+                oracle sql = do
+                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
+                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
+                    pure (hasT1 && hasSel)
+            metrics <- runComparisonBenchmark oracle script
+            assertEqual "Expected 3 benchmark metrics" 3 (length metrics)
+            let names = map metricAlgorithm metrics
+            assertEqual
+                "Expected algorithms [Occam, B1, B2]"
+                ["Occam", "B1 (Sequential)", "B2 (Naive ddmin)"]
+                names
+            mapM_
+                ( \m -> do
+                    assertEqual "Initial stmts must be 4" 4 (metricInitialStmts m)
+                    assertBool "Reduced stmts must be <= 4" (metricReducedStmts m <= 4)
+                    assertBool "Oracle calls must be positive" (metricOracleCalls m > 0)
+                    assertBool "Time must be non-negative" (metricTimeSeconds m >= 0)
+                )
+                metrics
         ]
 
 -- ----------------------------------------------------------------------------

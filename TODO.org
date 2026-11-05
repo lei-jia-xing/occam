@@ -43,11 +43,11 @@
 ** DONE MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
 ** DONE Native execution harnesses for local psql and mysql sockets
 
-* 8. Experimental Baselines & Benchmark Runner
-** TODO Implement Baseline 1 (Sequential statement-by-statement deletion)
-** TODO Implement Baseline 2 (Naive text/line-based ddmin without dependency graph)
-** TODO Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
-** TODO Automated report exporter: emit comparison tables in CSV and Markdown
+* 8. Experimental Baselines & Benchmark Runner                         :ARCHIVE:
+** DONE Implement Baseline 1 (Sequential statement-by-statement deletion)
+** DONE Implement Baseline 2 (Naive text/line-based ddmin without dependency graph)
+** DONE Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
+** DONE Automated report exporter: emit comparison tables in CSV and Markdown
 
 * 9. Real-World Crash Corpus Collection
 ** TODO Curate 20~30 real historical crash SQL test cases (PostgreSQL BUG tracker, MySQL CVEs, SQUIRREL dataset)

@@ -8,17 +8,19 @@ import Control.Monad (unless)
 import Data.Aeson (FromJSON, ToJSON, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
+import Data.Text.IO qualified as TIO
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
+import Occam.Benchmark (formatCSV, formatMarkdownTable, runComparisonBenchmark)
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Oracle (
     OracleConfig (..),
     runExternalOracle,
  )
 import Occam.Reducer (reduceSQL)
-import Occam.TreeSitter (extractStatements, parseSQL, withParser)
+import Occam.TreeSitter (countStatements)
 import Options.Applicative (
     Parser,
     ParserInfo,
@@ -39,6 +41,7 @@ import Options.Applicative (
     showDefault,
     strArgument,
     strOption,
+    switch,
     value,
     (<**>),
  )
@@ -60,6 +63,7 @@ data Options = Options
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
     , optFrames :: !Int
+    , optBenchmark :: !Bool
     }
     deriving (Eq, Show)
 
@@ -119,6 +123,10 @@ optionsParser =
                 <> showDefault
                 <> help "Top-N stack frame functions required for crash equivalence"
             )
+        <*> switch
+            ( long "benchmark"
+                <> help "Run comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)"
+            )
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -137,13 +145,6 @@ optsInfo =
             <> progDesc "Occam: Dependency-Aware SQL Crash Minimizer"
             <> header ("Occam v" ++ Occam.version ++ " - Semantic multi-statement crash reducer")
         )
-
-countStatements :: BS.ByteString -> IO Int
-countStatements sql = withParser $ \p -> do
-    mTree <- parseSQL p sql
-    case mTree of
-        Nothing -> pure 0
-        Just tree -> length <$> extractStatements tree sql
 
 main :: IO ()
 main = execParser optsInfo >>= runOccam
@@ -194,90 +195,112 @@ runOccam Options {..} = do
         exitFailure
     putStrLn "OK (Reproduced)"
 
-    (oracle, getCacheStats) <- memoizeOracle (runExternalOracle baseOracleCfg)
-    -- 2. Run hierarchical reduction engine
-    putStrLn "Running hierarchical reduction engine (Levels 1-4)..."
-    startTime <- getCurrentTime
-    reducedSQL <- reduceSQL oracle initialSQL
-    endTime <- getCurrentTime
+    if optBenchmark
+        then do
+            putStrLn "Running comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)..."
+            metrics <- runComparisonBenchmark (runExternalOracle baseOracleCfg) initialSQL
+            createDirectoryIfMissing True optOutDir
+            let mdTable = formatMarkdownTable metrics
+                csvData = formatCSV metrics
+                jsonData = encode metrics
+            TIO.writeFile (optOutDir </> "benchmark.md") mdTable
+            TIO.writeFile (optOutDir </> "benchmark.csv") csvData
+            BSL.writeFile (optOutDir </> "benchmark.json") jsonData
+            putStrLn "----------------------------------------------------------------------"
+            putStrLn "Benchmark Complete!"
+            putStrLn "======================================================================"
+            putStrLn "Comparative Benchmark Results"
+            putStrLn "======================================================================"
+            TIO.putStr mdTable
+            putStrLn "======================================================================"
+            putStrLn $ "  Artifacts: " ++ (optOutDir </> "benchmark.md")
+            putStrLn $ "             " ++ (optOutDir </> "benchmark.csv")
+            putStrLn $ "             " ++ (optOutDir </> "benchmark.json")
+            putStrLn "======================================================================"
+        else do
+            (oracle, getCacheStats) <- memoizeOracle (runExternalOracle baseOracleCfg)
+            -- 2. Run hierarchical reduction engine
+            putStrLn "Running hierarchical reduction engine (Levels 1-4)..."
+            startTime <- getCurrentTime
+            reducedSQL <- reduceSQL oracle initialSQL
+            endTime <- getCurrentTime
+            -- 3. Gather metrics
+            cacheStats <- getCacheStats
+            let totalHits = cacheHits cacheStats
+                totalMisses = cacheMisses cacheStats
+                totalCalls = totalMisses
+                totalLookups = totalHits + totalMisses
+                hitRatio =
+                    if totalLookups > 0
+                        then fromIntegral totalHits / fromIntegral totalLookups
+                        else 0.0
+            reducedStmts <- countStatements reducedSQL
+            let reducedBytes = BS.length reducedSQL
+                elapsedSecs = realToFrac (diffUTCTime endTime startTime) :: Double
+                ratio =
+                    if initialBytes > 0
+                        then (1.0 - (fromIntegral reducedBytes / fromIntegral initialBytes :: Double)) * 100.0
+                        else 0.0
 
-    -- 3. Gather metrics
-    cacheStats <- getCacheStats
-    let totalHits = cacheHits cacheStats
-        totalMisses = cacheMisses cacheStats
-        totalCalls = totalMisses
-        totalLookups = totalHits + totalMisses
-        hitRatio =
-            if totalLookups > 0
-                then fromIntegral totalHits / fromIntegral totalLookups
-                else 0.0
-    reducedStmts <- countStatements reducedSQL
-    let reducedBytes = BS.length reducedSQL
-        elapsedSecs = realToFrac (diffUTCTime endTime startTime) :: Double
-        ratio =
-            if initialBytes > 0
-                then (1.0 - (fromIntegral reducedBytes / fromIntegral initialBytes :: Double)) * 100.0
-                else 0.0
+            -- 4. Export artifacts
+            createDirectoryIfMissing True optOutDir
 
-    -- 4. Export artifacts
-    createDirectoryIfMissing True optOutDir
+            -- minimal.sql
+            let minimalPath = optOutDir </> "minimal.sql"
+            BS.writeFile minimalPath reducedSQL
 
-    -- minimal.sql
-    let minimalPath = optOutDir </> "minimal.sql"
-    BS.writeFile minimalPath reducedSQL
+            -- replay.sh
+            let replayPath = optOutDir </> "replay.sh"
+                replayScript =
+                    unlines
+                        [ "#!/usr/bin/env bash"
+                        , "set -euo pipefail"
+                        , "DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\""
+                        , "echo \"==> Replaying minimal.sql against oracle...\""
+                        , optOracleCmd ++ " < \"$DIR/minimal.sql\""
+                        ]
+            writeFile replayPath replayScript
+            perms <- getPermissions replayPath
+            setPermissions replayPath (setOwnerExecutable True perms)
 
-    -- replay.sh
-    let replayPath = optOutDir </> "replay.sh"
-        replayScript =
-            unlines
-                [ "#!/usr/bin/env bash"
-                , "set -euo pipefail"
-                , "DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\""
-                , "echo \"==> Replaying minimal.sql against oracle...\""
-                , optOracleCmd ++ " < \"$DIR/minimal.sql\""
-                ]
-    writeFile replayPath replayScript
-    perms <- getPermissions replayPath
-    setPermissions replayPath (setOwnerExecutable True perms)
+            -- stats.json
+            let statsPath = optOutDir </> "stats.json"
+                stats =
+                    Stats
+                        { initial_bytes = initialBytes
+                        , reduced_bytes = reducedBytes
+                        , reduction_ratio = ratio
+                        , initial_statements = initialStmts
+                        , reduced_statements = reducedStmts
+                        , oracle_executions = totalCalls
+                        , cache_hits = totalHits
+                        , cache_misses = totalMisses
+                        , cache_hit_ratio = hitRatio
+                        , elapsed_seconds = elapsedSecs
+                        }
+            BSL.writeFile statsPath (encode stats)
 
-    -- stats.json
-    let statsPath = optOutDir </> "stats.json"
-        stats =
-            Stats
-                { initial_bytes = initialBytes
-                , reduced_bytes = reducedBytes
-                , reduction_ratio = ratio
-                , initial_statements = initialStmts
-                , reduced_statements = reducedStmts
-                , oracle_executions = totalCalls
-                , cache_hits = totalHits
-                , cache_misses = totalMisses
-                , cache_hit_ratio = hitRatio
-                , elapsed_seconds = elapsedSecs
-                }
-    BSL.writeFile statsPath (encode stats)
-
-    -- 5. Print summary table
-    putStrLn "----------------------------------------------------------------------"
-    putStrLn "Reduction Complete!"
-    putStrLn "======================================================================"
-    putStrLn "Occam Reduction Summary"
-    putStrLn "======================================================================"
-    putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
-    putStrLn $
-        "  Bytes:        "
-            ++ show initialBytes
-            ++ " B -> "
-            ++ show reducedBytes
-            ++ " B (-"
-            ++ showFFloat (Just 1) ratio "%"
-            ++ ")"
-    putStrLn $ "  Oracle Calls: " ++ show totalCalls
-    putStrLn $ "  Cache Hits:   " ++ show totalHits
-    putStrLn $ "  Cache Misses: " ++ show totalMisses
-    putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
-    putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) elapsedSecs "s"
-    putStrLn $ "  Artifacts:    " ++ minimalPath
-    putStrLn $ "                " ++ replayPath
-    putStrLn $ "                " ++ statsPath
-    putStrLn "======================================================================"
+            -- 5. Print summary table
+            putStrLn "----------------------------------------------------------------------"
+            putStrLn "Reduction Complete!"
+            putStrLn "======================================================================"
+            putStrLn "Occam Reduction Summary"
+            putStrLn "======================================================================"
+            putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
+            putStrLn $
+                "  Bytes:        "
+                    ++ show initialBytes
+                    ++ " B -> "
+                    ++ show reducedBytes
+                    ++ " B (-"
+                    ++ showFFloat (Just 1) ratio "%"
+                    ++ ")"
+            putStrLn $ "  Oracle Calls: " ++ show totalCalls
+            putStrLn $ "  Cache Hits:   " ++ show totalHits
+            putStrLn $ "  Cache Misses: " ++ show totalMisses
+            putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
+            putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) elapsedSecs "s"
+            putStrLn $ "  Artifacts:    " ++ minimalPath
+            putStrLn $ "                " ++ replayPath
+            putStrLn $ "                " ++ statsPath
+            putStrLn "======================================================================"
