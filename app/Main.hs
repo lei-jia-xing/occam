@@ -1,11 +1,16 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module Main (main) where
 
 import Control.Monad (unless)
+import Data.Aeson (FromJSON, ToJSON, encode)
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BSL
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
+import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
 import Occam.Oracle (
@@ -57,6 +62,17 @@ data Options = Options
     , optFrames :: !Int
     }
     deriving (Eq, Show)
+
+data Stats = Stats
+    { initial_bytes :: !Int
+    , reduced_bytes :: !Int
+    , reduction_ratio :: !Double
+    , initial_statements :: !Int
+    , reduced_statements :: !Int
+    , oracle_executions :: !Int
+    , elapsed_seconds :: !Double
+    }
+    deriving (Eq, Show, Generic, ToJSON, FromJSON)
 
 optionsParser :: Parser Options
 optionsParser =
@@ -219,19 +235,17 @@ runOccam Options {..} = do
 
     -- stats.json
     let statsPath = optOutDir </> "stats.json"
-        statsJSON =
-            concat
-                [ "{\n"
-                , "  \"initial_bytes\": " ++ show initialBytes ++ ",\n"
-                , "  \"reduced_bytes\": " ++ show reducedBytes ++ ",\n"
-                , "  \"reduction_ratio\": " ++ showFFloat (Just 2) ratio "" ++ ",\n"
-                , "  \"initial_statements\": " ++ show initialStmts ++ ",\n"
-                , "  \"reduced_statements\": " ++ show reducedStmts ++ ",\n"
-                , "  \"oracle_executions\": " ++ show totalCalls ++ ",\n"
-                , "  \"elapsed_seconds\": " ++ showFFloat (Just 3) elapsedSecs "" ++ "\n"
-                , "}\n"
-                ]
-    writeFile statsPath statsJSON
+        stats =
+            Stats
+                { initial_bytes = initialBytes
+                , reduced_bytes = reducedBytes
+                , reduction_ratio = ratio
+                , initial_statements = initialStmts
+                , reduced_statements = reducedStmts
+                , oracle_executions = totalCalls
+                , elapsed_seconds = elapsedSecs
+                }
+    BSL.writeFile statsPath (encode stats)
 
     -- 5. Print summary table
     putStrLn "----------------------------------------------------------------------"

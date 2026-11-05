@@ -1,3 +1,7 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+
 module Occam.Oracle (
     CrashKind (..),
     StackFrame (..),
@@ -5,7 +9,6 @@ module Occam.Oracle (
     isEquivalentCrash,
     parseCrashReportJSON,
     crashReportToJSON,
-    parseGdbMiOutput,
     OracleConfig (..),
     executeReset,
     runExternalOracle,
@@ -14,39 +17,48 @@ module Occam.Oracle (
 
 import Control.Exception (IOException, handle)
 import Control.Monad (join, unless)
+import Data.Aeson (
+    FromJSON (..),
+    Object,
+    ToJSON (..),
+    decodeStrict,
+    encode,
+    object,
+    withObject,
+    (.!=),
+    (.:),
+    (.:?),
+    (.=),
+ )
+import Data.Aeson.Types (Parser)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
-import Data.Char (isDigit)
-import Data.List (intercalate)
-import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
-import Numeric (readHex)
+import GHC.Generics (Generic)
 import System.Exit (ExitCode (..))
-import System.IO (hClose, hFlush, hGetLine, hIsEOF, hPutStrLn)
+import System.IO (hClose, hFlush)
 import System.Process (
     CreateProcess (..),
     StdStream (..),
-    createProcess,
     proc,
     shell,
     waitForProcess,
+    withCreateProcess,
  )
 import System.Timeout (timeout)
 
 -- ----------------------------------------------------------------------------
--- 1. Typed CrashReport ADT
+-- 1. Typed CrashReport ADT & Community Aeson Serialization
 -- ----------------------------------------------------------------------------
 
 data CrashKind
     = SignalCrash !Int
-    | ASanCrash !Text
-    | AssertCrash !Text
-    | UnknownCrash
-    deriving (Eq, Show)
+    | ASanCrash !Text !(Maybe Text)
+    | AssertFailure !Text
+    | ExitFailureCode !Int
+    deriving (Eq, Show, Generic)
 
 data StackFrame = StackFrame
     { frameIndex :: !Int
@@ -54,14 +66,121 @@ data StackFrame = StackFrame
     , frameFile :: !(Maybe Text)
     , frameLine :: !(Maybe Int)
     }
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
 
 data CrashReport = CrashReport
     { reportKind :: !CrashKind
     , reportPC :: !(Maybe Word64)
     , reportFrames :: ![StackFrame]
     }
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
+
+instance ToJSON CrashKind where
+    toJSON = \case
+        SignalCrash sig ->
+            object ["kind" .= ("signal" :: Text), "signal" .= sig]
+        ASanCrash err mAddr ->
+            object $
+                [ "kind" .= ("asan" :: Text)
+                , "error_type" .= err
+                ]
+                    ++ maybe [] (\a -> ["address" .= a]) mAddr
+        AssertFailure msg ->
+            object
+                [ "kind" .= ("assert" :: Text)
+                , "assertion" .= msg
+                ]
+        ExitFailureCode code ->
+            object
+                [ "kind" .= ("exit" :: Text)
+                , "code" .= code
+                ]
+
+instance FromJSON CrashKind where
+    parseJSON = withObject "CrashKind" parseCrashKindFields
+
+parseCrashKindFields :: Object -> Parser CrashKind
+parseCrashKindFields o = do
+    mSig <- o .:? "signal" :: Parser (Maybe Int)
+    mKind <- o .:? "kind" :: Parser (Maybe Text)
+    mErrType <- o .:? "error_type" :: Parser (Maybe Text)
+    mAsan <- o .:? "asan" :: Parser (Maybe Text)
+    mAddr <- o .:? "address" :: Parser (Maybe Text)
+    mAssertion <- o .:? "assertion" :: Parser (Maybe Text)
+    mAssert <- o .:? "assert" :: Parser (Maybe Text)
+    mExitCode <- o .:? "exit_code" :: Parser (Maybe Int)
+    mCode <- o .:? "code" :: Parser (Maybe Int)
+    case () of
+        _
+            | Just sig <- mSig -> pure (SignalCrash sig)
+            | Just "SIGSEGV" <- mKind -> pure (SignalCrash 11)
+            | Just "SIGABRT" <- mKind -> pure (SignalCrash 6)
+            | Just "SIGBUS" <- mKind -> pure (SignalCrash 7)
+            | Just "SIGFPE" <- mKind -> pure (SignalCrash 8)
+            | Just "SIGILL" <- mKind -> pure (SignalCrash 4)
+            | Just "signal" <- mKind, Just sig <- mCode -> pure (SignalCrash sig)
+            | Just err <- mErrType -> pure (ASanCrash err mAddr)
+            | Just err <- mAsan -> pure (ASanCrash err mAddr)
+            | Just msg <- mAssertion -> pure (AssertFailure msg)
+            | Just msg <- mAssert -> pure (AssertFailure msg)
+            | Just code <- mExitCode -> pure (ExitFailureCode code)
+            | Just "exit" <- mKind, Just code <- mCode -> pure (ExitFailureCode code)
+            | otherwise -> fail "Unknown or invalid crash kind in JSON"
+
+instance ToJSON StackFrame where
+    toJSON StackFrame {..} =
+        object $
+            [ "index" .= frameIndex
+            , "function" .= frameFunction
+            ]
+                ++ maybe [] (\f -> ["file" .= f]) frameFile
+                ++ maybe [] (\l -> ["line" .= l]) frameLine
+
+instance FromJSON StackFrame where
+    parseJSON = withObject "StackFrame" $ \o ->
+        StackFrame
+            <$> o .:? "index" .!= 0
+            <*> o .: "function"
+            <*> o .:? "file"
+            <*> o .:? "line"
+
+instance ToJSON CrashReport where
+    toJSON CrashReport {..} =
+        object $
+            kindFields reportKind
+                ++ ["frames" .= reportFrames]
+                ++ maybe [] (\pc -> ["pc" .= pc]) reportPC
+        where
+            kindFields = \case
+                SignalCrash sig ->
+                    ["kind" .= ("signal" :: Text), "signal" .= sig]
+                ASanCrash err mAddr ->
+                    ["kind" .= ("asan" :: Text), "error_type" .= err]
+                        ++ maybe [] (\a -> ["address" .= a]) mAddr
+                AssertFailure msg ->
+                    ["kind" .= ("assert" :: Text), "assertion" .= msg]
+                ExitFailureCode code ->
+                    ["kind" .= ("exit" :: Text), "code" .= code]
+
+instance FromJSON CrashReport where
+    parseJSON = withObject "CrashReport" $ \o -> do
+        kind <- parseCrashKindFields o
+        pc <- o .:? "pc"
+        frames <- o .:? "frames" .!= []
+        pure
+            CrashReport
+                { reportKind = kind
+                , reportPC = pc
+                , reportFrames = frames
+                }
+
+-- | Parse a JSON ByteString into a typed CrashReport.
+parseCrashReportJSON :: ByteString -> Maybe CrashReport
+parseCrashReportJSON = decodeStrict
+
+-- | Serialize a CrashReport to a JSON ByteString.
+crashReportToJSON :: CrashReport -> ByteString
+crashReportToJSON = BSL.toStrict . encode
 
 -- ----------------------------------------------------------------------------
 -- 2. Semantic Equivalence Checker
@@ -77,309 +196,12 @@ isEquivalentCrash n r1 r2 =
             == take n (map frameFunction (reportFrames r2))
 
 -- ----------------------------------------------------------------------------
--- 3. Structured JSON Oracle Contract
+-- 3. Debugger Supervisor
 -- ----------------------------------------------------------------------------
 
-data JVal
-    = JObj ![(Text, JVal)]
-    | JArr ![JVal]
-    | JStr !Text
-    | JNum !Double
-    | JBool !Bool
-    | JNull
-    deriving (Eq, Show)
-
--- | Minimal robust JSON parser for CrashReport JSON.
-parseJSON :: Text -> Maybe JVal
-parseJSON input = case parseValue (T.strip input) of
-    Just (v, rest) | T.null (T.strip rest) -> Just v
-    _ -> Nothing
-    where
-        skipWs = T.dropWhile (\c -> c == ' ' || c == '\t' || c == '\n' || c == '\r')
-
-        parseValue s =
-            let s' = skipWs s
-             in case T.uncons s' of
-                    Nothing -> Nothing
-                    Just ('"', _) -> parseString s'
-                    Just ('{', _) -> parseObject s'
-                    Just ('[', _) -> parseArray s'
-                    Just ('t', _) -> if "true" `T.isPrefixOf` s' then Just (JBool True, T.drop 4 s') else Nothing
-                    Just ('f', _) -> if "false" `T.isPrefixOf` s' then Just (JBool False, T.drop 5 s') else Nothing
-                    Just ('n', _) -> if "null" `T.isPrefixOf` s' then Just (JNull, T.drop 4 s') else Nothing
-                    Just (c, _) | c == '-' || isDigit c -> parseNumber s'
-                    _ -> Nothing
-
-        parseString s = case T.uncons s of
-            Just ('"', rest) -> go rest T.empty
-            _ -> Nothing
-            where
-                go t acc = case T.uncons t of
-                    Nothing -> Nothing
-                    Just ('"', rest) -> Just (JStr acc, rest)
-                    Just ('\\', rest) -> case T.uncons rest of
-                        Just ('"', r) -> go r (T.snoc acc '"')
-                        Just ('\\', r) -> go r (T.snoc acc '\\')
-                        Just ('/', r) -> go r (T.snoc acc '/')
-                        Just ('n', r) -> go r (T.snoc acc '\n')
-                        Just ('t', r) -> go r (T.snoc acc '\t')
-                        Just ('r', r) -> go r (T.snoc acc '\r')
-                        Just (other, r) -> go r (T.snoc acc other)
-                        Nothing -> Nothing
-                    Just (c, rest) -> go rest (T.snoc acc c)
-
-        parseNumber s =
-            let (numStr, rest) =
-                    T.span
-                        (\c -> isDigit c || c == '-' || c == '.' || c == 'e' || c == 'E' || c == '+')
-                        s
-             in case reads (T.unpack numStr) of
-                    [(val, "")] -> Just (JNum val, rest)
-                    _ -> Nothing
-
-        parseArray s = case T.uncons s of
-            Just ('[', rest) ->
-                let rest' = skipWs rest
-                 in case T.uncons rest' of
-                        Just (']', r) -> Just (JArr [], r)
-                        _ -> parseElements rest' []
-            _ -> Nothing
-            where
-                parseElements cur acc = do
-                    (val, afterVal) <- parseValue cur
-                    let afterWs = skipWs afterVal
-                    case T.uncons afterWs of
-                        Just (',', next) -> parseElements (skipWs next) (val : acc)
-                        Just (']', r) -> Just (JArr (reverse (val : acc)), r)
-                        _ -> Nothing
-
-        parseObject s = case T.uncons s of
-            Just ('{', rest) ->
-                let rest' = skipWs rest
-                 in case T.uncons rest' of
-                        Just ('}', r) -> Just (JObj [], r)
-                        _ -> parsePairs rest' []
-            _ -> Nothing
-            where
-                parsePairs cur acc = do
-                    (JStr key, afterKey) <- parseString (skipWs cur)
-                    let afterColon = skipWs afterKey
-                    case T.uncons afterColon of
-                        Just (':', restVal) -> do
-                            (val, afterV) <- parseValue restVal
-                            let afterSep = skipWs afterV
-                            case T.uncons afterSep of
-                                Just (',', next) -> parsePairs (skipWs next) ((key, val) : acc)
-                                Just ('}', r) -> Just (JObj (reverse ((key, val) : acc)), r)
-                                _ -> Nothing
-                        _ -> Nothing
-
-lookupStr :: Text -> [(Text, JVal)] -> Maybe Text
-lookupStr k obj = case lookup k obj of
-    Just (JStr s) -> Just s
-    _ -> Nothing
-
-lookupInt :: Text -> [(Text, JVal)] -> Maybe Int
-lookupInt k obj = case lookup k obj of
-    Just (JNum n) -> Just (round n)
-    _ -> Nothing
-
-lookupWord64 :: Text -> [(Text, JVal)] -> Maybe Word64
-lookupWord64 k obj = case lookup k obj of
-    Just (JNum n) -> Just (round n)
-    _ -> Nothing
-
-lookupArr :: Text -> [(Text, JVal)] -> Maybe [JVal]
-lookupArr k obj = case lookup k obj of
-    Just (JArr a) -> Just a
-    _ -> Nothing
-
--- | Parse a JSON ByteString into a typed CrashReport.
-parseCrashReportJSON :: ByteString -> Maybe CrashReport
-parseCrashReportJSON bs = do
-    txt <- either (const Nothing) Just (TE.decodeUtf8' bs)
-    jval <- parseJSON txt
-    case jval of
-        JObj obj -> parseCrashReportObj obj
-        _ -> Nothing
-
-parseCrashReportObj :: [(Text, JVal)] -> Maybe CrashReport
-parseCrashReportObj obj = do
-    let mSig = lookupInt "signal" obj
-        mKindStr = lookupStr "kind" obj
-        mAssert = lookupStr "assert" obj
-        mAsan = lookupStr "asan" obj
-        kind = case (mSig, mKindStr, mAssert, mAsan) of
-            (Just sig, _, _, _) -> SignalCrash sig
-            (_, Just "SIGSEGV", _, _) -> SignalCrash 11
-            (_, Just "SIGABRT", _, _) -> SignalCrash 6
-            (_, Just "SIGBUS", _, _) -> SignalCrash 7
-            (_, Just "SIGFPE", _, _) -> SignalCrash 8
-            (_, Just "SIGILL", _, _) -> SignalCrash 4
-            (_, Just k, _, _) | "ASAN" `T.isInfixOf` T.toUpper k -> ASanCrash k
-            (_, Just k, _, _) | "ASSERT" `T.isInfixOf` T.toUpper k -> AssertCrash k
-            (_, _, Just msg, _) -> AssertCrash msg
-            (_, _, _, Just msg) -> ASanCrash msg
-            _ -> UnknownCrash
-        mPC = lookupWord64 "pc" obj
-        frames = case lookupArr "frames" obj of
-            Just arr -> mapMaybe parseFrame arr
-            Nothing -> []
-    pure
-        CrashReport
-            { reportKind = kind
-            , reportPC = mPC
-            , reportFrames = frames
-            }
-
-parseFrame :: JVal -> Maybe StackFrame
-parseFrame (JObj obj) = do
-    func <- lookupStr "function" obj
-    let idx = fromMaybe 0 (lookupInt "index" obj)
-        mFile = lookupStr "file" obj
-        mLine = lookupInt "line" obj
-    pure
-        StackFrame
-            { frameIndex = idx
-            , frameFunction = func
-            , frameFile = mFile
-            , frameLine = mLine
-            }
-parseFrame _ = Nothing
-
--- | Serialize a CrashReport to a JSON ByteString.
-crashReportToJSON :: CrashReport -> ByteString
-crashReportToJSON CrashReport {..} =
-    BSC.pack $
-        "{\"kind\":\""
-            ++ kindStr
-            ++ "\""
-            ++ sigField
-            ++ pcField
-            ++ ",\"frames\":["
-            ++ intercalate "," (map frameToJSON reportFrames)
-            ++ "]}"
-    where
-        (kindStr, sigField) = case reportKind of
-            SignalCrash s -> ("SignalCrash", ",\"signal\":" ++ show s)
-            ASanCrash msg -> ("ASanCrash", ",\"asan\":\"" ++ escapeJSON (T.unpack msg) ++ "\"")
-            AssertCrash msg -> ("AssertCrash", ",\"assert\":\"" ++ escapeJSON (T.unpack msg) ++ "\"")
-            UnknownCrash -> ("UnknownCrash", "")
-        pcField = case reportPC of
-            Just pc -> ",\"pc\":" ++ show pc
-            Nothing -> ""
-        frameToJSON StackFrame {..} =
-            "{\"index\":"
-                ++ show frameIndex
-                ++ ",\"function\":\""
-                ++ escapeJSON (T.unpack frameFunction)
-                ++ "\""
-                ++ maybe "" (\f -> ",\"file\":\"" ++ escapeJSON (T.unpack f) ++ "\"") frameFile
-                ++ maybe "" (\l -> ",\"line\":" ++ show l) frameLine
-                ++ "}"
-        escapeJSON = concatMap (\case '"' -> "\\\""; '\\' -> "\\\\"; c -> [c])
-
--- ----------------------------------------------------------------------------
--- 4. GDB-MI Output Parser & Debugger Supervisor
--- ----------------------------------------------------------------------------
-
-extractField :: Text -> Text -> Maybe Text
-extractField key txt =
-    let pat = key <> "=\""
-     in case T.breakOn pat txt of
-            (_, rest)
-                | not (T.null rest) ->
-                    let after = T.drop (T.length pat) rest
-                        val = T.takeWhile (/= '"') after
-                     in Just val
-            _ -> Nothing
-
-parseHexPC :: Text -> Maybe Word64
-parseHexPC txt =
-    let clean = if "0x" `T.isPrefixOf` txt || "0X" `T.isPrefixOf` txt then T.drop 2 txt else txt
-     in case readHex (T.unpack clean) of
-            [(val, "")] -> Just val
-            _ -> Nothing
-
-parseGdbFrame :: Text -> Maybe StackFrame
-parseGdbFrame frameText = do
-    func <- extractField "func" frameText
-    let mIdx =
-            extractField "level" frameText >>= \s -> case reads (T.unpack s) of
-                [(n, "")] -> Just n
-                _ -> Nothing
-        idx = fromMaybe 0 mIdx
-        mFile = extractField "file" frameText
-        mLine =
-            extractField "line" frameText >>= \s -> case reads (T.unpack s) of
-                [(n, "")] -> Just n
-                _ -> Nothing
-    pure
-        StackFrame
-            { frameIndex = idx
-            , frameFunction = func
-            , frameFile = mFile
-            , frameLine = mLine
-            }
-
--- | Parse GDB-MI text containing *stopped and/or stack=[frame={...},...] into a CrashReport.
-parseGdbMiOutput :: Text -> Maybe CrashReport
-parseGdbMiOutput miText = do
-    let linesList = T.lines miText
-        stoppedLine = case filter ("*stopped" `T.isInfixOf`) linesList of
-            (l : _) -> Just l
-            [] -> Nothing
-
-    -- Verify that a crash/signal stop actually occurred
-    stop <- stoppedLine
-    let reason = extractField "reason" stop
-        sigName = extractField "signal-name" stop
-        sigNum = case sigName of
-            Just "SIGSEGV" -> Just 11
-            Just "SIGABRT" -> Just 6
-            Just "SIGBUS" -> Just 7
-            Just "SIGFPE" -> Just 8
-            Just "SIGILL" -> Just 4
-            Just other -> case T.filter isDigit other of
-                s | not (T.null s) -> Just (read (T.unpack s))
-                _ -> Just 11
-            Nothing ->
-                if reason == Just "signal-received"
-                    then Just 11
-                    else Nothing
-
-    kind <- case sigNum of
-        Just n -> Just (SignalCrash n)
-        Nothing ->
-            if reason == Just "exited-signalled"
-                then Just (SignalCrash 11)
-                else Nothing
-
-    -- Extract frames (deduplicate by frameIndex, e.g. *stopped frame vs ^done,stack=[...])
-    let frameChunks = splitOnFrame miText
-        allFrames = mapMaybe parseGdbFrame frameChunks
-        frames = Map.elems (Map.fromList [(frameIndex f, f) | f <- allFrames])
-    -- Extract PC from first frame addr
-    let mPC = case frameChunks of
-            (f : _) -> extractField "addr" f >>= parseHexPC
-            [] -> Nothing
-
-    pure
-        CrashReport
-            { reportKind = kind
-            , reportPC = mPC
-            , reportFrames = frames
-            }
-    where
-        splitOnFrame t = case T.breakOn "frame={" t of
-            (_, rest)
-                | not (T.null rest) ->
-                    let after = T.drop 7 rest
-                        (body, tailRest) = T.breakOn "}" after
-                     in body : splitOnFrame tailRest
-            _ -> []
-
--- | Run target under GDB-MI, wait for crash/stop, extract CrashReport.
+{- | Run target under GDB, extracting typed CrashReport via Aeson JSON dump.
+Process execution is protected against timeouts without leaving zombie processes.
+-}
 runGdbSupervisor ::
     FilePath ->
     [String] ->
@@ -388,71 +210,82 @@ runGdbSupervisor ::
     IO (Maybe CrashReport)
 runGdbSupervisor targetProg targetArgs sql timeoutMicros =
     handle (\(_ :: IOException) -> pure Nothing) $ do
-        let gdbArgs = ["-q", "--nx", "-interpreter=mi2", "--args", targetProg] ++ targetArgs
-        mRes <- timeout timeoutMicros $ do
-            (Just hIn, Just hOut, _, ph) <-
-                createProcess
-                    (proc "gdb" gdbArgs)
-                        { std_in = CreatePipe
-                        , std_out = CreatePipe
-                        , std_err = CreatePipe
-                        }
-            hPutStrLn hIn "-exec-run"
-            hFlush hIn
-
-            unless (BSC.null sql) $ do
-                BSC.hPutStrLn hIn sql
-                hFlush hIn
-
-            outText <- readMiOutput hIn hOut ph
-            pure (parseGdbMiOutput outText)
+        let gdbPythonScript =
+                "import gdb, json\n\
+                \try:\n\
+                \    gdb.execute('run')\n\
+                \except Exception:\n\
+                \    pass\n\
+                \try:\n\
+                \    frame = gdb.newest_frame()\n\
+                \    pc = frame.pc()\n\
+                \    frames = []\n\
+                \    cur = frame\n\
+                \    idx = 0\n\
+                \    while cur and idx < 20:\n\
+                \        sal = cur.find_sal()\n\
+                \        frames.append({\n\
+                \            'index': idx,\n\
+                \            'function': cur.name() or '???',\n\
+                \            'file': sal.symtab.filename if sal and sal.symtab else None,\n\
+                \            'line': sal.line if sal and sal.line > 0 else None\n\
+                \        })\n\
+                \        cur = cur.older()\n\
+                \        idx += 1\n\
+                \    report = {'kind': 'signal', 'signal': 11, 'pc': pc, 'frames': frames}\n\
+                \    print('---JSON_REPORT_BEGIN---')\n\
+                \    print(json.dumps(report))\n\
+                \except Exception:\n\
+                \    pass\n"
+            gdbArgs =
+                ["--batch", "-q", "-nx", "-ex", "set confirm off", "-ex", "set pagination off"]
+                    ++ ["-ex", "file " ++ targetProg]
+                    ++ (if null targetArgs then [] else ["-ex", "set args " ++ unwords targetArgs])
+                    ++ ["-ex", "python " ++ gdbPythonScript]
+            cp =
+                (proc "gdb" gdbArgs)
+                    { std_in = CreatePipe
+                    , std_out = CreatePipe
+                    , std_err = CreatePipe
+                    }
+        mRes <- timeout timeoutMicros $
+            withCreateProcess cp $ \mbIn mbOut _ ph -> case (mbIn, mbOut) of
+                (Just hIn, Just hOut) -> do
+                    handle (\(_ :: IOException) -> pure ()) $ do
+                        unless (BSC.null sql) $ do
+                            BSC.hPutStr hIn sql
+                            hFlush hIn
+                        hClose hIn
+                    outBytes <- BSC.hGetContents hOut
+                    _ <- waitForProcess ph
+                    pure $ extractJsonReport outBytes
+                _ -> pure Nothing
         pure (join mRes)
     where
-        readMiOutput hIn hOut ph = do
-            output <- readLines hIn hOut []
-            _ <- waitForProcess ph
-            pure (T.unlines (reverse output))
-
-        readLines hIn hOut acc = do
-            isEof <- hIsEOF hOut
-            if isEof
-                then pure acc
-                else do
-                    line <- T.pack <$> hGetLine hOut
-                    let acc' = line : acc
-                    if "*stopped" `T.isPrefixOf` line
-                        then do
-                            hPutStrLn hIn "-stack-list-frames 0 10"
-                            hPutStrLn hIn "-gdb-exit"
-                            hFlush hIn
-                            drainLines hOut acc'
-                        else
-                            if "^exit" `T.isPrefixOf` line || "*stopped,reason=\"exited" `T.isPrefixOf` line
-                                then pure acc'
-                                else readLines hIn hOut acc'
-
-        drainLines hOut acc = do
-            isEof <- hIsEOF hOut
-            if isEof
-                then pure acc
-                else do
-                    line <- T.pack <$> hGetLine hOut
-                    drainLines hOut (line : acc)
+        extractJsonReport bs =
+            let marker = "---JSON_REPORT_BEGIN---\n"
+             in case BSC.breakSubstring marker bs of
+                    (_, rest)
+                        | not (BSC.null rest) ->
+                            let jsonBS = BSC.drop (BSC.length marker) rest
+                             in parseCrashReportJSON (BSC.takeWhile (/= '\n') jsonBS)
+                    _ -> parseCrashReportJSON bs
 
 -- ----------------------------------------------------------------------------
--- 5. Lightweight State Reset Mechanism
+-- 4. Lightweight State Reset Mechanism
 -- ----------------------------------------------------------------------------
 
 -- | Run a database/environment reset command.
 executeReset :: Maybe String -> IO Bool
 executeReset Nothing = pure True
-executeReset (Just cmd) = do
-    (_, _, _, ph) <- createProcess (shell cmd)
-    exitCode <- waitForProcess ph
-    pure (exitCode == ExitSuccess)
+executeReset (Just cmd) =
+    handle (\(_ :: IOException) -> pure False) $
+        withCreateProcess (shell cmd) $ \_ _ _ ph -> do
+            exitCode <- waitForProcess ph
+            pure (exitCode == ExitSuccess)
 
 -- ----------------------------------------------------------------------------
--- 6. External Oracle Runner
+-- 5. External Oracle Runner
 -- ----------------------------------------------------------------------------
 
 data OracleConfig = OracleConfig
@@ -471,7 +304,23 @@ runExternalOracle OracleConfig {..} sql = do
     if not resetOk
         then pure False
         else do
-            mResult <- timeout oracleTimeoutMicros runProcessWithStdin
+            let cp =
+                    (proc oracleCommand oracleArgs)
+                        { std_in = CreatePipe
+                        , std_out = CreatePipe
+                        , std_err = Inherit
+                        }
+            mResult <- timeout oracleTimeoutMicros $
+                withCreateProcess cp $ \mbIn mbOut _ ph -> case (mbIn, mbOut) of
+                    (Just hIn, Just hOut) -> do
+                        handle (\(_ :: IOException) -> pure ()) $ do
+                            BSC.hPutStr hIn sql
+                            hFlush hIn
+                            hClose hIn
+                        outBytes <- BSC.hGetContents hOut
+                        exitCode <- waitForProcess ph
+                        pure (exitCode, outBytes)
+                    _ -> pure (ExitFailure (-1), BSC.empty)
             case mResult of
                 Nothing -> pure False
                 Just (exitCode, stdoutBytes) ->
@@ -486,20 +335,6 @@ runExternalOracle OracleConfig {..} sql = do
                             case parseCrashReportJSON stdoutBytes of
                                 Just _ -> pure True
                                 Nothing -> pure (isCrashExitCode exitCode)
-    where
-        runProcessWithStdin = do
-            (Just hIn, Just hOut, _, ph) <-
-                createProcess
-                    (proc oracleCommand oracleArgs)
-                        { std_in = CreatePipe
-                        , std_out = CreatePipe
-                        , std_err = Inherit
-                        }
-            BSC.hPutStr hIn sql
-            hClose hIn
-            outBytes <- BSC.hGetContents hOut
-            exitCode <- waitForProcess ph
-            pure (exitCode, outBytes)
 
 isCrashExitCode :: ExitCode -> Bool
 isCrashExitCode ExitSuccess = True

@@ -281,20 +281,29 @@ phase4Tests =
                 Nothing -> assertFailure "Failed to parse round-tripped JSON"
                 Just rtReport ->
                     assertBool "Round-tripped CrashReport did not match" (isEquivalentCrash 1 reportA rtReport)
-        , testCase "GDB-MI output parsing" $ do
-            let gdbMiSample =
-                    T.unlines
-                        [ "*stopped,reason=\"signal-received\",signal-name=\"SIGSEGV\",signal-meaning=\"Segmentation fault\",frame={level=\"0\",addr=\"0x0000000000401000\",func=\"ExecScan\",file=\"execScan.c\",line=\"42\"}"
-                        , "^done,stack=[frame={level=\"0\",addr=\"0x0000000000401000\",func=\"ExecScan\",file=\"execScan.c\",line=\"42\"},frame={level=\"1\",addr=\"0x0000000000402000\",func=\"standard_ExecutorRun\",file=\"execMain.c\",line=\"300\"}]"
-                        ]
-            case parseGdbMiOutput gdbMiSample of
-                Nothing -> assertFailure "Failed to parse GDB-MI sample output"
-                Just miReport -> do
-                    assertEqual "Expected SignalCrash 11" (SignalCrash 11) (reportKind miReport)
-                    assertEqual "Expected 2 stack frames" 2 (length (reportFrames miReport))
-                    case reportFrames miReport of
-                        (f0 : _) -> assertEqual "Expected top function ExecScan" "ExecScan" (frameFunction f0)
-                        [] -> assertFailure "Expected non-empty frames"
+        , testCase "Typed CrashReport contract (ASan, Assert, ExitCode)" $ do
+            let asanPayload =
+                    BSC.pack
+                        "{\"kind\":\"asan\",\"error_type\":\"heap-use-after-free\",\"address\":\"0x1000\",\"frames\":[{\"index\":0,\"function\":\"free_buf\"}]}"
+            case parseCrashReportJSON asanPayload of
+                Nothing -> assertFailure "Failed to parse ASan crash report JSON"
+                Just r -> do
+                    assertEqual "Expected ASanCrash" (ASanCrash "heap-use-after-free" (Just "0x1000")) (reportKind r)
+                    assertEqual "Expected 1 frame" 1 (length (reportFrames r))
+            let assertPayload =
+                    BSC.pack
+                        "{\"kind\":\"assert\",\"assertion\":\"ptr != NULL\",\"frames\":[]}"
+            case parseCrashReportJSON assertPayload of
+                Nothing -> assertFailure "Failed to parse Assert crash report JSON"
+                Just r ->
+                    assertEqual "Expected AssertFailure" (AssertFailure "ptr != NULL") (reportKind r)
+            let exitPayload =
+                    BSC.pack
+                        "{\"kind\":\"exit\",\"code\":139,\"frames\":[]}"
+            case parseCrashReportJSON exitPayload of
+                Nothing -> assertFailure "Failed to parse ExitCode crash report JSON"
+                Just r ->
+                    assertEqual "Expected ExitFailureCode 139" (ExitFailureCode 139) (reportKind r)
         , testCase "Lightweight reset mechanism" $ do
             resNone <- executeReset Nothing
             assertBool "executeReset Nothing should return True" resNone
