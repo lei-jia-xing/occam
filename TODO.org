@@ -2,33 +2,33 @@
 #+AUTHOR: Hunter
 #+TODO: TODO(t) IN_PROGRESS(i) | DONE(d) BLOCKED(b)
 
-* 1. Frontend & CST Surgery (Tree-sitter)
+* 1. Frontend & CST Surgery (Tree-sitter)                              :ARCHIVE:
 ** DONE Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
 ** DONE Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
 ** DONE Byte-span text surgery: cut spans, replace with literals (zero unparser / zero re-formatting)
 ** DONE Multi-statement boundary detection: extract top-level statement sequence
 
-* 2. Semantic Dependency Analysis (Def/Use/Mod)
+* 2. Semantic Dependency Analysis (Def/Use/Mod)                        :ARCHIVE:
 ** DONE CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)
 ** DONE CST pattern matcher: extract DML references (tables/columns in SELECT, INSERT, UPDATE, DELETE)
 ** DONE Construct cross-statement dependency DAG (Directed Acyclic Graph)
 ** DONE Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
 
-* 3. Hierarchical Reduction Engine
+* 3. Hierarchical Reduction Engine                                     :ARCHIVE:
 ** DONE Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
 ** DONE Level 2: Closure-level delta debugging (ddmin over topological DAG components)
 ** DONE Level 3: Intra-statement CST pruning (remove optional clauses: WHERE, ORDER BY, unused columns)
 ** DONE Level 4: Expression simplification (binary expression -> operand -> literal)
 ** DONE Fixed-point scheduler: iterate levels until minimal fixed-point is reached
 
-* 4. Semantic Crash Oracle & Environment
+* 4. Semantic Crash Oracle & Environment                               :ARCHIVE:
 ** DONE Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])
 ** DONE Cross-platform debugger supervisor (LLDB / GDB-MI interface: structured event capture)
 ** DONE Standalone JSON Oracle contract (supports external runners emitting typed crash JSON)
 ** DONE Lightweight state reset: database-level DROP/CREATE or socket-level respawn
 ** DONE Semantic equivalence checker: compare CrashReport equality (avoid bug slippage)
 
-* 5. CLI & Test Suite
+* 5. CLI & Test Suite                                                  :ARCHIVE:
 ** DONE CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
 ** DONE Result exporter: emit minimal.sql, reproduction command, and reduction metrics
 ** DONE Unit test suite: CST byte cutting and dependency DAG correctness

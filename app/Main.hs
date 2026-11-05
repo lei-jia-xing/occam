@@ -5,7 +5,6 @@ module Main (main) where
 import Control.Monad (unless)
 import Data.ByteString qualified as BS
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (isPrefixOf)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Numeric (showFFloat)
 import Occam qualified
@@ -15,6 +14,29 @@ import Occam.Oracle (
  )
 import Occam.Reducer (reduceSQL)
 import Occam.TreeSitter (extractStatements, parseSQL, withParser)
+import Options.Applicative (
+    Parser,
+    ParserInfo,
+    auto,
+    execParser,
+    fullDesc,
+    header,
+    help,
+    helper,
+    info,
+    infoOption,
+    long,
+    metavar,
+    option,
+    optional,
+    progDesc,
+    short,
+    showDefault,
+    strArgument,
+    strOption,
+    value,
+    (<**>),
+ )
 import System.Directory (
     createDirectoryIfMissing,
     doesFileExist,
@@ -22,73 +44,80 @@ import System.Directory (
     setOwnerExecutable,
     setPermissions,
  )
-import System.Environment (getArgs)
-import System.Exit (exitFailure, exitSuccess)
+import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 
-data CLIConfig = CLIConfig
-    { cliInputFile :: !FilePath
-    , cliOracleCmd :: !String
-    , cliOutDir :: !FilePath
-    , cliResetCmd :: !(Maybe String)
-    , cliTimeoutSecs :: !Double
-    , cliFrames :: !Int
+data Options = Options
+    { optInputFile :: !FilePath
+    , optOracleCmd :: !String
+    , optOutDir :: !FilePath
+    , optResetCmd :: !(Maybe String)
+    , optTimeoutSecs :: !Double
+    , optFrames :: !Int
     }
     deriving (Eq, Show)
 
-defaultConfig :: CLIConfig
-defaultConfig =
-    CLIConfig
-        { cliInputFile = ""
-        , cliOracleCmd = ""
-        , cliOutDir = "./occam-out"
-        , cliResetCmd = Nothing
-        , cliTimeoutSecs = 5.0
-        , cliFrames = 3
-        }
+optionsParser :: Parser Options
+optionsParser =
+    Options
+        <$> strArgument
+            ( metavar "INPUT.sql"
+                <> help "Path to input SQL crash reproduction script"
+            )
+        <*> strOption
+            ( long "oracle"
+                <> metavar "COMMAND"
+                <> help "Target crash oracle command (e.g. script or binary)"
+            )
+        <*> strOption
+            ( long "out"
+                <> metavar "DIR"
+                <> value "occam-out"
+                <> showDefault
+                <> help "Directory where reduced artifacts will be written"
+            )
+        <*> optional
+            ( strOption
+                ( long "reset"
+                    <> metavar "COMMAND"
+                    <> help "Lightweight state reset command (e.g. dropdb/createdb)"
+                )
+            )
+        <*> option
+            auto
+            ( long "timeout"
+                <> metavar "SECONDS"
+                <> value 10.0
+                <> showDefault
+                <> help "Per-execution timeout in seconds"
+            )
+        <*> option
+            auto
+            ( long "frames"
+                <> metavar "N"
+                <> value 3
+                <> showDefault
+                <> help "Top-N stack frame functions required for crash equivalence"
+            )
 
-parseArgs :: [String] -> Either String (Maybe CLIConfig)
-parseArgs args
-    | "--help" `elem` args || "-h" `elem` args = Right Nothing
-    | "--version" `elem` args || "-v" `elem` args = Right Nothing
-    | otherwise = go args defaultConfig
-    where
-        go [] cfg
-            | null (cliInputFile cfg) = Left "Missing required input SQL file."
-            | null (cliOracleCmd cfg) = Left "Missing required --oracle command."
-            | otherwise = Right (Just cfg)
-        go ("--oracle" : cmd : rest) cfg = go rest cfg {cliOracleCmd = cmd}
-        go ("--out" : dir : rest) cfg = go rest cfg {cliOutDir = dir}
-        go ("--reset" : cmd : rest) cfg = go rest cfg {cliResetCmd = Just cmd}
-        go ("--timeout" : sec : rest) cfg =
-            case reads sec of
-                [(s, "")] -> go rest cfg {cliTimeoutSecs = s}
-                _ -> Left $ "Invalid timeout value: " ++ sec
-        go ("--frames" : n : rest) cfg =
-            case reads n of
-                [(f, "")] -> go rest cfg {cliFrames = f}
-                _ -> Left $ "Invalid frames value: " ++ n
-        go (arg : rest) cfg
-            | "-" `isPrefixOf` arg = Left $ "Unrecognized option: " ++ arg
-            | null (cliInputFile cfg) = go rest cfg {cliInputFile = arg}
-            | otherwise = Left $ "Unexpected positional argument: " ++ arg
+versionOption :: Parser (a -> a)
+versionOption =
+    infoOption
+        ("Occam v" ++ Occam.version)
+        ( long "version"
+            <> short 'v'
+            <> help "Show version information"
+        )
 
-printHelp :: IO ()
-printHelp = do
-    putStrLn $ "Occam v" ++ Occam.version ++ ": Dependency-Aware SQL Crash Minimizer"
-    putStrLn ""
-    putStrLn "Usage:"
-    putStrLn "  occam <input.sql> --oracle <oracle_cmd> [options]"
-    putStrLn ""
-    putStrLn "Options:"
-    putStrLn "  --oracle <cmd>       Target oracle command (executable or script) [REQUIRED]"
-    putStrLn "  --out <dir>          Directory to write artifacts (default: ./occam-out)"
-    putStrLn "  --reset <cmd>        Lightweight state reset command (e.g. dropdb/createdb)"
-    putStrLn "  --timeout <seconds>  Per-execution timeout in seconds (default: 5.0)"
-    putStrLn "  --frames <N>         Number of top stack frames for crash equivalence (default: 3)"
-    putStrLn "  --version, -v        Display version"
-    putStrLn "  --help, -h           Display this help message"
+optsInfo :: ParserInfo Options
+optsInfo =
+    info
+        (optionsParser <**> versionOption <**> helper)
+        ( fullDesc
+            <> progDesc "Occam: Dependency-Aware SQL Crash Minimizer"
+            <> header ("Occam v" ++ Occam.version ++ " - Semantic multi-statement crash reducer")
+        )
 
 countStatements :: BS.ByteString -> IO Int
 countStatements sql = withParser $ \p -> do
@@ -98,29 +127,16 @@ countStatements sql = withParser $ \p -> do
         Just tree -> length <$> extractStatements tree sql
 
 main :: IO ()
-main = do
-    args <- getArgs
-    if "--version" `elem` args || "-v" `elem` args
-        then putStrLn ("Occam v" ++ Occam.version) >> exitSuccess
-        else
-            if "--help" `elem` args || "-h" `elem` args || null args
-                then printHelp >> exitSuccess
-                else case parseArgs args of
-                    Left err -> do
-                        hPutStrLn stderr ("Error: " ++ err)
-                        hPutStrLn stderr "Run 'occam --help' for usage."
-                        exitFailure
-                    Right Nothing -> printHelp >> exitSuccess
-                    Right (Just cfg) -> runOccam cfg
+main = execParser optsInfo >>= runOccam
 
-runOccam :: CLIConfig -> IO ()
-runOccam CLIConfig {..} = do
-    fileExists <- doesFileExist cliInputFile
+runOccam :: Options -> IO ()
+runOccam Options {..} = do
+    fileExists <- doesFileExist optInputFile
     unless fileExists $ do
-        hPutStrLn stderr ("Error: Input file not found: " ++ cliInputFile)
+        hPutStrLn stderr ("Error: Input file not found: " ++ optInputFile)
         exitFailure
 
-    initialSQL <- BS.readFile cliInputFile
+    initialSQL <- BS.readFile optInputFile
     initialStmts <- countStatements initialSQL
     let initialBytes = BS.length initialSQL
 
@@ -129,25 +145,25 @@ runOccam CLIConfig {..} = do
     putStrLn "======================================================================"
     putStrLn $
         "  Target SQL:   "
-            ++ cliInputFile
+            ++ optInputFile
             ++ " ("
             ++ show initialBytes
             ++ " bytes, "
             ++ show initialStmts
             ++ " stmts)"
-    putStrLn $ "  Oracle Cmd:   " ++ cliOracleCmd
-    putStrLn $ "  Artifact Dir: " ++ cliOutDir
+    putStrLn $ "  Oracle Cmd:   " ++ optOracleCmd
+    putStrLn $ "  Artifact Dir: " ++ optOutDir
     putStrLn "----------------------------------------------------------------------"
 
     -- Setup oracle and counter
     oracleCallsRef <- newIORef (0 :: Int)
-    let timeoutMicros = round (cliTimeoutSecs * 1000000)
+    let timeoutMicros = round (optTimeoutSecs * 1000000)
         baseOracleCfg =
             OracleConfig
                 { oracleCommand = "sh"
-                , oracleArgs = ["-c", cliOracleCmd]
+                , oracleArgs = ["-c", optOracleCmd]
                 , oracleTimeoutMicros = timeoutMicros
-                , oracleResetCommand = cliResetCmd
+                , oracleResetCommand = optResetCmd
                 , oracleExpectedCrash = Nothing
                 }
 
@@ -181,28 +197,28 @@ runOccam CLIConfig {..} = do
                 else 0.0
 
     -- 4. Export artifacts
-    createDirectoryIfMissing True cliOutDir
+    createDirectoryIfMissing True optOutDir
 
     -- minimal.sql
-    let minimalPath = cliOutDir </> "minimal.sql"
+    let minimalPath = optOutDir </> "minimal.sql"
     BS.writeFile minimalPath reducedSQL
 
     -- replay.sh
-    let replayPath = cliOutDir </> "replay.sh"
+    let replayPath = optOutDir </> "replay.sh"
         replayScript =
             unlines
                 [ "#!/usr/bin/env bash"
                 , "set -euo pipefail"
                 , "DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\""
                 , "echo \"==> Replaying minimal.sql against oracle...\""
-                , cliOracleCmd ++ " < \"$DIR/minimal.sql\""
+                , optOracleCmd ++ " < \"$DIR/minimal.sql\""
                 ]
     writeFile replayPath replayScript
     perms <- getPermissions replayPath
     setPermissions replayPath (setOwnerExecutable True perms)
 
     -- stats.json
-    let statsPath = cliOutDir </> "stats.json"
+    let statsPath = optOutDir </> "stats.json"
         statsJSON =
             concat
                 [ "{\n"
