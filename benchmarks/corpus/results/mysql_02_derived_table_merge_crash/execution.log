@@ -1,0 +1,25 @@
+======================================================================
+Occam v0.1.0.0 starting reduction
+======================================================================
+  Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_02_derived_table_merge_crash.sql (2138 bytes, 9 stmts)
+  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash
+----------------------------------------------------------------------
+Verifying initial crash reproduction... OK (Reproduced)
+Running hierarchical reduction engine (Levels 1-4)...
+----------------------------------------------------------------------
+Reduction Complete!
+======================================================================
+Occam Reduction Summary
+======================================================================
+  Statements:   9 -> 1
+  Bytes:        2138 B -> 734 B (-65.7%)
+  Oracle Calls: 2
+  Cache Hits:   2
+  Cache Misses: 2
+  Hit Ratio:    50.0%
+  Elapsed Time: 0.065s
+  Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/minimal.sql
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/replay.sh
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_02_derived_table_merge_crash/stats.json
+======================================================================

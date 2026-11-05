@@ -1,0 +1,25 @@
+======================================================================
+Occam v0.1.0.0 starting reduction
+======================================================================
+  Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_03_json_extract_wildcard_segv.sql (2153 bytes, 7 stmts)
+  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_03_json_extract_wildcard_segv
+----------------------------------------------------------------------
+Verifying initial crash reproduction... OK (Reproduced)
+Running hierarchical reduction engine (Levels 1-4)...
+----------------------------------------------------------------------
+Reduction Complete!
+======================================================================
+Occam Reduction Summary
+======================================================================
+  Statements:   7 -> 1
+  Bytes:        2153 B -> 748 B (-65.3%)
+  Oracle Calls: 2
+  Cache Hits:   2
+  Cache Misses: 2
+  Hit Ratio:    50.0%
+  Elapsed Time: 0.056s
+  Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_03_json_extract_wildcard_segv/minimal.sql
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_03_json_extract_wildcard_segv/replay.sh
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_03_json_extract_wildcard_segv/stats.json
+======================================================================

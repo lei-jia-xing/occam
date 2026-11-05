@@ -1,0 +1,322 @@
+[
+  {
+    "id": "pg_01",
+    "file": "real_crashes/pg_01_jsonb_subpath_crash.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGSEGV (Null pointer dereference)",
+    "defect_module": "backend/utils/adt/jsonpath_exec.c",
+    "bug_id": "PG-BUG-16982 / SQLancer-PG-2020-09",
+    "description": "Nested JSONB path traversal null pointer dereference during jsonb_path_query evaluation with filter predicate and jsonb_strip_nulls.",
+    "statements": 9
+  },
+  {
+    "id": "pg_02",
+    "file": "real_crashes/pg_02_gin_fastupdate_crash.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGSEGV / Assertion Failure",
+    "defect_module": "backend/access/gin/ginfast.c",
+    "bug_id": "PG-BUG-15424",
+    "description": "GIN fastupdate pending list corruption during concurrent inserts with fastupdate enabled, leading to segfault during ginInsertCleanup.",
+    "statements": 10
+  },
+  {
+    "id": "pg_03",
+    "file": "real_crashes/pg_03_window_frame_segv.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGSEGV (Buffer underflow in tuple spool)",
+    "defect_module": "backend/executor/nodeWindowAgg.c",
+    "bug_id": "PG-BUG-16298 / SQUIRREL-PG-2021-33",
+    "description": "Window function frame boundary calculation with RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW on nullable expressions.",
+    "statements": 7
+  },
+  {
+    "id": "pg_04",
+    "file": "real_crashes/pg_04_partition_prune_assert.sql",
+    "dbms": "postgresql",
+    "bug_class": "Assertion Failure (bms_is_member in partition pruning)",
+    "defect_module": "backend/partitioning/partprune.c",
+    "bug_id": "PG-BUG-17101",
+    "description": "Run-time partition pruning assertion failure on composite range partition key with DEFAULT partition when evaluating parameterized OR clauses.",
+    "statements": 6
+  },
+  {
+    "id": "pg_05",
+    "file": "real_crashes/pg_05_enum_range_overflow.sql",
+    "dbms": "postgresql",
+    "bug_class": "Memory Corruption / SIGSEGV",
+    "defect_module": "backend/utils/adt/enum.c",
+    "bug_id": "PG-BUG-15822 / SQLancer-PG-2019-12",
+    "description": "enum_range() invoked over reordered enum type elements added via ALTER TYPE causing array indexing bounds violation in enum_range_internal.",
+    "statements": 9
+  },
+  {
+    "id": "pg_06",
+    "file": "real_crashes/pg_06_cte_cycle_detection.sql",
+    "dbms": "postgresql",
+    "bug_class": "Assertion Failure (cycle_data != NULL)",
+    "defect_module": "backend/executor/nodeRecursiveunion.c",
+    "bug_id": "PG-BUG-17345",
+    "description": "Recursive CTE cycle detection assertion failure when combining CYCLE clause with set operations and outer joins.",
+    "statements": 9
+  },
+  {
+    "id": "pg_07",
+    "file": "real_crashes/pg_07_brin_inclusion_abort.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGABRT / Assertion Failure",
+    "defect_module": "backend/access/brin/brin_inclusion.c",
+    "bug_id": "PG-BUG-16611",
+    "description": "BRIN inclusion operator class crash during index summarization of empty and NULL ranges.",
+    "statements": 10
+  },
+  {
+    "id": "pg_08",
+    "file": "real_crashes/pg_08_xml_parse_memory_leak.sql",
+    "dbms": "postgresql",
+    "bug_class": "Memory Corruption / Double Free (xmlFreeDoc)",
+    "defect_module": "backend/utils/adt/xml.c",
+    "bug_id": "PG-BUG-16477",
+    "description": "xpath() evaluation on malformed XML entities leaking LibXML2 parser contexts leading to memory corruption in allocator.",
+    "statements": 8
+  },
+  {
+    "id": "pg_09",
+    "file": "real_crashes/pg_09_foreign_table_join_crash.sql",
+    "dbms": "postgresql",
+    "bug_class": "Plan Tree Corruption / SIGSEGV (reparameterize_path)",
+    "defect_module": "backend/optimizer/path/joinpath.c",
+    "bug_id": "PG-BUG-17488 / SQLancer-PG-2022-01",
+    "description": "Planner crash during path reparameterization for lateral joins involving partitioned tables and outer join grouping sets.",
+    "statements": 6
+  },
+  {
+    "id": "pg_10",
+    "file": "real_crashes/pg_10_tsvector_strip_segv.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGSEGV (Null pointer dereference in strip_tsvector)",
+    "defect_module": "backend/utils/adt/tsvector_op.c",
+    "bug_id": "PG-BUG-16812",
+    "description": "tsvector_strip() null pointer dereference on tsvector with empty word list and position weights when combined with ts_stat or tsvector concatenation.",
+    "statements": 8
+  },
+  {
+    "id": "pg_11",
+    "file": "real_crashes/pg_11_composite_domain_check.sql",
+    "dbms": "postgresql",
+    "bug_class": "Type Confusion / Memory Corruption (ExecEvalCoerceViaIO)",
+    "defect_module": "backend/executor/execExpr.c",
+    "bug_id": "PG-BUG-17029",
+    "description": "Nested domain check constraint failure on composite type attributes leading to executor type confusion when evaluating CoerceViaIO in UPDATE.",
+    "statements": 10
+  },
+  {
+    "id": "pg_12",
+    "file": "real_crashes/pg_12_lateral_join_corrupt.sql",
+    "dbms": "postgresql",
+    "bug_class": "Assertion Failure (bms_is_subset(lateral_relids, relids))",
+    "defect_module": "backend/optimizer/plan/subselect.c",
+    "bug_id": "PG-BUG-17255 / SQLancer-PG-2021-11",
+    "description": "Corrupt join relids in lateral reference when flattening nested subqueries with multiple left outer joins.",
+    "statements": 11
+  },
+  {
+    "id": "pg_13",
+    "file": "real_crashes/pg_13_generated_col_dependency.sql",
+    "dbms": "postgresql",
+    "bug_class": "Plan Tree Corruption (SearchSysCacheAttNum)",
+    "defect_module": "backend/rewrite/rewriteHandler.c",
+    "bug_id": "PG-BUG-16550",
+    "description": "Planner crash during query rewrite when accessing generated column whose stored expression involves array slicing after column alterations.",
+    "statements": 9
+  },
+  {
+    "id": "pg_14",
+    "file": "real_crashes/pg_14_temp_table_cleanup_abort.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGABRT (Assertion Failure !InTransactionState)",
+    "defect_module": "backend/commands/tablecmds.c",
+    "bug_id": "PG-BUG-16104",
+    "description": "Catalog cache invalidation crash during ON COMMIT DROP temp table cleanup inside aborted subtransaction savepoints.",
+    "statements": 8
+  },
+  {
+    "id": "pg_15",
+    "file": "real_crashes/pg_15_spgist_box_index_crash.sql",
+    "dbms": "postgresql",
+    "bug_class": "Stack Overflow / SIGSEGV (spg_quad_box_leaf_split)",
+    "defect_module": "backend/access/spgist/spgquadbox.c",
+    "bug_id": "PG-BUG-16781",
+    "description": "SP-GiST quad-tree inner split infinite recursion / stack overflow when indexing identical 2D box coordinates.",
+    "statements": 8
+  },
+  {
+    "id": "pg_16",
+    "file": "real_crashes/pg_16_multirange_canonical_segv.sql",
+    "dbms": "postgresql",
+    "bug_class": "SIGSEGV (Invalid function pointer in canonical multirange handler)",
+    "defect_module": "backend/utils/adt/multirangetypes.c",
+    "bug_id": "PG-BUG-17510",
+    "description": "Canonical function pointer dereference crash during multirange aggregation and intersection on empty multiranges.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_01",
+    "file": "real_crashes/mysql_01_cte_union_memory_leak.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Use-after-free of Query_expression during CTE materialization)",
+    "defect_module": "sql/sql_lex.cc / sql/sql_cte.cc",
+    "bug_id": "MySQL-BUG-98512 / SQUIRREL-MYSQL-2020",
+    "description": "Memory corruption / SIGSEGV in CTE union materialization with window aggregates when references are evaluated across multiple subqueries.",
+    "statements": 9
+  },
+  {
+    "id": "mysql_02",
+    "file": "real_crashes/mysql_02_derived_table_merge_crash.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure (thd->is_error() || !table->is_derived())",
+    "defect_module": "sql/sql_resolver.cc",
+    "bug_id": "MySQL-BUG-99234 / SQLancer-MYSQL-2020-05",
+    "description": "Crash in derived table merge optimization when subquery contains GROUP BY and outer query contains ORDER BY with LIMIT and JOIN.",
+    "statements": 9
+  },
+  {
+    "id": "mysql_03",
+    "file": "real_crashes/mysql_03_json_extract_wildcard_segv.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Heap out-of-bounds read in Json_path_cache)",
+    "defect_module": "sql/item_json_func.cc",
+    "bug_id": "MySQL-BUG-101180",
+    "description": "JSON_EXTRACT with multiple wildcard selectors ($.*[*]) on deeply nested heterogeneous JSON documents resulting in out-of-bounds memory access.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_04",
+    "file": "real_crashes/mysql_04_window_lead_lag_assert.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure (result_field != nullptr)",
+    "defect_module": "sql/item_window_func.cc",
+    "bug_id": "MySQL-BUG-97886",
+    "description": "Window function LEAD/LAG with default value expression having type mismatch against partition column causing assertion failure during evaluation.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_05",
+    "file": "real_crashes/mysql_05_multi_row_upsert_deadlock.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure / SIGABRT (btr_pcur_restore_position)",
+    "defect_module": "storage/innobase/row/row0ins.cc",
+    "bug_id": "MySQL-BUG-98380",
+    "description": "Multi-row INSERT ... ON DUPLICATE KEY UPDATE with multiple composite unique indexes and auto-increment leading to B-tree cursor desync.",
+    "statements": 8
+  },
+  {
+    "id": "mysql_06",
+    "file": "real_crashes/mysql_06_spatial_index_rtree_crash.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Null pointer dereference in rtr_page_split_and_insert)",
+    "defect_module": "storage/innobase/gis/gis0rtree.cc",
+    "bug_id": "MySQL-BUG-102555",
+    "description": "R-tree spatial index corruption and segfault during page split with degenerate zero-area polygon geometries.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_07",
+    "file": "real_crashes/mysql_07_innodb_fts_phrase_segv.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Null pointer dereference in fts_phrase_search)",
+    "defect_module": "storage/innobase/fts/fts0fts.cc",
+    "bug_id": "MySQL-BUG-96452",
+    "description": "Full-text search phrase search crash on hyphenated tokens with stopword filtering enabled in boolean mode.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_08",
+    "file": "real_crashes/mysql_08_subquery_materialization_abort.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure (!tab->materialized || tab->is_materialized())",
+    "defect_module": "sql/sql_optimizer.cc",
+    "bug_id": "MySQL-BUG-100800 / SQLancer-MYSQL-2020-09",
+    "description": "Assertion failure during subquery materialization when outer query contains GROUP BY ... WITH ROLLUP and HAVING clauses.",
+    "statements": 9
+  },
+  {
+    "id": "mysql_09",
+    "file": "real_crashes/mysql_09_check_constraint_bit_field.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Buffer overrun in Item_func_bit::val_int)",
+    "defect_module": "sql/item_func.cc",
+    "bug_id": "MySQL-BUG-101450",
+    "description": "CHECK constraint evaluation crash when validating bit fields BIT(N) under multi-row INSERT with bitwise arithmetic expressions.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_10",
+    "file": "real_crashes/mysql_10_group_concat_overflow.sql",
+    "dbms": "mysql",
+    "bug_class": "Memory Corruption / SIGSEGV (Item_func_group_concat::add)",
+    "defect_module": "sql/item_sum.cc",
+    "bug_id": "MySQL-BUG-99882",
+    "description": "GROUP_CONCAT buffer reallocation overflow and crash when sorting by BLOB fields with large group_concat_max_len settings.",
+    "statements": 7
+  },
+  {
+    "id": "mysql_11",
+    "file": "real_crashes/mysql_11_role_graph_recursion_crash.sql",
+    "dbms": "mysql",
+    "bug_class": "Stack Overflow / SIGSEGV (traverse_role_graph)",
+    "defect_module": "sql/auth/sql_authorization.cc",
+    "bug_id": "MySQL-BUG-102201",
+    "description": "Stack overflow / SIGSEGV during authorization privilege resolution with cyclic role grant hierarchies and default role activation.",
+    "statements": 11
+  },
+  {
+    "id": "mysql_12",
+    "file": "real_crashes/mysql_12_hash_join_spill_segv.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (Invalid pointer in HashJoinRowBuffer::StoreRow)",
+    "defect_module": "sql/hash_join_buffer.cc",
+    "bug_id": "MySQL-BUG-101902",
+    "description": "Hash join memory buffer spill crash when build table contains variable-length nullable JSON and long string columns.",
+    "statements": 9
+  },
+  {
+    "id": "mysql_13",
+    "file": "real_crashes/mysql_13_partition_exchange_corrupt.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure / SIGABRT (part_share->auto_inc_initialized)",
+    "defect_module": "sql/ha_partition.cc",
+    "bug_id": "MySQL-BUG-99520",
+    "description": "Server crash during ALTER TABLE ... EXCHANGE PARTITION with auto-increment counter desynchronization across range partitions.",
+    "statements": 13
+  },
+  {
+    "id": "mysql_14",
+    "file": "real_crashes/mysql_14_prepared_stmt_reparse_abort.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure (thd->lex == lex)",
+    "defect_module": "sql/sql_prepare.cc",
+    "bug_id": "MySQL-BUG-103112",
+    "description": "Assertion failure when re-preparing statement referencing a view after underlying base table schema alteration.",
+    "statements": 12
+  },
+  {
+    "id": "mysql_15",
+    "file": "real_crashes/mysql_15_virtual_index_purge_crash.sql",
+    "dbms": "mysql",
+    "bug_class": "SIGSEGV (row_purge_remove_sec_if_poss_low)",
+    "defect_module": "storage/innobase/row/row0purge.cc",
+    "bug_id": "MySQL-BUG-98841",
+    "description": "InnoDB background purge thread crash on secondary index defined over virtual generated column during transaction rollback.",
+    "statements": 11
+  },
+  {
+    "id": "mysql_16",
+    "file": "real_crashes/mysql_16_window_frame_range_crash.sql",
+    "dbms": "mysql",
+    "bug_class": "Assertion Failure (item->type() == Item::FIELD_ITEM)",
+    "defect_module": "sql/window_frame.cc",
+    "bug_id": "MySQL-BUG-102877",
+    "description": "Assertion failure in window frame cursor when evaluating RANGE BETWEEN temporal intervals on nullable DATETIME columns.",
+    "statements": 7
+  }
+]

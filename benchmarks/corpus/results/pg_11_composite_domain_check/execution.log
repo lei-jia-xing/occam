@@ -1,0 +1,25 @@
+======================================================================
+Occam v0.1.0.0 starting reduction
+======================================================================
+  Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/pg_11_composite_domain_check.sql (1848 bytes, 10 stmts)
+  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_11_composite_domain_check
+----------------------------------------------------------------------
+Verifying initial crash reproduction... OK (Reproduced)
+Running hierarchical reduction engine (Levels 1-4)...
+----------------------------------------------------------------------
+Reduction Complete!
+======================================================================
+Occam Reduction Summary
+======================================================================
+  Statements:   10 -> 1
+  Bytes:        1848 B -> 722 B (-60.9%)
+  Oracle Calls: 2
+  Cache Hits:   2
+  Cache Misses: 2
+  Hit Ratio:    50.0%
+  Elapsed Time: 0.040s
+  Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_11_composite_domain_check/minimal.sql
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_11_composite_domain_check/replay.sh
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/pg_11_composite_domain_check/stats.json
+======================================================================

@@ -1,0 +1,25 @@
+======================================================================
+Occam v0.1.0.0 starting reduction
+======================================================================
+  Target SQL:   /home/hunter/Workspace/occam/benchmarks/corpus/real_crashes/mysql_12_hash_join_spill_segv.sql (2222 bytes, 9 stmts)
+  Oracle Cmd:   /home/hunter/Workspace/occam/benchmarks/corpus/mock_oracle.sh
+  Artifact Dir: /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_12_hash_join_spill_segv
+----------------------------------------------------------------------
+Verifying initial crash reproduction... OK (Reproduced)
+Running hierarchical reduction engine (Levels 1-4)...
+----------------------------------------------------------------------
+Reduction Complete!
+======================================================================
+Occam Reduction Summary
+======================================================================
+  Statements:   9 -> 1
+  Bytes:        2222 B -> 714 B (-67.9%)
+  Oracle Calls: 2
+  Cache Hits:   2
+  Cache Misses: 2
+  Hit Ratio:    50.0%
+  Elapsed Time: 0.043s
+  Artifacts:    /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_12_hash_join_spill_segv/minimal.sql
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_12_hash_join_spill_segv/replay.sh
+                /home/hunter/Workspace/occam/benchmarks/corpus/results/mysql_12_hash_join_spill_segv/stats.json
+======================================================================
