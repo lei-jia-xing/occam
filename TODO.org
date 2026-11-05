@@ -3,10 +3,10 @@
 #+TODO: TODO(t) IN_PROGRESS(i) | DONE(d) BLOCKED(b)
 
 * 1. Frontend & CST Surgery (Tree-sitter)
-** TODO Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
-** TODO Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
-** TODO Byte-span text surgery: cut spans, replace with literals (zero unparser / zero re-formatting)
-** TODO Multi-statement boundary detection: extract top-level statement sequence
+** DONE Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
+** DONE Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
+** DONE Byte-span text surgery: cut spans, replace with literals (zero unparser / zero re-formatting)
+** DONE Multi-statement boundary detection: extract top-level statement sequence
 
 * 2. Semantic Dependency Analysis (Def/Use/Mod)
 ** TODO CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)

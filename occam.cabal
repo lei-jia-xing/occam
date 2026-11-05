@@ -22,6 +22,7 @@ library
                     , Occam.Core
                     , Occam.Dependency
                     , Occam.Slicer
+                    , Occam.TreeSitter
     build-depends:    base >= 4.18 && < 5
                     , bytestring >= 0.11
                     , text >= 2.0
@@ -35,6 +36,13 @@ library
         OverloadedStrings
         RecordWildCards
         LambdaCase
+    c-sources:        cbits/occam_ts.c
+                    , cbits/tree-sitter-sql/parser.c
+                    , cbits/tree-sitter-sql/scanner.c
+    include-dirs:     cbits
+                    , cbits/tree-sitter-sql
+    pkgconfig-depends: tree-sitter
+    cc-options:       -O1 -fPIC
 
 executable occam
     import:           warnings
@@ -55,3 +63,5 @@ test-suite occam-test
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
+                    , bytestring
+                    , text
