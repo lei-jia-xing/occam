@@ -8,11 +8,11 @@ import Control.Monad (unless)
 import Data.Aeson (FromJSON, ToJSON, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
-import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
+import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Oracle (
     OracleConfig (..),
     runExternalOracle,
@@ -70,6 +70,9 @@ data Stats = Stats
     , initial_statements :: !Int
     , reduced_statements :: !Int
     , oracle_executions :: !Int
+    , cache_hits :: !Int
+    , cache_misses :: !Int
+    , cache_hit_ratio :: !Double
     , elapsed_seconds :: !Double
     }
     deriving (Eq, Show, Generic, ToJSON, FromJSON)
@@ -171,8 +174,7 @@ runOccam Options {..} = do
     putStrLn $ "  Artifact Dir: " ++ optOutDir
     putStrLn "----------------------------------------------------------------------"
 
-    -- Setup oracle and counter
-    oracleCallsRef <- newIORef (0 :: Int)
+    -- Setup oracle configuration
     let timeoutMicros = round (optTimeoutSecs * 1000000)
         baseOracleCfg =
             OracleConfig
@@ -192,10 +194,7 @@ runOccam Options {..} = do
         exitFailure
     putStrLn "OK (Reproduced)"
 
-    let oracle sql = do
-            modifyIORef' oracleCallsRef (+ 1)
-            runExternalOracle baseOracleCfg sql
-
+    (oracle, getCacheStats) <- memoizeOracle (runExternalOracle baseOracleCfg)
     -- 2. Run hierarchical reduction engine
     putStrLn "Running hierarchical reduction engine (Levels 1-4)..."
     startTime <- getCurrentTime
@@ -203,7 +202,15 @@ runOccam Options {..} = do
     endTime <- getCurrentTime
 
     -- 3. Gather metrics
-    totalCalls <- readIORef oracleCallsRef
+    cacheStats <- getCacheStats
+    let totalHits = cacheHits cacheStats
+        totalMisses = cacheMisses cacheStats
+        totalCalls = totalMisses
+        totalLookups = totalHits + totalMisses
+        hitRatio =
+            if totalLookups > 0
+                then fromIntegral totalHits / fromIntegral totalLookups
+                else 0.0
     reducedStmts <- countStatements reducedSQL
     let reducedBytes = BS.length reducedSQL
         elapsedSecs = realToFrac (diffUTCTime endTime startTime) :: Double
@@ -243,6 +250,9 @@ runOccam Options {..} = do
                 , initial_statements = initialStmts
                 , reduced_statements = reducedStmts
                 , oracle_executions = totalCalls
+                , cache_hits = totalHits
+                , cache_misses = totalMisses
+                , cache_hit_ratio = hitRatio
                 , elapsed_seconds = elapsedSecs
                 }
     BSL.writeFile statsPath (encode stats)
@@ -263,6 +273,9 @@ runOccam Options {..} = do
             ++ showFFloat (Just 1) ratio "%"
             ++ ")"
     putStrLn $ "  Oracle Calls: " ++ show totalCalls
+    putStrLn $ "  Cache Hits:   " ++ show totalHits
+    putStrLn $ "  Cache Misses: " ++ show totalMisses
+    putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
     putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) elapsedSecs "s"
     putStrLn $ "  Artifacts:    " ++ minimalPath
     putStrLn $ "                " ++ replayPath

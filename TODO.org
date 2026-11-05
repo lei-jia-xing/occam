@@ -34,9 +34,9 @@
 ** DONE Unit test suite: CST byte cutting and dependency DAG correctness
 ** DONE Integration test suite: test against simulated crash scripts
 
-* 6. Candidate Memoization & Performance Optimization
-** TODO In-memory candidate Hash memoization (prevent duplicate DB re-executions)
-** TODO Cache statistics reporting (cache hits vs oracle executions)
+* 6. Candidate Memoization & Performance Optimization                  :ARCHIVE:
+** DONE In-memory candidate Hash memoization (prevent duplicate DB re-executions)
+** DONE Cache statistics reporting (cache hits vs oracle executions)
 
 * 7. DBMS Dialect Hardening & Native Harnesses (PostgreSQL & MySQL)
 ** TODO PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)

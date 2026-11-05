@@ -19,6 +19,7 @@ common warnings
 library
     import:           warnings
     exposed-modules:  Occam
+                    , Occam.Cache
                     , Occam.Core
                     , Occam.Dependency
                     , Occam.Oracle

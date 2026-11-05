@@ -5,10 +5,12 @@ module Main (main) where
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as LBS
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
 import Occam.Oracle
@@ -53,6 +55,7 @@ tests =
         , phase3Tests
         , phase4Tests
         , phase5Tests
+        , phase6Tests
         , goldenTests
         , propertyTests
         ]
@@ -413,6 +416,62 @@ phase5Tests =
 
             removeFile tmpSQL
             removeDirectoryRecursive tmpOut
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Phase 6: Candidate Memoization
+-- ----------------------------------------------------------------------------
+
+phase6Tests :: TestTree
+phase6Tests =
+    testGroup
+        "Phase 6: Candidate Memoization"
+        [ testCase "memoizeOracle caches repeated queries and tracks hits/misses" $ do
+            callCountRef <- newIORef (0 :: Int)
+            let mockOracle sql = do
+                    modifyIORef' callCountRef (+ 1)
+                    pure (BSC.isInfixOf "CRASH" sql)
+
+            (cachedOracle, getStats) <- memoizeOracle mockOracle
+
+            -- 1. Initial queries (all misses)
+            r1 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            assertEqual "First query should return True" True r1
+            r2 <- cachedOracle "SELECT 1;"
+            assertEqual "Second query should return False" False r2
+
+            calls1 <- readIORef callCountRef
+            assertEqual "Underlying oracle should be called 2 times" 2 calls1
+
+            stats1 <- getStats
+            assertEqual "cacheHits should be 0" 0 (cacheHits stats1)
+            assertEqual "cacheMisses should be 2" 2 (cacheMisses stats1)
+
+            -- 2. Repeated queries (all hits)
+            r3 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            assertEqual "Cached query 1 should return True" True r3
+            r4 <- cachedOracle "SELECT 1;"
+            assertEqual "Cached query 2 should return False" False r4
+            r5 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            assertEqual "Cached query 1 (second time) should return True" True r5
+
+            calls2 <- readIORef callCountRef
+            assertEqual "Underlying oracle should NOT be re-invoked on cache hits" 2 calls2
+
+            stats2 <- getStats
+            assertEqual "cacheHits should be 3" 3 (cacheHits stats2)
+            assertEqual "cacheMisses should remain 2" 2 (cacheMisses stats2)
+
+            -- 3. Another new query (miss)
+            r6 <- cachedOracle "SELECT 2;"
+            assertEqual "New query should return False" False r6
+
+            calls3 <- readIORef callCountRef
+            assertEqual "Underlying oracle should be called for new query" 3 calls3
+
+            stats3 <- getStats
+            assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
+            assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
         ]
 
 -- ----------------------------------------------------------------------------
