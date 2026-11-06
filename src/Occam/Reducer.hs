@@ -20,8 +20,8 @@ module Occam.Reducer (
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Data.List (foldl', sortOn)
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Ord (Down (..))
 import Data.Set (Set)
@@ -41,10 +41,11 @@ import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
 import Occam.Slicer (backwardSlice)
 import Occam.TreeSitter (
     Parser,
+    StatementUnit (..),
     TSNode,
     collectDescendants,
     cutSpan,
-    extractStatementNodes,
+    extractStatementUnits,
     nodeNamedChildren,
     nodeSpan,
     nodeText,
@@ -413,11 +414,11 @@ statementDdminWithParser strategy oracle parser initialSQL = do
     if not initialOK
         then pure initialSQL
         else do
-            parsed <- withParsedSQL parser initialSQL $ \tree -> extractStatementNodes tree initialSQL
+            parsed <- withParsedSQL parser initialSQL $ \tree -> extractStatementUnits tree initialSQL
             case parsed of
                 Nothing -> pure initialSQL
-                Just pairs -> do
-                    let allStatements = map fst pairs
+                Just units -> do
+                    let allStatements = map unitStatement units
                     reduced <- searchStatements strategy plainCandidate oracle initialSQL allStatements allStatements
                     pure (statementSQL initialSQL allStatements reduced)
 
@@ -438,11 +439,11 @@ statementAuditWithParser logger oracle parser initialSQL = do
     pure outcome
     where
         loop current passCount attemptCount removalCount = do
-            parsed <- withParsedSQL parser current $ \tree -> extractStatementNodes tree current
+            parsed <- withParsedSQL parser current $ \tree -> extractStatementUnits tree current
             case parsed of
                 Nothing -> pure (current, AuditStats passCount attemptCount removalCount False)
-                Just pairs -> do
-                    let statements = map fst pairs
+                Just units -> do
+                    let statements = map unitStatement units
                     if null statements
                         then pure (current, AuditStats passCount attemptCount removalCount True)
                         else do
@@ -510,10 +511,9 @@ analyzeSQL ::
 analyzeSQL logger dialect parser sql = do
     started <- getMonotonicTimeNSec
     result <- withParsedSQL parser sql $ \tree -> do
-        pairs <- extractStatementNodes tree sql
-        let statements = map fst pairs
-            indexed = [(stmtId statement, node) | (statement, node) <- pairs]
-        graph <- analyzeStatementsWithDialect dialect indexed sql
+        units <- extractStatementUnits tree sql
+        let statements = map unitStatement units
+        graph <- analyzeStatementsWithDialect dialect units sql
         pure (statements, graph)
     finished <- getMonotonicTimeNSec
     let elapsed = finished - started

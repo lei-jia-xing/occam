@@ -24,7 +24,7 @@ Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`,
 
 ## Architecture
 
-- Tree-sitter C grammar bindings via FFI for exact byte-span SQL edits.
+- Tree-sitter C grammar bindings via FFI retain exact byte spans for source-preserving edits; statement extraction uses a shared SQL lexer and attaches CST nodes only on exact span matches.
 - Haskell dependency analysis, backward slicing, and dependency-constrained delta debugging.
 - External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 

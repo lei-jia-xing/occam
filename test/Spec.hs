@@ -144,9 +144,8 @@ phase2Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
 
                     let depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
                         depsS5 = Map.findWithDefault Set.empty (StatementId 5) (graphEdges graph)
@@ -171,9 +170,8 @@ phase2Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let queryId = StatementId 4
                         queryActions = Map.findWithDefault [] queryId (graphActions graph)
                         uses =
@@ -206,9 +204,8 @@ phase2Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let slice = backwardSlice (StatementId 5) graph
                     assertBool
                         "CRITICAL: Statement 2 (t2) should have been pruned by slice"
@@ -239,9 +236,8 @@ phase3Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexed = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexed script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     assertBool
                         "{s1, s3, s5} should be a valid closure"
                         (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 5]))
@@ -456,9 +452,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool "SELECT should depend on CREATE TABLE public.orders" (Set.member (StatementId 1) depsS2)
                 case res of
@@ -472,9 +467,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool "INSERT should depend on CREATE TABLE `items`" (Set.member (StatementId 1) depsS2)
                 case res of
@@ -488,9 +482,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool "SELECT should depend on CREATE TABLE \"Customers\"" (Set.member (StatementId 1) depsS2)
                 case res of
@@ -504,9 +497,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let actionsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
                         depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool
@@ -530,9 +522,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let sliceS3 = backwardSlice (StatementId 3) graph
                     assertBool
                         "Backward slice from SELECT should reach CREATE TABLE [products]"
@@ -549,9 +540,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                         depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
                     assertBool "INSERT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS2)
@@ -568,9 +558,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                         depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
                     assertBool "CREATE VIEW should depend on CREATE TABLE t1" (Set.member (StatementId 1) depsS2)
@@ -587,9 +576,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                         depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
                     assertBool
@@ -609,9 +597,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool
                         "CREATE TABLE child should depend on CREATE TABLE parent"
@@ -627,9 +614,8 @@ phase7Tests =
                         ]
             withParser $ \parser -> do
                 res <- withParsedSQL parser script $ \tree -> do
-                    pairs <- extractStatementNodes tree script
-                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
-                    graph <- analyzeStatements indexedNodes script
+                    units <- extractStatementUnits tree script
+                    graph <- analyzeStatements units script
                     let actsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
                         depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                     assertBool

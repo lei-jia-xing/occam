@@ -6,7 +6,8 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Occam.Core (Statement (..), StatementId (..))
+import Data.Text.Encoding qualified as TE
+import Occam.Core (StatementId (..))
 import Occam.Dependency (DependencyGraph (..), SQLDialect (..), analyzeStatementsWithDialect)
 import Occam.Logger (nullLogger)
 import Occam.Reducer (
@@ -17,7 +18,7 @@ import Occam.Reducer (
     statementAudit,
     statementDdmin,
  )
-import Occam.TreeSitter (extractStatementNodes, withParsedSQL, withParser)
+import Occam.TreeSitter (countStatements, extractStatementUnits, withParsedSQL, withParser)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
@@ -34,8 +35,8 @@ tests =
                         ]
             withParser $ \parser -> do
                 result <- withParsedSQL parser sql $ \tree -> do
-                    pairs <- extractStatementNodes tree sql
-                    analyzeStatementsWithDialect SQLite [(stmtId statement, node) | (statement, node) <- pairs] sql
+                    units <- extractStatementUnits tree sql
+                    analyzeStatementsWithDialect SQLite units sql
                 case result of
                     Nothing -> assertFailure "Dependency fixture did not parse"
                     Just graph -> do
@@ -87,14 +88,16 @@ tests =
                 "the unrestricted fallback/audit composition leaves this result unchanged"
                 closure
                 audited
-        , testCase "Weighted and CDD searches preserve the crash-causing statement" $ do
+        , testCase "Weighted and CDD searches preserve the predicate-required statement" $ do
             let target = BSC.concat ["SELECT 'sentinel", BS.replicate 256 120, "';\n"]
                 sql = BSC.concat ["SELECT 1;\nSELECT 2;\nSELECT 3;\nSELECT 4;\n", target]
                 oracle candidate = pure (BSC.isInfixOf "sentinel" candidate)
             weighted <- statementDdmin WeightedDD oracle sql
             cdd <- statementDdmin CDD oracle sql
-            assertBool "weighted search keeps the crash-causing statement" (BSC.isInfixOf "sentinel" weighted)
-            assertBool "CDD keeps the crash-causing statement" (BSC.isInfixOf "sentinel" cdd)
+            assertBool
+                "weighted search keeps the predicate-required statement"
+                (BSC.isInfixOf "sentinel" weighted)
+            assertBool "CDD keeps the predicate-required statement" (BSC.isInfixOf "sentinel" cdd)
             assertBool "weighted search removes irrelevant statements" (BS.length weighted < BS.length sql)
             assertBool "CDD removes irrelevant statements" (BS.length cdd < BS.length sql)
             assertBool
@@ -115,4 +118,24 @@ tests =
                 keepFirst candidate = pure (BSC.isInfixOf "SELECT 11" candidate)
             byteResult <- statementDdmin CountDD keepFirst bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
+        , testCase "Statement surgery preserves compound triggers and UTF-8 offsets" $ do
+            let prefix = TE.encodeUtf8 "-- café\n"
+                unused = BSC.pack "CREATE TABLE unused (id INT);\n"
+                trigger =
+                    TE.encodeUtf8
+                        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET x = CASE WHEN x = 'a;b' THEN 'c;d' ELSE x END; INSERT INTO audit VALUES ('x;y'); END;"
+                target = TE.encodeUtf8 "SELECT $tag$semi;colon$tag$;\n"
+                sql = prefix <> unused <> trigger <> "\n" <> target <> BSC.pack "SELECT 9;\n"
+                expected = prefix <> trigger <> "\n" <> target
+                oracle candidate = pure (BS.isInfixOf trigger candidate && BS.isInfixOf target candidate)
+            statementCount <- countStatements sql
+            assertEqual "table, trigger, target, and following SELECT are four source units" 4 statementCount
+            reduced <- statementDdmin CountDD oracle sql
+            assertEqual "the trigger is one source statement and retained bytes are untouched" expected reduced
+        , testCase "Statement counting respects quoted, escaped, and commented semicolons" $ do
+            let sql =
+                    TE.encodeUtf8
+                        "SELECT /*; block */ 'a;b'; -- line; comment\nSELECT [g;h]; SELECT $tag$semi;colon$tag$; SELECT E'a\\';semi';"
+            count <- countStatements sql
+            assertEqual "each SQL source statement remains one unit" 4 count
         ]

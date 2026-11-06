@@ -101,11 +101,10 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Extend and evaluate useful per-input metrics (including reset cost and corpus throughput); keep text-predicate results separate from DB-executing predicates.
 
 * 16. P1: SQL Reduction Quality
-** TODO [#A] Fix statement-unit and dependency failures for TRUNCATE and transactions
-- The integrated full suite still has four failures among 66 checks, in `Spec/DependencyChecks`; Oracle (7), CLI (2), and evaluator (5) checks pass.
-- Tree-sitter exposes `TRUNCATE` as a `keyword_truncate` child of `statement`, not the node cases currently handled by dependency analysis.
-- The parser groups `BEGIN` through `ROLLBACK` and merges `SAVEPOINT`/`RELEASE` error spans, breaking expected dependency checks.
-- Model these statement units and transaction/savepoint effects correctly; rerun the affected checks before claiming the full suite passes.
+** DONE Fix statement-unit and dependency failures for TRUNCATE and transactions
+- Statement extraction preserves exact source bytes and attaches a Tree-sitter node only for an exact-span match; shared SQL lexing separates transaction/error units while unknown syntax stays conservative.
+- Dependency analysis recognizes TRUNCATE and transaction controls from each raw unit, including savepoint rollback effects.
+- Verified: integrated build and full suites passed. A real SQLite savepoint smoke reduced 12 statements/284 B to 10/222 B, preserved quoted savepoints and expected rows, and passed two fresh final checks.
 ** TODO [#A] Add unrestricted deletion after graph-guided search
 - Hard closure can retain unnecessary statements through conservative dependencies.
 - Compare hard closure, closure with unrestricted fallback, and plain ddmin on fuzz inputs with false dependencies.
@@ -124,6 +123,8 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Prioritize useful list, VALUES, JOIN, CTE, subquery, constraint, type, and literal reductions.
 - Preserve untouched bytes and validate every candidate with the supplied oracle.
 - Choose additional transformations from structures that remain in reduced fuzz inputs.
+** OPEN QUESTION: Would sqlparser-rs simplify SQL syntax-fact extraction enough to justify its integration and dialect-coverage trade-offs?
+- Keep Tree-sitter for exact-source edits. This is a question only: no parser replacement or integration, dependency, adapter, or feature flag is scheduled, and fuzz reduction does not depend on it.
 
 * 17. P2: Large-Scale Fuzz Workloads
 ** TODO [#A] Exercise large SQL inputs and corpus batches

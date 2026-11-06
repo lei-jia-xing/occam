@@ -15,10 +15,8 @@ module Occam.Dependency (
     analyzeStatementsWithDialect,
 ) where
 
-import Control.Monad (filterM)
 import Data.ByteString (ByteString)
-import Data.Char (isAlphaNum, isSpace)
-import Data.List (foldl')
+import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe, maybeToList)
@@ -27,8 +25,16 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Occam.Core (StatementId (..))
-import Occam.TreeSitter (TSNode, collectDescendants, nodeNamedChildren, nodeText, nodeType)
+import Occam.Core (Statement (..), StatementId (..))
+import Occam.SQLLexer (SQLToken (..), lexSQL)
+import Occam.TreeSitter (
+    StatementUnit (..),
+    TSNode,
+    collectDescendants,
+    nodeNamedChildren,
+    nodeText,
+    nodeType,
+ )
 
 type ObjectName = Text
 
@@ -103,9 +109,9 @@ normalizeName dialect = canonicalName dialect . T.strip . TE.decodeUtf8Lenient
 
 canonicalName :: SQLDialect -> Text -> Text
 canonicalName dialect =
-    T.intercalate "." . map canonicalPart . splitIdentifier
+    T.intercalate "." . map normalizePart . splitIdentifier
     where
-        canonicalPart (quoted, part) =
+        normalizePart (quoted, part) =
             let normalized =
                     if dialect == PostgreSQL && quoted
                         then part
@@ -190,28 +196,31 @@ hasDescendantType targetType node = do
     matches <- collectDescendants (== targetType) node
     pure (not (null matches))
 
-extractActions :: TSNode -> ByteString -> IO [ObjectAction]
+extractActions :: StatementUnit -> ByteString -> IO [ObjectAction]
 extractActions = extractActionsWithDialect defaultSQLDialect
 
-extractActionsWithDialect :: SQLDialect -> TSNode -> ByteString -> IO [ObjectAction]
-extractActionsWithDialect dialect stmtNode src = do
-    control <- transactionControlForStatement dialect src stmtNode
+extractActionsWithDialect :: SQLDialect -> StatementUnit -> ByteString -> IO [ObjectAction]
+extractActionsWithDialect dialect statementUnit src = do
+    control <- transactionControlForStatement dialect statementUnit
     case control of
         Just command -> pure [ObjectAction BarrierObject BarrierDep (transactionActionName command)]
-        Nothing -> do
-            rootType <- nodeType stmtNode
-            hasError <- hasDescendantType "ERROR" stmtNode
-            if hasError || rootType == "ERROR"
-                then pure [ObjectAction BarrierObject BarrierDep "__syntax_error_barrier__"]
-                else
-                    if not (supportedStatement rootType)
-                        then pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
-                        else do
-                            actions <- inspectChild dialect Set.empty src stmtNode
-                            pure $
-                                if null actions
-                                    then []
-                                    else Set.toList (Set.fromList actions)
+        Nothing ->
+            case unitNode statementUnit of
+                Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
+                Just stmtNode -> do
+                    rootType <- nodeType stmtNode
+                    hasError <- hasDescendantType "ERROR" stmtNode
+                    if hasError || rootType == "ERROR"
+                        then pure [ObjectAction BarrierObject BarrierDep "__syntax_error_barrier__"]
+                        else
+                            if not (supportedStatement rootType)
+                                then pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
+                                else do
+                                    actions <- inspectChild dialect Set.empty src stmtNode
+                                    pure $
+                                        if null actions
+                                            then []
+                                            else Set.toList (Set.fromList actions)
 
 supportedStatement :: Text -> Bool
 supportedStatement t =
@@ -246,11 +255,15 @@ supportedStatement t =
 inspectStatement :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
 inspectStatement dialect outerCTEs src node = do
     children <- nodeNamedChildren node
-    localCTEs <- scopedCTENames dialect src node
-    let visibleCTEs = Set.union outerCTEs localCTEs
-    if null children
-        then pure [unknownStatement]
-        else concat <$> mapM (inspectStatementChild visibleCTEs) children
+    childTypes <- mapM nodeType children
+    if "keyword_truncate" `elem` childTypes
+        then truncateActions dialect outerCTEs src node
+        else do
+            localCTEs <- scopedCTENames dialect src node
+            let visibleCTEs = Set.union outerCTEs localCTEs
+            if null children
+                then pure [unknownStatement]
+                else concat <$> mapM (inspectStatementChild visibleCTEs) children
     where
         unknownStatement = ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"
 
@@ -661,34 +674,16 @@ scopedCTENames dialect src root = Set.fromList <$> collect True root
                             children <- nodeNamedChildren node
                             concat <$> mapM (collect False) children
 
-transactionControlForStatement :: SQLDialect -> ByteString -> TSNode -> IO (Maybe TxCommand)
-transactionControlForStatement dialect src stmtNode = do
-    statementText <- nodeText src stmtNode
-    let statementControl = parseTransactionControl dialect (TE.decodeUtf8Lenient statementText)
-    case statementControl of
-        Just TxRollback -> do
-            nestedControls <- transactionControls
-            pure $ case [command | command@(TxRollbackTo _) <- nestedControls] of
-                command : _ -> Just command
-                [] -> statementControl
-        Just command -> pure (Just command)
-        Nothing -> do
-            nestedControls <- transactionControls
-            pure $ case nestedControls of
-                command : _ -> Just command
-                [] -> Nothing
-    where
-        transactionControls = do
-            transactionNodes <- collectDescendants (== "transaction") stmtNode
-            controls <-
-                mapM
-                    (fmap (parseTransactionControl dialect . TE.decodeUtf8Lenient) . nodeText src)
-                    transactionNodes
-            pure (catMaybes controls)
+transactionControlForStatement :: SQLDialect -> StatementUnit -> IO (Maybe TxCommand)
+transactionControlForStatement dialect statementUnit =
+    pure $
+        parseTransactionControl
+            dialect
+            (stmtRaw (unitStatement statementUnit))
 
-parseTransactionControl :: SQLDialect -> Text -> Maybe TxCommand
+parseTransactionControl :: SQLDialect -> ByteString -> Maybe TxCommand
 parseTransactionControl dialect sql =
-    case sqlTokens sql of
+    case lexSQL sql of
         WordToken "begin" : _ -> Just TxBegin
         WordToken "start" : WordToken "transaction" : _ -> Just TxBegin
         WordToken "commit" : _ -> Just TxCommit
@@ -722,50 +717,6 @@ canonicalPart dialect isQuoted part =
             then part
             else T.toLower part
         )
-
-data SQLToken = WordToken !Text | IdentifierToken !Text
-    deriving (Eq, Show)
-
-sqlTokens :: Text -> [SQLToken]
-sqlTokens = scan . T.unpack
-    where
-        scan [] = []
-        scan ('-' : '-' : rest) = scan (dropWhile (/= '\n') rest)
-        scan ('/' : '*' : rest) = scan (skipBlock 1 rest)
-        scan ('\'' : rest) = scan (skipQuoted '\'' rest)
-        scan (opener : rest)
-            | Just closer <- closingQuote opener =
-                let (name, suffix) = readQuoted closer rest
-                 in IdentifierToken (T.pack name) : scan suffix
-        scan (c : rest)
-            | isAlphaNum c || c == '_' || c == '$' =
-                let (word, suffix) = span (\x -> isAlphaNum x || x == '_' || x == '$') (c : rest)
-                 in WordToken (T.toLower (T.pack word)) : scan suffix
-            | otherwise = scan rest
-
-        skipQuoted _ [] = []
-        skipQuoted closer (c : cs)
-            | c == closer =
-                case cs of
-                    next : rest | next == closer -> skipQuoted closer rest
-                    _ -> cs
-            | otherwise = skipQuoted closer cs
-
-        readQuoted _ [] = ([], [])
-        readQuoted closer (c : cs)
-            | c == closer =
-                case cs of
-                    next : rest | next == closer -> let (name, suffix) = readQuoted closer rest in (closer : name, suffix)
-                    _ -> ([], cs)
-            | otherwise =
-                let (name, suffix) = readQuoted closer cs
-                 in (c : name, suffix)
-
-        skipBlock 0 rest = rest
-        skipBlock _ [] = []
-        skipBlock depth ('/' : '*' : rest) = skipBlock (depth + 1) rest
-        skipBlock depth ('*' : '/' : rest) = skipBlock (depth - 1) rest
-        skipBlock depth (_ : rest) = skipBlock depth rest
 
 data TxCommand
     = TxBegin
@@ -1302,18 +1253,19 @@ txCommandFromAction name =
                     TxRelease <$> T.stripPrefix "__tx_release__\x1e" name
 
 -- | End-to-end analyzer; the existing entry point keeps its generic SQL rules.
-analyzeStatements :: [(StatementId, TSNode)] -> ByteString -> IO DependencyGraph
+analyzeStatements :: [StatementUnit] -> ByteString -> IO DependencyGraph
 analyzeStatements = analyzeStatementsWithDialect defaultSQLDialect
 
 analyzeStatementsWithDialect ::
     SQLDialect ->
-    [(StatementId, TSNode)] ->
+    [StatementUnit] ->
     ByteString ->
     IO DependencyGraph
-analyzeStatementsWithDialect dialect stmts src = do
-    stmtActions <- mapM extractPair stmts
+analyzeStatementsWithDialect dialect units src = do
+    stmtActions <- mapM extractUnit units
     pure (buildGraph stmtActions)
     where
-        extractPair (sid, node) = do
-            actions <- extractActionsWithDialect dialect node src
+        extractUnit unit = do
+            let sid = stmtId (unitStatement unit)
+            actions <- extractActionsWithDialect dialect unit src
             pure (sid, actions)

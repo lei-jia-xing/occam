@@ -6,9 +6,9 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Occam.Core (Statement (..), StatementId (..))
+import Occam.Core (StatementId (..))
 import Occam.Dependency
-import Occam.TreeSitter (extractStatementNodes, withParsedSQL, withParser)
+import Occam.TreeSitter (extractStatementUnits, withParsedSQL, withParser)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
@@ -270,11 +270,8 @@ tests =
 analyze :: SQLDialect -> ByteString -> IO DependencyGraph
 analyze dialect sql = withParser $ \parser -> do
     parsed <- withParsedSQL parser sql $ \tree -> do
-        statementNodes <- extractStatementNodes tree sql
-        analyzeStatementsWithDialect
-            dialect
-            [(stmtId statement, node) | (statement, node) <- statementNodes]
-            sql
+        units <- extractStatementUnits tree sql
+        analyzeStatementsWithDialect dialect units sql
     case parsed of
         Nothing -> assertFailure "SQL script did not parse"
         Just graph -> pure graph
