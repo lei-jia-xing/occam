@@ -86,6 +86,8 @@ Prepare/build native executables first. Workload preparation and profile output 
 
 `resets.json` compares fresh SQLite setup with copying a closed database template, on the same fixed-setup query. The predicate verifies schema, data, indexes, triggers, sequences and `user_version`, and applies `foreign_keys` per connection. This is a SQLite file-state comparison, not a server/container snapshot. No speculative parallel candidate search or incremental graph framework is enabled.
 
+Measured results, per-input distributions, 90 configured profile/strategy records, limitations and replayable evidence: [2026-11-07 evaluation](results/2026-11-07/README.md). Timeout checkpoints are validated separately, never relabeled completed.
+
 ## Optional upstream comparisons
 
 Prepare upstream sources/dependencies **outside** the measured reduction. SQLancer requires a Git checkout at [`a7d60ee`](https://github.com/sqlancer/sqlancer/tree/a7d60ee450e6a22ca38599c14e984a49773f4745), a JDK, and its built JAR/dependency directory. Set `SQLANCER_SOURCE` and run `mvn -q -Dmaven.test.skip=true package -f "$SQLANCER_SOURCE/pom.xml"` once before the comparison; the adapter no longer fetches or rebuilds on each input. It compiles the small Reproducer adapter per invocation, inside the shared deadline.

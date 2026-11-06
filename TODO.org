@@ -139,41 +139,47 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Keep Tree-sitter for exact-source edits. This is a question only: no parser replacement or integration, dependency, adapter, or feature flag is scheduled, and fuzz reduction does not depend on it.
 
 * 17. P2: Large-Scale Fuzz Workloads
-** TODO [#A] Exercise large SQL inputs and corpus batches
+** DONE [#A] Exercise large SQL inputs and corpus batches
 - Reuse existing fuzz outputs, generators, and runners; vary statements, objects, dependency density, and nesting independently.
 - Measure both single-input scaling and many-input throughput; the current 18 marker fixtures are not sufficient large-scale evidence.
 - Keep each input's setup, oracle configuration, budget, and result together.
-** TODO [#A] Reuse batch runners with per-input failure isolation
+- Completed 12 independently varied scale inputs (up to 4099 statements) and 130 corpus inputs through the existing runner. Inputs, expected rowsets, reset state, limits, outputs and raw metrics are archived with benchmarks/results/2026-11-07/README.md.
+** DONE [#A] Reuse batch runners with per-input failure isolation
 - Drive the existing single-input reducer rather than adding a separate reduction engine.
 - Continue after an individual timeout or failure; retain that input's status and last accepted SQL.
 - Report completion rate, inputs per unit time, reduction ratios, and per-input time/oracle-call distributions.
-** TODO [#B] Profile prefix search and repeated work
+- The 130-input/four-worker batch emitted all 260 case/tool records after isolated reset failures and actual SQLite timeouts. Measured makespan 576.891 s, 0.225 processed inputs/s; per-input distributions retain 128 B2 completions and 128 ordinary Occam short-budget timeouts, not fake successes. All retained results were freshly rechecked without changing original statuses.
+** DONE [#B] Profile prefix search and repeated work
 - Reuse prefix results and target locations when supplied by the oracle.
 - Use binary search only when prefix monotonicity is established.
 - Measure parsing, graph construction, closure, reset, and oracle costs before adding incremental updates.
-- Open profiling observation: under `--budget 180`, compact-01/Occam returned `timeout` after 493 reducer callbacks, retaining a 7 -> 6 statement / 1233 -> 1109 B last-valid checkpoint. Its runner-level `predicate_passed` remains null although native stats record two accepted final checks of that checkpoint. Do not call the run completed or a performance regression; profile before attributing a cause.
+- Historical compact-01 observation remains timeout at budget 180 after 493 callbacks, retaining 7 -> 6 statements / 1233 -> 1109 B. Without rerunning it, its archived profile attributes 174.012 s of 175.572 s reduction to the wrapped oracle, six prefix tests/1.509 s slicing and about 0.006 s graph analysis. Audited reset cost 40.304 s is inside that oracle scope, not additive; the last-root change is not claimed to fix this separate case.
 - Measured 67-statement SQLite run: prefix search made 67 tests and backward slicing consumed 17.481 s; dependency analysis consumed 0.061 s. An oracle-validated last-statement slice now precedes the unchanged linear fallback; no binary-search or monotonicity assumption was added.
 - Same 30 s budget after the change: slicing 0.208 s, retained checkpoint 545 -> 541 B, both runs still timeout and retain unknown runner-level predicate status; native final checks pass twice. Forced phase profiling at 4099 statements measured parse/units/actions/graph/closure at 0.061/0.400/4.495/0.061/0.000270 s; this does not justify an incremental graph framework.
-** TODO [#B] Evaluate weighted and feedback-guided search
+** DONE [#B] Evaluate weighted and feedback-guided search
 - Compare statement-count partitions with byte/token weights and actual closure gains.
 - Deduplicate candidates and cache closures; account for overlapping dependencies.
 - Try simple CDD/ProbDD-inspired feedback only after measuring the existing search.
-** TODO [#C] Evaluate faster resets and parallel search if profiling justifies them
+- Compared B1, count-DD, byte-WeightedDD and local CDD on identical statement units across six inputs; added six same-evaluator/no-slicing closure observations on sparse, dense and false-barrier cases. Full settings, overlap-aware closure behavior, calls, sizes and partial statuses are published; no token-weighting dependency or default strategy change was justified.
+** DONE [#C] Evaluate faster resets and parallel search if profiling justifies them
 - Compare fresh instances, database templates, and snapshots with complete state restoration.
 - Isolate workers, define deterministic result selection, and report speculative waste.
 - Compare equal resources and validate final results on fresh instances.
+- Fresh SQLite setup versus closed-file templates completed on the same query and equal per-tool callback counts; schema/data/index/trigger/sequence/user_version restoration has a corruption/reset regression. Keep independent-input workers; no speculative candidates were launched and no parallel speedup, generic server snapshot or incremental graph framework is claimed.
 
 * 18. P3: Comparative Evaluation
 These comparisons explain reduction gains; external-tool integration is not a prerequisite for processing fuzz SQL.
-** TODO [#B] Keep B1/B2 as reference baselines
+** DONE [#B] Keep B1/B2 as reference baselines
 - Name B1 sequential deletion and B2 standard statement ddmin.
 - Compare statement-only reducers separately from pipelines sharing clause/expression passes.
 - Share predicates, reset, cache policy, budgets, and postprocessing; report validation costs separately.
 - Report paired per-input results and distributions rather than grouping synthetic inputs as independent bugs.
-** TODO [#B] Add controlled ablations
+- Six-input/14-profile matrix keeps all statement-only references separate from shared AST pipelines; CSV and raw metrics preserve per-input pairs, validation scopes and distributions. No generated input is counted as an independent DBMS bug.
+** DONE [#B] Add controlled ablations
 - Disable slicing, closure, intra-statement passes, and caching independently.
 - Compare graph-aware and graph-free reducers within the same pipeline.
 - Record configuration, stage costs, success rates, and final sizes; test slicing/closure interactions.
+- All 84 configured profile records were emitted (58 completed, 26 timeout), including the slicing/closure 2x2 interaction, no-intra and oracle-cache toggle. Six supplemental closure-strategy records bring the unique matrix to 90; completed and partial results remain distinct. Every retained SQLite result passed two additional fresh checks.
 ** DONE [#C] Integrate upstream SQLancer reducers only for a specific comparison
 - Verified pinned upstream StatementReducer/ASTBasedReducer via the external-predicate adapter. Prepared-source run completed and independently validated two SQLite and two PostgreSQL scripts; callbacks 6/9 and 11/12 respectively. Fetch/build is outside the measured adapter; the earlier build-in-budget timeouts remain raw evidence.
 - Verify the pinned upstream entry point and reducer API before comparing `StatementReducer` or `ASTBasedReducer` with a compatible predicate adapter.
@@ -183,10 +189,11 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Report unsupported cases; use a separate fixed-setup query track where needed.
 - Apply the same target criterion and publish adapter changes.
 - Pinned SQLreduce AST/rules now share the external predicate and full input with all tools, without its intrinsic reconnect loop or tool-only setup/query substitution. Both PostgreSQL temporary/session scripts completed and independently validated; both SQLite cases report unsupported. Both upstream adapters stop at cap 1, retain accepted SQL, and their checkpoints pass a separate fresh PostgreSQL observation without relabeling the budget exit.
-** TODO [#C] Add modern and structural baselines only for a specific comparison
+** DONE [#C] Add modern and structural baselines only for a specific comparison
 - Align per-call limits (including adapter overhead), shared total deadlines, and oracle-execution budgets before comparing reducers; report the limits and validation costs.
 - Verify SQL grammar and dialect support before integrating Perses/HDD.
 - Prioritize CDD or Wddmin over accumulating more baselines; compare identical statement units first.
+- Chose the already implemented CountDD/WeightedDD/CDD comparison and verified pinned SQL grammar availability; Perses/Picireny remain explicitly not integrated rather than fake runtime baselines. Optional adapter overhead, execution caps and distinct native/callback validation scopes are documented with measured results.
 
 * 19. Related Work (2026-11-06)
 - SQLancer: statement DD and JSQLParser AST reductions; requires a `Reproducer`.
@@ -213,7 +220,9 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 ** DONE [#A] M1: Reliable single-input fuzz SQL reduction
 Given existing fuzz SQL, setup state, and an oracle, produce smaller SQL that passes an uncached fresh-state recheck; bound runtime and retain the last accepted result.
 - Verified: real SQLite accepted reductions passed two uncached fresh-state checks; cap-1 and timeout outcomes retained checkpoints and reported `execution-budget`/`timeout`, with runner completion status kept distinct from native final-validation results.
-** TODO [#A] M2: Large-input and corpus-scale validation
+** DONE [#A] M2: Large-input and corpus-scale validation
 Exercise both long SQL programs and many independent inputs; report reduction ratios, oracle calls, throughput, failures, and budget exhaustion.
-** TODO [#B] M3: Explain dependency-aware gains
+- Verified the long-input and full 130-input batches; report/archive include ratios, callbacks, makespans, failures and budget exhaustion. Across scale/corpus/profiles/supplement/reset cohorts, all 374 retained SQLite checkpoints passed 748 separately initialized observations; post-budget checks do not promote timeout outcomes.
+** DONE [#B] M3: Explain dependency-aware gains
 Compare B1/B2 and shared-pass ddmin with dependency ablations on the same fuzz inputs, predicates, and budgets; validate unrestricted fallback on false dependencies.
+- Published same-predicate statement-only/shared-pass/graph ablations: the long-input checkpoint improves without a fewer-callback claim, hard closure exposes false-barrier overconstraint, and other inputs show mixed quality/time trade-offs. No global minimum, compiler-as-SQL timing or universal graph advantage is claimed.
