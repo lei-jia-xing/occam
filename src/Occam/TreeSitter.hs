@@ -313,6 +313,7 @@ extractStatementUnits tree src = do
         afterKeyword keyword (_ : rest) = afterKeyword keyword rest
 
         -- ponytail: token-balances CASE/END; use a dialect grammar if trigger syntax needs broader coverage.
+        findOuterEnd :: Int -> [SQLToken] -> Maybe Span
         findOuterEnd _ [] = Nothing
         findOuterEnd caseDepth (WordToken "case" : rest) =
             findOuterEnd (caseDepth + 1) rest

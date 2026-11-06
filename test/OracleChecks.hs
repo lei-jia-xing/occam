@@ -36,11 +36,16 @@ tests =
           , testCase "initial SQL must satisfy the same predicate before reduction" $ do
                 let cfg = OracleConfig "sh" ["-c", "grep -q 'SELECT 42;'"] 2000000 Nothing
                 accepted <- prepareOracle cfg "SELECT 42;"
-                assertEqual "accepted original input was refused" (Right ()) accepted
+                assertBool
+                    "accepted original input was refused"
+                    ( case accepted of
+                        Right details -> detailedObservation details == OracleFinished ExitSuccess
+                        Left _ -> False
+                    )
                 rejected <- prepareOracle cfg "SELECT 1;"
                 assertBool
                     "noninteresting original input was accepted"
-                    (case rejected of Left _ -> True; Right () -> False)
+                    (case rejected of Left _ -> True; Right _ -> False)
           , testCase "reset, timeout, and launch failures remain distinct observations" $ do
                 let cfg = OracleConfig "sh" ["-c", "sleep 2"] 100000 Nothing
                 timed <- observeExternalOracle cfg BS.empty
@@ -77,6 +82,17 @@ posixTests =
             details <- observeExternalOracleDetailed cfg input
             assertEqual "output parsing, pipe deadlock, or input corruption changed the predicate" (OracleFinished ExitSuccess) (detailedObservation details)
             assertBool "oracle process start was not counted" (isJust (oracleElapsedMicros details))
+        , testCase "late infrastructure diagnostics remain visible after bounded output" $ do
+            let command =
+                    "import sys,time; s=sys.stdout.buffer; s.write(b'x'*2097152); s.flush(); "
+                        ++ "s.write(b'OCCAM_INFRA'); s.flush(); time.sleep(0.05); "
+                        ++ "s.write(b'STRUCTURE: late diagnostic\\n'); s.flush()"
+                cfg = OracleConfig "python3" ["-c", command] 5000000 Nothing
+            details <- observeExternalOracleDetailed cfg BS.empty
+            assertEqual
+                "late marker must remain an infrastructure error"
+                InfrastructureError
+                (classifyOracleObservation (detailedObservation details))
         , testCase "relative commands retain caller paths and each candidate gets fresh state" $ do
             let reset = "test \"$PWD\" = \"$OCCAM_ORIGINAL_CWD\" && : > \"$OCCAM_WORKDIR/reset.ready\""
                 command =

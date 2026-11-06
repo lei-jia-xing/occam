@@ -38,7 +38,11 @@ import Occam.Logger (
     logInfo',
     withLogger,
  )
-import Occam.Oracle (OracleConfig (..), prepareOracle)
+import Occam.Oracle (
+    OracleConfig (..),
+    OracleObservationDetails (..),
+    prepareOracle,
+ )
 import Occam.Reducer (
     ReductionConfig (..),
     SearchStrategy (..),
@@ -342,6 +346,8 @@ runOccamWithLogger logger Options {..} = do
                 , evaluationMaxOracleExecutions = optMaxOracleExecutions
                 , evaluationPreflightMicros = 0
                 , evaluationPreflightAttempts = 0
+                , evaluationPreflightResetMicros = Nothing
+                , evaluationPreflightOracleMicros = Nothing
                 }
     logInfo'
         logger
@@ -363,14 +369,14 @@ runOccamWithLogger logger Options {..} = do
             preflightStart
             totalBudgetMicros
             (prepareOracle baseOracleConfig initialSQL)
-    case prepared of
+    preflightDetails <- case prepared of
         Nothing -> do
             hPutStrLn stderr "Error: Initial predicate check exceeded the total budget"
             exitFailure
         Just (Left err) -> do
             hPutStrLn stderr ("Error: " ++ T.unpack err)
             exitFailure
-        Just (Right ()) -> pure ()
+        Just (Right details) -> pure details
     preflightEnd <- toInteger <$> getMonotonicTimeNSec
     initialEnd <- getCurrentTime
     let oracleCfg = baseOracleConfig
@@ -381,6 +387,8 @@ runOccamWithLogger logger Options {..} = do
             configuredBudget
                 { evaluationPreflightMicros = preflightMicros
                 , evaluationPreflightAttempts = 1
+                , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
+                , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
     logInfo logger "occam::oracle" "Initial predicate check passed"
 

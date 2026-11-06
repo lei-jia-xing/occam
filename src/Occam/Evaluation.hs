@@ -16,7 +16,6 @@ module Occam.Evaluation (
 import Control.Exception (
     AsyncException,
     Exception,
-    SomeException,
     displayException,
     finally,
     fromException,
@@ -63,6 +62,8 @@ data EvaluationConfig = EvaluationConfig
     , evaluationMaxOracleExecutions :: !(Maybe Int)
     , evaluationPreflightMicros :: !Int
     , evaluationPreflightAttempts :: !Int
+    , evaluationPreflightResetMicros :: !(Maybe Int)
+    , evaluationPreflightOracleMicros :: !(Maybe Int)
     }
     deriving (Eq, Show, Generic)
 
@@ -118,6 +119,8 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationReductionSeconds :: !Double
     , evaluationOracleSeconds :: !Double
     , evaluationResetSeconds :: !Double
+    , evaluationPreflightResetSeconds :: !(Maybe Double)
+    , evaluationPreflightOracleSeconds :: !(Maybe Double)
     , evaluationOracleAttempts :: !Int
     , evaluationDatabaseObservations :: !Int
     , evaluationCompletedOracleProcesses :: !Int
@@ -231,12 +234,10 @@ runEvaluatedReduction config oracleCfg parentLogger initialSQL checkpoint action
         validationCallLimit = min callsAvailable timeAvailable
         validationReserve = case evaluationTotalTimeoutMicros config of
             Nothing -> 0
-            Just limit
-                | validationCallLimit == 0 -> max 0 (toInteger limit)
-                | otherwise ->
-                    min
-                        (max 0 (toInteger limit - preflightMicros))
-                        (toInteger validationCallLimit * perValidationReserve)
+            Just limit ->
+                min
+                    (max 0 (toInteger limit - preflightMicros))
+                    (toInteger validationCallLimit * perValidationReserve)
         totalDeadline =
             (\limit -> totalStart + max 0 (toInteger limit) * 1000)
                 <$> evaluationTotalTimeoutMicros config
@@ -487,6 +488,10 @@ runEvaluatedReduction config oracleCfg parentLogger initialSQL checkpoint action
                 , evaluationReductionSeconds = reductionSeconds
                 , evaluationOracleSeconds = oracleSeconds
                 , evaluationResetSeconds = resetSeconds
+                , evaluationPreflightResetSeconds =
+                    fmap ((/ 1000000) . fromIntegral) (evaluationPreflightResetMicros config)
+                , evaluationPreflightOracleSeconds =
+                    fmap ((/ 1000000) . fromIntegral) (evaluationPreflightOracleMicros config)
                 , evaluationOracleAttempts = attempts
                 , evaluationDatabaseObservations = database
                 , evaluationCompletedOracleProcesses = completed

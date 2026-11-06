@@ -81,13 +81,13 @@ data OracleObservationDetails = OracleObservationDetails
     }
     deriving (Eq, Show)
 
-type CapturedProcess = (ExitCode, ByteString, ByteString)
+type CapturedProcess = (ExitCode, Maybe Text, Maybe Text)
 
 defaultResetTimeoutMicros :: Int
 defaultResetTimeoutMicros = 30000000
 
-maxCapturedOutputBytes :: Int
-maxCapturedOutputBytes = 2 * 1024 * 1024
+maxInfrastructureMessageBytes :: Int
+maxInfrastructureMessageBytes = 2 * 1024 * 1024
 
 {- | Oracle and reset children get a fresh process group. Ordinary descendants
 inherit ownership and are terminated on completion/timeout; children that call
@@ -121,8 +121,8 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                 restore $
                                     timeout
                                         timeoutMicros
-                                        ( withWorker (readPipeBounded hOut) $ \readOut ->
-                                            withWorker (readPipeBounded hErr) $ \readErr ->
+                                        ( withWorker (readInfrastructureDiagnostic hOut) $ \readOut ->
+                                            withWorker (readInfrastructureDiagnostic hErr) $ \readErr ->
                                                 withWorker (writePipe hIn input) $ \writeInput -> do
                                                     exitCode <- waitForProcess ph
                                                     writeInput
@@ -187,18 +187,65 @@ withWorker action use =
         (killThread . fst)
         (\(_, result) -> use (readMVar result >>= either throwIO pure))
 
-readPipeBounded :: Handle -> IO ByteString
-readPipeBounded h = BS.concat . reverse <$> go 0 []
+readInfrastructureDiagnostic :: Handle -> IO (Maybe Text)
+readInfrastructureDiagnostic h = go BS.empty Nothing
     where
-        go retained chunks = do
+        marker = "OCCAM_INFRASTRUCTURE:"
+        overlapLimit = BS.length marker - 1
+
+        go :: ByteString -> Maybe ([ByteString], Int, Bool) -> IO (Maybe Text)
+        go pending diagnostic = do
             chunk <- BS.hGetSome h 32768
             if BS.null chunk
-                then pure chunks
-                else do
-                    let kept = BS.take (maxCapturedOutputBytes - retained) chunk
-                    go
-                        (retained + BS.length kept)
-                        (if BS.null kept then chunks else kept : chunks)
+                then pure (diagnosticText diagnostic)
+                else case diagnostic of
+                    Just (_, _, True) -> go BS.empty diagnostic
+                    Just (pieces, size, False) ->
+                        go BS.empty (Just (appendDiagnostic pieces size chunk))
+                    Nothing ->
+                        case boundaryRemainder pending chunk of
+                            Just remainder ->
+                                go BS.empty (Just (appendDiagnostic [] 0 (BS.drop remainder chunk)))
+                            Nothing ->
+                                let (_, rest) = BSC.breakSubstring marker chunk
+                                 in if BS.null rest
+                                        then go (nextPending pending chunk) Nothing
+                                        else
+                                            go
+                                                BS.empty
+                                                (Just (appendDiagnostic [] 0 (BS.drop (BS.length marker) rest)))
+
+        boundaryRemainder :: ByteString -> ByteString -> Maybe Int
+        boundaryRemainder pending chunk = seek (min (BS.length pending) overlapLimit)
+            where
+                seek overlap
+                    | overlap <= 0 = Nothing
+                    | BS.drop (BS.length pending - overlap) pending == BS.take overlap marker
+                        && BS.take (BS.length marker - overlap) chunk == BS.drop overlap marker =
+                        Just (BS.length marker - overlap)
+                    | otherwise = seek (overlap - 1)
+
+        nextPending :: ByteString -> ByteString -> ByteString
+        nextPending pending chunk
+            | BS.length chunk >= overlapLimit =
+                BS.drop (BS.length chunk - overlapLimit) chunk
+            | otherwise =
+                let keepFromPending = min (BS.length pending) (overlapLimit - BS.length chunk)
+                 in BS.drop (BS.length pending - keepFromPending) pending <> chunk
+
+        appendDiagnostic :: [ByteString] -> Int -> ByteString -> ([ByteString], Int, Bool)
+        appendDiagnostic pieces size chunk =
+            let (line, newline) = BSC.break (== '\n') chunk
+                kept = BS.take (max 0 (maxInfrastructureMessageBytes - size)) line
+                newSize = size + BS.length kept
+                newPieces = if BS.null kept then pieces else kept : pieces
+                complete = not (BS.null newline) || newSize >= maxInfrastructureMessageBytes
+             in (newPieces, newSize, complete)
+
+        diagnosticText :: Maybe ([ByteString], Int, Bool) -> Maybe Text
+        diagnosticText Nothing = Nothing
+        diagnosticText (Just (pieces, _, _)) =
+            Just (T.strip . T.pack . BSC.unpack . BS.concat $ reverse pieces)
 
 writePipe :: Handle -> ByteString -> IO ()
 writePipe h bytes =
@@ -367,16 +414,8 @@ classifyOracleObservation observation = case observation of
     OracleFinished ExitSuccess -> Accepted
     OracleFinished _ -> Rejected
 
-infrastructureMessage :: ByteString -> ByteString -> Maybe Text
-infrastructureMessage stdout stderr = messageIn stdout <|> messageIn stderr
-    where
-        marker = "OCCAM_INFRASTRUCTURE:"
-        messageIn output =
-            let (_, rest) = BSC.breakSubstring marker output
-                message =
-                    T.strip . T.pack . BSC.unpack . BSC.takeWhile (/= '\n') $
-                        BS.drop (BS.length marker) rest
-             in if BSC.null rest then Nothing else Just message
+infrastructureMessage :: Maybe Text -> Maybe Text -> Maybe Text
+infrastructureMessage = (<|>)
 
 -- ----------------------------------------------------------------------------
 -- External interestingness predicate
@@ -399,15 +438,15 @@ data OracleObservation
     deriving (Eq, Show)
 
 -- | Refuse inputs that do not satisfy the supplied predicate before reduction.
-prepareOracle :: OracleConfig -> ByteString -> IO (Either Text ())
+prepareOracle :: OracleConfig -> ByteString -> IO (Either Text OracleObservationDetails)
 prepareOracle cfg sql
     | oracleTimeoutMicros cfg <= 0 = pure (Left "--timeout must be positive")
     | otherwise = do
-        observation <- observeExternalOracle cfg sql
-        pure $ case observation of
-            OracleFinished ExitSuccess -> Right ()
+        details <- observeExternalOracleDetailed cfg sql
+        pure $ case detailedObservation details of
+            OracleFinished ExitSuccess -> Right details
             OracleFinished _ -> Left "Initial input does not satisfy the oracle predicate."
-            _ -> Left ("Initial oracle failed: " <> T.pack (show observation))
+            _ -> Left ("Initial oracle failed: " <> T.pack (show (detailedObservation details)))
 
 -- | Only an explicit zero exit status accepts a candidate.
 runExternalOracle :: OracleConfig -> ByteString -> IO Bool

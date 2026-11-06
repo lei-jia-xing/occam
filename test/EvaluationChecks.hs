@@ -5,6 +5,7 @@ module EvaluationChecks (tests) where
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
 import Control.Monad (when)
+import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Occam.Dependency (SQLDialect (..))
 import Occam.Evaluation (
@@ -16,7 +17,11 @@ import Occam.Evaluation (
     sqlDialectName,
  )
 import Occam.Logger (nullLogger)
-import Occam.Oracle (OracleConfig (..))
+import Occam.Oracle (
+    OracleConfig (..),
+    OracleObservationDetails (..),
+    prepareOracle,
+ )
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
@@ -54,6 +59,42 @@ tests =
                 (sum (Map.elems (evaluationValidationOutcomes metrics)))
             assertBool "reset process time is reported separately" (evaluationResetSeconds metrics > 0)
             assertBool "validation reset time is separate" (evaluationValidationResetSeconds metrics > 0)
+        , testCase "preflight exhaustion reports execution budget and keeps the accepted checkpoint" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+            assertBool "candidate is a smaller acceptable reduction" (BS.length candidate < BS.length initial)
+            preflight <- prepareOracle oracleCfg initial
+            case preflight of
+                Left _ -> assertBool "initial SQL passes its real preflight oracle" False
+                Right details -> do
+                    let config =
+                            (evaluationConfig False (Just 30000000) (Just 1))
+                                { evaluationPreflightMicros = totalElapsedMicros details
+                                , evaluationPreflightAttempts = 1
+                                , evaluationPreflightResetMicros = Just (resetElapsedMicros details)
+                                , evaluationPreflightOracleMicros = oracleElapsedMicros details
+                                }
+                        action _ oracle = oracle candidate >> pure candidate
+                    result <- withCheckpoint $ \checkpoint -> do
+                        value <-
+                            runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                        saved <- BS.readFile checkpoint
+                        assertEqual "exhausted budget cannot replace accepted SQL" initial saved
+                        pure value
+                    let metrics = evaluationMetrics result
+                    assertEqual
+                        "an exhausted execution cap is not a wall timeout"
+                        "execution-budget"
+                        (evaluationStatus metrics)
+                    assertEqual "preflight consumed the only allowed execution" 0 (evaluationOracleAttempts metrics)
+                    assertEqual "no reducer subprocess started" 0 (evaluationDatabaseObservations metrics)
+                    assertEqual "no final validations were scheduled" 0 (evaluationValidationRepeats metrics)
+                    assertEqual
+                        "no final validation subprocess started"
+                        0
+                        (evaluationValidationDatabaseObservations metrics)
+                    assertEqual "last accepted SQL remains the initial input" initial (evaluatedSQL result)
         , testCase "timeouts keep the last accepted checkpoint and make no 1-minimal claim" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -125,6 +166,8 @@ evaluationConfig cacheEnabled wallBudget callBudget =
         , evaluationMaxOracleExecutions = callBudget
         , evaluationPreflightMicros = 0
         , evaluationPreflightAttempts = 0
+        , evaluationPreflightResetMicros = Nothing
+        , evaluationPreflightOracleMicros = Nothing
         }
 
 predicateOracle :: Int -> String -> OracleConfig

@@ -30,7 +30,11 @@ import Occam.Logger (
     logInfo',
     withLogger,
  )
-import Occam.Oracle (OracleConfig (..), prepareOracle)
+import Occam.Oracle (
+    OracleConfig (..),
+    OracleObservationDetails (..),
+    prepareOracle,
+ )
 import Occam.Reducer (ReductionConfig (..), SearchStrategy (..), defaultReductionConfig)
 import Options.Applicative (
     Parser,
@@ -305,10 +309,10 @@ runEvalWithLogger logger Options {..} = do
             preflightStart
             totalBudgetMicros
             (prepareOracle baseOracleConfig initialSQL)
-    case prepared of
+    preflightDetails <- case prepared of
         Nothing -> failWith "Error: Initial predicate check exceeded the total budget"
         Just (Left err) -> failWith ("Error: " ++ T.unpack err)
-        Just (Right ()) -> pure ()
+        Just (Right details) -> pure details
     preflightEnd <- toInteger <$> getMonotonicTimeNSec
     let preflightMicros =
             fromInteger
@@ -320,6 +324,8 @@ runEvalWithLogger logger Options {..} = do
                 , evaluationMaxOracleExecutions = optMaxOracleExecutions
                 , evaluationPreflightMicros = preflightMicros
                 , evaluationPreflightAttempts = 1
+                , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
+                , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
         reductionConfig = toReductionConfig optReductionOptions
 

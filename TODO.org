@@ -91,13 +91,15 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - The Occam CLI and evaluator use the same plain predicate contract; no crash signature, failure-any mode, or crash-specific metadata is required.
 - Final checks are uncached and use fresh candidate workdirs; two final validations run when budgets permit.
 - Verified smoke: Python stdlib SQLite reduced 44 statements/1,518 bytes to 3/149 while preserving `SELECT` result 42; the initial check ran once, final checks twice, and 57 distinct workdirs were observed across the run and adapter recheck. False, exit-139, and TERM predicates rejected before reduction.
-** IN_PROGRESS [#A] Bound oracle I/O and define the isolation boundary
-- Drain stdout/stderr while writing SQL on stdin. Each reset/predicate call gets a fresh `OCCAM_WORKDIR` also used for `TMP`, `TMPDIR`, and `TEMP`; reset and predicate share it, while cwd is preserved and exported as `OCCAM_ORIGINAL_CWD`.
-- Owned POSIX process groups are cleaned up after completion or timeout. Descendants that leave the group (including via `setsid`) are outside the contract; full Windows process-tree behavior remains unverified.
-- Linux checks passed for large-output handling and cleanup of owned descendants. Descendants outside the owned group, full Windows process-tree behavior, and real DB reset/isolation remain unverified; the external predicate owns database state.
+** DONE Bound oracle I/O and define the isolation boundary
+- Each observation gets a fresh `OCCAM_WORKDIR` (also used for `TMP`, `TMPDIR`, and `TEMP`); reset and predicate share it, while cwd is preserved and exported as `OCCAM_ORIGINAL_CWD`.
+- Haskell oracle output is drained while stdin is written concurrently; raw-byte marker scanning crosses chunks and retains only bounded diagnostics (up to 2 MiB). The benchmark wrapper keeps 8-KiB audit tails plus bounded marker diagnostics.
+- Linux real-process checks covered binary stdin, multi-megabyte output, early/late split markers, timeouts, and cleanup of owned process groups. Only owned POSIX groups are guaranteed: escaped descendants (including `setsid`) and full Windows process-tree cleanup remain outside the verified scope. Occam does not guarantee real DB reset/state isolation; the external reset/predicate owns database state.
 ** IN_PROGRESS [#A] Bound each reduction and record useful metrics
 - Per-call timeout, total wall-clock budget, and uncached oracle-execution budget include initial and final checks.
 - Preserve the last accepted SQL on exhaustion and return nonzero; run two uncached final validations when budgets permit. `stats.json` reports actual status and available measurements; token counts may be unknown.
+- `evaluationPreflightResetSeconds` and `evaluationPreflightOracleSeconds` describe the initial/preflight check; `evaluationResetSeconds` measures reduction resets; `evaluationValidationResetSeconds` measures final-validation resets. These phases are separate. Unavailable optional preflight measurements serialize as `null`.
+- Reserve final-validation wall time only for calls actually scheduled; zero scheduled validations reserve zero. If preflight consumes the execution cap, report `execution-budget`, make no reduction or final calls, and preserve the accepted checkpoint.
 - Extend and evaluate useful per-input metrics (including reset cost and corpus throughput); keep text-predicate results separate from DB-executing predicates.
 
 * 16. P1: SQL Reduction Quality
@@ -193,7 +195,7 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Establish SQL-specific gains with shared-predicate fuzz workloads and controlled baselines; scope claims to the oracle and evidence.
 
 * 20. Milestones
-** TODO [#A] M1: Reliable fuzz SQL reduction
+** IN_PROGRESS [#A] M1: Reliable fuzz SQL reduction
 Given existing fuzz SQL, setup state, and an oracle, produce smaller SQL that passes an uncached fresh-state recheck; bound runtime and retain the last accepted result.
 ** TODO [#A] M2: Large-input and corpus-scale validation
 Exercise both long SQL programs and many independent inputs; report reduction ratios, oracle calls, throughput, failures, and budget exhaustion.
