@@ -11,7 +11,7 @@ CANDIDATE_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        postgres|mysql)
+        postgres|mysql|sqlite|sqlite3|duckdb)
             DIALECT="$1"
             shift
             ;;
@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 <candidate_sql_file> <postgres|mysql>"
-            echo "   or: $0 <postgres|mysql> [candidate_sql_file]"
+            echo "Usage: $0 <candidate_sql_file> <postgres|mysql|sqlite|duckdb>"
+            echo "   or: $0 <postgres|mysql|sqlite|duckdb> [candidate_sql_file]"
             exit 0
             ;;
         *)
@@ -41,8 +41,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$DIALECT" ]]; then
-    echo "Error: dialect is required ('postgres' or 'mysql')." >&2
-    echo "Usage: $0 <candidate_sql_file> <postgres|mysql>" >&2
+    echo "Error: dialect is required ('postgres', 'mysql', 'sqlite', or 'duckdb')." >&2
+    echo "Usage: $0 <candidate_sql_file> <postgres|mysql|sqlite|duckdb>" >&2
     exit 2
 fi
 
@@ -195,6 +195,29 @@ elif [[ "$DIALECT" == "mysql" ]]; then
 
     server_logs=$(tail -n 100 /var/log/mysql/*.log /var/lib/mysql/*.err 2>/dev/null || true)
     full_output="${output}"$'\n'"${server_logs}"
+elif [[ "$DIALECT" == "sqlite" || "$DIALECT" == "sqlite3" ]]; then
+    SQLITE_DATABASE=${SQLITE_DATABASE:-/tmp/occam_sqlite_test.db}
+    SQLITE_BIN=${SQLITE_BIN:-sqlite3}
+    rm -f "$SQLITE_DATABASE"
+
+    if output=$("$SQLITE_BIN" -bail "$SQLITE_DATABASE" < "$CANDIDATE_FILE" 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    full_output="$output"
+
+elif [[ "$DIALECT" == "duckdb" ]]; then
+    DUCKDB_DATABASE=${DUCKDB_DATABASE:-/tmp/occam_duckdb_test.db}
+    DUCKDB_BIN=${DUCKDB_BIN:-duckdb}
+    rm -f "$DUCKDB_DATABASE"
+
+    if output=$("$DUCKDB_BIN" "$DUCKDB_DATABASE" < "$CANDIDATE_FILE" 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    full_output="$output"
 fi
 
 if parse_crash "$full_output" "$status"; then

@@ -102,7 +102,11 @@ extractActions stmtNode src = do
         else do
             children <- nodeNamedChildren stmtNode
             cteNames <- findCTEAliases stmtNode src
-            actions <- concat <$> mapM (inspectChild cteNames src) children
+            hasTruncate <- hasDescendantType "keyword_truncate" stmtNode
+            actions <-
+                if hasTruncate
+                    then dmlActions <$> findTableReferences cteNames stmtNode src
+                    else concat <$> mapM (inspectChild cteNames src) children
             let txAction = [ObjectAction BarrierObject BarrierDep "__tx_barrier__" | sRootType == "transaction"]
             let allActions = txAction ++ actions
             if null allActions
@@ -112,22 +116,57 @@ extractActions stmtNode src = do
     where
         dedup = Set.toList . Set.fromList
 
+findDirectTarget :: ByteString -> TSNode -> IO (Maybe ObjectName)
+findDirectTarget src node = do
+    children <- nodeNamedChildren node
+    findTarget children
+    where
+        findTarget [] = pure Nothing
+        findTarget (c : cs) = do
+            t <- nodeType c
+            if t == "object_reference" || t == "relation"
+                then do
+                    name <- normalizeName <$> nodeText src c
+                    if T.null name then findTarget cs else pure (Just name)
+                else findTarget cs
+
 inspectChild :: Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
 inspectChild cteNames src node = do
     t <- nodeType node
     case t of
         -- DDL: CREATE TABLE
         "create_table" -> do
+            mTgt <- findDirectTarget src node
             tables <- findTableReferences cteNames node src
-            pure [ObjectAction TableObject DefDep tbl | tbl <- tables]
+            case mTgt of
+                Just target -> do
+                    let defAction = [ObjectAction TableObject DefDep target]
+                        useActions = [ObjectAction TableObject UseDep tbl | tbl <- tables, tbl /= target]
+                    pure (defAction ++ useActions)
+                Nothing ->
+                    pure [ObjectAction TableObject DefDep tbl | tbl <- tables]
+        -- DDL: CREATE VIEW
+        "create_view" -> do
+            mTgt <- findDirectTarget src node
+            tables <- findTableReferences cteNames node src
+            case mTgt of
+                Just target -> do
+                    let defAction = [ObjectAction ViewObject DefDep target]
+                        useActions = [ObjectAction TableObject UseDep tbl | tbl <- tables, tbl /= target]
+                    pure (defAction ++ useActions)
+                Nothing ->
+                    pure [ObjectAction ViewObject DefDep tbl | tbl <- tables]
         -- DDL: CREATE INDEX
         "create_index" -> do
             tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject UseDep tbl | tbl <- tables]
-        -- DDL: DROP TABLE / ALTER TABLE
+        -- DDL: DROP TABLE / DROP VIEW / ALTER TABLE
         "drop_table" -> do
             tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
+        "drop_view" -> do
+            tables <- findTableReferences cteNames node src
+            pure [ObjectAction ViewObject ModDep tbl | tbl <- tables]
         "alter_table" -> do
             tables <- findTableReferences cteNames node src
             pure [ObjectAction TableObject ModDep tbl | tbl <- tables]
@@ -136,6 +175,7 @@ inspectChild cteNames src node = do
         "replace" -> dmlActions <$> findTableReferences cteNames node src
         "update" -> dmlActions <$> findTableReferences cteNames node src
         "delete" -> dmlActions <$> findTableReferences cteNames node src
+        "truncate" -> dmlActions <$> findTableReferences cteNames node src
         -- DML: SELECT / FROM
         "select" -> do
             tables <- findTableReferences cteNames node src

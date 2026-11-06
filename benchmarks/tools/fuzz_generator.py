@@ -281,7 +281,14 @@ class ChaosFuzzGenerator:
         seed: int | None = None,
         inject_case: str | None = None,
     ):
-        self.dialect = "postgres" if dialect in ("postgres", "postgresql") else "mysql"
+        if dialect in ("postgres", "postgresql", "pg"):
+            self.dialect = "postgres"
+        elif dialect in ("sqlite", "sqlite3"):
+            self.dialect = "sqlite"
+        elif dialect in ("duckdb",):
+            self.dialect = "duckdb"
+        else:
+            self.dialect = "mysql"
         self.total_statements = max(20, min(500, total_statements))
         self.ast_depth = max(5, min(25, ast_depth))
         self.seed = seed
@@ -474,6 +481,18 @@ class ChaosFuzzGenerator:
                     "INSERT INTO sales_pipeline (opportunity_id, rep_id, deal_value, stage) VALUES (1, 10, 50000.00, 'closed_won'), (2, 10, 15000.00, 'in_progress');",
                     "INSERT INTO crm_leads (lead_id, rep_id, estimated_arr) VALUES (101, 10, 45000.00), (102, 20, 90000.00);",
                     "WITH cte_pipeline AS (\n    SELECT rep_id, deal_value, stage,\n           ROW_NUMBER() OVER (PARTITION BY rep_id ORDER BY deal_value DESC) AS rank_in_rep\n    FROM sales_pipeline\n    WHERE stage = 'closed_won'\n    UNION\n    SELECT rep_id, estimated_arr, 'prospect',\n           DENSE_RANK() OVER (PARTITION BY rep_id ORDER BY estimated_arr DESC) AS rank_in_rep\n    FROM crm_leads\n)\nSELECT cp.rep_id, SUM(cp.deal_value) AS aggregate_val\nFROM cte_pipeline cp\nJOIN sales_pipeline sp ON cp.rep_id = sp.rep_id\nGROUP BY cp.rep_id, cp.stage\nHAVING aggregate_val > 10000\nORDER BY cp.rep_id;",
+                ],
+            },
+            "sqlite_01": {
+                "dbms": "sqlite",
+                "target_table": "inventory_cache",
+                "statements": [
+                    "CREATE TABLE inventory_cache (\n    item_id INT PRIMARY KEY,\n    sku VARCHAR(32) NOT NULL,\n    qty INT NOT NULL,\n    metadata JSON\n);",
+                    "CREATE TABLE price_overrides (\n    item_id INT PRIMARY KEY,\n    discount_pct NUMERIC(5,2) NOT NULL\n);",
+                    "INSERT INTO inventory_cache (item_id, sku, qty, metadata) VALUES (1, 'SKU-001', 50, '{\"warehouse\": \"central\"}'), (2, 'SKU-002', 15, '{\"warehouse\": \"east\"}');",
+                    "INSERT INTO price_overrides (item_id, discount_pct) VALUES (1, 10.00), (2, 25.00);",
+                    "INSERT OR REPLACE INTO inventory_cache (item_id, sku, qty, metadata) VALUES (1, 'SKU-001', 45, '{\"warehouse\": \"central\", \"updated\": true}');",
+                    "WITH discounted AS (\n    SELECT i.item_id, i.sku, i.qty, COALESCE(p.discount_pct, 0.0) AS discount\n    FROM inventory_cache i\n    LEFT JOIN price_overrides p ON i.item_id = p.item_id\n)\nSELECT d.item_id, d.sku, d.qty, json_extract(i.metadata, '$.warehouse') AS wh\nFROM discounted d\nJOIN inventory_cache i ON d.item_id = i.item_id\nWHERE d.discount > 5.0\nORDER BY d.item_id;",
                 ],
             },
         }
@@ -802,7 +821,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dialect",
-        choices=["postgres", "postgresql", "mysql"],
+        choices=["postgres", "postgresql", "mysql", "sqlite", "sqlite3", "duckdb"],
         default="postgres",
         help="Target SQL dialect (default: postgres)",
     )

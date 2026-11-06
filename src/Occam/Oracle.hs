@@ -15,6 +15,7 @@ module Occam.Oracle (
     runGdbSupervisor,
 ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (IOException, handle)
 import Control.Monad (join, unless)
 import Data.Aeson (
@@ -308,31 +309,33 @@ runExternalOracle OracleConfig {..} sql = do
                     (proc oracleCommand oracleArgs)
                         { std_in = CreatePipe
                         , std_out = CreatePipe
-                        , std_err = Inherit
+                        , std_err = CreatePipe
                         }
             mResult <- timeout oracleTimeoutMicros $
-                withCreateProcess cp $ \mbIn mbOut _ ph -> case (mbIn, mbOut) of
-                    (Just hIn, Just hOut) -> do
+                withCreateProcess cp $ \mbIn mbOut mbErr ph -> case (mbIn, mbOut, mbErr) of
+                    (Just hIn, Just hOut, Just hErr) -> do
                         handle (\(_ :: IOException) -> pure ()) $ do
                             BSC.hPutStr hIn sql
                             hFlush hIn
                             hClose hIn
                         outBytes <- BSC.hGetContents hOut
+                        errBytes <- BSC.hGetContents hErr
                         exitCode <- waitForProcess ph
-                        pure (exitCode, outBytes)
-                    _ -> pure (ExitFailure (-1), BSC.empty)
+                        pure (exitCode, outBytes, errBytes)
+                    _ -> pure (ExitFailure (-1), BSC.empty, BSC.empty)
             case mResult of
                 Nothing -> pure False
-                Just (exitCode, stdoutBytes) ->
+                Just (exitCode, stdoutBytes, stderrBytes) -> do
+                    let mReport = parseCrashReportJSON stdoutBytes <|> parseCrashReportJSON stderrBytes
                     case oracleExpectedCrash of
                         Just (topN, expectedReport) ->
-                            case parseCrashReportJSON stdoutBytes of
+                            case mReport of
                                 Just actualReport ->
                                     pure (isEquivalentCrash topN expectedReport actualReport)
                                 Nothing ->
                                     pure (isCrashExitCode exitCode)
                         Nothing ->
-                            case parseCrashReportJSON stdoutBytes of
+                            case mReport of
                                 Just _ -> pure True
                                 Nothing -> pure (isCrashExitCode exitCode)
 

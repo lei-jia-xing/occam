@@ -21,6 +21,14 @@ import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
+import Occam.Logger (
+    LogConfig (..),
+    LogFormat (..),
+    LogLevel (..),
+    logDebug,
+    logInfo,
+    withLogger,
+ )
 import Occam.Oracle
 import Occam.Reducer
 import Occam.Slicer
@@ -28,8 +36,11 @@ import Occam.TreeSitter
 import System.Directory (
     doesFileExist,
     findExecutable,
+    getPermissions,
     removeDirectoryRecursive,
     removeFile,
+    setOwnerExecutable,
+    setPermissions,
  )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -66,6 +77,8 @@ tests =
         , phase6Tests
         , phase7Tests
         , phase8Tests
+        , phase9Tests
+        , phase10Tests
         , goldenTests
         , propertyTests
         , generativeFuzzTests
@@ -496,6 +509,45 @@ phase5Tests =
 
             removeFile tmpSQL
             removeDirectoryRecursive tmpOut
+        , testCase "CLI --log-format json emits valid JSON logs and creates minimal.sql" $ do
+            let tmpSQL = "test_cli_json.sql"
+                tmpOut = "test_cli_json_out"
+                sampleCrashSQL =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "SELECT * FROM t1 WHERE a > 0;"
+                        ]
+            BSC.writeFile tmpSQL sampleCrashSQL
+            let pythonOracle =
+                    "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s else 1)\""
+            (okExit, okOut, okErr) <-
+                runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut, "--log-format", "json"]
+            assertEqual ("CLI json run failed: " ++ okErr ++ "\nStdout: " ++ okOut) ExitSuccess okExit
+            minExists <- doesFileExist (tmpOut </> "minimal.sql")
+            assertBool "minimal.sql must exist" minExists
+            removeFile tmpSQL
+            removeDirectoryRecursive tmpOut
+        , testCase "CLI --quiet suppresses banner and outputs minimal.sql" $ do
+            let tmpSQL = "test_cli_quiet.sql"
+                tmpOut = "test_cli_quiet_out"
+                sampleCrashSQL =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT);"
+                        , "SELECT * FROM t1;"
+                        ]
+            BSC.writeFile tmpSQL sampleCrashSQL
+            let pythonOracle = "python3 -c \"import sys; sys.exit(0)\""
+            (okExit, okOut, _) <-
+                runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut, "--quiet"]
+            assertEqual "CLI quiet run should exit success" ExitSuccess okExit
+            assertBool
+                "Banner should not be printed in quiet mode"
+                (not ("Occam Reduction Summary" `isInfixOf` okOut))
+            minExists <- doesFileExist (tmpOut </> "minimal.sql")
+            assertBool "minimal.sql must exist in quiet mode" minExists
+            removeFile tmpSQL
+            removeDirectoryRecursive tmpOut
         ]
 
 -- ----------------------------------------------------------------------------
@@ -635,6 +687,124 @@ phase7Tests =
                 case res of
                     Nothing -> assertFailure "Failed to parse script for ON DUPLICATE KEY UPDATE test"
                     Just () -> pure ()
+        , testCase "SQLite bracket identifiers: [products]" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE [products] (id INT, name TEXT);"
+                        , "INSERT INTO [products] VALUES (1, 'widget');"
+                        , "SELECT * FROM [products];"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let sliceS3 = backwardSlice (StatementId 3) graph
+                    assertBool
+                        "Backward slice from SELECT should reach CREATE TABLE [products]"
+                        (Set.member (StatementId 1) sliceS3)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for SQLite bracket identifiers test"
+                    Just () -> pure ()
+        , testCase "SQLite schema-qualified table: main.products" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE main.products (id INT, name TEXT);"
+                        , "INSERT INTO main.products VALUES (1, 'widget');"
+                        , "SELECT * FROM main.products;"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                    assertBool "INSERT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS2)
+                    assertBool "SELECT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS3)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for SQLite schema test"
+                    Just () -> pure ()
+        , testCase "SQLite CREATE VIEW and SELECT from view" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (id INT, val TEXT);"
+                        , "CREATE VIEW v1 AS SELECT * FROM t1;"
+                        , "SELECT * FROM v1;"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                    assertBool "CREATE VIEW should depend on CREATE TABLE t1" (Set.member (StatementId 1) depsS2)
+                    assertBool "SELECT from view should depend on CREATE VIEW v1" (Set.member (StatementId 2) depsS3)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for CREATE VIEW test"
+                    Just () -> pure ()
+        , testCase "SQLite CREATE TABLE t2 AS SELECT * FROM t1 maintains dependencies" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (id INT);"
+                        , "CREATE TABLE t2 AS SELECT * FROM t1;"
+                        , "SELECT * FROM t1;"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                    assertBool
+                        "CREATE TABLE t2 AS SELECT should depend on t1 (Stmt 1)"
+                        (Set.member (StatementId 1) depsS2)
+                    assertBool
+                        "SELECT * FROM t1 must still depend on CREATE TABLE t1 (Stmt 1)"
+                        (Set.member (StatementId 1) depsS3)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for CREATE TABLE AS SELECT test"
+                    Just () -> pure ()
+        , testCase "SQLite foreign key REFERENCES parent(id)" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id));"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool
+                        "CREATE TABLE child should depend on CREATE TABLE parent"
+                        (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for REFERENCES test"
+                    Just () -> pure ()
+        , testCase "SQLite TRUNCATE TABLE records UseDep and ModDep" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE items (id INT);"
+                        , "TRUNCATE TABLE items;"
+                        ]
+            withParser $ \parser -> do
+                res <- withParsedSQL parser script $ \tree -> do
+                    pairs <- extractStatementNodes tree script
+                    let indexedNodes = [(stmtId s, n) | (s, n) <- pairs]
+                    graph <- analyzeStatements indexedNodes script
+                    let actsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                        depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    assertBool
+                        "TRUNCATE should have ModDep on items"
+                        (any (\a -> actionType a == ModDep && actionName a == "items") actsS2)
+                    assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
+                case res of
+                    Nothing -> assertFailure "Failed to parse script for TRUNCATE test"
+                    Just () -> pure ()
         ]
 
 -- ----------------------------------------------------------------------------
@@ -760,6 +930,111 @@ phase8Tests =
                     assertBool "Time must be non-negative" (metricTimeSeconds m >= 0)
                 )
                 metrics
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Phase 9: SQLite & Modern DBMS Harness Execution
+-- ----------------------------------------------------------------------------
+
+phase9Tests :: TestTree
+phase9Tests =
+    testGroup
+        "Phase 9: SQLite & Modern DBMS Harness Execution"
+        [ testCase "sqlite_harness.sh traps signal 11 crash and emits CrashReport JSON" $ do
+            let scriptPath = "harness/sqlite_harness.sh"
+                fakeBinary = "test_fake_sqlite_crash.sh"
+                tmpSQL = "test_sqlite_crash.sql"
+            exists <- doesFileExist scriptPath
+            assertBool "sqlite_harness.sh must exist" exists
+            BSC.writeFile fakeBinary "#!/bin/sh\nkill -11 $$\n"
+            perms <- getPermissions fakeBinary
+            setPermissions fakeBinary (setOwnerExecutable True perms)
+            BSC.writeFile tmpSQL "SELECT * FROM test_crash;"
+            (exitCode, stdoutStr, _) <-
+                readProcessWithExitCode
+                    "sh"
+                    ["-c", "SQLITE_BIN=./" ++ fakeBinary ++ " ./" ++ scriptPath ++ " " ++ tmpSQL]
+                    ""
+            removeFile fakeBinary
+            removeFile tmpSQL
+            assertEqual "sqlite_harness should return exit 0 on crash reproduction" ExitSuccess exitCode
+            let mReport = parseCrashReportJSON (BSC.pack stdoutStr)
+            case mReport of
+                Nothing -> assertFailure ("Failed to parse crash report JSON: " ++ stdoutStr)
+                Just rep -> assertEqual "Expected SignalCrash 11" (SignalCrash 11) (reportKind rep)
+        , testCase "sqlite_harness.sh traps AddressSanitizer output and emits CrashReport JSON" $ do
+            let scriptPath = "harness/sqlite_harness.sh"
+                fakeBinary = "test_fake_sqlite_asan.sh"
+                tmpSQL = "test_sqlite_asan.sql"
+            BSC.writeFile
+                fakeBinary
+                "#!/bin/sh\necho '==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x1000' >&2\nexit 1\n"
+            perms <- getPermissions fakeBinary
+            setPermissions fakeBinary (setOwnerExecutable True perms)
+            BSC.writeFile tmpSQL "SELECT 1;"
+            (exitCode, stdoutStr, _) <-
+                readProcessWithExitCode
+                    "sh"
+                    ["-c", "SQLITE_BIN=./" ++ fakeBinary ++ " ./" ++ scriptPath ++ " " ++ tmpSQL]
+                    ""
+            removeFile fakeBinary
+            removeFile tmpSQL
+            assertEqual "sqlite_harness should return exit 0 on ASan reproduction" ExitSuccess exitCode
+            let mReport = parseCrashReportJSON (BSC.pack stdoutStr)
+            case mReport of
+                Nothing -> assertFailure ("Failed to parse ASan crash report JSON: " ++ stdoutStr)
+                Just rep ->
+                    assertEqual
+                        "Expected ASanCrash heap-use-after-free"
+                        (ASanCrash "heap-use-after-free" Nothing)
+                        (reportKind rep)
+        , testCase "sqlite_harness.sh executes non-crashing SQL with real sqlite3 and returns exit 1" $ do
+            let scriptPath = "harness/sqlite_harness.sh"
+                tmpSQL = "test_sqlite_ok.sql"
+            BSC.writeFile tmpSQL "CREATE TABLE t (x INT); INSERT INTO t VALUES (42);"
+            (exitCode, _, _) <-
+                readProcessWithExitCode scriptPath [tmpSQL] ""
+            removeFile tmpSQL
+            assertEqual
+                "sqlite_harness should return exit 1 (non-crash) for clean execution"
+                (ExitFailure 1)
+                exitCode
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Phase 10: Professional Logger Subsystem
+-- ----------------------------------------------------------------------------
+
+phase10Tests :: TestTree
+phase10Tests =
+    testGroup
+        "Phase 10: Professional Logger Subsystem"
+        [ testCase "LogLevel ordering and JSON encoding" $ do
+            assertBool "LevelDebug < LevelInfo" (LevelDebug < LevelInfo)
+            assertBool "LevelInfo < LevelWarn" (LevelInfo < LevelWarn)
+            assertBool "LevelWarn < LevelError" (LevelWarn < LevelError)
+            assertEqual "JSON LevelInfo" "\"info\"" (encode LevelInfo)
+            assertEqual "JSON LevelError" "\"error\"" (encode LevelError)
+        , testCase "withLogger in FormatJSON generates structured log output" $ do
+            let cfg = LogConfig LevelDebug FormatJSON False
+            withLogger cfg $ \logger -> do
+                logInfo logger "test::suite" "Structured logging message"
+                logDebug logger "test::suite" "Debug detail message"
+            pure ()
+        , testCase "reduceSQLWithLogger executes all reduction levels with real-time logger" $ do
+            let script =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "CREATE TABLE t2 (c INT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "SELECT * FROM t1 WHERE a > 0;"
+                        ]
+                oracle sql = pure (BSC.isInfixOf "t1" sql && BSC.isInfixOf "WHERE a > 0" sql)
+                cfg = LogConfig LevelDebug FormatJSON False
+            reduced <- withLogger cfg $ \logger ->
+                reduceSQLWithLogger logger oracle script
+            assertBool "Target table t1 retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
+            assertBool "Dead table t2 pruned" (not (BSC.isInfixOf "CREATE TABLE t2" reduced))
         ]
 
 -- ----------------------------------------------------------------------------

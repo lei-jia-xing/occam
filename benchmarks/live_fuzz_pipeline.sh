@@ -38,7 +38,7 @@ End-to-End Live Fuzz-to-Reduction Pipeline for Occam.
 Options:
   --fuzzer [sqlsmith|sqlancer|generator]
                      Target fuzzer stream (default: auto-detect, falls back to generator)
-  --dialect [postgres|mysql]
+  --dialect [postgres|mysql|sqlite|duckdb]
                      SQL dialect (default: postgres)
   --timeout N        Per-execution oracle timeout in seconds (default: 30)
   --out-dir DIR      Output directory for reduced SQL and metrics (default: benchmarks/live_fuzz_out)
@@ -109,8 +109,16 @@ case "$DIALECT" in
         DIALECT="mysql"
         DEFAULT_CASE="mysql_01"
         ;;
+    sqlite|sqlite3)
+        DIALECT="sqlite"
+        DEFAULT_CASE="sqlite_01"
+        ;;
+    duckdb)
+        DIALECT="duckdb"
+        DEFAULT_CASE="duckdb_01"
+        ;;
     *)
-        echo "Error: Unsupported dialect '$DIALECT'. Expected postgres or mysql." >&2
+        echo "Error: Unsupported dialect '$DIALECT'. Expected postgres, mysql, sqlite, or duckdb." >&2
         exit 1
         ;;
 esac
@@ -186,6 +194,14 @@ reset_database() {
             mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -e "DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;" >/dev/null 2>&1 || true
             echo "[RESET] MySQL database reset: $MYSQL_DATABASE"
         fi
+    elif [[ "$DIALECT" == "sqlite" ]]; then
+        SQLITE_DB="${DB_NAME:-/tmp/occam_sqlite_test.db}"
+        rm -f "$SQLITE_DB"
+        echo "[RESET] SQLite database reset: $SQLITE_DB"
+    elif [[ "$DIALECT" == "duckdb" ]]; then
+        DUCKDB_DB="${DB_NAME:-/tmp/occam_duckdb_test.db}"
+        rm -f "$DUCKDB_DB"
+        echo "[RESET] DuckDB database reset: $DUCKDB_DB"
     fi
 }
 

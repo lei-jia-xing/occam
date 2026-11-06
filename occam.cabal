@@ -10,6 +10,10 @@ maintainer:         leij49456@gmail.com
 category:           Development, Database, Testing
 build-type:         Simple
 extra-doc-files:    README.md
+source-repository head
+    type:     git
+    location: https://github.com/Hunter/occam
+
 
 common warnings
     ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
@@ -22,19 +26,21 @@ library
                     , Occam.Cache
                     , Occam.Core
                     , Occam.Dependency
+                    , Occam.Logger
                     , Occam.Oracle
                     , Occam.Reducer
                     , Occam.Slicer
                     , Occam.TreeSitter
     build-depends:    base >= 4.18 && < 5
-                    , bytestring >= 0.11
-                    , text >= 2.0
-                    , containers >= 0.6
-                    , process >= 1.6
-                    , filepath >= 1.4
-                    , directory >= 1.3
-                    , aeson >= 2.0
-                    , time >= 1.12
+                    , bytestring >= 0.11 && < 0.13
+                    , text >= 2.0 && < 2.2
+                    , containers >= 0.6 && < 0.8
+                    , process >= 1.6 && < 1.7
+                    , filepath >= 1.4 && < 1.6
+                    , directory >= 1.3 && < 1.4
+                    , aeson >= 2.0 && < 2.3
+                    , time >= 1.12 && < 1.15
+                    , fast-logger >= 3.1 && < 3.3
     hs-source-dirs:   src
     default-language: GHC2021
     default-extensions:
@@ -47,7 +53,7 @@ library
     include-dirs:     cbits
                     , cbits/tree-sitter-sql
     pkgconfig-depends: tree-sitter
-    cc-options:       -O1 -fPIC
+    cc-options:       -fPIC
 
 executable occam
     import:           warnings
@@ -59,7 +65,7 @@ executable occam
                     , directory
                     , filepath
                     , time
-                    , optparse-applicative
+                    , optparse-applicative >= 0.17 && < 0.19
                     , aeson >= 2.0
     hs-source-dirs:   app
     default-language: GHC2021
@@ -80,7 +86,7 @@ executable occam-eval
                     , filepath
                     , time
                     , aeson
-                    , optparse-applicative
+                    , optparse-applicative >= 0.17 && < 0.19
     default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 

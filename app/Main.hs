@@ -1,23 +1,36 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module Main (main) where
 
-import Control.Monad (unless)
-import Data.Aeson (FromJSON, ToJSON, encode)
+import Control.Monad (unless, when)
+import Data.Aeson (FromJSON, ToJSON, encode, toJSON)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
+import Data.Char (toLower)
+import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
 import Occam.Cache (CacheStats (..), memoizeOracle)
+import Occam.Logger (
+    LogConfig (..),
+    LogFormat (..),
+    LogLevel (..),
+    Logger,
+    logError,
+    logInfo,
+    logInfo',
+    withLogger,
+ )
 import Occam.Oracle (
     OracleConfig (..),
     runExternalOracle,
  )
-import Occam.Reducer (reduceSQL)
+import Occam.Reducer (reduceSQLWithLogger)
 import Occam.TreeSitter (countStatements)
 import Options.Applicative (
     Parser,
@@ -39,6 +52,7 @@ import Options.Applicative (
     showDefault,
     strArgument,
     strOption,
+    switch,
     value,
     (<**>),
  )
@@ -60,6 +74,10 @@ data Options = Options
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
     , optFrames :: !Int
+    , optLogLevel :: !String
+    , optLogFormat :: !String
+    , optVerbose :: !Bool
+    , optQuiet :: !Bool
     }
     deriving (Eq, Show)
 
@@ -119,6 +137,42 @@ optionsParser =
                 <> showDefault
                 <> help "Top-N stack frame functions required for crash equivalence"
             )
+        <*> strOption
+            ( long "log-level"
+                <> metavar "LEVEL"
+                <> value "info"
+                <> showDefault
+                <> help "Log severity level (debug, info, warn, error)"
+            )
+        <*> strOption
+            ( long "log-format"
+                <> metavar "FORMAT"
+                <> value "text"
+                <> showDefault
+                <> help "Log output format (text or json)"
+            )
+        <*> switch
+            ( long "verbose"
+                <> help "Enable verbose debug output (equivalent to --log-level debug)"
+            )
+        <*> switch
+            ( long "quiet"
+                <> short 'q'
+                <> help "Suppress info logs and banners (equivalent to --log-level error)"
+            )
+
+parseLogLevel :: String -> LogLevel
+parseLogLevel s = case map toLower s of
+    "debug" -> LevelDebug
+    "warn" -> LevelWarn
+    "warning" -> LevelWarn
+    "error" -> LevelError
+    _ -> LevelInfo
+
+parseLogFormat :: String -> LogFormat
+parseLogFormat s = case map toLower s of
+    "json" -> FormatJSON
+    _ -> FormatText
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -142,9 +196,25 @@ main :: IO ()
 main = execParser optsInfo >>= runOccam
 
 runOccam :: Options -> IO ()
-runOccam Options {..} = do
+runOccam opts@Options {..} = do
+    let effectiveLevel
+            | optQuiet = LevelError
+            | optVerbose = LevelDebug
+            | otherwise = parseLogLevel optLogLevel
+        effectiveFormat = parseLogFormat optLogFormat
+        logCfg =
+            LogConfig
+                { logMinLevel = effectiveLevel
+                , logFormat = effectiveFormat
+                , logUseColor = True
+                }
+    withLogger logCfg $ \logger -> runOccamWithLogger logger opts
+
+runOccamWithLogger :: Logger -> Options -> IO ()
+runOccamWithLogger logger Options {..} = do
     fileExists <- doesFileExist optInputFile
     unless fileExists $ do
+        logError logger "occam::cli" ("Error: Input file not found: " <> T.pack optInputFile)
         hPutStrLn stderr ("Error: Input file not found: " ++ optInputFile)
         exitFailure
 
@@ -152,20 +222,31 @@ runOccam Options {..} = do
     initialStmts <- countStatements initialSQL
     let initialBytes = BS.length initialSQL
 
-    putStrLn "======================================================================"
-    putStrLn $ "Occam v" ++ Occam.version ++ " starting reduction"
-    putStrLn "======================================================================"
-    putStrLn $
-        "  Target SQL:   "
-            ++ optInputFile
-            ++ " ("
-            ++ show initialBytes
-            ++ " bytes, "
-            ++ show initialStmts
-            ++ " stmts)"
-    putStrLn $ "  Oracle Cmd:   " ++ optOracleCmd
-    putStrLn $ "  Artifact Dir: " ++ optOutDir
-    putStrLn "----------------------------------------------------------------------"
+    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+        putStrLn "======================================================================"
+        putStrLn $ "Occam v" ++ Occam.version ++ " starting reduction"
+        putStrLn "======================================================================"
+        putStrLn $
+            "  Target SQL:   "
+                ++ optInputFile
+                ++ " ("
+                ++ show initialBytes
+                ++ " bytes, "
+                ++ show initialStmts
+                ++ " stmts)"
+        putStrLn $ "  Oracle Cmd:   " ++ optOracleCmd
+        putStrLn $ "  Artifact Dir: " ++ optOutDir
+        putStrLn "----------------------------------------------------------------------"
+
+    logInfo'
+        logger
+        "occam::cli"
+        "Starting reduction session"
+        [ ("input_file", toJSON optInputFile)
+        , ("initial_bytes", toJSON initialBytes)
+        , ("initial_statements", toJSON initialStmts)
+        , ("oracle_cmd", toJSON optOracleCmd)
+        ]
 
     -- Setup oracle configuration
     let timeoutMicros = round (optTimeoutSecs * 1000000)
@@ -179,20 +260,21 @@ runOccam Options {..} = do
                 }
 
     -- 1. Initial verification: make sure the input triggers the crash
-    putStr "Verifying initial crash reproduction... "
+    logInfo logger "occam::oracle" "Verifying initial crash reproduction against oracle..."
     initialOk <- runExternalOracle baseOracleCfg initialSQL
     unless initialOk $ do
-        putStrLn "FAILED"
+        logError logger "occam::oracle" "Initial input does not reproduce target crash!"
         hPutStrLn stderr "Error: Initial input does not reproduce target crash!"
         exitFailure
-    putStrLn "OK (Reproduced)"
+    logInfo logger "occam::oracle" "Initial crash verified successfully"
 
     (oracle, getCacheStats) <- memoizeOracle (runExternalOracle baseOracleCfg)
     -- 2. Run hierarchical reduction engine
-    putStrLn "Running hierarchical reduction engine (Levels 1-4)..."
+    logInfo logger "occam::reducer" "Running hierarchical reduction engine (Levels 1-4)..."
     startTime <- getCurrentTime
-    reducedSQL <- reduceSQL oracle initialSQL
+    reducedSQL <- reduceSQLWithLogger logger oracle initialSQL
     endTime <- getCurrentTime
+
     -- 3. Gather metrics
     cacheStats <- getCacheStats
     let totalHits = cacheHits cacheStats
@@ -213,7 +295,6 @@ runOccam Options {..} = do
 
     -- 4. Export artifacts
     createDirectoryIfMissing True optOutDir
-
     -- minimal.sql
     let minimalPath = optOutDir </> "minimal.sql"
     BS.writeFile minimalPath reducedSQL
@@ -250,26 +331,42 @@ runOccam Options {..} = do
     BSL.writeFile statsPath (encode stats)
 
     -- 5. Print summary table
-    putStrLn "----------------------------------------------------------------------"
-    putStrLn "Reduction Complete!"
-    putStrLn "======================================================================"
-    putStrLn "Occam Reduction Summary"
-    putStrLn "======================================================================"
-    putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
-    putStrLn $
-        "  Bytes:        "
-            ++ show initialBytes
-            ++ " B -> "
-            ++ show reducedBytes
-            ++ " B (-"
-            ++ showFFloat (Just 1) ratio "%"
-            ++ ")"
-    putStrLn $ "  Oracle Calls: " ++ show totalCalls
-    putStrLn $ "  Cache Hits:   " ++ show totalHits
-    putStrLn $ "  Cache Misses: " ++ show totalMisses
-    putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
-    putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) elapsedSecs "s"
-    putStrLn $ "  Artifacts:    " ++ minimalPath
-    putStrLn $ "                " ++ replayPath
-    putStrLn $ "                " ++ statsPath
-    putStrLn "======================================================================"
+    logInfo'
+        logger
+        "occam::cli"
+        "Reduction session completed"
+        [ ("initial_statements", toJSON initialStmts)
+        , ("reduced_statements", toJSON reducedStmts)
+        , ("initial_bytes", toJSON initialBytes)
+        , ("reduced_bytes", toJSON reducedBytes)
+        , ("reduction_ratio", toJSON ratio)
+        , ("oracle_calls", toJSON totalCalls)
+        , ("cache_hits", toJSON totalHits)
+        , ("cache_misses", toJSON totalMisses)
+        , ("elapsed_seconds", toJSON elapsedSecs)
+        ]
+
+    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+        putStrLn "----------------------------------------------------------------------"
+        putStrLn "Reduction Complete!"
+        putStrLn "======================================================================"
+        putStrLn "Occam Reduction Summary"
+        putStrLn "======================================================================"
+        putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
+        putStrLn $
+            "  Bytes:        "
+                ++ show initialBytes
+                ++ " B -> "
+                ++ show reducedBytes
+                ++ " B (-"
+                ++ showFFloat (Just 1) ratio "%"
+                ++ ")"
+        putStrLn $ "  Oracle Calls: " ++ show totalCalls
+        putStrLn $ "  Cache Hits:   " ++ show totalHits
+        putStrLn $ "  Cache Misses: " ++ show totalMisses
+        putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
+        putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) elapsedSecs "s"
+        putStrLn $ "  Artifacts:    " ++ minimalPath
+        putStrLn $ "                " ++ replayPath
+        putStrLn $ "                " ++ statsPath
+        putStrLn "======================================================================"

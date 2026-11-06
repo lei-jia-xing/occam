@@ -8,8 +8,11 @@ module Occam.Reducer (
     pruneClauses,
     simplifyExpressions,
     reduceSQL,
+    reduceSQLWithLogger,
 ) where
 
+import Control.Monad (when)
+import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.List (sortOn)
@@ -18,8 +21,10 @@ import Data.Maybe (fromMaybe)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
+import Occam.Logger (Logger, logDebug, logDebug', logInfo', logWarn, nullLogger)
 import Occam.Slicer (backwardSlice)
 import Occam.TreeSitter (
     Parser,
@@ -195,20 +200,43 @@ pruneClausesWithParser oracle parser = go
 
 -- | Fixed-Point Reducer Loop: Level 1 -> Level 2 -> Level 3 until fixed point.
 reduceSQL :: Oracle -> ByteString -> IO ByteString
-reduceSQL oracle initialSQL = do
+reduceSQL = reduceSQLWithLogger nullLogger
+
+-- | Fixed-Point Reducer Loop with structured progress logging.
+reduceSQLWithLogger :: Logger -> Oracle -> ByteString -> IO ByteString
+reduceSQLWithLogger logger oracle initialSQL = do
     initialOk <- oracle initialSQL
     if not initialOk
-        then pure initialSQL
-        else loop initialSQL
+        then do
+            logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
+            pure initialSQL
+        else loop (1 :: Int) initialSQL
     where
-        loop currentSQL = do
-            nextSQL <- reduceIteration oracle currentSQL
+        loop iter currentSQL = do
+            logInfo'
+                logger
+                "occam::reducer"
+                ("Starting reduction iteration " <> T.pack (show iter) <> "...")
+                [("iteration", toJSON iter), ("bytes", toJSON (BS.length currentSQL))]
+            nextSQL <- reduceIterationWithLogger logger oracle currentSQL
             if BS.length nextSQL < BS.length currentSQL
-                then loop nextSQL
-                else pure currentSQL
+                then do
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        ("Iteration " <> T.pack (show iter) <> " reduced SQL, continuing...")
+                        [("bytes_before", toJSON (BS.length currentSQL)), ("bytes_after", toJSON (BS.length nextSQL))]
+                    loop (iter + 1) nextSQL
+                else do
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        "Fixed point reached: no further reduction possible"
+                        [("total_iterations", toJSON iter), ("final_bytes", toJSON (BS.length currentSQL))]
+                    pure currentSQL
 
-reduceIteration :: Oracle -> ByteString -> IO ByteString
-reduceIteration oracle sql = withParser $ \parser -> do
+reduceIterationWithLogger :: Logger -> Oracle -> ByteString -> IO ByteString
+reduceIterationWithLogger logger oracle sql = withParser $ \parser -> do
     mTree <- parseSQL parser sql
     case mTree of
         Nothing -> pure sql
@@ -223,6 +251,12 @@ reduceIteration oracle sql = withParser $ \parser -> do
 
                     -- Level 1: Backward slice on crash statement
                     crashStmt <- findCrashStatement oracle sql stmts
+                    let StatementId cid = stmtId crashStmt
+                    logDebug'
+                        logger
+                        "occam::reducer"
+                        "Level 1: isolated earliest crash statement"
+                        [("crash_stmt_id", toJSON cid)]
                     let slice = backwardSlice (stmtId crashStmt) graph
                         l1Stmts = filter (\s -> Set.member (stmtId s) slice) stmts
                     sql1 <-
@@ -230,8 +264,21 @@ reduceIteration oracle sql = withParser $ \parser -> do
                             then do
                                 let cand = cutRemovedStatements sql stmts l1Stmts
                                 ok <- oracle cand
-                                pure (if ok then cand else sql)
-                            else pure sql
+                                if ok
+                                    then do
+                                        logInfo'
+                                            logger
+                                            "occam::reducer"
+                                            "Level 1 (Backward Slicing): pruned unreferenced statements"
+                                            [ ("statements_before", toJSON (length stmts))
+                                            , ("statements_after", toJSON (length l1Stmts))
+                                            , ("bytes", toJSON (BS.length cand))
+                                            ]
+                                        pure cand
+                                    else pure sql
+                            else do
+                                logDebug logger "occam::reducer" "Level 1 (Backward Slicing): all statements required by slice"
+                                pure sql
 
                     -- Level 2: Closure-constrained delta debugging
                     sql2 <- withParsedSQL parser sql1 $ \tree1 -> do
@@ -239,20 +286,51 @@ reduceIteration oracle sql = withParser $ \parser -> do
                         let stmts1 = map fst pairs1
                             indexed1 = [(stmtId s, n) | (s, n) <- pairs1]
                         graph1 <- analyzeStatements indexed1 sql1
+                        logDebug logger "occam::reducer" "Level 2: running closure-constrained ddmin..."
                         l2Stmts <- closureDdmin oracle sql1 stmts1 graph1
                         if length l2Stmts < length stmts1
                             then do
                                 let cand = cutRemovedStatements sql1 stmts1 l2Stmts
                                 ok <- oracle cand
-                                pure (if ok then cand else sql1)
+                                if ok
+                                    then do
+                                        logInfo'
+                                            logger
+                                            "occam::reducer"
+                                            "Level 2 (Closure ddmin): reduced statements"
+                                            [ ("statements_before", toJSON (length stmts1))
+                                            , ("statements_after", toJSON (length l2Stmts))
+                                            , ("bytes", toJSON (BS.length cand))
+                                            ]
+                                        pure cand
+                                    else pure sql1
                             else pure sql1
                     let sql2Final = fromMaybe sql1 sql2
 
                     -- Level 3: Intra-statement clause pruning
+                    logDebug logger "occam::reducer" "Level 3: running clause pruning..."
                     sql3 <- pruneClausesWithParser oracle parser sql2Final
+                    when (BS.length sql3 < BS.length sql2Final) $
+                        logInfo'
+                            logger
+                            "occam::reducer"
+                            "Level 3 (Clause Pruning): pruned optional clauses"
+                            [ ("bytes_before", toJSON (BS.length sql2Final))
+                            , ("bytes_after", toJSON (BS.length sql3))
+                            ]
 
                     -- Level 4: Intra-statement expression simplification
-                    simplifyExpressionsWithParser oracle parser sql3
+                    logDebug logger "occam::reducer" "Level 4: running expression simplification..."
+                    sql4 <- simplifyExpressionsWithParser oracle parser sql3
+                    when (BS.length sql4 < BS.length sql3) $
+                        logInfo'
+                            logger
+                            "occam::reducer"
+                            "Level 4 (Expression Simplification): simplified expressions"
+                            [ ("bytes_before", toJSON (BS.length sql3))
+                            , ("bytes_after", toJSON (BS.length sql4))
+                            ]
+                    pure sql4
 
 -- | Level 4: Intra-statement expression simplification (binary, unary, parenthesized).
 simplifyExpressions :: Oracle -> ByteString -> IO ByteString

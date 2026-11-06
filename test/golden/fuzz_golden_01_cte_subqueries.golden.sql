@@ -55,6 +55,7 @@
 
 
 
+CREATE TABLE target_customers (customer_id INT PRIMARY KEY, customer_name VARCHAR(64), tier VARCHAR(16));
 
 CREATE TABLE target_orders (order_id INT PRIMARY KEY, customer_id INT REFERENCES target_customers(customer_id), order_total NUMERIC(10,2), order_status VARCHAR(24));
 

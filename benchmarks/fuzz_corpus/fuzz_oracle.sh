@@ -106,6 +106,7 @@ TARGET_TABLES["pg_14"]="temp_batch_work"; TRIGGER_PATTERNS["pg_14"]="ROLLBACK TO
 TARGET_TABLES["pg_15"]="spatial_bounding_boxes"; TRIGGER_PATTERNS["pg_15"]="box '((-1,-1),(1,1))'"
 TARGET_TABLES["pg_16"]="staff_schedules"; TRIGGER_PATTERNS["pg_16"]="range_merge"
 TARGET_TABLES["mysql_01"]="sales_pipeline crm_leads"; TRIGGER_PATTERNS["mysql_01"]="WITH cte_pipeline"
+TARGET_TABLES["sqlite_01"]="inventory_cache price_overrides"; TRIGGER_PATTERNS["sqlite_01"]="WITH discounted"
 TARGET_TABLES["mysql_02"]="orders customers"; TRIGGER_PATTERNS["mysql_02"]="avg_spent"
 TARGET_TABLES["mysql_03"]="doc_registry"; TRIGGER_PATTERNS["mysql_03"]="JSON_EXTRACT"
 TARGET_TABLES["mysql_04"]="stock_ticks"; TRIGGER_PATTERNS["mysql_04"]="LEAD(price_cents"
