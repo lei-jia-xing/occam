@@ -3,14 +3,23 @@
 
 module Main (main) where
 
-import Benchmark (runComparisonBenchmark, runSingleAlgorithmBenchmark)
+import Benchmark (BenchmarkMetric (..), runComparisonBenchmark, runSingleAlgorithmBenchmark)
+import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
 import Data.Aeson (encode, toJSON)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
 import Data.Text qualified as T
+import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
+import Occam.Dependency (SQLDialect (..))
+import Occam.Evaluation (
+    EvaluationConfig (..),
+    EvaluationMetrics (..),
+    parseSQLDialect,
+    parseSearchStrategy,
+ )
 import Occam.Logger (
     LogConfig (..),
     LogFormat (..),
@@ -21,12 +30,15 @@ import Occam.Logger (
     logInfo',
     withLogger,
  )
-import Occam.Oracle (OracleConfig (..), runExternalOracle)
+import Occam.Oracle (OracleConfig (..), prepareOracle)
+import Occam.Reducer (ReductionConfig (..), SearchStrategy (..), defaultReductionConfig)
 import Options.Applicative (
     Parser,
     ParserInfo,
     auto,
+    eitherReader,
     execParser,
+    flag',
     fullDesc,
     header,
     help,
@@ -50,6 +62,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
+import System.Timeout (timeout)
 
 data Options = Options
     { optInputFile :: !FilePath
@@ -62,6 +75,20 @@ data Options = Options
     , optLogFormat :: !String
     , optVerbose :: !Bool
     , optQuiet :: !Bool
+    , optBudgetSecs :: !(Maybe Double)
+    , optMaxOracleExecutions :: !(Maybe Int)
+    , optReductionOptions :: !ReductionOptions
+    }
+    deriving (Eq, Show)
+
+data ReductionOptions = ReductionOptions
+    { optSlicing :: !Bool
+    , optClosure :: !Bool
+    , optIntraStatement :: !Bool
+    , optUnrestricted :: !Bool
+    , optCache :: !Bool
+    , optSearchStrategy :: !SearchStrategy
+    , optDialect :: !SQLDialect
     }
     deriving (Eq, Show)
 
@@ -70,12 +97,12 @@ optionsParser =
     Options
         <$> strArgument
             ( metavar "INPUT.sql"
-                <> help "Path to input SQL crash reproduction script"
+                <> help "Path to fuzz SQL input, including schema and setup statements"
             )
         <*> strOption
             ( long "oracle"
                 <> metavar "COMMAND"
-                <> help "Target crash oracle command (e.g. script or binary)"
+                <> help "Interestingness predicate command (SQL on stdin; exit 0 accepts)"
             )
         <*> strOption
             ( long "out"
@@ -104,7 +131,7 @@ optionsParser =
                 auto
                 ( long "baseline"
                     <> metavar "N"
-                    <> help "Run only specific baseline (1: Sequential, 2: Naive ddmin)"
+                    <> help "Run only specific baseline (1: Sequential, 2: Statement ddmin)"
                 )
             )
         <*> strOption
@@ -130,6 +157,54 @@ optionsParser =
                 <> short 'q'
                 <> help "Suppress info logs and banners (equivalent to --log-level error)"
             )
+        <*> optional
+            ( option
+                auto
+                ( long "budget"
+                    <> metavar "SECONDS"
+                    <> help "Shared wall-clock cap including initial verification, reduction, audit, and final validation"
+                )
+            )
+        <*> optional
+            ( option
+                auto
+                ( long "max-oracle-executions"
+                    <> metavar "N"
+                    <> help "Maximum uncached oracle attempts including the initial check and final validation"
+                )
+            )
+        <*> reductionOptionsParser
+
+reductionOptionsParser :: Parser ReductionOptions
+reductionOptionsParser =
+    ReductionOptions
+        <$> toggle True "slicing" "no-slicing" "dependency slicing"
+        <*> toggle True "closure" "no-closure" "dependency closure"
+        <*> toggle True "intra-statement" "no-intra-statement" "intra-statement reductions"
+        <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
+        <*> toggle True "cache" "no-cache" "candidate caching"
+        <*> option
+            (eitherReader parseSearchStrategy)
+            ( long "search-strategy"
+                <> metavar "STRATEGY"
+                <> value CountDD
+                <> showDefault
+                <> help "Search strategy: count-dd, weighted-dd, or cdd"
+            )
+        <*> option
+            (eitherReader parseSQLDialect)
+            ( long "dialect"
+                <> metavar "DIALECT"
+                <> value GenericSQL
+                <> showDefault
+                <> help "SQL dependency dialect: generic, postgresql, mysql, or sqlite"
+            )
+
+toggle :: Bool -> String -> String -> String -> Parser Bool
+toggle defaultValue enableName disableName description =
+    flag' True (long enableName <> help ("Enable " ++ description))
+        <|> flag' False (long disableName <> help ("Disable " ++ description))
+        <|> pure defaultValue
 
 parseLogLevel :: String -> LogLevel
 parseLogLevel s = case map toLower s of
@@ -158,7 +233,7 @@ optsInfo =
         (optionsParser <**> versionOption <**> helper)
         ( fullDesc
             <> progDesc "Occam-Eval: Comparative Evaluation Tool for Occam vs Baselines"
-            <> header ("Occam-Eval v" ++ Occam.version ++ " - Benchmark runner for SQL crash reduction")
+            <> header ("Occam-Eval v" ++ Occam.version ++ " - Benchmark runner for SQL test case reduction")
         )
 
 main :: IO ()
@@ -181,14 +256,25 @@ runEval opts@Options {..} = do
 
 runEvalWithLogger :: Logger -> Options -> IO ()
 runEvalWithLogger logger Options {..} = do
+    when (maybe False (`notElem` [1, 2]) optBaseline) $
+        failWith "Error: baseline must be 1 (Sequential) or 2 (Statement ddmin)"
+    let finiteTimeout seconds =
+            seconds > 0
+                && not (isNaN seconds || isInfinite seconds)
+                && seconds <= fromIntegral (maxBound :: Int) / 1000000
+                && seconds * 1000000 >= 1
+        validLimits =
+            finiteTimeout optTimeoutSecs
+                && maybe True finiteTimeout optBudgetSecs
+                && maybe True (> 0) optMaxOracleExecutions
+    unless validLimits $
+        failWith "Error: timeout, budget, and execution limits must be positive"
+
     exists <- doesFileExist optInputFile
     unless exists $ do
         logError logger "occam::eval" ("Error: Input file does not exist: " <> T.pack optInputFile)
-        hPutStrLn stderr $ "Error: Input file does not exist: " ++ optInputFile
-        exitFailure
-
+        failWith $ "Error: Input file does not exist: " ++ optInputFile
     initialSQL <- BS.readFile optInputFile
-
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
         putStrLn "======================================================================"
         putStrLn ("Occam-Eval v" ++ Occam.version ++ " - Comparative Evaluation Runner")
@@ -197,54 +283,79 @@ runEvalWithLogger logger Options {..} = do
         putStrLn $ "  Output Dir:     " ++ optOutDir
         putStrLn $ "  Oracle Command: " ++ optOracleCmd
         case optResetCmd of
-            Just r -> putStrLn $ "  Reset Command:  " ++ r
+            Just reset -> putStrLn $ "  Reset Command:  " ++ reset
             Nothing -> pure ()
-        putStrLn $ "  Timeout:        " ++ show optTimeoutSecs ++ "s"
+        putStrLn $ "  Timeout:        " ++ show optTimeoutSecs ++ "s per oracle call"
+        case optBudgetSecs of
+            Just budget -> putStrLn $ "  Total Budget:   " ++ show budget ++ "s per profile"
+            Nothing -> pure ()
         putStrLn "======================================================================"
+
+    let baseOracleConfig =
+            OracleConfig
+                { oracleCommand = "sh"
+                , oracleArgs = ["-c", optOracleCmd]
+                , oracleTimeoutMicros = round (optTimeoutSecs * 1000000)
+                , oracleResetCommand = optResetCmd
+                }
+        totalBudgetMicros = (round . (* 1000000)) <$> optBudgetSecs :: Maybe Integer
+    preflightStart <- toInteger <$> getMonotonicTimeNSec
+    prepared <-
+        runWithinBudget
+            preflightStart
+            totalBudgetMicros
+            (prepareOracle baseOracleConfig initialSQL)
+    case prepared of
+        Nothing -> failWith "Error: Initial predicate check exceeded the total budget"
+        Just (Left err) -> failWith ("Error: " ++ T.unpack err)
+        Just (Right ()) -> pure ()
+    preflightEnd <- toInteger <$> getMonotonicTimeNSec
+    let preflightMicros =
+            fromInteger
+                (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
+        evaluationConfig =
+            EvaluationConfig
+                { evaluationCacheEnabled = optCache optReductionOptions
+                , evaluationTotalTimeoutMicros = round . (* 1000000) <$> optBudgetSecs
+                , evaluationMaxOracleExecutions = optMaxOracleExecutions
+                , evaluationPreflightMicros = preflightMicros
+                , evaluationPreflightAttempts = 1
+                }
+        reductionConfig = toReductionConfig optReductionOptions
 
     logInfo'
         logger
         "occam::eval"
-        "Initialized evaluation runner"
+        "Initial predicate check passed"
         [ ("input_file", toJSON optInputFile)
         , ("oracle_cmd", toJSON optOracleCmd)
         , ("timeout_secs", toJSON optTimeoutSecs)
+        , ("evaluation_budget", toJSON evaluationConfig)
         ]
-
-    let timeoutMicros = round (optTimeoutSecs * 1000000)
-        baseOracleCfg =
-            OracleConfig
-                { oracleCommand = "sh"
-                , oracleArgs = ["-c", optOracleCmd]
-                , oracleTimeoutMicros = timeoutMicros
-                , oracleResetCommand = optResetCmd
-                , oracleExpectedCrash = Nothing
-                }
-
-    -- 1. Initial verification: make sure the input triggers the crash
-    logInfo logger "occam::eval" "Verifying initial crash reproduction against oracle..."
-    initialOk <- runExternalOracle baseOracleCfg initialSQL
-    unless initialOk $ do
-        logError logger "occam::eval" "Initial input does not reproduce target crash!"
-        hPutStrLn stderr "Error: Initial input does not reproduce target crash!"
-        exitFailure
-    logInfo logger "occam::eval" "Initial crash verified successfully"
-
-    -- 2. Run benchmark: single baseline or comparative Occam vs B1 vs B2
     createDirectoryIfMissing True optOutDir
-    jsonData <- case optBaseline of
-        Just b -> do
-            logInfo' logger "occam::eval" "Running single algorithm benchmark" [("baseline_idx", toJSON b)]
-            (metric, reducedSQL) <- runSingleAlgorithmBenchmark b (runExternalOracle baseOracleCfg) initialSQL
-            BS.writeFile (optOutDir </> "minimal.sql") reducedSQL
-            pure (encode [metric])
-        Nothing -> do
-            logInfo
+
+    metrics <- case optBaseline of
+        Just baseline -> do
+            logInfo'
                 logger
                 "occam::eval"
-                "Running comparative benchmark: Occam vs B1 (Sequential) vs B2 (Naive ddmin)..."
-            metrics <- runComparisonBenchmark (runExternalOracle baseOracleCfg) initialSQL
-            pure (encode metrics)
+                "Running single algorithm benchmark"
+                [("baseline_idx", toJSON baseline)]
+            metric <-
+                runSingleAlgorithmBenchmark
+                    baseline
+                    evaluationConfig
+                    baseOracleConfig
+                    logger
+                    initialSQL
+                    optOutDir
+            reducedSQL <- BS.readFile (metricSQLArtifact metric)
+            BS.writeFile (optOutDir </> "minimal.sql") reducedSQL
+            pure [metric]
+        Nothing -> do
+            logInfo logger "occam::eval" "Running comparative reducer and ablation profiles"
+            runComparisonBenchmark evaluationConfig baseOracleConfig logger reductionConfig initialSQL optOutDir
+    let jsonData = encode metrics
     BSL.writeFile (optOutDir </> "benchmark.json") jsonData
     logInfo'
         logger
@@ -252,7 +363,6 @@ runEvalWithLogger logger Options {..} = do
         "Benchmark evaluation finished"
         [("out_file", toJSON (optOutDir </> "benchmark.json"))]
 
-    -- 3. Print results JSON
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
         putStrLn "----------------------------------------------------------------------"
         putStrLn "Benchmark Complete!"
@@ -265,3 +375,32 @@ runEvalWithLogger logger Options {..} = do
         putStrLn "======================================================================"
         putStrLn $ "  Artifact: " ++ (optOutDir </> "benchmark.json")
         putStrLn "======================================================================"
+    unless (all completedAndValidated metrics) $
+        failWith "Error: one or more benchmark profiles did not complete repeated target validation"
+
+completedAndValidated :: BenchmarkMetric -> Bool
+completedAndValidated metric =
+    evaluationStatus (metricEvaluationMetrics metric) == "completed"
+        && evaluationValidationPassed (metricEvaluationMetrics metric)
+
+runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)
+runWithinBudget _ Nothing action = Just <$> action
+runWithinBudget started (Just totalMicros) action = do
+    now <- toInteger <$> getMonotonicTimeNSec
+    let remaining = max 0 (totalMicros - (now - started) `div` 1000)
+        timeoutMicros = fromInteger (min remaining (toInteger (maxBound :: Int)))
+    timeout timeoutMicros action
+
+toReductionConfig :: ReductionOptions -> ReductionConfig
+toReductionConfig ReductionOptions {..} =
+    defaultReductionConfig
+        { reductionSlicing = optSlicing
+        , reductionClosure = optClosure
+        , reductionIntraStatement = optIntraStatement
+        , reductionUnrestricted = optUnrestricted
+        , reductionSearch = optSearchStrategy
+        , reductionDialect = optDialect
+        }
+
+failWith :: String -> IO a
+failWith message = hPutStrLn stderr message >> exitFailure

@@ -533,7 +533,7 @@ prop_treeSitterValidity script = monadicIO $ do
         )
     assert valid
 
--- | Invariant 2: Oracle soundness (reduced output must satisfy the crash oracle)
+-- | Synthetic invariant: reduced output must satisfy the generated text predicate.
 prop_oracleSoundness :: FuzzScript -> Property
 prop_oracleSoundness script = monadicIO $ do
     let initialSQL = renderScriptSQL script
@@ -634,7 +634,7 @@ generativeFuzzTests =
             "Fuzz 1: Tree-sitter CST Validity (Zero Unparse Corruption)"
             prop_treeSitterValidity
         , testProperty
-            "Fuzz 2: Oracle Soundness (Bug Reproduction Preserved)"
+            "Fuzz 2: Synthetic Predicate Preservation"
             prop_oracleSoundness
         , testProperty
             "Fuzz 3: Reduction Monotonicity (Len Reduced <= Initial)"

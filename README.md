@@ -2,26 +2,31 @@
 
 > *Entia non sunt multiplicanda praeter necessitatem.* (Entities should not be multiplied beyond necessity.)
 
-**Occam** is a dependency-aware, state-preserving test case minimizer for multi-statement SQL crashes.
+**Occam** minimizes multi-statement SQL while preserving a supplied interestingness predicate. Existing fuzz SQL, including its schema and setup statements, is the input; collecting real DBMS bugs is not a prerequisite.
 
-## Overview
+## Predicate contract
 
-Fuzzers like SQUIRREL, SQLancer, and Griffin produce lengthy, stateful multi-statement SQL scripts (often 50–200+ statements) when triggering DBMS crashes. Most existing reducers either:
-1. Treat SQL as flat text/chunks (ddmin), wasting hundreds of database resets on syntactically/semantically invalid candidates.
-2. Rely on language unparsers that mangle precise byte sequences, comments, or float encodings, inadvertently causing **bug slippage**.
+Pass the complete candidate SQL to an external command on stdin. Exit status 0 accepts it; every nonzero status, including signal exits, rejects it. Stdout and stderr are opaque except `OCCAM_INFRASTRUCTURE:` diagnostics. Occam does not interpret crashes or automatically treat failures as interesting.
 
-Occam combines **Tree-sitter CST byte slicing** with **cross-statement object dependency analysis (Def/Use/Mod)** to prune crashing SQL scripts to 1-minimal reproducing examples without modifying the original byte syntax of preserved statements.
+```bash
+cabal run occam -- input.sql \
+  --oracle './interesting.sh' \
+  --reset './reset-db' \
+  --timeout 30 --budget 300 --max-oracle-executions 1000 \
+  --out /tmp/occam-result
+```
+
+`--reset` is optional. The initial input must pass before reduction. Per-call, total-time, and uncached-execution budgets include the initial and final checks; when budgets permit, Occam performs two uncached final validations. On exhaustion, it preserves the last accepted SQL and reports a nonzero status. `stats.json` reports available measurements; tokens can be unknown.
+
+## Candidate state
+
+Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`, and `TEMP`. The reset command and predicate share it; the original working directory is preserved and exported as `OCCAM_ORIGINAL_CWD`. Occam does not isolate or reset a real database for you: the external predicate/reset must provide the needed database state and isolation. Owned POSIX process groups are cleaned up; descendants that leave the group and full Windows process-tree behavior are outside the verified contract.
 
 ## Architecture
 
-- **Frontend**: Tree-sitter C grammar bindings via FFI (zero unparser, exact byte span slicing).
-- **Core (Haskell)**:
-  - Multi-statement Def/Use/Mod object dependency graph.
-  - Backward dependency slicing.
-  - Dependency-constrained hierarchical delta debugging (closure-level ddmin).
-- **Oracle (Haskell IO)**:
-  - Clean container / DBMS state management.
-  - ASan stack trace & signal consistency verification.
+- Tree-sitter C grammar bindings via FFI for exact byte-span SQL edits.
+- Haskell dependency analysis, backward slicing, and dependency-constrained delta debugging.
+- External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 
 ## Building
 
@@ -29,6 +34,8 @@ Occam combines **Tree-sitter CST byte slicing** with **cross-statement object de
 cabal build
 cabal test
 ```
+
+See `benchmarks/README.md` for processing existing fuzz SQL and comparing reducers.
 
 ## License
 

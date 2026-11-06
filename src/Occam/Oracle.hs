@@ -1,292 +1,385 @@
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Occam.Oracle (
-    CrashKind (..),
-    StackFrame (..),
-    CrashReport (..),
-    isEquivalentCrash,
-    parseCrashReportJSON,
-    crashReportToJSON,
     OracleConfig (..),
     executeReset,
     runExternalOracle,
-    runGdbSupervisor,
+    OracleObservation (..),
+    OracleObservationDetails (..),
+    OracleStatus (..),
+    observeExternalOracle,
+    observeExternalOracleDetailed,
+    observeExternalOracleDetailedWith,
+    oracleObservationMatches,
+    classifyOracleObservation,
+    prepareOracle,
 ) where
 
 import Control.Applicative ((<|>))
-import Control.Exception (IOException, handle)
-import Control.Monad (join, unless)
-import Data.Aeson (
-    FromJSON (..),
-    Object,
-    ToJSON (..),
-    decodeStrict,
-    encode,
-    object,
-    withObject,
-    (.!=),
-    (.:),
-    (.:?),
-    (.=),
+import Control.Concurrent (forkFinally, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
+import Control.Exception (
+    IOException,
+    bracket,
+    finally,
+    handle,
+    mask,
+    mask_,
+    onException,
+    throwIO,
+    try,
+    uninterruptibleMask_,
  )
-import Data.Aeson.Types (Parser)
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Word (Word64)
-import GHC.Generics (Generic)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
-import System.IO (hClose, hFlush)
-import System.Process (
-    CreateProcess (..),
-    StdStream (..),
-    proc,
-    shell,
-    waitForProcess,
-    withCreateProcess,
- )
+import System.FilePath (isAbsolute, isPathSeparator, (</>))
+#ifdef mingw32_HOST_OS
+import System.Directory (createDirectory, findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removeFile, removePathForcibly)
+import System.IO (Handle, hClose, hFlush, hSetBinaryMode, openBinaryTempFile)
+import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), proc, shell, terminateProcess, waitForProcess, withCreateProcess)
+#else
+import System.Directory (findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removePathForcibly)
+import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
+import System.Posix.Signals (sigKILL, sigTERM, signalProcessGroup)
+import System.Posix.Temp (mkdtemp)
+import System.Posix.Types (ProcessID)
+import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, proc, shell, waitForProcess, withCreateProcess)
+#endif
 import System.Timeout (timeout)
 
--- ----------------------------------------------------------------------------
--- 1. Typed CrashReport ADT & Community Aeson Serialization
--- ----------------------------------------------------------------------------
-
-data CrashKind
-    = SignalCrash !Int
-    | ASanCrash !Text !(Maybe Text)
-    | AssertFailure !Text
-    | ExitFailureCode !Int
-    deriving (Eq, Show, Generic)
-
-data StackFrame = StackFrame
-    { frameIndex :: !Int
-    , frameFunction :: !Text
-    , frameFile :: !(Maybe Text)
-    , frameLine :: !(Maybe Int)
-    }
-    deriving (Eq, Show, Generic)
-
-data CrashReport = CrashReport
-    { reportKind :: !CrashKind
-    , reportPC :: !(Maybe Word64)
-    , reportFrames :: ![StackFrame]
-    }
-    deriving (Eq, Show, Generic)
-
-instance ToJSON CrashKind where
-    toJSON = \case
-        SignalCrash sig ->
-            object ["kind" .= ("signal" :: Text), "signal" .= sig]
-        ASanCrash err mAddr ->
-            object $
-                [ "kind" .= ("asan" :: Text)
-                , "error_type" .= err
-                ]
-                    ++ maybe [] (\a -> ["address" .= a]) mAddr
-        AssertFailure msg ->
-            object
-                [ "kind" .= ("assert" :: Text)
-                , "assertion" .= msg
-                ]
-        ExitFailureCode code ->
-            object
-                [ "kind" .= ("exit" :: Text)
-                , "code" .= code
-                ]
-
-instance FromJSON CrashKind where
-    parseJSON = withObject "CrashKind" parseCrashKindFields
-
-parseCrashKindFields :: Object -> Parser CrashKind
-parseCrashKindFields o = do
-    mSig <- o .:? "signal" :: Parser (Maybe Int)
-    mKind <- o .:? "kind" :: Parser (Maybe Text)
-    mErrType <- o .:? "error_type" :: Parser (Maybe Text)
-    mAsan <- o .:? "asan" :: Parser (Maybe Text)
-    mAddr <- o .:? "address" :: Parser (Maybe Text)
-    mAssertion <- o .:? "assertion" :: Parser (Maybe Text)
-    mAssert <- o .:? "assert" :: Parser (Maybe Text)
-    mExitCode <- o .:? "exit_code" :: Parser (Maybe Int)
-    mCode <- o .:? "code" :: Parser (Maybe Int)
-    case () of
-        _
-            | Just sig <- mSig -> pure (SignalCrash sig)
-            | Just "SIGSEGV" <- mKind -> pure (SignalCrash 11)
-            | Just "SIGABRT" <- mKind -> pure (SignalCrash 6)
-            | Just "SIGBUS" <- mKind -> pure (SignalCrash 7)
-            | Just "SIGFPE" <- mKind -> pure (SignalCrash 8)
-            | Just "SIGILL" <- mKind -> pure (SignalCrash 4)
-            | Just "signal" <- mKind, Just sig <- mCode -> pure (SignalCrash sig)
-            | Just err <- mErrType -> pure (ASanCrash err mAddr)
-            | Just err <- mAsan -> pure (ASanCrash err mAddr)
-            | Just msg <- mAssertion -> pure (AssertFailure msg)
-            | Just msg <- mAssert -> pure (AssertFailure msg)
-            | Just code <- mExitCode -> pure (ExitFailureCode code)
-            | Just "exit" <- mKind, Just code <- mCode -> pure (ExitFailureCode code)
-            | otherwise -> fail "Unknown or invalid crash kind in JSON"
-
-instance ToJSON StackFrame where
-    toJSON StackFrame {..} =
-        object $
-            [ "index" .= frameIndex
-            , "function" .= frameFunction
-            ]
-                ++ maybe [] (\f -> ["file" .= f]) frameFile
-                ++ maybe [] (\l -> ["line" .= l]) frameLine
-
-instance FromJSON StackFrame where
-    parseJSON = withObject "StackFrame" $ \o ->
-        StackFrame
-            <$> o .:? "index" .!= 0
-            <*> o .: "function"
-            <*> o .:? "file"
-            <*> o .:? "line"
-
-instance ToJSON CrashReport where
-    toJSON CrashReport {..} =
-        object $
-            kindFields reportKind
-                ++ ["frames" .= reportFrames]
-                ++ maybe [] (\pc -> ["pc" .= pc]) reportPC
-        where
-            kindFields = \case
-                SignalCrash sig ->
-                    ["kind" .= ("signal" :: Text), "signal" .= sig]
-                ASanCrash err mAddr ->
-                    ["kind" .= ("asan" :: Text), "error_type" .= err]
-                        ++ maybe [] (\a -> ["address" .= a]) mAddr
-                AssertFailure msg ->
-                    ["kind" .= ("assert" :: Text), "assertion" .= msg]
-                ExitFailureCode code ->
-                    ["kind" .= ("exit" :: Text), "code" .= code]
-
-instance FromJSON CrashReport where
-    parseJSON = withObject "CrashReport" $ \o -> do
-        kind <- parseCrashKindFields o
-        pc <- o .:? "pc"
-        frames <- o .:? "frames" .!= []
-        pure
-            CrashReport
-                { reportKind = kind
-                , reportPC = pc
-                , reportFrames = frames
-                }
-
--- | Parse a JSON ByteString into a typed CrashReport.
-parseCrashReportJSON :: ByteString -> Maybe CrashReport
-parseCrashReportJSON = decodeStrict
-
--- | Serialize a CrashReport to a JSON ByteString.
-crashReportToJSON :: CrashReport -> ByteString
-crashReportToJSON = BSL.toStrict . encode
-
--- ----------------------------------------------------------------------------
--- 2. Semantic Equivalence Checker
--- ----------------------------------------------------------------------------
-
-{- | Check whether two crash reports represent the same crash.
-Checks that crash kinds match and top-N stack frame functions match.
--}
-isEquivalentCrash :: Int -> CrashReport -> CrashReport -> Bool
-isEquivalentCrash n r1 r2 =
-    reportKind r1 == reportKind r2
-        && take n (map frameFunction (reportFrames r1))
-            == take n (map frameFunction (reportFrames r2))
-
--- ----------------------------------------------------------------------------
--- 3. Debugger Supervisor
--- ----------------------------------------------------------------------------
-
-{- | Run target under GDB, extracting typed CrashReport via Aeson JSON dump.
-Process execution is protected against timeouts without leaving zombie processes.
--}
-runGdbSupervisor ::
-    FilePath ->
-    [String] ->
-    ByteString ->
-    Int ->
-    IO (Maybe CrashReport)
-runGdbSupervisor targetProg targetArgs sql timeoutMicros =
-    handle (\(_ :: IOException) -> pure Nothing) $ do
-        let gdbPythonScript =
-                "import gdb, json\n\
-                \try:\n\
-                \    gdb.execute('run')\n\
-                \except Exception:\n\
-                \    pass\n\
-                \try:\n\
-                \    frame = gdb.newest_frame()\n\
-                \    pc = frame.pc()\n\
-                \    frames = []\n\
-                \    cur = frame\n\
-                \    idx = 0\n\
-                \    while cur and idx < 20:\n\
-                \        sal = cur.find_sal()\n\
-                \        frames.append({\n\
-                \            'index': idx,\n\
-                \            'function': cur.name() or '???',\n\
-                \            'file': sal.symtab.filename if sal and sal.symtab else None,\n\
-                \            'line': sal.line if sal and sal.line > 0 else None\n\
-                \        })\n\
-                \        cur = cur.older()\n\
-                \        idx += 1\n\
-                \    report = {'kind': 'signal', 'signal': 11, 'pc': pc, 'frames': frames}\n\
-                \    print('---JSON_REPORT_BEGIN---')\n\
-                \    print(json.dumps(report))\n\
-                \except Exception:\n\
-                \    pass\n"
-            gdbArgs =
-                ["--batch", "-q", "-nx", "-ex", "set confirm off", "-ex", "set pagination off"]
-                    ++ ["-ex", "file " ++ targetProg]
-                    ++ (if null targetArgs then [] else ["-ex", "set args " ++ unwords targetArgs])
-                    ++ ["-ex", "python " ++ gdbPythonScript]
-            cp =
-                (proc "gdb" gdbArgs)
-                    { std_in = CreatePipe
-                    , std_out = CreatePipe
-                    , std_err = CreatePipe
-                    }
-        mRes <- timeout timeoutMicros $
-            withCreateProcess cp $ \mbIn mbOut _ ph -> case (mbIn, mbOut) of
-                (Just hIn, Just hOut) -> do
-                    handle (\(_ :: IOException) -> pure ()) $ do
-                        unless (BSC.null sql) $ do
-                            BSC.hPutStr hIn sql
-                            hFlush hIn
-                        hClose hIn
-                    outBytes <- BSC.hGetContents hOut
-                    _ <- waitForProcess ph
-                    pure $ extractJsonReport outBytes
-                _ -> pure Nothing
-        pure (join mRes)
-    where
-        extractJsonReport bs =
-            let marker = "---JSON_REPORT_BEGIN---\n"
-             in case BSC.breakSubstring marker bs of
-                    (_, rest)
-                        | not (BSC.null rest) ->
-                            let jsonBS = BSC.drop (BSC.length marker) rest
-                             in parseCrashReportJSON (BSC.takeWhile (/= '\n') jsonBS)
-                    _ -> parseCrashReportJSON bs
-
--- ----------------------------------------------------------------------------
--- 4. Lightweight State Reset Mechanism
--- ----------------------------------------------------------------------------
-
--- | Run a database/environment reset command.
+-- | Run a database/environment reset command in an owned process group.
 executeReset :: Maybe String -> IO Bool
 executeReset Nothing = pure True
 executeReset (Just cmd) =
     handle (\(_ :: IOException) -> pure False) $
-        withCreateProcess (shell cmd) $ \_ _ _ ph -> do
-            exitCode <- waitForProcess ph
-            pure (exitCode == ExitSuccess)
+        withCandidateWorkdir $ \workDir -> do
+            childEnv <- candidateEnvironment workDir
+            result <-
+                runProcessGroup
+                    defaultResetTimeoutMicros
+                    ((shell cmd) {env = Just childEnv})
+                    BS.empty
+            pure $ case result of
+                Just (ExitSuccess, _, _) -> True
+                _ -> False
+
+data OracleObservationDetails = OracleObservationDetails
+    { detailedObservation :: !OracleObservation
+    , totalElapsedMicros :: !Int
+    , resetElapsedMicros :: !Int
+    , oracleElapsedMicros :: !(Maybe Int)
+    }
+    deriving (Eq, Show)
+
+type CapturedProcess = (ExitCode, ByteString, ByteString)
+
+defaultResetTimeoutMicros :: Int
+defaultResetTimeoutMicros = 30000000
+
+maxCapturedOutputBytes :: Int
+maxCapturedOutputBytes = 2 * 1024 * 1024
+
+{- | Oracle and reset children get a fresh process group. Ordinary descendants
+inherit ownership and are terminated on completion/timeout; children that call
+setsid escape it and are outside the supported Linux/POSIX contract.
+-}
+runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe CapturedProcess)
+runProcessGroup timeoutMicros command input =
+    snd <$> runProcessGroupWithStart (pure ()) timeoutMicros command input
+
+runProcessGroupWithStart ::
+    IO () ->
+    Int ->
+    CreateProcess ->
+    ByteString ->
+    IO (Bool, Maybe CapturedProcess)
+runProcessGroupWithStart onStarted timeoutMicros command input
+    | timeoutMicros <= 0 = pure (False, Nothing)
+    | otherwise =
+        mask $ \restore ->
+            withCreateProcess process $ \mbIn mbOut mbErr ph ->
+                case (mbIn, mbOut, mbErr) of
+                    (Just hIn, Just hOut, Just hErr) -> do
+                        groupId <- getOwnedGroup ph
+                        let cleanup = cleanupOwnedGroup groupId ph
+                        result <-
+                            ( do
+                                onStarted
+                                hSetBinaryMode hIn True
+                                hSetBinaryMode hOut True
+                                hSetBinaryMode hErr True
+                                restore $
+                                    timeout
+                                        timeoutMicros
+                                        ( withWorker (readPipeBounded hOut) $ \readOut ->
+                                            withWorker (readPipeBounded hErr) $ \readErr ->
+                                                withWorker (writePipe hIn input) $ \writeInput -> do
+                                                    exitCode <- waitForProcess ph
+                                                    writeInput
+                                                    out <- readOut
+                                                    err <- readErr
+                                                    pure (exitCode, out, err)
+                                        )
+                            )
+                                `onException` cleanup
+                        cleanup
+                        pure (True, result)
+                    _ -> ioError (userError "Missing oracle process pipes")
+    where
+        process =
+            command
+                { std_in = CreatePipe
+                , std_out = CreatePipe
+                , std_err = CreatePipe
+                , create_group = createProcessGroup
+                }
+#ifdef mingw32_HOST_OS
+createProcessGroup :: Bool
+createProcessGroup = False
+
+getOwnedGroup :: ProcessHandle -> IO ()
+getOwnedGroup _ = pure ()
+
+cleanupOwnedGroup :: () -> ProcessHandle -> IO ()
+cleanupOwnedGroup _ ph = do
+    ignoreIOException (terminateProcess ph)
+    _ <- timeout 1000000 (waitForProcess ph)
+    pure ()
+#else
+createProcessGroup :: Bool
+createProcessGroup = True
+
+getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
+getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
+
+cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO ()
+cleanupOwnedGroup mPid ph = mask_ $ do
+    case mPid of
+        Nothing -> pure ()
+        Just pid -> do
+            termSent <- tryIOException (signalProcessGroup sigTERM pid)
+            case termSent of
+                Right () -> uninterruptibleMask_ (threadDelay 50000)
+                Left _ -> pure ()
+            ignoreIOException (signalProcessGroup sigKILL pid)
+    _ <- timeout 1000000 (waitForProcess ph)
+    pure ()
+#endif
+
+withWorker :: IO a -> (IO a -> IO b) -> IO b
+withWorker action use =
+    bracket
+        ( do
+            result <- newEmptyMVar
+            tid <- forkFinally action (putMVar result)
+            pure (tid, result)
+        )
+        (killThread . fst)
+        (\(_, result) -> use (readMVar result >>= either throwIO pure))
+
+readPipeBounded :: Handle -> IO ByteString
+readPipeBounded h = BS.concat . reverse <$> go 0 []
+    where
+        go retained chunks = do
+            chunk <- BS.hGetSome h 32768
+            if BS.null chunk
+                then pure chunks
+                else do
+                    let kept = BS.take (maxCapturedOutputBytes - retained) chunk
+                    go
+                        (retained + BS.length kept)
+                        (if BS.null kept then chunks else kept : chunks)
+
+writePipe :: Handle -> ByteString -> IO ()
+writePipe h bytes =
+    handle
+        (\(_ :: IOException) -> pure ())
+        ( do
+            unless (BS.null bytes) (BS.hPut h bytes)
+            hFlush h
+        )
+        `finally` ignoreIOException (hClose h)
+
+tryIOException :: IO a -> IO (Either IOException a)
+tryIOException = try
+
+ignoreIOException :: IO () -> IO ()
+ignoreIOException = handle (\(_ :: IOException) -> pure ())
+
+withCandidateWorkdir :: (FilePath -> IO a) -> IO a
+withCandidateWorkdir = bracket createWorkdir (ignoreIOException . removePathForcibly)
+    where
+#ifdef mingw32_HOST_OS
+    createWorkdir = do
+        tempDir <- getTemporaryDirectory
+        (path, h) <- openBinaryTempFile tempDir "occam-candidate-"
+        hClose h
+        removeFile path
+        createDirectory path
+        pure path
+#else
+    createWorkdir = do
+        tempDir <- getTemporaryDirectory
+        mkdtemp (tempDir </> "occam-candidate-XXXXXX")
+#endif
+
+resolveExecutable :: FilePath -> IO FilePath
+resolveExecutable executable
+    | isAbsolute executable || any isPathSeparator executable = makeAbsolute executable
+    | otherwise = do
+        found <- findExecutable executable
+        maybe (pure executable) makeAbsolute found
+
+candidateEnvironment :: FilePath -> IO [(String, String)]
+candidateEnvironment workDir = do
+    current <- getEnvironment
+    originalDir <- getCurrentDirectory
+    let overrides =
+            [ ("OCCAM_WORKDIR", workDir)
+            , ("OCCAM_ORIGINAL_CWD", originalDir)
+            , ("TMPDIR", workDir)
+            , ("TMP", workDir)
+            , ("TEMP", workDir)
+            ]
+        keys = map fst overrides
+    pure (overrides ++ filter ((`notElem` keys) . fst) current)
+
+elapsedMicros :: Word64 -> Word64 -> Int
+elapsedMicros start end = fromIntegral ((end - start) `div` 1000)
+
+observeExternalOracle :: OracleConfig -> ByteString -> IO OracleObservation
+observeExternalOracle cfg sql =
+    detailedObservation <$> observeExternalOracleDetailed cfg sql
+
+observeExternalOracleDetailed :: OracleConfig -> ByteString -> IO OracleObservationDetails
+observeExternalOracleDetailed = observeExternalOracleDetailedWith (pure ())
+
+-- | Count the oracle process only after it has actually been created.
+observeExternalOracleDetailedWith ::
+    IO () ->
+    OracleConfig ->
+    ByteString ->
+    IO OracleObservationDetails
+observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
+    started <- getMonotonicTimeNSec
+    let finish observation resetElapsed oracleElapsed = do
+            ended <- getMonotonicTimeNSec
+            pure
+                OracleObservationDetails
+                    { detailedObservation = observation
+                    , totalElapsedMicros = elapsedMicros started ended
+                    , resetElapsedMicros = resetElapsed
+                    , oracleElapsedMicros = oracleElapsed
+                    }
+        remainingMicros = do
+            now <- getMonotonicTimeNSec
+            pure (oracleTimeoutMicros - elapsedMicros started now)
+    if oracleTimeoutMicros <= 0
+        then finish OracleTimedOut 0 Nothing
+        else do
+            attempt <- tryIOException $ withCandidateWorkdir $ \workDir -> do
+                childEnv <- candidateEnvironment workDir
+                (resetResult, resetElapsed) <- case oracleResetCommand of
+                    Nothing -> pure (Right (Just ExitSuccess), 0)
+                    Just command -> do
+                        resetStarted <- getMonotonicTimeNSec
+                        remaining <- remainingMicros
+                        result <-
+                            if remaining <= 0
+                                then pure (Right Nothing)
+                                else
+                                    tryIOException $
+                                        runProcessGroup
+                                            remaining
+                                            ((shell command) {env = Just childEnv})
+                                            BS.empty
+                        resetEnded <- getMonotonicTimeNSec
+                        let duration = elapsedMicros resetStarted resetEnded
+                        pure
+                            ( fmap (fmap (\(code, _, _) -> code)) result
+                            , duration
+                            )
+                case resetResult of
+                    Left err -> pure (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
+                    Right Nothing -> pure (OracleTimedOut, resetElapsed, Nothing)
+                    Right (Just code)
+                        | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
+                        | otherwise -> do
+                            oracleExecutable <- resolveExecutable oracleCommand
+                            oracleStarted <- getMonotonicTimeNSec
+                            remaining <- remainingMicros
+                            if remaining <= 0
+                                then pure (OracleTimedOut, resetElapsed, Nothing)
+                                else do
+                                    oracleResult <-
+                                        tryIOException $
+                                            runProcessGroupWithStart
+                                                onOracleStarted
+                                                remaining
+                                                ((proc oracleExecutable oracleArgs) {env = Just childEnv})
+                                                sql
+                                    oracleEnded <- getMonotonicTimeNSec
+                                    let oracleElapsed = elapsedMicros oracleStarted oracleEnded
+                                    pure
+                                        ( case oracleResult of
+                                            Left err -> OracleIOFailed (T.pack (show err))
+                                            Right (_, Nothing) -> OracleTimedOut
+                                            Right (_, Just (code', out, err))
+                                                | Just message <- infrastructureMessage out err ->
+                                                    OracleIOFailed message
+                                                | otherwise -> OracleFinished code'
+                                        , resetElapsed
+                                        , case oracleResult of
+                                            Right (True, _) -> Just oracleElapsed
+                                            _ -> Nothing
+                                        )
+            case attempt of
+                Left err -> finish (OracleIOFailed (T.pack (show err))) 0 Nothing
+                Right (observation, resetElapsed, oracleElapsed) ->
+                    finish observation resetElapsed oracleElapsed
+
+oracleObservationMatches :: OracleObservation -> Bool
+oracleObservationMatches (OracleFinished ExitSuccess) = True
+oracleObservationMatches _ = False
+
+data OracleStatus
+    = Accepted
+    | Rejected
+    | TimedOut
+    | InfrastructureError
+    deriving (Eq, Ord, Show)
+
+classifyOracleObservation :: OracleObservation -> OracleStatus
+classifyOracleObservation observation = case observation of
+    OracleTimedOut -> TimedOut
+    OracleResetFailed -> InfrastructureError
+    OracleIOFailed _ -> InfrastructureError
+    OracleFinished ExitSuccess -> Accepted
+    OracleFinished _ -> Rejected
+
+infrastructureMessage :: ByteString -> ByteString -> Maybe Text
+infrastructureMessage stdout stderr = messageIn stdout <|> messageIn stderr
+    where
+        marker = "OCCAM_INFRASTRUCTURE:"
+        messageIn output =
+            let (_, rest) = BSC.breakSubstring marker output
+                message =
+                    T.strip . T.pack . BSC.unpack . BSC.takeWhile (/= '\n') $
+                        BS.drop (BS.length marker) rest
+             in if BSC.null rest then Nothing else Just message
 
 -- ----------------------------------------------------------------------------
--- 5. External Oracle Runner
+-- External interestingness predicate
 -- ----------------------------------------------------------------------------
 
 data OracleConfig = OracleConfig
@@ -294,51 +387,29 @@ data OracleConfig = OracleConfig
     , oracleArgs :: ![String]
     , oracleTimeoutMicros :: !Int
     , oracleResetCommand :: !(Maybe String)
-    , oracleExpectedCrash :: !(Maybe (Int, CrashReport))
     }
     deriving (Eq, Show)
 
--- | Run an external script/oracle with timeout and optional reset.
-runExternalOracle :: OracleConfig -> ByteString -> IO Bool
-runExternalOracle OracleConfig {..} sql = do
-    resetOk <- executeReset oracleResetCommand
-    if not resetOk
-        then pure False
-        else do
-            let cp =
-                    (proc oracleCommand oracleArgs)
-                        { std_in = CreatePipe
-                        , std_out = CreatePipe
-                        , std_err = CreatePipe
-                        }
-            mResult <- timeout oracleTimeoutMicros $
-                withCreateProcess cp $ \mbIn mbOut mbErr ph -> case (mbIn, mbOut, mbErr) of
-                    (Just hIn, Just hOut, Just hErr) -> do
-                        handle (\(_ :: IOException) -> pure ()) $ do
-                            BSC.hPutStr hIn sql
-                            hFlush hIn
-                            hClose hIn
-                        outBytes <- BSC.hGetContents hOut
-                        errBytes <- BSC.hGetContents hErr
-                        exitCode <- waitForProcess ph
-                        pure (exitCode, outBytes, errBytes)
-                    _ -> pure (ExitFailure (-1), BSC.empty, BSC.empty)
-            case mResult of
-                Nothing -> pure False
-                Just (exitCode, stdoutBytes, stderrBytes) -> do
-                    let mReport = parseCrashReportJSON stdoutBytes <|> parseCrashReportJSON stderrBytes
-                    case oracleExpectedCrash of
-                        Just (topN, expectedReport) ->
-                            case mReport of
-                                Just actualReport ->
-                                    pure (isEquivalentCrash topN expectedReport actualReport)
-                                Nothing ->
-                                    pure (isCrashExitCode exitCode)
-                        Nothing ->
-                            case mReport of
-                                Just _ -> pure True
-                                Nothing -> pure (isCrashExitCode exitCode)
+-- | An observation retains execution failures instead of conflating them with rejection.
+data OracleObservation
+    = OracleFinished !ExitCode
+    | OracleTimedOut
+    | OracleResetFailed
+    | OracleIOFailed !Text
+    deriving (Eq, Show)
 
-isCrashExitCode :: ExitCode -> Bool
-isCrashExitCode ExitSuccess = True
-isCrashExitCode (ExitFailure code) = code < 0 || code >= 128
+-- | Refuse inputs that do not satisfy the supplied predicate before reduction.
+prepareOracle :: OracleConfig -> ByteString -> IO (Either Text ())
+prepareOracle cfg sql
+    | oracleTimeoutMicros cfg <= 0 = pure (Left "--timeout must be positive")
+    | otherwise = do
+        observation <- observeExternalOracle cfg sql
+        pure $ case observation of
+            OracleFinished ExitSuccess -> Right ()
+            OracleFinished _ -> Left "Initial input does not satisfy the oracle predicate."
+            _ -> Left ("Initial oracle failed: " <> T.pack (show observation))
+
+-- | Only an explicit zero exit status accepts a candidate.
+runExternalOracle :: OracleConfig -> ByteString -> IO Bool
+runExternalOracle cfg sql =
+    oracleObservationMatches <$> observeExternalOracle cfg sql

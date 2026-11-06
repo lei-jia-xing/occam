@@ -1,67 +1,44 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Occam Upstream Fuzz Driver: SQLancer
-# Supports PostgreSQL and MySQL targets, capturing crashes and execution logs.
+# Supports PostgreSQL and MySQL targets and records the fuzzer's execution log.
 # ==============================================================================
-set -eo pipefail
+set -euo pipefail
 
-# 1. Verify Java 17+
-if ! command -v java >/dev/null 2>&1; then
-    echo "Error: java command not found in PATH. Java 17+ is required." >&2
-    exit 1
-fi
+SQLANCER_PIN="a7d60ee450e6a22ca38599c14e984a49773f4745"
+SQLANCER_SOURCE="${SQLANCER_SOURCE:-${XDG_CACHE_HOME:-$HOME/.cache}/occam/sqlancer-$SQLANCER_PIN}"
+
+for tool in java git mvn; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Error: SQLancer requires $tool (Java 11+, Git, and Maven)." >&2
+        exit 1
+    fi
+done
 
 JAVA_VER=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}')
 JAVA_MAJOR=$(echo "$JAVA_VER" | awk -F '.' '{if ($1 == "1") print $2; else print $1}')
-if [[ -z "$JAVA_MAJOR" || "$JAVA_MAJOR" -lt 17 ]]; then
-    echo "Error: Java 17+ is required, but detected Java version $JAVA_VER." >&2
+if [[ -z "$JAVA_MAJOR" || "$JAVA_MAJOR" -lt 11 ]]; then
+    echo "Error: Java 11+ is required, but detected Java version ${JAVA_VER:-unknown}." >&2
     exit 1
 fi
 
-# 2. Locate sqlancer.jar
-SQLANCER_JAR="${SQLANCER_JAR:-}"
-if [[ -n "$SQLANCER_JAR" && -f "$SQLANCER_JAR" ]]; then
-    :
-elif [[ -f "/opt/sqlancer/sqlancer.jar" ]]; then
-    SQLANCER_JAR="/opt/sqlancer/sqlancer.jar"
-elif [[ -f "$HOME/.sqlancer/sqlancer.jar" ]]; then
-    SQLANCER_JAR="$HOME/.sqlancer/sqlancer.jar"
-elif [[ -f "./sqlancer.jar" ]]; then
-    SQLANCER_JAR="./sqlancer.jar"
-elif [[ -f "./target/sqlancer.jar" ]]; then
-    SQLANCER_JAR="./target/sqlancer.jar"
-else
-    found=$(find /opt "$HOME/.sqlancer" . -maxdepth 3 -name "sqlancer*.jar" 2>/dev/null | head -n 1 || true)
-    if [[ -n "$found" ]]; then
-        SQLANCER_JAR="$found"
-    fi
+if [[ ! -d "$SQLANCER_SOURCE/.git" ]]; then
+    mkdir -p "$(dirname "$SQLANCER_SOURCE")"
+    git init -q "$SQLANCER_SOURCE"
+    git -C "$SQLANCER_SOURCE" remote add origin https://github.com/sqlancer/sqlancer.git
+    git -C "$SQLANCER_SOURCE" fetch -q --depth 1 origin "$SQLANCER_PIN"
+    git -C "$SQLANCER_SOURCE" checkout -q --detach FETCH_HEAD
+fi
+actual_pin=$(git -C "$SQLANCER_SOURCE" rev-parse HEAD 2>/dev/null || true)
+if [[ "$actual_pin" != "$SQLANCER_PIN" ]]; then
+    echo "Error: SQLANCER_SOURCE must be pinned at $SQLANCER_PIN (found ${actual_pin:-not a git checkout})." >&2
+    exit 1
 fi
 
-if [[ -z "$SQLANCER_JAR" || ! -f "$SQLANCER_JAR" ]]; then
-    echo "sqlancer.jar not found. Attempting to download..." >&2
-    mkdir -p "$HOME/.sqlancer"
-    if curl -fsSL -o "$HOME/.sqlancer/sqlancer.jar" "https://github.com/sqlancer/sqlancer/releases/download/v2.0.0/sqlancer-2.0.0.jar" 2>/dev/null; then
-        SQLANCER_JAR="$HOME/.sqlancer/sqlancer.jar"
-    fi
-fi
-
-if [[ -z "$SQLANCER_JAR" || ! -f "$SQLANCER_JAR" ]]; then
-    cat >&2 <<'EOF'
-Error: sqlancer.jar not found.
-Checked locations:
-  - $SQLANCER_JAR
-  - /opt/sqlancer/sqlancer.jar
-  - ~/.sqlancer/sqlancer.jar
-  - ./sqlancer.jar
-
-To install SQLancer:
-  mkdir -p ~/.sqlancer
-  curl -L -o ~/.sqlancer/sqlancer.jar https://github.com/sqlancer/sqlancer/releases/download/v2.0.0/sqlancer-2.0.0.jar
-Or build from source:
-  git clone https://github.com/sqlancer/sqlancer.git
-  cd sqlancer && mvn package -DskipTests
-  cp target/sqlancer-*.jar ~/.sqlancer/sqlancer.jar
-EOF
+mvn -q -DskipTests package -f "$SQLANCER_SOURCE/pom.xml"
+SQLANCER_JAR="$SQLANCER_SOURCE/target/sqlancer-2.0.0.jar"
+if [[ ! -f "$SQLANCER_JAR" ]]; then
+    echo "Error: Maven did not produce $SQLANCER_JAR." >&2
     exit 1
 fi
 
@@ -145,7 +122,7 @@ echo "==> Running SQLancer ($DIALECT) for $QUERIES queries..."
 echo "==> Host: $HOST:$PORT | Database: $DB | User: $USER"
 echo "==> Capturing logs to: $LOG_FILE"
 
-# 5. Run SQLancer and capture crashes / logs
+# 5. Run SQLancer and record its output.
 JAVA_CMD=("java")
 if [[ -n "${SQLANCER_CLASSPATH:-}" ]]; then
     JAVA_CMD+=("-cp" "$SQLANCER_CLASSPATH:$SQLANCER_JAR" "sqlancer.Main")
@@ -157,13 +134,6 @@ set +e
 "${JAVA_CMD[@]}" --num-queries "$QUERIES" "$DIALECT" "${DIALECT_ARGS[@]}" "${EXTRA_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 status=${PIPESTATUS[0]}
 set -e
-
-# Capture any crash reports or logs generated in workdir
-for crash_src in logs/ target/logs/; do
-    if [[ -d "$crash_src" ]]; then
-        cp -r "$crash_src"* "$OUT_DIR/" 2>/dev/null || true
-    fi
-done
 
 if [[ $status -ne 0 ]]; then
     echo "==> SQLancer exited with status $status (logs saved to $OUT_DIR)" >&2

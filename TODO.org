@@ -8,7 +8,7 @@ Research question: Can SQL state dependencies reduce DBMS executions and reset c
 Scope: Existing fuzz SQL, setup state, and an oracle -> reduced SQL that still satisfies that oracle. Collecting real DBMS crashes is not required.
 Scale: Both statements per input and inputs per corpus matter.
 Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus throughput -> P3 comparative evaluation.
-Archived DONE items record implementation history, not verified experimental claims. Existing crash samples remain regression inputs, not a collection requirement.
+- Archived DONE items are historical notes, not claims about current APIs. Crash-reporting, debugger, signature-matching, and crash-harvesting prototypes were removed during the predicate-only cutover.
 
 * 1. Frontend & CST Surgery (Tree-sitter)                              :ARCHIVE:
 ** DONE Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
@@ -29,88 +29,83 @@ Archived DONE items record implementation history, not verified experimental cla
 ** DONE Level 4: Expression simplification (binary expression -> operand -> literal)
 ** DONE Fixed-point scheduler: iterate levels until minimal fixed-point is reached
 
-* 4. Semantic Crash Oracle & Environment                               :ARCHIVE:
-** DONE Define typed CrashReport ADT (signal/exception kind, faulting PC, [StackFrame])
-** DONE Implement a GDB batch supervisor prototype; LLDB and GDB-MI backends were not verified.
-** DONE Standalone JSON Oracle contract (supports external runners emitting typed crash JSON)
-** DONE Lightweight state reset: database-level DROP/CREATE or socket-level respawn
-** DONE Prototype crash-kind and top-frame matching; strict-signature and fresh-state validation are tracked in P0.
+* 4. Removed Crash-Oriented Prototypes                                 :ARCHIVE:
+- Earlier iterations included typed crash reports, debugger integration, JSON crash reports, and crash-signature matching. These paths are removed, not current features or prerequisites.
 
 * 5. CLI & Test Suite                                                  :ARCHIVE:
-** DONE CLI interface: input SQL file, DBMS dialect (PG/MySQL), oracle configuration
-** DONE Result exporter: emit minimal.sql, reproduction command, and reduction metrics
+** DONE CLI interface: input SQL file, dialect, and external predicate configuration
+** DONE Result exporter: minimal.sql and reduction metrics
 ** DONE Unit test suite: CST byte cutting and dependency DAG correctness
-** DONE Integration test suite: test against simulated crash scripts
+- Earlier crash-script integration tests were removed with the crash-specific oracle paths.
 
 * 6. Candidate Memoization & Performance Optimization                  :ARCHIVE:
 ** DONE In-memory candidate Hash memoization (prevent duplicate DB re-executions)
 ** DONE Cache statistics reporting (cache hits vs oracle executions)
 
-* 7. DBMS Dialect Hardening & Native Harnesses (PostgreSQL & MySQL)     :ARCHIVE:
+* 7. DBMS Dialect Handling (PostgreSQL & MySQL)                       :ARCHIVE:
 ** DONE PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)
 ** DONE MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
-** DONE Native execution harnesses for local psql and mysql sockets
+- Earlier DBMS crash harnesses were removed; database execution, reset, and isolation belong to external predicates.
 
 * 8. Experimental Baselines & Benchmark Runner                         :ARCHIVE:
 ** DONE Implement Baseline 1 (Sequential statement-by-statement deletion)
 ** DONE Implement Baseline 2 (statement-level ddmin without dependency graph; uses Tree-sitter boundaries)
 ** DONE Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
-** DONE Decouple baselines and benchmark runner from core Occam into standalone bench/ (occam-eval executable)
+** DONE Decouple baselines from the core into the standalone `occam-eval` executable.
 ** DONE Modernize benchmark export from hardcoded CSV/MD to Unix-native streaming JSONL (fuzz_benchmark_results.jsonl) and presentation tool benchmarks/report.sh
 
 * 9. Synthetic Fuzz Corpus and Mechanics Tests                             :ARCHIVE:
 ** DONE Generate 18 PostgreSQL/MySQL-shaped SQL stress fixtures with text-marker predicates
 ** DONE Add a reducer runner for synthetic-predicate mechanics; this is not real-crash evidence
 
-* 10. Heavy Fuzzing & Large-Scale Corpus                               :ARCHIVE:
+* 10. Fuzzing Experiments                                              :ARCHIVE:
 ** DONE Multi-statement generative & mutational SQL generator with varied schemas and constraints
-** DONE Complex programmatic crash oracle simulator with hidden non-trivial invariants
 ** DONE Property-based fuzz test suite (test-suite occam-fuzz) with native QuickCheck / Tasty integration
-** DONE Invariant verification: Tree-sitter validity, Oracle soundness, monotonicity, and idempotency
-** DONE Integrated shrinking on invariant failures finding minimal failing SQL sequences
-** DONE Heavy multi-statement fuzz golden tests in test/golden/ replacing toy test scenarios
+** DONE Heavy multi-statement fuzz golden tests in test/golden/
+- Crash-oracle simulation and crash-specific soundness experiments from earlier iterations are not current features.
 
-* 11. Upstream Fuzz Tools Integration (SQLsmith & SQLancer)             :ARCHIVE:
+* 11. Optional Fuzz Producers (SQLsmith & SQLancer)                    :ARCHIVE:
 ** DONE Add optional upstream SQLsmith and SQLancer driver scripts.
-** DONE Add a live-capture script prototype; a driver invocation alone is not evidence of a DBMS crash.
-** DONE Add pipeline wiring; upstream crash capture is an optional validation track, not a reduction prerequisite.
+- SQLsmith can dump generated queries; the SQLancer driver records its fuzzer log and does not harvest crash cases or build a reduction corpus.
+- The SQLancer source fetch/build attempt timed out; runtime integration remains unverified.
 
 * 12. Prototype Reducer Comparison (Synthetic Predicate)                 :ARCHIVE:
-- Validation of the native SQLancer entry point and Reproducer adapter is tracked in P3.
+- Optional external SQLancer reducer integration remains unverified; see P3.
 ** DONE Prototype C-Reduce and statement-ddmin runs against a text-pattern predicate; outputs are synthetic mechanics data.
 ** DONE Stream synthetic-predicate measurements into JSONL; records do not establish SQL validity or bug reproduction.
 
 * 13. Fuzz-to-Reduction Pipeline Prototype                                 :ARCHIVE:
-** DONE Add a script that prefers available upstream fuzzers but may fall back to synthetic SQL generation.
-- Limitation: no verified end-to-end upstream-fuzzer capture is recorded here; the prototype is not real-crash evidence.
+** DONE Add a pipeline for existing SQL input with an explicit predicate, plus an explicitly synthetic-input mode.
+- No automatic upstream-fuzzer capture or crash harvesting is part of the current pipeline.
 
 * 14. Synthetic Evaluation Artifacts                                       :ARCHIVE:
 ** DONE Add a comparative benchmark data stream and presentation script for synthetic predicates.
-- Limitation: these artifacts support synthetic-predicate mechanics only; DBMS execution and crash-specific claims require separate evidence.
+- Historical JSONL artifacts describe synthetic-predicate mechanics only; they do not establish SQL validity or DBMS execution.
 
 * 15. P0: Reliable Fuzz-to-Reduction
-** TODO [#A] Define the fuzz-input and oracle contract
-- Consume existing fuzz outputs, including schema/setup SQL and an external interestingness predicate; do not require a new fuzzer or crash collection.
-- Check that the original input satisfies the predicate before reducing it.
-- Preserve the specified target behavior, not merely any failure or a shorter SQL string.
-- Keep synthetic text-marker tests labeled as mechanics tests; they do not establish SQL validity, DBMS execution, or semantic bug preservation.
-** IN_PROGRESS [#A] Preserve the supplied target predicate
-- Use explicit exit-code mode for external interestingness predicates; require crash signatures only when the selected target is a crash.
-- In crash mode, reject missing or mismatched reports rather than silently falling back to exit codes.
-- Distinguish predicate rejection, SQL errors, timeouts, and infrastructure errors where the oracle reports them.
-- Recheck final results without caching and with fresh candidate state.
-** IN_PROGRESS [#A] Fix oracle I/O and isolation
-- Drain stdout/stderr while writing stdin to prevent pipe deadlocks.
-- Clean up child processes on timeout; isolate databases and workdirs per candidate.
-- Use candidate-isolated database paths and workdirs before batch or parallel evaluation.
-- Verify large-output handling, process cleanup, and state isolation.
-** TODO [#A] Bound each reduction and record useful metrics
-- Separate per-call timeouts from per-input total time and oracle-execution budgets.
-- Save the last accepted result on budget exhaustion; distinguish completed, budget-exhausted, tool-error, and invalid-result states.
-- Record input/output bytes, tokens, SQL-aware statement counts, oracle executions, cache hits, reset time, and final validation status.
-- Keep text-predicate measurements separate from DBMS-executing predicates.
+** DONE Define the existing-fuzz-input and oracle contract
+- Accept existing SQL, including schema/setup statements, with a user-supplied external predicate; no new fuzzer or crash collection is required.
+- The predicate receives the complete candidate on stdin; exit 0 accepts and every nonzero or signal exit rejects. Output is opaque except the reserved `OCCAM_INFRASTRUCTURE:` diagnostic.
+- Require the initial input to pass before reduction; keep synthetic text-marker checks labeled as mechanics only.
+** DONE Preserve the supplied generic predicate
+- The Occam CLI and evaluator use the same plain predicate contract; no crash signature, failure-any mode, or crash-specific metadata is required.
+- Final checks are uncached and use fresh candidate workdirs; two final validations run when budgets permit.
+- Verified smoke: Python stdlib SQLite reduced 44 statements/1,518 bytes to 3/149 while preserving `SELECT` result 42; the initial check ran once, final checks twice, and 57 distinct workdirs were observed across the run and adapter recheck. False, exit-139, and TERM predicates rejected before reduction.
+** IN_PROGRESS [#A] Bound oracle I/O and define the isolation boundary
+- Drain stdout/stderr while writing SQL on stdin. Each reset/predicate call gets a fresh `OCCAM_WORKDIR` also used for `TMP`, `TMPDIR`, and `TEMP`; reset and predicate share it, while cwd is preserved and exported as `OCCAM_ORIGINAL_CWD`.
+- Owned POSIX process groups are cleaned up after completion or timeout. Descendants that leave the group (including via `setsid`) are outside the contract; full Windows process-tree behavior remains unverified.
+- Linux checks passed for large-output handling and cleanup of owned descendants. Descendants outside the owned group, full Windows process-tree behavior, and real DB reset/isolation remain unverified; the external predicate owns database state.
+** IN_PROGRESS [#A] Bound each reduction and record useful metrics
+- Per-call timeout, total wall-clock budget, and uncached oracle-execution budget include initial and final checks.
+- Preserve the last accepted SQL on exhaustion and return nonzero; run two uncached final validations when budgets permit. `stats.json` reports actual status and available measurements; token counts may be unknown.
+- Extend and evaluate useful per-input metrics (including reset cost and corpus throughput); keep text-predicate results separate from DB-executing predicates.
 
 * 16. P1: SQL Reduction Quality
+** TODO [#A] Fix statement-unit and dependency failures for TRUNCATE and transactions
+- The integrated full suite still has four failures among 66 checks, in `Spec/DependencyChecks`; Oracle (7), CLI (2), and evaluator (5) checks pass.
+- Tree-sitter exposes `TRUNCATE` as a `keyword_truncate` child of `statement`, not the node cases currently handled by dependency analysis.
+- The parser groups `BEGIN` through `ROLLBACK` and merges `SAVEPOINT`/`RELEASE` error spans, breaking expected dependency checks.
+- Model these statement units and transaction/savepoint effects correctly; rerun the affected checks before claiming the full suite passes.
 ** TODO [#A] Add unrestricted deletion after graph-guided search
 - Hard closure can retain unnecessary statements through conservative dependencies.
 - Compare hard closure, closure with unrestricted fallback, and plain ddmin on fuzz inputs with false dependencies.
@@ -163,16 +158,16 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Disable slicing, closure, intra-statement passes, and caching independently.
 - Compare graph-aware and graph-free reducers within the same pipeline.
 - Record configuration, stage costs, success rates, and final sizes; test slicing/closure interactions.
-** TODO [#C] Integrate upstream SQLancer reducers when a SQL-specific comparison is needed
-- Use StatementReducer and ASTBasedReducer with a compatible Reproducer adapter.
-- Verify the entry point at a pinned revision; the current sqlancer.reducer.Reducer command is unverified.
+** TODO [#C] Integrate upstream SQLancer reducers only for a specific comparison
+- The generic `PredicateReducer.java` adapter is optional; SQLancer source fetch/build timed out and runtime integration is unverified.
+- Verify the pinned upstream entry point and reducer API before comparing `StatementReducer` or `ASTBasedReducer` with a compatible predicate adapter.
 - Measure oracle calls or report unknown, independently validate outputs, and report unsupported dialects.
 ** TODO [#C] Add SQLreduce when PostgreSQL comparison is needed
 - Verify multiple statements, setup state, target predicates, and reconnects.
 - Report unsupported cases; use a separate fixed-setup query track where needed.
 - Apply the same target criterion and publish adapter changes.
 ** TODO [#C] Add modern and structural baselines only for a specific comparison
-- Remove C-Reduce's 25-second cap and align total-time/oracle-call budgets before comparison.
+- Align per-call limits (including adapter overhead), shared total deadlines, and oracle-execution budgets before comparing reducers; report the limits and validation costs.
 - Verify SQL grammar and dialect support before integrating Perses/HDD.
 - Prioritize CDD or Wddmin over accumulating more baselines; compare identical statement units first.
 
@@ -194,7 +189,7 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Contrast its user/provider reconstruction with SQL schema generations, transactional state, conservative fallback, and byte-preserving reduction; do not compare the paper's C/Java results as SQL measurements.
 - Read full paper: https://arxiv.org/abs/2605.19412
 - Inspected the public artifact repository on its `master` branch: https://github.com/XYZboom/DRReduceData . It contains C/Java inputs, outputs, predicates and ablations, not an Occam-compatible SQL runner. Its `clang-22382/cdd_result/cdd_result.txt` reports 1,998 calls, 135 seconds and 113 tokens; these are authors' compiler measurements, not Occam results.
-- Establish SQL-specific gains with shared-predicate fuzz workloads and controlled baselines; real-crash evidence is required only for crash-specific claims.
+- Establish SQL-specific gains with shared-predicate fuzz workloads and controlled baselines; scope claims to the oracle and evidence.
 
 * 20. Milestones
 ** TODO [#A] M1: Reliable fuzz SQL reduction
@@ -203,19 +198,3 @@ Given existing fuzz SQL, setup state, and an oracle, produce smaller SQL that pa
 Exercise both long SQL programs and many independent inputs; report reduction ratios, oracle calls, throughput, failures, and budget exhaustion.
 ** TODO [#B] M3: Explain dependency-aware gains
 Compare B1/B2 and shared-pass ddmin with dependency ablations on the same fuzz inputs, predicates, and budgets; validate unrestricted fallback on false dependencies.
-
-* Review Queue
-** BLOCKED [#A] Define process-tree timeout cleanup
-- Review required: current process cleanup does not guarantee termination of shell descendants or daemonized DBMS workers.
-- Choose supported platforms and process-group ownership before adding group termination.
-- Concurrent pipe I/O and reset deadlines are implemented; full process-tree cleanup remains unverified.
-
-* Optional Crash-Specific Review
-Crash collection, debugger integration, and expanding DBMS crash coverage are outside the current fuzz-SQL reduction scope. Retain existing samples and reports; do not block the main milestones on them.
-** BLOCKED [#C] Replace weak harness crash reports
-- Review required: native harnesses emit empty stacks or generic assertions; GDB reports signal 11 unconditionally.
-- Strict CLI mode now rejects signals without frames. Exit-code predicates do not establish crash identity.
-- Choose debugger/sanitizer capture requirements before treating these harnesses as real-crash evidence.
-** BLOCKED [#C] Define assertion identity and report trust
-- Review required: generic assertion labels can merge distinct bugs; JSON reports are currently trusted as oracle output.
-- Decide whether strict mode requires assertion locations/stacks and how to validate conflicting JSON fields.

@@ -3,8 +3,10 @@
 module Occam.Cache (
     CacheStats (..),
     memoizeOracle,
+    memoizeOracleWith,
 ) where
 
+import Control.Monad (when)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -22,26 +24,35 @@ data CacheStats = CacheStats
 instance ToJSON CacheStats
 instance FromJSON CacheStats
 
-{- | Wraps an Oracle with an in-memory memoization cache.
-If a candidate SQL was already evaluated, returns the cached result and increments cacheHits.
-Otherwise, calls the underlying Oracle, caches the result, and increments cacheMisses.
--}
+-- | Memoize completed results. Failed actions are counted as misses but never cached.
 memoizeOracle :: Oracle -> IO (Oracle, IO CacheStats)
-memoizeOracle oracle = do
-    cacheRef <- newIORef (Map.empty :: Map ByteString Bool)
+memoizeOracle = memoizeOracleWith True (const True)
+
+memoizeOracleWith ::
+    Bool ->
+    (a -> Bool) ->
+    (ByteString -> IO a) ->
+    IO (ByteString -> IO a, IO CacheStats)
+memoizeOracleWith enabled cacheResult oracle = do
+    cacheRef <- newIORef Map.empty
     hitsRef <- newIORef (0 :: Int)
     missesRef <- newIORef (0 :: Int)
-    let cachedOracle sql = do
-            cache <- readIORef cacheRef
-            case Map.lookup sql cache of
-                Just res -> do
-                    modifyIORef' hitsRef (+ 1)
-                    pure res
-                Nothing -> do
-                    res <- oracle sql
-                    modifyIORef' missesRef (+ 1)
-                    modifyIORef' cacheRef (Map.insert sql res)
-                    pure res
+    let cachedOracle sql
+            | not enabled = do
+                modifyIORef' missesRef (+ 1)
+                oracle sql
+            | otherwise = do
+                cache <- readIORef cacheRef
+                case Map.lookup sql cache of
+                    Just res -> do
+                        modifyIORef' hitsRef (+ 1)
+                        pure res
+                    Nothing -> do
+                        modifyIORef' missesRef (+ 1)
+                        res <- oracle sql
+                        when (cacheResult res) $
+                            modifyIORef' cacheRef (Map.insert sql res)
+                        pure res
         getStats = do
             hits <- readIORef hitsRef
             misses <- readIORef missesRef

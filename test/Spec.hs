@@ -3,47 +3,37 @@
 module Main (main) where
 
 import Baseline (runNaiveDdmin, runSequentialDrop)
-import Benchmark (
-    BenchmarkMetric (..),
-    runComparisonBenchmark,
- )
-import Data.Aeson (decode, encode)
+import Control.Exception (bracket)
+import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.ByteString.Lazy qualified as LBS
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import DependencyChecks qualified
+import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
-import Occam.Logger (
-    LogConfig (..),
-    LogFormat (..),
-    LogLevel (..),
-    logDebug,
-    logInfo,
-    withLogger,
- )
-import Occam.Oracle
 import Occam.Reducer
 import Occam.Slicer
 import Occam.TreeSitter
+import OracleChecks qualified
+import ReductionChecks qualified
 import System.Directory (
+    doesDirectoryExist,
     doesFileExist,
     findExecutable,
-    getPermissions,
+    getTemporaryDirectory,
     removeDirectoryRecursive,
     removeFile,
-    setOwnerExecutable,
-    setPermissions,
  )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (hClose, openTempFile)
 import System.Process (readProcessWithExitCode)
 import Test.QuickCheck (
     Arbitrary (..),
@@ -58,7 +48,6 @@ import Test.QuickCheck (
  )
 import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.Golden (goldenVsString)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
@@ -72,14 +61,14 @@ tests =
         [ phase1Tests
         , phase2Tests
         , phase3Tests
-        , phase4Tests
         , phase5Tests
         , phase6Tests
         , phase7Tests
         , phase8Tests
-        , phase9Tests
-        , phase10Tests
-        , goldenTests
+        , DependencyChecks.tests
+        , EvaluationChecks.tests
+        , OracleChecks.tests
+        , ReductionChecks.tests
         , propertyTests
         , generativeFuzzTests
         , mutationalFuzzTests
@@ -192,6 +181,7 @@ phase2Tests =
                                 [ actionName action
                                 | action <- queryActions
                                 , actionType action == UseDep
+                                , actionKind action == TableObject
                                 ]
                         deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
                     assertEqual
@@ -296,112 +286,6 @@ phase3Tests =
         ]
 
 -- ----------------------------------------------------------------------------
--- Phase 4: Crash Oracle
--- ----------------------------------------------------------------------------
-
-phase4Tests :: TestTree
-phase4Tests =
-    testGroup
-        "Phase 4: Crash Oracle"
-        [ testCase "CrashReport semantic equivalence" $ do
-            let frame0 = StackFrame 0 "ExecScan" (Just "execScan.c") (Just 42)
-                frame1 = StackFrame 1 "standard_ExecutorRun" (Just "execMain.c") (Just 300)
-                frame2 = StackFrame 2 "PortalRun" (Just "pquery.c") (Just 780)
-                frameAlt = StackFrame 0 "errfinish" (Just "elog.c") (Just 100)
-
-                reportA = CrashReport (SignalCrash 11) (Just 0x401000) [frame0, frame1, frame2]
-                reportB = CrashReport (SignalCrash 11) (Just 0x401050) [frame0, frame1, frame2]
-                reportDiffSig = CrashReport (SignalCrash 6) (Just 0x401000) [frame0, frame1, frame2]
-                reportDiffFrame = CrashReport (SignalCrash 11) (Just 0x401000) [frameAlt, frame1, frame2]
-
-            assertBool "Expected reportA and reportB to be equivalent" (isEquivalentCrash 3 reportA reportB)
-            assertBool
-                "Expected different signals to not match"
-                (not (isEquivalentCrash 3 reportA reportDiffSig))
-            assertBool
-                "Expected different top frame to not match"
-                (not (isEquivalentCrash 3 reportA reportDiffFrame))
-        , testCase "JSON contract parsing and round-trip" $ do
-            let jsonPayload =
-                    BSC.pack
-                        "{\"kind\":\"SIGSEGV\",\"signal\":11,\"pc\":4198400,\"frames\":[\
-                        \{\"index\":0,\"function\":\"ExecScan\",\"file\":\"execScan.c\",\"line\":42},\
-                        \{\"index\":1,\"function\":\"standard_ExecutorRun\",\"file\":\"execMain.c\",\"line\":300}\
-                        \]}"
-            case parseCrashReportJSON jsonPayload of
-                Nothing -> assertFailure "Failed to parse crash report JSON"
-                Just parsed -> do
-                    assertEqual "Expected SignalCrash 11" (SignalCrash 11) (reportKind parsed)
-                    assertEqual "Expected PC" (Just 4198400) (reportPC parsed)
-                    assertEqual "Expected 2 frames" 2 (length (reportFrames parsed))
-                    case reportFrames parsed of
-                        (f0 : _) -> do
-                            assertEqual "Expected function ExecScan" "ExecScan" (frameFunction f0)
-                            assertEqual "Expected file execScan.c" (Just "execScan.c") (frameFile f0)
-                            assertEqual "Expected line 42" (Just 42) (frameLine f0)
-                        [] -> assertFailure "Expected non-empty frames"
-
-            let frame0 = StackFrame 0 "ExecScan" (Just "execScan.c") (Just 42)
-                reportA = CrashReport (SignalCrash 11) (Just 0x401000) [frame0]
-                rtJSON = crashReportToJSON reportA
-            case parseCrashReportJSON rtJSON of
-                Nothing -> assertFailure "Failed to parse round-tripped JSON"
-                Just rtReport ->
-                    assertBool "Round-tripped CrashReport did not match" (isEquivalentCrash 1 reportA rtReport)
-        , testCase "Typed CrashReport contract (ASan, Assert, ExitCode)" $ do
-            let asanPayload =
-                    BSC.pack
-                        "{\"kind\":\"asan\",\"error_type\":\"heap-use-after-free\",\"address\":\"0x1000\",\"frames\":[{\"index\":0,\"function\":\"free_buf\"}]}"
-            case parseCrashReportJSON asanPayload of
-                Nothing -> assertFailure "Failed to parse ASan crash report JSON"
-                Just r -> do
-                    assertEqual "Expected ASanCrash" (ASanCrash "heap-use-after-free" (Just "0x1000")) (reportKind r)
-                    assertEqual "Expected 1 frame" 1 (length (reportFrames r))
-            let assertPayload =
-                    BSC.pack
-                        "{\"kind\":\"assert\",\"assertion\":\"ptr != NULL\",\"frames\":[]}"
-            case parseCrashReportJSON assertPayload of
-                Nothing -> assertFailure "Failed to parse Assert crash report JSON"
-                Just r ->
-                    assertEqual "Expected AssertFailure" (AssertFailure "ptr != NULL") (reportKind r)
-            let exitPayload =
-                    BSC.pack
-                        "{\"kind\":\"exit\",\"code\":139,\"frames\":[]}"
-            case parseCrashReportJSON exitPayload of
-                Nothing -> assertFailure "Failed to parse ExitCode crash report JSON"
-                Just r ->
-                    assertEqual "Expected ExitFailureCode 139" (ExitFailureCode 139) (reportKind r)
-        , testCase "Lightweight reset mechanism" $ do
-            resNone <- executeReset Nothing
-            assertBool "executeReset Nothing should return True" resNone
-            resTrue <- executeReset (Just "true")
-            assertBool "executeReset (Just 'true') should return True" resTrue
-            resFalse <- executeReset (Just "false")
-            assertBool "executeReset (Just 'false') should return False" (not resFalse)
-        , testCase "External oracle runner & bug slippage prevention" $ do
-            let frame0 = StackFrame 0 "ExecScan" (Just "execScan.c") (Just 42)
-                frameAlt = StackFrame 0 "errfinish" (Just "elog.c") (Just 100)
-                reportA = CrashReport (SignalCrash 11) (Just 0x401000) [frame0]
-                reportDiff = CrashReport (SignalCrash 11) (Just 0x401000) [frameAlt]
-                mockScript =
-                    "echo '{\"kind\":\"SIGSEGV\",\"signal\":11,\"frames\":[{\"index\":0,\"function\":\"ExecScan\"}]}'"
-                cfgMatch =
-                    OracleConfig
-                        { oracleCommand = "sh"
-                        , oracleArgs = ["-c", mockScript]
-                        , oracleTimeoutMicros = 2000000
-                        , oracleResetCommand = Nothing
-                        , oracleExpectedCrash = Just (1, reportA)
-                        }
-                cfgMismatch = cfgMatch {oracleExpectedCrash = Just (1, reportDiff)}
-
-            matched <- runExternalOracle cfgMatch "SELECT 1;"
-            assertBool "runExternalOracle should have matched" matched
-            slipped <- runExternalOracle cfgMismatch "SELECT 1;"
-            assertBool "runExternalOracle should reject mismatch" (not slipped)
-        ]
-
--- ----------------------------------------------------------------------------
 -- Phase 5: CLI
 -- ----------------------------------------------------------------------------
 
@@ -444,43 +328,41 @@ runOccamEvalCLI cliArgs = do
         then readProcessWithExitCode "cabal" (["run", "-v0", "occam-eval", "--"] ++ cliArgs) ""
         else readProcessWithExitCode bin cliArgs ""
 
+withCLIInput :: BS.ByteString -> (FilePath -> FilePath -> IO a) -> IO a
+withCLIInput sql action =
+    bracket create cleanup $ \input -> do
+        BS.writeFile input sql
+        action input (input ++ ".out")
+    where
+        create = do
+            directory <- getTemporaryDirectory
+            (path, handle) <- openTempFile directory "occam-cli-"
+            hClose handle
+            pure path
+        cleanup path = do
+            removeFile path
+            exists <- doesDirectoryExist (path ++ ".out")
+            when exists (removeDirectoryRecursive (path ++ ".out"))
+
 phase5Tests :: TestTree
 phase5Tests =
     testGroup
-        "Phase 5: CLI"
-        [ testCase "CLI --version output" $ do
-            (verExit, verOut, _) <- runOccamCLI ["--version"]
-            assertEqual "occam --version failed" ExitSuccess verExit
-            assertBool "occam --version output missing 'Occam v'" ("Occam v" `isInfixOf` verOut)
-        , testCase "CLI --help output" $ do
-            (helpExit, helpOut, _) <- runOccamCLI ["--help"]
-            assertEqual "occam --help failed" ExitSuccess helpExit
-            assertBool
-                "occam --help output missing 'Usage:'"
-                ("Usage:" `isInfixOf` helpOut && "occam" `isInfixOf` helpOut)
-            assertBool
-                "occam --help output should not contain '--benchmark'"
-                (not ("--benchmark" `isInfixOf` helpOut))
-        , testCase "occam-eval CLI --help output" $ do
-            (evalHelpExit, evalHelpOut, _) <- runOccamEvalCLI ["--help"]
-            assertEqual "occam-eval --help failed" ExitSuccess evalHelpExit
-            assertBool
-                "occam-eval --help output missing 'Usage:'"
-                ("Usage:" `isInfixOf` evalHelpOut && "occam-eval" `isInfixOf` evalHelpOut)
-        , testCase "CLI non-reproducing input error" $ do
-            let tmpSQL = "test_cli_input.sql"
-                tmpOut = "test_cli_out"
-            BSC.writeFile tmpSQL "SELECT 1;"
-            (badExit, _, badErr) <- runOccamCLI [tmpSQL, "--oracle", "false", "--out", tmpOut]
-            assertBool "Expected failure on non-reproducing input" (badExit /= ExitSuccess)
-            assertBool
-                "Expected error message in stderr"
-                ("Error: Initial input does not reproduce target crash!" `isInfixOf` badErr)
-            removeFile tmpSQL
-        , testCase "CLI end-to-end reduction and artifact generation" $ do
-            let tmpSQL = "test_cli_e2e.sql"
-                tmpOut = "test_cli_e2e_out"
-                sampleCrashSQL =
+        "CLI predicate contract"
+        [ testCase "CLI and evaluator refuse rejected or signaled initial predicates" $
+            mapM_
+                ( \(runner, extra) ->
+                    mapM_
+                        ( \command -> withCLIInput "SELECT 1;" $ \input outDir -> do
+                            (code, _, _) <- runner ([input, "--oracle", command, "--out", outDir, "--quiet"] ++ extra)
+                            assertBool ("Noninteresting input was accepted: " ++ command) (code /= ExitSuccess)
+                            exists <- doesDirectoryExist outDir
+                            assertBool "Reduction started before the initial predicate accepted" (not exists)
+                        )
+                        ["false", "exit 139", "kill -TERM $$"]
+                )
+                [(runOccamCLI, []), (runOccamEvalCLI, ["--baseline", "2"])]
+        , testCase "CLI and evaluator shrink SQL while preserving the supplied predicate" $ do
+            let initialSQL =
                     BSC.unlines
                         [ "CREATE TABLE t1 (a INT, b TEXT);"
                         , "CREATE TABLE t2 (c INT);"
@@ -488,66 +370,18 @@ phase5Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
                         ]
-            BSC.writeFile tmpSQL sampleCrashSQL
-            let pythonOracle =
+                predicate =
                     "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
-            (okExit, okOut, okErr) <- runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut]
-            assertEqual ("CLI reduction failed: " ++ okErr ++ "\nStdout: " ++ okOut) ExitSuccess okExit
-
-            minExists <- doesFileExist (tmpOut </> "minimal.sql")
-            assertBool "minimal.sql not created" minExists
-            replayExists <- doesFileExist (tmpOut </> "replay.sh")
-            assertBool "replay.sh not created" replayExists
-            statsExists <- doesFileExist (tmpOut </> "stats.json")
-            assertBool "stats.json not created" statsExists
-
-            minSQL <- BSC.readFile (tmpOut </> "minimal.sql")
-            assertBool "minimal.sql contains unpruned t2" (not (BSC.isInfixOf "t2" minSQL))
-            assertBool "minimal.sql contains unpruned ORDER BY" (not (BSC.isInfixOf "ORDER BY" minSQL))
-            assertBool "minimal.sql contains unsimplified 1 = 1" (not (BSC.isInfixOf "1 = 1" minSQL))
-            assertBool "minimal.sql missing required WHERE a > 0" (BSC.isInfixOf "WHERE a > 0" minSQL)
-
-            removeFile tmpSQL
-            removeDirectoryRecursive tmpOut
-        , testCase "CLI --log-format json emits valid JSON logs and creates minimal.sql" $ do
-            let tmpSQL = "test_cli_json.sql"
-                tmpOut = "test_cli_json_out"
-                sampleCrashSQL =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-            BSC.writeFile tmpSQL sampleCrashSQL
-            let pythonOracle =
-                    "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s else 1)\""
-            (okExit, okOut, okErr) <-
-                runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut, "--log-format", "json"]
-            assertEqual ("CLI json run failed: " ++ okErr ++ "\nStdout: " ++ okOut) ExitSuccess okExit
-            minExists <- doesFileExist (tmpOut </> "minimal.sql")
-            assertBool "minimal.sql must exist" minExists
-            removeFile tmpSQL
-            removeDirectoryRecursive tmpOut
-        , testCase "CLI --quiet suppresses banner and outputs minimal.sql" $ do
-            let tmpSQL = "test_cli_quiet.sql"
-                tmpOut = "test_cli_quiet_out"
-                sampleCrashSQL =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT);"
-                        , "SELECT * FROM t1;"
-                        ]
-            BSC.writeFile tmpSQL sampleCrashSQL
-            let pythonOracle = "python3 -c \"import sys; sys.exit(0)\""
-            (okExit, okOut, _) <-
-                runOccamCLI [tmpSQL, "--oracle", pythonOracle, "--out", tmpOut, "--quiet"]
-            assertEqual "CLI quiet run should exit success" ExitSuccess okExit
-            assertBool
-                "Banner should not be printed in quiet mode"
-                (not ("Occam Reduction Summary" `isInfixOf` okOut))
-            minExists <- doesFileExist (tmpOut </> "minimal.sql")
-            assertBool "minimal.sql must exist in quiet mode" minExists
-            removeFile tmpSQL
-            removeDirectoryRecursive tmpOut
+            mapM_
+                ( \(runner, extra) -> withCLIInput initialSQL $ \input outDir -> do
+                    (code, _, err) <- runner ([input, "--oracle", predicate, "--out", outDir, "--quiet"] ++ extra)
+                    assertEqual ("Reduction failed: " ++ err) ExitSuccess code
+                    reduced <- BSC.readFile (outDir </> "minimal.sql")
+                    (verified, _, _) <- readProcessWithExitCode "sh" ["-c", predicate] (BSC.unpack reduced)
+                    assertEqual "Reduced SQL lost the target property" ExitSuccess verified
+                    assertBool "No SQL reduction occurred" (BS.length reduced < BS.length initialSQL)
+                )
+                [(runOccamCLI, []), (runOccamEvalCLI, ["--baseline", "2"])]
         ]
 
 -- ----------------------------------------------------------------------------
@@ -859,250 +693,7 @@ phase8Tests =
             assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
             assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
             assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
-        , testCase "BenchmarkMetric JSON serialization and roundtrip" $ do
-            let sampleMetrics =
-                    [ BenchmarkMetric
-                        { metricAlgorithm = "Occam"
-                        , metricInitialBytes = 200
-                        , metricReducedBytes = 50
-                        , metricByteReduction = 75.0
-                        , metricInitialStmts = 5
-                        , metricReducedStmts = 2
-                        , metricStmtReduction = 60.0
-                        , metricOracleCalls = 8
-                        , metricTimeSeconds = 0.042
-                        }
-                    , BenchmarkMetric
-                        { metricAlgorithm = "B1 (Sequential)"
-                        , metricInitialBytes = 200
-                        , metricReducedBytes = 80
-                        , metricByteReduction = 60.0
-                        , metricInitialStmts = 5
-                        , metricReducedStmts = 3
-                        , metricStmtReduction = 40.0
-                        , metricOracleCalls = 14
-                        , metricTimeSeconds = 0.055
-                        }
-                    , BenchmarkMetric
-                        { metricAlgorithm = "B2 (Naive ddmin)"
-                        , metricInitialBytes = 200
-                        , metricReducedBytes = 80
-                        , metricByteReduction = 60.0
-                        , metricInitialStmts = 5
-                        , metricReducedStmts = 3
-                        , metricStmtReduction = 40.0
-                        , metricOracleCalls = 18
-                        , metricTimeSeconds = 0.063
-                        }
-                    ]
-                encoded = encode sampleMetrics
-                decoded = decode encoded :: Maybe [BenchmarkMetric]
-                strictBytes = LBS.toStrict encoded
-            assertEqual "JSON roundtrip preserves metrics" (Just sampleMetrics) decoded
-            assertBool "JSON output contains Occam algorithm name" (BSC.isInfixOf "Occam" strictBytes)
-            assertBool
-                "JSON output contains field metricByteReduction"
-                (BSC.isInfixOf "metricByteReduction" strictBytes)
-        , testCase "runComparisonBenchmark executes all 3 algorithms and produces metrics" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-                oracle sql = do
-                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
-                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
-                    pure (hasT1 && hasSel)
-            metrics <- runComparisonBenchmark oracle script
-            assertEqual "Expected 3 benchmark metrics" 3 (length metrics)
-            let names = map metricAlgorithm metrics
-            assertEqual
-                "Expected algorithms [Occam, B1, B2]"
-                ["Occam", "B1 (Sequential)", "B2 (Naive ddmin)"]
-                names
-            mapM_
-                ( \m -> do
-                    assertEqual "Initial stmts must be 4" 4 (metricInitialStmts m)
-                    assertBool "Reduced stmts must be <= 4" (metricReducedStmts m <= 4)
-                    assertBool "Oracle calls must be positive" (metricOracleCalls m > 0)
-                    assertBool "Time must be non-negative" (metricTimeSeconds m >= 0)
-                )
-                metrics
         ]
-
--- ----------------------------------------------------------------------------
--- Phase 9: SQLite & Modern DBMS Harness Execution
--- ----------------------------------------------------------------------------
-
-phase9Tests :: TestTree
-phase9Tests =
-    testGroup
-        "Phase 9: SQLite & Modern DBMS Harness Execution"
-        [ testCase "sqlite_harness.sh traps signal 11 crash and emits CrashReport JSON" $ do
-            let scriptPath = "harness/sqlite_harness.sh"
-                fakeBinary = "test_fake_sqlite_crash.sh"
-                tmpSQL = "test_sqlite_crash.sql"
-            exists <- doesFileExist scriptPath
-            assertBool "sqlite_harness.sh must exist" exists
-            BSC.writeFile fakeBinary "#!/bin/sh\nkill -11 $$\n"
-            perms <- getPermissions fakeBinary
-            setPermissions fakeBinary (setOwnerExecutable True perms)
-            BSC.writeFile tmpSQL "SELECT * FROM test_crash;"
-            (exitCode, stdoutStr, _) <-
-                readProcessWithExitCode
-                    "sh"
-                    ["-c", "SQLITE_BIN=./" ++ fakeBinary ++ " ./" ++ scriptPath ++ " " ++ tmpSQL]
-                    ""
-            removeFile fakeBinary
-            removeFile tmpSQL
-            assertEqual "sqlite_harness should return exit 0 on crash reproduction" ExitSuccess exitCode
-            let mReport = parseCrashReportJSON (BSC.pack stdoutStr)
-            case mReport of
-                Nothing -> assertFailure ("Failed to parse crash report JSON: " ++ stdoutStr)
-                Just rep -> assertEqual "Expected SignalCrash 11" (SignalCrash 11) (reportKind rep)
-        , testCase "sqlite_harness.sh traps AddressSanitizer output and emits CrashReport JSON" $ do
-            let scriptPath = "harness/sqlite_harness.sh"
-                fakeBinary = "test_fake_sqlite_asan.sh"
-                tmpSQL = "test_sqlite_asan.sql"
-            BSC.writeFile
-                fakeBinary
-                "#!/bin/sh\necho '==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x1000' >&2\nexit 1\n"
-            perms <- getPermissions fakeBinary
-            setPermissions fakeBinary (setOwnerExecutable True perms)
-            BSC.writeFile tmpSQL "SELECT 1;"
-            (exitCode, stdoutStr, _) <-
-                readProcessWithExitCode
-                    "sh"
-                    ["-c", "SQLITE_BIN=./" ++ fakeBinary ++ " ./" ++ scriptPath ++ " " ++ tmpSQL]
-                    ""
-            removeFile fakeBinary
-            removeFile tmpSQL
-            assertEqual "sqlite_harness should return exit 0 on ASan reproduction" ExitSuccess exitCode
-            let mReport = parseCrashReportJSON (BSC.pack stdoutStr)
-            case mReport of
-                Nothing -> assertFailure ("Failed to parse ASan crash report JSON: " ++ stdoutStr)
-                Just rep ->
-                    assertEqual
-                        "Expected ASanCrash heap-use-after-free"
-                        (ASanCrash "heap-use-after-free" Nothing)
-                        (reportKind rep)
-        , testCase "sqlite_harness.sh executes non-crashing SQL with real sqlite3 and returns exit 1" $ do
-            let scriptPath = "harness/sqlite_harness.sh"
-                tmpSQL = "test_sqlite_ok.sql"
-            BSC.writeFile tmpSQL "CREATE TABLE t (x INT); INSERT INTO t VALUES (42);"
-            (exitCode, _, _) <-
-                readProcessWithExitCode scriptPath [tmpSQL] ""
-            removeFile tmpSQL
-            assertEqual
-                "sqlite_harness should return exit 1 (non-crash) for clean execution"
-                (ExitFailure 1)
-                exitCode
-        ]
-
--- ----------------------------------------------------------------------------
--- Phase 10: Professional Logger Subsystem
--- ----------------------------------------------------------------------------
-
-phase10Tests :: TestTree
-phase10Tests =
-    testGroup
-        "Phase 10: Professional Logger Subsystem"
-        [ testCase "LogLevel ordering and JSON encoding" $ do
-            assertBool "LevelDebug < LevelInfo" (LevelDebug < LevelInfo)
-            assertBool "LevelInfo < LevelWarn" (LevelInfo < LevelWarn)
-            assertBool "LevelWarn < LevelError" (LevelWarn < LevelError)
-            assertEqual "JSON LevelInfo" "\"info\"" (encode LevelInfo)
-            assertEqual "JSON LevelError" "\"error\"" (encode LevelError)
-        , testCase "withLogger in FormatJSON generates structured log output" $ do
-            let cfg = LogConfig LevelDebug FormatJSON False
-            withLogger cfg $ \logger -> do
-                logInfo logger "test::suite" "Structured logging message"
-                logDebug logger "test::suite" "Debug detail message"
-            pure ()
-        , testCase "reduceSQLWithLogger executes all reduction levels with real-time logger" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-                oracle sql = pure (BSC.isInfixOf "t1" sql && BSC.isInfixOf "WHERE a > 0" sql)
-                cfg = LogConfig LevelDebug FormatJSON False
-            reduced <- withLogger cfg $ \logger ->
-                reduceSQLWithLogger logger oracle script
-            assertBool "Target table t1 retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
-            assertBool "Dead table t2 pruned" (not (BSC.isInfixOf "CREATE TABLE t2" reduced))
-        ]
-
--- ----------------------------------------------------------------------------
--- Golden Tests: Snapshot Testing of Reduction Outputs
--- ----------------------------------------------------------------------------
-
-goldenTests :: TestTree
-goldenTests =
-    testGroup
-        "Golden Tests"
-        [ goldenVsString
-            "fuzz_golden_01_cte_subqueries: unreferenced tables pruned through complex CTE aliases"
-            "test/golden/fuzz_golden_01_cte_subqueries.golden.sql"
-            (runReduction "test/golden/fuzz_golden_01_cte_subqueries.sql" oracle1)
-        , goldenVsString
-            "fuzz_golden_02_schema_churn_tx: transaction fences & ALTER TABLE schema churn preserved"
-            "test/golden/fuzz_golden_02_schema_churn_tx.golden.sql"
-            (runReduction "test/golden/fuzz_golden_02_schema_churn_tx.sql" oracle2)
-        , goldenVsString
-            "fuzz_golden_03_deep_expressions: deep expression trees simplified & optional clauses pruned"
-            "test/golden/fuzz_golden_03_deep_expressions.golden.sql"
-            (runReduction "test/golden/fuzz_golden_03_deep_expressions.sql" oracle3)
-        , goldenVsString
-            "fuzz_golden_04_multitable_diamond_dag: multi-table diamond DAG relations preserved"
-            "test/golden/fuzz_golden_04_multitable_diamond_dag.golden.sql"
-            (runReduction "test/golden/fuzz_golden_04_multitable_diamond_dag.sql" oracle4)
-        ]
-    where
-        runReduction path oracle = do
-            input <- BS.readFile path
-            reduced <- reduceSQL oracle input
-            pure (LBS.fromStrict reduced)
-
-        oracle1 s =
-            pure
-                ( BSC.isInfixOf "WITH regional_summary AS" s
-                    && BSC.isInfixOf "vip_customers AS" s
-                    && BSC.isInfixOf "target_orders" s
-                    && BSC.isInfixOf "target_customers" s
-                )
-
-        oracle2 s =
-            pure
-                ( BSC.isInfixOf "CREATE TABLE tx_account_ledger" s
-                    && BSC.isInfixOf "branch_code" s
-                    && BSC.isInfixOf "SELECT account_id" s
-                    && BSC.isInfixOf "balance < 10000.00" s
-                )
-
-        oracle3 s =
-            pure
-                ( BSC.isInfixOf "CREATE TABLE expr_calc_inputs" s
-                    && BSC.isInfixOf "complex_calc" s
-                    && BSC.isInfixOf "COALESCE" s
-                    && BSC.isInfixOf "NULLIF" s
-                )
-
-        oracle4 s =
-            pure
-                ( BSC.isInfixOf "CREATE TABLE diamond_root" s
-                    && BSC.isInfixOf "CREATE TABLE diamond_branch_left" s
-                    && BSC.isInfixOf "CREATE TABLE diamond_branch_right" s
-                    && BSC.isInfixOf "CREATE TABLE diamond_sink" s
-                    && BSC.isInfixOf "diamond_sink s" s
-                    && BSC.isInfixOf "JOIN diamond_branch_left" s
-                    && BSC.isInfixOf "JOIN diamond_branch_right" s
-                    && BSC.isInfixOf "JOIN diamond_root" s
-                )
 
 -- ----------------------------------------------------------------------------
 -- Property Tests: Invariants of Reducer & DAG

@@ -1,5 +1,5 @@
 {
-  description = "Occam: Cross-Platform Dependency-Aware SQL Crash Minimizer";
+  description = "Occam: Cross-Platform Dependency-Aware SQL Test Case Minimizer";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -32,7 +32,6 @@
               fourmolu
               hlint
               pkg-config
-              gdb
             ];
 
             # Shared C libraries

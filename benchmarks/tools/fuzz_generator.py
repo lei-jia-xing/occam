@@ -784,7 +784,7 @@ def run_self_test() -> bool:
 
         print(f"  Target: {inj_file.name} ({len(injected_sql)} bytes)")
         print("  Executing Occam reducer...")
-        res = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+        res = subprocess.run(cmd, check=False, cwd=root, capture_output=True, text=True)
 
         if res.returncode != 0:
             print("  Occam reduction failed!")
@@ -817,7 +817,7 @@ def run_self_test() -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Chaos Fuzz SQL Generator for Occam & Crash Reducer Stress Benchmarking."
+        description="Synthetic SQL Generator for Occam Reducer Stress Benchmarking."
     )
     parser.add_argument(
         "--dialect",
@@ -847,7 +847,7 @@ def main() -> None:
         "--inject",
         type=str,
         default=None,
-        help="Known defect case ID to inject (e.g. pg_01, mysql_01, pg_03)",
+        help="Synthetic predicate marker to inject (e.g. pg_01, mysql_01, pg_03)",
     )
     parser.add_argument(
         "--out",
