@@ -52,12 +52,25 @@ python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
 
 The runner defaults to optional external reducers as well, so select `--tools occam,ddmin` for a local comparison. `--out` selects the JSONL result file and `--artifacts-dir` the per-run artifacts. The default manifest uses synthetic text-marker fixtures; historical JSONL records from that corpus are mechanics data, not validated DBMS results.
 
+Each JSONL line stays a per-case/tool record. The runner writes a sibling `<stem>.summary.json` sidecar (`results.summary.json` for `results.jsonl`) with processed/expected counts, validated reductions, status counts, throughput, and actual monotonic batch makespan. Rates use that makespan; `wall_time_sec` on each record is worker time, so summed case time is not batch elapsed time (especially with `--jobs`).
+
+For `occam`/`ddmin`, a normally terminated native process may report a recognized evaluation status from a fresh stats/profile file; outer command timeouts, spawn failures, and missing, stale, or unknown profiles are not overridden. A nonzero native exit is never promoted to `completed`. Successful native exit requires `minimal.sql`; missing output is a `tool-error`, not a successful unchanged result. Partial budget/timeout/error outcomes keep `predicate_passed` unknown; `evaluationFailure` is preferred as the reason when available.
+
+`evidence_class` and `oracle_kind` come from the manifest (or documented runner defaults); reports group and pair only records with matching labels and input. These labels do not prove a database was executed.
+
+Comparison-runner `reset_calls` and `reset_time_sec` cover audited reducer callbacks only; initial/final validation calls are excluded and reported separately. Incomplete reducer audit data stays `null`. A zero reducer-scope count does not mean no reset was attempted: inspect `oracle_audit_file` for validation-phase attempts and failures. The single-input pipeline records `reset_preflight_sec`, `reset_reduction_sec`, and `reset_validation_sec`; `reset_time_sec` sums these stages once only when all are known, otherwise it is `null`.
+
+`oracle_timeouts` counts reducer-scope observations only: native tools use a fresh `evaluationTimedOutObservations` profile count, callback tools use observed callback/reducer-audit outcomes, and validation-phase audit rows are excluded. If a native count is missing or invalid, it remains `null`.
+
+
 ## Reports and synthetic inputs
 
-`benchmarks/report.sh` formats JSONL records; it reports recorded fields and cannot establish SQL validity or bug reproduction:
+`benchmarks/report.sh` formats JSONL records and cannot establish SQL validity or bug reproduction. `--table` is the default, `--summary` groups by evidence class/oracle kind/tool, and `--md` emits Markdown. `--json` emits case/tool records as a JSON array; `--csv` emits one case/tool record per CSV row. These two data modes do not merge the separate batch-summary sidecar.
 
 ```bash
 ./benchmarks/report.sh --summary
+./benchmarks/report.sh --json results.jsonl > results.json
+./benchmarks/report.sh --csv results.jsonl > results.csv
 cat results.jsonl | ./benchmarks/report.sh --summary
 ```
 

@@ -145,16 +145,65 @@ def case_file(root: Path, entry: dict[str, Any], manifest_dir: Path) -> Path:
 
 
 def oracle_wrapper(root: Path, command: str, audit_file: Path, timeout: float,
-                   scenario: str | None = None, reset: str | None = None) -> str:
+                   scenario: str | None = None, reset: str | None = None,
+                   phase: str = "reducer") -> str:
     args = [
         sys.executable, str(root / "benchmarks" / "upstream" / "oracle_exec.py"),
         "--command", command, "--audit", str(audit_file), "--timeout", str(timeout), "--cwd", str(root),
+        "--phase", phase,
     ]
     if scenario:
         args += ["--scenario", scenario]
     if reset:
         args += ["--reset", reset]
     return shlex.join(args)
+
+
+def read_jsonl_since(path: Path, offset: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open("rb") as source:
+            source.seek(offset)
+            for line in source:
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return records
+
+
+def run_exit_oracle(oracle: str, candidate: Path, cwd: Path, deadline: float,
+                    call_timeout: float, audit_file: Path) -> tuple[bool | None, float, str | None]:
+    try:
+        audit_offset = audit_file.stat().st_size
+    except OSError:
+        audit_offset = 0
+    command = ["bash", "-c", "exec " + oracle + ' "$1"', "oracle", str(candidate.resolve())]
+    outcome = command_result(command, cwd, deadline, call_timeout, allow_nonzero=True)
+    if outcome["status"] == "timeout":
+        return None, outcome["elapsed"], "oracle call timed out"
+    if outcome["status"] == "tool-error":
+        return None, outcome["elapsed"], outcome["stderr"] or "oracle invocation failed"
+    wrapper_record = next(
+        (row for row in reversed(read_jsonl_since(audit_file, audit_offset)) if row.get("phase") == "validation"),
+        None,
+    )
+    if wrapper_record is not None:
+        if wrapper_record.get("status") == "timeout":
+            return None, outcome["elapsed"], "oracle call timed out"
+        if wrapper_record.get("status") == "interrupted":
+            return None, outcome["elapsed"], "oracle call interrupted"
+        if wrapper_record.get("status") == "tool-error":
+            return None, outcome["elapsed"], outcome["stderr"] or "oracle infrastructure failure"
+    if "OCCAM_INFRASTRUCTURE:" in outcome["stdout"] or "OCCAM_INFRASTRUCTURE:" in outcome["stderr"]:
+        return None, outcome["elapsed"], outcome["stderr"] or outcome["stdout"] or "oracle infrastructure failure"
+    return outcome["returncode"] == 0, outcome["elapsed"], (
+        None if outcome["returncode"] == 0 else "configured exit-code oracle rejected the candidate"
+    )
 
 
 def base_record(entry: dict[str, Any], tool: str, oracle_timeout: float, budget: float,
@@ -182,14 +231,15 @@ def base_record(entry: dict[str, Any], tool: str, oracle_timeout: float, budget:
         "budget_sec": budget,
         "max_oracle_executions": max_oracle_executions,
         "oracle_calls": None,
-        "oracle_calls_scope": "reduction only; validation is separate",
+        "oracle_calls_scope": "uncached reducer callbacks only; initial checks and validation calls excluded",
         "candidate_checks": None,
         "oracle_cache_hits": None,
         "validation_calls": 0,
         "validation_time_sec": 0.0,
         "reset_calls": None,
+        "reset_calls_scope": "uncached reducer callbacks only; initial checks and validation calls excluded",
         "reset_time_sec": None,
-        "reset_accounting": "not exposed by the configured oracle",
+        "reset_accounting": "not measured; predicate-internal reset unknown",
         "reduction_time_sec": None,
         "wall_time_sec": None,
         "predicate_passed": None,
@@ -283,25 +333,86 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def metric_count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def eval_internal_scope(profile: Any) -> tuple[int | None, int | None, int | None]:
+    if not isinstance(profile, dict):
+        return None, None, None
+    budget = profile.get("evaluationBudget")
+    if not isinstance(budget, dict):
+        return None, None, None
+    preflight = metric_count(budget.get("evaluationPreflightAttempts"))
+    reduction = metric_count(profile.get("evaluationDatabaseObservations"))
+    validation = metric_count(profile.get("evaluationValidationDatabaseObservations"))
+    if preflight is None or reduction is None or validation is None:
+        return None, None, None
+    return preflight + reduction + validation, preflight, reduction
+def set_reducer_reset_metrics(
+    record: dict[str, Any],
+    audit_file: Path,
+    configured: bool,
+    expected_internal_rows: int | None,
+    reducer_start: int | None,
+    reducer_count: int | None,
+) -> None:
+    if not configured:
+        record["reset_accounting"] = "wrapper reset not configured; predicate-internal reset unknown"
+        return
+    if (
+        expected_internal_rows is None
+        or reducer_start is None
+        or reducer_count is None
+        or expected_internal_rows < 0
+        or reducer_start < 0
+        or reducer_count < 0
+    ):
+        record["reset_accounting"] = "wrapper reset audit incomplete; reducer callback scope only"
+        return
+    internal_rows = [
+        row for row in read_jsonl(audit_file) if row.get("phase") == "reducer"
+    ]
+    if len(internal_rows) != expected_internal_rows:
+        record["reset_accounting"] = "wrapper reset audit incomplete; reducer callback scope only"
+        return
+    reducer_rows = internal_rows[reducer_start : reducer_start + reducer_count]
+    if len(reducer_rows) != reducer_count:
+        record["reset_accounting"] = "wrapper reset audit incomplete; reducer callback scope only"
+        return
+    durations = [row.get("reset_elapsed_sec") for row in reducer_rows]
+    if any(
+        row.get("reset_attempted") is not True
+        or not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(duration)
+        for row, duration in zip(reducer_rows, durations)
+    ):
+        record["reset_accounting"] = "wrapper reset audit incomplete; reducer callback scope only"
+        return
+    record["reset_calls"] = sum(row["reset_attempted"] for row in reducer_rows)
+    record["reset_time_sec"] = round(sum(durations), 6)
+    record["reset_calls_scope"] = record["oracle_calls_scope"]
+    record["reset_accounting"] = "oracle_exec measured; reducer callbacks only"
+
+
+def set_no_reducer_reset_metrics(record: dict[str, Any], configured: bool) -> None:
+    record["oracle_calls"] = 0
+    if configured:
+        record["reset_calls"] = 0
+        record["reset_time_sec"] = 0.0
+        record["reset_calls_scope"] = record["oracle_calls_scope"]
+        record["reset_accounting"] = "no reducer callbacks; wrapper reset scope only"
+
+
+
+
 def unsupported(record: dict[str, Any], reason: str) -> dict[str, Any]:
     record["status"] = "unsupported"
     record["status_reason"] = reason
     return record
 
 
-def run_exit_oracle(oracle: str, candidate: Path, cwd: Path, deadline: float,
-                    call_timeout: float) -> tuple[bool | None, float, str | None]:
-    command = ["bash", "-c", "exec " + oracle + ' "$1"', "oracle", str(candidate.resolve())]
-    outcome = command_result(command, cwd, deadline, call_timeout, allow_nonzero=True)
-    if outcome["status"] == "timeout":
-        return None, outcome["elapsed"], "oracle call timed out"
-    if outcome["status"] == "tool-error":
-        return None, outcome["elapsed"], outcome["stderr"] or "oracle invocation failed"
-    if "OCCAM_INFRASTRUCTURE:" in outcome["stdout"] or "OCCAM_INFRASTRUCTURE:" in outcome["stderr"]:
-        return None, outcome["elapsed"], outcome["stderr"] or outcome["stdout"] or "oracle infrastructure failure"
-    return outcome["returncode"] == 0, outcome["elapsed"], (
-        None if outcome["returncode"] == 0 else "configured exit-code oracle rejected the candidate"
-    )
 
 
 def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
@@ -394,11 +505,19 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     reducer_calls: int | None = None
     candidate_checks: int | None = None
     cache_hits: int | None = None
+    internal_expected_rows: int | None = None
+    internal_reducer_start: int | None = None
+    internal_reducer_count: int | None = None
+    native_profile: dict[str, Any] | None = None
+    native_metrics_path: Path | None = None
+    native_metrics_mtime: int | None = None
+    native_profile_fresh = False
     reset_command = entry.get("reset_command")
     if isinstance(reset_command, list):
         reset_command = shlex.join([str(part) for part in reset_command])
     elif reset_command is not None:
         reset_command = str(reset_command)
+    reset_configured = bool(reset_command)
 
     raw_oracle = oracle_override or entry.get("oracle_command")
     scenario = None
@@ -407,10 +526,16 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         scenario = entry["id"]
     if not raw_oracle:
         return unsupported(record, "case has no oracle command")
-    oracle = oracle_wrapper(root, str(raw_oracle), audit_file, oracle_timeout, scenario, reset_command)
+    reducer_oracle = oracle_wrapper(
+        root, str(raw_oracle), audit_file, oracle_timeout, scenario, reset_command, "reducer"
+    )
+    validation_oracle = oracle_wrapper(
+        root, str(raw_oracle), audit_file, oracle_timeout, scenario, reset_command, "validation"
+    )
 
     valid, validation_elapsed, validation_error = run_exit_oracle(
-        oracle, source_file, root, deadline, oracle_timeout)
+        validation_oracle, source_file, root, deadline, oracle_timeout, audit_file)
+
     validation_calls += 1
     validation_time += validation_elapsed
     if valid is None:
@@ -422,6 +547,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             "predicate_passed": None,
             "wall_time_sec": round(time.monotonic() - started, 4),
         })
+        set_no_reducer_reset_metrics(record, reset_configured)
         return record
     if not valid:
         record.update({
@@ -433,6 +559,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             "tool_candidate_valid": False,
             "wall_time_sec": round(time.monotonic() - started, 4),
         })
+        set_no_reducer_reset_metrics(record, reset_configured)
         return record
 
     remaining = max(0.0, deadline - time.monotonic())
@@ -447,11 +574,18 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             "wall_time_sec": round(time.monotonic() - started, 4),
         })
         set_size_metrics(record, original, checkpoint.read_bytes(), dialect)
+        set_no_reducer_reset_metrics(record, reset_configured)
         return record
 
     if tool in {"occam", "ddmin"}:
+        native_metrics_path = tool_dir / ("stats.json" if tool == "occam" else "benchmark.json")
+        # A stale profile must not reinterpret this invocation's exit.
+        try:
+            native_metrics_mtime = native_metrics_path.stat().st_mtime_ns
+        except OSError:
+            pass
         command = [
-            str(binaries[tool]), str(input_file), "--oracle", oracle, "--out", str(tool_dir),
+            str(binaries[tool]), str(input_file), "--oracle", reducer_oracle, "--out", str(tool_dir),
             "--timeout", str(oracle_timeout), "--budget", str(remaining),
         ]
         command += ["--dialect", dialect_key if dialect_key in {"postgres", "mysql", "sqlite"} else "generic"]
@@ -464,22 +598,32 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         if tool == "occam":
             stats = read_json(tool_dir / "stats.json")
             if isinstance(stats, dict):
-                profile = stats.get("evaluation_metrics", {})
-                reducer_calls = profile.get("evaluationDatabaseObservations")
-                cache_hits = profile.get("evaluationCacheHits")
-                hits, misses = profile.get("evaluationCacheHits"), profile.get("evaluationCacheMisses")
-                candidate_checks = hits + misses if isinstance(hits, int) and isinstance(misses, int) else None
+                profile = stats.get("evaluation_metrics")
+                if isinstance(profile, dict):
+                    native_profile = profile
+                    reducer_calls = profile.get("evaluationDatabaseObservations")
+                    cache_hits = profile.get("evaluationCacheHits")
+                    hits, misses = profile.get("evaluationCacheHits"), profile.get("evaluationCacheMisses")
+                    candidate_checks = hits + misses if isinstance(hits, int) and isinstance(misses, int) else None
+                    internal_expected_rows, internal_reducer_start, internal_reducer_count = eval_internal_scope(profile)
+                    if outcome["status"] == "timeout":
+                        internal_expected_rows = internal_reducer_start = internal_reducer_count = None
             candidate_path = tool_dir / "minimal.sql"
             metrics = stats
         else:
             values = read_json(tool_dir / "benchmark.json")
             metrics = values[0] if isinstance(values, list) and values and isinstance(values[0], dict) else None
             if metrics:
-                profile = metrics.get("metricEvaluationMetrics", {})
-                reducer_calls = profile.get("evaluationDatabaseObservations")
-                cache_hits = profile.get("evaluationCacheHits")
-                hits, misses = profile.get("evaluationCacheHits"), profile.get("evaluationCacheMisses")
-                candidate_checks = hits + misses if isinstance(hits, int) and isinstance(misses, int) else None
+                profile = metrics.get("metricEvaluationMetrics")
+                if isinstance(profile, dict):
+                    native_profile = profile
+                    reducer_calls = profile.get("evaluationDatabaseObservations")
+                    cache_hits = profile.get("evaluationCacheHits")
+                    hits, misses = profile.get("evaluationCacheHits"), profile.get("evaluationCacheMisses")
+                    candidate_checks = hits + misses if isinstance(hits, int) and isinstance(misses, int) else None
+                    internal_expected_rows, internal_reducer_start, internal_reducer_count = eval_internal_scope(profile)
+                    if outcome["status"] == "timeout":
+                        internal_expected_rows = internal_reducer_start = internal_reducer_count = None
             candidate_path = tool_dir / "minimal.sql"
     elif tool == "creduce":
         helper = root / "benchmarks" / "upstream" / "oracle_test.py"
@@ -488,7 +632,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         helper_args = [
             "--checkpoint", str(checkpoint), "--calls", str(calls_file), "--cache", str(cache_file),
             "--timeout", str(oracle_timeout), "--deadline", str(deadline),
-            "--oracle", oracle,
+            "--oracle", reducer_oracle, "--oracle-audit", str(audit_file),
         ]
         if max_oracle_executions is not None:
             helper_args += ["--max-executions", str(max_oracle_executions)]
@@ -507,6 +651,10 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
                             {"accepted", "rejected", "timeout", "tool-error"})
         candidate_checks = len(call_records)
         cache_hits = sum(1 for row in call_records if row.get("cache_hit"))
+        if outcome["status"] != "timeout" and reducer_calls is not None:
+            internal_expected_rows = reducer_calls
+            internal_reducer_start = 0
+            internal_reducer_count = reducer_calls
         candidate_path = checkpoint
         metrics = None
     elif tool == "sqlancer":
@@ -516,7 +664,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         helper_args = [
             sys.executable, str(helper), "--checkpoint", str(checkpoint), "--calls", str(calls_file),
             "--cache", str(cache_file), "--timeout", str(oracle_timeout), "--deadline", str(deadline),
-            "--oracle", oracle,
+            "--oracle", reducer_oracle, "--oracle-audit", str(audit_file),
         ]
         if max_oracle_executions is not None:
             helper_args += ["--max-executions", str(max_oracle_executions)]
@@ -534,6 +682,10 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
                             {"accepted", "rejected", "timeout", "tool-error"})
         candidate_checks = len(call_records)
         cache_hits = sum(1 for row in call_records if row.get("cache_hit"))
+        if outcome["status"] != "timeout" and reducer_calls is not None:
+            internal_expected_rows = reducer_calls
+            internal_reducer_start = 0
+            internal_reducer_count = reducer_calls
         metrics = read_json(metrics_file)
         if isinstance(metrics, dict):
             record["sqlancer_ast_unsupported_statements"] = metrics.get("ast_unsupported_statements")
@@ -566,11 +718,54 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             cache_hits = metrics.get("cache_hits")
         candidate_path = checkpoint
 
+    if native_metrics_path is not None:
+        try:
+            native_profile_fresh = native_metrics_path.stat().st_mtime_ns != native_metrics_mtime
+        except OSError:
+            native_profile_fresh = False
+    if (
+        native_profile is not None
+        and native_metrics_path is not None
+        and outcome["status"] in {"completed", "tool-error"}
+        and outcome["returncode"] is not None
+    ):
+        if native_profile_fresh:
+            native_status = native_profile.get("evaluationStatus")
+            failure = native_profile.get("evaluationFailure")
+            failure_reason = failure.strip() if isinstance(failure, str) and failure.strip() else None
+            if failure_reason:
+                outcome["status_reason"] = failure_reason
+            if isinstance(native_status, str) and native_status in {
+                "completed", "timeout", "execution-budget", "error",
+                "validation-failed", "validation-incomplete",
+            }:
+                if native_status == "completed":
+                    if outcome["returncode"] != 0:
+                        outcome["status"] = "tool-error"
+                        outcome["status_reason"] = (
+                            failure_reason or "native reducer exited nonzero with completed status"
+                        )
+                else:
+                    outcome["status"] = native_status
+                    outcome["status_reason"] = failure_reason or (
+                        "max oracle executions reached"
+                        if native_status == "execution-budget"
+                        else native_status
+                    )
     if tool == "sqlreduce" and isinstance(metrics, dict):
         record["reset_time_sec"] = metrics.get("reset_time_sec")
         record["reset_calls"] = metrics.get("reset_calls")
         record["reset_accounting"] = "reset command measured by SQLreduce adapter"
         record["reduction_track"] = metrics.get("reduction_track", "fixed_setup_query")
+
+    if (
+        tool in {"occam", "ddmin"}
+        and outcome["status"] == "completed"
+        and outcome["returncode"] == 0
+        and not candidate_path.is_file()
+    ):
+        outcome["status"] = "tool-error"
+        outcome["status_reason"] = "native reducer exited successfully without minimal.sql"
 
     if tool in {"occam", "ddmin"} and candidate_path and candidate_path.is_file():
         shutil.copyfile(candidate_path, checkpoint)
@@ -582,7 +777,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         candidate_bytes = candidate_path.read_bytes() if candidate_path and candidate_path.is_file() else original
         candidate.write_bytes(candidate_bytes)
         valid, final_validation_elapsed, validation_error = run_exit_oracle(
-            oracle, candidate, root, deadline, oracle_timeout)
+            validation_oracle, candidate, root, deadline, oracle_timeout, audit_file)
         validation_calls += 1
         validation_time += final_validation_elapsed
         if valid is True:
@@ -612,11 +807,16 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             candidate_bytes = original
     else:
         record["status"] = tool_status
-        detail = (outcome.get("stderr") or outcome.get("stdout") or "").strip()
+        detail = (
+            outcome.get("status_reason")
+            or outcome.get("stderr")
+            or outcome.get("stdout")
+            or ""
+        ).strip()
         record["status_reason"] = detail[:500] if detail else tool_status
         candidate_bytes = checkpoint.read_bytes() if checkpoint.is_file() else original
         record["checkpoint_used"] = "last-valid" if candidate_bytes != original else "initial"
-        record["predicate_passed"] = None if tool_status in {"timeout", "tool-error"} else True
+        record["predicate_passed"] = False if tool_status == "validation-failed" else None
         record["tool_candidate_valid"] = None
 
     record["oracle_calls"] = reducer_calls
@@ -627,10 +827,32 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     record["reduction_time_sec"] = round(reduction_elapsed, 4)
     record["wall_time_sec"] = round(time.monotonic() - started, 4)
     record["oracle_calls_scope"] = "uncached reducer callbacks only; initial checks and validation calls excluded"
-    reducer_timeout_count = sum(1 for row in read_jsonl(calls_file) if row.get("status") == "timeout")
-    audit_timeout_count = sum(1 for row in read_jsonl(audit_file) if row.get("status") == "timeout")
-    record["oracle_timeouts"] = max(reducer_timeout_count, audit_timeout_count)
-    if any(row.get("status") == "execution-limit" for row in read_jsonl(calls_file)):
+    if tool != "sqlreduce":
+        set_reducer_reset_metrics(
+            record,
+            audit_file,
+            reset_configured,
+            internal_expected_rows,
+            internal_reducer_start,
+            internal_reducer_count,
+        )
+    call_records = read_jsonl(calls_file)
+    audit_records = read_jsonl(audit_file)
+    if tool in {"occam", "ddmin"}:
+        timed_out_observations = (
+            native_profile.get("evaluationTimedOutObservations")
+            if native_profile is not None and native_profile_fresh
+            else None
+        )
+        record["oracle_timeouts"] = metric_count(timed_out_observations)
+    else:
+        reducer_timeout_count = sum(1 for row in call_records if row.get("status") == "timeout")
+        audit_timeout_count = sum(
+            1 for row in audit_records
+            if row.get("phase") == "reducer" and row.get("status") == "timeout"
+        )
+        record["oracle_timeouts"] = max(reducer_timeout_count, audit_timeout_count)
+    if any(row.get("status") == "execution-limit" for row in call_records):
         record["status_reason"] = record.get("status_reason") or "max oracle executions reached"
     result_file = tool_dir / "result.sql"
     result_file.write_bytes(candidate_bytes)
@@ -748,6 +970,17 @@ def main() -> None:
     started = time.monotonic()
     work_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path = jsonl_path.with_suffix(".summary.json")
+    try:
+        summary_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    input_count = 0
+    record_count = 0
+    validated_reduction_count = 0
+    status_counts: dict[str, int] = {}
+    expected_record_count = len(entries) * len(selected_tools)
     with jsonl_path.open("w", encoding="utf-8") as output:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = {
@@ -768,11 +1001,45 @@ def main() -> None:
                     for result in results:
                         result["status"] = "tool-error"
                         result["status_reason"] = str(exc)
+                input_count += 1
                 for result in results:
                     output.write(json.dumps(result, sort_keys=True) + "\n")
                     output.flush()
-    print(f"Completed {len(entries) * len(selected_tools)} case/tool records in {time.monotonic() - started:.2f}s")
+                    record_count += 1
+                    status = str(result.get("status") or "unknown")
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    if status == "completed" and result.get("predicate_passed") is True:
+                        validated_reduction_count += 1
+
+    elapsed = time.monotonic() - started
+    summary = {
+        "schema_version": 1,
+        "results_file": str(jsonl_path),
+        "expected_input_count": len(entries),
+        "input_count": input_count,
+        "input_count_scope": "manifest inputs with records emitted; errors count as processed",
+        "inputs_per_second": input_count / elapsed if elapsed > 0 else None,
+        "expected_record_count": expected_record_count,
+        "record_count": record_count,
+        "record_count_scope": "emitted case/tool records, including failures and unsupported cases",
+        "records_per_second": record_count / elapsed if elapsed > 0 else None,
+        "validated_reduction_count": validated_reduction_count,
+        "nonvalidated_record_count": record_count - validated_reduction_count,
+        "status_counts": status_counts,
+        "wall_time_sec": elapsed,
+    }
+    summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    summary_tmp.write_text(json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(summary_tmp, summary_path)
+    print(
+        f"Processed {input_count}/{len(entries)} inputs and {record_count}/{expected_record_count} "
+        f"case/tool records in {elapsed:.2f}s; validated reductions: {validated_reduction_count}"
+    )
+    input_rate = f"{summary['inputs_per_second']:.2f}" if summary["inputs_per_second"] is not None else "N/A"
+    record_rate = f"{summary['records_per_second']:.2f}" if summary["records_per_second"] is not None else "N/A"
+    print(f"Throughput: {input_rate} inputs/s, {record_rate} records/s")
     print(f"Results written to: {jsonl_path}")
+    print(f"Run summary written to: {summary_path}")
 
 
 if __name__ == "__main__":

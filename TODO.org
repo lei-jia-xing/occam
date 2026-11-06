@@ -95,12 +95,14 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Each observation gets a fresh `OCCAM_WORKDIR` (also used for `TMP`, `TMPDIR`, and `TEMP`); reset and predicate share it, while cwd is preserved and exported as `OCCAM_ORIGINAL_CWD`.
 - Haskell oracle output is drained while stdin is written concurrently; raw-byte marker scanning crosses chunks and retains only bounded diagnostics (up to 2 MiB). The benchmark wrapper keeps 8-KiB audit tails plus bounded marker diagnostics.
 - Linux real-process checks covered binary stdin, multi-megabyte output, early/late split markers, timeouts, and cleanup of owned process groups. Only owned POSIX groups are guaranteed: escaped descendants (including `setsid`) and full Windows process-tree cleanup remain outside the verified scope. Occam does not guarantee real DB reset/state isolation; the external reset/predicate owns database state.
-** IN_PROGRESS [#A] Bound each reduction and record useful metrics
+** DONE Bound each reduction and record useful metrics
 - Per-call timeout, total wall-clock budget, and uncached oracle-execution budget include initial and final checks.
 - Preserve the last accepted SQL on exhaustion and return nonzero; run two uncached final validations when budgets permit. `stats.json` reports actual status and available measurements; token counts may be unknown.
 - `evaluationPreflightResetSeconds` and `evaluationPreflightOracleSeconds` describe the initial/preflight check; `evaluationResetSeconds` measures reduction resets; `evaluationValidationResetSeconds` measures final-validation resets. These phases are separate. Unavailable optional preflight measurements serialize as `null`.
-- Reserve final-validation wall time only for calls actually scheduled; zero scheduled validations reserve zero. If preflight consumes the execution cap, report `execution-budget`, make no reduction or final calls, and preserve the accepted checkpoint.
-- Extend and evaluate useful per-input metrics (including reset cost and corpus throughput); keep text-predicate results separate from DB-executing predicates.
+- Reserve final-validation wall time only for calls actually scheduled; zero scheduled validations reserve zero. If preflight consumes the execution cap, return `execution-budget`, make no reduction or final calls, and preserve the accepted checkpoint.
+- A real SQLite timeout-count run reported `oracle_timeouts=2`, matching fresh native `evaluationTimedOutObservations=2` and exactly two reducer-phase interrupted audit calls; accepted initial/final validations are separate.
+- The three-input, six-record budget-180 batch recorded 3 completed/validated, one genuine timeout, and two reset `tool-error`s, with per-input metrics and throughput. The compact-01/Occam runner row remains `timeout`/`predicate_passed=null`; native stats show two accepted final checks of its last-valid checkpoint. Keep statuses honest; this small smoke is not M2-scale validation.
+- Keep text-predicate results separate from DB-executing predicates.
 
 * 16. P1: SQL Reduction Quality
 ** DONE Fix statement-unit and dependency failures for TRUNCATE and transactions
@@ -141,6 +143,7 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Reuse prefix results and target locations when supplied by the oracle.
 - Use binary search only when prefix monotonicity is established.
 - Measure parsing, graph construction, closure, reset, and oracle costs before adding incremental updates.
+- Open profiling observation: under `--budget 180`, compact-01/Occam returned `timeout` after 493 reducer callbacks, retaining a 7 -> 6 statement / 1233 -> 1109 B last-valid checkpoint. Its runner-level `predicate_passed` remains null although native stats record two accepted final checks of that checkpoint. Do not call the run completed or a performance regression; profile before attributing a cause.
 ** TODO [#B] Evaluate weighted and feedback-guided search
 - Compare statement-count partitions with byte/token weights and actual closure gains.
 - Deduplicate candidates and cache closures; account for overlapping dependencies.
@@ -195,8 +198,9 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Establish SQL-specific gains with shared-predicate fuzz workloads and controlled baselines; scope claims to the oracle and evidence.
 
 * 20. Milestones
-** IN_PROGRESS [#A] M1: Reliable fuzz SQL reduction
+** DONE [#A] M1: Reliable single-input fuzz SQL reduction
 Given existing fuzz SQL, setup state, and an oracle, produce smaller SQL that passes an uncached fresh-state recheck; bound runtime and retain the last accepted result.
+- Verified: real SQLite accepted reductions passed two uncached fresh-state checks; cap-1 and timeout outcomes retained checkpoints and reported `execution-budget`/`timeout`, with runner completion status kept distinct from native final-validation results.
 ** TODO [#A] M2: Large-input and corpus-scale validation
 Exercise both long SQL programs and many independent inputs; report reduction ratios, oracle calls, throughput, failures, and budget exhaustion.
 ** TODO [#B] M3: Explain dependency-aware gains

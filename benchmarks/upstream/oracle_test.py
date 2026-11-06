@@ -22,6 +22,23 @@ def append_record(path: Path, record: dict[str, Any]) -> None:
         output.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+
+def read_jsonl_since(path: Path, offset: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open("rb") as source:
+            source.seek(offset)
+            for line in source:
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return records
+
 def kill_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -40,6 +57,7 @@ def main() -> int:
     parser.add_argument("--timeout", required=True, type=float)
     parser.add_argument("--deadline", required=True, type=float)
     parser.add_argument("--oracle", required=True)
+    parser.add_argument("--oracle-audit", type=Path)
     parser.add_argument("--max-executions", type=int)
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
@@ -80,6 +98,13 @@ def main() -> int:
         })
         return 1
 
+    audit_offset = 0
+    if args.oracle_audit is not None:
+        try:
+            audit_offset = args.oracle_audit.stat().st_size
+        except OSError:
+            pass
+
     remaining = args.deadline - time.monotonic()
     if remaining <= 0:
         status = "timeout"
@@ -110,6 +135,20 @@ def main() -> int:
             stdout = ""
             stderr = str(exc)
         elapsed = time.monotonic() - started
+        if args.oracle_audit is not None:
+            wrapper_record = next(
+                (
+                    row
+                    for row in reversed(read_jsonl_since(args.oracle_audit, audit_offset))
+                    if row.get("phase") == "reducer"
+                ),
+                None,
+            )
+            if wrapper_record is not None:
+                if wrapper_record.get("status") in {"timeout", "interrupted"}:
+                    status = "timeout"
+                elif wrapper_record.get("status") == "tool-error":
+                    status = "tool-error"
 
     if status in {"accepted", "rejected"} and not args.no_cache:
         cache[digest] = status

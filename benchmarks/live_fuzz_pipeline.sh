@@ -94,6 +94,7 @@ status=0
 # The CLI's final checks are uncached, use fresh candidate state, and share its budget.
 python3 - "$RUN_DIR" "$EVIDENCE_CLASS" "$ORACLE_KIND" "$DIALECT" "$status" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -103,6 +104,19 @@ stats = json.loads(stats_path.read_text()) if stats_path.is_file() else {}
 metrics = stats.get("evaluation_metrics", {})
 initial = stats.get("initial_statements")
 reduced = stats.get("reduced_statements")
+
+def seconds(name):
+    value = metrics.get(name)
+    return value if type(value) in (int, float) and math.isfinite(value) else None
+
+reset_preflight = seconds("evaluationPreflightResetSeconds")
+reset_reduction = seconds("evaluationResetSeconds")
+reset_validation = seconds("evaluationValidationResetSeconds")
+reset_total = (
+    reset_preflight + reset_reduction + reset_validation
+    if all(value is not None for value in (reset_preflight, reset_reduction, reset_validation))
+    else None
+)
 record = {
     "scenario": run_dir.name,
     "tool": "occam",
@@ -119,6 +133,11 @@ record = {
     "byte_red_pct": stats.get("reduction_ratio"),
     "oracle_calls": stats.get("oracle_executions"),
     "oracle_calls_scope": "initial check, reduction, and final validation",
+    "reset_preflight_sec": reset_preflight,
+    "reset_reduction_sec": reset_reduction,
+    "reset_validation_sec": reset_validation,
+    "reset_time_sec": reset_total,
+    "reset_time_scope": "preflight + reduction/audit + repeated final validation; each stage counted once",
     "oracle_timeouts": metrics.get("evaluationTimedOutObservations"),
     "wall_time_sec": stats.get("elapsed_seconds"),
     "predicate_passed": metrics.get("evaluationValidationPassed"),
