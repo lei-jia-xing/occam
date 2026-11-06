@@ -109,24 +109,32 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Statement extraction preserves exact source bytes and attaches a Tree-sitter node only for an exact-span match; shared SQL lexing separates transaction/error units while unknown syntax stays conservative.
 - Dependency analysis recognizes TRUNCATE and transaction controls from each raw unit, including savepoint rollback effects.
 - Verified: integrated build and full suites passed. A real SQLite savepoint smoke reduced 12 statements/284 B to 10/222 B, preserved quoted savepoints and expected rows, and passed two fresh final checks.
-** TODO [#A] Add unrestricted deletion after graph-guided search
+** DONE [#A] Add unrestricted deletion after graph-guided search
 - Hard closure can retain unnecessary statements through conservative dependencies.
 - Compare hard closure, closure with unrestricted fallback, and plain ddmin on fuzz inputs with false dependencies.
 - Audit single-statement deletion to a fixed point; report its cost separately.
 - Distinguish statement-1-minimality, closure-minimality, and rewrite fixed points; do not claim a global minimum.
-** TODO [#A] Model object identity and scope
+- Implemented unrestricted statement ddmin and repeated single-statement audit with separate stage costs. Real SQLite false-barrier comparison: hard closure retained 3 statements/28 B; unrestricted fallback and plain ddmin retained 1/11 B, with two fresh validations each.
+** DONE [#A] Model object identity and scope
 - Preserve schema, dialect-specific casing, quoted names, and object generations.
 - Handle DROP/CREATE, RENAME, temporary objects, search_path, and nested CTE scopes.
 - Separate DML target writes from source reads; refine index/view/trigger/column dependencies.
 - Test schema collisions, quoted identifiers, CTE shadowing, object recreation, and INSERT SELECT.
-** TODO [#B] Refine state dependencies
+- Columns and index/trigger bindings use resolved owner keys; view sources retain definition-time bindings. Temporary DROP/RENAME no longer corrupts permanent objects, qualified recreation retires old tombstones, and nonrecursive/nested/quoted CTE scope regressions pass. Explicit INSERT target columns are writes, not source columns.
+- Unknown search_path remains a conservative union/fence, not an ordered dialect resolver; unparsed trigger semantics stay conservative.
+** DONE [#B] Refine state dependencies
 - Model transactions, savepoints, rollback, session settings, schema changes, and writes.
 - Start with table/column reaching definitions; add finer data dependencies only when useful.
 - Keep unknown syntax conservative and measure barrier frequency and overconstraint.
-** TODO [#B] Extend SQL reduction passes
+- Whole-catalog transaction/savepoint snapshots restore schema, columns, relations, and reaching writes. Known but unmodeled view-target DML is a catalog-sensitive barrier; direct reaching edges and transitive barrier retention are distinguished.
+- Barrier statements/actions/edges and target closure size are available for profiling. The four-statement false-barrier fixture had two barriers; accepted unrestricted deletion demonstrated its overconstraint, rather than inferring false edges from counts alone.
+** DONE [#B] Extend SQL reduction passes
 - Prioritize useful list, VALUES, JOIN, CTE, subquery, constraint, type, and literal reductions.
 - Preserve untouched bytes and validate every candidate with the supplied oracle.
 - Choose additional transformations from structures that remain in reduced fuzz inputs.
+- Corrected actual bundled-CST containers for projection terms, VALUES rows, and CTEs; added independent OFFSET removal and literal-only scalar-subquery lifting without treating table relations as scalar expressions.
+- Verified build, 86 main-suite tests and 10 fuzz-suite tests. Five real SQLite before/after reductions improved old minima from 84/90/88/20/39 B to 63/76/67/11/32 B; all completed two fresh final checks. A combined temporary/schema/savepoint smoke reduced 298 -> 115 B and passed both final checks.
+- Removed residual CrashSignature types and crash-specific prefix/log naming. No identifier rebinding, semantic stubbing, or parser dependency was introduced.
 ** OPEN QUESTION: Would sqlparser-rs simplify SQL syntax-fact extraction enough to justify its integration and dialect-coverage trade-offs?
 - Keep Tree-sitter for exact-source edits. This is a question only: no parser replacement or integration, dependency, adapter, or feature flag is scheduled, and fuzz reduction does not depend on it.
 

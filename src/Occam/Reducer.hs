@@ -56,7 +56,7 @@ import Occam.TreeSitter (
     withParser,
  )
 
--- | The oracle returns True exactly when the candidate preserves the target crash.
+-- | The oracle returns True exactly when the complete candidate satisfies the user's predicate.
 type Oracle = ByteString -> IO Bool
 
 data SearchStrategy
@@ -490,9 +490,9 @@ logAuditStats logger stats =
         ]
 
 -- Prefix tests are linear: oracle results are not assumed to be monotone.
-findCrashStatement ::
+findInterestingPrefix ::
     Oracle -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
-findCrashStatement oracle baseSQL statements = go 1
+findInterestingPrefix oracle baseSQL statements = go 1
     where
         go prefixLength
             | prefixLength > length statements = pure (Nothing, prefixLength - 1)
@@ -514,7 +514,7 @@ analyzeSQL logger dialect parser sql = do
         units <- extractStatementUnits tree sql
         let statements = map unitStatement units
         graph <- analyzeStatementsWithDialect dialect units sql
-        pure (statements, graph)
+        graph `seq` pure (statements, graph)
     finished <- getMonotonicTimeNSec
     let elapsed = finished - started
         statementCount = maybe 0 (length . fst) result
@@ -543,17 +543,17 @@ sliceSQL logger dialect oracle parser sql = do
         Nothing -> pure sql
         Just ([], _) -> pure sql
         Just (statements, graph) -> do
-            (maybeCrash, prefixTests) <- findCrashStatement oracle sql statements
-            case maybeCrash of
+            (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
+            case maybeTarget of
                 Nothing -> do
                     logInfo'
                         logger
                         "occam::reducer"
-                        "No crash-preserving statement prefix found"
+                        "No predicate-preserving statement prefix found"
                         [("prefix_tests", toJSON prefixTests)]
                     pure sql
-                Just (crashStatement, prefixSQL, prefixLength) -> do
-                    let slice = backwardSlice (stmtId crashStatement) graph
+                Just (targetStatement, prefixSQL, prefixLength) -> do
+                    let slice = backwardSlice (stmtId targetStatement) graph
                         retained = filter (\s -> Set.member (stmtId s) slice) statements
                         candidate = statementSQL sql statements retained
                     if BS.length candidate >= BS.length sql
@@ -571,12 +571,12 @@ sliceSQL logger dialect oracle parser sql = do
                                 ]
                             if ok
                                 then do
-                                    let StatementId crashId = stmtId crashStatement
+                                    let StatementId targetId = stmtId targetStatement
                                     logInfo'
                                         logger
                                         "occam::reducer"
                                         "Backward slicing accepted"
-                                        [ ("crash_statement_id", toJSON crashId)
+                                        [ ("target_statement_id", toJSON targetId)
                                         , ("statements_before", toJSON (length statements))
                                         , ("statements_after", toJSON (length retained))
                                         , ("bytes_before", toJSON (BS.length sql))
@@ -788,10 +788,16 @@ nodeSyntaxEdits source node = do
     childInfo <- mapM locate children
     let clauseEdits =
             [ SyntaxEdit (precedingSpace source start) end BS.empty "clause" ("remove-" <> nodeName)
-            | nodeName `elem` ["where", "order_by", "group_by", "having", "limit"]
+            | nodeName `elem` ["where", "order_by", "group_by", "having", "limit", "offset"]
             ]
-    listEdits <- listSyntaxEdits source nodeName (Span start end) childInfo
-    expressionEdits <- expressionSyntaxEdits source nodeName (Span start end) children
+        listEdits = listSyntaxEdits source nodeName childInfo
+        scalarSubquery = case childInfo of
+            [LocatedNode "subquery" _] -> True
+            _ -> False
+    expressionEdits <-
+        if nodeName == "term" && not scalarSubquery
+            then pure []
+            else expressionSyntaxEdits source nodeName (Span start end) children
     scalarEdits <- scalarSyntaxEdits source nodeName (Span start end)
     pure (clauseEdits <> listEdits <> expressionEdits <> scalarEdits)
     where
@@ -806,28 +812,51 @@ precedingSpace source start
 isSQLSpace :: Word8 -> Bool
 isSQLSpace byte = byte == 32 || byte == 9 || byte == 10 || byte == 13
 
-listSyntaxEdits :: ByteString -> T.Text -> Span -> [LocatedNode] -> IO [SyntaxEdit]
-listSyntaxEdits source parentName parentSpan children =
+listSyntaxEdits :: ByteString -> T.Text -> [LocatedNode] -> [SyntaxEdit]
+listSyntaxEdits source parentName children =
     case parentName of
-        "from" -> pure (fromListEdits source children)
+        "from" -> fromListEdits source children
+        "statement" -> cteListEdits source children
+        "insert" ->
+            let afterValues = drop 1 (dropWhile ((/= "keyword_values") . locatedType) children)
+                rows =
+                    foldr
+                        ( \child rest -> case locatedType child of
+                            "list" -> child : rest
+                            "comment" -> rest
+                            _ -> []
+                        )
+                        []
+                        afterValues
+             in listEditsForItems source "values" rows
         _ ->
             case listItemTypes parentName of
-                Nothing -> pure []
+                Nothing -> []
                 Just itemTypes ->
                     let items = filter ((`elem` itemTypes) . locatedType) children
-                     in pure (listEditsForItems source parentName parentSpan items)
+                     in listEditsForItems source parentName items
+
+cteListEdits :: ByteString -> [LocatedNode] -> [SyntaxEdit]
+cteListEdits source children =
+    case dropWhile ((/= "keyword_with") . locatedType) children of
+        withNode : rest ->
+            case filter ((== "cte") . locatedType) rest of
+                [] -> []
+                ctes ->
+                    let Span start _ = locatedSpan withNode
+                        Span _ end = locatedSpan (last ctes)
+                     in SyntaxEdit start end BS.empty "list" "remove-with"
+                            : listEditsForItems source "cte" ctes
+        [] -> []
 
 listItemTypes :: T.Text -> Maybe [T.Text]
 listItemTypes parentName =
     case parentName of
-        "select" -> Just ["select_expression", "all_fields"]
+        "select_expression" -> Just ["term"]
         "column_definitions" -> Just ["column_definition", "constraint", "constraints"]
         "constraints" -> Just ["constraint"]
         "assignment_list" -> Just ["assignment"]
         "enum_elements" -> Just ["literal", "identifier"]
-        "_cte" -> Just ["cte"]
-        "cte" -> Just ["cte"]
-        "values" -> Just ["list"]
         "list" -> Just expressionNodeTypes
         "ordered_columns" -> Just ["column"]
         "index_fields" -> Just ["field"]
@@ -866,7 +895,7 @@ fromListEdits source children =
                 children
         relationEdits =
             if length relations > 1
-                then listEditsForItems source "from-relation" (Span 0 (BS.length source)) relations
+                then listEditsForItems source "from-relation" relations
                 else []
         joinEdits =
             [ SyntaxEdit start end BS.empty "list" ("remove-" <> locatedType child)
@@ -875,8 +904,8 @@ fromListEdits source children =
             ]
      in relationEdits <> joinEdits
 
-listEditsForItems :: ByteString -> T.Text -> Span -> [LocatedNode] -> [SyntaxEdit]
-listEditsForItems source parentName _ items
+listEditsForItems :: ByteString -> T.Text -> [LocatedNode] -> [SyntaxEdit]
+listEditsForItems source parentName items
     | length items <= 1 = []
     | otherwise =
         [ SyntaxEdit start end BS.empty "list" ("remove-" <> parentName <> "-" <> locatedType item)
@@ -917,7 +946,9 @@ findLastByte byte source start end = go (end - 1)
 
 expressionSyntaxEdits :: ByteString -> T.Text -> Span -> [TSNode] -> IO [SyntaxEdit]
 expressionSyntaxEdits source nodeName (Span start end) children
-    | nodeName `notElem` ["binary_expression", "unary_expression", "parenthesized_expression"] = pure []
+    | nodeName
+        `notElem` ["binary_expression", "unary_expression", "parenthesized_expression", "exists", "term"] =
+        pure []
     | otherwise = do
         replacements <- expressionReplacements source nodeName children
         pure
@@ -929,6 +960,7 @@ expressionSyntaxEdits source nodeName (Span start end) children
 expressionReplacements :: ByteString -> T.Text -> [TSNode] -> IO [ByteString]
 expressionReplacements source nodeName children =
     case nodeName of
+        "exists" -> pure ["0"]
         "binary_expression" ->
             case children of
                 left : rest@(_ : _) -> do
@@ -948,6 +980,30 @@ expressionReplacements source nodeName children =
                     innerText <- nodeText source inner
                     pure [innerText]
                 [] -> pure []
+        "term" ->
+            case children of
+                [subquery] -> do
+                    queries <- nodeNamedChildren subquery
+                    case queries of
+                        [query] -> do
+                            queryChildren <- nodeNamedChildren query
+                            case queryChildren of
+                                [keyword, projection] -> do
+                                    terms <- nodeNamedChildren projection
+                                    case terms of
+                                        [term] -> do
+                                            values <- nodeNamedChildren term
+                                            case values of
+                                                [value] -> do
+                                                    types <- mapM nodeType [query, keyword, projection, term, value]
+                                                    if types == ["select", "keyword_select", "select_expression", "term", "literal"]
+                                                        then (: []) <$> nodeText source value
+                                                        else pure []
+                                                _ -> pure []
+                                        _ -> pure []
+                                _ -> pure []
+                        _ -> pure []
+                _ -> pure []
         _ -> pure []
 
 scalarSyntaxEdits :: ByteString -> T.Text -> Span -> IO [SyntaxEdit]

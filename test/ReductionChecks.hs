@@ -118,6 +118,54 @@ tests =
                 keepFirst candidate = pure (BSC.isInfixOf "SELECT 11" candidate)
             byteResult <- statementDdmin CountDD keepFirst bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
+        , testCase "CTE removal preserves a required sibling and untouched source bytes" $ do
+            let prefix = TE.encodeUtf8 "-- café\n"
+                kept = "kept AS (SELECT 42 AS value)"
+                query = "SELECT value FROM kept;\r\n"
+                sql = prefix <> "WITH unused AS (SELECT 1), " <> kept <> " " <> query
+                oracle candidate = pure (BS.isInfixOf kept candidate && BS.isInfixOf query candidate)
+            reduced <- syntaxOnly oracle sql
+            assertBool "the unnecessary CTE is removed" (not (BSC.isInfixOf "unused" reduced))
+            assertBool "the required CTE is unchanged" (BS.isInfixOf kept reduced)
+            assertBool "the Unicode prefix is untouched" (BS.isPrefixOf prefix reduced)
+            assertBool "the query and CRLF ending are untouched" (BS.isSuffixOf query reduced)
+            withoutCTEs <- syntaxOnly (pure . BSC.isInfixOf "SELECT 42;") "WITH unused AS (SELECT 1) SELECT 42;"
+            assertBool
+                "the final unnecessary CTE and WITH keyword can disappear"
+                (not (BSC.isInfixOf "WITH" withoutCTEs))
+        , testCase "VALUES row reduction excludes the INSERT target column list" $ do
+            let sql = "INSERT INTO t(a,b) VALUES (1,2),(42,43);"
+                oracle candidate = pure (BSC.isInfixOf "t(a,b)" candidate && BSC.isInfixOf "(42,43)" candidate)
+            reduced <- syntaxOnly oracle sql
+            assertEqual
+                "only the irrelevant VALUES row and its comma are removed"
+                "INSERT INTO t(a,b) VALUES (42,43);"
+                reduced
+        , testCase "unused projection terms are removed inside a subquery" $ do
+            let sql = "SELECT a FROM (SELECT 42 AS a,99 AS b);\r\n"
+                oracle candidate = pure (BSC.isInfixOf "SELECT a FROM" candidate && BSC.isInfixOf "42 AS a" candidate)
+            reduced <- syntaxOnly oracle sql
+            assertEqual
+                "the unused projection and comma disappear without reformatting"
+                "SELECT a FROM (SELECT 42 AS a);\r\n"
+                reduced
+        , testCase "OFFSET can disappear while a required LIMIT remains" $ do
+            let sql = "SELECT a FROM t LIMIT 1 OFFSET 0;\r\n"
+                oracle candidate = pure (BSC.isInfixOf "SELECT a FROM t" candidate && BSC.isInfixOf "LIMIT 1" candidate)
+            reduced <- syntaxOnly oracle sql
+            assertEqual
+                "LIMIT and the original ending survive OFFSET removal"
+                "SELECT a FROM t LIMIT 1;\r\n"
+                reduced
+        , testCase "literal scalar subqueries collapse using their exact source span" $ do
+            let prefix = TE.encodeUtf8 "-- café\n"
+                sql = prefix <> "SELECT (SELECT 42);\r\n"
+            reduced <- syntaxOnly (pure . BSC.isInfixOf "42") sql
+            assertEqual "outer Unicode and CRLF bytes remain untouched" (prefix <> "SELECT 42;\r\n") reduced
+            tableQuery <- syntaxOnly (pure . BSC.isInfixOf "42") "SELECT * FROM (SELECT 42);"
+            assertBool
+                "table subqueries are not replaced by scalar literals"
+                (not (BSC.isInfixOf "FROM 42" tableQuery))
         , testCase "Statement surgery preserves compound triggers and UTF-8 offsets" $ do
             let prefix = TE.encodeUtf8 "-- café\n"
                 unused = BSC.pack "CREATE TABLE unused (id INT);\n"
@@ -139,3 +187,14 @@ tests =
             count <- countStatements sql
             assertEqual "each SQL source statement remains one unit" 4 count
         ]
+
+syntaxOnly :: (BS.ByteString -> IO Bool) -> BS.ByteString -> IO BS.ByteString
+syntaxOnly =
+    reduceSQLWithConfig
+        defaultReductionConfig
+            { reductionSlicing = False
+            , reductionClosure = False
+            , reductionUnrestricted = False
+            , reductionIntraStatement = True
+            }
+        nullLogger

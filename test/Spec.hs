@@ -239,11 +239,14 @@ phase3Tests =
                     units <- extractStatementUnits tree script
                     graph <- analyzeStatements units script
                     assertBool
-                        "{s1, s3, s5} should be a valid closure"
-                        (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 5]))
+                        "table, data, index, and query form a valid conservative closure"
+                        (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 4, StatementId 5]))
                     assertBool
-                        "{s3, s5} should be invalid (dangling s1)"
-                        (not (isValidClosure graph (Set.fromList [StatementId 3, StatementId 5])))
+                        "omitting the table definition leaves a dangling dependency"
+                        (not (isValidClosure graph (Set.fromList [StatementId 3, StatementId 4, StatementId 5])))
+                    assertBool
+                        "omitting index state leaves a dangling dependency"
+                        (not (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 5])))
                 case res of
                     Nothing -> assertFailure "Failed to parse script for closure check"
                     Just () -> pure ()

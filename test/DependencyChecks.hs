@@ -136,7 +136,7 @@ tests =
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE main.items (id INT);"
-                        , "CREATE TEMP TABLE items (id INT);"
+                        , "CREATE TABLE temp.items (id INT);"
                         , "SELECT * FROM items;"
                         , "SELECT * FROM main.items;"
                         ]
@@ -154,16 +154,32 @@ tests =
                     BSC.unlines
                         [ "CREATE TABLE destination (id INT);"
                         , "CREATE TABLE source (id INT);"
-                        , "INSERT INTO destination SELECT id FROM source;"
+                        , "INSERT INTO destination (id) SELECT id FROM source;"
+                        , "SELECT id FROM source;"
                         ]
             graph <- analyze PostgreSQL sql
             let actions = actionsFor (StatementId 3) graph
                 tableActions = [action | action <- actions, actionKind action == TableObject]
                 writes = Set.fromList [actionName action | action <- tableActions, actionType action == ModDep]
                 reads = Set.fromList [actionName action | action <- tableActions, actionType action == UseDep]
+                columnWrites =
+                    Set.fromList
+                        [ actionName action
+                        | action <- actions
+                        , actionKind action == ColumnObject
+                        , actionType action == ModDep
+                        ]
                 deps = dependenciesFor (StatementId 3) graph
             assertEqual "only the insert target is modified" (Set.singleton "destination") writes
             assertEqual "the SELECT input is a source read" (Set.singleton "source") reads
+            assertEqual
+                "only explicit target columns are written"
+                (Set.singleton "destination\x1fid")
+                columnWrites
+            assertEqual
+                "source reads do not depend on the insert"
+                (Set.singleton (StatementId 2))
+                (dependenciesFor (StatementId 4) graph)
             assertBool
                 "both relation definitions are necessary"
                 (has (StatementId 1) deps && has (StatementId 2) deps)
@@ -244,6 +260,158 @@ tests =
             assertBool
                 "barrier metrics include the unsupported schema operation"
                 (graphBarrierStatements graph > 0 && graphBarrierActions graph > 0)
+        , testCase "temporary definitions preserve permanent column and index ownership" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE main.t (x INT);"
+                        , "CREATE INDEX ix ON t (x);"
+                        , "CREATE TEMP TABLE t (x INT);"
+                        , "SELECT * FROM main.t;"
+                        , "SELECT x FROM main.t;"
+                        ]
+            assertBool
+                "index name is not confused with its target table"
+                (ObjectAction IndexObject DefDep "ix" `elem` actionsFor (StatementId 2) graph)
+            assertEqual
+                "index creation reads its table"
+                (Set.singleton (StatementId 1))
+                (dependenciesFor (StatementId 2) graph)
+            let expected = Set.fromList [StatementId 1, StatementId 2]
+            assertEqual
+                "explicit permanent lookup retains its index"
+                expected
+                (dependenciesFor (StatementId 4) graph)
+            assertEqual
+                "temporary columns do not replace permanent columns"
+                expected
+                (dependenciesFor (StatementId 5) graph)
+        , testCase "dropping a temporary table reveals permanent reaching writes" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE main.t (x INT);"
+                        , "INSERT INTO main.t VALUES (42);"
+                        , "CREATE TEMP TABLE t (x INT);"
+                        , "DROP TABLE t;"
+                        , "SELECT x FROM t;"
+                        ]
+            assertEqual
+                "the dropped shadow does not hide the live permanent object"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 4])
+                (dependenciesFor (StatementId 5) graph)
+        , testCase "temporary rename does not redirect a bound permanent view" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE main.t (x INT);"
+                        , "CREATE VIEW v AS SELECT * FROM t;"
+                        , "CREATE TEMP TABLE t (x INT);"
+                        , "ALTER TABLE t RENAME TO u;"
+                        , "INSERT INTO main.t VALUES (42);"
+                        , "SELECT * FROM v;"
+                        ]
+            assertEqual
+                "the view remains bound to its definition-time source"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 5])
+                (dependenciesFor (StatementId 6) graph)
+        , testCase "qualified recreation retires an unqualified dropped generation" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE \"t.part\" (old_col INT);"
+                        , "DROP TABLE \"t.part\";"
+                        , "CREATE TABLE main.\"t.part\" (new_col INT);"
+                        , "SELECT new_col FROM main.\"t.part\";"
+                        ]
+            assertEqual
+                "only the new definition reaches the qualified query"
+                (Set.singleton (StatementId 3))
+                (dependenciesFor (StatementId 4) graph)
+        , testCase "nested-only CTE aliases do not shadow an outer table read" $ do
+            graph <-
+                analyze PostgreSQL $
+                    BSC.unlines
+                        [ "CREATE TABLE base (id INT);"
+                        , "CREATE TABLE src (id INT);"
+                        , "SELECT * FROM base WHERE EXISTS (WITH base AS (SELECT id FROM src) SELECT 1 FROM base);"
+                        ]
+            assertEqual
+                "both outer and nested external sources remain visible"
+                (Set.fromList [StatementId 1, StatementId 2])
+                (dependenciesFor (StatementId 3) graph)
+        , testCase "a nonrecursive CTE body can read its same-named base table" $ do
+            graph <-
+                analyze PostgreSQL "CREATE TABLE t (id INT); WITH t AS (SELECT id FROM t) SELECT id FROM t;"
+            assertEqual
+                "a CTE alias is not visible in its own nonrecursive body"
+                (Set.singleton (StatementId 1))
+                (dependenciesFor (StatementId 2) graph)
+        , testCase "quoted dotted CTE aliases retain their identity" $ do
+            graph <-
+                analyze
+                    PostgreSQL
+                    "CREATE TABLE \"a.b\" (id INT); WITH \"a.b\" AS (SELECT 42 AS id) SELECT id FROM \"a.b\";"
+            assertEqual
+                "the quoted CTE shadows the quoted base table"
+                Set.empty
+                (dependenciesFor (StatementId 2) graph)
+        , testCase "view reads retain indexes created after the view" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE t (x INT);"
+                        , "CREATE VIEW v AS SELECT * FROM t;"
+                        , "CREATE INDEX ix ON t (x);"
+                        , "INSERT INTO t VALUES (42);"
+                        , "SELECT * FROM v;"
+                        ]
+            assertEqual
+                "view sources include their current data and index state"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 4])
+                (dependenciesFor (StatementId 5) graph)
+        , testCase "unmodeled writes through known views fence subsequent reads" $ do
+            graph <-
+                analyze
+                    PostgreSQL
+                    "CREATE TABLE t (x INT); CREATE VIEW v AS SELECT * FROM t; INSERT INTO v VALUES (42); SELECT * FROM t;"
+            assertEqual
+                "view writes retain the known source and view"
+                (Set.fromList [StatementId 1, StatementId 2])
+                (dependenciesFor (StatementId 3) graph)
+            assertEqual
+                "base-table reads retain the conservative view write"
+                (Set.fromList [StatementId 1, StatementId 3])
+                (dependenciesFor (StatementId 4) graph)
+            assertBool "catalog-sensitive view writes count as barriers" (graphBarrierStatements graph > 0)
+        , testCase "transaction rollback restores column and index ownership" $ do
+            graph <-
+                analyze
+                    SQLite
+                    "CREATE TABLE t (x INT); CREATE INDEX ix ON t (x); BEGIN; ALTER TABLE t RENAME TO u; ROLLBACK; SELECT x FROM t;"
+            assertEqual
+                "the restored table and index, not the rename, reach the read directly"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 5])
+                (dependenciesFor (StatementId 6) graph)
+        , testCase "savepoint rollback restores a dropped schema generation and its data" $ do
+            graph <-
+                analyze SQLite $
+                    BSC.unlines
+                        [ "CREATE TABLE t (old_col INT);"
+                        , "CREATE INDEX ix ON t (old_col);"
+                        , "INSERT INTO t VALUES (42);"
+                        , "SAVEPOINT s;"
+                        , "DROP TABLE t;"
+                        , "CREATE TABLE t (new_col INT);"
+                        , "INSERT INTO t VALUES (99);"
+                        , "ROLLBACK TO s;"
+                        , "SELECT old_col FROM t;"
+                        , "RELEASE s;"
+                        ]
+            assertEqual
+                "only the restored generation and rollback reach the read directly"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 8])
+                (dependenciesFor (StatementId 9) graph)
         , testCase "table writes retain related indexes, triggers, and column definitions" $ do
             let table = ObjectAction TableObject DefDep "t"
                 column = ObjectAction ColumnObject DefDep "t\x1fid"
