@@ -72,6 +72,7 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
     let cacheEnabled = evaluationCacheEnabled evaluationConfig
         noSlicing = baseConfig {reductionSlicing = False}
         noClosure = baseConfig {reductionClosure = False}
+        noSlicingOrClosure = baseConfig {reductionSlicing = False, reductionClosure = False}
         noIntra = baseConfig {reductionIntraStatement = False}
         hardClosure = baseConfig {reductionClosure = True, reductionUnrestricted = False}
         unrestrictedFallback = baseConfig {reductionClosure = True, reductionUnrestricted = True}
@@ -118,6 +119,11 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
             , statementTrack "CDD (statement ddmin)" "cdd" CDD
             , pipeline "Shared (no slicing)" "ablation-no-slicing" noSlicing cacheEnabled
             , pipeline "Shared (no closure)" "ablation-no-closure" noClosure cacheEnabled
+            , pipeline
+                "Shared (no slicing or closure)"
+                "ablation-no-slicing-no-closure"
+                noSlicingOrClosure
+                cacheEnabled
             , pipeline "Shared (no intra-statement)" "ablation-no-intra-statement" noIntra cacheEnabled
             , pipeline "Shared (hard closure)" "closure-hard" hardClosure cacheEnabled
             , pipeline "Shared (unrestricted fallback)" "closure-unrestricted" unrestrictedFallback cacheEnabled

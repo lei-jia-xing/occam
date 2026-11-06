@@ -174,14 +174,15 @@ These comparisons explain reduction gains; external-tool integration is not a pr
 - Disable slicing, closure, intra-statement passes, and caching independently.
 - Compare graph-aware and graph-free reducers within the same pipeline.
 - Record configuration, stage costs, success rates, and final sizes; test slicing/closure interactions.
-** TODO [#C] Integrate upstream SQLancer reducers only for a specific comparison
-- The generic `PredicateReducer.java` adapter is optional; SQLancer source fetch/build timed out and runtime integration is unverified.
+** DONE [#C] Integrate upstream SQLancer reducers only for a specific comparison
+- Verified pinned upstream StatementReducer/ASTBasedReducer via the external-predicate adapter. Prepared-source run completed and independently validated two SQLite and two PostgreSQL scripts; callbacks 6/9 and 11/12 respectively. Fetch/build is outside the measured adapter; the earlier build-in-budget timeouts remain raw evidence.
 - Verify the pinned upstream entry point and reducer API before comparing `StatementReducer` or `ASTBasedReducer` with a compatible predicate adapter.
 - Measure oracle calls or report unknown, independently validate outputs, and report unsupported dialects.
-** TODO [#C] Add SQLreduce when PostgreSQL comparison is needed
+** DONE [#C] Add SQLreduce when PostgreSQL comparison is needed
 - Verify multiple statements, setup state, target predicates, and reconnects.
 - Report unsupported cases; use a separate fixed-setup query track where needed.
 - Apply the same target criterion and publish adapter changes.
+- Pinned SQLreduce AST/rules now share the external predicate and full input with all tools, without its intrinsic reconnect loop or tool-only setup/query substitution. Both PostgreSQL temporary/session scripts completed and independently validated; both SQLite cases report unsupported. Both upstream adapters stop at cap 1, retain accepted SQL, and their checkpoints pass a separate fresh PostgreSQL observation without relabeling the budget exit.
 ** TODO [#C] Add modern and structural baselines only for a specific comparison
 - Align per-call limits (including adapter overhead), shared total deadlines, and oracle-execution budgets before comparing reducers; report the limits and validation costs.
 - Verify SQL grammar and dialect support before integrating Perses/HDD.
@@ -200,12 +201,13 @@ These comparisons explain reduction gains; external-tool integration is not a pr
   https://arxiv.org/abs/2411.19410
 - Perses: syntax-guided reduction; verify SQL support at the selected revision.
   https://github.com/uw-pluverse/perses
-** TODO [#C] Compare Occam with DRReduce when positioning the method
+** DONE [#C] Compare Occam with DRReduce when positioning the method
 - DRReduce builds a dependency graph, uses DDMin with dependency reconstruction (default-value replacement or associated-node deletion), then delegates to Perses. Its evaluated frontends are C/Java using IntelliJ PSI; the paper does not report SQL or stateful DBMS support.
 - Contrast its user/provider reconstruction with SQL schema generations, transactional state, conservative fallback, and byte-preserving reduction; do not compare the paper's C/Java results as SQL measurements.
 - Read full paper: https://arxiv.org/abs/2605.19412
 - Inspected the public artifact repository on its `master` branch: https://github.com/XYZboom/DRReduceData . It contains C/Java inputs, outputs, predicates and ablations, not an Occam-compatible SQL runner. Its `clang-22382/cdd_result/cdd_result.txt` reports 1,998 calls, 135 seconds and 113 tokens; these are authors' compiler measurements, not Occam results.
 - Establish SQL-specific gains with shared-predicate fuzz workloads and controlled baselines; scope claims to the oracle and evidence.
+- Full primary paper and artifact reviewed; positioning and limitations are documented in benchmarks/README.md. Current same-predicate SQL ablations separate conservative closure overconstraint from byte-preserving rewriting; no compiler timing or SQL-support claim is borrowed from DRReduce.
 
 * 20. Milestones
 ** DONE [#A] M1: Reliable single-input fuzz SQL reduction

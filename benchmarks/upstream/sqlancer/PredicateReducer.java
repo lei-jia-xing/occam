@@ -106,13 +106,23 @@ public final class PredicateReducer {
         BenchState reduced = newState(provider, dbmsOptions, options, state);
 
         long started = System.nanoTime();
-        new StatementReducer<>(provider).reduce(original, reproducer, reduced);
-        if (!reproducer.budgetExpired()) {
-            new ASTBasedReducer<>(provider).reduce(original, reproducer, reduced);
+        Runtime.getRuntime().addShutdownHook(new Thread(reproducer::cancelActiveChecker));
+        if (reproducer.bugStillTriggers(original)) {
+            new StatementReducer<>(provider).reduce(original, reproducer, reduced);
+            if (reproducer.stopCode == 0 && !reproducer.budgetExpired()) {
+                new ASTBasedReducer<>(provider).reduce(original, reproducer, reduced);
+            }
+        } else if (reproducer.stopCode == 0) {
+            reproducer.stopCode = 77;
         }
-        writeCandidate(output, state.getStatements());
+        if (reproducer.stopCode == 0 && reproducer.budgetExpired()) {
+            reproducer.stopCode = 124;
+        }
         long elapsed = System.nanoTime() - started;
-        writeMetrics(metrics, reproducer.checks, astUnsupported, sourceStatements.size(), elapsed);
+        writeMetrics(metrics, reproducer.checks, astUnsupported, sourceStatements.size(), elapsed, reproducer.stopCode);
+        if (reproducer.stopCode != 0) {
+            System.exit(reproducer.stopCode);
+        }
     }
 
     private static int countAstUnsupported(List<String> statements) {
@@ -128,12 +138,12 @@ public final class PredicateReducer {
     }
 
     private static void writeMetrics(Path metrics, long callbacks, int astUnsupported, int statementCount,
-            long elapsedNanos) throws IOException {
+            long elapsedNanos, int exitCode) throws IOException {
         Path parent = metrics.toAbsolutePath().getParent();
         Files.createDirectories(parent);
         String json = "{\"reducer_callbacks\":" + callbacks + ",\"ast_unsupported_statements\":" + astUnsupported
                 + ",\"statement_count\":" + statementCount + ",\"elapsed_sec\":"
-                + (elapsedNanos / 1_000_000_000.0) + "}\n";
+                + (elapsedNanos / 1_000_000_000.0) + ",\"exit_code\":" + exitCode + "}\n";
         Files.writeString(metrics, json, StandardCharsets.UTF_8);
     }
 
@@ -218,8 +228,8 @@ public final class PredicateReducer {
             } else if (c == '/' && next == '*') {
                 blockDepth = 1;
                 i++;
-            } else if (c == '\'' || c == '"' || c == '`') {
-                quote = c;
+            } else if (c == '\'' || c == '"' || c == '`' || c == '[') {
+                quote = c == '[' ? ']' : c;
             } else if (c == '$') {
                 int end = sql.indexOf('$', i + 1);
                 if (end >= 0) {
@@ -281,6 +291,32 @@ public final class PredicateReducer {
         private final long timeoutMillis;
         private final long deadlineNanos;
         private long checks;
+        private int stopCode;
+        private volatile Process activeChecker;
+
+        void cancelActiveChecker() {
+            Process process = activeChecker;
+            if (process == null) {
+                return;
+            }
+            List<ProcessHandle> descendants = process.descendants().collect(java.util.stream.Collectors.toList());
+            process.destroy();
+            try {
+                if (!process.waitFor(250, TimeUnit.MILLISECONDS)) {
+                    process.destroyForcibly();
+                }
+                for (ProcessHandle child : descendants) {
+                    if (child.isAlive()) {
+                        child.destroyForcibly();
+                    }
+                }
+                process.waitFor();
+            } catch (InterruptedException e) {
+                descendants.forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+                Thread.currentThread().interrupt();
+            }
+        }
 
         PredicateReproducer(List<String> command, Path calls, Path output, long timeoutMillis, long budgetMillis) {
             this.command = command;
@@ -296,6 +332,9 @@ public final class PredicateReducer {
 
         @Override
         public boolean bugStillTriggers(BenchState state) {
+            if (stopCode != 0) {
+                return false;
+            }
             Path candidate = null;
             long started = System.nanoTime();
             String status = "tool-error";
@@ -303,6 +342,7 @@ public final class PredicateReducer {
                 long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - started);
                 if (remainingMillis < 1) {
                     status = "timeout";
+                    stopCode = 124;
                     return false;
                 }
                 candidate = Files.createTempFile(output.toAbsolutePath().getParent(), "sqlancer-oracle-", ".sql");
@@ -312,20 +352,37 @@ public final class PredicateReducer {
                 Process process = new ProcessBuilder(invocation).directory(output.toAbsolutePath().getParent().toFile())
                         .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD)
                         .start();
+                activeChecker = process;
                 boolean finished = process.waitFor(Math.min(timeoutMillis, remainingMillis), TimeUnit.MILLISECONDS);
                 if (!finished) {
                     status = "timeout";
-                } else if (process.exitValue() == 0) {
-                    status = "accepted";
-                    writeCandidate(output, state.getState().getStatements());
+                    cancelActiveChecker();
                 } else {
-                    status = "rejected";
+                    int exitCode = process.exitValue();
+                    status = exitCode == 0 ? "accepted" : exitCode == 1 ? "rejected"
+                            : exitCode == 124 ? "timeout" : exitCode == 126 ? "execution-limit" : "tool-error";
+                    if (exitCode == 125 || (exitCode != 0 && exitCode != 1 && exitCode != 124 && exitCode != 126)) {
+                        stopCode = 125;
+                    } else if (exitCode == 126) {
+                        stopCode = 126;
+                    }
+                    if (exitCode == 0) {
+                        writeCandidate(output, state.getState().getStatements());
+                    }
+                }
+                if (status.equals("timeout") && (checks == 0 || budgetExpired())) {
+                    stopCode = 124;
                 }
                 return status.equals("accepted");
             } catch (Exception e) {
                 status = "tool-error";
+                stopCode = 125;
                 return false;
             } finally {
+                if (activeChecker != null && activeChecker.isAlive()) {
+                    cancelActiveChecker();
+                }
+                activeChecker = null;
                 checks++;
                 long elapsed = System.nanoTime() - started;
                 String line = "{\"call\":" + checks + ",\"status\":\"" + status + "\",\"duration_sec\":"

@@ -1,146 +1,141 @@
 #!/usr/bin/env python3
-"""Adapter to pinned SQLreduce for fixed-setup, single PostgreSQL SELECT cases."""
-
+"""Run pinned SQLreduce AST transformations with the shared external predicate."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
-import shlex
+import math
+from pathlib import Path
+import signal
 import subprocess
 import sys
+import tempfile
 import time
-from pathlib import Path
-from typing import Any
 
 PIN = "568c8a9a31601ead7128d0b067658b4d5a26821d"
-UNSUPPORTED = 78
-INVALID_RESULT = 77
 
 
-def unsupported(message: str) -> int:
-    print(message, file=sys.stderr)
-    return UNSUPPORTED
+class ReductionStopped(Exception):
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code = code
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--setup", required=True, type=Path)
-    parser.add_argument("--query", required=True, type=Path)
+    parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--metrics", required=True, type=Path)
-    parser.add_argument("--expected-sqlstate", required=True)
-    parser.add_argument("--database", default=os.environ.get("SQLREDUCE_DATABASE", ""))
     parser.add_argument("--timeout", required=True, type=float)
-    parser.add_argument("--reset-command", default=os.environ.get("SQLREDUCE_RESET_COMMAND", ""))
+    parser.add_argument("--deadline", required=True, type=float)
+    parser.add_argument("checker", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-
-    if not args.database:
-        return unsupported("SQLreduce requires SQLREDUCE_DATABASE for PostgreSQL")
-    if not args.setup.is_file() or not args.query.is_file():
-        return unsupported("SQLreduce fixed-setup track requires readable setup and query files")
-    if not args.reset_command:
-        return unsupported("SQLreduce fixed-setup track requires SQLREDUCE_RESET_COMMAND")
+    checker = args.checker[1:] if args.checker[:1] == ["--"] else args.checker
+    if not checker or not math.isfinite(args.timeout) or not math.isfinite(args.deadline) or args.timeout <= 0:
+        parser.error("a checker command and a positive timeout are required")
     try:
         revision = subprocess.run(
-            ["git", "-C", str(args.source), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
+            ["git", "-C", str(args.source), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True, timeout=max(0.001, args.deadline - time.monotonic()),
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return unsupported(f"Cannot verify pinned SQLreduce source: {exc}")
-    if revision != PIN:
-        return unsupported(f"SQLreduce source must be pinned at {PIN}, found {revision}")
-
-    sys.path.insert(0, str(args.source))
-    try:
+        if revision != PIN:
+            raise ReductionStopped(78, f"SQLreduce source must be pinned at {PIN}, found {revision}")
+        sys.path.insert(0, str(args.source))
         import pglast
         import sqlreduce
-        from pglast.parser import parse_sql
-    except ImportError as exc:
-        return unsupported(f"SQLreduce requires its pinned Python dependencies: {exc}")
-    if Path(sqlreduce.__file__).resolve().parent != (args.source / "sqlreduce").resolve():
-        return unsupported("Imported SQLreduce module is not from the pinned source checkout")
-
-    query = args.query.read_text(encoding="utf-8")
-    try:
-        parsed = parse_sql(query)
-    except Exception as exc:
-        return unsupported(f"SQLreduce could not parse the PostgreSQL query: {exc}")
-    if len(parsed) != 1 or parsed[0].stmt.__class__.__name__ != "SelectStmt":
-        return unsupported("SQLreduce track supports exactly one PostgreSQL SELECT/CTE query, not multi-statement or stateful input")
-    if not args.expected_sqlstate or len(args.expected_sqlstate) != 5:
-        return unsupported("SQLreduce track requires the expected five-character PostgreSQL SQLSTATE")
-
-    try:
-        reset_command = shlex.split(args.reset_command)
-        if not reset_command:
-            return unsupported("SQLREDUCE_RESET_COMMAND is empty")
-        reset_start = time.monotonic()
-        subprocess.run(reset_command, check=True, timeout=args.timeout)
-        setup_start = time.monotonic()
-        subprocess.run(
-            ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-d", args.database, "-f", str(args.setup)],
-            check=True,
-            timeout=args.timeout,
-            capture_output=True,
-            text=True,
-        )
-        setup_seconds = time.monotonic() - setup_start
-
-        timeout_text = f"{args.timeout:g}s"
-        connection_args = args.database
-        if "connect_timeout=" not in connection_args:
-            connection_args = f"{connection_args} connect_timeout={max(1, int(args.timeout))}"
-        state: dict[str, Any] = {
-            "database": connection_args,
-            "timeout": timeout_text,
-            "use_sqlstate": True,
-        }
-        observed = sqlreduce.run_query(state, query)
-        if observed == "CRASH" or observed == "no error":
-            return unsupported("SQLreduce cannot preserve crash/reconnect behavior; input must produce a PostgreSQL SQLSTATE")
-        if observed != args.expected_sqlstate:
-            args.metrics.write_text(
-                json.dumps({"status": "invalid-result", "expected_sqlstate": args.expected_sqlstate,
-                            "observed_sqlstate": observed, "reset_time_sec": time.monotonic() - reset_start,
-                            "setup_time_sec": setup_seconds}) + "\n",
-                encoding="utf-8",
-            )
-            return INVALID_RESULT
-
-        reduction_start = time.monotonic()
-        reduced_query, result_state = sqlreduce.run_reduce(
-            query,
-            database=connection_args,
-            verbose=False,
-            use_sqlstate=True,
-            timeout=timeout_text,
-        )
-        reduction_seconds = time.monotonic() - reduction_start
-        result_state = result_state or {}
-        if result_state.get("expected_error") != args.expected_sqlstate:
-            return INVALID_RESULT
-        args.output.write_text(reduced_query.rstrip() + "\n", encoding="utf-8")
-        args.metrics.write_text(
-            json.dumps({"status": "completed", "oracle_calls": result_state.get("called"),
-                        "expected_sqlstate": args.expected_sqlstate,
-                        "reset_time_sec": time.monotonic() - reset_start,
-                        "setup_time_sec": setup_seconds, "reduction_time_sec": reduction_seconds,
-                        "reduction_track": "fixed_setup_query"}) + "\n",
-            encoding="utf-8",
-        )
-        return 0
+        if Path(sqlreduce.__file__).resolve().parent != (args.source / "sqlreduce").resolve():
+            raise ReductionStopped(78, "SQLreduce was not imported from the pinned checkout")
+    except (ImportError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"unsupported: SQLreduce prerequisite: {exc}", file=sys.stderr)
+        return 78
     except subprocess.TimeoutExpired:
         return 124
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"SQLreduce setup failed: {exc}", file=sys.stderr)
-        return 1
+    except ReductionStopped as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+
+    checks = 0
+    started = time.monotonic()
+    status = "tool-error"
+    reason = None
+    code = 125
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    def predicate(_state, query):
+        nonlocal checks
+        remaining = args.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReductionStopped(124, "total tool budget exhausted")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".sql", dir=args.output.parent) as candidate:
+            def terminate_checker():
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+            candidate.write(query)
+            candidate.flush()
+            process = subprocess.Popen([*checker, candidate.name], start_new_session=True)
+            try:
+                result = process.wait(timeout=min(args.timeout, remaining))
+            except subprocess.TimeoutExpired:
+                terminate_checker()
+                result = 124
+            finally:
+                terminate_checker()
+        checks += 1
+        if result == 124:
+            if checks <= 2 or time.monotonic() >= args.deadline:
+                raise ReductionStopped(124, "initial predicate or total tool budget timed out")
+            return "rejected"
+        if result in {125, 126}:
+            raise ReductionStopped(result, "predicate infrastructure failure" if result == 125 else "max oracle executions reached")
+        if result not in {0, 1}:
+            raise ReductionStopped(125, f"checker exited {result}")
+        if checks <= 2 and result != 0:
+            raise ReductionStopped(77, "original or pglast-regenerated SQL did not preserve the predicate")
+        return "accepted" if result == 0 else "rejected"
+
+    def interrupt(_signal, _frame):
+        raise ReductionStopped(124, "adapter interrupted")
+
+    signal.signal(signal.SIGTERM, interrupt)
+
+    try:
+        original = args.input.read_text(encoding="utf-8")
+        try:
+            pglast.parse_sql(original)
+        except Exception as exc:
+            raise ReductionStopped(78, f"unsupported PostgreSQL syntax: {exc}") from exc
+        # Keep upstream's search/rules unchanged; replace only candidate execution, not its AST engine.
+        sqlreduce.run_query = predicate
+        reduced, state = sqlreduce.run_reduce(original, debug=True)
+        if predicate(state, reduced) != "accepted":
+            raise ReductionStopped(77, "SQLreduce's final SQL did not preserve the predicate")
+        temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+        temporary.write_text(reduced.rstrip() + "\n", encoding="utf-8")
+        temporary.replace(args.output)
+        status, code = "completed", 0
+    except ReductionStopped as exc:
+        code, reason = exc.code, str(exc)
+        status = {77: "invalid-result", 78: "unsupported", 124: "timeout", 125: "tool-error", 126: "execution-budget"}[code]
     except Exception as exc:
-        print(f"SQLreduce adapter failed: {exc}", file=sys.stderr)
-        return 1
+        reason = str(exc)
+    args.metrics.write_text(json.dumps({
+        "status": status, "reason": reason, "upstream_pin": PIN,
+        "upstream_source_sha256": hashlib.sha256(Path(sqlreduce.__file__).read_bytes()).hexdigest(),
+        "pglast_version": pglast.__version__, "candidate_checks": checks,
+        "elapsed_sec": time.monotonic() - started,
+        "execution_adapter": "shared external predicate; no upstream database/reconnect loop",
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    if reason:
+        print(reason, file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

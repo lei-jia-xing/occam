@@ -96,7 +96,7 @@ def main() -> int:
         append_record(args.calls, {
             "digest": digest, "cache_hit": False, "status": "execution-limit", "duration_sec": 0,
         })
-        return 1
+        return 126
 
     audit_offset = 0
     if args.oracle_audit is not None:
@@ -114,6 +114,10 @@ def main() -> int:
     else:
         command = ["bash", "-c", args.oracle + ' "$1"', "oracle",
                    str(args.candidate.resolve())]
+        def interrupt(_signal, _frame):
+            raise InterruptedError("predicate checker interrupted")
+
+        signal.signal(signal.SIGTERM, interrupt)
         started = time.monotonic()
         try:
             process = subprocess.Popen(
@@ -125,9 +129,12 @@ def main() -> int:
                     status = "tool-error"
                 else:
                     status = "accepted" if process.returncode == 0 else "rejected"
-            except subprocess.TimeoutExpired as exc:
-                stdout = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                stderr = (exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            except (subprocess.TimeoutExpired, InterruptedError) as exc:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                stdout = (getattr(exc, "stdout", None) or b"")
+                stderr = (getattr(exc, "stderr", None) or b"")
+                stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
+                stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
                 kill_group(process)
                 status = "timeout"
         except OSError as exc:
@@ -150,6 +157,9 @@ def main() -> int:
                 elif wrapper_record.get("status") == "tool-error":
                     status = "tool-error"
 
+    if status == "accepted" and time.monotonic() >= args.deadline:
+        status = "timeout"
+
     if status in {"accepted", "rejected"} and not args.no_cache:
         cache[digest] = status
         args.cache.write_text(json.dumps(cache, sort_keys=True), encoding="utf-8")
@@ -166,7 +176,7 @@ def main() -> int:
         "stdout": stdout[-8192:],
         "stderr": stderr[-8192:],
     })
-    return 0 if status == "accepted" else 1
+    return {"accepted": 0, "rejected": 1, "timeout": 124, "tool-error": 125}[status]
 
 
 if __name__ == "__main__":

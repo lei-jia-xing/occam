@@ -159,8 +159,8 @@ render_batch_summary() {
 
 render_table() {
     {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "SCENARIO" "EVIDENCE" "ORACLE_KIND" "TOOL" "STATUS" "SCALE" "INIT_S" "RED_S" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "SCENARIO" "EVIDENCE" "ORACLE_KIND" "DIALECT" "TRACK" "TOOL" "STATUS" "SCALE" "INIT_S" "RED_S" \
             "STMT_RED%" "INIT_B" "RED_B" "BYTE_RED%" "CALLS" "RESET_CALLS" "RESET(s)" \
             "RESET_SCOPE" "ORACLE_TO" "TIME(s)" "PREDICATE"
         printf "%s" "$RAW_DATA" | jq -r '
@@ -168,6 +168,8 @@ render_table() {
                 (.scenario // "N/A"),
                 (.evidence_class // "unknown"),
                 (.oracle_kind // "unknown"),
+                (.dialect // "unknown"),
+                (.reduction_track // "unknown"),
                 (.tool // .algorithm // "Unknown"),
                 (.status // "unknown"),
                 (.scale // "N/A"),
@@ -194,8 +196,8 @@ render_table() {
 
 render_summary() {
     {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "EVIDENCE" "ORACLE_KIND" "TOOL" "CASES" "INPUTS" "PAIRED_INPUTS" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "EVIDENCE" "ORACLE_KIND" "DIALECT" "TRACK" "TOOL" "CASES" "INPUTS" "PAIRED_INPUTS" \
             "UNKNOWN_SIZES" "INIT_STMTS" "RED_STMTS" "MEDIAN_STMT_RED%" \
             "CALLS(KNOWN/UNKNOWN)" "ORACLE_TO(KNOWN/UNKNOWN)" "RESET_CALLS(KNOWN/UNKNOWN)" \
             "RESET(s)SUM/UNKNOWN_RECORDS" "RESET_SCOPE" "TIMEOUT_CASES" "STATUS_DISTRIBUTION" \
@@ -203,11 +205,13 @@ render_summary() {
         printf "%s" "$RAW_DATA" | jq -s -r '
             . as $all
             | group_by([(.evidence_class // "unknown"), (.oracle_kind // "unknown"),
-                        (.tool // .algorithm // "unknown")])
+                        (.dialect // "unknown"), (.reduction_track // "unknown"), (.tool // .algorithm // "unknown")])
             | map(
                 . as $rows
                 | ($rows[0].evidence_class // "unknown") as $evidence
                 | ($rows[0].oracle_kind // "unknown") as $kind
+                | ($rows[0].dialect // "unknown") as $dialect
+                | ($rows[0].reduction_track // "unknown") as $track
                 | ($rows[0].tool // $rows[0].algorithm // "unknown") as $tool
                 | ($rows | map(select(.initial_stmts != null) | .initial_stmts) | add // 0) as $init
                 | ($rows | map(select(.reduced_stmts != null) | .reduced_stmts) | add // 0) as $reduced
@@ -215,15 +219,19 @@ render_summary() {
                           | map(select(. != null)) | sort) as $pct
                 | ($all
                    | group_by([(.scenario // "unknown"), (.evidence_class // "unknown"),
-                               (.oracle_kind // "unknown")])
+                               (.oracle_kind // "unknown"), (.dialect // "unknown"), (.reduction_track // "unknown")])
                    | map(select((map(.tool // .algorithm // "unknown") | unique | length) > 1)
                          | select(any(.[]; (.evidence_class // "unknown") == $evidence
                                             and (.oracle_kind // "unknown") == $kind
+                                            and (.dialect // "unknown") == $dialect
+                                            and (.reduction_track // "unknown") == $track
                                             and (.tool // .algorithm // "unknown") == $tool)))
                    | length) as $paired
                 | {
                     evidence: $evidence,
                     oracle_kind: $kind,
+                    dialect: $dialect,
+                    track: $track,
                     tool: $tool,
                     cases: ($rows | length),
                     inputs: ($rows | map(.scenario // "unknown") | unique | length),
@@ -261,10 +269,10 @@ render_summary() {
                     valid_false: ($rows | map(select(.predicate_passed == false)) | length),
                     valid_unknown: ($rows | map(select(.predicate_passed == null)) | length)
                   })
-            | sort_by([.evidence, .oracle_kind, .tool])
+            | sort_by([.evidence, .oracle_kind, .dialect, .track, .tool])
             | .[]
             | [
-                .evidence, .oracle_kind, .tool, (.cases | tostring), (.inputs | tostring),
+                .evidence, .oracle_kind, .dialect, .track, .tool, (.cases | tostring), (.inputs | tostring),
                 (.paired_inputs | tostring), (.missing_sizes | tostring),
                 (if .missing_sizes > 0 then "N/A" else (.initial_stmts | tostring) end),
                 (if .missing_sizes > 0 then "N/A" else (.reduced_stmts | tostring) end),
@@ -282,17 +290,20 @@ render_summary() {
         '
     } | column -t -s $'\t'
 
-    printf "\nPaired input coverage (within evidence class and oracle kind):\n"
+    printf "\nPaired input coverage (within evidence, predicate kind, dialect and reduction track):\n"
     {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "SCENARIO" "EVIDENCE" "ORACLE_KIND" "TOOLS" "CASES" "VALIDATED_TOOLS" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "SCENARIO" "EVIDENCE" "ORACLE_KIND" "DIALECT" "TRACK" "TOOLS" "CASES" "VALIDATED_TOOLS" \
             "ORACLE_TIMEOUT_TOOLS" "TIMEOUT_STATUS_TOOLS"
         printf "%s" "$RAW_DATA" | jq -s -r '
-            group_by([(.scenario // "unknown"), (.evidence_class // "unknown"), (.oracle_kind // "unknown")])
+            group_by([(.scenario // "unknown"), (.evidence_class // "unknown"), (.oracle_kind // "unknown"),
+                      (.dialect // "unknown"), (.reduction_track // "unknown")])
             | map({
                 input: (.[0].scenario // "unknown"),
                 evidence: (.[0].evidence_class // "unknown"),
                 oracle_kind: (.[0].oracle_kind // "unknown"),
+                dialect: (.[0].dialect // "unknown"),
+                track: (.[0].reduction_track // "unknown"),
                 tools: (map(.tool // .algorithm // "unknown") | unique | join(",")),
                 cases: length,
                 validated: (map(select(.predicate_passed == true) | (.tool // .algorithm // "unknown")) | unique | join(",")),
@@ -300,7 +311,7 @@ render_summary() {
                 timeouts: (map(select(.status == "timeout") | (.tool // .algorithm // "unknown")) | unique | join(","))
               })
             | .[]
-            | [.input, .evidence, .oracle_kind, .tools, (.cases | tostring),
+            | [.input, .evidence, .oracle_kind, .dialect, .track, .tools, (.cases | tostring),
                (if .validated == "" then "none" else .validated end),
                (if .oracle_timeouts == "" then "none" else .oracle_timeouts end),
                (if .timeouts == "" then "none" else .timeouts end)] | @tsv
@@ -314,14 +325,16 @@ render_md() {
 
 ## Detailed Comparative Results
 
-| Scenario | Evidence | Oracle Kind | Tool | Status | Scale | Initial Stmts | Reduced Stmts | Stmt Red % | Initial Bytes | Reduced Bytes | Byte Red % | Oracle Calls | Reset Calls | Reset (s) | Reset Scope | Oracle Timeouts | Time (s) | Predicate |
-| :--- | :--- | :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | :---: |
+| Scenario | Evidence | Oracle Kind | Dialect | Track | Tool | Status | Scale | Initial Stmts | Reduced Stmts | Stmt Red % | Initial Bytes | Reduced Bytes | Byte Red % | Oracle Calls | Reset Calls | Reset (s) | Reset Scope | Oracle Timeouts | Time (s) | Predicate |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | :---: |
 EOF
     printf "%s" "$RAW_DATA" | jq -r '
         [
             (.scenario // "N/A"),
             (.evidence_class // "unknown"),
             (.oracle_kind // "unknown"),
+            (.dialect // "unknown"),
+            (.reduction_track // "unknown"),
             (.tool // .algorithm // "Unknown"),
             (.status // "unknown"),
             (.scale // "N/A"),
@@ -348,17 +361,19 @@ EOF
 
 ## Per-Tool Summary
 
-| Evidence | Oracle Kind | Tool | Cases | Inputs | Paired Inputs | Unknown Sizes | Initial Stmts | Reduced Stmts | Median Stmt Red % | Calls Known/Unknown | Oracle Timeouts Known/Unknown | Reset Calls Known/Unknown | Reset (s) Sum/Unknown Records | Reset Scope | Timeout Cases | Status Distribution | Sum Case Wall (s)/Unknown | Predicate (T/F/U) |
-| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- | ---: | :--- | :---: | :---: |
+| Evidence | Oracle Kind | Dialect | Track | Tool | Cases | Inputs | Paired Inputs | Unknown Sizes | Initial Stmts | Reduced Stmts | Median Stmt Red % | Calls Known/Unknown | Oracle Timeouts Known/Unknown | Reset Calls Known/Unknown | Reset (s) Sum/Unknown Records | Reset Scope | Timeout Cases | Status Distribution | Sum Case Wall (s)/Unknown | Predicate (T/F/U) |
+| :--- | :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- | ---: | :--- | :---: | :---: |
 EOF
     printf "%s" "$RAW_DATA" | jq -s -r '
         . as $all
         | group_by([(.evidence_class // "unknown"), (.oracle_kind // "unknown"),
-                    (.tool // .algorithm // "unknown")])
+                    (.dialect // "unknown"), (.reduction_track // "unknown"), (.tool // .algorithm // "unknown")])
         | map(
             . as $rows
             | ($rows[0].evidence_class // "unknown") as $evidence
             | ($rows[0].oracle_kind // "unknown") as $kind
+            | ($rows[0].dialect // "unknown") as $dialect
+            | ($rows[0].reduction_track // "unknown") as $track
             | ($rows[0].tool // $rows[0].algorithm // "unknown") as $tool
             | ($rows | map(select(.initial_stmts != null) | .initial_stmts) | add // 0) as $init
             | ($rows | map(select(.reduced_stmts != null) | .reduced_stmts) | add // 0) as $reduced
@@ -366,15 +381,19 @@ EOF
                       | map(select(. != null)) | sort) as $pct
             | ($all
                | group_by([(.scenario // "unknown"), (.evidence_class // "unknown"),
-                           (.oracle_kind // "unknown")])
+                           (.oracle_kind // "unknown"), (.dialect // "unknown"), (.reduction_track // "unknown")])
                | map(select((map(.tool // .algorithm // "unknown") | unique | length) > 1)
                      | select(any(.[]; (.evidence_class // "unknown") == $evidence
                                         and (.oracle_kind // "unknown") == $kind
+                                        and (.dialect // "unknown") == $dialect
+                                        and (.reduction_track // "unknown") == $track
                                         and (.tool // .algorithm // "unknown") == $tool)))
                | length) as $paired
             | {
                 evidence: $evidence,
                 oracle_kind: $kind,
+                dialect: $dialect,
+                track: $track,
                 tool: $tool,
                 cases: ($rows | length),
                 inputs: ($rows | map(.scenario // "unknown") | unique | length),
@@ -412,10 +431,10 @@ EOF
                 valid_false: ($rows | map(select(.predicate_passed == false)) | length),
                 valid_unknown: ($rows | map(select(.predicate_passed == null)) | length)
               })
-        | sort_by([.evidence, .oracle_kind, .tool])
+        | sort_by([.evidence, .oracle_kind, .dialect, .track, .tool])
         | .[]
         | [
-            .evidence, .oracle_kind, .tool, (.cases | tostring), (.inputs | tostring), (.paired_inputs | tostring),
+            .evidence, .oracle_kind, .dialect, .track, .tool, (.cases | tostring), (.inputs | tostring), (.paired_inputs | tostring),
             (.missing_sizes | tostring),
             (if .missing_sizes > 0 then "N/A" else (.initial_stmts | tostring) end),
             (if .missing_sizes > 0 then "N/A" else (.reduced_stmts | tostring) end),
@@ -436,15 +455,18 @@ EOF
 
 ## Paired Input Coverage and Timeouts
 
-| Scenario | Evidence | Oracle Kind | Tools | Cases | Validated Tools | Oracle Timeout Tools | Timeout-Status Tools |
-| :--- | :--- | :--- | :--- | ---: | :--- | :--- | :--- |
+| Scenario | Evidence | Oracle Kind | Dialect | Track | Tools | Cases | Validated Tools | Oracle Timeout Tools | Timeout-Status Tools |
+| :--- | :--- | :--- | :--- | :--- | :--- | ---: | :--- | :--- | :--- |
 EOF
     printf "%s" "$RAW_DATA" | jq -s -r '
-        group_by([(.scenario // "unknown"), (.evidence_class // "unknown"), (.oracle_kind // "unknown")])
+        group_by([(.scenario // "unknown"), (.evidence_class // "unknown"), (.oracle_kind // "unknown"),
+                  (.dialect // "unknown"), (.reduction_track // "unknown")])
         | map({
             input: (.[0].scenario // "unknown"),
             evidence: (.[0].evidence_class // "unknown"),
             oracle_kind: (.[0].oracle_kind // "unknown"),
+            dialect: (.[0].dialect // "unknown"),
+            track: (.[0].reduction_track // "unknown"),
             tools: (map(.tool // .algorithm // "unknown") | unique | join(",")),
             cases: length,
             validated: (map(select(.predicate_passed == true) | (.tool // .algorithm // "unknown")) | unique | join(",")),
@@ -452,7 +474,7 @@ EOF
             timeouts: (map(select(.status == "timeout") | (.tool // .algorithm // "unknown")) | unique | join(","))
           })
         | .[]
-        | [.input, .evidence, .oracle_kind, .tools, (.cases | tostring),
+        | [.input, .evidence, .oracle_kind, .dialect, .track, .tools, (.cases | tostring),
            (if .validated == "" then "none" else .validated end),
            (if .oracle_timeouts == "" then "none" else .oracle_timeouts end),
            (if .timeouts == "" then "none" else .timeouts end)]
@@ -479,12 +501,14 @@ case "$MODE" in
     csv)
         {
             printf "%s\n" \
-                "scenario,evidence_class,oracle_kind,tool,status,scale,initial_stmts,reduced_stmts,stmt_red_pct,initial_bytes,reduced_bytes,byte_red_pct,oracle_calls,reset_calls,reset_time_sec,reset_calls_scope,oracle_timeouts,wall_time_sec,predicate_passed"
+                "scenario,evidence_class,oracle_kind,dialect,reduction_track,tool,status,scale,initial_stmts,reduced_stmts,stmt_red_pct,initial_bytes,reduced_bytes,byte_red_pct,oracle_calls,reset_calls,reset_time_sec,reset_calls_scope,oracle_timeouts,wall_time_sec,predicate_passed"
             printf "%s" "$RAW_DATA" | jq -r '
                 [
                     (.scenario // ""),
                     (.evidence_class // ""),
                     (.oracle_kind // ""),
+                    (.dialect // ""),
+                    (.reduction_track // ""),
                     (.tool // .algorithm // ""),
                     (.status // ""),
                     (.scale // ""),
@@ -500,7 +524,7 @@ case "$MODE" in
                     (.reset_calls_scope // ""),
                     (.oracle_timeouts // ""),
                     (.wall_time_sec // .time_seconds // ""),
-                    (.predicate_passed // "")
+                    (if .predicate_passed == null then "" else .predicate_passed end)
                 ] | @csv
             '
         }

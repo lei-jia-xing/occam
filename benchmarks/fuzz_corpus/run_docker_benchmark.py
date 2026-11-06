@@ -29,8 +29,10 @@ ANTLR_GRAMMARS_PIN = "9fa9f94b20cd3225bd84f27554515da207ec39ff"
 
 def find_binary(root: Path, name: str) -> Path | None:
     try:
+        build_env = os.environ.copy()
+        build_env.pop("GHCRTS", None)
         result = subprocess.run(["cabal", "list-bin", name], check=False, cwd=root,
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, env=build_env)
         if result.returncode == 0 and result.stdout.strip():
             path = Path(result.stdout.strip())
             if path.is_file() and os.access(path, os.X_OK):
@@ -231,13 +233,13 @@ def base_record(entry: dict[str, Any], tool: str, oracle_timeout: float, budget:
         "budget_sec": budget,
         "max_oracle_executions": max_oracle_executions,
         "oracle_calls": None,
-        "oracle_calls_scope": "uncached reducer callbacks only; initial checks and validation calls excluded",
+        "oracle_calls_scope": "uncached reducer-side callbacks; runner initial/final checks excluded",
         "candidate_checks": None,
         "oracle_cache_hits": None,
         "validation_calls": 0,
         "validation_time_sec": 0.0,
         "reset_calls": None,
-        "reset_calls_scope": "uncached reducer callbacks only; initial checks and validation calls excluded",
+        "reset_calls_scope": "uncached reducer-side callbacks; runner initial/final checks excluded",
         "reset_time_sec": None,
         "reset_accounting": "not measured; predicate-internal reset unknown",
         "reduction_time_sec": None,
@@ -245,7 +247,7 @@ def base_record(entry: dict[str, Any], tool: str, oracle_timeout: float, budget:
         "predicate_passed": None,
         "tool_candidate_valid": None,
         "checkpoint_used": None,
-        "reduction_track": "whole_script",
+        "reduction_track": entry.get("reduction_track", "whole_script"),
     }
 
 
@@ -423,17 +425,8 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     if not source_file.is_file():
         return unsupported(record, f"input SQL does not exist: {source_file}")
     original = source_file.read_bytes()
-    input_file = source_file
     dialect = str(entry.get("dialect", ""))
     synthetic = record["evidence_class"] == "synthetic"
-    sqlreduce_track = entry.get("sqlreduce_track") == "fixed_setup_query"
-    if sqlreduce_track:
-        query_file = case_file(root, {"file": entry.get("query_file", "")}, manifest_dir)
-        if not query_file.is_file():
-            return unsupported(record, "SQLreduce fixed-setup track requires a readable query_file")
-        input_file = query_file
-        original = query_file.read_bytes()
-        record["reduction_track"] = "fixed_setup_query"
     set_size_metrics(record, original, original, dialect)
 
     if tool in {"occam", "ddmin", "creduce"} and binaries.get(tool) is None:
@@ -441,13 +434,6 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     if tool == "sqlreduce":
         if dialect.lower() not in {"postgres", "postgresql", "pg"}:
             return unsupported(record, "SQLreduce supports PostgreSQL only")
-        if not sqlreduce_track:
-            return unsupported(record, "pinned SQLreduce supports only a fixed_setup_query with one parsed PostgreSQL query")
-    elif sqlreduce_track:
-        input_file = source_file
-        original = source_file.read_bytes()
-        record["reduction_track"] = "whole_script"
-        set_size_metrics(record, original, original, dialect)
 
     dialect_key = {"postgresql": "postgres", "pg": "postgres", "sqlite3": "sqlite"}.get(
         dialect.lower(), dialect.lower())
@@ -585,7 +571,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         except OSError:
             pass
         command = [
-            str(binaries[tool]), str(input_file), "--oracle", reducer_oracle, "--out", str(tool_dir),
+            str(binaries[tool]), str(source_file), "--oracle", reducer_oracle, "--out", str(tool_dir),
             "--timeout", str(oracle_timeout), "--budget", str(remaining),
         ]
         command += ["--dialect", dialect_key if dialect_key in {"postgres", "mysql", "sqlite"} else "generic"]
@@ -657,10 +643,9 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             internal_reducer_count = reducer_calls
         candidate_path = checkpoint
         metrics = None
-    elif tool == "sqlancer":
-        adapter = root / "benchmarks" / "upstream" / "sqlancer_adapter.sh"
+    elif tool in {"sqlancer", "sqlreduce"}:
+        candidate.unlink()
         helper = root / "benchmarks" / "upstream" / "oracle_test.py"
-        reducer_calls_file = tool_dir / "reducer-calls.jsonl"
         helper_args = [
             sys.executable, str(helper), "--checkpoint", str(checkpoint), "--calls", str(calls_file),
             "--cache", str(cache_file), "--timeout", str(oracle_timeout), "--deadline", str(deadline),
@@ -668,55 +653,49 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         ]
         if max_oracle_executions is not None:
             helper_args += ["--max-executions", str(max_oracle_executions)]
-        command = [
-            str(adapter), "--input", str(source_file.resolve()), "--output", str(candidate.resolve()),
-            "--calls", str(reducer_calls_file), "--metrics", str(metrics_file),
-            "--timeout-ms", str(max(1, int(oracle_timeout * 1000))),
-            "--budget-ms", str(max(1, int(remaining * 1000))),
-        ]
-        command += ["--", *helper_args]
-        outcome = command_result(command, tool_dir, deadline)
+        if tool == "sqlancer":
+            adapter = root / "benchmarks" / "upstream" / "sqlancer_adapter.sh"
+            command = [
+                str(adapter), "--input", str(source_file.resolve()), "--output", str(candidate.resolve()),
+                "--calls", str(tool_dir / "reducer-calls.jsonl"), "--metrics", str(metrics_file),
+                "--timeout-ms", str(max(1, int(oracle_timeout * 1000))),
+                "--budget-ms", str(max(1, int(remaining * 1000))),
+            ]
+        else:
+            source = Path(os.environ.get("SQLREDUCE_SOURCE", f"{Path.home()}/.cache/occam/sqlreduce-{SQLREDUCE_PIN}"))
+            command = [
+                sys.executable, str(root / "benchmarks" / "upstream" / "sqlreduce_adapter.py"),
+                "--source", str(source.resolve()), "--input", str(source_file.resolve()),
+                "--output", str(candidate.resolve()), "--metrics", str(metrics_file),
+                "--timeout", str(oracle_timeout), "--deadline", str(deadline),
+            ]
+        outcome = command_result([*command, "--", *helper_args], tool_dir, deadline)
+        if outcome["status"] != "timeout":
+            outcome["status"] = {
+                0: "completed", 77: "invalid-result", 78: "unsupported", 124: "timeout",
+                125: "tool-error", 126: "execution-budget",
+            }.get(outcome["returncode"], "tool-error")
         reduction_elapsed = outcome["elapsed"]
         call_records = read_jsonl(calls_file)
         reducer_calls = sum(1 for row in call_records if not row.get("cache_hit") and row.get("status") in
                             {"accepted", "rejected", "timeout", "tool-error"})
         candidate_checks = len(call_records)
         cache_hits = sum(1 for row in call_records if row.get("cache_hit"))
-        if outcome["status"] != "timeout" and reducer_calls is not None:
+        if outcome["status"] != "timeout":
             internal_expected_rows = reducer_calls
             internal_reducer_start = 0
             internal_reducer_count = reducer_calls
         metrics = read_json(metrics_file)
-        if isinstance(metrics, dict):
+        launched = metrics.get("reducer_callbacks") if isinstance(metrics, dict) and tool == "sqlancer" else None
+        if outcome["returncode"] is None or isinstance(launched, int) and launched > len(call_records):
+            record["observed_uncached_callbacks"] = reducer_calls
+            record["observed_callback_records"] = len(call_records)
+            reducer_calls = candidate_checks = cache_hits = None
+            internal_expected_rows = internal_reducer_start = internal_reducer_count = None
+        if isinstance(metrics, dict) and tool == "sqlancer":
             record["sqlancer_ast_unsupported_statements"] = metrics.get("ast_unsupported_statements")
             record["sqlancer_ast_statement_count"] = metrics.get("statement_count")
-        candidate_path = checkpoint
-    else:
-        source = Path(os.environ.get("SQLREDUCE_SOURCE", f"{Path.home()}/.cache/occam/sqlreduce-{SQLREDUCE_PIN}"))
-        setup_file = case_file(root, {"file": entry["setup_file"]}, manifest_dir)
-        query_file = case_file(root, {"file": entry["query_file"]}, manifest_dir)
-        reset = entry.get("reset_command", os.environ.get("SQLREDUCE_RESET_COMMAND", ""))
-        if isinstance(reset, list):
-            reset = shlex.join([str(part) for part in reset])
-        command = [
-            sys.executable, str(root / "benchmarks" / "upstream" / "sqlreduce_adapter.py"),
-            "--source", str(source), "--setup", str(setup_file), "--query", str(query_file),
-            "--output", str(candidate), "--metrics", str(metrics_file),
-            "--timeout", str(oracle_timeout), "--reset-command", str(reset),
-            "--expected-sqlstate", str(entry.get("expected_sqlstate", "")),
-        ]
-        outcome = command_result(command, root, deadline)
-        if outcome["returncode"] == 78:
-            outcome["status"] = "unsupported"
-        elif outcome["returncode"] == 124:
-            outcome["status"] = "timeout"
-        reduction_elapsed = outcome["elapsed"]
-        metrics = read_json(metrics_file)
-        if isinstance(metrics, dict):
-            reducer_calls = metrics.get("oracle_calls")
-            candidate_checks = metrics.get("candidate_checks")
-            cache_hits = metrics.get("cache_hits")
-        candidate_path = checkpoint
+        candidate_path = candidate
 
     if native_metrics_path is not None:
         try:
@@ -752,25 +731,25 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
                         if native_status == "execution-budget"
                         else native_status
                     )
-    if tool == "sqlreduce" and isinstance(metrics, dict):
-        record["reset_time_sec"] = metrics.get("reset_time_sec")
-        record["reset_calls"] = metrics.get("reset_calls")
-        record["reset_accounting"] = "reset command measured by SQLreduce adapter"
-        record["reduction_track"] = metrics.get("reduction_track", "fixed_setup_query")
 
     if (
-        tool in {"occam", "ddmin"}
+        tool in {"occam", "ddmin", "sqlancer", "sqlreduce"}
         and outcome["status"] == "completed"
         and outcome["returncode"] == 0
         and not candidate_path.is_file()
     ):
         outcome["status"] = "tool-error"
-        outcome["status_reason"] = "native reducer exited successfully without minimal.sql"
+        outcome["status_reason"] = "reducer exited successfully without its required SQL output"
 
     if tool in {"occam", "ddmin"} and candidate_path and candidate_path.is_file():
         shutil.copyfile(candidate_path, checkpoint)
-    if tool == "sqlreduce" and candidate.is_file() and not checkpoint.is_file():
-        shutil.copyfile(candidate, checkpoint)
+
+    call_records = read_jsonl(calls_file)
+    if outcome["status"] == "completed":
+        if any(row.get("status") == "execution-limit" for row in call_records):
+            outcome.update({"status": "execution-budget", "status_reason": "max oracle executions reached"})
+        elif any(row.get("status") == "tool-error" for row in call_records):
+            outcome.update({"status": "tool-error", "status_reason": "predicate infrastructure failure"})
 
     tool_status = outcome["status"]
     if tool_status == "completed" and outcome["returncode"] == 0:
@@ -826,16 +805,15 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     record["validation_time_sec"] = round(validation_time, 4)
     record["reduction_time_sec"] = round(reduction_elapsed, 4)
     record["wall_time_sec"] = round(time.monotonic() - started, 4)
-    record["oracle_calls_scope"] = "uncached reducer callbacks only; initial checks and validation calls excluded"
-    if tool != "sqlreduce":
-        set_reducer_reset_metrics(
-            record,
-            audit_file,
-            reset_configured,
-            internal_expected_rows,
-            internal_reducer_start,
-            internal_reducer_count,
-        )
+    record["oracle_calls_scope"] = "uncached reducer-side callbacks; runner initial/final checks excluded"
+    set_reducer_reset_metrics(
+        record,
+        audit_file,
+        reset_configured,
+        internal_expected_rows,
+        internal_reducer_start,
+        internal_reducer_count,
+    )
     call_records = read_jsonl(calls_file)
     audit_records = read_jsonl(audit_file)
     if tool in {"occam", "ddmin"}:
