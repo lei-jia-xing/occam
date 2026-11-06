@@ -152,6 +152,8 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - Use binary search only when prefix monotonicity is established.
 - Measure parsing, graph construction, closure, reset, and oracle costs before adding incremental updates.
 - Open profiling observation: under `--budget 180`, compact-01/Occam returned `timeout` after 493 reducer callbacks, retaining a 7 -> 6 statement / 1233 -> 1109 B last-valid checkpoint. Its runner-level `predicate_passed` remains null although native stats record two accepted final checks of that checkpoint. Do not call the run completed or a performance regression; profile before attributing a cause.
+- Measured 67-statement SQLite run: prefix search made 67 tests and backward slicing consumed 17.481 s; dependency analysis consumed 0.061 s. An oracle-validated last-statement slice now precedes the unchanged linear fallback; no binary-search or monotonicity assumption was added.
+- Same 30 s budget after the change: slicing 0.208 s, retained checkpoint 545 -> 541 B, both runs still timeout and retain unknown runner-level predicate status; native final checks pass twice. Forced phase profiling at 4099 statements measured parse/units/actions/graph/closure at 0.061/0.400/4.495/0.061/0.000270 s; this does not justify an incremental graph framework.
 ** TODO [#B] Evaluate weighted and feedback-guided search
 - Compare statement-count partitions with byte/token weights and actual closure gains.
 - Deduplicate candidates and cache closures; account for overlapping dependencies.

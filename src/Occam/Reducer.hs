@@ -543,47 +543,60 @@ sliceSQL logger dialect oracle parser sql = do
         Nothing -> pure sql
         Just ([], _) -> pure sql
         Just (statements, graph) -> do
-            (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
-            case maybeTarget of
-                Nothing -> do
+            let sliceFor target =
+                    let slice = backwardSlice (stmtId target) graph
+                        retained = filter (\s -> Set.member (stmtId s) slice) statements
+                     in (retained, statementSQL sql statements retained)
+                acceptSlice strategy target retained candidate = do
+                    let StatementId targetId = stmtId target
                     logInfo'
                         logger
                         "occam::reducer"
-                        "No predicate-preserving statement prefix found"
-                        [("prefix_tests", toJSON prefixTests)]
-                    pure sql
-                Just (targetStatement, prefixSQL, prefixLength) -> do
-                    let slice = backwardSlice (stmtId targetStatement) graph
-                        retained = filter (\s -> Set.member (stmtId s) slice) statements
-                        candidate = statementSQL sql statements retained
-                    if BS.length candidate >= BS.length sql
-                        then pure sql
-                        else do
-                            let reusedPrefixResult = candidate == prefixSQL
-                            ok <- if reusedPrefixResult then pure True else oracle candidate
+                        "Backward slicing accepted"
+                        [ ("seed_strategy", toJSON (strategy :: String))
+                        , ("target_statement_id", toJSON targetId)
+                        , ("statements_before", toJSON (length statements))
+                        , ("statements_after", toJSON (length retained))
+                        , ("bytes_before", toJSON (BS.length sql))
+                        , ("bytes_after", toJSON (BS.length candidate))
+                        ]
+                    pure candidate
+                lastStatement = last statements
+                (lastRetained, lastCandidate) = sliceFor lastStatement
+            lastAccepted <-
+                if BS.length lastCandidate < BS.length sql
+                    then oracle lastCandidate
+                    else pure False
+            if lastAccepted
+                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate
+                else do
+                    (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
+                    case maybeTarget of
+                        Nothing -> do
                             logInfo'
                                 logger
                                 "occam::reducer"
-                                "Prefix oracle result considered for backward slice"
-                                [ ("prefix_tests", toJSON prefixTests)
-                                , ("prefix_length", toJSON prefixLength)
-                                , ("prefix_result_reused", toJSON reusedPrefixResult)
-                                ]
-                            if ok
-                                then do
-                                    let StatementId targetId = stmtId targetStatement
+                                "No predicate-preserving statement prefix found"
+                                [("prefix_tests", toJSON prefixTests)]
+                            pure sql
+                        Just (targetStatement, prefixSQL, prefixLength) -> do
+                            let (retained, candidate) = sliceFor targetStatement
+                            if BS.length candidate >= BS.length sql
+                                then pure sql
+                                else do
+                                    let reusedPrefixResult = candidate == prefixSQL
+                                    ok <- if reusedPrefixResult then pure True else oracle candidate
                                     logInfo'
                                         logger
                                         "occam::reducer"
-                                        "Backward slicing accepted"
-                                        [ ("target_statement_id", toJSON targetId)
-                                        , ("statements_before", toJSON (length statements))
-                                        , ("statements_after", toJSON (length retained))
-                                        , ("bytes_before", toJSON (BS.length sql))
-                                        , ("bytes_after", toJSON (BS.length candidate))
+                                        "Prefix oracle result considered for backward slice"
+                                        [ ("prefix_tests", toJSON prefixTests)
+                                        , ("prefix_length", toJSON prefixLength)
+                                        , ("prefix_result_reused", toJSON reusedPrefixResult)
                                         ]
-                                    pure candidate
-                                else pure sql
+                                    if ok
+                                        then acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                        else pure sql
 
 closureSearchSQL ::
     Logger -> SQLDialect -> SearchStrategy -> Oracle -> Parser -> ByteString -> IO ByteString

@@ -28,7 +28,7 @@ Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`,
 
 - Tree-sitter C grammar bindings via FFI retain exact byte spans for source-preserving edits; statement extraction uses a shared SQL lexer and attaches CST nodes only on exact span matches.
 - Haskell dependency analysis tracks recognized schema generations, table-owned columns/indexes, lexical CTE scopes, and transaction/savepoint catalog snapshots. Unknown scope/effects remain conservative.
-- Graph-guided search is followed by unrestricted deletion and a fixed-point statement audit; byte-preserving passes reduce projections, VALUES rows, CTEs, joins, clauses, types, literals, and literal scalar subqueries. These are local guarantees, not a global minimum.
+- Graph-guided search first tests the last statement's backward slice; rejection falls back to linear prefix search without assuming a monotone predicate. Unrestricted deletion and a fixed-point statement audit follow; byte-preserving passes reduce projections, VALUES rows, CTEs, joins, clauses, types, literals, and literal scalar subqueries. These are local guarantees, not a global minimum.
 - External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 
 The bundled Tree-sitter grammar does not cover every valid dialect construct: for example, SQLite accepts `SELECT 42 LIMIT 1 OFFSET 0`, but this grammar produces an `ERROR`. Unknown statements retain conservative dependencies; the predicate still decides every candidate. Parser alternatives remain an open question in `TODO.org`, not a new dependency.

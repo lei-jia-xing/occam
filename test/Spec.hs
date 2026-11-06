@@ -18,6 +18,7 @@ import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency
+import Occam.Logger (nullLogger)
 import Occam.Reducer
 import Occam.Slicer
 import Occam.TreeSitter
@@ -437,6 +438,28 @@ phase6Tests =
             stats3 <- getStats
             assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
             assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
+        , testCase "Late-query slicing completes within a bounded oracle allowance" $ do
+            let required =
+                    [ "CREATE TABLE needed (v INT);"
+                    , "INSERT INTO needed VALUES (42);"
+                    , "SELECT v FROM needed;"
+                    ]
+                noise = [BSC.pack ("CREATE TABLE unused_" ++ show n ++ " (v INT);") | n <- [1 .. 64 :: Int]]
+                sql = BSC.unlines (take 2 required ++ noise ++ drop 2 required)
+            calls <- newIORef (0 :: Int)
+            let check candidate = do
+                    modifyIORef' calls (+ 1)
+                    count <- readIORef calls
+                    when (count > 32) (assertFailure "Oracle execution allowance exhausted before reduction")
+                    pure (all (`BSC.isInfixOf` candidate) required)
+            (oracle, _) <- memoizeOracle check
+            reduced <-
+                reduceSQLWithConfig
+                    defaultReductionConfig {reductionIntraStatement = False, reductionUnrestricted = False}
+                    nullLogger
+                    oracle
+                    sql
+            assertEqual "Unrelated setup is removed without walking every prefix" (BSC.unlines required) reduced
         ]
 
 -- ----------------------------------------------------------------------------
