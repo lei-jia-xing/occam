@@ -293,10 +293,10 @@ runOccam opts@Options {..} = do
 
 runOccamWithLogger :: Logger -> Options -> IO ()
 runOccamWithLogger logger Options {..} = do
-    let finitePositive value = value > 0 && not (isNaN value || isInfinite value)
+    let finitePositive seconds = seconds > 0 && not (isNaN seconds || isInfinite seconds)
         maxSeconds = fromIntegral (maxBound :: Int) / 1000000
-        finiteTimeout value =
-            finitePositive value && value <= maxSeconds && value * 1000000 >= 1
+        finiteTimeout seconds =
+            finitePositive seconds && seconds <= maxSeconds && seconds * 1000000 >= 1
         validBudget =
             finiteTimeout optTimeoutSecs
                 && maybe True finiteTimeout optBudgetSecs

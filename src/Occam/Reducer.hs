@@ -118,8 +118,8 @@ isValidClosure DependencyGraph {..} kept =
 
 -- | Transitive backward closure of a set of statement IDs.
 closeSet :: DependencyGraph -> Set StatementId -> Set StatementId
-closeSet graph statementIds =
-    Set.unions [backwardSlice sid graph | sid <- Set.toList statementIds]
+closeSet graph roots =
+    Set.unions [backwardSlice sid graph | sid <- Set.toList roots]
 
 -- | Cut removed statement spans without unparsing or changing retained bytes.
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
@@ -396,6 +396,7 @@ cddSubsetSize roundNumber count
     | estimatedProbability >= 1 = 1
     | otherwise = bestSize [1 .. count] 1
     where
+        estimatedProbability :: Double
         estimatedProbability = 0.25 * (1.582 ** fromIntegral roundNumber)
         gain size = fromIntegral size * ((1 - estimatedProbability) ** fromIntegral size)
         bestSize [] currentBest = currentBest
@@ -455,7 +456,7 @@ statementAuditWithParser logger oracle parser initialSQL = do
 
         auditPass baseSQL allStatements candidates = go (statementSQL baseSQL allStatements allStatements) allStatements candidates 0 0
             where
-                go currentSQL current [] attempts removals = pure (currentSQL, attempts, removals)
+                go currentSQL _ [] attempts removals = pure (currentSQL, attempts, removals)
                 go currentSQL current (statement : rest) attempts removals
                     | Set.notMember (stmtId statement) (statementIds current) =
                         go currentSQL current rest attempts removals

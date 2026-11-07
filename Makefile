@@ -1,12 +1,15 @@
-.PHONY: all build test fmt fmt-check lint check hooks dev clean
+.PHONY: all build build-check test fmt fmt-check lint check hooks dev clean
 
 all: build
 
 build:
 	cabal build
 
+build-check:
+	cabal build all --enable-tests --ghc-options=-Werror
+
 test:
-	cabal test
+	cabal test all --ghc-options=-Werror
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
@@ -29,7 +32,7 @@ lint:
 		nix develop --command hlint src app test bench; \
 	fi
 
-check: fmt-check lint test
+check: fmt-check lint build-check test
 
 hooks:
 	git config core.hooksPath .githooks

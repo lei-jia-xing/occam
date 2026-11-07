@@ -10,7 +10,6 @@ import Control.Monad (when)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import GHC.Generics (Generic)
 import Occam.Reducer (Oracle)

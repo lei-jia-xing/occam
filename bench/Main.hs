@@ -302,7 +302,7 @@ runEvalWithLogger logger Options {..} = do
                 , oracleTimeoutMicros = round (optTimeoutSecs * 1000000)
                 , oracleResetCommand = optResetCmd
                 }
-        totalBudgetMicros = (round . (* 1000000)) <$> optBudgetSecs :: Maybe Integer
+        totalBudgetMicros = round . (* 1000000) <$> optBudgetSecs :: Maybe Integer
     preflightStart <- toInteger <$> getMonotonicTimeNSec
     prepared <-
         runWithinBudget

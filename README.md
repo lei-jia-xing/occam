@@ -40,6 +40,12 @@ cabal build
 cabal test
 ```
 
+`nix develop` provides the GHC, Tree-sitter, pkg-config, Fourmolu, and HLint development environment. Run `make hooks` once per checkout to enable the repository's pre-commit hook.
+
+`make check` checks formatting, runs HLint, builds all project components (including tests) with GHC warnings treated as errors, and runs both test suites. The pre-commit hook runs only `make fmt-check lint build-check`: it checks the working tree, including `bench/`, rather than a staged snapshot, and does not execute tests. Missing formatter/linter commands fall back to `nix develop`; unavailable tools or failed checks stop the hook instead of being skipped.
+
+The bounded generated properties check slicing and closure against independent `Data.Graph` reachability for every node and root subset on graphs of at most eight statements, and compare two-table SQLite generation/latest-write snapshots across drop/recreate, full rollback, savepoint rollback+release, and outer release. Catalog comparisons exclude transaction-control barrier IDs; they do not prove nested-savepoint, column/index/view, or general SQL semantics.
+
 See `benchmarks/README.md` for processing existing fuzz SQL and comparing reducers.
 
 ## License

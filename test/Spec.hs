@@ -7,7 +7,9 @@ import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.Graph qualified as Graph
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (subsequences)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -39,13 +41,14 @@ import System.Process (readProcessWithExitCode)
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
-    Positive (..),
     Property,
     chooseInt,
     counterexample,
     elements,
     oneof,
+    resize,
     sublistOf,
+    vectorOf,
  )
 import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.Tasty (TestTree, defaultMain, testGroup)
@@ -724,14 +727,48 @@ instance Arbitrary ArbitraryAction where
 toObjectAction :: ArbitraryAction -> ObjectAction
 toObjectAction (ArbitraryAction k t name) = ObjectAction k t name
 
+newtype SmallActionGraph = SmallActionGraph [[ArbitraryAction]]
+    deriving (Show)
+
+instance Arbitrary SmallActionGraph where
+    arbitrary = do
+        statementCount <- chooseInt (2, 8)
+        SmallActionGraph <$> vectorOf statementCount (resize 8 arbitrary)
+    shrink (SmallActionGraph statements) =
+        [SmallActionGraph smaller | smaller <- shrink statements, not (null smaller)]
+
+buildActionGraph :: [[ArbitraryAction]] -> DependencyGraph
+buildActionGraph rawActions =
+    buildGraph
+        [ (StatementId sid, map toObjectAction actions)
+        | (sid, actions) <- zip [1 ..] rawActions
+        ]
+
+-- Data.Graph independently computes reachability along each statement's predecessors.
+backwardReachabilityOracle ::
+    DependencyGraph ->
+    Map.Map StatementId (Set.Set StatementId)
+backwardReachabilityOracle dependencyGraph =
+    let nodes =
+            [ (sid, sid, Set.toList (Map.findWithDefault Set.empty sid (graphEdges dependencyGraph)))
+            | sid <- Set.toList (graphStmts dependencyGraph)
+            ]
+        (graph, nodeFromVertex, vertexFromKey) = Graph.graphFromEdges nodes
+        reachableFrom target =
+            case vertexFromKey target of
+                Nothing -> Set.empty
+                Just vertex ->
+                    Set.fromList
+                        [ reached
+                        | reachedVertex <- Graph.reachable graph vertex
+                        , let (_, reached, _) = nodeFromVertex reachedVertex
+                        ]
+     in Map.fromSet reachableFrom (graphStmts dependencyGraph)
+
 -- Prop 1: DAG Acyclicity
 prop_dagAcyclicity :: [[ArbitraryAction]] -> Property
 prop_dagAcyclicity rawActions =
-    let stmtActions =
-            [ (StatementId sid, map toObjectAction acts)
-            | (sid, acts) <- zip [1 ..] rawActions
-            ]
-        graph = buildGraph stmtActions
+    let graph = buildActionGraph rawActions
         edges = Map.toList (graphEdges graph)
         strictlyBackwards (StatementId j, preds) =
             all (\(StatementId i) -> i < j) (Set.toList preds)
@@ -739,21 +776,46 @@ prop_dagAcyclicity rawActions =
             ("Graph edges violate acyclicity: " ++ show edges)
             (all strictlyBackwards edges)
 
--- Prop 2: Backward Slicing Soundness
-prop_backwardSliceSoundness :: [[ArbitraryAction]] -> Positive Int -> Property
-prop_backwardSliceSoundness rawActions (Positive targetInt) =
-    let stmtActions =
-            [ (StatementId sid, map toObjectAction acts)
-            | (sid, acts) <- zip [1 ..] rawActions
+-- Prop 2: Backward slices exactly match graph reachability
+prop_backwardSliceSoundness :: SmallActionGraph -> Property
+prop_backwardSliceSoundness (SmallActionGraph rawActions) =
+    let graph = buildActionGraph rawActions
+        expectedByTarget = backwardReachabilityOracle graph
+        mismatches =
+            [ (target, Set.difference expected actual, Set.difference actual expected)
+            | target <- Set.toList (graphStmts graph)
+            , let actual = backwardSlice target graph
+                  expected = Map.findWithDefault Set.empty target expectedByTarget
+            , actual /= expected
             ]
-        graph = buildGraph stmtActions
-        targetSid = StatementId targetInt
-        slice = backwardSlice targetSid graph
-        containsSelf = Set.member targetSid slice
-        validClosure = isValidClosure graph slice
      in counterexample
-            ("Slice: " ++ show slice ++ ", graph: " ++ show (graphEdges graph))
-            (containsSelf && validClosure)
+            ( "Backward slices differ (target, missing ancestors, unrelated extras): "
+                ++ show mismatches
+                ++ "; graph edges: "
+                ++ show (graphEdges graph)
+            )
+            (null mismatches)
+
+-- Prop 2b: Set closure exactly matches reachability for every valid root subset
+prop_closeSetReachability :: SmallActionGraph -> Property
+prop_closeSetReachability (SmallActionGraph rawActions) =
+    let graph = buildActionGraph rawActions
+        expectedByTarget = backwardReachabilityOracle graph
+        rootSets = map Set.fromList (subsequences (Set.toList (graphStmts graph)))
+        mismatches =
+            [ (roots, actual, expected)
+            | roots <- rootSets
+            , let actual = closeSet graph roots
+                  expected =
+                    Set.unions
+                        [ Map.findWithDefault Set.empty root expectedByTarget
+                        | root <- Set.toList roots
+                        ]
+            , actual /= expected
+            ]
+     in counterexample
+            ("closeSet differs from reachability (roots, actual, expected): " ++ show mismatches)
+            (null mismatches)
 
 -- Prop 3: Reduction Monotonicity
 data TestOracle
@@ -839,8 +901,11 @@ propertyTests =
         "Property Tests (QuickCheck)"
         [ testProperty "Prop 1: DAG Acyclicity (j -> i implies i < j)" prop_dagAcyclicity
         , testProperty
-            "Prop 2: Backward Slicing Soundness (s in slice & closure valid)"
+            "Prop 2: Backward Slice Soundness (exact predecessor reachability)"
             prop_backwardSliceSoundness
+        , testProperty
+            "Prop 2b: Set closure matches reachability for every valid root subset"
+            prop_closeSetReachability
         , testProperty
             "Prop 3: Reduction Monotonicity (len reduced <= len initial)"
             prop_reductionMonotonicity
