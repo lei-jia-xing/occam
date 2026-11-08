@@ -943,4 +943,31 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn constraint_stripping_and_deeper_ast_pruning() {
+        let sql = "CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'abc', PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p(id));";
+        let units = parse_units(sql, DialectKind::Generic).unwrap();
+        let edits = &units[0].facts.as_ref().unwrap().edits;
+        let constraint_edits: Vec<_> = edits
+            .iter()
+            .filter(|e| e.category == "constraint")
+            .collect();
+        assert!(constraint_edits
+            .iter()
+            .any(|e| e.label == "remove-column_constraint"));
+        assert!(constraint_edits
+            .iter()
+            .any(|e| e.label == "remove-table_constraint"));
+
+        let expr_sql = "SELECT CASE WHEN a = 1 THEN 42 ELSE 0 END, COALESCE(x, y), z IS NOT NULL, b BETWEEN 1 AND 10 FROM t;";
+        let expr_units = parse_units(expr_sql, DialectKind::Generic).unwrap();
+        let expr_edits = &expr_units[0].facts.as_ref().unwrap().edits;
+        assert!(expr_edits.iter().any(|e| e.label == "simplify-case_result"));
+        assert!(expr_edits
+            .iter()
+            .any(|e| e.label == "simplify-function_to_argument"));
+        assert!(expr_edits.iter().any(|e| e.label == "simplify-is_null"));
+        assert!(expr_edits.iter().any(|e| e.label == "simplify-between"));
+    }
 }

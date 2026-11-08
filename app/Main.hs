@@ -249,7 +249,7 @@ reductionOptionsParser =
                 <> metavar "STRATEGY"
                 <> value CountDD
                 <> showDefault
-                <> help "Search strategy: count-dd, weighted-dd, or cdd"
+                <> help "Search strategy: count-dd, weighted-dd, cdd, or dominator-dd"
             )
         <*> option
             (eitherReader parseSQLDialect)

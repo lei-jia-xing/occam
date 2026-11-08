@@ -4,8 +4,8 @@ use crate::{DialectKind, NativeEdit};
 use sqlparser::ast::{
     AlterTableOperation, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
     GroupByWithModifier, LimitClause, ObjectName, OffsetRows, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, TableWithJoins,
-    ValueWithSpan, Visitor,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableConstraint, TableFactor,
+    TableWithJoins, ValueWithSpan, Visitor,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Tokenizer};
@@ -1308,6 +1308,104 @@ impl<'a> AnalysisVisitor<'a> {
         self.token_span_after(&self.data_type_pattern(&column.data_type)?, name_end)
     }
 
+    fn column_options_span(&self, column: &sqlparser::ast::ColumnDef) -> Option<(usize, usize)> {
+        let (_, type_end) = self.column_type_span(column)?;
+        let mut index = self.tokens.partition_point(|token| token.start < type_end);
+        let mut col_end = type_end;
+        while let Some(token) = self.tokens.get(index).copied() {
+            if matches!(
+                token.kind,
+                TokenKind::Comma | TokenKind::RightParen | TokenKind::Semicolon
+            ) {
+                break;
+            }
+            if matches!(token.kind, TokenKind::LeftParen) {
+                if let Some(pair) = token.parentheses {
+                    col_end = pair.end;
+                    index = self.tokens.partition_point(|t| t.end <= pair.end);
+                    continue;
+                }
+            }
+            col_end = token.end;
+            index += 1;
+        }
+        if col_end > type_end {
+            Some((type_end, col_end))
+        } else {
+            None
+        }
+    }
+
+    fn table_constraint_span(&self, tc: &TableConstraint) -> Option<(usize, usize)> {
+        let (inner_start, _) = self.mapped_span(tc.span())?;
+        let mut comma_before = None;
+        let mut index = self.tokens.partition_point(|t| t.start < inner_start);
+        let mut depth = 1usize;
+        while index > 0 {
+            index -= 1;
+            let token = self.tokens[index];
+            match token.kind {
+                TokenKind::RightParen => depth += 1,
+                TokenKind::LeftParen => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                TokenKind::Comma if depth == 0 => {
+                    comma_before = Some(token.start);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let mut comma_after = None;
+        let mut paren_after = None;
+        let mut fwd_index = self.tokens.partition_point(|t| t.start < inner_start);
+        let mut fwd_depth = 1usize;
+        while let Some(token) = self.tokens.get(fwd_index).copied() {
+            match token.kind {
+                TokenKind::LeftParen => fwd_depth += 1,
+                TokenKind::RightParen => {
+                    if fwd_depth > 0 {
+                        fwd_depth -= 1;
+                    } else {
+                        paren_after = Some(token.start);
+                        break;
+                    }
+                }
+                TokenKind::Comma if fwd_depth == 0 => {
+                    comma_after = Some(token);
+                    break;
+                }
+                TokenKind::Semicolon => break,
+                _ => {}
+            }
+            fwd_index += 1;
+        }
+
+        if let Some(c_before) = comma_before {
+            let edit_start = preceding_whitespace(self.source.as_bytes(), c_before);
+            let edit_end =
+                comma_after.map_or_else(|| paren_after.unwrap_or(inner_start), |c| c.start);
+            Some((edit_start, edit_end))
+        } else if let Some(c_after) = comma_after {
+            let mut start = inner_start;
+            let before_idx = self.tokens.partition_point(|t| t.start < inner_start);
+            for token in self.tokens[..before_idx].iter().rev() {
+                if matches!(token.kind, TokenKind::LeftParen) {
+                    break;
+                }
+                start = token.start;
+            }
+            Some((start, c_after.end))
+        } else {
+            None
+        }
+    }
+
     fn cast_type_span(
         &self,
         inner_end: usize,
@@ -1677,6 +1775,38 @@ impl Visitor for AnalysisVisitor<'_> {
                     if let Some(range) = self.column_type_span(column) {
                         self.add_type_edits(range);
                     }
+                    if let Some((opt_start, opt_end)) = self.column_options_span(column) {
+                        self.add_edit_bytes(
+                            opt_start,
+                            opt_end,
+                            "",
+                            "constraint",
+                            "remove-column_constraint",
+                        );
+                    }
+                    for option in &column.options {
+                        if let Some((start, end)) = self.mapped_span(option.span()) {
+                            let edit_start = preceding_whitespace(self.source.as_bytes(), start);
+                            self.add_edit_bytes(
+                                edit_start,
+                                end,
+                                "",
+                                "constraint",
+                                "remove-column_constraint",
+                            );
+                        }
+                    }
+                }
+                for tc in &create.constraints {
+                    if let Some((start, end)) = self.table_constraint_span(tc) {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            "",
+                            "constraint",
+                            "remove-table_constraint",
+                        );
+                    }
                 }
             }
             Statement::AlterTable(alter) => {
@@ -1684,6 +1814,28 @@ impl Visitor for AnalysisVisitor<'_> {
                     if let AlterTableOperation::AddColumn { column_def, .. } = operation {
                         if let Some(range) = self.column_type_span(column_def) {
                             self.add_type_edits(range);
+                        }
+                        if let Some((opt_start, opt_end)) = self.column_options_span(column_def) {
+                            self.add_edit_bytes(
+                                opt_start,
+                                opt_end,
+                                "",
+                                "constraint",
+                                "remove-column_constraint",
+                            );
+                        }
+                        for option in &column_def.options {
+                            if let Some((start, end)) = self.mapped_span(option.span()) {
+                                let edit_start =
+                                    preceding_whitespace(self.source.as_bytes(), start);
+                                self.add_edit_bytes(
+                                    edit_start,
+                                    end,
+                                    "",
+                                    "constraint",
+                                    "remove-column_constraint",
+                                );
+                            }
                         }
                     }
                 }
@@ -1816,10 +1968,154 @@ impl Visitor for AnalysisVisitor<'_> {
                     }
                 }
             }
-            Expr::InList { list, .. } => {
+            Expr::InList {
+                expr: inner, list, ..
+            } => {
                 self.list_edits("remove-in_list", list, |visitor, item| {
                     visitor.expression_source_span(item)
-                })
+                });
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    if let Some(replacement) = self.expression_source_slice(inner) {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-in_list",
+                        );
+                    }
+                    for replacement in ["1", "0"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-in_list",
+                        );
+                    }
+                }
+            }
+            Expr::InSubquery { expr: inner, .. } => {
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    if let Some(replacement) = self.expression_source_slice(inner) {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-in_subquery",
+                        );
+                    }
+                    for replacement in ["1", "0"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-in_subquery",
+                        );
+                    }
+                }
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    for candidate in [inner.as_ref(), low.as_ref(), high.as_ref()] {
+                        if let Some(replacement) = self.expression_source_slice(candidate) {
+                            self.add_edit_bytes(
+                                start,
+                                end,
+                                replacement,
+                                "expression",
+                                "simplify-between",
+                            );
+                        }
+                    }
+                    for replacement in ["1", "0"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-between",
+                        );
+                    }
+                }
+            }
+            Expr::Like { expr: inner, .. } | Expr::ILike { expr: inner, .. } => {
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    if let Some(replacement) = self.expression_source_slice(inner) {
+                        self.add_edit_bytes(start, end, replacement, "expression", "simplify-like");
+                    }
+                    for replacement in ["1", "0"] {
+                        self.add_edit_bytes(start, end, replacement, "expression", "simplify-like");
+                    }
+                }
+            }
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    if let Some(replacement) = self.expression_source_slice(inner) {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-is_null",
+                        );
+                    }
+                    for replacement in ["0", "1"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-is_null",
+                        );
+                    }
+                }
+            }
+            Expr::Case {
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    for cw in conditions {
+                        if let Some(replacement) = self.expression_source_slice(&cw.result) {
+                            self.add_edit_bytes(
+                                start,
+                                end,
+                                replacement,
+                                "expression",
+                                "simplify-case_result",
+                            );
+                        }
+                    }
+                    if let Some(else_expr) = else_result {
+                        if let Some(replacement) = self.expression_source_slice(else_expr) {
+                            self.add_edit_bytes(
+                                start,
+                                end,
+                                replacement,
+                                "expression",
+                                "simplify-case_else",
+                            );
+                        }
+                    }
+                    for replacement in ["0", "1"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-case_literal",
+                        );
+                    }
+                }
             }
             Expr::Tuple(items) => self.list_edits("remove-tuple_item", items, |visitor, item| {
                 visitor.expression_source_span(item)
@@ -1831,6 +2127,32 @@ impl Visitor for AnalysisVisitor<'_> {
                         &arguments.args,
                         |visitor, argument| visitor.function_arg_source_span(argument),
                     );
+                    if let Some((start, end)) = self.expression_source_span(expr) {
+                        for arg in &arguments.args {
+                            if let Some(arg_span) = self.function_arg_source_span(arg) {
+                                if let Some(replacement) = self.source.get(arg_span.0..arg_span.1) {
+                                    self.add_edit_bytes(
+                                        start,
+                                        end,
+                                        replacement,
+                                        "expression",
+                                        "simplify-function_to_argument",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((start, end)) = self.expression_source_span(expr) {
+                    for replacement in ["0", "1"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            "expression",
+                            "simplify-function_literal",
+                        );
+                    }
                 }
             }
             Expr::Cast {
@@ -1898,4 +2220,11 @@ fn preceding_space(source: &[u8], start: usize) -> usize {
     } else {
         start
     }
+}
+
+fn preceding_whitespace(source: &[u8], mut start: usize) -> usize {
+    while start > 0 && matches!(source[start - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        start -= 1;
+    }
+    start
 }

@@ -95,16 +95,68 @@ tests =
                 oracle candidate = pure (BSC.isInfixOf "sentinel" candidate)
             weighted <- statementDdmin GenericSQL WeightedDD oracle sql
             cdd <- statementDdmin GenericSQL CDD oracle sql
+            dom <- statementDdmin GenericSQL DominatorDD oracle sql
             assertBool
                 "weighted search keeps the predicate-required statement"
                 (BSC.isInfixOf "sentinel" weighted)
             assertBool "CDD keeps the predicate-required statement" (BSC.isInfixOf "sentinel" cdd)
+            assertBool "DominatorDD keeps the predicate-required statement" (BSC.isInfixOf "sentinel" dom)
             assertBool "weighted search removes irrelevant statements" (BS.length weighted < BS.length sql)
             assertBool "CDD removes irrelevant statements" (BS.length cdd < BS.length sql)
+            assertBool "DominatorDD removes irrelevant statements" (BS.length dom < BS.length sql)
             assertBool
                 "weighted search removes the unrelated first statement"
                 (not (BSC.isInfixOf "SELECT 1" weighted))
             assertBool "CDD removes the unrelated first statement" (not (BSC.isInfixOf "SELECT 1" cdd))
+            assertBool "DominatorDD removes the unrelated first statement" (not (BSC.isInfixOf "SELECT 1" dom))
+        , testCase "Dominator-guided closure search prunes unneeded independent subgraphs" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unneeded_tbl (id INT);"
+                        , "INSERT INTO unneeded_tbl VALUES (1);"
+                        , "SELECT * FROM unneeded_tbl;"
+                        , "CREATE TABLE crash_tbl (id INT);"
+                        , "INSERT INTO crash_tbl VALUES (42);"
+                        , "SELECT * FROM crash_tbl WHERE id = 42;"
+                        ]
+                oracle candidate = pure (BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)
+                config =
+                    defaultReductionConfig
+                        { reductionSearch = DominatorDD
+                        , reductionIntraStatement = False
+                        , reductionUnrestricted = False
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger oracle sql
+            assertBool "keeps crash table" (BSC.isInfixOf "crash_tbl" reduced)
+            assertBool "keeps crash value" (BSC.isInfixOf "42" reduced)
+            assertBool "eliminates unneeded dominator subgraph" (not (BSC.isInfixOf "unneeded_tbl" reduced))
+        , testCase "Constraint stripping and deeper branch pruning simplify table definitions and expressions" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'abc', PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p(id));"
+                        , "SELECT CASE WHEN id = 1 THEN 42 ELSE 0 END, COALESCE(id, 0), id IS NOT NULL FROM t;"
+                        ]
+                oracle candidate = pure (BSC.isInfixOf "42" candidate && BSC.isInfixOf "CREATE TABLE t" candidate)
+            reduced <- reduceSQL GenericSQL oracle sql
+            assertBool "strips table constraint" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
+            assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
+            assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
+            assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
+        , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE helper (hid INT);"
+                        , "INSERT INTO helper VALUES (999);"
+                        , "CREATE TABLE main_tbl (id INT);"
+                        , "INSERT INTO main_tbl VALUES (42);"
+                        , "SELECT id FROM main_tbl WHERE id = 42 AND (SELECT COUNT(*) FROM helper) > 0;"
+                        ]
+                oracle candidate = pure (BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)
+            reduced <- reduceSQL GenericSQL oracle sql
+            assertBool "keeps main table" (BSC.isInfixOf "main_tbl" reduced)
+            assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
+            assertBool "eliminates helper table via interleaved audit" (not (BSC.isInfixOf "helper" reduced))
+            assertBool "eliminates helper insert via interleaved audit" (not (BSC.isInfixOf "999" reduced))
         , testCase "Statement audit reaches a fixed point, permits empty output, and preserves bytes" $ do
             let sql = BSC.unlines ["SELECT 101;", "SELECT 202;", "SELECT 303;"]
                 accepted = BSC.pack "SELECT 101;\nSELECT 303;\n"

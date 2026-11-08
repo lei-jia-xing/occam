@@ -151,9 +151,15 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Extracted cascading foreign key constraints (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) across CREATE TABLE and ALTER TABLE.
 - Propagated write dependencies across transitive cascading child tables.
 - Modeled temporary table lifecycles across transaction rollback and ON COMMIT DROP / DELETE ROWS.
-** TODO Implement dominator-guided and feedback-directed closure search
-** TODO Support constraint stripping and deeper AST branch pruning
-** TODO Interleave statement audit and intra-statement rewrites to a global fixed point
+** DONE Implement dominator-guided and feedback-directed closure search
+- Added DominatorDD search strategy with topological sink clustering and backward slice partition isolation.
+- Implemented feedback-directed pruning tracking failed removals, essential statements, and evaluated candidate memoization.
+** DONE Support constraint stripping and deeper AST branch pruning
+- Added table and column constraint stripping (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, NOT NULL, DEFAULT).
+- Added deeper AST branch pruning for CASE expressions, function call simplifications to arguments/literals, IS [NOT] NULL, BETWEEN, and pattern matching.
+** DONE Interleave statement audit and intra-statement rewrites to a global fixed point
+- Interleaved statement audit and intra-statement syntax rewrites into a simultaneous global fixed-point loop.
+- Ensured monotonic byte reduction and verified termination at the true fixed point.
 
 * 23. Real-World DBMS Evaluation & Quality Metrics
 ** TODO Collect real-world DBMS bug corpora from PostgreSQL, SQLite, and DuckDB

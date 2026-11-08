@@ -74,12 +74,15 @@ parseSearchStrategy value = case map toLower value of
     "count-dd" -> Right CountDD
     "weighted-dd" -> Right WeightedDD
     "cdd" -> Right CDD
-    _ -> Left "Expected count-dd, weighted-dd, or cdd"
+    "dominator-dd" -> Right DominatorDD
+    "dominator" -> Right DominatorDD
+    _ -> Left "Expected count-dd, weighted-dd, cdd, or dominator-dd"
 
 searchStrategyName :: SearchStrategy -> Text
 searchStrategyName CountDD = "count-dd"
 searchStrategyName WeightedDD = "weighted-dd"
 searchStrategyName CDD = "cdd"
+searchStrategyName DominatorDD = "dominator-dd"
 parseSQLDialect :: String -> Either String SQLDialect
 parseSQLDialect value = case map toLower value of
     "generic" -> Right GenericSQL

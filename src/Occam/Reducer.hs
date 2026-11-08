@@ -20,7 +20,7 @@ module Occam.Reducer (
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Ord (Down (..))
@@ -54,6 +54,7 @@ data SearchStrategy
     = CountDD
     | WeightedDD
     | CDD
+    | DominatorDD
     deriving (Eq, Show)
 
 data ReductionConfig = ReductionConfig
@@ -200,10 +201,64 @@ weightedChunks n weight items
                         | score < previous -> (index, prefixWeight, index, Just score)
                     _ -> (index, prefixWeight, bestCut, bestScore)
 
-chunksFor :: SearchStrategy -> Int -> ByteString -> [Statement] -> [[Statement]]
-chunksFor CountDD count _ = partitionChunks count
-chunksFor WeightedDD count source = weightedChunks count (statementByteWeight source)
-chunksFor CDD count _ = partitionChunks count
+chunksFor ::
+    Maybe DependencyGraph -> SearchStrategy -> Int -> ByteString -> [Statement] -> [[Statement]]
+chunksFor _ CountDD count _ = partitionChunks count
+chunksFor _ WeightedDD count source = weightedChunks count (statementByteWeight source)
+chunksFor _ CDD count _ = partitionChunks count
+chunksFor (Just graph) DominatorDD count _ = dominatorChunks graph count
+chunksFor Nothing DominatorDD count _ = partitionChunks count
+
+dominatorChunks :: DependencyGraph -> Int -> [Statement] -> [[Statement]]
+dominatorChunks graph n current
+    | n <= 1 || length current <= 1 = [current]
+    | otherwise =
+        let currentIds = statementIds current
+            stmtMap = Map.fromList [(stmtId s, s) | s <- current]
+            restrictedEdges =
+                Map.fromList
+                    [ (sid, Set.intersection (Map.findWithDefault Set.empty sid (graphEdges graph)) currentIds)
+                    | sid <- Set.toList currentIds
+                    ]
+            hasDependent sid =
+                any (Set.member sid) (Map.elems restrictedEdges)
+            sinks = filter (not . hasDependent) (Set.toList currentIds)
+         in if null sinks || length sinks == 1
+                then partitionChunks n current
+                else
+                    let slices =
+                            [ (sink, backwardSlice sink graph `Set.intersection` currentIds)
+                            | sink <- sinks
+                            ]
+                        exclusiveClusters =
+                            [ excl
+                            | (sink, sl) <- slices
+                            , let others = Set.unions [sl' | (s', sl') <- slices, s' /= sink]
+                            , let excl = Set.difference sl others
+                            , not (Set.null excl)
+                            ]
+                        allExclusive = Set.unions exclusiveClusters
+                        shared = Set.difference currentIds allExclusive
+                        clusters =
+                            [ [stmt | sid <- Set.toList excl, Just stmt <- [Map.lookup sid stmtMap]]
+                            | excl <- exclusiveClusters
+                            ]
+                                ++ [ [stmt | sid <- Set.toList shared, Just stmt <- [Map.lookup sid stmtMap]]
+                                   | not (Set.null shared)
+                                   ]
+                        clusterHeadId cl = case cl of (s : _) -> stmtId s; [] -> StatementId 0
+                        orderedClusters =
+                            sortOn clusterHeadId (filter (not . null) clusters)
+                     in packClusters n orderedClusters
+
+packClusters :: Int -> [[Statement]] -> [[Statement]]
+packClusters n clusters
+    | n <= 1 = [concat clusters]
+    | n >= length clusters = clusters
+    | otherwise =
+        let targetSize = (length clusters + n - 1) `div` n
+            (chunk, rest) = splitAt targetSize clusters
+         in concat chunk : packClusters (n - 1) rest
 
 statementIds :: [Statement] -> Set StatementId
 statementIds = Set.fromList . map stmtId
@@ -249,7 +304,14 @@ closureDdminWithLogger logger strategy oracle baseSQL initialStatements graph = 
                 then pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
                 else pure Nothing
     result <-
-        searchStatements strategy buildCandidate oracle baseSQL initialStatements initialStatements
+        searchStatements
+            (Just graph)
+            strategy
+            buildCandidate
+            oracle
+            baseSQL
+            initialStatements
+            initialStatements
     stats <- readIORef closureStats
     logInfo'
         logger
@@ -274,7 +336,17 @@ data ClosureStats = ClosureStats
     , closureGainBytes :: !Int
     }
 
+data Feedback = Feedback
+    { fbFailedRemovals :: !(IORef (Set (Set StatementId)))
+    , fbEssentialStatements :: !(IORef (Set StatementId))
+    , fbEvaluated :: !(IORef (Map.Map ByteString Bool))
+    }
+
+newFeedback :: IO Feedback
+newFeedback = Feedback <$> newIORef Set.empty <*> newIORef Set.empty <*> newIORef Map.empty
+
 searchStatements ::
+    Maybe DependencyGraph ->
     SearchStrategy ->
     CandidateBuilder ->
     Oracle ->
@@ -282,10 +354,20 @@ searchStatements ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements strategy buildCandidate oracle baseSQL allStatements initialStatements =
+searchStatements maybeGraph strategy buildCandidate oracle baseSQL allStatements initialStatements = do
+    feedback <- newFeedback
     case strategy of
-        CDD -> searchCDD buildCandidate oracle baseSQL allStatements initialStatements
-        _ -> searchDDMin strategy buildCandidate oracle baseSQL allStatements initialStatements
+        CDD -> searchCDD feedback buildCandidate oracle baseSQL allStatements initialStatements
+        _ ->
+            searchDDMin
+                maybeGraph
+                feedback
+                strategy
+                buildCandidate
+                oracle
+                baseSQL
+                allStatements
+                initialStatements
 
 type CandidateBuilder = [Statement] -> Set StatementId -> IO (Maybe [Statement])
 
@@ -294,6 +376,8 @@ plainCandidate current keptIds =
     pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
 
 searchDDMin ::
+    Maybe DependencyGraph ->
+    Feedback ->
     SearchStrategy ->
     CandidateBuilder ->
     Oracle ->
@@ -301,12 +385,12 @@ searchDDMin ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin strategy buildCandidate oracle baseSQL allStatements = go 2
+searchDDMin maybeGraph feedback strategy buildCandidate oracle baseSQL allStatements = go 2
     where
         go _ [] = pure []
         go granularity current = do
             let n = min (length current) (max 1 granularity)
-                chunks = chunksFor strategy n baseSQL current
+                chunks = chunksFor maybeGraph strategy n baseSQL current
             subset <- trySubsets current chunks
             case subset of
                 Just reduced -> go 2 reduced
@@ -321,7 +405,7 @@ searchDDMin strategy buildCandidate oracle baseSQL allStatements = go 2
         trySubsets _ [] = pure Nothing
         trySubsets current (chunk : rest) = do
             let seedIds = statementIds chunk
-            candidate <- testSeed current seedIds
+            candidate <- testCandidate current seedIds
             case candidate of
                 Just reduced -> pure (Just reduced)
                 Nothing -> trySubsets current rest
@@ -329,29 +413,55 @@ searchDDMin strategy buildCandidate oracle baseSQL allStatements = go 2
         tryComplements _ [] = pure Nothing
         tryComplements current (chunk : rest) = do
             let seedIds = statementIds current `Set.difference` statementIds chunk
-            candidate <- testSeed current seedIds
+            candidate <- testCandidate current seedIds
             case candidate of
                 Just reduced -> pure (Just reduced)
                 Nothing -> tryComplements current rest
 
-        testSeed current seedIds
+        testCandidate current seedIds
             | seedIds == statementIds current = pure Nothing
             | otherwise = do
-                maybeKept <- buildCandidate current seedIds
-                case maybeKept of
-                    Nothing -> pure Nothing
-                    Just kept -> do
-                        let currentSQL = statementSQL baseSQL allStatements current
-                            candidateSQL = statementSQL baseSQL allStatements kept
-                        if BS.length candidateSQL >= BS.length currentSQL
-                            then pure Nothing
-                            else do
-                                ok <- oracle candidateSQL
-                                pure (if ok then Just kept else Nothing)
+                let removedIds = statementIds current `Set.difference` seedIds
+                essential <- readIORef (fbEssentialStatements feedback)
+                failed <- readIORef (fbFailedRemovals feedback)
+                if (Set.size removedIds == 1 && any (`Set.member` essential) (Set.toList removedIds))
+                    || Set.member removedIds failed
+                    then pure Nothing
+                    else do
+                        maybeKept <- buildCandidate current seedIds
+                        case maybeKept of
+                            Nothing -> pure Nothing
+                            Just kept -> do
+                                let currentSQL = statementSQL baseSQL allStatements current
+                                    candidateSQL = statementSQL baseSQL allStatements kept
+                                if BS.length candidateSQL >= BS.length currentSQL
+                                    then pure Nothing
+                                    else do
+                                        evaluated <- readIORef (fbEvaluated feedback)
+                                        case Map.lookup candidateSQL evaluated of
+                                            Just True -> pure (Just kept)
+                                            Just False -> pure Nothing
+                                            Nothing -> do
+                                                ok <- oracle candidateSQL
+                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
+                                                if ok
+                                                    then pure (Just kept)
+                                                    else do
+                                                        modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
+                                                        case Set.toList removedIds of
+                                                            [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
+                                                            _ -> pure ()
+                                                        pure Nothing
 
 searchCDD ::
-    CandidateBuilder -> Oracle -> ByteString -> [Statement] -> [Statement] -> IO [Statement]
-searchCDD buildCandidate oracle baseSQL allStatements = rounds 0
+    Feedback ->
+    CandidateBuilder ->
+    Oracle ->
+    ByteString ->
+    [Statement] ->
+    [Statement] ->
+    IO [Statement]
+searchCDD feedback buildCandidate oracle baseSQL allStatements = rounds 0
     where
         rounds _ [] = pure []
         rounds roundNumber current = do
@@ -367,17 +477,37 @@ searchCDD buildCandidate oracle baseSQL allStatements = rounds 0
             | null current = pure []
             | otherwise = do
                 let retainedIds = statementIds current `Set.difference` statementIds partition
-                maybeKept <- buildCandidate current retainedIds
-                case maybeKept of
-                    Nothing -> tryPartitions current rest
-                    Just kept -> do
-                        let currentSQL = statementSQL baseSQL allStatements current
-                            candidateSQL = statementSQL baseSQL allStatements kept
-                        if BS.length candidateSQL < BS.length currentSQL
-                            then do
-                                ok <- oracle candidateSQL
-                                tryPartitions (if ok then kept else current) rest
-                            else tryPartitions current rest
+                    removedIds = statementIds partition
+                essential <- readIORef (fbEssentialStatements feedback)
+                failed <- readIORef (fbFailedRemovals feedback)
+                if (Set.size removedIds == 1 && any (`Set.member` essential) (Set.toList removedIds))
+                    || Set.member removedIds failed
+                    then tryPartitions current rest
+                    else do
+                        maybeKept <- buildCandidate current retainedIds
+                        case maybeKept of
+                            Nothing -> tryPartitions current rest
+                            Just kept -> do
+                                let currentSQL = statementSQL baseSQL allStatements current
+                                    candidateSQL = statementSQL baseSQL allStatements kept
+                                if BS.length candidateSQL >= BS.length currentSQL
+                                    then tryPartitions current rest
+                                    else do
+                                        evaluated <- readIORef (fbEvaluated feedback)
+                                        case Map.lookup candidateSQL evaluated of
+                                            Just True -> tryPartitions kept rest
+                                            Just False -> tryPartitions current rest
+                                            Nothing -> do
+                                                ok <- oracle candidateSQL
+                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
+                                                if ok
+                                                    then tryPartitions kept rest
+                                                    else do
+                                                        modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
+                                                        case Set.toList removedIds of
+                                                            [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
+                                                            _ -> pure ()
+                                                        tryPartitions current rest
 
         chunksOf size xs
             | null xs = []
@@ -413,7 +543,8 @@ statementDdmin dialect strategy oracle initialSQL = do
         else do
             units <- parseUnitsOrThrow dialect initialSQL
             let allStatements = map unitStatement units
-            reduced <- searchStatements strategy plainCandidate oracle initialSQL allStatements allStatements
+            reduced <-
+                searchStatements Nothing strategy plainCandidate oracle initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
 -- | Sequential one-statement deletion to a fixed point; the empty candidate is allowed.
@@ -674,22 +805,54 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                     "unrestricted-fallback"
                     (statementDdmin (reductionDialect config) (reductionSearch config) oracle searched)
             else pure searched
-    audited <-
-        if reductionUnrestricted config
-            then do
-                started <- getMonotonicTimeNSec
-                (result, _) <- statementAuditWithLogger logger (reductionDialect config) oracle fallback
-                finished <- getMonotonicTimeNSec
-                logStage logger "statement-audit" (finished - started)
-                pure result
-            else pure fallback
-    if reductionIntraStatement config
-        then
-            timedStage
-                logger
-                "intra-statement-rewrites"
-                (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) audited)
-        else pure audited
+    interleaveStages fallback
+    where
+        interleaveStages base =
+            case (reductionUnrestricted config, reductionIntraStatement config) of
+                (True, True) -> interleaveFixedPoint (1 :: Int) base
+                (True, False) -> do
+                    started <- getMonotonicTimeNSec
+                    (result, _) <- statementAuditWithLogger logger (reductionDialect config) oracle base
+                    finished <- getMonotonicTimeNSec
+                    logStage logger "statement-audit" (finished - started)
+                    pure result
+                (False, True) ->
+                    timedStage
+                        logger
+                        "intra-statement-rewrites"
+                        (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) base)
+                (False, False) -> pure base
+
+        interleaveFixedPoint iter current = do
+            started <- getMonotonicTimeNSec
+            (afterAudit, _) <- statementAuditWithLogger logger (reductionDialect config) oracle current
+            finished <- getMonotonicTimeNSec
+            logStage logger "statement-audit" (finished - started)
+            afterSyntax <-
+                timedStage
+                    logger
+                    "intra-statement-rewrites"
+                    (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) afterAudit)
+            if BS.length afterSyntax < BS.length current
+                then do
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        "Interleaved reduction step accepted"
+                        [ ("interleave_iteration", toJSON iter)
+                        , ("bytes_before", toJSON (BS.length current))
+                        , ("bytes_after", toJSON (BS.length afterSyntax))
+                        ]
+                    interleaveFixedPoint (iter + 1) afterSyntax
+                else do
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        "Interleaved audit and syntax global fixed point reached"
+                        [ ("total_interleave_iterations", toJSON iter)
+                        , ("final_bytes", toJSON (BS.length current))
+                        ]
+                    pure afterSyntax
 
 pruneClauses :: SQLDialect -> Oracle -> ByteString -> IO ByteString
 pruneClauses dialect oracle =
