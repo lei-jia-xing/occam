@@ -90,7 +90,20 @@ parseSQLDialect value = case map toLower value of
     "duckdb" -> Right DuckDB
     "clickhouse" -> Right ClickHouse
     "oracle" -> Right Oracle
-    _ -> Left "Expected generic, postgresql, mysql, sqlite, duckdb, clickhouse, or oracle"
+    "ansi" -> Right Ansi
+    "bigquery" -> Right BigQuery
+    "databricks" -> Right Databricks
+    "hive" -> Right Hive
+    "mssql" -> Right MsSql
+    "sqlserver" -> Right MsSql
+    "redshift" -> Right Redshift
+    "snowflake" -> Right Snowflake
+    "spark" -> Right Spark
+    "sparksql" -> Right Spark
+    "teradata" -> Right Teradata
+    _ ->
+        Left
+            "Expected generic, postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
 
 sqlDialectName :: SQLDialect -> Text
 sqlDialectName GenericSQL = "generic"
@@ -100,6 +113,15 @@ sqlDialectName SQLite = "sqlite"
 sqlDialectName DuckDB = "duckdb"
 sqlDialectName ClickHouse = "clickhouse"
 sqlDialectName Oracle = "oracle"
+sqlDialectName Ansi = "ansi"
+sqlDialectName BigQuery = "bigquery"
+sqlDialectName Databricks = "databricks"
+sqlDialectName Hive = "hive"
+sqlDialectName MsSql = "mssql"
+sqlDialectName Redshift = "redshift"
+sqlDialectName Snowflake = "snowflake"
+sqlDialectName Spark = "spark"
+sqlDialectName Teradata = "teradata"
 
 data EvaluationPoint = EvaluationPoint
     { pointElapsedSeconds :: !Double

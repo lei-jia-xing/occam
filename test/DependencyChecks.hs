@@ -510,6 +510,23 @@ tests =
             assertBool
                 "SELECT from dual does not depend on other tables"
                 (not (has (StatementId 1) depsS4 || has (StatementId 2) depsS4))
+        , testCase "MsSql dependency extraction handles bracketed identifiers and schema qualification" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE [dbo].[users] ([UserId] INT, [UserName] NVARCHAR(50));"
+                        , "CREATE TABLE [dbo].[other] ([id] INT);"
+                        , "SELECT [UserId], [UserName] FROM [dbo].[users];"
+                        ]
+            graph <- analyze MsSql sql
+            let actionsS1 = actionsFor (StatementId 1) graph
+                depsS3 = dependenciesFor (StatementId 3) graph
+            assertBool
+                "MsSql captures DefDep for bracketed table and columns"
+                ( ObjectAction TableObject DefDep "dbo.users" `elem` actionsS1
+                    && ObjectAction ColumnObject DefDep "dbo.users\USUserId" `elem` actionsS1
+                )
+            assertBool "SELECT from users depends on users" (has (StatementId 1) depsS3)
+            assertBool "SELECT from users does not depend on other" (not (has (StatementId 2) depsS3))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

@@ -173,6 +173,17 @@ tests =
             assertEqual "DuckDB dialect" (Right DuckDB) (parseSQLDialect "duckdb")
             assertEqual "ClickHouse dialect" (Right ClickHouse) (parseSQLDialect "clickhouse")
             assertEqual "Oracle dialect" (Right Oracle) (parseSQLDialect "oracle")
+            assertEqual "Ansi dialect" (Right Ansi) (parseSQLDialect "ansi")
+            assertEqual "BigQuery dialect" (Right BigQuery) (parseSQLDialect "bigquery")
+            assertEqual "Databricks dialect" (Right Databricks) (parseSQLDialect "databricks")
+            assertEqual "Hive dialect" (Right Hive) (parseSQLDialect "hive")
+            assertEqual "MsSql dialect" (Right MsSql) (parseSQLDialect "mssql")
+            assertEqual "SqlServer alias" (Right MsSql) (parseSQLDialect "sqlserver")
+            assertEqual "Redshift dialect" (Right Redshift) (parseSQLDialect "redshift")
+            assertEqual "Snowflake dialect" (Right Snowflake) (parseSQLDialect "snowflake")
+            assertEqual "Spark dialect" (Right Spark) (parseSQLDialect "spark")
+            assertEqual "SparkSql alias" (Right Spark) (parseSQLDialect "sparksql")
+            assertEqual "Teradata dialect" (Right Teradata) (parseSQLDialect "teradata")
             assertEqual
                 "invalid dialect rejected"
                 True
@@ -181,6 +192,15 @@ tests =
             assertEqual "DuckDB serialized using CLI spelling" "duckdb" (sqlDialectName DuckDB)
             assertEqual "ClickHouse serialized using CLI spelling" "clickhouse" (sqlDialectName ClickHouse)
             assertEqual "Oracle serialized using CLI spelling" "oracle" (sqlDialectName Oracle)
+            assertEqual "Ansi serialized using CLI spelling" "ansi" (sqlDialectName Ansi)
+            assertEqual "BigQuery serialized using CLI spelling" "bigquery" (sqlDialectName BigQuery)
+            assertEqual "Databricks serialized using CLI spelling" "databricks" (sqlDialectName Databricks)
+            assertEqual "Hive serialized using CLI spelling" "hive" (sqlDialectName Hive)
+            assertEqual "MsSql serialized using CLI spelling" "mssql" (sqlDialectName MsSql)
+            assertEqual "Redshift serialized using CLI spelling" "redshift" (sqlDialectName Redshift)
+            assertEqual "Snowflake serialized using CLI spelling" "snowflake" (sqlDialectName Snowflake)
+            assertEqual "Spark serialized using CLI spelling" "spark" (sqlDialectName Spark)
+            assertEqual "Teradata serialized using CLI spelling" "teradata" (sqlDialectName Teradata)
         ]
 
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig

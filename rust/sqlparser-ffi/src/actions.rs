@@ -27,7 +27,14 @@ fn barrier(name: &str) -> NativeAction {
 pub(super) fn canonical_ident(ident: &Ident, dialect: DialectKind) -> String {
     let value = match dialect {
         DialectKind::ClickHouse => ident.value.clone(),
-        DialectKind::PostgreSql | DialectKind::DuckDB | DialectKind::Oracle
+        DialectKind::PostgreSql
+        | DialectKind::DuckDB
+        | DialectKind::Oracle
+        | DialectKind::Ansi
+        | DialectKind::MsSql
+        | DialectKind::Redshift
+        | DialectKind::Snowflake
+        | DialectKind::Teradata
             if ident.quote_style.is_some() =>
         {
             ident.value.clone()
@@ -107,7 +114,7 @@ fn column_name(table: &str, column: &str) -> String {
 fn temp_schema(name: &ObjectName, dialect: DialectKind) -> bool {
     if !matches!(
         dialect,
-        DialectKind::SQLite | DialectKind::PostgreSql | DialectKind::DuckDB
+        DialectKind::SQLite | DialectKind::PostgreSql | DialectKind::DuckDB | DialectKind::Redshift
     ) {
         return false;
     }

@@ -35,7 +35,23 @@ import Occam.Core (
 
 -- Keep dialect selection at the frontend boundary: parsing and every derived
 -- fact use the same selected sqlparser dialect.
-data SQLDialect = GenericSQL | PostgreSQL | MySQL | SQLite | DuckDB | ClickHouse | Oracle
+data SQLDialect
+    = GenericSQL
+    | PostgreSQL
+    | MySQL
+    | SQLite
+    | DuckDB
+    | ClickHouse
+    | Oracle
+    | Ansi
+    | BigQuery
+    | Databricks
+    | Hive
+    | MsSql
+    | Redshift
+    | Snowflake
+    | Spark
+    | Teradata
     deriving (Eq, Ord, Show, Enum, Bounded)
 
 defaultSQLDialect :: SQLDialect
@@ -209,6 +225,15 @@ dialectCode SQLite = 3
 dialectCode DuckDB = 4
 dialectCode ClickHouse = 5
 dialectCode Oracle = 6
+dialectCode Ansi = 7
+dialectCode BigQuery = 8
+dialectCode Databricks = 9
+dialectCode Hive = 10
+dialectCode MsSql = 11
+dialectCode Redshift = 12
+dialectCode Snowflake = 13
+dialectCode Spark = 14
+dialectCode Teradata = 15
 makeUnits :: ByteString -> [NativeUnit] -> Either ParserError [StatementUnit]
 makeUnits source = go 0 1
     where

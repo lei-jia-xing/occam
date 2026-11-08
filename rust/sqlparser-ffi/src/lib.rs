@@ -16,7 +16,7 @@ use sqlparser::dialect::SQLiteDialect;
 #[cfg(test)]
 use sqlparser::parser::Parser;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DialectKind {
     Generic,
     PostgreSql,
@@ -25,6 +25,15 @@ enum DialectKind {
     DuckDB,
     ClickHouse,
     Oracle,
+    Ansi,
+    BigQuery,
+    Databricks,
+    Hive,
+    MsSql,
+    Redshift,
+    Snowflake,
+    Spark,
+    Teradata,
 }
 
 #[derive(Serialize)]
@@ -798,5 +807,101 @@ mod tests {
                 && action.action == NativeActionType::Def
                 && action.name == "dept\u{1f}deptname"
         }));
+    }
+
+    #[test]
+    fn additional_sqlparser_dialects_parsing_and_facts() {
+        let test_cases = [
+            (
+                DialectKind::Ansi,
+                7u32,
+                "SELECT 1 FROM \"t1\";\nSELECT 2 FROM \"t2\";",
+                2,
+                "t1",
+            ),
+            (
+                DialectKind::BigQuery,
+                8u32,
+                "SELECT `id` FROM `proj.dataset.tbl`;\nSELECT 42;",
+                2,
+                "proj.dataset.tbl",
+            ),
+            (
+                DialectKind::Databricks,
+                9u32,
+                "CREATE TABLE `events` (`id` INT);\nSELECT `id` FROM `events`;",
+                2,
+                "events",
+            ),
+            (
+                DialectKind::Hive,
+                10u32,
+                "CREATE TABLE `logs` (`msg` STRING);\nSELECT `msg` FROM `logs`;",
+                2,
+                "logs",
+            ),
+            (
+                DialectKind::MsSql,
+                11u32,
+                "SELECT TOP 10 [id], [name] FROM [dbo].[users];\nSELECT 1;",
+                2,
+                "dbo.users",
+            ),
+            (
+                DialectKind::Redshift,
+                12u32,
+                "CREATE TABLE dist_tbl (id INT) DISTKEY(id);\nSELECT id FROM dist_tbl;",
+                2,
+                "dist_tbl",
+            ),
+            (
+                DialectKind::Snowflake,
+                13u32,
+                "SELECT \"ColA\" FROM \"MyTable\";\nSELECT 1;",
+                2,
+                "MyTable",
+            ),
+            (
+                DialectKind::Spark,
+                14u32,
+                "CREATE TABLE `spark_tbl` (`x` INT);\nSELECT `x` FROM `spark_tbl`;",
+                2,
+                "spark_tbl",
+            ),
+            (
+                DialectKind::Teradata,
+                15u32,
+                "SELECT \"id\" FROM \"tera_tbl\";\nSELECT 1;",
+                2,
+                "tera_tbl",
+            ),
+        ];
+
+        for (kind, code, sql, expected_count, expected_table) in test_cases {
+            assert_eq!(count_units(sql, kind), Ok(expected_count));
+            let mut ffi_count = 0;
+            let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), code, &mut ffi_count) };
+            assert_eq!(status, 0);
+            assert_eq!(ffi_count, expected_count);
+
+            let units = parse_units(sql, kind).unwrap();
+            assert_eq!(units.len(), expected_count);
+            for unit in &units {
+                assert!(unit.facts.is_some());
+                assert!(unit.parse_error.is_none());
+            }
+
+            let first_facts = units[0].facts.as_ref().unwrap();
+            assert!(
+                first_facts.actions.iter().any(|action| {
+                    (action.kind == NativeObjectKind::Table
+                        || action.kind == NativeObjectKind::TemporaryTable)
+                        && action.name == expected_table
+                }),
+                "Dialect {:?} should identify table {}",
+                code,
+                expected_table
+            );
+        }
     }
 }

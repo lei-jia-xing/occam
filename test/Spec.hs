@@ -571,6 +571,27 @@ phase7Tests =
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "Oracle parses four statement units" 4 (length (parsedUnits parsed))
+        , testCase "MsSql dialect parses bracketed identifiers and TOP clauses" $ do
+            let script = "SELECT TOP 10 [id], [val] FROM [dbo].[my_table];\nSELECT 1;"
+            result <- parseSQL MsSql script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "MsSql parses two statement units" 2 (length (parsedUnits parsed))
+        , testCase "BigQuery dialect parses backtick qualified identifiers" $ do
+            let script = "SELECT `x` FROM `project.dataset.table`;\nSELECT 42;"
+            result <- parseSQL BigQuery script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "BigQuery parses two statement units" 2 (length (parsedUnits parsed))
+        , testCase "Snowflake dialect parses double-quoted identifiers" $ do
+            let script = "SELECT \"ColA\" FROM \"Db\".\"Schema\".\"MyTable\";\nSELECT 1;"
+            result <- parseSQL Snowflake script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "Snowflake parses two statement units" 2 (length (parsedUnits parsed))
         ]
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()

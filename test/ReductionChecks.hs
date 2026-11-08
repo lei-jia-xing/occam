@@ -193,9 +193,34 @@ tests =
             duckdbCount <- countOrFail DuckDB "SELECT [1, 2, 3]; -- comment\nSELECT * FROM range(5);"
             clickhouseCount <- countOrFail ClickHouse "SELECT number FROM numbers(10); -- comment\nSELECT 1;"
             oracleCount <- countOrFail Oracle "SELECT 1 FROM dual; -- comment\nSELECT 2 FROM dual;"
+            ansiCount <- countOrFail Ansi "SELECT 1; -- comment\nSELECT 2;"
+            mssqlCount <- countOrFail MsSql "SELECT [a;b]; -- comment\nSELECT TOP 1 * FROM [t];"
+            snowflakeCount <- countOrFail Snowflake "SELECT \"a;b\"; -- comment\nSELECT 2;"
+            bigqueryCount <- countOrFail BigQuery "SELECT `a;b`; -- comment\nSELECT 2;"
             assertEqual "DuckDB statements stay within units" 2 duckdbCount
             assertEqual "ClickHouse statements stay within units" 2 clickhouseCount
             assertEqual "Oracle statements stay within units" 2 oracleCount
+            assertEqual "Ansi statements stay within units" 2 ansiCount
+            assertEqual "MsSql statements stay within units" 2 mssqlCount
+            assertEqual "Snowflake statements stay within units" 2 snowflakeCount
+            assertEqual "BigQuery statements stay within units" 2 bigqueryCount
+        , testCase
+            "MsSql dependency extraction and reduction removes dead tables while preserving bracketed query"
+            $ do
+                let sql =
+                        BSC.unlines
+                            [ "CREATE TABLE [dbo].[dead_table] ([id] INT);"
+                            , "CREATE TABLE [dbo].[live_table] ([id] INT, [name] NVARCHAR(50));"
+                            , "INSERT INTO [dbo].[live_table] VALUES (1, 'bob');"
+                            , "SELECT TOP 1 [name] FROM [dbo].[live_table] WHERE [id] = 1;"
+                            ]
+                mssqlCount <- countOrFail MsSql sql
+                assertEqual "MsSql statement counting counts 4 statements" 4 mssqlCount
+                let oracle candidate = pure (BSC.isInfixOf "live_table" candidate && BSC.isInfixOf "SELECT" candidate)
+                reduced <- reduceSQL MsSql oracle sql
+                assertBool "dead table is eliminated by reduction" (not (BSC.isInfixOf "dead_table" reduced))
+                assertBool "live table is preserved" (BSC.isInfixOf "live_table" reduced)
+                assertBool "query is preserved" (BSC.isInfixOf "SELECT" reduced)
         , testCase "DuckDB dependency extraction and reduction removes unused statements" $ do
             let sql =
                     BSC.unlines

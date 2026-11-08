@@ -15,6 +15,15 @@ fn dialect_from_code(code: u32) -> Option<DialectKind> {
         4 => Some(DialectKind::DuckDB),
         5 => Some(DialectKind::ClickHouse),
         6 => Some(DialectKind::Oracle),
+        7 => Some(DialectKind::Ansi),
+        8 => Some(DialectKind::BigQuery),
+        9 => Some(DialectKind::Databricks),
+        10 => Some(DialectKind::Hive),
+        11 => Some(DialectKind::MsSql),
+        12 => Some(DialectKind::Redshift),
+        13 => Some(DialectKind::Snowflake),
+        14 => Some(DialectKind::Spark),
+        15 => Some(DialectKind::Teradata),
         _ => None,
     }
 }

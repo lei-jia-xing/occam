@@ -1,7 +1,8 @@
 use crate::DialectKind;
 use sqlparser::dialect::{
-    ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MySqlDialect, OracleDialect,
-    PostgreSqlDialect, SQLiteDialect,
+    AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
+    GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
+    RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect, SparkSqlDialect, TeradataDialect,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan};
@@ -61,6 +62,15 @@ pub(super) fn dialect(kind: DialectKind) -> &'static dyn Dialect {
         DialectKind::DuckDB => &DuckDbDialect {},
         DialectKind::ClickHouse => &ClickHouseDialect {},
         DialectKind::Oracle => &OracleDialect {},
+        DialectKind::Ansi => &AnsiDialect {},
+        DialectKind::BigQuery => &BigQueryDialect {},
+        DialectKind::Databricks => &DatabricksDialect {},
+        DialectKind::Hive => &HiveDialect {},
+        DialectKind::MsSql => &MsSqlDialect {},
+        DialectKind::Redshift => &RedshiftSqlDialect {},
+        DialectKind::Snowflake => &SnowflakeDialect {},
+        DialectKind::Spark => &SparkSqlDialect {},
+        DialectKind::Teradata => &TeradataDialect {},
     }
 }
 
