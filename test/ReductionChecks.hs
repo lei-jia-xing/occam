@@ -192,8 +192,10 @@ tests =
             assertEqual "MySQL backticks and strings stay within units" 2 mysqlCount
             duckdbCount <- countOrFail DuckDB "SELECT [1, 2, 3]; -- comment\nSELECT * FROM range(5);"
             clickhouseCount <- countOrFail ClickHouse "SELECT number FROM numbers(10); -- comment\nSELECT 1;"
+            oracleCount <- countOrFail Oracle "SELECT 1 FROM dual; -- comment\nSELECT 2 FROM dual;"
             assertEqual "DuckDB statements stay within units" 2 duckdbCount
             assertEqual "ClickHouse statements stay within units" 2 clickhouseCount
+            assertEqual "Oracle statements stay within units" 2 oracleCount
         , testCase "DuckDB dependency extraction and reduction removes unused statements" $ do
             let sql =
                     BSC.unlines
@@ -220,6 +222,22 @@ tests =
             assertBool "unneeded table is eliminated by reduction" (not (BSC.isInfixOf "unneeded" reduced))
             assertBool "referenced table is preserved" (BSC.isInfixOf "ch_events" reduced)
             assertBool "query statement is preserved" (BSC.isInfixOf "SELECT" reduced)
+        , testCase "Oracle statement counting and reduction removes dead tables while preserving DUAL query" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE dead_table (id NUMBER(10));"
+                        , "CREATE TABLE live_table (id NUMBER(10), name VARCHAR2(50));"
+                        , "INSERT INTO live_table VALUES (1, 'alice');"
+                        , "SELECT 1 FROM dual;"
+                        , "SELECT name FROM live_table WHERE id = 1;"
+                        ]
+            oracleCount <- countOrFail Oracle sql
+            assertEqual "Oracle statement counting counts 5 statements" 5 oracleCount
+            let oracle candidate = pure (BSC.isInfixOf "live_table" candidate && BSC.isInfixOf "dual" candidate)
+            reduced <- reduceSQL Oracle oracle sql
+            assertBool "dead table is eliminated by reduction" (not (BSC.isInfixOf "dead_table" reduced))
+            assertBool "live table is preserved" (BSC.isInfixOf "live_table" reduced)
+            assertBool "dual query is preserved" (BSC.isInfixOf "dual" reduced)
         , testCase "invalid SQL still counts its raw statement units; transport errors stay explicit" $ do
             invalidCount <- countOrFail SQLite "SELECT FROM ; SELECT 42;"
             assertEqual "invalid syntax does not turn statement count into zero" 2 invalidCount

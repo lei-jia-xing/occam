@@ -483,6 +483,33 @@ tests =
                 )
             assertBool "SELECT EventId depends on EventsLog" (has (StatementId 1) depsS3)
             assertBool "SELECT EventId has no dependency on OtherLog" (not (has (StatementId 2) depsS3))
+        , testCase "Oracle dependency extraction handles tables, DUAL, and identifier casing" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE dept (\"DeptId\" NUMBER(10), DeptName VARCHAR2(50));"
+                        , "CREATE TABLE other (id NUMBER(10));"
+                        , "SELECT \"DeptId\", DeptName FROM dept;"
+                        , "SELECT 1 FROM dual;"
+                        ]
+            graph <- analyze Oracle sql
+            let actionsS1 = actionsFor (StatementId 1) graph
+                actionsS4 = actionsFor (StatementId 4) graph
+                depsS3 = dependenciesFor (StatementId 3) graph
+                depsS4 = dependenciesFor (StatementId 4) graph
+            assertBool
+                "Oracle normalizes unquoted identifiers to lower case and preserves quoted identifier case"
+                ( ObjectAction TableObject DefDep "dept" `elem` actionsS1
+                    && ObjectAction ColumnObject DefDep "dept\USDeptId" `elem` actionsS1
+                    && ObjectAction ColumnObject DefDep "dept\USdeptname" `elem` actionsS1
+                )
+            assertBool "SELECT from dept depends on dept" (has (StatementId 1) depsS3)
+            assertBool "SELECT from dept does not depend on other" (not (has (StatementId 2) depsS3))
+            assertBool
+                "SELECT from dual records UseDep on dual"
+                (ObjectAction TableObject UseDep "dual" `elem` actionsS4)
+            assertBool
+                "SELECT from dual does not depend on other tables"
+                (not (has (StatementId 1) depsS4 || has (StatementId 2) depsS4))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

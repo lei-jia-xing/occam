@@ -560,6 +560,17 @@ phase7Tests =
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "ClickHouse parses two statement units" 2 (length (parsedUnits parsed))
+        , testCase "Oracle dialect parses DUAL, outer join (+), and hierarchical queries" $ do
+            let script =
+                    "SELECT 1 FROM dual;\n\
+                    \CREATE TABLE emp (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100));\n\
+                    \SELECT a.id, b.name FROM a, b WHERE a.id = b.id(+);\n\
+                    \SELECT id, name FROM emp START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id;"
+            result <- parseSQL Oracle script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "Oracle parses four statement units" 4 (length (parsedUnits parsed))
         ]
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()

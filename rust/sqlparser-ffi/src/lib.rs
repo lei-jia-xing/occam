@@ -24,6 +24,7 @@ enum DialectKind {
     SQLite,
     DuckDB,
     ClickHouse,
+    Oracle,
 }
 
 #[derive(Serialize)]
@@ -708,6 +709,94 @@ mod tests {
             action.kind == NativeObjectKind::Column
                 && action.action == NativeActionType::Def
                 && action.name == "events\u{1f}event_name"
+        }));
+    }
+
+    #[test]
+    fn oracle_dialect_parsing_and_statement_boundaries() {
+        let sql = "SELECT 42 FROM dual;\nCREATE TABLE employees (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100));\nSELECT a.id, b.name FROM a, b WHERE a.id = b.id(+);\nSELECT id, name FROM employees START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id;";
+        assert_eq!(count_units(sql, DialectKind::Oracle), Ok(4));
+        let mut ffi_count = 0;
+        let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), 6, &mut ffi_count) };
+        assert_eq!(status, 0);
+        assert_eq!(ffi_count, 4);
+
+        let units = parse_units(sql, DialectKind::Oracle).unwrap();
+        assert_eq!(units.len(), 4);
+        assert_eq!(&sql[units[0].start..units[0].end], "SELECT 42 FROM dual");
+        assert_eq!(
+            &sql[units[1].start..units[1].end],
+            "CREATE TABLE employees (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100))"
+        );
+        assert_eq!(
+            &sql[units[2].start..units[2].end],
+            "SELECT a.id, b.name FROM a, b WHERE a.id = b.id(+)"
+        );
+        assert_eq!(
+            &sql[units[3].start..units[3].end],
+            "SELECT id, name FROM employees START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id"
+        );
+
+        for unit in &units {
+            assert!(unit.facts.is_some());
+            assert!(unit.parse_error.is_none());
+        }
+
+        let facts0 = units[0].facts.as_ref().unwrap();
+        assert!(facts0.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Use
+                && action.name == "dual"
+        }));
+
+        let facts1 = units[1].facts.as_ref().unwrap();
+        assert!(facts1.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Def
+                && action.name == "employees"
+        }));
+        assert!(facts1.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "employees\u{1f}id"
+        }));
+        assert!(facts1.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "employees\u{1f}name"
+        }));
+
+        let facts2 = units[2].facts.as_ref().unwrap();
+        assert!(facts2.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Use
+                && action.name == "a"
+        }));
+        assert!(facts2.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Use
+                && action.name == "b"
+        }));
+
+        let facts3 = units[3].facts.as_ref().unwrap();
+        assert!(facts3.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Use
+                && action.name == "employees"
+        }));
+
+        let quoted_sql = "CREATE TABLE dept (\"DeptId\" NUMBER(10), DeptName VARCHAR2(50));";
+        let quoted_units = parse_units(quoted_sql, DialectKind::Oracle).unwrap();
+        let quoted_facts = quoted_units[0].facts.as_ref().unwrap();
+        assert!(quoted_facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "dept\u{1f}DeptId"
+        }));
+        assert!(quoted_facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "dept\u{1f}deptname"
         }));
     }
 }

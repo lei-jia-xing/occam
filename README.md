@@ -31,7 +31,7 @@ Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`,
 - Graph-guided search first tests the last statement's backward slice; rejection falls back to linear prefix search without assuming a monotone predicate. Unrestricted deletion and a fixed-point statement audit follow; byte-preserving passes reduce projections, VALUES rows, CTEs, joins, clauses, types, literals, and literal scalar subqueries. These are local guarantees, not a global minimum.
 - External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 
-The frontend uses the selected Generic, PostgreSQL, MySQL, SQLite, DuckDB, or ClickHouse dialect. Statement-local SQL parse errors stay attached to their source units; FFI/transport failures remain separate. Unknown dependency effects stay conservative, and the supplied predicate decides every candidate.
+The frontend uses the selected Generic, PostgreSQL, MySQL, SQLite, DuckDB, ClickHouse, or Oracle Database dialect. Statement-local SQL parse errors stay attached to their source units; FFI/transport failures remain separate. Unknown dependency effects stay conservative, and the supplied predicate decides every candidate.
 
 ## Building
 

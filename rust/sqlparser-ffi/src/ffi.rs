@@ -14,6 +14,7 @@ fn dialect_from_code(code: u32) -> Option<DialectKind> {
         3 => Some(DialectKind::SQLite),
         4 => Some(DialectKind::DuckDB),
         5 => Some(DialectKind::ClickHouse),
+        6 => Some(DialectKind::Oracle),
         _ => None,
     }
 }

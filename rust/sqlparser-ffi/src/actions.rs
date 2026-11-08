@@ -27,7 +27,9 @@ fn barrier(name: &str) -> NativeAction {
 pub(super) fn canonical_ident(ident: &Ident, dialect: DialectKind) -> String {
     let value = match dialect {
         DialectKind::ClickHouse => ident.value.clone(),
-        DialectKind::PostgreSql | DialectKind::DuckDB if ident.quote_style.is_some() => {
+        DialectKind::PostgreSql | DialectKind::DuckDB | DialectKind::Oracle
+            if ident.quote_style.is_some() =>
+        {
             ident.value.clone()
         }
         _ => ident.value.to_lowercase(),
