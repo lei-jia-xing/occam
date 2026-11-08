@@ -10,13 +10,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import MutationalFuzz (mutationalFuzzTests)
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
 import Occam.Reducer (Oracle, reduceSQL)
-import Occam.TreeSitter (
-    collectDescendants,
-    parseSQL,
-    rootNode,
-    withParser,
- )
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -457,11 +452,16 @@ genFuzzScript = do
 instance Arbitrary FuzzScript where
     arbitrary = genFuzzScript
     shrink FuzzScript {..} =
-        -- QuickCheck native shrinking: drop distractor DML while preserving minimal target
-        [ FuzzScript {scriptDml = dml', ..}
-        | dml' <- shrinkList (const []) scriptDml
-        , length dml' >= 2
+        [ FuzzScript {scriptDml = targetDml ++ distractors, ..}
+        | distractors <- shrinkList (const []) distractorDml
         ]
+        where
+            targetDmlCount = case targetKind scriptTarget of
+                TargetTableColRow {} -> 2
+                TargetJoin {} -> 3
+                TargetTx _ _ -> 1
+                TargetExpr _ _ -> 2
+            (targetDml, distractorDml) = splitAt targetDmlCount scriptDml
 
 -- ----------------------------------------------------------------------------
 -- Programmatic Crash Oracle Simulation
@@ -497,35 +497,31 @@ makeScriptOracle FuzzScript {..} bs =
     pure (evalTargetCondition (targetKind scriptTarget) bs)
 
 -- ----------------------------------------------------------------------------
--- Invariant Checkers
--- ----------------------------------------------------------------------------
-
-checkTreeSitterValidity :: ByteString -> IO Bool
-checkTreeSitterValidity sql
-    | BSC.null (BSC.filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t') sql) = pure True
-    | otherwise = withParser $ \parser -> do
-        mTree <- parseSQL parser sql
-        case mTree of
-            Nothing -> pure False
-            Just tree -> do
-                root <- rootNode tree
-                errs <- collectDescendants (== "ERROR") root
-                pure (null errs)
-
--- ----------------------------------------------------------------------------
 -- QuickCheck Properties
 -- ----------------------------------------------------------------------------
 
--- | Invariant 1: Tree-sitter validity (reduced output must parse cleanly with zero corruption)
-prop_treeSitterValidity :: FuzzScript -> Property
-prop_treeSitterValidity script = monadicIO $ do
+checkParserValidity :: SQLDialect -> ByteString -> IO Bool
+checkParserValidity dialect sql = do
+    result <- parseSQL dialect sql
+    pure $ case result of
+        Left _ -> False
+        Right parsed -> all validUnit (parsedUnits parsed)
+    where
+        validUnit unit =
+            case unitParseError unit of
+                Nothing -> True
+                Just _ -> False
+
+-- | The selected dialect accepts reduced SQL without syntax-error units.
+prop_parserValidity :: FuzzScript -> Property
+prop_parserValidity script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL oracle initialSQL)
-    valid <- run (checkTreeSitterValidity reducedSQL)
+    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
+    valid <- run (checkParserValidity SQLite reducedSQL)
     monitor
         ( counterexample
-            ( "Tree-sitter parse failed on reduced SQL:\n"
+            ( "SQL parser rejected reduced output:\n"
                 ++ BSC.unpack reducedSQL
                 ++ "\nOracle desc: "
                 ++ T.unpack (targetDesc (scriptTarget script))
@@ -538,7 +534,7 @@ prop_oracleSoundness :: FuzzScript -> Property
 prop_oracleSoundness script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL oracle initialSQL)
+    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
     sound <- run (oracle reducedSQL)
     monitor
         ( counterexample
@@ -555,7 +551,7 @@ prop_reductionMonotonicity :: FuzzScript -> Property
 prop_reductionMonotonicity script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL oracle initialSQL)
+    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
     let initLen = BSC.length initialSQL
         redLen = BSC.length reducedSQL
     monitor
@@ -568,13 +564,13 @@ prop_reductionMonotonicity script = monadicIO $ do
         )
     assert (redLen <= initLen)
 
--- | Invariant 4: Reducer idempotency (running reduceSQL again reaches the same fixed point)
+-- | Invariant 4: Reducer idempotency reaches the same fixed point.
 prop_reductionIdempotency :: FuzzScript -> Property
 prop_reductionIdempotency script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL oracle initialSQL)
-    secondReducedSQL <- run (reduceSQL oracle reducedSQL)
+    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
+    secondReducedSQL <- run (reduceSQL SQLite oracle reducedSQL)
     monitor
         ( counterexample
             ( "Idempotency violated: fixed-point not reached.\nFirst:\n"
@@ -585,24 +581,22 @@ prop_reductionIdempotency script = monadicIO $ do
         )
     assert (secondReducedSQL == reducedSQL)
 
--- | Comprehensive Heavy Fuzzing Property (All 4 invariants verified on every candidate)
+-- | Comprehensive Heavy Fuzzing Property (syntax validity, oracle, monotonicity, and idempotency).
 prop_heavyFuzzAllInvariants :: FuzzScript -> Property
 prop_heavyFuzzAllInvariants script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL oracle initialSQL)
-
-    valid <- run (checkTreeSitterValidity reducedSQL)
+    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
+    valid <- run (checkParserValidity SQLite reducedSQL)
     sound <- run (oracle reducedSQL)
     let mono = BSC.length reducedSQL <= BSC.length initialSQL
-    secondReducedSQL <- run (reduceSQL oracle reducedSQL)
+    secondReducedSQL <- run (reduceSQL SQLite oracle reducedSQL)
     let idem = secondReducedSQL == reducedSQL
-
     monitor
         ( counterexample
             ( "Fuzz invariant failure!\nTarget: "
                 ++ T.unpack (targetDesc (scriptTarget script))
-                ++ "\nValid CST: "
+                ++ "\nSyntax validity: "
                 ++ show valid
                 ++ ", Soundness: "
                 ++ show sound
@@ -631,8 +625,8 @@ generativeFuzzTests =
     testGroup
         "Generative Fuzzing (Tasty / QuickCheck)"
         [ testProperty
-            "Fuzz 1: Tree-sitter CST Validity (Zero Unparse Corruption)"
-            prop_treeSitterValidity
+            "Fuzz 1: SQL parser accepts reduced output"
+            prop_parserValidity
         , testProperty
             "Fuzz 2: Synthetic Predicate Preservation"
             prop_oracleSoundness
@@ -644,7 +638,7 @@ generativeFuzzTests =
             prop_reductionIdempotency
         , localOption (QuickCheckTests 200) $
             testProperty
-                "Fuzz 5: Deep Stress Invariants (All 4 Invariants Held under Multi-Statement Fuzzing)"
+                "Fuzz 5: Deep Stress Invariants (syntax, oracle, monotonicity, idempotency)"
                 prop_heavyFuzzAllInvariants
         ]
 

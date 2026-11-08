@@ -17,7 +17,6 @@ import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
-import Occam.Dependency (SQLDialect (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -43,13 +42,13 @@ import Occam.Oracle (
     OracleObservationDetails (..),
     prepareOracle,
  )
+import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     ReductionConfig (..),
     SearchStrategy (..),
     defaultReductionConfig,
     reduceSQLWithConfig,
  )
-import Occam.TreeSitter (countStatements)
 import Options.Applicative (
     Parser,
     ParserInfo,
@@ -293,6 +292,7 @@ runOccam opts@Options {..} = do
 
 runOccamWithLogger :: Logger -> Options -> IO ()
 runOccamWithLogger logger Options {..} = do
+    let dialect = optDialect optReductionOptions
     let finitePositive seconds = seconds > 0 && not (isNaN seconds || isInfinite seconds)
         maxSeconds = fromIntegral (maxBound :: Int) / 1000000
         finiteTimeout seconds =
@@ -312,7 +312,7 @@ runOccamWithLogger logger Options {..} = do
         exitFailure
 
     initialSQL <- BS.readFile optInputFile
-    initialStmts <- countStatements initialSQL
+    initialStmts <- countStatementsForCLI logger dialect initialSQL
     let initialBytes = BS.length initialSQL
 
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
@@ -400,6 +400,7 @@ runOccamWithLogger logger Options {..} = do
     result <-
         runEvaluatedReduction
             budgetConfig
+            dialect
             oracleCfg
             logger
             initialSQL
@@ -414,7 +415,7 @@ runOccamWithLogger logger Options {..} = do
             if totalLookups > 0
                 then fromIntegral totalHits / fromIntegral totalLookups
                 else 0.0
-    reducedStmts <- countStatements reducedSQL
+    reducedStmts <- countStatementsForCLI logger dialect reducedSQL
     let reducedBytes = BS.length reducedSQL
         ratio =
             if initialBytes > 0
@@ -505,6 +506,17 @@ runWithinBudget started (Just totalMicros) action = do
     let remaining = max 0 (totalMicros - (now - started) `div` 1000)
         timeoutMicros = fromInteger (min remaining (toInteger (maxBound :: Int)))
     timeout timeoutMicros action
+
+countStatementsForCLI :: Logger -> SQLDialect -> BS.ByteString -> IO Int
+countStatementsForCLI logger dialect sql = do
+    result <- countStatements dialect sql
+    case result of
+        Left err -> do
+            let message = "SQL parser failed while counting statements: " <> T.pack (show err)
+            logError logger "occam::parser" message
+            hPutStrLn stderr ("Error: " ++ T.unpack message)
+            exitFailure
+        Right count -> pure count
 
 toReductionConfig :: ReductionOptions -> ReductionConfig
 toReductionConfig ReductionOptions {..} =

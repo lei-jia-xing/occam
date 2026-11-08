@@ -37,7 +37,6 @@ import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Occam.Cache (CacheStats (..), memoizeOracleWith)
-import Occam.Dependency (SQLDialect (..))
 import Occam.Logger (Logger (..), logInfo')
 import Occam.Oracle (
     OracleConfig (..),
@@ -47,12 +46,12 @@ import Occam.Oracle (
     observeExternalOracleDetailedWith,
     oracleObservationMatches,
  )
+import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     Oracle,
     SearchStrategy (..),
     statementAudit,
  )
-import Occam.TreeSitter (countStatements)
 import System.Directory (renameFile)
 import System.Timeout (timeout)
 
@@ -178,13 +177,14 @@ final checks, and an atomically persisted best accepted result.
 -}
 runEvaluatedReduction ::
     EvaluationConfig ->
+    SQLDialect ->
     OracleConfig ->
     Logger ->
     ByteString ->
     FilePath ->
     ReductionAction ->
     IO EvaluationResult
-runEvaluatedReduction config oracleCfg parentLogger initialSQL checkpoint action = do
+runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoint action = do
     startedAt <- ticks
     let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
         totalStart = startedAt - preflightMicros * 1000
@@ -298,7 +298,10 @@ runEvaluatedReduction config oracleCfg parentLogger initialSQL checkpoint action
             before <- getCacheStats
             callIndex <- readIORef callIndexRef
             modifyIORef' callIndexRef (+ 1)
-            statements <- countStatements candidate
+            statementsResult <- countStatements dialect candidate
+            statements <- case statementsResult of
+                Left err -> ioError (userError ("SQL parser failed while counting statements: " ++ show err))
+                Right count -> pure count
             result <- cachedObservation candidate
             after <- getCacheStats
             let hit = cacheHits after > cacheHits before
@@ -353,7 +356,7 @@ runEvaluatedReduction config oracleCfg parentLogger initialSQL checkpoint action
                         ]
             _ <-
                 ( do
-                    result <- statementAudit auditOracle auditInput
+                    result <- statementAudit dialect auditOracle auditInput
                     initialAccepted <- readIORef auditInitialAcceptedRef
                     writeIORef auditCompletedRef True
                     writeIORef auditUnchangedRef (initialAccepted && result == auditInput)

@@ -82,7 +82,14 @@ else
 fi
 
 if [[ -z "${OCCAM_BIN:-}" ]]; then
-    OCCAM_BIN="$(cd "$ROOT_DIR" && cabal list-bin exe:occam)"
+    if command -v cabal >/dev/null 2>&1; then
+        OCCAM_BIN="$(cd "$ROOT_DIR" && cabal list-bin exe:occam)"
+    elif command -v occam >/dev/null 2>&1; then
+        OCCAM_BIN="$(command -v occam)"
+    else
+        echo "Error: Occam binary not found (install Cabal or add it to PATH)." >&2
+        exit 1
+    fi
 fi
 ARGS=("$SQL_FILE" --oracle "$ORACLE_CMD" --out "$RUN_DIR" --timeout "$TIMEOUT" --dialect "$DEPENDENCY_DIALECT")
 if [[ -n "$RESET_CMD" ]]; then ARGS+=(--reset "$RESET_CMD"); fi

@@ -13,6 +13,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -714,32 +715,35 @@ class ChaosFuzzGenerator:
 
 
 # -----------------------------------------------------------------------------
-# Self-Test and AST Verification Suite
+# Self-Test Suite
 # -----------------------------------------------------------------------------
 
 def run_self_test() -> bool:
-    """Validates fuzzer output scaling (50, 100, 200), Tree-sitter AST parsing, and Occam reduction."""
+    """Validates fuzzer output scaling and Occam reduction."""
     print("======================================================================")
     print("Running Chaos Fuzz SQL Generator Self-Test Suite")
     print("======================================================================")
 
     root = Path(__file__).resolve().parents[2]
     occam_bin: Path | None = None
-    try:
-        res = subprocess.run(["cabal", "list-bin", "occam"], check=False, cwd=root, capture_output=True, text=True)
-        if res.returncode == 0 and res.stdout.strip():
-            p = Path(res.stdout.strip())
-            if p.exists() and os.access(p, os.X_OK):
-                occam_bin = p
-    except Exception:
-        pass
+    if shutil.which("cabal"):
+        try:
+            res = subprocess.run(["cabal", "list-bin", "occam"], check=False, cwd=root,
+                                 capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                path = Path(res.stdout.strip())
+                if path.is_file() and os.access(path, os.X_OK):
+                    occam_bin = path
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if occam_bin is None:
-        candidates = [
-            root / "dist-newstyle" / "build" / "x86_64-linux" / "ghc-9.10.3" / "occam-0.1.0.0" / "x" / "occam" / "build" / "occam" / "occam",
-        ]
-        for c in candidates:
-            if c.exists() and os.access(c, os.X_OK):
-                occam_bin = c
+        found = shutil.which("occam")
+        if found:
+            occam_bin = Path(found)
+    if occam_bin is None:
+        for candidate in root.glob("dist-newstyle/**/occam"):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                occam_bin = candidate
                 break
 
     # Step 1: Scaling tests (50, 100, 200 statements for PG and MySQL)
@@ -748,7 +752,7 @@ def run_self_test() -> bool:
 
     with tempfile.TemporaryDirectory(prefix="occam-fuzz-selftest-") as tmpdir:
         tmp_path = Path(tmpdir)
-        print("\n[Phase 1] Multi-statement scaling & Tree-sitter AST verification...")
+        print("\n[Phase 1] Multi-statement scaling...")
 
         all_ok = True
         for dialect in dialects:
@@ -858,7 +862,7 @@ def main() -> None:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run comprehensive self-test suite (scaling, AST validity, and Occam reduction)",
+        help="Run self-test suite (scaling and Occam reduction)",
     )
 
     args = parser.parse_args()

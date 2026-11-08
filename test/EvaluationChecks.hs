@@ -7,7 +7,6 @@ import Control.Exception (finally)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
-import Occam.Dependency (SQLDialect (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -22,6 +21,8 @@ import Occam.Oracle (
     OracleObservationDetails (..),
     prepareOracle,
  )
+import Occam.Parser (SQLDialect (..))
+import Occam.Reducer (reduceSQL)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
@@ -41,7 +42,7 @@ tests =
                     _ <- oracle candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "accepted checkpoint survives execution cap" candidate (evaluatedSQL result)
             assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
@@ -78,7 +79,7 @@ tests =
                         action _ oracle = oracle candidate >> pure candidate
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
-                            runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                            runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
                         saved <- BS.readFile checkpoint
                         assertEqual "exhausted budget cannot replace accepted SQL" initial saved
                         pure value
@@ -105,7 +106,7 @@ tests =
                     threadDelay 2000000
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "checkpoint remains the last accepted SQL" candidate (evaluatedSQL result)
             assertEqual "timeout is not reported as completion" "timeout" (evaluationStatus metrics)
@@ -123,7 +124,7 @@ tests =
                     _ <- oracle initial
                     pure initial
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "in-flight oracle attempt is counted" 1 (evaluationOracleAttempts metrics)
             assertEqual "oracle process start survives cancellation" 1 (evaluationDatabaseObservations metrics)
@@ -140,12 +141,30 @@ tests =
                     _ <- oracle candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "audit cannot erase the candidate" candidate (evaluatedSQL result)
             assertBool "audit completed" (evaluationAuditCompleted metrics)
             assertEqual "audit found a further reduction" "not-established" (evaluationMinimalityClaim metrics)
             assertBool "candidate passed independent final validation" (evaluationValidationPassed metrics)
+        , testCase "parser transport failures preserve the last accepted checkpoint" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                invalidUtf8 = BS.pack [255]
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = evaluationConfig False Nothing Nothing
+                action _ oracle = do
+                    _ <- oracle candidate
+                    reduceSQL SQLite (const (pure True)) invalidUtf8
+            result <- withCheckpoint $ \checkpoint -> do
+                value <-
+                    runEvaluatedReduction config SQLite oracleCfg nullLogger initial checkpoint action
+                saved <- BS.readFile checkpoint
+                assertEqual "failed parser input cannot overwrite the accepted checkpoint" candidate saved
+                pure value
+            let metrics = evaluationMetrics result
+            assertEqual "parser failure is reported" "error" (evaluationStatus metrics)
+            assertEqual "evaluation returns the last accepted SQL" candidate (evaluatedSQL result)
         , testCase "dialect flags parse to their dependency dialect" $ do
             assertEqual "generic dialect" (Right GenericSQL) (parseSQLDialect "generic")
             assertEqual "PostgreSQL dialect" (Right PostgreSQL) (parseSQLDialect "POSTGRESQL")

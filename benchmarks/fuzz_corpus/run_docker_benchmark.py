@@ -28,22 +28,25 @@ ANTLR_GRAMMARS_PIN = "9fa9f94b20cd3225bd84f27554515da207ec39ff"
 
 
 def find_binary(root: Path, name: str) -> Path | None:
-    try:
-        build_env = os.environ.copy()
-        build_env.pop("GHCRTS", None)
-        result = subprocess.run(["cabal", "list-bin", name], check=False, cwd=root,
-                               capture_output=True, text=True, timeout=10, env=build_env)
-        if result.returncode == 0 and result.stdout.strip():
-            path = Path(result.stdout.strip())
-            if path.is_file() and os.access(path, os.X_OK):
-                return path
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    if shutil.which("cabal"):
+        try:
+            build_env = os.environ.copy()
+            build_env.pop("GHCRTS", None)
+            result = subprocess.run(["cabal", "list-bin", name], check=False, cwd=root,
+                                   capture_output=True, text=True, timeout=10, env=build_env)
+            if result.returncode == 0 and result.stdout.strip():
+                path = Path(result.stdout.strip())
+                if path.is_file() and os.access(path, os.X_OK):
+                    return path
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    found = shutil.which(name)
+    if found:
+        return Path(found)
     for path in root.glob(f"dist-newstyle/**/{name}"):
         if path.is_file() and os.access(path, os.X_OK) and path.name == name:
             return path
-    found = shutil.which(name)
-    return Path(found) if found else None
+    return None
 
 
 def split_sql_statements(sql: str, dialect: str = "") -> list[str]:
@@ -495,6 +498,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     internal_reducer_start: int | None = None
     internal_reducer_count: int | None = None
     native_profile: dict[str, Any] | None = None
+    native_stats: dict[str, Any] | None = None
     native_metrics_path: Path | None = None
     native_metrics_mtime: int | None = None
     native_profile_fresh = False
@@ -584,6 +588,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         if tool == "occam":
             stats = read_json(tool_dir / "stats.json")
             if isinstance(stats, dict):
+                native_stats = stats
                 profile = stats.get("evaluation_metrics")
                 if isinstance(profile, dict):
                     native_profile = profile
@@ -600,6 +605,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             values = read_json(tool_dir / "benchmark.json")
             metrics = values[0] if isinstance(values, list) and values and isinstance(values[0], dict) else None
             if metrics:
+                native_stats = metrics
                 profile = metrics.get("metricEvaluationMetrics")
                 if isinstance(profile, dict):
                     native_profile = profile
@@ -837,6 +843,31 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
     record["result_file"] = str(result_file)
     record["oracle_audit_file"] = str(audit_file)
     set_size_metrics(record, original, candidate_bytes, dialect)
+    if tool in {"occam", "ddmin"} and native_profile_fresh and native_stats is not None:
+        initial_statements = (
+            native_stats.get("initial_statements")
+            if tool == "occam"
+            else native_stats.get("metricInitialStmts")
+        )
+        native_reduced_statements = (
+            native_stats.get("reduced_statements")
+            if tool == "occam"
+            else native_stats.get("metricReducedStmts")
+        )
+        if isinstance(initial_statements, int):
+            reduced_statements = record["reduced_stmts"]
+            if record["checkpoint_used"] == "tool-result" and isinstance(native_reduced_statements, int):
+                reduced_statements = native_reduced_statements
+            record.update(
+                {
+                    "scale": f"{initial_statements} stmts",
+                    "initial_stmts": initial_statements,
+                    "reduced_stmts": reduced_statements,
+                    "stmt_red_pct": round((1 - reduced_statements / initial_statements) * 100, 2)
+                    if initial_statements
+                    else None,
+                }
+            )
     return record
 
 

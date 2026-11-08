@@ -5,11 +5,11 @@ module DependencyChecks (tests) where
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
-import Data.Maybe (maybeToList)
+import Data.Maybe (isJust, isNothing, maybeToList)
 import Data.Set qualified as Set
-import Occam.Core (StatementId (..))
-import Occam.Dependency
-import Occam.TreeSitter (extractStatementUnits, withParsedSQL, withParser)
+import Occam.Core (DependencyType (..), ObjectAction (..), ObjectKind (..), StatementId (..))
+import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
 import Test.QuickCheck (Gen, Property, arbitrary, chooseInt, counterexample, forAll, listOf, resize)
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, testGroup)
@@ -53,6 +53,19 @@ tests =
             assertBool
                 "qualified read excludes the colliding schema"
                 (has (StatementId 5) qualifiedReads && not (has (StatementId 6) qualifiedReads))
+        , testCase "invalid SQL units retain conservative dependency barriers" $ do
+            let sql = BSC.pack "SELECT FROM ; CREATE TABLE t (id INT); SELECT id FROM t;"
+            result <- parseSQL SQLite sql
+            parsed <- case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right value -> pure value
+            case parsedUnits parsed of
+                [invalid, _, _] -> do
+                    assertBool "invalid SQL has no parser facts" (isNothing (unitFacts invalid))
+                    assertBool "invalid SQL exposes its parse error" (isJust (unitParseError invalid))
+                    let graph = analyzeStatements (parsedUnits parsed)
+                    assertBool "invalid SQL is counted as a conservative barrier" (graphBarrierStatements graph > 0)
+                units -> assertFailure ("expected three parser units, got " ++ show (length units))
         , testCase "SQLite and MySQL identifier folding is case-insensitive" $ do
             sqliteGraph <-
                 analyze
@@ -624,13 +637,11 @@ prop_catalogTransitions =
                 )
 
 analyze :: SQLDialect -> ByteString -> IO DependencyGraph
-analyze dialect sql = withParser $ \parser -> do
-    parsed <- withParsedSQL parser sql $ \tree -> do
-        units <- extractStatementUnits tree sql
-        analyzeStatementsWithDialect dialect units sql
-    case parsed of
-        Nothing -> assertFailure "SQL script did not parse"
-        Just graph -> pure graph
+analyze dialect sql = do
+    result <- parseSQL dialect sql
+    case result of
+        Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+        Right parsed -> pure (analyzeStatements (parsedUnits parsed))
 
 actionsFor :: StatementId -> DependencyGraph -> [ObjectAction]
 actionsFor sid graph = Map.findWithDefault [] sid (graphActions graph)

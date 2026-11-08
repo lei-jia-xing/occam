@@ -13,7 +13,6 @@ import Data.Char (toLower)
 import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
-import Occam.Dependency (SQLDialect (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -35,6 +34,7 @@ import Occam.Oracle (
     OracleObservationDetails (..),
     prepareOracle,
  )
+import Occam.Parser (SQLDialect (..))
 import Occam.Reducer (ReductionConfig (..), SearchStrategy (..), defaultReductionConfig)
 import Options.Applicative (
     Parser,
@@ -349,6 +349,7 @@ runEvalWithLogger logger Options {..} = do
                 [("baseline_idx", toJSON baseline)]
             metric <-
                 runSingleAlgorithmBenchmark
+                    (optDialect optReductionOptions)
                     baseline
                     evaluationConfig
                     baseOracleConfig

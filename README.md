@@ -26,12 +26,12 @@ Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`,
 
 ## Architecture
 
-- Tree-sitter C grammar bindings via FFI retain exact byte spans for source-preserving edits; statement extraction uses a shared SQL lexer and attaches CST nodes only on exact span matches.
+- The Rust `sqlparser-rs` frontend receives an explicit dialect and returns statement boundaries and dialect-normalized dependency facts. It emits byte edits only when a node has a complete, exact source range; partial `Spanned` ranges are not treated as whole-node spans. When a compound node lacks a complete range (including some unknown, window, NULL-treatment, or ODBC forms), only recursively verified child edits and statement-level deletion are offered; AST display text is never used to regenerate SQL.
 - Haskell dependency analysis tracks recognized schema generations, table-owned columns/indexes, lexical CTE scopes, and transaction/savepoint catalog snapshots. Unknown scope/effects remain conservative.
 - Graph-guided search first tests the last statement's backward slice; rejection falls back to linear prefix search without assuming a monotone predicate. Unrestricted deletion and a fixed-point statement audit follow; byte-preserving passes reduce projections, VALUES rows, CTEs, joins, clauses, types, literals, and literal scalar subqueries. These are local guarantees, not a global minimum.
 - External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 
-The bundled Tree-sitter grammar does not cover every valid dialect construct: for example, SQLite accepts `SELECT 42 LIMIT 1 OFFSET 0`, but this grammar produces an `ERROR`. Unknown statements retain conservative dependencies; the predicate still decides every candidate. Parser alternatives remain an open question in `TODO.org`, not a new dependency.
+The frontend uses the selected Generic, PostgreSQL, MySQL, or SQLite dialect. Statement-local SQL parse errors stay attached to their source units; FFI/transport failures remain separate. Unknown dependency effects stay conservative, and the supplied predicate decides every candidate.
 
 ## Building
 
@@ -40,9 +40,15 @@ cabal build
 cabal test
 ```
 
-`nix develop` provides the GHC, Tree-sitter, pkg-config, Fourmolu, and HLint development environment. Run `make hooks` once per checkout to enable the repository's pre-commit hook.
+`nix develop` provides GHC, Cabal, Rust/Cargo, rust-analyzer with matching standard-library sources, Rustfmt, Clippy, Fourmolu, HLint, and HLS. Run `make hooks` once per checkout to enable the repository's pre-commit hook.
 
-`make check` checks formatting, runs HLint, builds all project components (including tests) with GHC warnings treated as errors, and runs both test suites. The pre-commit hook runs only `make fmt-check lint build-check`: it checks the working tree, including `bench/`, rather than a staged snapshot, and does not execute tests. Missing formatter/linter commands fall back to `nix develop`; unavailable tools or failed checks stop the hook instead of being skipped.
+The Cabal setup hook builds the locked Rust crate and bundles its static library during ordinary builds; no manual Cargo pre-build is required. `Dockerfile.benchmark` uses a two-stage build and copies only the Occam binaries and benchmark entrypoint into runtime. `benchmarks/docker_run.sh` bind-mounts the checkout at `/workspace`.
+
+The source distribution also includes the Rust crate and `Cargo.lock`; an extracted archive build and an installed-library consumer outside the checkout were verified.
+
+`make check` checks Haskell/Rust formatting, runs HLint, builds all Cabal components with GHC warnings treated as errors, runs the Cabal and Cargo test suites, and runs Rust check/clippy with warnings as errors. The pre-commit hook runs `make fmt-check lint build-check rust-check`: it checks the working tree, including `bench/`, rather than a staged snapshot, and does not execute tests. Missing formatter/linter commands fall back to `nix develop`; unavailable tools or failed checks stop the hook instead of being skipped.
+
+On the final sqlparser-rs source, `make check` passed 101 Haskell cases (91 main-suite plus 10 fuzz-suite cases) and 19 native Rust tests. The final SQLite CLI/container smoke passed two fresh validations; PostgreSQL and MySQL runs exercised parser mechanics only and do not establish database semantics.
 
 The bounded generated properties check slicing and closure against independent `Data.Graph` reachability for every node and root subset on graphs of at most eight statements, and compare two-table SQLite generation/latest-write snapshots across drop/recreate, full rollback, savepoint rollback+release, and outer release. Catalog comparisons exclude transaction-control barrier IDs; they do not prove nested-savepoint, column/index/view, or general SQL semantics.
 

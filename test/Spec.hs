@@ -13,17 +13,18 @@ import Data.List (subsequences)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import DependencyChecks qualified
 import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle)
-import Occam.Core (Span (..), Statement (..), StatementId (..))
-import Occam.Dependency
+import Occam.Core (DependencyType (..), ObjectAction (..), ObjectKind (..), StatementId (..))
+import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Logger (nullLogger)
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), parseSQL)
 import Occam.Reducer
 import Occam.Slicer
-import Occam.TreeSitter
 import OracleChecks qualified
 import ReductionChecks qualified
 import System.Directory (
@@ -79,54 +80,28 @@ tests =
         ]
 
 -- ----------------------------------------------------------------------------
--- Phase 1: Tree-sitter
+-- Phase 1: SQL frontend
 -- ----------------------------------------------------------------------------
 
 phase1Tests :: TestTree
 phase1Tests =
     testGroup
-        "Phase 1: Tree-sitter"
-        [ testCase "Root node & multi-statement extraction" $ do
-            let sampleSQL =
-                    BSC.unlines
-                        [ "CREATE TABLE users (id INT, name TEXT);"
-                        , "INSERT INTO users VALUES (1, 'alice');"
-                        , "SELECT * FROM users WHERE id = 1;"
-                        ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser sampleSQL $ \tree -> do
-                    root <- rootNode tree
-                    rType <- nodeType root
-                    assertEqual "Expected root node type 'program'" "program" rType
-                    stmts <- extractStatements tree sampleSQL
-                    assertEqual "Expected 3 statements" 3 (length stmts)
-                case res of
-                    Nothing -> assertFailure "Failed to parse sample SQL"
-                    Just () -> pure ()
-        , testCase "Byte-span cutting and replacement surgery" $ do
-            let sampleSQL =
-                    BSC.unlines
-                        [ "CREATE TABLE users (id INT, name TEXT);"
-                        , "INSERT INTO users VALUES (1, 'alice');"
-                        , "SELECT * FROM users WHERE id = 1;"
-                        ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser sampleSQL $ \tree -> do
-                    stmts <- extractStatements tree sampleSQL
-                    let stmt2 = stmts !! 1
-                        Span sStart sEnd = stmtSpan stmt2
-                        cutSQL = cutSpan sStart sEnd sampleSQL
-                    assertBool "Cut statement still present in cutSQL" (not (BSC.isInfixOf "INSERT INTO" cutSQL))
-
-                    case stmts of
-                        (stmt1 : _) -> do
-                            let Span s1Start s1End = stmtSpan stmt1
-                                replacedSQL = replaceSpan s1Start s1End "CREATE TABLE t (x INT);" sampleSQL
-                            assertBool "Replacement failed" (BSC.isInfixOf "CREATE TABLE t (x INT);" replacedSQL)
-                        [] -> assertFailure "Expected non-empty statements"
-                case res of
-                    Nothing -> assertFailure "Failed to parse sample SQL"
-                    Just () -> pure ()
+        "SQL frontend"
+        [ testCase "same-line UTF-8 projection surgery preserves retained bytes and CRLF" $ do
+            let kept = TE.encodeUtf8 "SELECT 'café' AS kept, a FROM"
+                sql = kept <> " (SELECT 42 AS a,99 AS b);\r\n"
+                expected = kept <> " (SELECT 42 AS a);\r\n"
+                oracle candidate = pure (BS.isInfixOf kept candidate && BSC.isInfixOf "42 AS a" candidate)
+                config =
+                    defaultReductionConfig
+                        { reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionIntraStatement = True
+                        , reductionUnrestricted = False
+                        , reductionDialect = GenericSQL
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger oracle sql
+            assertEqual "unused projection removal leaves UTF-8 SQL and CRLF untouched" expected reduced
         ]
 
 -- ----------------------------------------------------------------------------
@@ -146,18 +121,11 @@ phase2Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-
-                    let depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                        depsS5 = Map.findWithDefault Set.empty (StatementId 5) (graphEdges graph)
-                    assertBool "s3 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS3))
-                    assertBool "s5 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS5))
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for dependency test"
-                    Just () -> pure ()
+            withGraph GenericSQL script $ \graph -> do
+                let depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                    depsS5 = Map.findWithDefault Set.empty (StatementId 5) (graphEdges graph)
+                assertBool "s3 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS3))
+                assertBool "s5 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS5))
         , testCase "Reads base tables through CTEs, subqueries, and UNION branches" $ do
             let script =
                     BSC.unlines
@@ -172,31 +140,25 @@ phase2Tests =
                         , "SELECT id FROM cte_union"
                         , "WHERE EXISTS (SELECT 1 FROM base_c WHERE base_c.id = cte_union.id);"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let queryId = StatementId 4
-                        queryActions = Map.findWithDefault [] queryId (graphActions graph)
-                        uses =
-                            Set.fromList
-                                [ actionName action
-                                | action <- queryActions
-                                , actionType action == UseDep
-                                , actionKind action == TableObject
-                                ]
-                        deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
-                    assertEqual
-                        "Only external base tables are query reads"
-                        (Set.fromList ["base_a", "base_b", "base_c"])
-                        uses
-                    assertEqual
-                        "Query depends on each referenced base table definition"
-                        (Set.fromList (map StatementId [1, 2, 3]))
-                        deps
-                case res of
-                    Nothing -> assertFailure "Failed to parse CTE dependency test"
-                    Just () -> pure ()
+            withGraph GenericSQL script $ \graph -> do
+                let queryId = StatementId 4
+                    queryActions = Map.findWithDefault [] queryId (graphActions graph)
+                    uses =
+                        Set.fromList
+                            [ actionName action
+                            | action <- queryActions
+                            , actionType action == UseDep
+                            , actionKind action == TableObject
+                            ]
+                    deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
+                assertEqual
+                    "Only external base tables are query reads"
+                    (Set.fromList ["base_a", "base_b", "base_c"])
+                    uses
+                assertEqual
+                    "Query depends on each referenced base table definition"
+                    (Set.fromList (map StatementId [1, 2, 3]))
+                    deps
         , testCase "Backward slicing from crashing statement" $ do
             let script =
                     BSC.unlines
@@ -206,19 +168,13 @@ phase2Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let slice = backwardSlice (StatementId 5) graph
-                    assertBool
-                        "CRITICAL: Statement 2 (t2) should have been pruned by slice"
-                        (not (Set.member (StatementId 2) slice))
-                    assertBool "Statement 1 (CREATE TABLE t1) must be in slice" (Set.member (StatementId 1) slice)
-                    assertBool "Statement 5 (Crash trigger) must be in slice" (Set.member (StatementId 5) slice)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for slicing test"
-                    Just () -> pure ()
+            withGraph GenericSQL script $ \graph -> do
+                let slice = backwardSlice (StatementId 5) graph
+                assertBool
+                    "CRITICAL: Statement 2 (t2) should have been pruned by slice"
+                    (not (Set.member (StatementId 2) slice))
+                assertBool "Statement 1 (CREATE TABLE t1) must be in slice" (Set.member (StatementId 1) slice)
+                assertBool "Statement 5 (Crash trigger) must be in slice" (Set.member (StatementId 5) slice)
         ]
 
 -- ----------------------------------------------------------------------------
@@ -238,22 +194,16 @@ phase3Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0 ORDER BY a LIMIT 1;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    assertBool
-                        "table, data, index, and query form a valid conservative closure"
-                        (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 4, StatementId 5]))
-                    assertBool
-                        "omitting the table definition leaves a dangling dependency"
-                        (not (isValidClosure graph (Set.fromList [StatementId 3, StatementId 4, StatementId 5])))
-                    assertBool
-                        "omitting index state leaves a dangling dependency"
-                        (not (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 5])))
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for closure check"
-                    Just () -> pure ()
+            withGraph GenericSQL script $ \graph -> do
+                assertBool
+                    "table, data, index, and query form a valid conservative closure"
+                    (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 4, StatementId 5]))
+                assertBool
+                    "omitting the table definition leaves a dangling dependency"
+                    (not (isValidClosure graph (Set.fromList [StatementId 3, StatementId 4, StatementId 5])))
+                assertBool
+                    "omitting index state leaves a dangling dependency"
+                    (not (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 5])))
         , testCase "End-to-end multi-statement reduction" $ do
             let script =
                     BSC.unlines
@@ -268,7 +218,7 @@ phase3Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT" sql && BSC.isInfixOf "WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- reduceSQL oracle script
+            reduced <- reduceSQL GenericSQL oracle script
             ok <- oracle reduced
             assertBool "Reduced SQL failed to satisfy the crash oracle" ok
             assertBool "Table t2 was not pruned" (not (BSC.isInfixOf "t2" reduced))
@@ -283,7 +233,7 @@ phase3Tests =
         , testCase "Expression simplification unit test" $ do
             let complexExprSQL = "SELECT * FROM t1 WHERE (a + 10) > 0 AND 1 = 1;"
                 exprOracle sql = pure (BSC.isInfixOf "a" sql && BSC.isInfixOf "> 0" sql)
-            simplifiedExpr <- simplifyExpressions exprOracle complexExprSQL
+            simplifiedExpr <- simplifyExpressions GenericSQL exprOracle complexExprSQL
             assertBool "Failed to simplify 1 = 1" (not (BSC.isInfixOf "1 = 1" simplifiedExpr))
             assertBool "Failed to simplify + 10" (not (BSC.isInfixOf "10" simplifiedExpr))
         ]
@@ -479,69 +429,47 @@ phase7Tests =
                         [ "CREATE TABLE public.orders (id INT);"
                         , "SELECT * FROM public.orders;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool "SELECT should depend on CREATE TABLE public.orders" (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for PG schema test"
-                    Just () -> pure ()
+            withGraph PostgreSQL script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool "SELECT should depend on CREATE TABLE public.orders" (Set.member (StatementId 1) depsS2)
         , testCase "MySQL backticks: `items`" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE `items` (id INT);"
                         , "INSERT INTO `items` VALUES (1);"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool "INSERT should depend on CREATE TABLE `items`" (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for MySQL backticks test"
-                    Just () -> pure ()
-        , testCase "Mixed quotes & casing: \"Customers\" vs \"customers\"" $ do
+            withGraph MySQL script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool "INSERT should depend on CREATE TABLE `items`" (Set.member (StatementId 1) depsS2)
+        , testCase "Unquoted mixed-case PostgreSQL name matches quoted lowercase" $ do
             let script =
                     BSC.unlines
-                        [ "CREATE TABLE \"Customers\" (id INT);"
+                        [ "CREATE TABLE Customers (id INT);"
                         , "SELECT * FROM \"customers\";"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool "SELECT should depend on CREATE TABLE \"Customers\"" (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for mixed quotes/casing test"
-                    Just () -> pure ()
+            withGraph PostgreSQL script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool
+                    "PostgreSQL folds unquoted identifiers to lowercase"
+                    (Set.member (StatementId 1) depsS2)
         , testCase "MySQL ON DUPLICATE KEY UPDATE records ModDep" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE `items` (id INT, val INT);"
                         , "INSERT INTO `items` VALUES (1, 2) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`);"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let actionsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
-                        depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool
-                        "INSERT ... ON DUPLICATE KEY UPDATE should record ModDep on items"
-                        ( any
-                            (\act -> actionKind act == TableObject && actionType act == ModDep && actionName act == "items")
-                            actionsS2
-                        )
-                    assertBool
-                        "INSERT ... ON DUPLICATE KEY UPDATE should depend on CREATE TABLE"
-                        (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for ON DUPLICATE KEY UPDATE test"
-                    Just () -> pure ()
+            withGraph MySQL script $ \graph -> do
+                let actionsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                    depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool
+                    "INSERT ... ON DUPLICATE KEY UPDATE should record ModDep on items"
+                    ( any
+                        (\act -> actionKind act == TableObject && actionType act == ModDep && actionName act == "items")
+                        actionsS2
+                    )
+                assertBool
+                    "INSERT ... ON DUPLICATE KEY UPDATE should depend on CREATE TABLE"
+                    (Set.member (StatementId 1) depsS2)
         , testCase "SQLite bracket identifiers: [products]" $ do
             let script =
                     BSC.unlines
@@ -549,17 +477,11 @@ phase7Tests =
                         , "INSERT INTO [products] VALUES (1, 'widget');"
                         , "SELECT * FROM [products];"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let sliceS3 = backwardSlice (StatementId 3) graph
-                    assertBool
-                        "Backward slice from SELECT should reach CREATE TABLE [products]"
-                        (Set.member (StatementId 1) sliceS3)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for SQLite bracket identifiers test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let sliceS3 = backwardSlice (StatementId 3) graph
+                assertBool
+                    "Backward slice from SELECT should reach CREATE TABLE [products]"
+                    (Set.member (StatementId 1) sliceS3)
         , testCase "SQLite schema-qualified table: main.products" $ do
             let script =
                     BSC.unlines
@@ -567,17 +489,11 @@ phase7Tests =
                         , "INSERT INTO main.products VALUES (1, 'widget');"
                         , "SELECT * FROM main.products;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                    assertBool "INSERT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS2)
-                    assertBool "SELECT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS3)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for SQLite schema test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                assertBool "INSERT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS2)
+                assertBool "SELECT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS3)
         , testCase "SQLite CREATE VIEW and SELECT from view" $ do
             let script =
                     BSC.unlines
@@ -585,17 +501,11 @@ phase7Tests =
                         , "CREATE VIEW v1 AS SELECT * FROM t1;"
                         , "SELECT * FROM v1;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                    assertBool "CREATE VIEW should depend on CREATE TABLE t1" (Set.member (StatementId 1) depsS2)
-                    assertBool "SELECT from view should depend on CREATE VIEW v1" (Set.member (StatementId 2) depsS3)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for CREATE VIEW test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                assertBool "CREATE VIEW should depend on CREATE TABLE t1" (Set.member (StatementId 1) depsS2)
+                assertBool "SELECT from view should depend on CREATE VIEW v1" (Set.member (StatementId 2) depsS3)
         , testCase "SQLite CREATE TABLE t2 AS SELECT * FROM t1 maintains dependencies" $ do
             let script =
                     BSC.unlines
@@ -603,58 +513,47 @@ phase7Tests =
                         , "CREATE TABLE t2 AS SELECT * FROM t1;"
                         , "SELECT * FROM t1;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                        depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                    assertBool
-                        "CREATE TABLE t2 AS SELECT should depend on t1 (Stmt 1)"
-                        (Set.member (StatementId 1) depsS2)
-                    assertBool
-                        "SELECT * FROM t1 must still depend on CREATE TABLE t1 (Stmt 1)"
-                        (Set.member (StatementId 1) depsS3)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for CREATE TABLE AS SELECT test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
+                assertBool
+                    "CREATE TABLE t2 AS SELECT should depend on t1 (Stmt 1)"
+                    (Set.member (StatementId 1) depsS2)
+                assertBool
+                    "SELECT * FROM t1 must still depend on CREATE TABLE t1 (Stmt 1)"
+                    (Set.member (StatementId 1) depsS3)
         , testCase "SQLite foreign key REFERENCES parent(id)" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE parent (id INT PRIMARY KEY);"
                         , "CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id));"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool
-                        "CREATE TABLE child should depend on CREATE TABLE parent"
-                        (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for REFERENCES test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool
+                    "CREATE TABLE child should depend on CREATE TABLE parent"
+                    (Set.member (StatementId 1) depsS2)
         , testCase "SQLite TRUNCATE TABLE records UseDep and ModDep" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE items (id INT);"
                         , "TRUNCATE TABLE items;"
                         ]
-            withParser $ \parser -> do
-                res <- withParsedSQL parser script $ \tree -> do
-                    units <- extractStatementUnits tree script
-                    graph <- analyzeStatements units script
-                    let actsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
-                        depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    assertBool
-                        "TRUNCATE should have ModDep on items"
-                        (any (\a -> actionType a == ModDep && actionName a == "items") actsS2)
-                    assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
-                case res of
-                    Nothing -> assertFailure "Failed to parse script for TRUNCATE test"
-                    Just () -> pure ()
+            withGraph SQLite script $ \graph -> do
+                let actsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                    depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                assertBool
+                    "TRUNCATE should have ModDep on items"
+                    (any (\a -> actionType a == ModDep && actionName a == "items") actsS2)
+                assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
         ]
+
+withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()
+withGraph dialect source action = do
+    result <- parseSQL dialect source
+    case result of
+        Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+        Right parsed -> action (analyzeStatements (parsedUnits parsed))
 
 -- ----------------------------------------------------------------------------
 -- Phase 8: Baselines & Benchmark Runner
@@ -678,7 +577,7 @@ phase8Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- runSequentialDrop oracle script
+            reduced <- runSequentialDrop GenericSQL oracle script
             ok <- oracle reduced
             assertBool "B1 reduced SQL must satisfy oracle" ok
             assertBool "Dead table t2 should be removed by B1" (not (BSC.isInfixOf "t2" reduced))
@@ -700,7 +599,7 @@ phase8Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- runNaiveDdmin oracle script
+            reduced <- runNaiveDdmin GenericSQL oracle script
             ok <- oracle reduced
             assertBool "B2 reduced SQL must satisfy oracle" ok
             assertBool "Dead table t2 should be removed by B2" (not (BSC.isInfixOf "t2" reduced))
@@ -856,44 +755,13 @@ instance Arbitrary TestScript where
                 ]
         lines_ <- sublistOf pool
         extra <- arbitrary :: Gen String
-        let full = BSC.unlines (map BSC.pack lines_ ++ [BSC.pack extra | not (null extra)])
+        let full = BSC.unlines (map BSC.pack lines_ ++ [TE.encodeUtf8 (T.pack extra) | not (null extra)])
         pure (TestScript full)
 
 prop_reductionMonotonicity :: TestScript -> TestOracle -> Property
 prop_reductionMonotonicity (TestScript script) testOracle = monadicIO $ do
-    reduced <- run (reduceSQL (runTestOracle testOracle) script)
+    reduced <- run (reduceSQL SQLite (runTestOracle testOracle) script)
     assert (BS.length reduced <= BS.length script)
-
--- Prop 4: Byte Slicing Non-destructive
-newtype DisjointIntervals
-    = DisjointIntervals (BSC.ByteString, Int, Int, Int, Int, BSC.ByteString, BSC.ByteString)
-    deriving (Show)
-
-instance Arbitrary DisjointIntervals where
-    arbitrary = do
-        str <- arbitrary :: Gen String
-        let src = BSC.pack str
-            len = BS.length src
-        s1 <- chooseInt (0, len)
-        e1 <- chooseInt (s1, len)
-        s2 <- chooseInt (e1, len)
-        e2 <- chooseInt (s2, len)
-        r1 <- BSC.pack <$> arbitrary
-        r2 <- BSC.pack <$> arbitrary
-        pure (DisjointIntervals (src, s1, e1, s2, e2, r1, r2))
-
-prop_byteSlicingNonDestructive :: DisjointIntervals -> Property
-prop_byteSlicingNonDestructive (DisjointIntervals (src, s1, e1, s2, e2, r1, r2)) =
-    let prefix = BS.take s1 src
-        mid = BS.take (s2 - e1) (BS.drop e1 src)
-        suffix = BS.drop e2 src
-        cutResult = cutSpan s1 e1 (cutSpan s2 e2 src)
-        repResult = replaceSpan s1 e1 r1 (replaceSpan s2 e2 r2 src)
-        surroundingCutOk = cutResult == (prefix <> mid <> suffix)
-        surroundingRepOk = repResult == (prefix <> r1 <> mid <> r2 <> suffix)
-     in counterexample
-            ("prefix=" ++ show prefix ++ ", mid=" ++ show mid ++ ", suffix=" ++ show suffix)
-            (surroundingCutOk && surroundingRepOk)
 
 propertyTests :: TestTree
 propertyTests =
@@ -909,7 +777,4 @@ propertyTests =
         , testProperty
             "Prop 3: Reduction Monotonicity (len reduced <= len initial)"
             prop_reductionMonotonicity
-        , testProperty
-            "Prop 4: Byte Slicing Non-destructive on disjoint intervals"
-            prop_byteSlicingNonDestructive
         ]

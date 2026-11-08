@@ -28,33 +28,24 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Word (Word64, Word8)
+import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (
     DependencyGraph (..),
-    SQLDialect (..),
-    analyzeStatementsWithDialect,
-    defaultSQLDialect,
+    analyzeStatements,
  )
 import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
-import Occam.Slicer (backwardSlice)
-import Occam.TreeSitter (
-    Parser,
+import Occam.Parser (
+    ParsedSQL (..),
+    ParserEdit (..),
+    SQLDialect (..),
+    StatementFacts (..),
     StatementUnit (..),
-    TSNode,
-    collectDescendants,
-    cutSpan,
-    extractStatementUnits,
-    nodeNamedChildren,
-    nodeSpan,
-    nodeText,
-    nodeType,
-    replaceSpan,
-    rootNode,
-    withParsedSQL,
-    withParser,
+    defaultSQLDialect,
+    parseSQL,
  )
+import Occam.Slicer (backwardSlice)
 
 -- | The oracle returns True exactly when the complete candidate satisfies the user's predicate.
 type Oracle = ByteString -> IO Bool
@@ -105,6 +96,13 @@ timedStage logger stage action = do
     logStage logger stage (finished - started)
     pure result
 
+parseUnitsOrThrow :: SQLDialect -> ByteString -> IO [StatementUnit]
+parseUnitsOrThrow dialect sql = do
+    parsed <- parseSQL dialect sql
+    case parsed of
+        Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
+        Right result -> pure (parsedUnits result)
+
 {- | A retained candidate set K is closed iff every kept statement's direct
 predecessors are also retained.
 -}
@@ -149,6 +147,8 @@ absorbTrailing source (Span start end) =
 cutSpans :: [Span] -> ByteString -> ByteString
 cutSpans spans source =
     foldl' (\acc (Span start end) -> cutSpan start end acc) source (sortOn (Down . spanStartByte) spans)
+cutSpan :: Int -> Int -> ByteString -> ByteString
+cutSpan start end source = BS.take start source <> BS.drop end source
 
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]
@@ -405,32 +405,24 @@ cddSubsetSize roundNumber count
             | otherwise = bestSize sizes currentBest
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
-statementDdmin :: SearchStrategy -> Oracle -> ByteString -> IO ByteString
-statementDdmin strategy oracle initialSQL =
-    withParser $ \parser -> statementDdminWithParser strategy oracle parser initialSQL
-
-statementDdminWithParser :: SearchStrategy -> Oracle -> Parser -> ByteString -> IO ByteString
-statementDdminWithParser strategy oracle parser initialSQL = do
+statementDdmin :: SQLDialect -> SearchStrategy -> Oracle -> ByteString -> IO ByteString
+statementDdmin dialect strategy oracle initialSQL = do
     initialOK <- oracle initialSQL
     if not initialOK
         then pure initialSQL
         else do
-            parsed <- withParsedSQL parser initialSQL $ \tree -> extractStatementUnits tree initialSQL
-            case parsed of
-                Nothing -> pure initialSQL
-                Just units -> do
-                    let allStatements = map unitStatement units
-                    reduced <- searchStatements strategy plainCandidate oracle initialSQL allStatements allStatements
-                    pure (statementSQL initialSQL allStatements reduced)
+            units <- parseUnitsOrThrow dialect initialSQL
+            let allStatements = map unitStatement units
+            reduced <- searchStatements strategy plainCandidate oracle initialSQL allStatements allStatements
+            pure (statementSQL initialSQL allStatements reduced)
 
 -- | Sequential one-statement deletion to a fixed point; the empty candidate is allowed.
-statementAudit :: Oracle -> ByteString -> IO ByteString
-statementAudit oracle initialSQL = withParser $ \parser -> do
-    (result, _) <- statementAuditWithParser nullLogger oracle parser initialSQL
-    pure result
+statementAudit :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+statementAudit dialect oracle initialSQL = fst <$> statementAuditWithLogger nullLogger dialect oracle initialSQL
 
-statementAuditWithParser :: Logger -> Oracle -> Parser -> ByteString -> IO (ByteString, AuditStats)
-statementAuditWithParser logger oracle parser initialSQL = do
+statementAuditWithLogger ::
+    Logger -> SQLDialect -> Oracle -> ByteString -> IO (ByteString, AuditStats)
+statementAuditWithLogger logger dialect oracle initialSQL = do
     initialOK <- oracle initialSQL
     outcome <-
         if initialOK
@@ -440,19 +432,16 @@ statementAuditWithParser logger oracle parser initialSQL = do
     pure outcome
     where
         loop current passCount attemptCount removalCount = do
-            parsed <- withParsedSQL parser current $ \tree -> extractStatementUnits tree current
-            case parsed of
-                Nothing -> pure (current, AuditStats passCount attemptCount removalCount False)
-                Just units -> do
-                    let statements = map unitStatement units
-                    if null statements
-                        then pure (current, AuditStats passCount attemptCount removalCount True)
-                        else do
-                            (nextSQL, attempts, removals) <- auditPass current statements statements
-                            let nextPassCount = passCount + 1
-                            if removals > 0
-                                then loop nextSQL nextPassCount (attemptCount + attempts) (removalCount + removals)
-                                else pure (current, AuditStats nextPassCount (attemptCount + attempts) removalCount True)
+            units <- parseUnitsOrThrow dialect current
+            let statements = map unitStatement units
+            if null statements
+                then pure (current, AuditStats passCount attemptCount removalCount True)
+                else do
+                    (nextSQL, attempts, removals) <- auditPass current statements statements
+                    let nextPassCount = passCount + 1
+                    if removals > 0
+                        then loop nextSQL nextPassCount (attemptCount + attempts) (removalCount + removals)
+                        else pure (current, AuditStats nextPassCount (attemptCount + attempts) removalCount True)
 
         auditPass baseSQL allStatements candidates = go (statementSQL baseSQL allStatements allStatements) allStatements candidates 0 0
             where
@@ -507,22 +496,20 @@ findInterestingPrefix oracle baseSQL statements = go 1
                         [] -> pure (Nothing, prefixLength)
                     else go (prefixLength + 1)
 
-analyzeSQL ::
-    Logger -> SQLDialect -> Parser -> ByteString -> IO (Maybe ([Statement], DependencyGraph))
-analyzeSQL logger dialect parser sql = do
+analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO ([Statement], DependencyGraph)
+analyzeSQL logger dialect sql = do
     started <- getMonotonicTimeNSec
-    result <- withParsedSQL parser sql $ \tree -> do
-        units <- extractStatementUnits tree sql
-        let statements = map unitStatement units
-        graph <- analyzeStatementsWithDialect dialect units sql
-        graph `seq` pure (statements, graph)
+    units <- parseUnitsOrThrow dialect sql
+    let statements = map unitStatement units
+        graph = analyzeStatements units
+    graph `seq` pure ()
     finished <- getMonotonicTimeNSec
     let elapsed = finished - started
-        statementCount = maybe 0 (length . fst) result
-        edgeCount = maybe 0 (graphEdgeCount . snd) result
-        barrierActions = maybe 0 (graphBarrierActions . snd) result
-        barrierStatements = maybe 0 (graphBarrierStatements . snd) result
-        barrierEdges = maybe 0 (graphBarrierEdges . snd) result
+        statementCount = length statements
+        edgeCount = graphEdgeCount graph
+        barrierActions = graphBarrierActions graph
+        barrierStatements = graphBarrierStatements graph
+        barrierEdges = graphBarrierEdges graph
     logInfo'
         logger
         "occam::reducer"
@@ -535,15 +522,14 @@ analyzeSQL logger dialect parser sql = do
         , ("barrier_edges", toJSON barrierEdges)
         , ("dialect", toJSON (T.pack (show dialect)))
         ]
-    pure result
+    pure (statements, graph)
 
-sliceSQL :: Logger -> SQLDialect -> Oracle -> Parser -> ByteString -> IO ByteString
-sliceSQL logger dialect oracle parser sql = do
-    analyzed <- analyzeSQL logger dialect parser sql
-    case analyzed of
-        Nothing -> pure sql
-        Just ([], _) -> pure sql
-        Just (statements, graph) -> do
+sliceSQL :: Logger -> SQLDialect -> Oracle -> ByteString -> IO ByteString
+sliceSQL logger dialect oracle sql = do
+    (statements, graph) <- analyzeSQL logger dialect sql
+    if null statements
+        then pure sql
+        else do
             let sliceFor target =
                     let slice = backwardSlice (stmtId target) graph
                         retained = filter (\s -> Set.member (stmtId s) slice) statements
@@ -600,22 +586,21 @@ sliceSQL logger dialect oracle parser sql = do
                                         else pure sql
 
 closureSearchSQL ::
-    Logger -> SQLDialect -> SearchStrategy -> Oracle -> Parser -> ByteString -> IO ByteString
-closureSearchSQL logger dialect strategy oracle parser sql = do
-    analyzed <- analyzeSQL logger dialect parser sql
-    case analyzed of
-        Nothing -> pure sql
-        Just (statements, graph)
-            | null statements -> pure sql
-            | otherwise -> do
-                retained <- closureDdminWithLogger logger strategy oracle sql statements graph
-                pure (statementSQL sql statements retained)
+    Logger -> SQLDialect -> SearchStrategy -> Oracle -> ByteString -> IO ByteString
+closureSearchSQL logger dialect strategy oracle sql = do
+    (statements, graph) <- analyzeSQL logger dialect sql
+    if null statements
+        then pure sql
+        else do
+            retained <- closureDdminWithLogger logger strategy oracle sql statements graph
+            pure (statementSQL sql statements retained)
 
-reduceSQL :: Oracle -> ByteString -> IO ByteString
-reduceSQL = reduceSQLWithLogger nullLogger
+reduceSQL :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+reduceSQL dialect = reduceSQLWithLogger dialect nullLogger
 
-reduceSQLWithLogger :: Logger -> Oracle -> ByteString -> IO ByteString
-reduceSQLWithLogger = reduceSQLWithConfig defaultReductionConfig
+reduceSQLWithLogger :: SQLDialect -> Logger -> Oracle -> ByteString -> IO ByteString
+reduceSQLWithLogger dialect =
+    reduceSQLWithConfig (defaultReductionConfig {reductionDialect = dialect})
 
 reduceSQLWithConfig :: ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
 reduceSQLWithConfig config logger oracle initialSQL = do
@@ -624,9 +609,9 @@ reduceSQLWithConfig config logger oracle initialSQL = do
         then do
             logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
             pure initialSQL
-        else withParser $ \parser -> loop parser (1 :: Int) initialSQL
+        else loop (1 :: Int) initialSQL
     where
-        loop parser iteration currentSQL = do
+        loop iteration currentSQL = do
             logInfo'
                 logger
                 "occam::reducer"
@@ -645,9 +630,9 @@ reduceSQLWithConfig config logger oracle initialSQL = do
                 , ("intra_statement", toJSON (reductionIntraStatement config))
                 , ("dialect", toJSON (T.pack (show (reductionDialect config))))
                 ]
-            nextSQL <- reduceIterationWithConfig config logger oracle parser currentSQL
+            nextSQL <- reduceIterationWithConfig config logger oracle currentSQL
             if BS.length nextSQL < BS.length currentSQL
-                then loop parser (iteration + 1) nextSQL
+                then loop (iteration + 1) nextSQL
                 else do
                     logInfo'
                         logger
@@ -659,15 +644,15 @@ reduceSQLWithConfig config logger oracle initialSQL = do
                     pure currentSQL
 
 reduceIterationWithConfig ::
-    ReductionConfig -> Logger -> Oracle -> Parser -> ByteString -> IO ByteString
-reduceIterationWithConfig config logger oracle parser initialSQL = do
+    ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
+reduceIterationWithConfig config logger oracle initialSQL = do
     sliced <-
         if reductionSlicing config
             then
                 timedStage
                     logger
                     "backward-slicing"
-                    (sliceSQL logger (reductionDialect config) oracle parser initialSQL)
+                    (sliceSQL logger (reductionDialect config) oracle initialSQL)
             else pure initialSQL
     searched <-
         if reductionClosure config
@@ -675,25 +660,25 @@ reduceIterationWithConfig config logger oracle parser initialSQL = do
                 timedStage
                     logger
                     "closure-search"
-                    (closureSearchSQL logger (reductionDialect config) (reductionSearch config) oracle parser sliced)
+                    (closureSearchSQL logger (reductionDialect config) (reductionSearch config) oracle sliced)
             else
                 timedStage
                     logger
                     "graph-free-statement-search"
-                    (statementDdminWithParser (reductionSearch config) oracle parser sliced)
+                    (statementDdmin (reductionDialect config) (reductionSearch config) oracle sliced)
     fallback <-
         if reductionClosure config && reductionUnrestricted config
             then
                 timedStage
                     logger
                     "unrestricted-fallback"
-                    (statementDdminWithParser (reductionSearch config) oracle parser searched)
+                    (statementDdmin (reductionDialect config) (reductionSearch config) oracle searched)
             else pure searched
     audited <-
         if reductionUnrestricted config
             then do
                 started <- getMonotonicTimeNSec
-                (result, _) <- statementAuditWithParser logger oracle parser fallback
+                (result, _) <- statementAuditWithLogger logger (reductionDialect config) oracle fallback
                 finished <- getMonotonicTimeNSec
                 logStage logger "statement-audit" (finished - started)
                 pure result
@@ -703,38 +688,21 @@ reduceIterationWithConfig config logger oracle parser initialSQL = do
             timedStage
                 logger
                 "intra-statement-rewrites"
-                (reduceSyntaxWithParser logger oracle parser (const True) audited)
+                (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) audited)
         else pure audited
 
-pruneClauses :: Oracle -> ByteString -> IO ByteString
-pruneClauses oracle sql = withParser (\parser -> pruneClausesWithParser oracle parser sql)
-
-pruneClausesWithParser :: Oracle -> Parser -> ByteString -> IO ByteString
-pruneClausesWithParser oracle parser = reduceSyntaxWithParser nullLogger oracle parser ((== "clause") . editCategory)
+pruneClauses :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+pruneClauses dialect oracle =
+    reduceSyntaxWithDialect nullLogger dialect oracle ((== "clause") . parserEditCategory)
 
 -- Expression-only public pass.
-simplifyExpressions :: Oracle -> ByteString -> IO ByteString
-simplifyExpressions oracle sql = withParser (\parser -> simplifyExpressionsWithParser oracle parser sql)
+simplifyExpressions :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+simplifyExpressions dialect oracle =
+    reduceSyntaxWithDialect nullLogger dialect oracle ((== "expression") . parserEditCategory)
 
-simplifyExpressionsWithParser :: Oracle -> Parser -> ByteString -> IO ByteString
-simplifyExpressionsWithParser oracle parser = reduceSyntaxWithParser nullLogger oracle parser ((== "expression") . editCategory)
-
-data SyntaxEdit = SyntaxEdit
-    { editStart :: !Int
-    , editEnd :: !Int
-    , editReplacement :: !ByteString
-    , editCategory :: !T.Text
-    , editLabel :: !T.Text
-    }
-
-data LocatedNode = LocatedNode
-    { locatedType :: !T.Text
-    , locatedSpan :: !Span
-    }
-
-reduceSyntaxWithParser ::
-    Logger -> Oracle -> Parser -> (SyntaxEdit -> Bool) -> ByteString -> IO ByteString
-reduceSyntaxWithParser logger oracle parser shouldRun initialSQL = do
+reduceSyntaxWithDialect ::
+    Logger -> SQLDialect -> Oracle -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
+reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
     stats <- newIORef (0 :: Int, 0 :: Int, 0 :: Word64)
     result <- go stats initialSQL
     (attempts, accepted, oracleElapsed) <- readIORef stats
@@ -749,18 +717,19 @@ reduceSyntaxWithParser logger oracle parser shouldRun initialSQL = do
     pure result
     where
         go stats currentSQL = do
-            parsed <- withParsedSQL parser currentSQL $ \tree -> do
-                root <- rootNode tree
-                edits <- collectSyntaxEdits currentSQL root
-                tryEdits stats currentSQL (filter shouldRun edits)
-            case parsed of
-                Nothing -> pure currentSQL
-                Just Nothing -> pure currentSQL
-                Just (Just reduced) -> go stats reduced
+            units <- parseUnitsOrThrow dialect currentSQL
+            let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
+            reduced <- tryEdits stats currentSQL edits
+            maybe (pure currentSQL) (go stats) reduced
 
         tryEdits _ _ [] = pure Nothing
         tryEdits stats currentSQL (edit : rest) =
-            let candidate = replaceSpan (editStart edit) (editEnd edit) (editReplacement edit) currentSQL
+            let candidate =
+                    replaceSpan
+                        (parserEditStart edit)
+                        (parserEditEnd edit)
+                        (parserEditReplacement edit)
+                        currentSQL
              in if BS.length candidate >= BS.length currentSQL
                     then tryEdits stats currentSQL rest
                     else do
@@ -778,280 +747,17 @@ reduceSyntaxWithParser logger oracle parser shouldRun initialSQL = do
                                     logger
                                     "occam::reducer"
                                     "Accepted byte-preserving syntax rewrite"
-                                    [ ("rewrite_kind", toJSON (editLabel edit))
-                                    , ("rewrite_category", toJSON (editCategory edit))
-                                    , ("span_start", toJSON (editStart edit))
-                                    , ("span_end", toJSON (editEnd edit))
-                                    , ("replacement", toJSON (TE.decodeUtf8Lenient (editReplacement edit)))
+                                    [ ("rewrite_kind", toJSON (parserEditLabel edit))
+                                    , ("rewrite_category", toJSON (parserEditCategory edit))
+                                    , ("span_start", toJSON (parserEditStart edit))
+                                    , ("span_end", toJSON (parserEditEnd edit))
+                                    , ("replacement", toJSON (TE.decodeUtf8Lenient (parserEditReplacement edit)))
                                     , ("bytes_before", toJSON (BS.length currentSQL))
                                     , ("bytes_after", toJSON (BS.length candidate))
                                     ]
                                 pure (Just candidate)
                             else tryEdits stats currentSQL rest
 
-collectSyntaxEdits :: ByteString -> TSNode -> IO [SyntaxEdit]
-collectSyntaxEdits source root = do
-    nodes <- collectDescendants (const True) root
-    concat <$> mapM (nodeSyntaxEdits source) nodes
-
-nodeSyntaxEdits :: ByteString -> TSNode -> IO [SyntaxEdit]
-nodeSyntaxEdits source node = do
-    nodeName <- nodeType node
-    Span start end <- nodeSpan node
-    children <- nodeNamedChildren node
-    childInfo <- mapM locate children
-    let clauseEdits =
-            [ SyntaxEdit (precedingSpace source start) end BS.empty "clause" ("remove-" <> nodeName)
-            | nodeName `elem` ["where", "order_by", "group_by", "having", "limit", "offset"]
-            ]
-        listEdits = listSyntaxEdits source nodeName childInfo
-        scalarSubquery = case childInfo of
-            [LocatedNode "subquery" _] -> True
-            _ -> False
-    expressionEdits <-
-        if nodeName == "term" && not scalarSubquery
-            then pure []
-            else expressionSyntaxEdits source nodeName (Span start end) children
-    scalarEdits <- scalarSyntaxEdits source nodeName (Span start end)
-    pure (clauseEdits <> listEdits <> expressionEdits <> scalarEdits)
-    where
-        locate child = LocatedNode <$> nodeType child <*> nodeSpan child
-
-precedingSpace :: ByteString -> Int -> Int
-precedingSpace source start
-    | start <= 0 = start
-    | isSQLSpace (BS.index source (start - 1)) = start - 1
-    | otherwise = start
-
-isSQLSpace :: Word8 -> Bool
-isSQLSpace byte = byte == 32 || byte == 9 || byte == 10 || byte == 13
-
-listSyntaxEdits :: ByteString -> T.Text -> [LocatedNode] -> [SyntaxEdit]
-listSyntaxEdits source parentName children =
-    case parentName of
-        "from" -> fromListEdits source children
-        "statement" -> cteListEdits source children
-        "insert" ->
-            let afterValues = drop 1 (dropWhile ((/= "keyword_values") . locatedType) children)
-                rows =
-                    foldr
-                        ( \child rest -> case locatedType child of
-                            "list" -> child : rest
-                            "comment" -> rest
-                            _ -> []
-                        )
-                        []
-                        afterValues
-             in listEditsForItems source "values" rows
-        _ ->
-            case listItemTypes parentName of
-                Nothing -> []
-                Just itemTypes ->
-                    let items = filter ((`elem` itemTypes) . locatedType) children
-                     in listEditsForItems source parentName items
-
-cteListEdits :: ByteString -> [LocatedNode] -> [SyntaxEdit]
-cteListEdits source children =
-    case dropWhile ((/= "keyword_with") . locatedType) children of
-        withNode : rest ->
-            case filter ((== "cte") . locatedType) rest of
-                [] -> []
-                ctes ->
-                    let Span start _ = locatedSpan withNode
-                        Span _ end = locatedSpan (last ctes)
-                     in SyntaxEdit start end BS.empty "list" "remove-with"
-                            : listEditsForItems source "cte" ctes
-        [] -> []
-
-listItemTypes :: T.Text -> Maybe [T.Text]
-listItemTypes parentName =
-    case parentName of
-        "select_expression" -> Just ["term"]
-        "column_definitions" -> Just ["column_definition", "constraint", "constraints"]
-        "constraints" -> Just ["constraint"]
-        "assignment_list" -> Just ["assignment"]
-        "enum_elements" -> Just ["literal", "identifier"]
-        "list" -> Just expressionNodeTypes
-        "ordered_columns" -> Just ["column"]
-        "index_fields" -> Just ["field"]
-        "function_arguments" -> Just ["function_argument"]
-        "_column_list" -> Just ["column"]
-        _ -> Nothing
-
-expressionNodeTypes :: [T.Text]
-expressionNodeTypes =
-    [ "literal"
-    , "identifier"
-    , "field"
-    , "object_reference"
-    , "invocation"
-    , "binary_expression"
-    , "unary_expression"
-    , "parenthesized_expression"
-    , "subquery"
-    , "list"
-    , "case"
-    , "cast"
-    , "implicit_cast"
-    , "exists"
-    , "between_expression"
-    , "not_in"
-    , "select_expression"
-    , "term"
-    ]
-
-fromListEdits :: ByteString -> [LocatedNode] -> [SyntaxEdit]
-fromListEdits source children =
-    let relations = filter ((== "relation") . locatedType) children
-        joins =
-            filter
-                ((`elem` ["join", "cross_join", "lateral_join", "lateral_cross_join"]) . locatedType)
-                children
-        relationEdits =
-            if length relations > 1
-                then listEditsForItems source "from-relation" relations
-                else []
-        joinEdits =
-            [ SyntaxEdit start end BS.empty "list" ("remove-" <> locatedType child)
-            | child <- joins
-            , let Span start end = locatedSpan child
-            ]
-     in relationEdits <> joinEdits
-
-listEditsForItems :: ByteString -> T.Text -> [LocatedNode] -> [SyntaxEdit]
-listEditsForItems source parentName items
-    | length items <= 1 = []
-    | otherwise =
-        [ SyntaxEdit start end BS.empty "list" ("remove-" <> parentName <> "-" <> locatedType item)
-        | (index, item) <- zip [0 ..] items
-        , Just (Span start end) <- [itemRemovalSpan source items index]
-        ]
-
-itemRemovalSpan :: ByteString -> [LocatedNode] -> Int -> Maybe Span
-itemRemovalSpan source items index =
-    case splitAt index items of
-        (before, item : after) ->
-            let Span itemStart itemEnd = locatedSpan item
-             in case (reverse before, after) of
-                    (previous : _, _) ->
-                        let Span _ previousEnd = locatedSpan previous
-                         in fmap (`Span` itemEnd) (findLastByte 44 source previousEnd itemStart)
-                    ([], next : _) ->
-                        let Span nextStart _ = locatedSpan next
-                         in fmap (\comma -> Span itemStart (comma + 1)) (findByte 44 source itemEnd nextStart)
-                    ([], []) -> Nothing
-        _ -> Nothing
-
-findByte :: Word8 -> ByteString -> Int -> Int -> Maybe Int
-findByte byte source start end = go start
-    where
-        go index
-            | index >= end = Nothing
-            | BS.index source index == byte = Just index
-            | otherwise = go (index + 1)
-
-findLastByte :: Word8 -> ByteString -> Int -> Int -> Maybe Int
-findLastByte byte source start end = go (end - 1)
-    where
-        go index
-            | index < start = Nothing
-            | BS.index source index == byte = Just index
-            | otherwise = go (index - 1)
-
-expressionSyntaxEdits :: ByteString -> T.Text -> Span -> [TSNode] -> IO [SyntaxEdit]
-expressionSyntaxEdits source nodeName (Span start end) children
-    | nodeName
-        `notElem` ["binary_expression", "unary_expression", "parenthesized_expression", "exists", "term"] =
-        pure []
-    | otherwise = do
-        replacements <- expressionReplacements source nodeName children
-        pure
-            [ SyntaxEdit start end replacement "expression" ("simplify-" <> nodeName)
-            | replacement <- replacements
-            , BS.length replacement < end - start
-            ]
-
-expressionReplacements :: ByteString -> T.Text -> [TSNode] -> IO [ByteString]
-expressionReplacements source nodeName children =
-    case nodeName of
-        "exists" -> pure ["0"]
-        "binary_expression" ->
-            case children of
-                left : rest@(_ : _) -> do
-                    leftText <- nodeText source left
-                    rightText <- nodeText source (last rest)
-                    pure [leftText, rightText, "0", "1", "'0'"]
-                _ -> pure []
-        "unary_expression" ->
-            case reverse children of
-                operand : _ -> do
-                    operandText <- nodeText source operand
-                    pure [operandText, "0", "1", "'0'"]
-                [] -> pure []
-        "parenthesized_expression" ->
-            case children of
-                inner : _ -> do
-                    innerText <- nodeText source inner
-                    pure [innerText]
-                [] -> pure []
-        "term" ->
-            case children of
-                [subquery] -> do
-                    queries <- nodeNamedChildren subquery
-                    case queries of
-                        [query] -> do
-                            queryChildren <- nodeNamedChildren query
-                            case queryChildren of
-                                [keyword, projection] -> do
-                                    terms <- nodeNamedChildren projection
-                                    case terms of
-                                        [term] -> do
-                                            values <- nodeNamedChildren term
-                                            case values of
-                                                [value] -> do
-                                                    types <- mapM nodeType [query, keyword, projection, term, value]
-                                                    if types == ["select", "keyword_select", "select_expression", "term", "literal"]
-                                                        then (: []) <$> nodeText source value
-                                                        else pure []
-                                                _ -> pure []
-                                        _ -> pure []
-                                _ -> pure []
-                        _ -> pure []
-                _ -> pure []
-        _ -> pure []
-
-scalarSyntaxEdits :: ByteString -> T.Text -> Span -> IO [SyntaxEdit]
-scalarSyntaxEdits source nodeName (Span start end)
-    | nodeName == "literal" = do
-        let raw = BS.take (end - start) (BS.drop start source)
-        pure
-            [ SyntaxEdit start end replacement "literal" "simplify-literal"
-            | replacement <- literalReplacements raw
-            , BS.length replacement < end - start
-            ]
-    | Just replacement <- typeReplacement nodeName =
-        pure
-            [ SyntaxEdit start end replacement "type" ("simplify-type-" <> nodeName)
-            | BS.length replacement < end - start
-            ]
-    | otherwise = pure []
-
-literalReplacements :: ByteString -> [ByteString]
-literalReplacements raw
-    | not (BS.null raw) && BS.head raw == 39 = ["''", "'0'", "NULL", "0"]
-    | otherwise = ["0", "1", "NULL", "FALSE", "TRUE", "''"]
-
-typeReplacement :: T.Text -> Maybe ByteString
-typeReplacement nodeName =
-    case nodeName of
-        "bigint" -> Just "INT"
-        "mediumint" -> Just "INT"
-        "smallint" -> Just "INT"
-        "decimal" -> Just "INT"
-        "numeric" -> Just "INT"
-        "double" -> Just "FLOAT"
-        "varchar" -> Just "TEXT"
-        "nvarchar" -> Just "TEXT"
-        "varbinary" -> Just "BLOB"
-        "boolean" -> Just "BOOL"
-        _ -> Nothing
+replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
+replaceSpan start end replacement source =
+    BS.take start source <> replacement <> BS.drop end source

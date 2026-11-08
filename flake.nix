@@ -31,18 +31,15 @@
               haskell-language-server
               fourmolu
               hlint
-              pkg-config
+              rustc
+              cargo
+              rust-analyzer
+              rustfmt
+              clippy
             ];
-
-            # Shared C libraries
-            buildInputs = with pkgs; [
-              tree-sitter
-            ];
-
-            # Ensure dynamic loader finds C FFI shared libraries at runtime
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.tree-sitter ];
-
+            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             shellHook = ''
+              export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
               if [ -d .githooks ]; then
                 git config core.hooksPath .githooks
               fi

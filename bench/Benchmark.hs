@@ -25,6 +25,7 @@ import Occam.Evaluation (
  )
 import Occam.Logger (Logger)
 import Occam.Oracle (OracleConfig)
+import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     Oracle,
     ReductionConfig (..),
@@ -32,7 +33,6 @@ import Occam.Reducer (
     reduceSQLWithConfig,
     statementDdmin,
  )
-import Occam.TreeSitter (countStatements)
 import System.FilePath ((</>))
 
 data BenchmarkMetric = BenchmarkMetric
@@ -68,7 +68,8 @@ runComparisonBenchmark ::
     FilePath ->
     IO [BenchmarkMetric]
 runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDir = do
-    initialStmts <- countStatements sql
+    let dialect = reductionDialect baseConfig
+    initialStmts <- countStatementsOrFail dialect sql
     let cacheEnabled = evaluationCacheEnabled evaluationConfig
         noSlicing = baseConfig {reductionSlicing = False}
         noClosure = baseConfig {reductionClosure = False}
@@ -96,8 +97,8 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
             ( name
             , artifact
             , cacheEnabled
-            , statementSettings cacheEnabled strategy
-            , \_ oracle input -> statementDdmin strategy oracle input
+            , statementSettings dialect cacheEnabled strategy
+            , \_ oracle input -> statementDdmin dialect strategy oracle input
             )
         profiles =
             [ pipeline "Occam" "occam" baseConfig cacheEnabled
@@ -105,15 +106,15 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
                 ( "B1 (Sequential)"
                 , "b1-sequential"
                 , cacheEnabled
-                , statementOnlySettings cacheEnabled "sequential-deletion"
-                , \_ oracle input -> runSequentialDrop oracle input
+                , statementOnlySettings dialect cacheEnabled "sequential-deletion"
+                , \_ oracle input -> runSequentialDrop dialect oracle input
                 )
             ,
                 ( "B2 (Statement ddmin)"
                 , "b2-statement-ddmin"
                 , cacheEnabled
-                , statementSettings cacheEnabled CountDD
-                , \_ oracle input -> runNaiveDdmin oracle input
+                , statementSettings dialect cacheEnabled CountDD
+                , \_ oracle input -> runNaiveDdmin dialect oracle input
                 )
             , statementTrack "WeightedDD (statement ddmin)" "weighted-dd" WeightedDD
             , statementTrack "CDD (statement ddmin)" "cdd" CDD
@@ -135,9 +136,10 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
                 baseConfig
                 (not cacheEnabled)
             ]
-    mapM (runOne evaluationConfig oracleConfig logger sql initialStmts outDir) profiles
+    mapM (runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir) profiles
 
 runSingleAlgorithmBenchmark ::
+    SQLDialect ->
     Int ->
     EvaluationConfig ->
     OracleConfig ->
@@ -145,8 +147,8 @@ runSingleAlgorithmBenchmark ::
     ByteString ->
     FilePath ->
     IO BenchmarkMetric
-runSingleAlgorithmBenchmark baselineIdx evaluationConfig oracleConfig logger sql outDir = do
-    initialStmts <- countStatements sql
+runSingleAlgorithmBenchmark dialect baselineIdx evaluationConfig oracleConfig logger sql outDir = do
+    initialStmts <- countStatementsOrFail dialect sql
     let cacheEnabled = evaluationCacheEnabled evaluationConfig
     profile <- case baselineIdx of
         1 ->
@@ -154,21 +156,22 @@ runSingleAlgorithmBenchmark baselineIdx evaluationConfig oracleConfig logger sql
                 ( "B1 (Sequential)"
                 , "b1-sequential"
                 , cacheEnabled
-                , statementOnlySettings cacheEnabled "sequential-deletion"
-                , \_ oracle input -> runSequentialDrop oracle input
+                , statementOnlySettings dialect cacheEnabled "sequential-deletion"
+                , \_ oracle input -> runSequentialDrop dialect oracle input
                 )
         2 ->
             pure
                 ( "B2 (Statement ddmin)"
                 , "b2-statement-ddmin"
                 , cacheEnabled
-                , statementSettings cacheEnabled CountDD
-                , \_ oracle input -> runNaiveDdmin oracle input
+                , statementSettings dialect cacheEnabled CountDD
+                , \_ oracle input -> runNaiveDdmin dialect oracle input
                 )
         _ -> ioError (userError "baseline index must be 1 or 2")
-    runOne evaluationConfig oracleConfig logger sql initialStmts outDir profile
+    runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir profile
 
 runOne ::
+    SQLDialect ->
     EvaluationConfig ->
     OracleConfig ->
     Logger ->
@@ -177,7 +180,7 @@ runOne ::
     FilePath ->
     BenchmarkProfile ->
     IO BenchmarkMetric
-runOne evaluationConfig oracleConfig logger sql initialStmts outDir (name, artifactName, cacheEnabled, settings, action) = do
+runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (name, artifactName, cacheEnabled, settings, action) = do
     let sqlPath = outDir </> (artifactName ++ ".sql")
         metricsPath = outDir </> (artifactName ++ ".json")
         runConfig = evaluationConfig {evaluationCacheEnabled = cacheEnabled}
@@ -185,12 +188,13 @@ runOne evaluationConfig oracleConfig logger sql initialStmts outDir (name, artif
     EvaluationResult {..} <-
         runEvaluatedReduction
             runConfig
+            dialect
             oracleConfig
             logger
             sql
             sqlPath
             (\reducerLogger oracle -> action reducerLogger oracle sql)
-    reducedStmts <- countStatements evaluatedSQL
+    reducedStmts <- countStatementsOrFail dialect evaluatedSQL
     let metrics = evaluationMetrics
         reducedBytes = BS.length evaluatedSQL
         metric =
@@ -217,6 +221,13 @@ reductionPercent initial reduced
     | initial > 0 = (1.0 - fromIntegral reduced / fromIntegral initial) * 100.0
     | otherwise = 0.0
 
+countStatementsOrFail :: SQLDialect -> ByteString -> IO Int
+countStatementsOrFail dialect sql = do
+    result <- countStatements dialect sql
+    case result of
+        Left err -> ioError (userError ("SQL parser failed while counting statements: " ++ show err))
+        Right count -> pure count
+
 reductionSettings :: Bool -> ReductionConfig -> Value
 reductionSettings cacheEnabled ReductionConfig {..} =
     object
@@ -230,19 +241,21 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "dialect" .= sqlDialectName reductionDialect
         ]
 
-statementOnlySettings :: Bool -> Text -> Value
-statementOnlySettings cacheEnabled strategy =
+statementOnlySettings :: SQLDialect -> Bool -> Text -> Value
+statementOnlySettings dialect cacheEnabled strategy =
     object
         [ "kind" .= strategy
         , "unit" .= ("top-level-statement" :: Text)
         , "cache" .= cacheEnabled
+        , "dialect" .= sqlDialectName dialect
         ]
 
-statementSettings :: Bool -> SearchStrategy -> Value
-statementSettings cacheEnabled strategy =
+statementSettings :: SQLDialect -> Bool -> SearchStrategy -> Value
+statementSettings dialect cacheEnabled strategy =
     object
         [ "kind" .= ("statement-ddmin" :: Text)
         , "unit" .= ("top-level-statement" :: Text)
         , "search_strategy" .= searchStrategyName strategy
         , "cache" .= cacheEnabled
+        , "dialect" .= sqlDialectName dialect
         ]

@@ -1,4 +1,41 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    libffi-dev \
+    libgmp-dev \
+    libncurses-dev \
+    libtinfo-dev \
+    libzstd-dev \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+    https://get-ghcup.haskell.org -o /tmp/ghcup.sh \
+    && env BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
+        BOOTSTRAP_HASKELL_GHC_VERSION=9.10.3 \
+        BOOTSTRAP_HASKELL_CABAL_VERSION=3.16.1.0 \
+        BOOTSTRAP_HASKELL_INSTALL_NO_STACK=1 \
+        sh /tmp/ghcup.sh \
+    && rm /tmp/ghcup.sh
+
+ENV PATH="/root/.cargo/bin:/root/.ghcup/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
+    https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN cabal build exe:occam exe:occam-eval \
+    && install -D -m 0755 "$(cabal list-bin exe:occam)" /opt/occam/bin/occam \
+    && install -D -m 0755 "$(cabal list-bin exe:occam-eval)" /opt/occam/bin/occam-eval
+
+FROM ubuntu:24.04 AS benchmark
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,12 +51,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     libpq-dev \
+    libgmp10 \
+    libffi8 \
+    libtinfo6 \
+    libzstd1 \
     jq \
     curl \
     git \
     make \
     gcc \
-    libtree-sitter-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,4 +68,9 @@ ENV SQLREDUCE_SOURCE=/opt/sqlreduce/568c8a9a31601ead7128d0b067658b4d5a26821d
 
 WORKDIR /workspace
 
-ENTRYPOINT ["/workspace/harness/docker_entrypoint.sh"]
+COPY --from=builder /opt/occam/bin/occam /usr/local/bin/occam
+COPY --from=builder /opt/occam/bin/occam-eval /usr/local/bin/occam-eval
+COPY --from=builder /workspace/harness/docker_entrypoint.sh /usr/local/bin/occam-benchmark-entrypoint
+RUN chmod 0755 /usr/local/bin/occam-benchmark-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/occam-benchmark-entrypoint"]

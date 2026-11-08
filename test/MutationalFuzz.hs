@@ -20,25 +20,19 @@ module MutationalFuzz (
     prop_lexicalNoiseSoundness,
 
     -- * Test Tree & Runner
-    checkTreeSitterValidity,
     mutationalFuzzTests,
     main,
 ) where
 
-import Control.Monad (foldM)
+import Control.Monad (foldM, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Char (toUpper)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
 import Occam.Reducer (Oracle, reduceSQL)
-import Occam.TreeSitter (
-    collectDescendants,
-    parseSQL,
-    rootNode,
-    withParser,
- )
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -47,6 +41,7 @@ import Test.QuickCheck (
     counterexample,
     elements,
     forAll,
+    forAllShrink,
     frequency,
  )
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
@@ -361,22 +356,20 @@ compositeMutate initialSQL = do
                 ]
 
 -- ----------------------------------------------------------------------------
--- Syntactic Validity Checker
--- ----------------------------------------------------------------------------
-
-checkTreeSitterValidity :: ByteString -> IO Bool
-checkTreeSitterValidity sql = withParser $ \p -> do
-    mTree <- parseSQL p sql
-    case mTree of
-        Nothing -> pure False
-        Just tree -> do
-            root <- rootNode tree
-            errs <- collectDescendants (\t -> t == "ERROR" || t == "MISSING") root
-            pure (null errs)
-
--- ----------------------------------------------------------------------------
 -- QuickCheck Invariant Properties
 -- ----------------------------------------------------------------------------
+
+checkParserValidity :: SQLDialect -> ByteString -> IO Bool
+checkParserValidity dialect sql = do
+    result <- parseSQL dialect sql
+    pure $ case result of
+        Left _ -> False
+        Right parsed -> all validUnit (parsedUnits parsed)
+    where
+        validUnit unit =
+            case unitParseError unit of
+                Nothing -> True
+                Just _ -> False
 
 -- | Invariant 1: Injected dead tables are completely pruned
 prop_deadTablesPruned :: Property
@@ -384,7 +377,7 @@ prop_deadTablesPruned = forAll (elements seedPool) $ \seed ->
     forAll (injectDeadTables (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -396,7 +389,7 @@ prop_bloatExpressionsSimplified = forAll (elements seedPool) $ \seed ->
     forAll (bloatExpressions (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -408,55 +401,63 @@ prop_optionalClausesPruned = forAll (elements seedPool) $ \seed ->
     forAll (injectOptionalClauses (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
         assert (not (BSC.isInfixOf "ORDER BY 1" s_red))
         assert (not (BSC.isInfixOf "LIMIT 9999" s_red))
 
--- | Invariant 4: Lexical noise does not compromise reduction or validity
+-- | Invariant 4: Lexical noise does not compromise reduction or syntax validity
 prop_lexicalNoiseSoundness :: Property
 prop_lexicalNoiseSoundness = forAll (elements seedPool) $ \seed ->
     forAll (injectLexicalNoise (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
-        valid <- run (checkTreeSitterValidity s_red)
-        monitor (counterexample "Reduced SQL failed Tree-sitter syntax validation")
+        valid <- run (checkParserValidity SQLite s_red)
+        monitor (counterexample "Reduced SQL was rejected by the selected dialect parser")
         assert valid
 
--- | Grand Invariant: Mutational Recovery property asserting all 4 invariants under composite mutation
+-- | Grand Invariant: Mutational recovery preserves syntax, the oracle, and output bounds.
 prop_mutationRecovery :: Property
 prop_mutationRecovery = forAll (elements seedPool) $ \seed ->
-    forAll (compositeMutate (seedSQL seed)) $ \s_mutated -> monadicIO $ do
+    forAllShrink (compositeMutate (seedSQL seed)) (const []) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
-        monitor (counterexample "Mutated SQL failed initial crash oracle check")
+        unless origOk $
+            monitor (counterexample "Mutated SQL failed initial crash oracle check")
         assert origOk
-        s_red <- run (reduceSQL (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
         -- 1. Crash is strictly preserved
         crashPreserved <- run (seedOracle seed s_red)
-        monitor (counterexample "Invariant 1 Failed: Crash was not strictly preserved")
+        unless crashPreserved $
+            monitor (counterexample "Invariant 1 Failed: Crash was not strictly preserved")
         assert crashPreserved
         -- 2. Monotonic length reduction
         let lenRed = BS.length s_red
             lenMut = BS.length s_mutated
-        monitor
-            (counterexample ("Invariant 2 Failed: Length not monotonic: " ++ show lenRed ++ " > " ++ show lenMut))
+        when (lenRed > lenMut) $
+            monitor
+                (counterexample ("Invariant 2 Failed: Length not monotonic: " ++ show lenRed ++ " > " ++ show lenMut))
         assert (lenRed <= lenMut)
-        -- 3. Tree-sitter parses s_red successfully (syntactic validity)
-        valid <- run (checkTreeSitterValidity s_red)
-        monitor (counterexample "Invariant 3 Failed: Tree-sitter parsing syntax error in reduced SQL")
+        -- 3. The selected SQL dialect accepts the reduced units.
+        valid <- run (checkParserValidity SQLite s_red)
+        unless valid $
+            monitor
+                ( counterexample
+                    ("Invariant 3 Failed: selected-dialect parser rejected reduced SQL:\n" ++ BSC.unpack s_red)
+                )
         assert valid
         -- 4. Injected noise tables (e.g. noise_tbl) are pruned from s_red
         let noisePruned = not (BSC.isInfixOf "noise_tbl" s_red)
-        monitor
-            ( counterexample
-                ("Invariant 4 Failed: Injected noise_tbl was not pruned from reduced SQL:\n" ++ BSC.unpack s_red)
-            )
+        unless noisePruned $
+            monitor
+                ( counterexample
+                    ("Invariant 4 Failed: Injected noise_tbl was not pruned from reduced SQL:\n" ++ BSC.unpack s_red)
+                )
         assert noisePruned
 
 -- ----------------------------------------------------------------------------

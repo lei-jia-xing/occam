@@ -1,7 +1,5 @@
 module Occam.Dependency (
     ObjectName,
-    SQLDialect (..),
-    defaultSQLDialect,
     ObjectKind (..),
     DependencyType (..),
     ObjectAction (..),
@@ -9,71 +7,26 @@ module Occam.Dependency (
     emptyGraph,
     isBarrierAction,
     extractActions,
-    extractActionsWithDialect,
     buildGraph,
     analyzeStatements,
-    analyzeStatementsWithDialect,
 ) where
 
-import Data.ByteString (ByteString)
-import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, mapMaybe, maybeToList)
+import Data.Maybe (catMaybes, isNothing, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
-import Occam.Core (Statement (..), StatementId (..))
-import Occam.SQLLexer (SQLToken (..), lexSQL)
-import Occam.TreeSitter (
-    StatementUnit (..),
-    TSNode,
-    collectDescendants,
-    nodeNamedChildren,
-    nodeText,
-    nodeType,
+import Occam.Core (
+    DependencyType (..),
+    ObjectAction (..),
+    ObjectKind (..),
+    ObjectName,
+    Statement (..),
+    StatementId (..),
  )
-
-type ObjectName = Text
-
-data SQLDialect
-    = GenericSQL
-    | PostgreSQL
-    | MySQL
-    | SQLite
-    deriving (Eq, Ord, Show)
-
-defaultSQLDialect :: SQLDialect
-defaultSQLDialect = GenericSQL
-
-data ObjectKind
-    = TableObject
-    | TemporaryTableObject
-    | ColumnObject
-    | IndexObject
-    | ViewObject
-    | TriggerObject
-    | BarrierObject
-    deriving (Eq, Ord, Show)
-
-data DependencyType
-    = DefDep
-    | UseDep
-    | ModDep
-    | DropDep
-    | RenameFromDep
-    | RenameToDep
-    | BarrierDep
-    deriving (Eq, Ord, Show)
-
-data ObjectAction = ObjectAction
-    { actionKind :: !ObjectKind
-    , actionType :: !DependencyType
-    , actionName :: !ObjectName
-    }
-    deriving (Eq, Ord, Show)
+import Occam.Parser (StatementFacts (..), StatementUnit (..))
 
 data DependencyGraph = DependencyGraph
     { graphStmts :: !(Set StatementId)
@@ -102,65 +55,8 @@ isBarrierAction :: ObjectAction -> Bool
 isBarrierAction act =
     actionKind act == BarrierObject || actionType act == BarrierDep
 
--- PostgreSQL preserves quoted case; SQLite is case-insensitive, and MySQL names
--- are folded case-insensitively as a conservative lower_case_table_names assumption.
-normalizeName :: SQLDialect -> ByteString -> Text
-normalizeName dialect = canonicalName dialect . T.strip . TE.decodeUtf8Lenient
-
-canonicalName :: SQLDialect -> Text -> Text
-canonicalName dialect =
-    T.intercalate "." . map normalizePart . splitIdentifier
-    where
-        normalizePart (quoted, part) =
-            let normalized =
-                    if dialect == PostgreSQL && quoted
-                        then part
-                        else T.toLower part
-             in escapePart normalized
-
-splitIdentifier :: Text -> [(Bool, Text)]
-splitIdentifier = go . T.unpack
-    where
-        go input =
-            case dropWhile isSpace input of
-                [] -> []
-                opener : rest
-                    | Just closer <- closingQuote opener ->
-                        let (part, suffix) = quoted closer rest
-                         in (True, T.pack part) : go (afterDot suffix)
-                    | otherwise ->
-                        let (part, suffix) = break (== '.') input
-                         in (False, T.strip (T.pack part)) : go (afterDot suffix)
-
-        quoted _ [] = ([], [])
-        quoted closer (c : cs)
-            | c == closer =
-                case cs of
-                    next : rest | next == closer -> let (part, suffix) = quoted closer rest in (closer : part, suffix)
-                    _ -> ([], cs)
-            | otherwise =
-                let (part, suffix) = quoted closer cs
-                 in (c : part, suffix)
-
-        afterDot suffix =
-            case dropWhile isSpace suffix of
-                '.' : rest -> rest
-                rest -> rest
-
-closingQuote :: Char -> Maybe Char
-closingQuote '"' = Just '"'
-closingQuote '`' = Just '`'
-closingQuote '[' = Just ']'
-closingQuote _ = Nothing
-
-escapePart :: Text -> Text
-escapePart = T.concatMap escape
-    where
-        escape c
-            | c == '.' || c == '\\' = T.pack ['\\', c]
-            | otherwise = T.singleton c
-
--- Canonical parts retain their escapes and can be joined without re-encoding.
+-- Canonical object names use escaped dots and backslashes between dialect
+-- parsing and the catalog. Quoted/case-folding decisions happen in Occam.Parser.
 canonicalParts :: Text -> [Text]
 canonicalParts = go . T.unpack
     where
@@ -185,564 +81,26 @@ lastNamePart name =
         [] -> name
         parts -> last parts
 
-columnName :: ObjectName -> ObjectName -> ObjectName
-columnName table column = table <> "\x1f" <> column
-
--- ----------------------------------------------------------------------------
--- CST Pattern Matching & Action Extraction
--- ----------------------------------------------------------------------------
-
-hasDescendantType :: Text -> TSNode -> IO Bool
-hasDescendantType targetType node = do
-    matches <- collectDescendants (== targetType) node
-    pure (not (null matches))
-
-extractActions :: StatementUnit -> ByteString -> IO [ObjectAction]
-extractActions = extractActionsWithDialect defaultSQLDialect
-
-extractActionsWithDialect :: SQLDialect -> StatementUnit -> ByteString -> IO [ObjectAction]
-extractActionsWithDialect dialect statementUnit src = do
-    control <- transactionControlForStatement dialect statementUnit
-    case control of
-        Just command -> pure [ObjectAction BarrierObject BarrierDep (transactionActionName command)]
-        Nothing ->
-            case unitNode statementUnit of
-                Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
-                Just stmtNode -> do
-                    rootType <- nodeType stmtNode
-                    hasError <- hasDescendantType "ERROR" stmtNode
-                    if hasError || rootType == "ERROR"
-                        then pure [ObjectAction BarrierObject BarrierDep "__syntax_error_barrier__"]
-                        else
-                            if not (supportedStatement rootType)
-                                then pure [ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"]
-                                else do
-                                    actions <- inspectChild dialect Set.empty src stmtNode
-                                    pure $
-                                        if null actions
-                                            then []
-                                            else Set.toList (Set.fromList actions)
-
-supportedStatement :: Text -> Bool
-supportedStatement t =
-    t
-        `elem` [ "statement"
-               , "create_table"
-               , "create_view"
-               , "create_materialized_view"
-               , "create_index"
-               , "create_trigger"
-               , "drop_table"
-               , "drop_view"
-               , "drop_materialized_view"
-               , "drop_index"
-               , "drop_trigger"
-               , "alter_table"
-               , "_select_statement"
-               , "insert"
-               , "replace"
-               , "update"
-               , "delete"
-               , "_truncate_statement"
-               , "truncate"
-               , "select"
-               , "from"
-               , "transaction"
-               , "set"
-               , "set_statement"
-               , "reset_statement"
-               ]
-
-inspectStatement :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-inspectStatement dialect outerCTEs src node = do
-    children <- scopedQueryChildren dialect outerCTEs src node
-    let childTypes = [t | (t, _, _) <- children]
-    if "keyword_truncate" `elem` childTypes
-        then truncateActions dialect outerCTEs src node
-        else
-            if null children
-                then pure [unknownStatement]
-                else concat <$> mapM inspectStatementChild children
-    where
-        unknownStatement = ObjectAction BarrierObject BarrierDep "__unknown_stmt_barrier__"
-
-        inspectStatementChild (t, child, env)
-            | (supportedStatement t && t /= "statement") || t == "cte" =
-                inspectChild dialect env src child
-            | t `elem` statementWrappers = do
-                nested <- scopedQueryChildren dialect env src child
-                if null nested
-                    then pure [unknownStatement]
-                    else concat <$> mapM inspectStatementChild nested
-            | t `elem` ["keyword_with", "keyword_recursive"] = pure []
-            | otherwise = do
-                nested <- nodeNamedChildren child
-                nestedActions <- concat <$> mapM (inspectChild dialect env src) nested
-                pure (unknownStatement : nestedActions)
-
-        statementWrappers =
-            [ "_ddl_statement"
-            , "_create_statement"
-            , "_alter_statement"
-            , "_drop_statement"
-            , "_insert_statement"
-            , "_update_statement"
-            , "_delete_statement"
-            , "_truncate_statement"
-            , "_select_statement"
-            , "_select_body"
-            , "_subquery_body"
-            , "_dml_write"
-            , "_dml_read"
-            ]
-
-inspectChild :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-inspectChild dialect outerCTEs src node = do
-    t <- nodeType node
-    case t of
-        "statement" -> inspectStatement dialect outerCTEs src node
-        "_select_statement" -> queryActions dialect outerCTEs src node
-        "create_table" -> createTableActions dialect src node
-        "create_view" -> createViewActions dialect src node
-        "create_materialized_view" -> createViewActions dialect src node
-        "create_index" -> createIndexActions dialect src node
-        "create_trigger" -> createTriggerActions dialect src node
-        "drop_table" -> dropActions dialect TableObject src node
-        "drop_view" -> dropActions dialect ViewObject src node
-        "drop_materialized_view" -> dropActions dialect ViewObject src node
-        "drop_index" -> dropActions dialect IndexObject src node
-        "drop_trigger" -> dropActions dialect TriggerObject src node
-        "alter_table" -> alterTableActions dialect src node
-        "insert" -> dmlActions dialect outerCTEs src node
-        "replace" -> dmlActions dialect outerCTEs src node
-        "update" -> dmlActions dialect outerCTEs src node
-        "delete" -> dmlActions dialect outerCTEs src node
-        "_truncate_statement" -> truncateActions dialect outerCTEs src node
-        "truncate" -> truncateActions dialect outerCTEs src node
-        "select" -> queryActions dialect outerCTEs src node
-        "from" -> queryActions dialect outerCTEs src node
-        "transaction" -> pure [ObjectAction BarrierObject BarrierDep "__tx_barrier__"]
-        "set" -> pure [sessionBarrier]
-        "set_statement" -> pure [sessionBarrier]
-        "reset_statement" -> pure [sessionBarrier]
-        _ -> do
-            children <- nodeNamedChildren node
-            concat <$> mapM (inspectChild dialect outerCTEs src) children
-    where
-        sessionBarrier = ObjectAction BarrierObject BarrierDep "__session_barrier__"
-truncateActions :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-truncateActions dialect outerCTEs src node = do
-    tables <- findTableReferences dialect outerCTEs src node
-    pure $
-        case tables of
-            [] -> [ObjectAction BarrierObject BarrierDep "__unknown_truncate_barrier__"]
-            _ -> [ObjectAction TableObject ModDep table | table <- tables]
-
-createTableActions :: SQLDialect -> ByteString -> TSNode -> IO [ObjectAction]
-createTableActions dialect src node = do
-    target <- findDirectTarget dialect src node
-    case target of
-        Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_ddl_barrier__"]
-        Just (table, targetNode) -> do
-            references <- findTableReferencesExcept dialect Set.empty [targetNode] src node
-            temporary <-
-                (||)
-                    <$> hasDescendantType "keyword_temp" node
-                    <*> hasDescendantType "keyword_temporary" node
-            definitions <- findColumnDefinitions dialect table src node
-            let temporarySchema =
-                    dialect `elem` [SQLite, PostgreSQL] && isQualifiedName table && isTemporarySchema table
-                tableKind = if temporary || temporarySchema then TemporaryTableObject else TableObject
-            pure $
-                ObjectAction tableKind DefDep table
-                    : [ObjectAction TableObject UseDep ref | ref <- references]
-                    ++ definitions
-
-createViewActions :: SQLDialect -> ByteString -> TSNode -> IO [ObjectAction]
-createViewActions dialect src node = do
-    target <- findDirectTarget dialect src node
-    case target of
-        Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_view_barrier__"]
-        Just (view, targetNode) -> do
-            references <- findTableReferencesExcept dialect Set.empty [targetNode] src node
-            columns <- columnUseActions dialect references src node
-            pure $
-                ObjectAction ViewObject DefDep view
-                    : [ObjectAction TableObject UseDep ref | ref <- references]
-                    ++ columns
-
-createIndexActions :: SQLDialect -> ByteString -> TSNode -> IO [ObjectAction]
-createIndexActions dialect src node = do
-    children <- nodeNamedChildren node
-    typed <- mapM (\child -> (,child) <$> nodeType child) children
-    let targets =
-            [ child
-            | (t, child) <- takeWhile ((/= "keyword_on") . fst) typed
-            , t `elem` ["identifier", "object_reference"]
-            ]
-    case reverse targets of
-        [] -> pure [ObjectAction BarrierObject BarrierDep "__unknown_index_barrier__"]
-        targetNode : _ -> do
-            index <- normalizeName dialect <$> nodeText src targetNode
-            references <- findTableReferencesExcept dialect Set.empty [targetNode] src node
-            columns <- columnUseActions dialect references src node
-            pure $
-                ObjectAction IndexObject DefDep index
-                    : [ObjectAction TableObject UseDep ref | ref <- references]
-                    ++ columns
-
-createTriggerActions :: SQLDialect -> ByteString -> TSNode -> IO [ObjectAction]
-createTriggerActions dialect src node = do
-    target <- findDirectTarget dialect src node
-    case target of
-        Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_trigger_barrier__"]
-        Just (trigger, targetNode) -> do
-            references <- findTableReferencesExcept dialect Set.empty [targetNode] src node
-            pure $
-                ObjectAction TriggerObject DefDep trigger
-                    : [ObjectAction TableObject UseDep ref | ref <- references]
-                    ++ [ObjectAction BarrierObject BarrierDep "__trigger_semantics_barrier__"]
-
-dropActions :: SQLDialect -> ObjectKind -> ByteString -> TSNode -> IO [ObjectAction]
-dropActions dialect kind src node = do
-    tables <- findTableReferences dialect Set.empty src node
-    target <- findDirectTarget dialect src node
-    temporary <-
-        if kind == TableObject
-            then
-                (||)
-                    <$> hasDescendantType "keyword_temp" node
-                    <*> hasDescendantType "keyword_temporary" node
-            else pure False
-    let actionKind' = if temporary then TemporaryTableObject else kind
-        names =
-            if null tables
-                then maybe [] (pure . fst) target
-                else tables
-    pure $
-        if null names
-            then [ObjectAction BarrierObject BarrierDep "__unknown_drop_barrier__"]
-            else [ObjectAction actionKind' DropDep name | name <- names]
-
-alterTableActions :: SQLDialect -> ByteString -> TSNode -> IO [ObjectAction]
-alterTableActions dialect src node = do
-    target <- findDirectTarget dialect src node
-    renameNodes <- collectDescendants (== "rename_object") node
-    case (target, renameNodes) of
-        (Just (oldName, _), renameNode : _) -> do
-            newName <- lastIdentifierName dialect src renameNode
-            case newName of
-                Just rawNew -> do
-                    let newName' = qualifyRename oldName rawNew
-                    pure
-                        [ ObjectAction TableObject RenameFromDep oldName
-                        , ObjectAction TableObject RenameToDep newName'
-                        ]
-                Nothing -> pure [ObjectAction TableObject ModDep oldName, unknownAlter]
-        (Just (table, _), []) -> do
-            added <- collectDescendants (== "column_definition") node
-            addActions <- fmap concat (mapM (columnDefinitionAction dialect table src) added)
-            dropped <- collectDescendants (== "drop_column") node
-            dropActions' <- fmap concat (mapM (columnDropAction dialect table src) dropped)
-            renamed <- collectDescendants (== "rename_column") node
-            renameActions <- fmap concat (mapM (columnRenameActions dialect table src) renamed)
-            pure $
-                ObjectAction TableObject ModDep table
-                    : addActions
-                    ++ dropActions'
-                    ++ renameActions
-        _ -> pure [unknownAlter]
-    where
-        unknownAlter = ObjectAction BarrierObject BarrierDep "__unknown_alter_barrier__"
-
 qualifyRename :: ObjectName -> ObjectName -> ObjectName
 qualifyRename oldName newName
     | isQualifiedName oldName && not (isQualifiedName newName) =
         T.intercalate "." (init (canonicalParts oldName) ++ [newName])
     | otherwise = newName
 
-columnDefinitionAction :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-columnDefinitionAction dialect table src node = do
-    name <- firstIdentifierName dialect src node
-    pure [ObjectAction ColumnObject DefDep (columnName table col) | col <- maybeToList name]
+-- ----------------------------------------------------------------------------
+-- sqlparser-derived facts
+-- ----------------------------------------------------------------------------
 
-columnDropAction :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-columnDropAction dialect table src node = do
-    name <- firstIdentifierName dialect src node
-    pure [ObjectAction ColumnObject DropDep (columnName table col) | col <- maybeToList name]
-
-columnRenameActions :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-columnRenameActions dialect table src node = do
-    names <- identifierNames dialect src node
-    pure $ case names of
-        oldName : newName : _ ->
-            [ ObjectAction ColumnObject DropDep (columnName table oldName)
-            , ObjectAction ColumnObject DefDep (columnName table newName)
-            ]
-        _ -> []
-
-findColumnDefinitions :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-findColumnDefinitions dialect table src node = do
-    definitions <- collectDescendants (== "column_definition") node
-    concat <$> mapM (columnDefinitionAction dialect table src) definitions
-
-findDirectTarget :: SQLDialect -> ByteString -> TSNode -> IO (Maybe (ObjectName, TSNode))
-findDirectTarget dialect src node = do
-    children <- nodeNamedChildren node
-    findTarget children
-    where
-        findTarget [] = pure Nothing
-        findTarget (child : rest) = do
-            t <- nodeType child
-            if t == "object_reference"
-                then targetFrom child
-                else
-                    if t == "relation"
-                        then do
-                            refs <- collectDescendants (== "object_reference") child
-                            case refs of
-                                ref : _ -> targetFrom ref
-                                [] -> targetFrom child
-                        else findTarget rest
-
-        targetFrom candidate = do
-            name <- normalizeName dialect <$> nodeText src candidate
-            if T.null name
-                then pure Nothing
-                else pure (Just (name, candidate))
-
-firstIdentifierName :: SQLDialect -> ByteString -> TSNode -> IO (Maybe ObjectName)
-firstIdentifierName dialect src node = do
-    names <- identifierNames dialect src node
-    pure $ case names of
-        name : _ -> Just name
-        [] -> Nothing
-
-lastIdentifierName :: SQLDialect -> ByteString -> TSNode -> IO (Maybe ObjectName)
-lastIdentifierName dialect src node = do
-    names <- identifierNames dialect src node
-    pure $ case names of
-        [] -> Nothing
-        _ -> Just (last names)
-
-identifierNames :: SQLDialect -> ByteString -> TSNode -> IO [ObjectName]
-identifierNames dialect src node = do
-    ids <- collectDescendants isIdentifierNode node
-    names <- mapM (fmap (normalizeName dialect) . nodeText src) ids
-    pure (filter (not . T.null) names)
-    where
-        isIdentifierNode t =
-            t `elem` ["identifier", "object_id", "object_reference", "field"]
-
-dmlActions :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-dmlActions dialect outerCTEs src node = do
-    t <- nodeType node
-    target <- findDirectTarget dialect src node
-    case target of
-        Nothing -> pure [ObjectAction BarrierObject BarrierDep "__unknown_dml_barrier__"]
-        Just (targetName, targetNode) -> do
-            sources <- findTableReferencesExcept dialect outerCTEs [targetNode] src node
-            columns <-
-                columnUseActions
-                    dialect
-                    (if t `elem` ["update", "delete"] then targetName : sources else sources)
-                    src
-                    node
-            columnWrites <-
-                if t `elem` ["update", "insert", "replace"]
-                    then updateColumnActions dialect targetName src node
-                    else pure []
-            insertedColumns <-
-                if t `elem` ["insert", "replace"]
-                    then insertColumnActions dialect targetName src node
-                    else pure []
-            pure $
-                ObjectAction TableObject ModDep targetName
-                    : [ObjectAction TableObject UseDep source | source <- sources]
-                    ++ columns
-                    ++ columnWrites
-                    ++ insertedColumns
-
-insertColumnActions :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-insertColumnActions dialect table src node = do
-    children <- nodeNamedChildren node
-    typed <- mapM (\child -> (,child) <$> nodeType child) children
-    let targetLists =
-            [ child
-            | (t, child) <- takeWhile ((`notElem` ["keyword_values", "select", "from"]) . fst) typed
-            , t == "list"
-            ]
-    names <- concat <$> mapM (identifierNames dialect src) targetLists
-    pure [ObjectAction ColumnObject ModDep (columnName table (lastNamePart name)) | name <- names]
-
-updateColumnActions :: SQLDialect -> ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-updateColumnActions dialect table src node = do
-    assignments <- collectDescendants (== "assignment") node
-    names <- mapM assignmentTarget assignments
-    pure
-        [ ObjectAction ColumnObject ModDep (columnName table (lastNamePart name))
-        | name <- Set.toList (Set.fromList (catMaybes names))
+extractActions :: StatementUnit -> [ObjectAction]
+extractActions unit =
+    maybe
+        [ ObjectAction BarrierObject BarrierDep $
+            if isNothing (unitParseError unit)
+                then "__unknown_stmt_barrier__"
+                else "__syntax_error_barrier__"
         ]
-    where
-        assignmentTarget assignment = do
-            children <- nodeNamedChildren assignment
-            case children of
-                target : _ -> firstIdentifierName dialect src target
-                [] -> pure Nothing
-
-queryActions :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectAction]
-queryActions dialect outerCTEs src node = do
-    tables <- findTableReferences dialect outerCTEs src node
-    columns <- columnUseActions dialect tables src node
-    pure ([ObjectAction TableObject UseDep table | table <- tables] ++ columns)
-
-columnUseActions :: SQLDialect -> [ObjectName] -> ByteString -> TSNode -> IO [ObjectAction]
-columnUseActions dialect tables src node = do
-    fields <- collectDescendants isField node
-    fieldNames <- mapM (fmap (normalizeName dialect) . nodeText src) fields
-    let actions =
-            [ ObjectAction ColumnObject UseDep (columnName table column)
-            | fieldName <- Set.toList (Set.fromList (filter (not . T.null) fieldNames))
-            , let parts = canonicalParts fieldName
-            , not (null parts)
-            , let column = last parts
-            , let qualifier = T.intercalate "." (init parts)
-            , table <- columnTables qualifier tables
-            ]
-    pure actions
-    where
-        isField t = t == "field" || t == "_qualified_field"
-
-        columnTables qualifier candidates
-            | T.null qualifier = candidates
-            | otherwise =
-                let exact =
-                        [ table
-                        | table <- candidates
-                        , table == qualifier || lastNamePart table == lastNamePart qualifier
-                        ]
-                 in if null exact then candidates else exact
-
-findTableReferences :: SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [ObjectName]
-findTableReferences dialect outerCTEs =
-    findTableReferencesExcept dialect outerCTEs []
-
-findTableReferencesExcept ::
-    SQLDialect ->
-    Set ObjectName ->
-    [TSNode] ->
-    ByteString ->
-    TSNode ->
-    IO [ObjectName]
-findTableReferencesExcept dialect outerCTEs excluded src node = do
-    refs <- collectRefs outerCTEs node
-    names <- mapM (fmap (normalizeName dialect) . nodeText src) refs
-    pure
-        ( Set.toList
-            ( Set.fromList
-                [ name
-                | (ref, name) <- zip refs names
-                , ref `notElem` excluded
-                , not (T.null name)
-                ]
-            )
-        )
-    where
-        collectRefs env current = do
-            t <- nodeType current
-            if t == "invocation"
-                then pure []
-                else do
-                    children <- scopedQueryChildren dialect env src current
-                    let visibleChildren = if t == "cte" then drop 1 children else children
-                    childRefs <- concat <$> mapM (\(_, child, childEnv) -> collectRefs childEnv child) visibleChildren
-                    hasObjectRef <- hasDescendantType "object_reference" current
-                    let isReference = t == "object_reference" || (t == "relation" && not hasObjectRef)
-                    if not isReference
-                        then pure childRefs
-                        else do
-                            raw <- nodeText src current
-                            let name = normalizeName dialect raw
-                            pure $
-                                if isCTEReference env name
-                                    then childRefs
-                                    else current : childRefs
-
-        isCTEReference env name =
-            not (isQualifiedName name) && Set.member (lastNamePart name) env
-
-scopedQueryChildren ::
-    SQLDialect -> Set ObjectName -> ByteString -> TSNode -> IO [(Text, TSNode, Set ObjectName)]
-scopedQueryChildren dialect outerCTEs src node = do
-    children <- nodeNamedChildren node
-    typed <- mapM identify children
-    let localCTEs = Set.fromList (mapMaybe (\(_, _, alias) -> alias) typed)
-        visible = Set.union outerCTEs localCTEs
-        recursive = any (\(t, _, _) -> t == "keyword_recursive") typed
-        scope _ [] = []
-        scope prior ((t, child, alias) : rest) =
-            let env = if t == "cte" && not recursive then prior else visible
-                next = maybe prior (`Set.insert` prior) alias
-             in (t, child, env) : scope next rest
-    pure (scope outerCTEs typed)
-    where
-        identify child = do
-            t <- nodeType child
-            alias <-
-                if t == "cte"
-                    then do
-                        parts <- nodeNamedChildren child
-                        case parts of
-                            nameNode : _ -> do
-                                name <- normalizeName dialect <$> nodeText src nameNode
-                                pure (if T.null name then Nothing else Just name)
-                            [] -> pure Nothing
-                    else pure Nothing
-            pure (t, child, alias)
-
-transactionControlForStatement :: SQLDialect -> StatementUnit -> IO (Maybe TxCommand)
-transactionControlForStatement dialect statementUnit =
-    pure $
-        parseTransactionControl
-            dialect
-            (stmtRaw (unitStatement statementUnit))
-
-parseTransactionControl :: SQLDialect -> ByteString -> Maybe TxCommand
-parseTransactionControl dialect sql =
-    case lexSQL sql of
-        WordToken "begin" : _ -> Just TxBegin
-        WordToken "start" : WordToken "transaction" : _ -> Just TxBegin
-        WordToken "commit" : _ -> Just TxCommit
-        WordToken "end" : _ -> Just TxCommit
-        WordToken "rollback" : WordToken "to" : rest ->
-            TxRollbackTo <$> savepointName dialect (dropSavepointKeyword rest)
-        WordToken "rollback" : WordToken "work" : WordToken "to" : rest ->
-            TxRollbackTo <$> savepointName dialect (dropSavepointKeyword rest)
-        WordToken "rollback" : WordToken "transaction" : WordToken "to" : rest ->
-            TxRollbackTo <$> savepointName dialect (dropSavepointKeyword rest)
-        WordToken "rollback" : _ -> Just TxRollback
-        WordToken "abort" : _ -> Just TxRollback
-        WordToken "savepoint" : rest -> TxSavepoint <$> savepointName dialect rest
-        WordToken "release" : rest -> TxRelease <$> savepointName dialect (dropSavepointKeyword rest)
-        _ -> Nothing
-    where
-        dropSavepointKeyword (WordToken "savepoint" : rest) = rest
-        dropSavepointKeyword rest = rest
-
-savepointName :: SQLDialect -> [SQLToken] -> Maybe ObjectName
-savepointName dialect tokens =
-    case tokens of
-        WordToken name : _ -> Just (canonicalName dialect name)
-        IdentifierToken name : _ -> Just (canonicalPart dialect True name)
-        _ -> Nothing
-
-canonicalPart :: SQLDialect -> Bool -> Text -> Text
-canonicalPart dialect isQuoted part =
-    escapePart
-        ( if dialect == PostgreSQL && isQuoted
-            then part
-            else T.toLower part
-        )
+        factActions
+        (unitFacts unit)
 
 data TxCommand
     = TxBegin
@@ -753,13 +111,14 @@ data TxCommand
     | TxRelease !ObjectName
     deriving (Eq, Show)
 
-transactionActionName :: TxCommand -> ObjectName
-transactionActionName TxBegin = "__tx_begin__"
-transactionActionName TxCommit = "__tx_commit__"
-transactionActionName TxRollback = "__tx_rollback__"
-transactionActionName (TxSavepoint name) = "__tx_savepoint__\x1e" <> name
-transactionActionName (TxRollbackTo name) = "__tx_rollback_to__\x1e" <> name
-transactionActionName (TxRelease name) = "__tx_release__\x1e" <> name
+-- Facts were parsed once with the selected dialect; graph construction stays
+-- independent of SQL syntax and retains object generations and transaction snapshots.
+analyzeStatements :: [StatementUnit] -> DependencyGraph
+analyzeStatements units =
+    buildGraph
+        [ (stmtId (unitStatement unit), extractActions unit)
+        | unit <- units
+        ]
 
 -- ----------------------------------------------------------------------------
 -- Dependency DAG Construction
@@ -1369,21 +728,3 @@ txCommandFromAction name =
                 Just label -> Just (TxRollbackTo label)
                 Nothing ->
                     TxRelease <$> T.stripPrefix "__tx_release__\x1e" name
-
--- | End-to-end analyzer; the existing entry point keeps its generic SQL rules.
-analyzeStatements :: [StatementUnit] -> ByteString -> IO DependencyGraph
-analyzeStatements = analyzeStatementsWithDialect defaultSQLDialect
-
-analyzeStatementsWithDialect ::
-    SQLDialect ->
-    [StatementUnit] ->
-    ByteString ->
-    IO DependencyGraph
-analyzeStatementsWithDialect dialect units src = do
-    stmtActions <- mapM extractUnit units
-    pure (buildGraph stmtActions)
-    where
-        extractUnit unit = do
-            let sid = stmtId (unitStatement unit)
-            actions <- extractActionsWithDialect dialect unit src
-            pure (sid, actions)
