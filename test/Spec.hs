@@ -546,6 +546,20 @@ phase7Tests =
                     "TRUNCATE should have ModDep on items"
                     (any (\a -> actionType a == ModDep && actionName a == "items") actsS2)
                 assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
+        , testCase "DuckDB dialect parses range and list comprehension syntax" $ do
+            let script = "SELECT * FROM range(10); SELECT [x + 1 FOR x IN [1, 2, 3]];"
+            result <- parseSQL DuckDB script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "DuckDB parses two statement units" 2 (length (parsedUnits parsed))
+        , testCase "ClickHouse dialect parses numbers and engine clauses" $ do
+            let script = "CREATE TABLE t (id UInt64) ENGINE = MergeTree() ORDER BY id; SELECT number FROM numbers(5);"
+            result <- parseSQL ClickHouse script
+            case result of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right parsed ->
+                    assertEqual "ClickHouse parses two statement units" 2 (length (parsedUnits parsed))
         ]
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()

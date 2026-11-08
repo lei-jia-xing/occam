@@ -22,6 +22,8 @@ enum DialectKind {
     PostgreSql,
     MySql,
     SQLite,
+    DuckDB,
+    ClickHouse,
 }
 
 #[derive(Serialize)]
@@ -640,5 +642,72 @@ mod tests {
                 edit.label
             );
         }
+    }
+
+    #[test]
+    fn duckdb_dialect_parsing_and_statement_boundaries() {
+        let sql = "SELECT range(5);\nSELECT {'a': 1, 'b': 2};\nCREATE TABLE t (\"QuotedCol\" INT, unquoted_col INT);";
+        assert_eq!(count_units(sql, DialectKind::DuckDB), Ok(3));
+        let mut ffi_count = 0;
+        let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), 4, &mut ffi_count) };
+        assert_eq!(status, 0);
+        assert_eq!(ffi_count, 3);
+
+        let units = parse_units(sql, DialectKind::DuckDB).unwrap();
+        assert_eq!(units.len(), 3);
+        assert_eq!(&sql[units[0].start..units[0].end], "SELECT range(5)");
+        assert_eq!(
+            &sql[units[1].start..units[1].end],
+            "SELECT {'a': 1, 'b': 2}"
+        );
+        assert_eq!(
+            &sql[units[2].start..units[2].end],
+            "CREATE TABLE t (\"QuotedCol\" INT, unquoted_col INT)"
+        );
+
+        let facts = units[2].facts.as_ref().unwrap();
+        assert!(facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "t\u{1f}QuotedCol"
+        }));
+        assert!(facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "t\u{1f}unquoted_col"
+        }));
+    }
+
+    #[test]
+    fn clickhouse_dialect_parsing_and_statement_boundaries() {
+        let sql = "SELECT number FROM numbers(10);\nCREATE TABLE events (EventId UInt64, event_name String) ENGINE = MergeTree ORDER BY EventId;";
+        assert_eq!(count_units(sql, DialectKind::ClickHouse), Ok(2));
+        let mut ffi_count = 0;
+        let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), 5, &mut ffi_count) };
+        assert_eq!(status, 0);
+        assert_eq!(ffi_count, 2);
+
+        let units = parse_units(sql, DialectKind::ClickHouse).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            &sql[units[0].start..units[0].end],
+            "SELECT number FROM numbers(10)"
+        );
+        assert_eq!(
+            &sql[units[1].start..units[1].end],
+            "CREATE TABLE events (EventId UInt64, event_name String) ENGINE = MergeTree ORDER BY EventId"
+        );
+        let facts = units[1].facts.as_ref().unwrap();
+        // ClickHouse identifiers are case-sensitive: EventId preserves case even unquoted.
+        assert!(facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "events\u{1f}EventId"
+        }));
+        assert!(facts.actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column
+                && action.action == NativeActionType::Def
+                && action.name == "events\u{1f}event_name"
+        }));
     }
 }

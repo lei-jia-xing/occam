@@ -257,7 +257,7 @@ reductionOptionsParser =
                 <> metavar "DIALECT"
                 <> value GenericSQL
                 <> showDefault
-                <> help "SQL dependency dialect: generic, postgresql, mysql, or sqlite"
+                <> help "SQL dependency dialect: generic, postgresql, mysql, sqlite, duckdb, or clickhouse"
             )
 
 toggle :: Bool -> String -> String -> String -> Parser Bool

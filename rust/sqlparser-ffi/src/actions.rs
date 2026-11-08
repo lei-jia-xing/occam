@@ -25,10 +25,12 @@ fn barrier(name: &str) -> NativeAction {
 }
 
 pub(super) fn canonical_ident(ident: &Ident, dialect: DialectKind) -> String {
-    let value = if dialect == DialectKind::PostgreSql && ident.quote_style.is_some() {
-        ident.value.clone()
-    } else {
-        ident.value.to_lowercase()
+    let value = match dialect {
+        DialectKind::ClickHouse => ident.value.clone(),
+        DialectKind::PostgreSql | DialectKind::DuckDB if ident.quote_style.is_some() => {
+            ident.value.clone()
+        }
+        _ => ident.value.to_lowercase(),
     };
     escape_part(&value)
 }
@@ -101,7 +103,10 @@ fn column_name(table: &str, column: &str) -> String {
 }
 
 fn temp_schema(name: &ObjectName, dialect: DialectKind) -> bool {
-    if !matches!(dialect, DialectKind::SQLite | DialectKind::PostgreSql) {
+    if !matches!(
+        dialect,
+        DialectKind::SQLite | DialectKind::PostgreSql | DialectKind::DuckDB
+    ) {
         return false;
     }
     let Some(parts) = name_parts(name, dialect) else {

@@ -190,6 +190,36 @@ tests =
             assertEqual "SQLite quoted/comment semicolons stay within units" 2 sqliteCount
             assertEqual "PostgreSQL dollar and escaped strings stay within units" 2 postgresCount
             assertEqual "MySQL backticks and strings stay within units" 2 mysqlCount
+            duckdbCount <- countOrFail DuckDB "SELECT [1, 2, 3]; -- comment\nSELECT * FROM range(5);"
+            clickhouseCount <- countOrFail ClickHouse "SELECT number FROM numbers(10); -- comment\nSELECT 1;"
+            assertEqual "DuckDB statements stay within units" 2 duckdbCount
+            assertEqual "ClickHouse statements stay within units" 2 clickhouseCount
+        , testCase "DuckDB dependency extraction and reduction removes unused statements" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unused_tbl (id INT);"
+                        , "CREATE TABLE duck_data (id INT, val INT);"
+                        , "INSERT INTO duck_data VALUES (1, 10);"
+                        , "SELECT [x + 1 FOR x IN [1, 2, 3]] FROM duck_data WHERE val > 5;"
+                        ]
+                oracle candidate = pure (BSC.isInfixOf "duck_data" candidate && BSC.isInfixOf "SELECT" candidate)
+            reduced <- reduceSQL DuckDB oracle sql
+            assertBool "unused table is eliminated by reduction" (not (BSC.isInfixOf "unused_tbl" reduced))
+            assertBool "referenced table is preserved" (BSC.isInfixOf "duck_data" reduced)
+            assertBool "query statement is preserved" (BSC.isInfixOf "SELECT" reduced)
+        , testCase "ClickHouse dependency extraction and reduction preserves engine clauses and dependencies" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unneeded (id UInt64) ENGINE = MergeTree() ORDER BY id;"
+                        , "CREATE TABLE ch_events (EventId UInt64) ENGINE = MergeTree() ORDER BY EventId;"
+                        , "INSERT INTO ch_events VALUES (42);"
+                        , "SELECT EventId FROM ch_events WHERE EventId > 0;"
+                        ]
+                oracle candidate = pure (BSC.isInfixOf "ch_events" candidate && BSC.isInfixOf "SELECT" candidate)
+            reduced <- reduceSQL ClickHouse oracle sql
+            assertBool "unneeded table is eliminated by reduction" (not (BSC.isInfixOf "unneeded" reduced))
+            assertBool "referenced table is preserved" (BSC.isInfixOf "ch_events" reduced)
+            assertBool "query statement is preserved" (BSC.isInfixOf "SELECT" reduced)
         , testCase "invalid SQL still counts its raw statement units; transport errors stay explicit" $ do
             invalidCount <- countOrFail SQLite "SELECT FROM ; SELECT 42;"
             assertEqual "invalid syntax does not turn statement count into zero" 2 invalidCount

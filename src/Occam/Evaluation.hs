@@ -87,13 +87,17 @@ parseSQLDialect value = case map toLower value of
     "postgresql" -> Right PostgreSQL
     "mysql" -> Right MySQL
     "sqlite" -> Right SQLite
-    _ -> Left "Expected generic, postgresql, mysql, or sqlite"
+    "duckdb" -> Right DuckDB
+    "clickhouse" -> Right ClickHouse
+    _ -> Left "Expected generic, postgresql, mysql, sqlite, duckdb, or clickhouse"
 
 sqlDialectName :: SQLDialect -> Text
 sqlDialectName GenericSQL = "generic"
 sqlDialectName PostgreSQL = "postgresql"
 sqlDialectName MySQL = "mysql"
 sqlDialectName SQLite = "sqlite"
+sqlDialectName DuckDB = "duckdb"
+sqlDialectName ClickHouse = "clickhouse"
 
 data EvaluationPoint = EvaluationPoint
     { pointElapsedSeconds :: !Double

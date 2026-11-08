@@ -450,6 +450,39 @@ tests =
             assertBool
                 "reads depend on index and latest column reaching definition"
                 (has (StatementId 2) readDeps && has (StatementId 4) readDeps)
+        , testCase "DuckDB dependency extraction handles table references and closures" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE duck_src (id INT);"
+                        , "CREATE TABLE duck_target AS SELECT * FROM duck_src;"
+                        , "CREATE TABLE duck_other (id INT);"
+                        , "SELECT id FROM duck_target;"
+                        ]
+            graph <- analyze DuckDB sql
+            let depsS2 = dependenciesFor (StatementId 2) graph
+                depsS4 = dependenciesFor (StatementId 4) graph
+            assertBool "duck_target creation depends on duck_src" (has (StatementId 1) depsS2)
+            assertBool "SELECT from duck_target depends on duck_target" (has (StatementId 2) depsS4)
+            assertBool
+                "SELECT from duck_target has no dependency on duck_other"
+                (not (has (StatementId 3) depsS4))
+        , testCase "ClickHouse dependency extraction preserves unquoted case and engine dependencies" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE EventsLog (EventId UInt64) ENGINE = MergeTree() ORDER BY EventId;"
+                        , "CREATE TABLE OtherLog (OtherId UInt64) ENGINE = MergeTree() ORDER BY OtherId;"
+                        , "SELECT EventId FROM EventsLog;"
+                        ]
+            graph <- analyze ClickHouse sql
+            let actionsS1 = actionsFor (StatementId 1) graph
+                depsS3 = dependenciesFor (StatementId 3) graph
+            assertBool
+                "ClickHouse preserves unquoted table and column identifier case"
+                ( ObjectAction TableObject DefDep "EventsLog" `elem` actionsS1
+                    && ObjectAction ColumnObject DefDep "EventsLog\USEventId" `elem` actionsS1
+                )
+            assertBool "SELECT EventId depends on EventsLog" (has (StatementId 1) depsS3)
+            assertBool "SELECT EventId has no dependency on OtherLog" (not (has (StatementId 2) depsS3))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

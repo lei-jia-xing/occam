@@ -1,5 +1,8 @@
 use crate::DialectKind;
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{
+    ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
+    SQLiteDialect,
+};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan};
 
@@ -55,6 +58,8 @@ pub(super) fn dialect(kind: DialectKind) -> &'static dyn Dialect {
         DialectKind::PostgreSql => &PostgreSqlDialect {},
         DialectKind::MySql => &MySqlDialect {},
         DialectKind::SQLite => &SQLiteDialect {},
+        DialectKind::DuckDB => &DuckDbDialect {},
+        DialectKind::ClickHouse => &ClickHouseDialect {},
     }
 }
 

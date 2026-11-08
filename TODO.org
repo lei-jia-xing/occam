@@ -141,3 +141,12 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Formally modeled 1-minimality, single-statement audit step, well-founded auditLoop, termination bounds, length monotonicity, oracle preservation, fixed-point 1-minimality, and closure 1-minimality in Lean 4 (proofs/Proofs/Minimality.lean; 0 sorry).
 ** DONE Implement certifying trace exporter and standalone verified checker
 - Export certificate.json from Occam CLI; build standalone Lean 4 verified checker occam-checker; verify end-to-end (proofs/Proofs/Checker.lean; 0 sorry).
+* 22. More Database Support (DuckDB & ClickHouse)
+** DONE Expand Rust sqlparser-ffi with DuckDB and ClickHouse dialects
+- Added DuckDbDialect (code 4) and ClickHouseDialect (code 5) with unit-boundary tests in rust/sqlparser-ffi.
+** DONE Wire DuckDB and ClickHouse into Haskell Occam.Parser and Evaluation CLI
+- Expanded SQLDialect with DuckDB (code 4) and ClickHouse (code 5) and updated CLI dialect options in Occam.Evaluation and Main.
+** DONE Add multi-statement parsing, dependency, and reduction test coverage
+- Added DuckDB and ClickHouse syntax parsing, case-preservation, statement-counting, and dependency extraction tests in test suites.
+** DONE Verify end-to-end reduction with DuckDB and ClickHouse predicates
+- Verified dialect-specific multi-statement reduction and all 107 Haskell and 21 Rust tests.

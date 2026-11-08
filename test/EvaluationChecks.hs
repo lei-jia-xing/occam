@@ -170,11 +170,15 @@ tests =
             assertEqual "PostgreSQL dialect" (Right PostgreSQL) (parseSQLDialect "POSTGRESQL")
             assertEqual "MySQL dialect" (Right MySQL) (parseSQLDialect "mysql")
             assertEqual "SQLite dialect" (Right SQLite) (parseSQLDialect "sqlite")
+            assertEqual "DuckDB dialect" (Right DuckDB) (parseSQLDialect "duckdb")
+            assertEqual "ClickHouse dialect" (Right ClickHouse) (parseSQLDialect "clickhouse")
             assertEqual
                 "invalid dialect rejected"
                 True
                 (case parseSQLDialect "oracle" of Left _ -> True; Right _ -> False)
             assertEqual "dialect serialized using CLI spelling" "postgresql" (sqlDialectName PostgreSQL)
+            assertEqual "DuckDB serialized using CLI spelling" "duckdb" (sqlDialectName DuckDB)
+            assertEqual "ClickHouse serialized using CLI spelling" "clickhouse" (sqlDialectName ClickHouse)
         ]
 
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig
