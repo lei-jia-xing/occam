@@ -37,6 +37,8 @@ data ObjectKind
     | ViewObject
     | TriggerObject
     | BarrierObject
+    | SessionVariableObject
+    | TransactionObject
     deriving (Eq, Ord, Show)
 
 data DependencyType
@@ -47,6 +49,12 @@ data DependencyType
     | RenameFromDep
     | RenameToDep
     | BarrierDep
+    | TxBeginDep
+    | TxCommitDep
+    | TxRollbackDep
+    | TxSavepointDep
+    | TxRollbackToDep
+    | TxReleaseDep
     deriving (Eq, Ord, Show)
 
 data ObjectAction = ObjectAction

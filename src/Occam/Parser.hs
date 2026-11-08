@@ -275,6 +275,8 @@ parseObjectKind "index" = Just IndexObject
 parseObjectKind "view" = Just ViewObject
 parseObjectKind "trigger" = Just TriggerObject
 parseObjectKind "barrier" = Just BarrierObject
+parseObjectKind "session_variable" = Just SessionVariableObject
+parseObjectKind "transaction" = Just TransactionObject
 parseObjectKind _ = Nothing
 
 parseActionType :: Text -> Maybe DependencyType
@@ -285,4 +287,10 @@ parseActionType "drop" = Just DropDep
 parseActionType "rename_from" = Just RenameFromDep
 parseActionType "rename_to" = Just RenameToDep
 parseActionType "barrier" = Just BarrierDep
+parseActionType "tx_begin" = Just TxBeginDep
+parseActionType "tx_commit" = Just TxCommitDep
+parseActionType "tx_rollback" = Just TxRollbackDep
+parseActionType "tx_savepoint" = Just TxSavepointDep
+parseActionType "tx_rollback_to" = Just TxRollbackToDep
+parseActionType "tx_release" = Just TxReleaseDep
 parseActionType _ = Nothing

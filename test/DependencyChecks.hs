@@ -232,7 +232,7 @@ tests =
                 afterSessionChange = dependenciesFor (StatementId 11) graph
             assertBool
                 "ROLLBACK TO is recognized from this statement, not the whole script"
-                (any ((== "__tx_rollback_to__\x1es") . actionName) savepointActions)
+                (ObjectAction TransactionObject TxRollbackToDep "s" `elem` savepointActions)
             assertBool
                 "savepoint snapshot retains the earlier write"
                 (has (StatementId 3) afterSavepointRollback)
@@ -261,7 +261,7 @@ tests =
             let releaseActions = actionsFor (StatementId 4) graph
             assertBool
                 "RELEASE is extracted from its statement"
-                (ObjectAction BarrierObject BarrierDep "__tx_release__\x1es" `elem` releaseActions)
+                (ObjectAction TransactionObject TxReleaseDep "s" `elem` releaseActions)
             assertBool
                 "released savepoint writes remain in the catalog"
                 (has (StatementId 3) (dependenciesFor (StatementId 6) graph))
@@ -527,6 +527,62 @@ tests =
                 )
             assertBool "SELECT from users depends on users" (has (StatementId 1) depsS3)
             assertBool "SELECT from users does not depend on other" (not (has (StatementId 2) depsS3))
+        , testCase "session SET does not create false dependencies on prior unrelated tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unneeded_tbl (id INT);"
+                        , "CREATE TABLE needed_tbl (id INT, val INT);"
+                        , "SET enable_seqscan = off;"
+                        , "SELECT val FROM needed_tbl;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let setDeps = dependenciesFor (StatementId 3) graph
+                queryDeps = dependenciesFor (StatementId 4) graph
+            assertBool "SET does not depend on unneeded_tbl" (not (has (StatementId 1) setDeps))
+            assertBool "SET does not depend on needed_tbl" (not (has (StatementId 2) setDeps))
+            assertBool "Query depends on needed_tbl" (has (StatementId 2) queryDeps)
+            assertBool "Query does not depend on unneeded_tbl through SET" (not (has (StatementId 1) queryDeps))
+        , testCase "triggers do not create global serialization barriers across unrelated tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t_target (id INT);"
+                        , "CREATE TABLE t_log (msg TEXT);"
+                        , "CREATE TABLE t_unrelated (x INT);"
+                        , "CREATE TRIGGER tr_target AFTER INSERT ON t_target BEGIN INSERT INTO t_log VALUES ('new'); END;"
+                        , "SELECT x FROM t_unrelated;"
+                        ]
+            graph <- analyze SQLite sql
+            let unrelatedDeps = dependenciesFor (StatementId 5) graph
+            assertBool "SELECT from unrelated depends on unrelated" (has (StatementId 3) unrelatedDeps)
+            assertBool
+                "SELECT from unrelated does not depend on trigger"
+                (not (has (StatementId 4) unrelatedDeps))
+            assertBool
+                "SELECT from unrelated does not depend on t_target"
+                (not (has (StatementId 1) unrelatedDeps))
+            assertBool
+                "SELECT from unrelated does not depend on t_log"
+                (not (has (StatementId 2) unrelatedDeps))
+        , testCase "MERGE statement extracts precise ModDep on target and UseDep on source" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE target_tbl (id INT, val INT);"
+                        , "CREATE TABLE source_tbl (id INT, val INT);"
+                        , "CREATE TABLE untouched_tbl (id INT);"
+                        , "MERGE INTO target_tbl USING source_tbl ON target_tbl.id = source_tbl.id WHEN MATCHED THEN UPDATE SET val = source_tbl.val;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let mergeDeps = dependenciesFor (StatementId 4) graph
+                actions = actionsFor (StatementId 4) graph
+            assertBool
+                "MERGE has ModDep on target_tbl"
+                (ObjectAction TableObject ModDep "target_tbl" `elem` actions)
+            assertBool
+                "MERGE has UseDep on source_tbl"
+                (ObjectAction TableObject UseDep "source_tbl" `elem` actions)
+            assertBool "MERGE depends on target_tbl definition" (has (StatementId 1) mergeDeps)
+            assertBool "MERGE depends on source_tbl definition" (has (StatementId 2) mergeDeps)
+            assertBool "MERGE does not depend on untouched_tbl" (not (has (StatementId 3) mergeDeps))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

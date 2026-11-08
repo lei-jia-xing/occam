@@ -143,7 +143,10 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Export certificate.json from Occam CLI; build standalone Lean 4 verified checker occam-checker; verify end-to-end (proofs/Proofs/Checker.lean; 0 sorry).
 
 * 22. Algorithm & Semantic Precision
-** TODO De-escalate conservative barriers for multi-table DML, triggers, and session commands
+** DONE De-escalate conservative barriers for multi-table DML, triggers, and session commands
+- Removed global serialization barriers for triggers and multi-table DML (MERGE, multi-target DELETE).
+- Replaced string heuristics (isPrefixOf, delimiters) with strongly-typed SessionVariableObject and TransactionObject (TxBegin, TxCommit, TxRollback, TxSavepoint, TxRollbackTo, TxRelease).
+- De-escalated session commands to eliminate false dependencies on prior unrelated statements.
 ** TODO Model cascading foreign keys and temporary object lifecycles
 ** TODO Implement dominator-guided and feedback-directed closure search
 ** TODO Support constraint stripping and deeper AST branch pruning

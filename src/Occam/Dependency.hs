@@ -53,7 +53,11 @@ emptyGraph =
 
 isBarrierAction :: ObjectAction -> Bool
 isBarrierAction act =
-    actionKind act == BarrierObject || actionType act == BarrierDep
+    actionKind act `elem` [BarrierObject, SessionVariableObject, TransactionObject]
+        || actionType act == BarrierDep
+
+isSessionAction :: ObjectAction -> Bool
+isSessionAction act = actionKind act == SessionVariableObject
 
 -- Canonical object names use escaped dots and backslashes between dialect
 -- parsing and the catalog. Quoted/case-folding decisions happen in Occam.Parser.
@@ -192,9 +196,13 @@ processStmt (state, edgeMap, barrierEdgeCount, barrierStmtCount, barrierActionCo
         declaredBarriers = length (filter isBarrierAction actions)
         catalogBarrier = declaredBarriers == 0 && needsCatalogBarrier state actions
         hasBarrier = declaredBarriers > 0 || catalogBarrier
+        isSessionOnly = declaredBarriers > 0 && all isSessionAction (filter isBarrierAction actions)
         barrierDeps =
             if hasBarrier
-                then scanPriorStatements state
+                then
+                    if isSessionOnly
+                        then maybe Set.empty Set.singleton (scanLastBarrier state)
+                        else scanPriorStatements state
                 else maybe Set.empty Set.singleton (scanLastBarrier state)
         (objectDeps, state') = processObjectActions sid actions state
         (controlDeps, state'') = applyTransactionControl sid actions state'
@@ -249,48 +257,56 @@ processAction ::
     (Set StatementId, ScanState) ->
     ObjectAction ->
     (Set StatementId, ScanState)
-processAction sid priorState stmtActions (deps, state) act =
-    case actionType act of
-        DefDep ->
-            let catalog = scanCatalog state
-                keys = definitionKeys catalog stmtActions act
-                sources = viewSources (scanCatalog priorState) stmtActions (actionName act)
-                newObject = ObjectState (Just sid) Nothing sources False
-                catalog0 =
-                    if actionKind act `elem` [TableObject, TemporaryTableObject]
-                        then foldl' (prepareDefinition sid) catalog keys
-                        else catalog
-                catalog' =
-                    catalog0
-                        { catalogObjects =
-                            foldl' (\objects key -> Map.insert key newObject objects) (catalogObjects catalog0) keys
-                        }
-                catalog'' =
-                    if actionKind act `elem` [IndexObject, TriggerObject]
-                        then foldl' (\current key -> bindRelations sid key stmtActions current) catalog' keys
-                        else catalog'
-             in (deps, state {scanCatalog = catalog''})
-        UseDep ->
-            let objectDeps = dependenciesForAction priorState act
-                indexDeps =
-                    if actionKind act /= TableObject
-                        || any (\action -> actionKind action == IndexObject && actionType action == DefDep) stmtActions
-                        then Set.empty
-                        else boundIndexDependencies (scanCatalog priorState) (actionName act)
-             in (Set.union deps (Set.union objectDeps indexDeps), state)
-        ModDep ->
-            let priorDeps = dependenciesForAction priorState act
-                keys = actionKeys priorState act
-                catalog' = writeObjects sid keys (scanCatalog state)
-             in (Set.union deps priorDeps, state {scanCatalog = catalog'})
-        DropDep ->
-            let priorDeps = dependenciesForAction priorState act
-                keys = actionKeys priorState act
-                catalog' = dropObjects sid keys (scanCatalog state)
-             in (Set.union deps priorDeps, state {scanCatalog = catalog'})
-        BarrierDep -> (deps, state)
-        RenameFromDep -> (deps, state)
-        RenameToDep -> (deps, state)
+processAction sid priorState stmtActions (deps, state) act
+    | actionKind act `elem` [SessionVariableObject, TransactionObject] = (deps, state)
+    | otherwise =
+        case actionType act of
+            DefDep ->
+                let catalog = scanCatalog state
+                    keys = definitionKeys catalog stmtActions act
+                    sources = viewSources (scanCatalog priorState) stmtActions (actionName act)
+                    newObject = ObjectState (Just sid) Nothing sources False
+                    catalog0 =
+                        if actionKind act `elem` [TableObject, TemporaryTableObject]
+                            then foldl' (prepareDefinition sid) catalog keys
+                            else catalog
+                    catalog' =
+                        catalog0
+                            { catalogObjects =
+                                foldl' (\objects key -> Map.insert key newObject objects) (catalogObjects catalog0) keys
+                            }
+                    catalog'' =
+                        if actionKind act `elem` [IndexObject, TriggerObject]
+                            then foldl' (\current key -> bindRelations sid key stmtActions current) catalog' keys
+                            else catalog'
+                 in (deps, state {scanCatalog = catalog''})
+            UseDep ->
+                let objectDeps = dependenciesForAction priorState act
+                    indexDeps =
+                        if actionKind act /= TableObject
+                            || any (\action -> actionKind action == IndexObject && actionType action == DefDep) stmtActions
+                            then Set.empty
+                            else boundIndexDependencies (scanCatalog priorState) (actionName act)
+                 in (Set.union deps (Set.union objectDeps indexDeps), state)
+            ModDep ->
+                let priorDeps = dependenciesForAction priorState act
+                    keys = actionKeys priorState act
+                    catalog' = writeObjects sid keys (scanCatalog state)
+                 in (Set.union deps priorDeps, state {scanCatalog = catalog'})
+            DropDep ->
+                let priorDeps = dependenciesForAction priorState act
+                    keys = actionKeys priorState act
+                    catalog' = dropObjects sid keys (scanCatalog state)
+                 in (Set.union deps priorDeps, state {scanCatalog = catalog'})
+            BarrierDep -> (deps, state)
+            RenameFromDep -> (deps, state)
+            RenameToDep -> (deps, state)
+            TxBeginDep -> (deps, state)
+            TxCommitDep -> (deps, state)
+            TxRollbackDep -> (deps, state)
+            TxSavepointDep -> (deps, state)
+            TxRollbackToDep -> (deps, state)
+            TxReleaseDep -> (deps, state)
 
 processRenames ::
     StatementId ->
@@ -647,7 +663,7 @@ moveRelations oldKey newKey sourceRelations targetRelations =
 applyTransactionControl ::
     StatementId -> [ObjectAction] -> ScanState -> (Set StatementId, ScanState)
 applyTransactionControl _sid actions state =
-    case mapMaybe (txCommandFromAction . actionName) actions of
+    case mapMaybe txCommandFromAction actions of
         command : _ -> apply command
         [] -> (Set.empty, state)
     where
@@ -716,15 +732,15 @@ applyTransactionControl _sid actions state =
                         _ -> (Set.empty, state)
                 [] -> (Set.empty, state)
 
-txCommandFromAction :: ObjectName -> Maybe TxCommand
-txCommandFromAction "__tx_begin__" = Just TxBegin
-txCommandFromAction "__tx_commit__" = Just TxCommit
-txCommandFromAction "__tx_rollback__" = Just TxRollback
-txCommandFromAction name =
-    case T.stripPrefix "__tx_savepoint__\x1e" name of
-        Just label -> Just (TxSavepoint label)
-        Nothing ->
-            case T.stripPrefix "__tx_rollback_to__\x1e" name of
-                Just label -> Just (TxRollbackTo label)
-                Nothing ->
-                    TxRelease <$> T.stripPrefix "__tx_release__\x1e" name
+txCommandFromAction :: ObjectAction -> Maybe TxCommand
+txCommandFromAction act
+    | actionKind act == TransactionObject =
+        case actionType act of
+            TxBeginDep -> Just TxBegin
+            TxCommitDep -> Just TxCommit
+            TxRollbackDep -> Just TxRollback
+            TxSavepointDep -> Just (TxSavepoint (actionName act))
+            TxRollbackToDep -> Just (TxRollbackTo (actionName act))
+            TxReleaseDep -> Just (TxRelease (actionName act))
+            _ -> Nothing
+    | otherwise = Nothing

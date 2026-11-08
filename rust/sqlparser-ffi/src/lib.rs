@@ -55,7 +55,7 @@ struct NativeFacts {
     edits: Vec<NativeEdit>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum NativeObjectKind {
     Table,
@@ -65,9 +65,11 @@ enum NativeObjectKind {
     View,
     Trigger,
     Barrier,
+    SessionVariable,
+    Transaction,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum NativeActionType {
     Def,
@@ -77,6 +79,12 @@ enum NativeActionType {
     RenameFrom,
     RenameTo,
     Barrier,
+    TxBegin,
+    TxCommit,
+    TxRollback,
+    TxSavepoint,
+    TxRollbackTo,
+    TxRelease,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]

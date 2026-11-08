@@ -368,7 +368,6 @@ pub(super) fn analyze_statement(
                 for reference in relation_names(&visitor, &[]) {
                     add_table_use(&mut actions, reference);
                 }
-                actions.insert(barrier("__trigger_semantics_barrier__"));
             } else {
                 actions.insert(barrier("__unknown_trigger_barrier__"));
             }
@@ -411,7 +410,7 @@ pub(super) fn analyze_statement(
                 } else {
                     for name in names {
                         if let Some(name) = from_name(name, dialect) {
-                            actions.insert(action(kind.clone(), NativeActionType::Drop, name));
+                            actions.insert(action(kind, NativeActionType::Drop, name));
                         } else {
                             actions.insert(barrier("__unknown_drop_barrier__"));
                         }
@@ -587,7 +586,31 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::Delete(delete) => {
-            if let Some((table, target_span)) = first_delete_target(&delete.from, dialect) {
+            if !delete.tables.is_empty() {
+                let mut target_spans = Vec::new();
+                let mut modified_tables = Vec::new();
+                for tbl in &delete.tables {
+                    if let Some(name) = from_name(tbl, dialect) {
+                        actions.insert(action(
+                            NativeObjectKind::Table,
+                            NativeActionType::Mod,
+                            name.clone(),
+                        ));
+                        target_spans.push(tbl.span());
+                        modified_tables.push(name);
+                    }
+                }
+                let refs = relation_names(&visitor, &target_spans);
+                for reference in &refs {
+                    add_table_use(&mut actions, reference.clone());
+                }
+                let mut column_tables = modified_tables;
+                column_tables.extend(refs);
+                append_column_uses(&mut actions, &visitor, &column_tables);
+                if has_unmodeled_relation(&visitor, &target_spans) {
+                    actions.insert(barrier("__unknown_relation_barrier__"));
+                }
+            } else if let Some((table, target_span)) = first_delete_target(&delete.from, dialect) {
                 actions.insert(action(
                     NativeObjectKind::Table,
                     NativeActionType::Mod,
@@ -608,6 +631,42 @@ pub(super) fn analyze_statement(
                 actions.insert(barrier("__unknown_dml_barrier__"));
             }
         }
+        Statement::Merge(merge) => {
+            if let Some((target, target_span)) = table_factor_name(&merge.table, dialect) {
+                actions.insert(action(
+                    NativeObjectKind::Table,
+                    NativeActionType::Mod,
+                    target.clone(),
+                ));
+                let excluded = [target_span];
+                let refs = relation_names(&visitor, &excluded);
+                for reference in &refs {
+                    add_table_use(&mut actions, reference.clone());
+                }
+                let mut column_tables = vec![target.clone()];
+                column_tables.extend(refs);
+                append_column_uses(&mut actions, &visitor, &column_tables);
+                if has_unmodeled_relation(&visitor, &excluded) {
+                    actions.insert(barrier("__unknown_relation_barrier__"));
+                }
+                for clause in &merge.clauses {
+                    if let sqlparser::ast::MergeAction::Update(update) = &clause.action {
+                        if let sqlparser::ast::MergeUpdateKind::Set(assignments) = &update.kind {
+                            for assignment in assignments {
+                                add_assignment_columns(
+                                    &mut actions,
+                                    &target,
+                                    &assignment.target,
+                                    dialect,
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                actions.insert(barrier("__unknown_dml_barrier__"));
+            }
+        }
         Statement::Truncate(truncate) => {
             if truncate.table_names.is_empty() {
                 actions.insert(barrier("__unknown_truncate_barrier__"));
@@ -620,38 +679,118 @@ pub(super) fn analyze_statement(
                 }
             }
         }
-        Statement::Set(_) | Statement::Reset(_) => {
-            actions.insert(barrier("__session_barrier__"));
-        }
+        Statement::Set(set) => match set {
+            sqlparser::ast::Set::SingleAssignment { variable, .. } => {
+                if let Some(name) = canonical_name(variable, dialect) {
+                    actions.insert(action(
+                        NativeObjectKind::SessionVariable,
+                        NativeActionType::Mod,
+                        name,
+                    ));
+                } else {
+                    actions.insert(action(
+                        NativeObjectKind::SessionVariable,
+                        NativeActionType::Barrier,
+                        "",
+                    ));
+                }
+            }
+            sqlparser::ast::Set::ParenthesizedAssignments { variables, .. } => {
+                for var in variables {
+                    if let Some(name) = canonical_name(var, dialect) {
+                        actions.insert(action(
+                            NativeObjectKind::SessionVariable,
+                            NativeActionType::Mod,
+                            name,
+                        ));
+                    }
+                }
+            }
+            sqlparser::ast::Set::MultipleAssignments { assignments } => {
+                for assignment in assignments {
+                    if let Some(name) = canonical_name(&assignment.name, dialect) {
+                        actions.insert(action(
+                            NativeObjectKind::SessionVariable,
+                            NativeActionType::Mod,
+                            name,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                actions.insert(action(
+                    NativeObjectKind::SessionVariable,
+                    NativeActionType::Barrier,
+                    "",
+                ));
+            }
+        },
+        Statement::Reset(reset_stmt) => match &reset_stmt.reset {
+            sqlparser::ast::Reset::ConfigurationParameter(name) => {
+                if let Some(var_name) = canonical_name(name, dialect) {
+                    actions.insert(action(
+                        NativeObjectKind::SessionVariable,
+                        NativeActionType::Mod,
+                        var_name,
+                    ));
+                } else {
+                    actions.insert(action(
+                        NativeObjectKind::SessionVariable,
+                        NativeActionType::Barrier,
+                        "",
+                    ));
+                }
+            }
+            _ => {
+                actions.insert(action(
+                    NativeObjectKind::SessionVariable,
+                    NativeActionType::Barrier,
+                    "",
+                ));
+            }
+        },
         Statement::StartTransaction { .. } => {
-            actions.insert(barrier("__tx_begin__"));
+            actions.insert(action(
+                NativeObjectKind::Transaction,
+                NativeActionType::TxBegin,
+                "",
+            ));
         }
         Statement::Commit { .. } => {
-            actions.insert(barrier("__tx_commit__"));
+            actions.insert(action(
+                NativeObjectKind::Transaction,
+                NativeActionType::TxCommit,
+                "",
+            ));
         }
         Statement::Rollback { savepoint, .. } => {
-            let name = savepoint
-                .as_ref()
-                .map(|ident| {
-                    format!(
-                        "__tx_rollback_to__\u{1e}{}",
-                        canonical_ident(ident, dialect)
-                    )
-                })
-                .unwrap_or_else(|| "__tx_rollback__".to_string());
-            actions.insert(barrier(&name));
+            if let Some(ident) = savepoint {
+                actions.insert(action(
+                    NativeObjectKind::Transaction,
+                    NativeActionType::TxRollbackTo,
+                    canonical_ident(ident, dialect),
+                ));
+            } else {
+                actions.insert(action(
+                    NativeObjectKind::Transaction,
+                    NativeActionType::TxRollback,
+                    "",
+                ));
+            }
         }
         Statement::Savepoint { name } => {
-            actions.insert(barrier(&format!(
-                "__tx_savepoint__\u{1e}{}",
-                canonical_ident(name, dialect)
-            )));
+            actions.insert(action(
+                NativeObjectKind::Transaction,
+                NativeActionType::TxSavepoint,
+                canonical_ident(name, dialect),
+            ));
         }
         Statement::ReleaseSavepoint { name } => {
-            actions.insert(barrier(&format!(
-                "__tx_release__\u{1e}{}",
-                canonical_ident(name, dialect)
-            )));
+            actions.insert(action(
+                NativeObjectKind::Transaction,
+                NativeActionType::TxRelease,
+                canonical_ident(name, dialect),
+            ));
         }
         _ => {
             actions.insert(barrier("__unknown_stmt_barrier__"));
@@ -693,6 +832,13 @@ fn add_assignment_columns(
                 add_modified_column(actions, table, column, dialect);
             }
         }
+    }
+}
+
+fn table_factor_name(factor: &TableFactor, dialect: DialectKind) -> Option<(String, Span)> {
+    match factor {
+        TableFactor::Table { name, .. } => Some((from_name(name, dialect)?, name.span())),
+        _ => None,
     }
 }
 
