@@ -7,7 +7,7 @@ Goal: Minimize SQL programs from large-scale fuzz testing while preserving a use
 Research question: Can SQL state dependencies reduce DBMS executions and reset costs while producing smaller SQL test cases with the same target behavior?
 Scope: Existing fuzz SQL, setup state, and an oracle -> reduced SQL that still satisfies that oracle. Collecting real DBMS crashes is not required.
 Scale: Both statements per input and inputs per corpus matter.
-Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus throughput -> P3 comparative evaluation.
+Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale workloads -> Comparative evaluation -> Formal verification.
 - Archived DONE items are historical notes, not claims about current APIs. Crash-reporting, debugger, signature-matching, and crash-harvesting prototypes were removed during the predicate-only cutover.
 
 * 1. Frontend & CST Surgery (Tree-sitter)                              :ARCHIVE:
@@ -70,7 +70,7 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 - The SQLancer source fetch/build attempt timed out; runtime integration remains unverified.
 
 * 12. Prototype Reducer Comparison (Synthetic Predicate)                 :ARCHIVE:
-- Optional external SQLancer reducer integration remains unverified; see P3.
+- Optional external SQLancer reducer integration remains unverified; see Comparative Evaluation.
 ** DONE Prototype C-Reduce and statement-ddmin runs against a text-pattern predicate; outputs are synthetic mechanics data.
 ** DONE Stream synthetic-predicate measurements into JSONL; records do not establish SQL validity or bug reproduction.
 
@@ -82,36 +82,36 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
 ** DONE Add a comparative benchmark data stream and presentation script for synthetic predicates.
 - Historical JSONL artifacts describe synthetic-predicate mechanics only; they do not establish SQL validity or DBMS execution.
 
-* 15. P0: Reliable Fuzz-to-Reduction
+* 15. Reliable Fuzz-to-Reduction                                       :ARCHIVE:
 ** DONE Define the existing-fuzz-input and oracle contract
 ** DONE Preserve the supplied generic predicate
 ** DONE Bound oracle I/O and define the isolation boundary
 ** DONE Bound each reduction and record useful metrics
 
-* 16. P1: SQL Reduction Quality
+* 16. SQL Reduction Quality                                            :ARCHIVE:
 ** DONE Fix statement-unit and dependency failures for TRUNCATE and transactions
-** DONE [#A] Add unrestricted deletion after graph-guided search
-** DONE [#A] Model object identity and scope
-** DONE [#B] Refine state dependencies
-** DONE [#B] Extend SQL reduction passes
+** DONE Add unrestricted deletion after graph-guided search
+** DONE Model object identity and scope
+** DONE Refine state dependencies
+** DONE Extend SQL reduction passes
 ** DONE Complete sqlparser-rs clean-cutover verification
 - Cut over parser and facts to bundled sqlparser-rs FFI; verify full test suites and CLI packaging.
 
-* 17. P2: Large-Scale Fuzz Workloads
-** DONE [#A] Exercise large SQL inputs and corpus batches
-** DONE [#A] Reuse batch runners with per-input failure isolation
-** DONE [#B] Profile prefix search and repeated work
-** DONE [#B] Evaluate weighted and feedback-guided search
-** DONE [#C] Evaluate faster resets and parallel search if profiling justifies them
+* 17. Large-Scale Fuzz Workloads                                       :ARCHIVE:
+** DONE Exercise large SQL inputs and corpus batches
+** DONE Reuse batch runners with per-input failure isolation
+** DONE Profile prefix search and repeated work
+** DONE Evaluate weighted and feedback-guided search
+** DONE Evaluate faster resets and parallel search if profiling justifies them
 
-* 18. P3: Comparative Evaluation
-** DONE [#B] Keep B1/B2 as reference baselines
-** DONE [#B] Add controlled ablations
-** DONE [#C] Integrate upstream SQLancer reducers only for a specific comparison
-** DONE [#C] Add SQLreduce when PostgreSQL comparison is needed
-** DONE [#C] Add modern and structural baselines only for a specific comparison
+* 18. Comparative Evaluation                                           :ARCHIVE:
+** DONE Keep B1/B2 as reference baselines
+** DONE Add controlled ablations
+** DONE Integrate upstream SQLancer reducers only for a specific comparison
+** DONE Add SQLreduce when PostgreSQL comparison is needed
+** DONE Add modern and structural baselines only for a specific comparison
 
-* 19. Related Work (2026-11-06)
+* 19. Related Work (2026-11-06)                                        :ARCHIVE:
 - SQLancer: statement DD and JSQLParser AST reductions; requires a `Reproducer`.
   https://github.com/sqlancer/sqlancer/blob/main/docs/testCaseReduction.md
 - SQLreduce: PostgreSQL/pglast query reduction preserving errors or SQLSTATE.
@@ -124,10 +124,20 @@ Order: P0 reliable fuzz-to-reduction -> P1 SQL reduction quality -> P2 corpus th
   https://arxiv.org/abs/2411.19410
 - Perses: syntax-guided reduction; verify SQL support at the selected revision.
   https://github.com/uw-pluverse/perses
-** DONE [#C] Compare Occam with DRReduce when positioning the method
+** DONE Compare Occam with DRReduce when positioning the method
 - Review paper and public artifact; contrast dependency reconstruction with stateful SQL constraints.
 
-* 20. Milestones
-** DONE [#A] M1: Reliable single-input fuzz SQL reduction
-** DONE [#A] M2: Large-input and corpus-scale validation
-** DONE [#B] M3: Explain dependency-aware gains
+* 20. Milestones                                                       :ARCHIVE:
+** DONE M1: Reliable single-input fuzz SQL reduction
+** DONE M2: Large-input and corpus-scale validation
+** DONE M3: Explain dependency-aware gains
+
+* 21. Formal Verification (Lean 4)                                     :ARCHIVE:
+** DONE Model dependency DAG and prove reachability soundness
+- Formally modeled DAG, backwardSlice, and closeSet in Lean 4 (proofs/Proofs/DAG.lean); proved acyclicity, reachability soundness, closure validity, and minimality (0 sorry).
+** DONE Prove reduction monotonicity and termination on finite measure
+- Formally modeled reduction steps, well-founded termination, oracle preservation, and fixed-point convergence in Lean 4 (proofs/Proofs/Reduction.lean; 0 sorry).
+** DONE Formalize 1-minimality of statement audit fixed point
+- Formally modeled 1-minimality, single-statement audit step, well-founded auditLoop, termination bounds, length monotonicity, oracle preservation, fixed-point 1-minimality, and closure 1-minimality in Lean 4 (proofs/Proofs/Minimality.lean; 0 sorry).
+** DONE Implement certifying trace exporter and standalone verified checker
+- Export certificate.json from Occam CLI; build standalone Lean 4 verified checker occam-checker; verify end-to-end (proofs/Proofs/Checker.lean; 0 sorry).

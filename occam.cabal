@@ -71,6 +71,7 @@ executable occam
                     , occam
                     , bytestring
                     , text
+                    , containers
                     , directory
                     , filepath
                     , time

@@ -1,0 +1,21 @@
+cradle:
+  multi:
+    - path: "./Setup.hs"
+      config:
+        cradle:
+          direct:
+            arguments:
+              - "-package"
+              - "Cabal"
+              - "-package"
+              - "base"
+              - "-package"
+              - "directory"
+              - "-package"
+              - "filepath"
+              - "-package"
+              - "process"
+    - path: "./"
+      config:
+        cradle:
+          cabal:

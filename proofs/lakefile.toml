@@ -1,0 +1,10 @@
+name = "proofs"
+version = "0.1.0"
+defaultTargets = ["Proofs", "occam-checker"]
+
+[[lean_lib]]
+name = "Proofs"
+
+[[lean_exe]]
+name = "occam-checker"
+root = "Proofs.Checker"

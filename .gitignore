@@ -28,6 +28,7 @@ rust/sqlparser-ffi/target/
 .direnv/
 
 # Build artifacts & databases
+.lake/
 *.so
 *.dylib
 *.dll
