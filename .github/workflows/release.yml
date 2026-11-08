@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.1.0, required if triggering manually without a tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    name: Build & Release (Linux x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v0.0.0-$(git rev-parse --short HEAD)"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: ${TAG}"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust/sqlparser-ffi -> rust/sqlparser-ffi/target"
+
+      - name: Set up GHC and Cabal
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10'
+          cabal-version: 'latest'
+
+      - name: Cache Cabal
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-release-${{ hashFiles('**/*.cabal', 'cabal.project') }}
+          restore-keys: |
+            ${{ runner.os }}-cabal-release-
+            ${{ runner.os }}-cabal-
+
+      - name: Update Cabal package list
+        run: cabal update
+
+      - name: Build occam executable
+        run: cabal build exe:occam
+
+      - name: Package Binary & Generate Checksum
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          BIN_PATH="$(cabal list-bin occam)"
+          echo "Found binary at: ${BIN_PATH}"
+
+          mkdir -p dist
+          TARBALL_NAME="occam-${TAG}-linux-x86_64.tar.gz"
+          STAGE_DIR="$(mktemp -d)"
+
+          cp "${BIN_PATH}" "${STAGE_DIR}/occam"
+          [ -f README.md ] && cp README.md "${STAGE_DIR}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE_DIR}/"
+
+          tar -czvf "dist/${TARBALL_NAME}" -C "${STAGE_DIR}" .
+          cd dist
+          sha256sum "${TARBALL_NAME}" > "${TARBALL_NAME}.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ${{ steps.vars.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
