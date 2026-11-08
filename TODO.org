@@ -141,3 +141,16 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Formally modeled 1-minimality, single-statement audit step, well-founded auditLoop, termination bounds, length monotonicity, oracle preservation, fixed-point 1-minimality, and closure 1-minimality in Lean 4 (proofs/Proofs/Minimality.lean; 0 sorry).
 ** DONE Implement certifying trace exporter and standalone verified checker
 - Export certificate.json from Occam CLI; build standalone Lean 4 verified checker occam-checker; verify end-to-end (proofs/Proofs/Checker.lean; 0 sorry).
+
+* 22. Algorithm & Semantic Precision
+** TODO De-escalate conservative barriers for multi-table DML, triggers, and session commands
+** TODO Model cascading foreign keys and temporary object lifecycles
+** TODO Implement dominator-guided and feedback-directed closure search
+** TODO Support constraint stripping and deeper AST branch pruning
+** TODO Interleave statement audit and intra-statement rewrites to a global fixed point
+
+* 23. Real-World DBMS Evaluation & Quality Metrics
+** TODO Collect real-world DBMS bug corpora from PostgreSQL, SQLite, and DuckDB
+** TODO Evaluate unconstrained long-budget reduction ratios and 1-minimality
+** TODO Measure test-case slippage and bug fidelity preservation
+** TODO Construct Pareto frontier comparing reduction quality versus oracle executions
