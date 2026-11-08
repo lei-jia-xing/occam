@@ -55,6 +55,9 @@ data DependencyType
     | TxSavepointDep
     | TxRollbackToDep
     | TxReleaseDep
+    | CascadeDep
+    | OnCommitDropDep
+    | OnCommitDeleteRowsDep
     deriving (Eq, Ord, Show)
 
 data ObjectAction = ObjectAction

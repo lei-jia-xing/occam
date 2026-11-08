@@ -161,6 +161,7 @@ data ObjectState = ObjectState
 data Catalog = Catalog
     { catalogObjects :: !(Map ObjectKey ObjectState)
     , catalogRelations :: !(Map ObjectKey (Set ObjectKey))
+    , catalogCascades :: !(Map ObjectKey (Set ObjectKey))
     }
     deriving (Eq, Show)
 
@@ -168,6 +169,8 @@ data TxFrame = TxFrame
     { txStart :: !Catalog
     , txSavepoints :: ![(ObjectName, Catalog)]
     , txImplicitSavepoint :: !Bool
+    , txOnCommitDrop :: !(Set ObjectKey)
+    , txOnCommitDeleteRows :: !(Set ObjectKey)
     }
     deriving (Eq, Show)
 
@@ -181,7 +184,7 @@ data ScanState = ScanState
 initialState :: ScanState
 initialState =
     ScanState
-        { scanCatalog = Catalog Map.empty Map.empty
+        { scanCatalog = Catalog Map.empty Map.empty Map.empty
         , scanTransactions = []
         , scanLastBarrier = Nothing
         , scanPriorStatements = Set.empty
@@ -247,8 +250,11 @@ processObjectActions sid actions state =
         (actionDeps, state') =
             foldl' (processAction sid priorState actions) (Set.empty, state) nonRename
         (renameDeps, state'') = processRenames sid priorState actions state'
+        catalogWithCascades = bindCascades sid actions (scanCatalog state'')
+        state''' = state'' {scanCatalog = catalogWithCascades}
+        state4 = recordOnCommit sid actions state'''
      in
-        (Set.union actionDeps renameDeps, state'')
+        (Set.union actionDeps renameDeps, state4)
 
 processAction ::
     StatementId ->
@@ -307,6 +313,9 @@ processAction sid priorState stmtActions (deps, state) act
             TxSavepointDep -> (deps, state)
             TxRollbackToDep -> (deps, state)
             TxReleaseDep -> (deps, state)
+            CascadeDep -> (deps, state)
+            OnCommitDropDep -> (deps, state)
+            OnCommitDeleteRowsDep -> (deps, state)
 
 processRenames ::
     StatementId ->
@@ -341,6 +350,8 @@ processRenames sid priorState actions state =
                                             Map.insert targetKey (ObjectState (Just sid) Nothing Set.empty False) (catalogObjects cleanTarget)
                                         , catalogRelations =
                                             moveRelations sourceKey targetKey (catalogRelations catalog) (catalogRelations cleanTarget)
+                                        , catalogCascades =
+                                            moveCascades sourceKey targetKey (catalogCascades catalog) (catalogCascades cleanTarget)
                                         }
                                 withSources = updateViewSources sourceKey targetKey withTarget
                              in moveTableColumns sid sourceKey targetKey catalog withSources
@@ -504,14 +515,25 @@ objectKind (ColumnKey _ _) = ColumnObject
 
 writeObjects :: StatementId -> [ObjectKey] -> Catalog -> Catalog
 writeObjects sid keys catalog =
-    catalog
-        { catalogObjects =
-            foldl' write (catalogObjects catalog) keys
-        }
+    let allKeys = transitiveCascades keys (catalogCascades catalog)
+     in catalog
+            { catalogObjects =
+                foldl' write (catalogObjects catalog) allKeys
+            }
     where
         write objects key =
             let old = Map.findWithDefault (ObjectState Nothing Nothing Set.empty False) key objects
              in Map.insert key old {objectLastWrite = Just sid} objects
+
+transitiveCascades :: [ObjectKey] -> Map ObjectKey (Set ObjectKey) -> [ObjectKey]
+transitiveCascades initial cascades = go (Set.fromList initial) initial
+    where
+        go visited [] = Set.toList visited
+        go visited (k : rest) =
+            let children = Map.findWithDefault Set.empty k cascades
+                newChildren = Set.difference children visited
+                visited' = Set.union visited newChildren
+             in go visited' (rest ++ Set.toList newChildren)
 
 dropObjects :: StatementId -> [ObjectKey] -> Catalog -> Catalog
 dropObjects sid keys catalog =
@@ -521,6 +543,7 @@ dropObjects sid keys catalog =
             catalog
                 { catalogObjects = foldl' dropOne (catalogObjects catalog) keys
                 , catalogRelations = foldl' removeObjectBindings (catalogRelations catalog) keys
+                , catalogCascades = foldl' removeCascadeBindings (catalogCascades catalog) keys
                 }
 
         dropOne objects key =
@@ -531,9 +554,15 @@ dropObjects sid keys catalog =
                 (\bound -> let kept = Set.delete key bound in if Set.null kept then Nothing else Just kept)
                 relations
 
+        removeCascadeBindings cascades key =
+            let withoutKey = Map.delete key cascades
+             in Map.mapMaybe
+                    (\bound -> let kept = Set.delete key bound in if Set.null kept then Nothing else Just kept)
+                    withoutKey
+
         resetDroppedTable current key
             | objectKind key `elem` [TableObject, TemporaryTableObject] =
-                removeRelationsForTable key (resetTableColumns sid key current)
+                removeCascadesForTable key (removeRelationsForTable key (resetTableColumns sid key current))
             | otherwise = current
 
 removeRelationsForTable :: ObjectKey -> Catalog -> Catalog
@@ -541,6 +570,76 @@ removeRelationsForTable table catalog =
     catalog
         { catalogRelations = Map.delete table (catalogRelations catalog)
         }
+
+removeCascadesForTable :: ObjectKey -> Catalog -> Catalog
+removeCascadesForTable table catalog =
+    catalog
+        { catalogCascades = Map.delete table (catalogCascades catalog)
+        }
+
+bindCascades :: StatementId -> [ObjectAction] -> Catalog -> Catalog
+bindCascades _sid actions catalog =
+    let cascadeParents =
+            [ parent
+            | act <- actions
+            , actionType act == CascadeDep
+            , parent <- matchingKeysInCatalog catalog TableObject UseDep (actionName act)
+            ]
+        localTables =
+            [ key
+            | act <- actions
+            , actionType act `elem` [DefDep, ModDep]
+            , actionKind act `elem` [TableObject, TemporaryTableObject]
+            , key <- matchingKeysInCatalog catalog (actionKind act) (actionType act) (actionName act)
+            ]
+     in if null cascadeParents || null localTables
+            then catalog
+            else
+                let cascades' =
+                        foldl'
+                            ( \cascades pKey ->
+                                foldl' (\c locKey -> Map.insertWith Set.union pKey (Set.singleton locKey) c) cascades localTables
+                            )
+                            (catalogCascades catalog)
+                            cascadeParents
+                 in catalog {catalogCascades = cascades'}
+
+recordOnCommit :: StatementId -> [ObjectAction] -> ScanState -> ScanState
+recordOnCommit _sid actions state =
+    case scanTransactions state of
+        frame : rest ->
+            let dropKeys =
+                    [ key
+                    | act <- actions
+                    , actionType act == OnCommitDropDep
+                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionName act)
+                    ]
+                deleteKeys =
+                    [ key
+                    | act <- actions
+                    , actionType act == OnCommitDeleteRowsDep
+                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionName act)
+                    ]
+                frame' =
+                    frame
+                        { txOnCommitDrop = Set.union (txOnCommitDrop frame) (Set.fromList dropKeys)
+                        , txOnCommitDeleteRows = Set.union (txOnCommitDeleteRows frame) (Set.fromList deleteKeys)
+                        }
+             in state {scanTransactions = frame' : rest}
+        [] -> state
+
+moveCascades ::
+    ObjectKey ->
+    ObjectKey ->
+    Map ObjectKey (Set ObjectKey) ->
+    Map ObjectKey (Set ObjectKey) ->
+    Map ObjectKey (Set ObjectKey)
+moveCascades oldKey newKey sourceCascades targetCascades =
+    let updatedParent =
+            case Map.lookup oldKey sourceCascades of
+                Nothing -> targetCascades
+                Just bound -> Map.insertWith Set.union newKey bound (Map.delete oldKey targetCascades)
+     in Map.map (Set.map (\k -> if k == oldKey then newKey else k)) updatedParent
 
 resetTableColumns :: StatementId -> ObjectKey -> Catalog -> Catalog
 resetTableColumns sid table catalog =
@@ -673,11 +772,17 @@ applyTransactionControl _sid actions state =
             case scanTransactions state of
                 [] ->
                     ( Set.empty
-                    , state {scanTransactions = [TxFrame snapshot [] False]}
+                    , state {scanTransactions = [TxFrame snapshot [] False Set.empty Set.empty]}
                     )
                 _ -> (Set.empty, state)
         apply TxCommit =
-            (Set.empty, state {scanTransactions = drop 1 (scanTransactions state)})
+            case scanTransactions state of
+                frame : rest ->
+                    let catalog = scanCatalog state
+                        droppedCatalog = dropObjects _sid (Set.toList (txOnCommitDrop frame)) catalog
+                        truncatedCatalog = writeObjects _sid (Set.toList (txOnCommitDeleteRows frame)) droppedCatalog
+                     in (Set.empty, state {scanCatalog = truncatedCatalog, scanTransactions = rest})
+                [] -> (Set.empty, state)
         apply TxRollback =
             case scanTransactions state of
                 frame : rest ->
@@ -701,7 +806,7 @@ applyTransactionControl _sid actions state =
                     ( Set.empty
                     , state
                         { scanTransactions =
-                            [TxFrame snapshot [(name, snapshot)] True]
+                            [TxFrame snapshot [(name, snapshot)] True Set.empty Set.empty]
                         }
                     )
         apply (TxRollbackTo name) =

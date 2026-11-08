@@ -293,4 +293,7 @@ parseActionType "tx_rollback" = Just TxRollbackDep
 parseActionType "tx_savepoint" = Just TxSavepointDep
 parseActionType "tx_rollback_to" = Just TxRollbackToDep
 parseActionType "tx_release" = Just TxReleaseDep
+parseActionType "cascade" = Just CascadeDep
+parseActionType "on_commit_drop" = Just OnCommitDropDep
+parseActionType "on_commit_delete_rows" = Just OnCommitDeleteRowsDep
 parseActionType _ = Nothing

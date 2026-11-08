@@ -85,6 +85,9 @@ enum NativeActionType {
     TxSavepoint,
     TxRollbackTo,
     TxRelease,
+    Cascade,
+    OnCommitDrop,
+    OnCommitDeleteRows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -432,6 +435,34 @@ mod tests {
                     && action.name == "parent"
             }));
         }
+    }
+
+    #[test]
+    fn cascading_foreign_keys_and_on_commit_actions() {
+        let sql = "CREATE TABLE child (p_id INT REFERENCES parent(id) ON DELETE CASCADE); CREATE TEMPORARY TABLE temp_tbl (x INT) ON COMMIT DROP;";
+        let units = parse_units(sql, DialectKind::PostgreSql).unwrap();
+        assert!(units[0]
+            .facts
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| {
+                action.kind == NativeObjectKind::Table
+                    && action.action == NativeActionType::Cascade
+                    && action.name == "parent"
+            }));
+        assert!(units[1]
+            .facts
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| {
+                action.kind == NativeObjectKind::TemporaryTable
+                    && action.action == NativeActionType::OnCommitDrop
+                    && action.name == "temp_tbl"
+            }));
     }
 
     #[test]

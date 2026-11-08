@@ -583,6 +583,82 @@ tests =
             assertBool "MERGE depends on target_tbl definition" (has (StatementId 1) mergeDeps)
             assertBool "MERGE depends on source_tbl definition" (has (StatementId 2) mergeDeps)
             assertBool "MERGE does not depend on untouched_tbl" (not (has (StatementId 3) mergeDeps))
+        , testCase "cascading foreign keys propagate delete writes to child tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (id INT, p_id INT REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "CREATE TABLE unrelated (x INT);"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT id FROM child;"
+                        , "SELECT x FROM unrelated;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let childQueryDeps = dependenciesFor (StatementId 5) graph
+                unrelatedQueryDeps = dependenciesFor (StatementId 6) graph
+            assertBool "Child query depends on parent deletion via cascade" (has (StatementId 4) childQueryDeps)
+            assertBool "Child query depends on child definition" (has (StatementId 2) childQueryDeps)
+            assertBool
+                "Unrelated query does not depend on parent deletion"
+                (not (has (StatementId 4) unrelatedQueryDeps))
+            assertBool "Unrelated query depends on unrelated table" (has (StatementId 3) unrelatedQueryDeps)
+        , testCase "multi-level cascading foreign keys propagate to grandchildren" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE grand_parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE parent (id INT PRIMARY KEY, gp_id INT REFERENCES grand_parent(id) ON DELETE CASCADE);"
+                        , "CREATE TABLE child (id INT, p_id INT REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "DELETE FROM grand_parent WHERE id = 10;"
+                        , "SELECT id FROM child;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let childQueryDeps = dependenciesFor (StatementId 5) graph
+            assertBool
+                "Child query depends on grand_parent deletion via transitive cascade"
+                (has (StatementId 4) childQueryDeps)
+            assertBool "Child query depends on child definition" (has (StatementId 3) childQueryDeps)
+        , testCase "non-cascading foreign keys do not propagate writes to child tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (id INT, p_id INT REFERENCES parent(id));"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT id FROM child;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let childQueryDeps = dependenciesFor (StatementId 4) graph
+            assertBool
+                "Child query does not depend on parent deletion without cascade"
+                (not (has (StatementId 3) childQueryDeps))
+            assertBool "Child query depends on child definition" (has (StatementId 2) childQueryDeps)
+        , testCase "temporary table with ON COMMIT DROP is dropped upon commit" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE persistent_tbl (id INT);"
+                        , "BEGIN;"
+                        , "CREATE TEMPORARY TABLE temp_drop (id INT) ON COMMIT DROP;"
+                        , "COMMIT;"
+                        , "SELECT id FROM persistent_tbl;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let queryDeps = dependenciesFor (StatementId 5) graph
+            assertBool "Query depends on persistent table" (has (StatementId 1) queryDeps)
+            assertBool "Query does not depend on dropped temp table" (not (has (StatementId 3) queryDeps))
+        , testCase "temporary table created inside a rolled-back transaction is not visible after rollback" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE persistent_tbl (id INT);"
+                        , "BEGIN;"
+                        , "CREATE TEMPORARY TABLE temp_tbl (id INT);"
+                        , "ROLLBACK;"
+                        , "SELECT id FROM persistent_tbl;"
+                        ]
+            graph <- analyze SQLite sql
+            let queryDeps = dependenciesFor (StatementId 5) graph
+            assertBool "Query depends on persistent table" (has (StatementId 1) queryDeps)
+            assertBool
+                "Query does not depend on rolled-back temp table definition"
+                (not (has (StatementId 3) queryDeps))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

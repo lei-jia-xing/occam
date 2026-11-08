@@ -147,7 +147,10 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Removed global serialization barriers for triggers and multi-table DML (MERGE, multi-target DELETE).
 - Replaced string heuristics (isPrefixOf, delimiters) with strongly-typed SessionVariableObject and TransactionObject (TxBegin, TxCommit, TxRollback, TxSavepoint, TxRollbackTo, TxRelease).
 - De-escalated session commands to eliminate false dependencies on prior unrelated statements.
-** TODO Model cascading foreign keys and temporary object lifecycles
+** DONE Model cascading foreign keys and temporary object lifecycles
+- Extracted cascading foreign key constraints (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) across CREATE TABLE and ALTER TABLE.
+- Propagated write dependencies across transitive cascading child tables.
+- Modeled temporary table lifecycles across transaction rollback and ON COMMIT DROP / DELETE ROWS.
 ** TODO Implement dominator-guided and feedback-directed closure search
 ** TODO Support constraint stripping and deeper AST branch pruning
 ** TODO Interleave statement audit and intra-statement rewrites to a global fixed point

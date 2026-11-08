@@ -2,9 +2,9 @@ use crate::edits::AnalysisVisitor;
 use crate::source::{ByteSpan, SourceMap, TokenPosition};
 use crate::{DialectKind, NativeAction, NativeActionType, NativeFacts, NativeObjectKind};
 use sqlparser::ast::{
-    AlterTableOperation, AssignmentTarget, ColumnOption, Ident, ObjectName, ObjectNamePart,
-    ObjectType, OnInsert, RenameTableNameKind, Spanned, Statement, TableConstraint, TableFactor,
-    TableObject, Visit,
+    AlterTableOperation, AssignmentTarget, ColumnOption, ForeignKeyConstraint, Ident, ObjectName,
+    ObjectNamePart, ObjectType, OnCommit, OnInsert, ReferentialAction, RenameTableNameKind,
+    Spanned, Statement, TableConstraint, TableFactor, TableObject, Visit,
 };
 use sqlparser::tokenizer::Span;
 use std::collections::BTreeSet;
@@ -135,13 +135,35 @@ fn add_table_use(actions: &mut BTreeSet<NativeAction>, name: String) {
     actions.insert(action(NativeObjectKind::Table, NativeActionType::Use, name));
 }
 
-fn add_foreign_key_use(
+fn add_foreign_key(
     actions: &mut BTreeSet<NativeAction>,
-    target: &ObjectName,
     dialect: DialectKind,
+    reference: &ForeignKeyConstraint,
 ) {
-    if let Some(name) = from_name(target, dialect) {
-        add_table_use(actions, name);
+    if let Some(target) = from_name(&reference.foreign_table, dialect) {
+        add_table_use(actions, target.clone());
+        let is_cascading = matches!(
+            reference.on_delete,
+            Some(
+                ReferentialAction::Cascade
+                    | ReferentialAction::SetNull
+                    | ReferentialAction::SetDefault,
+            )
+        ) || matches!(
+            reference.on_update,
+            Some(
+                ReferentialAction::Cascade
+                    | ReferentialAction::SetNull
+                    | ReferentialAction::SetDefault,
+            )
+        );
+        if is_cascading {
+            actions.insert(action(
+                NativeObjectKind::Table,
+                NativeActionType::Cascade,
+                target,
+            ));
+        }
     } else {
         actions.insert(barrier("__unknown_relation_barrier__"));
     }
@@ -285,14 +307,31 @@ pub(super) fn analyze_statement(
                 for column in &create.columns {
                     for option in &column.options {
                         if let ColumnOption::ForeignKey(reference) = &option.option {
-                            add_foreign_key_use(&mut actions, &reference.foreign_table, dialect);
+                            add_foreign_key(&mut actions, dialect, reference);
                         }
                     }
                 }
                 for constraint in &create.constraints {
                     if let TableConstraint::ForeignKey(reference) = constraint {
-                        add_foreign_key_use(&mut actions, &reference.foreign_table, dialect);
+                        add_foreign_key(&mut actions, dialect, reference);
                     }
+                }
+                match create.on_commit {
+                    Some(OnCommit::Drop) => {
+                        actions.insert(action(
+                            NativeObjectKind::TemporaryTable,
+                            NativeActionType::OnCommitDrop,
+                            table.clone(),
+                        ));
+                    }
+                    Some(OnCommit::DeleteRows) => {
+                        actions.insert(action(
+                            NativeObjectKind::TemporaryTable,
+                            NativeActionType::OnCommitDeleteRows,
+                            table.clone(),
+                        ));
+                    }
+                    _ => {}
                 }
                 if let Some(like) = &create.like {
                     let like_name = match like {
@@ -480,6 +519,11 @@ pub(super) fn analyze_statement(
                                 NativeActionType::Def,
                                 column_name(&table, &canonical_ident(new_column_name, dialect)),
                             ));
+                        }
+                        AlterTableOperation::AddConstraint { constraint, .. } => {
+                            if let TableConstraint::ForeignKey(reference) = constraint {
+                                add_foreign_key(&mut actions, dialect, reference);
+                            }
                         }
                         _ => {
                             actions.insert(barrier("__unknown_alter_barrier__"));
