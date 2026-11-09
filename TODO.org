@@ -160,9 +160,3 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 ** DONE Interleave statement audit and intra-statement rewrites to a global fixed point
 - Interleaved statement audit and intra-statement syntax rewrites into a simultaneous global fixed-point loop.
 - Ensured monotonic byte reduction and verified termination at the true fixed point.
-
-* 23. Real-World DBMS Evaluation & Quality Metrics
-** TODO Collect real-world DBMS bug corpora from PostgreSQL, SQLite, and DuckDB
-** TODO Evaluate unconstrained long-budget reduction ratios and 1-minimality
-** TODO Measure test-case slippage and bug fidelity preservation
-** TODO Construct Pareto frontier comparing reduction quality versus oracle executions
