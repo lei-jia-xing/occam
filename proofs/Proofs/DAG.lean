@@ -1,8 +1,3 @@
-/-
-Copyright (c) 2026 Occam Authors. All rights reserved.
-Released under Apache 2.0 license as described in the file LICENSE.
--/
-
 /-!
 This module provides the formal mathematical model and verified properties
 of Occam's temporal dependency DAG, backward slicing, and set closure algorithms.

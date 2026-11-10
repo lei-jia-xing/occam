@@ -32,6 +32,7 @@ import Data.Char (toLower)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
@@ -48,9 +49,10 @@ import Occam.Oracle (
  )
 import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
+    AuditStats (..),
     Oracle,
     SearchStrategy (..),
-    statementAudit,
+    statementAuditWithLogger,
  )
 import System.Directory (renameFile)
 import System.Timeout (timeout)
@@ -210,12 +212,13 @@ runEvaluatedReduction ::
     EvaluationConfig ->
     SQLDialect ->
     OracleConfig ->
+    Maybe OracleObservation ->
     Logger ->
     ByteString ->
     FilePath ->
     ReductionAction ->
     IO EvaluationResult
-runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoint action = do
+runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
     startedAt <- ticks
     let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
         totalStart = startedAt - preflightMicros * 1000
@@ -247,7 +250,7 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
     auditInitialAcceptedRef <- newIORef False
     auditCompletedRef <- newIORef False
     auditUnchangedRef <- newIORef False
-    auditInputRef <- newIORef initialSQL
+    auditResultRef <- newIORef (Nothing :: Maybe ByteString)
     writeCheckpoint initialSQL
 
     let oracleTimeout = max 1 (toInteger (oracleTimeoutMicros oracleCfg))
@@ -319,9 +322,12 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
                     `onException` recordInterrupted
             recordReductionObservation profile
             pure (detailedObservation profile)
+    let precomputedObservations =
+            maybe Map.empty (Map.singleton initialSQL) preflightObservation
     (cachedObservation, getCacheStats) <-
         memoizeOracleWith
             (evaluationCacheEnabled config)
+            precomputedObservations
             isCompleted
             runObservation
     reductionStart <- ticks
@@ -360,12 +366,11 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
         runAction = do
             reduced <- action captureLogger (measuredOracle True)
             auditInput <- readIORef acceptedRef
-            writeIORef auditInputRef auditInput
             auditStart <- ticks
             let auditOracle candidate = do
                     priorChecks <- readIORef auditChecksRef
                     modifyIORef' auditChecksRef (+ 1)
-                    accepted <- measuredOracle False candidate
+                    accepted <- measuredOracle True candidate
                     when (priorChecks == 0) (writeIORef auditInitialAcceptedRef accepted)
                     pure accepted
                 finishAudit = do
@@ -383,14 +388,16 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
                         , ("candidate_checks", toJSON checks)
                         , ("completed", toJSON complete)
                         , ("candidate_unchanged", toJSON unchanged)
-                        , ("minimality_claim", toJSON ("not-established" :: Text))
+                        , ("audit_minimality_confirmed", toJSON complete)
                         ]
             _ <-
                 ( do
-                    result <- statementAudit dialect auditOracle auditInput
+                    (result, stats) <-
+                        statementAuditWithLogger captureLogger dialect auditOracle auditInput
                     initialAccepted <- readIORef auditInitialAcceptedRef
-                    writeIORef auditCompletedRef True
+                    writeIORef auditCompletedRef (auditMinimalityConfirmed stats)
                     writeIORef auditUnchangedRef (initialAccepted && result == auditInput)
+                    writeIORef auditResultRef (Just result)
                     pure result
                 )
                     `finally` finishAudit
@@ -417,8 +424,14 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
             | Just asyncErr <- fromException err -> throwIO (asyncErr :: AsyncException)
             | otherwise -> pure ("error", Just (T.pack (displayException err)))
 
-    finalSQL <- readIORef acceptedRef
-    let validateOnce candidate = do
+    acceptedFinal <- readIORef acceptedRef
+    auditResult <- readIORef auditResultRef
+    let finalSQL = fromMaybe acceptedFinal auditResult
+        auditResultIsFinal =
+            case auditResult of
+                Just result -> result == finalSQL
+                Nothing -> False
+        validateOnce candidate = do
             prior <- readIORef validationObsRef
             if prior >= validationCallLimit
                 then pure Nothing
@@ -490,8 +503,6 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
     auditSeconds <- readIORef auditSecondsRef
     auditChecks <- readIORef auditChecksRef
     auditCompleted <- readIORef auditCompletedRef
-    auditUnchanged <- readIORef auditUnchangedRef
-    auditInput <- readIORef auditInputRef
     totalEnd <- ticks
     let finalStatus
             | status /= "completed" = status
@@ -550,7 +561,7 @@ runEvaluatedReduction config dialect oracleCfg parentLogger initialSQL checkpoin
                 , evaluationAuditChecks = auditChecks
                 , evaluationAuditCompleted = auditCompleted
                 , evaluationMinimalityClaim =
-                    if validationPassed && auditCompleted && auditUnchanged && finalSQL == auditInput
+                    if validationPassed && auditCompleted && auditResultIsFinal
                         then "statement-deletion-1-minimal"
                         else "not-established"
                 , evaluationCurve = curve

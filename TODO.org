@@ -139,14 +139,13 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 - Formally modeled reduction steps, well-founded termination, oracle preservation, and fixed-point convergence in Lean 4 (proofs/Proofs/Reduction.lean; 0 sorry).
 ** DONE Formalize 1-minimality of statement audit fixed point
 - Formally modeled 1-minimality, single-statement audit step, well-founded auditLoop, termination bounds, length monotonicity, oracle preservation, fixed-point 1-minimality, and closure 1-minimality in Lean 4 (proofs/Proofs/Minimality.lean; 0 sorry).
-** DONE Implement certifying trace exporter and standalone verified checker
-- Export certificate.json from Occam CLI; build standalone Lean 4 verified checker occam-checker; verify end-to-end (proofs/Proofs/Checker.lean; 0 sorry).
+** DONE Drop ceremonial certificate.json exporter
+- Removed redundant certificate.json export, secondary AST re-parsing, and fake audit traces from Occam CLI (YAGNI).
 
 * 22. Algorithm & Semantic Precision
-** DONE De-escalate conservative barriers for multi-table DML, triggers, and session commands
-- Removed global serialization barriers for triggers and multi-table DML (MERGE, multi-target DELETE).
-- Replaced string heuristics (isPrefixOf, delimiters) with strongly-typed SessionVariableObject and TransactionObject (TxBegin, TxCommit, TxRollback, TxSavepoint, TxRollbackTo, TxRelease).
-- De-escalated session commands to eliminate false dependencies on prior unrelated statements.
+** DONE De-escalate conservative barriers for transactions, triggers, and DDL
+- De-escalated TransactionObject from global script barriers: transactions only bind their frame (BEGIN/COMMIT/ROLLBACK) and precisely restored tables without fencing unrelated tables.
+- Refined Rust AST actions for EXPLAIN queries, table alterations, sequences, and types to prevent false barriers.
 ** DONE Model cascading foreign keys and temporary object lifecycles
 - Extracted cascading foreign key constraints (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) across CREATE TABLE and ALTER TABLE.
 - Propagated write dependencies across transitive cascading child tables.

@@ -42,7 +42,7 @@ tests =
                     _ <- oracle candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "accepted checkpoint survives execution cap" candidate (evaluatedSQL result)
             assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
@@ -79,7 +79,7 @@ tests =
                         action _ oracle = oracle candidate >> pure candidate
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
-                            runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
+                            runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
                         saved <- BS.readFile checkpoint
                         assertEqual "exhausted budget cannot replace accepted SQL" initial saved
                         pure value
@@ -106,7 +106,7 @@ tests =
                     threadDelay 2000000
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "checkpoint remains the last accepted SQL" candidate (evaluatedSQL result)
             assertEqual "timeout is not reported as completion" "timeout" (evaluationStatus metrics)
@@ -124,7 +124,7 @@ tests =
                     _ <- oracle initial
                     pure initial
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
+                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "in-flight oracle attempt is counted" 1 (evaluationOracleAttempts metrics)
             assertEqual "oracle process start survives cancellation" 1 (evaluationDatabaseObservations metrics)
@@ -132,7 +132,7 @@ tests =
                 "timeout prevents a minimality claim"
                 "not-established"
                 (evaluationMinimalityClaim metrics)
-        , testCase "audit probes do not replace the selected reduction result" $ do
+        , testCase "audit removals replace the selected reduction result" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
@@ -140,13 +140,20 @@ tests =
                 action _ oracle = do
                     _ <- oracle candidate
                     pure candidate
-            result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg nullLogger initial checkpoint action
+            result <- withCheckpoint $ \checkpoint -> do
+                value <-
+                    runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                saved <- BS.readFile checkpoint
+                assertEqual "audit result is checkpointed" "" saved
+                pure value
             let metrics = evaluationMetrics result
-            assertEqual "audit cannot erase the candidate" candidate (evaluatedSQL result)
+            assertEqual "audit result becomes the selected reduction" "" (evaluatedSQL result)
             assertBool "audit completed" (evaluationAuditCompleted metrics)
-            assertEqual "audit found a further reduction" "not-established" (evaluationMinimalityClaim metrics)
-            assertBool "candidate passed independent final validation" (evaluationValidationPassed metrics)
+            assertEqual
+                "audit fixed point is claimed minimal"
+                "statement-deletion-1-minimal"
+                (evaluationMinimalityClaim metrics)
+            assertBool "audit result passed independent final validation" (evaluationValidationPassed metrics)
         , testCase "parser transport failures preserve the last accepted checkpoint" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -158,7 +165,7 @@ tests =
                     reduceSQL SQLite (const (pure True)) invalidUtf8
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config SQLite oracleCfg nullLogger initial checkpoint action
+                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
                 saved <- BS.readFile checkpoint
                 assertEqual "failed parser input cannot overwrite the accepted checkpoint" candidate saved
                 pure value

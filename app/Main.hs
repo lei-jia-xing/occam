@@ -11,16 +11,12 @@ import Data.Aeson (FromJSON, ToJSON, Value, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
-import Data.Map.Strict qualified as Map
-import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Numeric (showFFloat)
 import Occam qualified
-import Occam.Core (Statement (..), StatementId (..))
-import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -46,7 +42,7 @@ import Occam.Oracle (
     OracleObservationDetails (..),
     prepareOracle,
  )
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), countStatements, parseSQL)
+import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     ReductionConfig (..),
     SearchStrategy (..),
@@ -114,27 +110,6 @@ data ReductionOptions = ReductionOptions
     , optDialect :: !SQLDialect
     }
     deriving (Eq, Show)
-
-data StepCertificate = StepCertificate
-    { stepKind :: !T.Text
-    , bytesBefore :: !Int
-    , bytesAfter :: !Int
-    , stmtsBefore :: ![Int]
-    , stmtsAfter :: ![Int]
-    , valid :: !Bool
-    }
-    deriving (Eq, Show, Generic, ToJSON, FromJSON)
-
-data ReductionCertificate = ReductionCertificate
-    { initialBytes :: !Int
-    , initialStmts :: ![Int]
-    , finalBytes :: !Int
-    , finalStmts :: ![Int]
-    , dagEdges :: ![(Int, [Int])]
-    , steps :: ![StepCertificate]
-    , auditRejected :: ![Int]
-    }
-    deriving (Eq, Show, Generic, ToJSON, FromJSON)
 
 data Stats = Stats
     { initial_bytes :: !Int
@@ -428,6 +403,7 @@ runOccamWithLogger logger Options {..} = do
             budgetConfig
             dialect
             oracleCfg
+            (Just (detailedObservation preflightDetails))
             logger
             initialSQL
             minimalPath
@@ -479,62 +455,8 @@ runOccamWithLogger logger Options {..} = do
                 , initial_oracle_seconds = initialOracleSeconds
                 , elapsed_seconds = evaluationTotalSeconds evaluation
                 }
-    parsedInitial <- parseSQL dialect initialSQL
-    let initialUnits = case parsedInitial of
-            Right (ParsedSQL units) -> units
-            Left _ -> []
-        initialStatements = map unitStatement initialUnits
-        initialStmtIds =
-            if null initialStatements
-                then [1 .. max 1 initialStmts]
-                else [sid | StatementId sid <- map stmtId initialStatements]
-        depGraph = analyzeStatements initialUnits
-        dagEdgesList =
-            [ (v, uList)
-            | (StatementId v, deps) <- Map.toAscList (graphEdges depGraph)
-            , let uList = [u | StatementId u <- Set.toAscList deps, u < v]
-            , not (null uList)
-            ]
-
-    parsedReduced <- parseSQL dialect reducedSQL
-    let finalUnits = case parsedReduced of
-            Right (ParsedSQL units) -> units
-            Left _ -> []
-        finalStatements = map unitStatement finalUnits
-        matchedIds = matchRetainedIds initialStatements finalStatements
-        finalStmtIds
-            | reducedBytes == initialBytes = initialStmtIds
-            | null matchedIds = [sid | StatementId sid <- map stmtId finalStatements]
-            | otherwise = matchedIds
-        finalStmtsResolved =
-            if null finalStmtIds
-                then [1 .. max 1 reducedStmts]
-                else finalStmtIds
-        reductionSteps =
-            [ StepCertificate
-                { stepKind = "reduction"
-                , bytesBefore = initialBytes
-                , bytesAfter = reducedBytes
-                , stmtsBefore = initialStmtIds
-                , stmtsAfter = finalStmtsResolved
-                , valid = True
-                }
-            | initialBytes > reducedBytes
-            ]
-        certificate =
-            ReductionCertificate
-                { initialBytes = initialBytes
-                , initialStmts = initialStmtIds
-                , finalBytes = min initialBytes reducedBytes
-                , finalStmts = if initialBytes > reducedBytes then finalStmtsResolved else initialStmtIds
-                , dagEdges = dagEdgesList
-                , steps = reductionSteps
-                , auditRejected = if initialBytes > reducedBytes then finalStmtsResolved else initialStmtIds
-                }
-        certificatePath = optOutDir </> "certificate.json"
     BS.writeFile minimalPath reducedSQL
     BSL.writeFile statsPath (encode stats)
-    BSL.writeFile certificatePath (encode certificate)
 
     logInfo'
         logger
@@ -574,7 +496,6 @@ runOccamWithLogger logger Options {..} = do
         putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) (evaluationTotalSeconds evaluation) "s"
         putStrLn $ "  Artifacts:    " ++ minimalPath
         putStrLn $ "                " ++ statsPath
-        putStrLn $ "                " ++ certificatePath
         putStrLn "======================================================================"
     unless
         (evaluationStatus evaluation == "completed" && evaluationValidationPassed evaluation)
@@ -621,21 +542,3 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "search_strategy" .= searchStrategyName reductionSearch
         , "dialect" .= sqlDialectName reductionDialect
         ]
-
-matchRetainedIds :: [Statement] -> [Statement] -> [Int]
-matchRetainedIds [] fins = [sid | StatementId sid <- map stmtId fins]
-matchRetainedIds _ [] = []
-matchRetainedIds (orig : origs) (fin : fins)
-    | normalizeStmt (stmtRaw orig) == normalizeStmt (stmtRaw fin) =
-        let StatementId sid = stmtId orig
-         in sid : matchRetainedIds origs fins
-    | otherwise =
-        case dropWhile (\o -> normalizeStmt (stmtRaw o) /= normalizeStmt (stmtRaw fin)) origs of
-            (matched : remaining) ->
-                let StatementId sid = stmtId matched
-                 in sid : matchRetainedIds remaining fins
-            [] ->
-                let StatementId sid = stmtId fin
-                 in sid : matchRetainedIds origs fins
-    where
-        normalizeStmt = BS.filter (\w -> w /= 32 && w /= 10 && w /= 13 && w /= 9)

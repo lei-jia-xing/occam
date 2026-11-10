@@ -53,7 +53,7 @@ emptyGraph =
 
 isBarrierAction :: ObjectAction -> Bool
 isBarrierAction act =
-    actionKind act `elem` [BarrierObject, SessionVariableObject, TransactionObject]
+    actionKind act `elem` [BarrierObject, SessionVariableObject]
         || actionType act == BarrierDep
 
 isSessionAction :: ObjectAction -> Bool
@@ -153,6 +153,7 @@ data ObjectKey
 data ObjectState = ObjectState
     { objectDefinition :: !(Maybe StatementId)
     , objectLastWrite :: !(Maybe StatementId)
+    , objectRestored :: !(Maybe StatementId)
     , objectSources :: !(Set (Either ObjectName ObjectKey))
     , objectDropped :: !Bool
     }
@@ -166,8 +167,9 @@ data Catalog = Catalog
     deriving (Eq, Show)
 
 data TxFrame = TxFrame
-    { txStart :: !Catalog
-    , txSavepoints :: ![(ObjectName, Catalog)]
+    { txBeginSid :: !StatementId
+    , txStart :: !Catalog
+    , txSavepoints :: ![(ObjectName, Catalog, StatementId)]
     , txImplicitSavepoint :: !Bool
     , txOnCommitDrop :: !(Set ObjectKey)
     , txOnCommitDeleteRows :: !(Set ObjectKey)
@@ -271,7 +273,7 @@ processAction sid priorState stmtActions (deps, state) act
                 let catalog = scanCatalog state
                     keys = definitionKeys catalog stmtActions act
                     sources = viewSources (scanCatalog priorState) stmtActions (actionName act)
-                    newObject = ObjectState (Just sid) Nothing sources False
+                    newObject = ObjectState (Just sid) Nothing Nothing sources False
                     catalog0 =
                         if actionKind act `elem` [TableObject, TemporaryTableObject]
                             then foldl' (prepareDefinition sid) catalog keys
@@ -347,7 +349,10 @@ processRenames sid priorState actions state =
                                 withTarget =
                                     cleanTarget
                                         { catalogObjects =
-                                            Map.insert targetKey (ObjectState (Just sid) Nothing Set.empty False) (catalogObjects cleanTarget)
+                                            Map.insert
+                                                targetKey
+                                                (ObjectState (Just sid) Nothing Nothing Set.empty False)
+                                                (catalogObjects cleanTarget)
                                         , catalogRelations =
                                             moveRelations sourceKey targetKey (catalogRelations catalog) (catalogRelations cleanTarget)
                                         , catalogCascades =
@@ -397,7 +402,7 @@ stateDependencies state key =
 
 stateDependenciesInObject :: ObjectState -> Set StatementId
 stateDependenciesInObject object =
-    Set.fromList (catMaybes [objectDefinition object, objectLastWrite object])
+    Set.fromList (catMaybes [objectDefinition object, objectLastWrite object, objectRestored object])
 
 matchingKeys :: ScanState -> ObjectKind -> DependencyType -> ObjectName -> [ObjectKey]
 matchingKeys state = matchingKeysInCatalog (scanCatalog state)
@@ -522,8 +527,8 @@ writeObjects sid keys catalog =
             }
     where
         write objects key =
-            let old = Map.findWithDefault (ObjectState Nothing Nothing Set.empty False) key objects
-             in Map.insert key old {objectLastWrite = Just sid} objects
+            let old = Map.findWithDefault (ObjectState Nothing Nothing Nothing Set.empty False) key objects
+             in Map.insert key old {objectLastWrite = Just sid, objectRestored = Nothing} objects
 
 transitiveCascades :: [ObjectKey] -> Map ObjectKey (Set ObjectKey) -> [ObjectKey]
 transitiveCascades initial cascades = go (Set.fromList initial) initial
@@ -547,7 +552,7 @@ dropObjects sid keys catalog =
                 }
 
         dropOne objects key =
-            Map.insert key (ObjectState (Just sid) Nothing Set.empty True) objects
+            Map.insert key (ObjectState (Just sid) Nothing Nothing Set.empty True) objects
 
         removeObjectBindings relations key =
             Map.mapMaybe
@@ -663,7 +668,11 @@ moveTableColumns sid oldKey newKey sourceCatalog targetCatalog =
         cleanTarget = resetTableColumns sid newKey targetCatalog
         movedObjects =
             foldl'
-                ( \objects column -> Map.insert (ColumnKey newKey column) (ObjectState (Just sid) Nothing Set.empty False) objects
+                ( \objects column ->
+                    Map.insert
+                        (ColumnKey newKey column)
+                        (ObjectState (Just sid) Nothing Nothing Set.empty False)
+                        objects
                 )
                 (catalogObjects cleanTarget)
                 sourceColumns
@@ -759,6 +768,20 @@ moveRelations oldKey newKey sourceRelations targetRelations =
         Nothing -> targetRelations
         Just bound -> Map.insertWith Set.union newKey bound targetRelations
 
+restoreCatalog :: StatementId -> Catalog -> Catalog -> Catalog
+restoreCatalog sid targetCatalog currentCatalog =
+    let modifiedKeys =
+            [ key
+            | (key, obj) <- Map.toList (catalogObjects targetCatalog)
+            , Map.lookup key (catalogObjects currentCatalog) /= Just obj
+            ]
+        restoredObjects =
+            foldl'
+                (flip (Map.adjust (\obj -> obj {objectRestored = Just sid})))
+                (catalogObjects targetCatalog)
+                modifiedKeys
+     in targetCatalog {catalogObjects = restoredObjects}
+
 applyTransactionControl ::
     StatementId -> [ObjectAction] -> ScanState -> (Set StatementId, ScanState)
 applyTransactionControl _sid actions state =
@@ -772,7 +795,7 @@ applyTransactionControl _sid actions state =
             case scanTransactions state of
                 [] ->
                     ( Set.empty
-                    , state {scanTransactions = [TxFrame snapshot [] False Set.empty Set.empty]}
+                    , state {scanTransactions = [TxFrame _sid snapshot [] False Set.empty Set.empty]}
                     )
                 _ -> (Set.empty, state)
         apply TxCommit =
@@ -781,62 +804,63 @@ applyTransactionControl _sid actions state =
                     let catalog = scanCatalog state
                         droppedCatalog = dropObjects _sid (Set.toList (txOnCommitDrop frame)) catalog
                         truncatedCatalog = writeObjects _sid (Set.toList (txOnCommitDeleteRows frame)) droppedCatalog
-                     in (Set.empty, state {scanCatalog = truncatedCatalog, scanTransactions = rest})
+                     in (Set.singleton (txBeginSid frame), state {scanCatalog = truncatedCatalog, scanTransactions = rest})
                 [] -> (Set.empty, state)
         apply TxRollback =
             case scanTransactions state of
                 frame : rest ->
-                    ( Set.empty
-                    , state
-                        { scanCatalog = txStart frame
-                        , scanTransactions = rest
-                        }
-                    )
+                    let restored = restoreCatalog _sid (txStart frame) (scanCatalog state)
+                     in ( Set.singleton (txBeginSid frame)
+                        , state
+                            { scanCatalog = restored
+                            , scanTransactions = rest
+                            }
+                        )
                 [] -> (Set.empty, state)
         apply (TxSavepoint name) =
             case scanTransactions state of
                 frame : rest ->
-                    ( Set.empty
+                    ( Set.singleton (txBeginSid frame)
                     , state
                         { scanTransactions =
-                            frame {txSavepoints = txSavepoints frame ++ [(name, snapshot)]} : rest
+                            frame {txSavepoints = txSavepoints frame ++ [(name, snapshot, _sid)]} : rest
                         }
                     )
                 [] ->
                     ( Set.empty
                     , state
                         { scanTransactions =
-                            [TxFrame snapshot [(name, snapshot)] True Set.empty Set.empty]
+                            [TxFrame _sid snapshot [(name, snapshot, _sid)] True Set.empty Set.empty]
                         }
                     )
         apply (TxRollbackTo name) =
             case scanTransactions state of
                 frame : rest ->
-                    case break ((== name) . fst) (reverse (txSavepoints frame)) of
-                        (_, saved : older) ->
-                            let retained = reverse older ++ [saved]
-                             in ( Set.empty
+                    case break (\(n, _, _) -> n == name) (reverse (txSavepoints frame)) of
+                        (_, (savedName, saved, spSid) : older) ->
+                            let retained = reverse older ++ [(savedName, saved, spSid)]
+                                restored = restoreCatalog _sid saved (scanCatalog state)
+                             in ( Set.singleton spSid
                                 , state
-                                    { scanCatalog = snd saved
+                                    { scanCatalog = restored
                                     , scanTransactions = frame {txSavepoints = retained} : rest
                                     }
                                 )
-                        _ -> (Set.empty, state)
+                        _ -> (Set.singleton (txBeginSid frame), state)
                 [] -> (Set.empty, state)
         apply (TxRelease name) =
             case scanTransactions state of
                 frame : rest ->
-                    case break ((== name) . fst) (reverse (txSavepoints frame)) of
-                        (_, _ : older) ->
+                    case break (\(n, _, _) -> n == name) (reverse (txSavepoints frame)) of
+                        (_, (_, _, spSid) : older) ->
                             let retained = reverse older
                                 transactions =
                                     if txImplicitSavepoint frame && null retained
                                         then rest
                                         else frame {txSavepoints = retained} : rest
-                             in (Set.empty, state {scanTransactions = transactions})
+                             in (Set.singleton spSid, state {scanTransactions = transactions})
                         _ -> (Set.empty, state)
                 [] -> (Set.empty, state)
-
 txCommandFromAction :: ObjectAction -> Maybe TxCommand
 txCommandFromAction act
     | actionKind act == TransactionObject =

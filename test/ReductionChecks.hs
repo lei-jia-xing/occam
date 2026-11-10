@@ -142,6 +142,21 @@ tests =
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
             assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
+        , testCase "Named table constraints are stripped with their CONSTRAINT prefix" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, CONSTRAINT pk PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id), name TEXT);"
+                        , "SELECT id FROM t;"
+                        ]
+                oracle candidate =
+                    pure
+                        ( BSC.isInfixOf "CREATE TABLE t" candidate
+                            && BSC.isInfixOf "SELECT id FROM t" candidate
+                        )
+            reduced <- reduceSQL GenericSQL oracle sql
+            assertBool "strips named primary key" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
+            assertBool "strips named foreign key" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
+            assertBool "strips constraint names" (not (BSC.isInfixOf "CONSTRAINT" reduced))
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             let sql =
                     BSC.unlines

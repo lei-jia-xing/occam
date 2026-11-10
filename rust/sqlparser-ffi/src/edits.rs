@@ -1336,71 +1336,70 @@ impl<'a> AnalysisVisitor<'a> {
         }
     }
 
-    fn table_constraint_span(&self, tc: &TableConstraint) -> Option<(usize, usize)> {
-        let (inner_start, _) = self.mapped_span(tc.span())?;
-        let mut comma_before = None;
-        let mut index = self.tokens.partition_point(|t| t.start < inner_start);
-        let mut depth = 1usize;
-        while index > 0 {
-            index -= 1;
-            let token = self.tokens[index];
+    /// Outermost parentheses pair that contains the given source range.
+    fn enclosing_parentheses(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        self.tokens
+            .iter()
+            .filter(|token| matches!(token.kind, TokenKind::LeftParen))
+            .filter_map(|token| token.parentheses.map(|pair| (token.start, pair.end)))
+            .filter(|(open, close)| *open < start && *close >= end)
+            .min_by_key(|(open, _)| *open)
+    }
+
+    /// Top-level comma-separated item inside a table body that contains `target`.
+    fn table_body_item(
+        &self,
+        body_start: usize,
+        body_end: usize,
+        target: usize,
+    ) -> Option<(usize, usize)> {
+        let mut item_start = body_start;
+        let mut index = self.tokens.partition_point(|token| token.end <= body_start);
+        while let Some(token) = self.tokens.get(index).copied() {
+            if token.start >= body_end {
+                break;
+            }
             match token.kind {
-                TokenKind::RightParen => depth += 1,
                 TokenKind::LeftParen => {
-                    if depth > 0 {
-                        depth -= 1;
-                    } else {
-                        break;
+                    let pair = token.parentheses?;
+                    if pair.end > body_end {
+                        return None;
                     }
+                    index = self
+                        .tokens
+                        .partition_point(|candidate| candidate.start < pair.end);
                 }
-                TokenKind::Comma if depth == 0 => {
-                    comma_before = Some(token.start);
-                    break;
+                TokenKind::Comma if token.start < target => {
+                    item_start = token.end;
+                    index += 1;
                 }
-                _ => {}
+                TokenKind::Comma => return Some((item_start, token.start)),
+                _ => index += 1,
             }
         }
+        Some((item_start, body_end))
+    }
 
-        let mut comma_after = None;
-        let mut paren_after = None;
-        let mut fwd_index = self.tokens.partition_point(|t| t.start < inner_start);
-        let mut fwd_depth = 1usize;
-        while let Some(token) = self.tokens.get(fwd_index).copied() {
-            match token.kind {
-                TokenKind::LeftParen => fwd_depth += 1,
-                TokenKind::RightParen => {
-                    if fwd_depth > 0 {
-                        fwd_depth -= 1;
-                    } else {
-                        paren_after = Some(token.start);
-                        break;
-                    }
-                }
-                TokenKind::Comma if fwd_depth == 0 => {
-                    comma_after = Some(token);
-                    break;
-                }
-                TokenKind::Semicolon => break,
-                _ => {}
-            }
-            fwd_index += 1;
+    fn table_constraint_span(&self, tc: &TableConstraint) -> Option<(usize, usize)> {
+        let (inner_start, inner_end) = self.mapped_span(tc.span())?;
+        let (open, close) = self.enclosing_parentheses(inner_start, inner_end)?;
+        let body_start = open + 1;
+        let body_end = close.checked_sub(1)?;
+        if body_start > body_end {
+            return None;
         }
-
-        if let Some(c_before) = comma_before {
-            let edit_start = preceding_whitespace(self.source.as_bytes(), c_before);
-            let edit_end =
-                comma_after.map_or_else(|| paren_after.unwrap_or(inner_start), |c| c.start);
+        let (item_start, item_end) = self.table_body_item(body_start, body_end, inner_start)?;
+        if item_start > body_start {
+            let comma_start = item_start.checked_sub(1)?;
+            let edit_start = preceding_whitespace(self.source.as_bytes(), comma_start);
+            let edit_end = if item_end < body_end {
+                item_end
+            } else {
+                body_end
+            };
             Some((edit_start, edit_end))
-        } else if let Some(c_after) = comma_after {
-            let mut start = inner_start;
-            let before_idx = self.tokens.partition_point(|t| t.start < inner_start);
-            for token in self.tokens[..before_idx].iter().rev() {
-                if matches!(token.kind, TokenKind::LeftParen) {
-                    break;
-                }
-                start = token.start;
-            }
-            Some((start, c_after.end))
+        } else if item_end < body_end {
+            Some((item_start, item_end + 1))
         } else {
             None
         }

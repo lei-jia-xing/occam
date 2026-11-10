@@ -118,7 +118,6 @@ mod tests {
         assert_eq!(&sql[units[0].start..units[0].end], "SELECT 'x;y'");
         assert_eq!(&sql[units[1].start..units[1].end], "SELECT 2");
     }
-
     #[test]
     fn invalid_middle_unit_does_not_hide_later_statement() {
         let sql = "SELECT 1; SELECT FROM; SELECT 3";
@@ -969,5 +968,24 @@ mod tests {
             .any(|e| e.label == "simplify-function_to_argument"));
         assert!(expr_edits.iter().any(|e| e.label == "simplify-is_null"));
         assert!(expr_edits.iter().any(|e| e.label == "simplify-between"));
+    }
+
+    #[test]
+    fn named_table_constraints_are_removed_with_their_prefix() {
+        let sql = "CREATE TABLE t (id INT, CONSTRAINT pk PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id), name TEXT);";
+        let units = parse_units(sql, DialectKind::Generic).unwrap();
+        let edits = &units[0].facts.as_ref().unwrap().edits;
+        let removed: Vec<_> = edits
+            .iter()
+            .filter(|edit| edit.label == "remove-table_constraint")
+            .map(|edit| &sql[edit.start..edit.end])
+            .collect();
+        assert_eq!(removed.len(), 2);
+        assert!(removed
+            .iter()
+            .any(|text| text.contains("CONSTRAINT pk PRIMARY KEY (id)")));
+        assert!(removed
+            .iter()
+            .any(|text| { text.contains("CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id)") }));
     }
 }

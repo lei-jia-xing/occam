@@ -18,7 +18,7 @@ import DependencyChecks qualified
 import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
-import Occam.Cache (CacheStats (..), memoizeOracle)
+import Occam.Cache (CacheStats (..), memoizeOracle, memoizeOracleWith)
 import Occam.Core (DependencyType (..), ObjectAction (..), ObjectKind (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Logger (nullLogger)
@@ -391,19 +391,53 @@ phase6Tests =
             stats3 <- getStats
             assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
             assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
-        , testCase "Late-query slicing completes within a bounded oracle allowance" $ do
+        , testCase "precomputed observations are served even without memoization" $ do
+            callCountRef <- newIORef (0 :: Int)
+            let mockOracle _ = do
+                    modifyIORef' callCountRef (+ 1)
+                    pure False
+            (cachedOracle, getStats) <-
+                memoizeOracleWith
+                    False
+                    (Map.singleton "SELECT 1;" True)
+                    (const True)
+                    mockOracle
+            seeded <- cachedOracle "SELECT 1;"
+            assertEqual "precomputed observation is returned" True seeded
+            callsAfterSeed <- readIORef callCountRef
+            assertEqual "precomputed observation does not invoke the oracle" 0 callsAfterSeed
+            repeated <- cachedOracle "SELECT 1;"
+            assertEqual "precomputed observation remains available" True repeated
+            callsAfterRepeat <- readIORef callCountRef
+            assertEqual "repeated precomputed lookup does not invoke the oracle" 0 callsAfterRepeat
+            unseeded <- cachedOracle "SELECT 2;"
+            assertEqual "unseeded query reaches the oracle" False unseeded
+            callsAfterMiss <- readIORef callCountRef
+            assertEqual "unseeded query is counted as a miss" 1 callsAfterMiss
+            stats <- getStats
+            assertEqual "precomputed lookups are not cache hits when disabled" 0 (cacheHits stats)
+            assertEqual "only the real query is a miss" 1 (cacheMisses stats)
+        , testCase "Late-query slicing completes within a linear oracle allowance" $ do
             let required =
                     [ "CREATE TABLE needed (v INT);"
                     , "INSERT INTO needed VALUES (42);"
                     , "SELECT v FROM needed;"
                     ]
                 noise = [BSC.pack ("CREATE TABLE unused_" ++ show n ++ " (v INT);") | n <- [1 .. 64 :: Int]]
-                sql = BSC.unlines (take 2 required ++ noise ++ drop 2 required)
+                statements = take 2 required ++ noise ++ drop 2 required
+                sql = BSC.unlines statements
+                allowance = length statements + 16
             calls <- newIORef (0 :: Int)
             let check candidate = do
                     modifyIORef' calls (+ 1)
                     count <- readIORef calls
-                    when (count > 32) (assertFailure "Oracle execution allowance exhausted before reduction")
+                    when (count > allowance) $
+                        assertFailure
+                            ( "Linear prefix search exceeded its oracle allowance: "
+                                ++ show count
+                                ++ " > "
+                                ++ show allowance
+                            )
                     pure (all (`BSC.isInfixOf` candidate) required)
             (oracle, _) <- memoizeOracle check
             reduced <-
@@ -412,7 +446,7 @@ phase6Tests =
                     nullLogger
                     oracle
                     sql
-            assertEqual "Unrelated setup is removed without walking every prefix" (BSC.unlines required) reduced
+            assertEqual "Unrelated setup is removed by a linear prefix scan" (BSC.unlines required) reduced
         ]
 
 -- ----------------------------------------------------------------------------

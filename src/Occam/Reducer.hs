@@ -15,6 +15,8 @@ module Occam.Reducer (
     reduceSQLWithConfig,
     statementDdmin,
     statementAudit,
+    statementAuditWithLogger,
+    AuditStats (..),
 ) where
 
 import Data.Aeson (toJSON)
@@ -610,7 +612,7 @@ logAuditStats logger stats =
         , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
         ]
 
--- Prefix tests are linear: oracle results are not assumed to be monotone.
+-- | Linear search for the first predicate-preserving statement prefix.
 findInterestingPrefix ::
     Oracle -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
 findInterestingPrefix oracle baseSQL statements = go 1
@@ -627,7 +629,13 @@ findInterestingPrefix oracle baseSQL statements = go 1
                         [] -> pure (Nothing, prefixLength)
                     else go (prefixLength + 1)
 
-analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO ([Statement], DependencyGraph)
+-- | Parsed statements plus their dependency graph for one exact candidate byte string.
+data SQLAnalysis = SQLAnalysis
+    { analyzedStatements :: ![Statement]
+    , analyzedGraph :: !DependencyGraph
+    }
+
+analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
 analyzeSQL logger dialect sql = do
     started <- getMonotonicTimeNSec
     units <- parseUnitsOrThrow dialect sql
@@ -653,13 +661,21 @@ analyzeSQL logger dialect sql = do
         , ("barrier_edges", toJSON barrierEdges)
         , ("dialect", toJSON (T.pack (show dialect)))
         ]
-    pure (statements, graph)
+    pure SQLAnalysis {analyzedStatements = statements, analyzedGraph = graph}
 
-sliceSQL :: Logger -> SQLDialect -> Oracle -> ByteString -> IO ByteString
-sliceSQL logger dialect oracle sql = do
-    (statements, graph) <- analyzeSQL logger dialect sql
+{- | Slice @sql@ using an analysis of the same bytes. The analysis is returned
+only when the result is byte-identical to @sql@, so the caller can safely reuse
+it for the next stage without re-parsing.
+-}
+sliceWithAnalysis ::
+    Logger -> Oracle -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
+sliceWithAnalysis logger oracle analysis sql = do
+    let statements = analyzedStatements analysis
+        graph = analyzedGraph analysis
+        keep result =
+            pure (result, if result == sql then Just analysis else Nothing)
     if null statements
-        then pure sql
+        then keep sql
         else do
             let sliceFor target =
                     let slice = backwardSlice (stmtId target) graph
@@ -685,22 +701,14 @@ sliceSQL logger dialect oracle sql = do
                 if BS.length lastCandidate < BS.length sql
                     then oracle lastCandidate
                     else pure False
-            if lastAccepted
-                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate
-                else do
+            let tryPrefix bestCandidate = do
                     (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
                     case maybeTarget of
-                        Nothing -> do
-                            logInfo'
-                                logger
-                                "occam::reducer"
-                                "No predicate-preserving statement prefix found"
-                                [("prefix_tests", toJSON prefixTests)]
-                            pure sql
+                        Nothing -> pure bestCandidate
                         Just (targetStatement, prefixSQL, prefixLength) -> do
                             let (retained, candidate) = sliceFor targetStatement
                             if BS.length candidate >= BS.length sql
-                                then pure sql
+                                then pure bestCandidate
                                 else do
                                     let reusedPrefixResult = candidate == prefixSQL
                                     ok <- if reusedPrefixResult then pure True else oracle candidate
@@ -712,19 +720,38 @@ sliceSQL logger dialect oracle sql = do
                                         , ("prefix_length", toJSON prefixLength)
                                         , ("prefix_result_reused", toJSON reusedPrefixResult)
                                         ]
-                                    if ok
-                                        then acceptSlice "first-interesting-prefix" targetStatement retained candidate
-                                        else pure sql
+                                    let bestLen = maybe (BS.length sql) BS.length bestCandidate
+                                    if ok && BS.length candidate < bestLen
+                                        then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                        else pure bestCandidate
+            if lastAccepted && length lastRetained <= 2
+                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
+                else do
+                    let initialBest = if lastAccepted then Just lastCandidate else Nothing
+                    better <- tryPrefix initialBest
+                    case better of
+                        Just result -> keep result
+                        Nothing ->
+                            if lastAccepted
+                                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
+                                else keep sql
 
-closureSearchSQL ::
-    Logger -> SQLDialect -> SearchStrategy -> Oracle -> ByteString -> IO ByteString
-closureSearchSQL logger dialect strategy oracle sql = do
-    (statements, graph) <- analyzeSQL logger dialect sql
-    if null statements
-        then pure sql
-        else do
-            retained <- closureDdminWithLogger logger strategy oracle sql statements graph
-            pure (statementSQL sql statements retained)
+closureSearchWithAnalysis ::
+    Logger -> SearchStrategy -> Oracle -> ByteString -> SQLAnalysis -> IO ByteString
+closureSearchWithAnalysis logger strategy oracle sql analysis =
+    let statements = analyzedStatements analysis
+     in if null statements
+            then pure sql
+            else do
+                retained <-
+                    closureDdminWithLogger
+                        logger
+                        strategy
+                        oracle
+                        sql
+                        statements
+                        (analyzedGraph analysis)
+                pure (statementSQL sql statements retained)
 
 reduceSQL :: SQLDialect -> Oracle -> ByteString -> IO ByteString
 reduceSQL dialect = reduceSQLWithLogger dialect nullLogger
@@ -777,21 +804,20 @@ reduceSQLWithConfig config logger oracle initialSQL = do
 reduceIterationWithConfig ::
     ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
 reduceIterationWithConfig config logger oracle initialSQL = do
-    sliced <-
+    (sliced, reusableAnalysis) <-
         if reductionSlicing config
-            then
-                timedStage
-                    logger
-                    "backward-slicing"
-                    (sliceSQL logger (reductionDialect config) oracle initialSQL)
-            else pure initialSQL
+            then timedStage logger "backward-slicing" $ do
+                analysis <- analyzeSQL logger (reductionDialect config) initialSQL
+                sliceWithAnalysis logger oracle analysis initialSQL
+            else pure (initialSQL, Nothing)
     searched <-
         if reductionClosure config
-            then
-                timedStage
-                    logger
-                    "closure-search"
-                    (closureSearchSQL logger (reductionDialect config) (reductionSearch config) oracle sliced)
+            then timedStage logger "closure-search" $ do
+                analysis <-
+                    case reusableAnalysis of
+                        Just cached -> pure cached
+                        Nothing -> analyzeSQL logger (reductionDialect config) sliced
+                closureSearchWithAnalysis logger (reductionSearch config) oracle sliced analysis
             else
                 timedStage
                     logger

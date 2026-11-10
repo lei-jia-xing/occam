@@ -41,4 +41,6 @@ benchmarks/**/results/
 benchmarks/*.jsonl
 benchmarks/**/*.jsonl
 benchmarks/fuzz_benchmark_results.jsonl
+benchmarks/benchmark_artifacts/
+benchmarks/*.summary.json
 benchmarks/fuzz_benchmark_summary.*

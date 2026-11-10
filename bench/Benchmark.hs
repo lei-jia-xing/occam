@@ -190,6 +190,7 @@ runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (nam
             runConfig
             dialect
             oracleConfig
+            Nothing
             logger
             sql
             sqlPath

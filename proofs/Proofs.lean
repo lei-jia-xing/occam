@@ -3,4 +3,3 @@
 import Proofs.DAG
 import Proofs.Reduction
 import Proofs.Minimality
-import Proofs.Checker

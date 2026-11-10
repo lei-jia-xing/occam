@@ -10,6 +10,7 @@ import Control.Monad (when)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import GHC.Generics (Generic)
 import Occam.Reducer (Oracle)
@@ -25,21 +26,31 @@ instance FromJSON CacheStats
 
 -- | Memoize completed results. Failed actions are counted as misses but never cached.
 memoizeOracle :: Oracle -> IO (Oracle, IO CacheStats)
-memoizeOracle = memoizeOracleWith True (const True)
+memoizeOracle = memoizeOracleWith True Map.empty (const True)
 
+{- | Memoize completed results, starting from a set of observations that are
+already known to be authoritative. Precomputed entries are served even when
+memoization is disabled: they are established facts, not speculative cache
+entries, and re-running them would only duplicate work. They are not counted as
+cache hits while memoization is disabled, so @--no-cache@ metrics stay honest.
+-}
 memoizeOracleWith ::
     Bool ->
+    Map ByteString a ->
     (a -> Bool) ->
     (ByteString -> IO a) ->
     IO (ByteString -> IO a, IO CacheStats)
-memoizeOracleWith enabled cacheResult oracle = do
-    cacheRef <- newIORef Map.empty
+memoizeOracleWith enabled precomputed cacheResult oracle = do
+    cacheRef <- newIORef precomputed
     hitsRef <- newIORef (0 :: Int)
     missesRef <- newIORef (0 :: Int)
     let cachedOracle sql
-            | not enabled = do
-                modifyIORef' missesRef (+ 1)
-                oracle sql
+            | not enabled =
+                case Map.lookup sql precomputed of
+                    Just res -> pure res
+                    Nothing -> do
+                        modifyIORef' missesRef (+ 1)
+                        oracle sql
             | otherwise = do
                 cache <- readIORef cacheRef
                 case Map.lookup sql cache of

@@ -563,6 +563,23 @@ tests =
             assertBool
                 "SELECT from unrelated does not depend on t_log"
                 (not (has (StatementId 2) unrelatedDeps))
+        , testCase "transactions do not create global serialization barriers across unrelated tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t_unrelated (id INT);"
+                        , "BEGIN;"
+                        , "CREATE TABLE t_in_tx (val INT);"
+                        , "INSERT INTO t_in_tx VALUES (42);"
+                        , "COMMIT;"
+                        , "SELECT id FROM t_unrelated;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let queryDeps = dependenciesFor (StatementId 6) graph
+            assertBool "Query depends on t_unrelated" (has (StatementId 1) queryDeps)
+            assertBool "Query does not depend on BEGIN" (not (has (StatementId 2) queryDeps))
+            assertBool "Query does not depend on t_in_tx" (not (has (StatementId 3) queryDeps))
+            assertBool "Query does not depend on INSERT" (not (has (StatementId 4) queryDeps))
+            assertBool "Query does not depend on COMMIT" (not (has (StatementId 5) queryDeps))
         , testCase "MERGE statement extracts precise ModDep on target and UseDep on source" $ do
             let sql =
                     BSC.unlines

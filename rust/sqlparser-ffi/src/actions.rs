@@ -441,6 +441,7 @@ pub(super) fn analyze_statement(
                 }),
                 ObjectType::View | ObjectType::MaterializedView => Some(NativeObjectKind::View),
                 ObjectType::Index => Some(NativeObjectKind::Index),
+                ObjectType::Sequence | ObjectType::Type => Some(NativeObjectKind::Table),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -520,14 +521,13 @@ pub(super) fn analyze_statement(
                                 column_name(&table, &canonical_ident(new_column_name, dialect)),
                             ));
                         }
-                        AlterTableOperation::AddConstraint { constraint, .. } => {
-                            if let TableConstraint::ForeignKey(reference) = constraint {
-                                add_foreign_key(&mut actions, dialect, reference);
-                            }
+                        AlterTableOperation::AddConstraint {
+                            constraint: TableConstraint::ForeignKey(reference),
+                            ..
+                        } => {
+                            add_foreign_key(&mut actions, dialect, reference);
                         }
-                        _ => {
-                            actions.insert(barrier("__unknown_alter_barrier__"));
-                        }
+                        _ => {}
                     }
                 }
             } else {
@@ -835,6 +835,28 @@ pub(super) fn analyze_statement(
                 NativeActionType::TxRelease,
                 canonical_ident(name, dialect),
             ));
+        }
+        Statement::Explain { statement, .. } => {
+            return analyze_statement(statement, dialect, source, source_map, tokens, unit);
+        }
+        Statement::ExplainTable { table_name, .. } => {
+            if let Some(table) = from_name(table_name, dialect) {
+                add_table_use(&mut actions, table);
+            }
+        }
+        Statement::CreateSequence { name, .. } => {
+            if let Some(seq) = from_name(name, dialect) {
+                actions.insert(action(NativeObjectKind::Table, NativeActionType::Def, seq));
+            }
+        }
+        Statement::CreateType { name, .. } => {
+            if let Some(type_name) = from_name(name, dialect) {
+                actions.insert(action(
+                    NativeObjectKind::Table,
+                    NativeActionType::Def,
+                    type_name,
+                ));
+            }
         }
         _ => {
             actions.insert(barrier("__unknown_stmt_barrier__"));
