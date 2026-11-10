@@ -24,22 +24,49 @@ fn barrier(name: &str) -> NativeAction {
     action(NativeObjectKind::Barrier, NativeActionType::Barrier, name)
 }
 
-pub(super) fn canonical_ident(ident: &Ident, dialect: DialectKind) -> String {
-    let value = match dialect {
-        DialectKind::ClickHouse => ident.value.clone(),
-        DialectKind::PostgreSql
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentifierCase {
+    Lower,
+    Upper,
+    Preserve,
+}
+
+fn unquoted_identifier_case(dialect: DialectKind) -> IdentifierCase {
+    match dialect {
+        DialectKind::ClickHouse => IdentifierCase::Preserve,
+        DialectKind::Oracle
+        | DialectKind::Ansi
+        | DialectKind::Snowflake
+        | DialectKind::Teradata => IdentifierCase::Upper,
+        _ => IdentifierCase::Lower,
+    }
+}
+
+fn quoted_identifier_case(dialect: DialectKind) -> IdentifierCase {
+    match dialect {
+        DialectKind::ClickHouse
+        | DialectKind::PostgreSql
         | DialectKind::DuckDB
         | DialectKind::Oracle
         | DialectKind::Ansi
         | DialectKind::MsSql
         | DialectKind::Redshift
         | DialectKind::Snowflake
-        | DialectKind::Teradata
-            if ident.quote_style.is_some() =>
-        {
-            ident.value.clone()
-        }
-        _ => ident.value.to_lowercase(),
+        | DialectKind::Teradata => IdentifierCase::Preserve,
+        _ => IdentifierCase::Lower,
+    }
+}
+
+pub(super) fn canonical_ident(ident: &Ident, dialect: DialectKind) -> String {
+    let case = if ident.quote_style.is_some() {
+        quoted_identifier_case(dialect)
+    } else {
+        unquoted_identifier_case(dialect)
+    };
+    let value = match case {
+        IdentifierCase::Lower => ident.value.to_lowercase(),
+        IdentifierCase::Upper => ident.value.to_uppercase(),
+        IdentifierCase::Preserve => ident.value.clone(),
     };
     escape_part(&value)
 }
@@ -450,6 +477,7 @@ pub(super) fn analyze_statement(
             object_type,
             names,
             temporary,
+            table,
             ..
         } => {
             let kind = match object_type {
@@ -464,6 +492,13 @@ pub(super) fn analyze_statement(
                 _ => None,
             };
             if let Some(kind) = kind {
+                if let Some(table) = table {
+                    if let Some(table) = from_name(table, dialect) {
+                        add_table_use(&mut actions, table);
+                    } else {
+                        actions.insert(barrier("__unknown_drop_barrier__"));
+                    }
+                }
                 if names.is_empty() {
                     actions.insert(barrier("__unknown_drop_barrier__"));
                 } else {

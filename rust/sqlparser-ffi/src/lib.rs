@@ -831,43 +831,43 @@ mod tests {
         assert!(facts0.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Table
                 && action.action == NativeActionType::Use
-                && action.name == "dual"
+                && action.name == "DUAL"
         }));
 
         let facts1 = units[1].facts.as_ref().unwrap();
         assert!(facts1.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Table
                 && action.action == NativeActionType::Def
-                && action.name == "employees"
+                && action.name == "EMPLOYEES"
         }));
         assert!(facts1.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Column
                 && action.action == NativeActionType::Def
-                && action.name == "employees\u{1f}id"
+                && action.name == "EMPLOYEES\u{1f}ID"
         }));
         assert!(facts1.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Column
                 && action.action == NativeActionType::Def
-                && action.name == "employees\u{1f}name"
+                && action.name == "EMPLOYEES\u{1f}NAME"
         }));
 
         let facts2 = units[2].facts.as_ref().unwrap();
         assert!(facts2.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Table
                 && action.action == NativeActionType::Use
-                && action.name == "a"
+                && action.name == "A"
         }));
         assert!(facts2.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Table
                 && action.action == NativeActionType::Use
-                && action.name == "b"
+                && action.name == "B"
         }));
 
         let facts3 = units[3].facts.as_ref().unwrap();
         assert!(facts3.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Table
                 && action.action == NativeActionType::Use
-                && action.name == "employees"
+                && action.name == "EMPLOYEES"
         }));
 
         let quoted_sql = "CREATE TABLE dept (\"DeptId\" NUMBER(10), DeptName VARCHAR2(50));";
@@ -876,12 +876,12 @@ mod tests {
         assert!(quoted_facts.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Column
                 && action.action == NativeActionType::Def
-                && action.name == "dept\u{1f}DeptId"
+                && action.name == "DEPT\u{1f}DeptId"
         }));
         assert!(quoted_facts.actions.iter().any(|action| {
             action.kind == NativeObjectKind::Column
                 && action.action == NativeActionType::Def
-                && action.name == "dept\u{1f}deptname"
+                && action.name == "DEPT\u{1f}DEPTNAME"
         }));
     }
 
@@ -979,6 +979,52 @@ mod tests {
                 expected_table
             );
         }
+    }
+
+    #[test]
+    fn identifier_case_folding_follows_dialect_semantics() {
+        let oracle_units = parse_units(
+            "CREATE TABLE Dept (DeptName INT, \"QuotedName\" INT);",
+            DialectKind::Oracle,
+        )
+        .unwrap();
+        let oracle_actions = &oracle_units[0].facts.as_ref().unwrap().actions;
+        assert!(oracle_actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Def
+                && action.name == "DEPT"
+        }));
+        assert!(oracle_actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column && action.name == "DEPT\u{1f}DEPTNAME"
+        }));
+        assert!(oracle_actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column && action.name == "DEPT\u{1f}QuotedName"
+        }));
+
+        let postgres_units =
+            parse_units("CREATE TABLE Dept (DeptName INT);", DialectKind::PostgreSql).unwrap();
+        let postgres_actions = &postgres_units[0].facts.as_ref().unwrap().actions;
+        assert!(postgres_actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Def
+                && action.name == "dept"
+        }));
+    }
+
+    #[test]
+    fn mysql_drop_index_records_its_table_use() {
+        let units = parse_units("DROP INDEX ix ON t;", DialectKind::MySql).unwrap();
+        let actions = &units[0].facts.as_ref().unwrap().actions;
+        assert!(actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Index
+                && action.action == NativeActionType::Drop
+                && action.name == "ix"
+        }));
+        assert!(actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Table
+                && action.action == NativeActionType::Use
+                && action.name == "t"
+        }));
     }
 
     #[test]

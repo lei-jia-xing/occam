@@ -560,16 +560,16 @@ tests =
                 depsS3 = dependenciesFor (StatementId 3) graph
                 depsS4 = dependenciesFor (StatementId 4) graph
             assertBool
-                "Oracle normalizes unquoted identifiers to lower case and preserves quoted identifier case"
-                ( objectAction TableObject DefDep (ObjectName ["dept"]) `elem` actionsS1
-                    && columnAction ColumnObject DefDep (ObjectName ["dept"]) "DeptId" `elem` actionsS1
-                    && columnAction ColumnObject DefDep (ObjectName ["dept"]) "deptname" `elem` actionsS1
+                "Oracle folds unquoted identifiers to upper case and preserves quoted identifier case"
+                ( objectAction TableObject DefDep (ObjectName ["DEPT"]) `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["DEPT"]) "DeptId" `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["DEPT"]) "DEPTNAME" `elem` actionsS1
                 )
             assertBool "SELECT from dept depends on dept" (has (StatementId 1) depsS3)
             assertBool "SELECT from dept does not depend on other" (not (has (StatementId 2) depsS3))
             assertBool
                 "SELECT from dual records UseDep on dual"
-                (objectAction TableObject UseDep (ObjectName ["dual"]) `elem` actionsS4)
+                (objectAction TableObject UseDep (ObjectName ["DUAL"]) `elem` actionsS4)
             assertBool
                 "SELECT from dual does not depend on other tables"
                 (not (has (StatementId 1) depsS4 || has (StatementId 2) depsS4))
