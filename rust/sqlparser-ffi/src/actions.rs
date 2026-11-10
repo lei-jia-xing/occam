@@ -131,6 +131,29 @@ fn from_name(name: &ObjectName, dialect: DialectKind) -> Option<String> {
     canonical_name(name, dialect)
 }
 
+fn temporary_schema(dialect: DialectKind) -> Option<&'static str> {
+    match dialect {
+        DialectKind::SQLite | DialectKind::DuckDB => Some("temp"),
+        DialectKind::PostgreSql | DialectKind::Redshift => Some("pg_temp"),
+        _ => None,
+    }
+}
+
+fn table_definition_name(
+    name: &ObjectName,
+    dialect: DialectKind,
+    temporary: bool,
+) -> Option<String> {
+    let canonical = canonical_name(name, dialect)?;
+    if !temporary || split_canonical_name(&canonical).len() > 1 {
+        return Some(canonical);
+    }
+    match temporary_schema(dialect) {
+        Some(schema) => Some(format!("{schema}.{canonical}")),
+        None => Some(canonical),
+    }
+}
+
 fn add_table_use(actions: &mut BTreeSet<NativeAction>, name: String) {
     actions.insert(action(NativeObjectKind::Table, NativeActionType::Use, name));
 }
@@ -182,26 +205,22 @@ fn add_column_actions(
             .iter()
             .map(String::as_str)
             .collect();
+        // An unqualified column belongs to every relation in scope. A
+        // one-part qualifier names a relation directly or by its final
+        // canonical component. A multi-part qualifier must match the complete
+        // canonical name; an unresolved qualifier contributes no column edge.
         let matched: Vec<_> = if qualifier.is_empty() {
             tables.to_vec()
         } else {
-            let exact: Vec<_> = tables
+            tables
                 .iter()
                 .filter(|table| {
                     let table_parts = split_canonical_name(table);
                     table_parts.as_slice() == qualifier.as_slice()
-                        || table_parts
-                            .last()
-                            .zip(qualifier.last())
-                            .is_some_and(|(a, b)| a == b)
+                        || (qualifier.len() == 1 && table_parts.last() == qualifier.last())
                 })
                 .cloned()
-                .collect();
-            if exact.is_empty() {
-                tables.to_vec()
-            } else {
-                exact
-            }
+                .collect()
         };
         for table in matched {
             actions.insert(action(
@@ -280,8 +299,8 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::CreateTable(create) => {
-            if let Some(table) = from_name(&create.name, dialect) {
-                let temporary = create.temporary || temp_schema(&create.name, dialect);
+            let temporary = create.temporary || temp_schema(&create.name, dialect);
+            if let Some(table) = table_definition_name(&create.name, dialect, temporary) {
                 let kind = if temporary {
                     NativeObjectKind::TemporaryTable
                 } else {

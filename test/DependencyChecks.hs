@@ -68,6 +68,23 @@ tests =
             assertBool
                 "qualified read excludes the colliding schema"
                 (has (StatementId 5) qualifiedReads && not (has (StatementId 6) qualifiedReads))
+        , testCase "unresolved column qualifiers do not bind to every table" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE actual (id INT);"
+                        , "SELECT missing.id FROM actual;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let actions = actionsFor (StatementId 2) graph
+            assertBool
+                "an unresolved qualifier emits no column use"
+                (not (any (\action -> actionKind action == ColumnObject && actionType action == UseDep) actions))
+            assertBool
+                "the table-level read is still recorded"
+                (objectAction TableObject UseDep (ObjectName ["actual"]) `elem` actions)
+            assertBool
+                "the query still depends on the table definition"
+                (has (StatementId 1) (dependenciesFor (StatementId 2) graph))
         , testCase "invalid SQL units retain conservative dependency barriers" $ do
             let sql = BSC.pack "SELECT FROM ; CREATE TABLE t (id INT); SELECT id FROM t;"
             result <- parseSQL SQLite sql

@@ -130,6 +130,30 @@ mod tests {
         assert_eq!(&sql[units[1].start..units[1].end], "SELECT 2");
     }
     #[test]
+    fn column_qualifiers_require_a_structural_match() {
+        let sql = "SELECT missing.id FROM actual;";
+        let units = parse_units(sql, DialectKind::SQLite).unwrap();
+        let actions = &units[0].facts.as_ref().unwrap().actions;
+        assert!(!actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column && action.name == "actual\u{1f}id"
+        }));
+
+        let sql = "SELECT t.id FROM public.t;";
+        let units = parse_units(sql, DialectKind::SQLite).unwrap();
+        let actions = &units[0].facts.as_ref().unwrap().actions;
+        assert!(actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column && action.name == "public.t\u{1f}id"
+        }));
+
+        let sql = "SELECT other.t.id FROM public.t;";
+        let units = parse_units(sql, DialectKind::SQLite).unwrap();
+        let actions = &units[0].facts.as_ref().unwrap().actions;
+        assert!(!actions.iter().any(|action| {
+            action.kind == NativeObjectKind::Column && action.name == "public.t\u{1f}id"
+        }));
+    }
+
+    #[test]
     fn invalid_middle_unit_does_not_hide_later_statement() {
         let sql = "SELECT 1; SELECT FROM; SELECT 3";
         let units = parse_units(sql, DialectKind::SQLite).unwrap();
@@ -471,7 +495,7 @@ mod tests {
             .any(|action| {
                 action.kind == NativeObjectKind::TemporaryTable
                     && action.action == NativeActionType::OnCommitDrop
-                    && action.name == "temp_tbl"
+                    && action.name == "pg_temp.temp_tbl"
             }));
     }
 

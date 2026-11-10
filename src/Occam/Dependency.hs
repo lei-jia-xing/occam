@@ -13,11 +13,10 @@ module Occam.Dependency (
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, isNothing, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Data.Text qualified as T
 import Occam.Core (
     ActionTarget (..),
     BarrierReason (..),
@@ -514,37 +513,52 @@ matchingKeysInCatalog catalog kind dependency (ObjectTarget name) =
             [ key
             | key@(ObjectKey keyKind objectName) <- available
             , keyKind `elem` acceptableKinds
-            , not
-                ( keyKind == TemporaryTableObject
-                    && isQualifiedName name
-                    && not (isTemporarySchema name)
-                    && objectName /= name
-                )
-            , namesMayReferToEachOther name objectName
+            , temporaryReferenceMatches key name
+            , isJust (nameMatch name objectName)
             ]
-        tempMatches =
+     in preferTemporaryScope catalog kind dependency matches
+
+{- | A temporary definition carries an explicit temporary schema name. A
+qualified reference must name that object exactly; an unqualified reference
+can still resolve to it through the search path.
+-}
+temporaryReferenceMatches :: ObjectKey -> ObjectName -> Bool
+temporaryReferenceMatches (ObjectKey TemporaryTableObject stored) requested =
+    not (isQualifiedName requested) || stored == requested
+temporaryReferenceMatches _ _ = True
+
+{- | Without a known search_path, an unqualified name can resolve in any
+schema, while a qualified name must match the stored identity exactly.
+-}
+data NameMatch
+    = ExactNameMatch
+    | SearchPathNameMatch
+    deriving (Eq, Ord, Show)
+
+nameMatch :: ObjectName -> ObjectName -> Maybe NameMatch
+nameMatch requested stored
+    | requested == stored = Just ExactNameMatch
+    | not (isQualifiedName requested) || not (isQualifiedName stored) =
+        if lastNamePart requested == lastNamePart stored
+            then Just SearchPathNameMatch
+            else Nothing
+    | otherwise = Nothing
+
+{- | Live temporary definitions take precedence for unqualified relation
+references, matching the search path that places the temporary schema first.
+-}
+preferTemporaryScope :: Catalog -> ObjectKind -> DependencyType -> [ObjectKey] -> [ObjectKey]
+preferTemporaryScope catalog kind dependency matches
+    | kind /= TableObject = matches
+    | dependency `notElem` [UseDep, ModDep, DropDep, RenameFromDep] = matches
+    | null liveTemporary = matches
+    | otherwise = liveTemporary
+    where
+        liveTemporary =
             [ key
             | key@(ObjectKey TemporaryTableObject _) <- matches
             , isLiveKey catalog key
             ]
-        shouldPreferTemp =
-            kind == TableObject
-                && dependency `elem` [UseDep, ModDep, DropDep, RenameFromDep]
-                && not (null tempMatches)
-     in if shouldPreferTemp then tempMatches else matches
-
-isTemporarySchema :: ObjectName -> Bool
-isTemporarySchema (ObjectName (schema : _)) =
-    schema == "temp" || schema == "pg_temp" || "pg_temp_" `T.isPrefixOf` schema
-isTemporarySchema (ObjectName []) = False
-
--- Without a known search_path, an unqualified name can resolve in any schema.
-namesMayReferToEachOther :: ObjectName -> ObjectName -> Bool
-namesMayReferToEachOther requested stored
-    | requested == stored = True
-    | not (isQualifiedName requested) || not (isQualifiedName stored) =
-        lastNamePart requested == lastNamePart stored
-    | otherwise = False
 
 objectKind :: ObjectKey -> ObjectKind
 objectKind (ObjectKey kind _) = kind
@@ -786,7 +800,7 @@ updateViewSources oldKey newKey catalog =
         replaceSource source@(UnresolvedSource name) =
             case (oldKey, newKey) of
                 (ObjectKey _ oldName, ObjectKey _ newName)
-                    | namesMayReferToEachOther oldName name ->
+                    | isJust (nameMatch oldName name) ->
                         Set.fromList [source, UnresolvedSource newName]
                 _ -> Set.singleton source
 
