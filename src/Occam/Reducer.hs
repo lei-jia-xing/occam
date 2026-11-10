@@ -375,10 +375,15 @@ data ClosureStats = ClosureStats
     , closureGainBytes :: !Int
     }
 
+data CandidateVerdict
+    = CandidateAccepted
+    | CandidateRejected
+    deriving (Eq, Show)
+
 data Feedback = Feedback
     { fbFailedRemovals :: !(IORef (Set (Set StatementId)))
     , fbEssentialStatements :: !(IORef (Set StatementId))
-    , fbEvaluated :: !(IORef (Map.Map ByteString Bool))
+    , fbEvaluated :: !(IORef (Map.Map ByteString CandidateVerdict))
     }
 
 newFeedback :: IO Feedback
@@ -478,14 +483,15 @@ searchDDMin maybeGraph feedback strategy buildCandidate oracle baseSQL allStatem
                                     else do
                                         evaluated <- readIORef (fbEvaluated feedback)
                                         case Map.lookup candidateSQL evaluated of
-                                            Just True -> pure (Just kept)
-                                            Just False -> pure Nothing
+                                            Just CandidateAccepted -> pure (Just kept)
+                                            Just CandidateRejected -> pure Nothing
                                             Nothing -> do
                                                 ok <- oracleAccepts oracle candidateSQL
-                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
-                                                if ok
-                                                    then pure (Just kept)
-                                                    else do
+                                                let verdict = if ok then CandidateAccepted else CandidateRejected
+                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL verdict)
+                                                case verdict of
+                                                    CandidateAccepted -> pure (Just kept)
+                                                    CandidateRejected -> do
                                                         modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
                                                         case Set.toList removedIds of
                                                             [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
@@ -534,14 +540,15 @@ searchCDD feedback buildCandidate oracle baseSQL allStatements = rounds 0
                                     else do
                                         evaluated <- readIORef (fbEvaluated feedback)
                                         case Map.lookup candidateSQL evaluated of
-                                            Just True -> tryPartitions kept rest
-                                            Just False -> tryPartitions current rest
+                                            Just CandidateAccepted -> tryPartitions kept rest
+                                            Just CandidateRejected -> tryPartitions current rest
                                             Nothing -> do
                                                 ok <- oracleAccepts oracle candidateSQL
-                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
-                                                if ok
-                                                    then tryPartitions kept rest
-                                                    else do
+                                                let verdict = if ok then CandidateAccepted else CandidateRejected
+                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL verdict)
+                                                case verdict of
+                                                    CandidateAccepted -> tryPartitions kept rest
+                                                    CandidateRejected -> do
                                                         modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
                                                         case Set.toList removedIds of
                                                             [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
