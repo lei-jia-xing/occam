@@ -21,6 +21,8 @@ import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationResult (..),
+    EvaluationStatus (..),
+    evaluationStatusName,
     parseSQLDialect,
     parseSearchStrategy,
     runEvaluatedReduction,
@@ -90,8 +92,8 @@ data Options = Options
     , optOutDir :: !FilePath
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
-    , optLogLevel :: !String
-    , optLogFormat :: !String
+    , optLogLevel :: !LogLevel
+    , optLogFormat :: !LogFormat
     , optVerbose :: !Bool
     , optQuiet :: !Bool
     , optBudgetSecs :: !(Maybe Double)
@@ -125,7 +127,7 @@ data Stats = Stats
     , cache_hits :: !Int
     , cache_misses :: !Int
     , cache_hit_ratio :: !Double
-    , status :: !T.Text
+    , status :: !EvaluationStatus
     , reduction_settings :: !Value
     , evaluation_budget :: !EvaluationConfig
     , evaluation_metrics :: !EvaluationMetrics
@@ -168,19 +170,19 @@ optionsParser =
                 <> showDefault
                 <> help "Per-execution timeout in seconds"
             )
-        <*> strOption
+        <*> option
+            (eitherReader parseLogLevel)
             ( long "log-level"
                 <> metavar "LEVEL"
-                <> value "info"
-                <> showDefault
-                <> help "Log severity level (debug, info, warn, error)"
+                <> value LevelInfo
+                <> help "Log severity level (debug, info, warn, error; default: info)"
             )
-        <*> strOption
+        <*> option
+            (eitherReader parseLogFormat)
             ( long "log-format"
                 <> metavar "FORMAT"
-                <> value "text"
-                <> showDefault
-                <> help "Log output format (text or json)"
+                <> value FormatText
+                <> help "Log output format (text or json; default: text)"
             )
         <*> switch
             ( long "verbose"
@@ -242,18 +244,20 @@ toggle defaultValue enableName disableName description =
         <|> flag' False (long disableName <> help ("Disable " ++ description))
         <|> pure defaultValue
 
-parseLogLevel :: String -> LogLevel
+parseLogLevel :: String -> Either String LogLevel
 parseLogLevel s = case map toLower s of
-    "debug" -> LevelDebug
-    "warn" -> LevelWarn
-    "warning" -> LevelWarn
-    "error" -> LevelError
-    _ -> LevelInfo
+    "debug" -> Right LevelDebug
+    "info" -> Right LevelInfo
+    "warn" -> Right LevelWarn
+    "warning" -> Right LevelWarn
+    "error" -> Right LevelError
+    _ -> Left "Expected debug, info, warn, or error"
 
-parseLogFormat :: String -> LogFormat
+parseLogFormat :: String -> Either String LogFormat
 parseLogFormat s = case map toLower s of
-    "json" -> FormatJSON
-    _ -> FormatText
+    "text" -> Right FormatText
+    "json" -> Right FormatJSON
+    _ -> Left "Expected text or json"
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -281,8 +285,8 @@ runOccam opts@Options {..} = do
     let effectiveLevel
             | optQuiet = LevelError
             | optVerbose = LevelDebug
-            | otherwise = parseLogLevel optLogLevel
-        effectiveFormat = parseLogFormat optLogFormat
+            | otherwise = optLogLevel
+        effectiveFormat = optLogFormat
         logCfg =
             LogConfig
                 { logMinLevel = effectiveLevel
@@ -316,7 +320,7 @@ runOccamWithLogger logger Options {..} = do
     initialStmts <- countStatementsForCLI logger dialect initialSQL
     let initialBytes = BS.length initialSQL
 
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+    when (not optQuiet && optLogFormat == FormatText) $ do
         putStrLn "======================================================================"
         putStrLn $ "Occam v" ++ Occam.version ++ " starting reduction"
         putStrLn "======================================================================"
@@ -473,13 +477,13 @@ runOccamWithLogger logger Options {..} = do
         , ("elapsed_seconds", toJSON (evaluationTotalSeconds evaluation))
         ]
 
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+    when (not optQuiet && optLogFormat == FormatText) $ do
         putStrLn "----------------------------------------------------------------------"
         putStrLn "Reduction Finished"
         putStrLn "======================================================================"
         putStrLn "Occam Reduction Summary"
         putStrLn "======================================================================"
-        putStrLn $ "  Status:       " ++ T.unpack (evaluationStatus evaluation)
+        putStrLn $ "  Status:       " ++ T.unpack (evaluationStatusName (evaluationStatus evaluation))
         putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
         putStrLn $
             "  Bytes:        "
@@ -498,7 +502,7 @@ runOccamWithLogger logger Options {..} = do
         putStrLn $ "                " ++ statsPath
         putStrLn "======================================================================"
     unless
-        (evaluationStatus evaluation == "completed" && evaluationValidationPassed evaluation)
+        (evaluationStatus evaluation == EvaluationCompleted && evaluationValidationPassed evaluation)
         exitFailure
 
 runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)

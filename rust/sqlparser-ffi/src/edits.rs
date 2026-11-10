@@ -1,6 +1,6 @@
 use crate::actions::{canonical_ident, name_parts};
 use crate::source::{dialect, ByteSpan, SourceMap, TokenKind, TokenPosition};
-use crate::{DialectKind, NativeEdit};
+use crate::{DialectKind, NativeEdit, NativeEditCategory};
 use sqlparser::ast::{
     AlterTableOperation, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
     GroupByWithModifier, LimitClause, ObjectName, OffsetRows, Query, Select, SelectItem,
@@ -539,7 +539,7 @@ impl<'a> AnalysisVisitor<'a> {
         &mut self,
         expr: &Expr,
         replacement: &str,
-        category: &'static str,
+        category: NativeEditCategory,
         label: &'static str,
     ) {
         if let Some((start, end)) = self.expression_source_span(expr) {
@@ -552,7 +552,7 @@ impl<'a> AnalysisVisitor<'a> {
         start: usize,
         end: usize,
         replacement: &str,
-        category: &'static str,
+        category: NativeEditCategory,
         label: impl Into<Cow<'static, str>>,
     ) {
         let Some(range) = ByteSpan::checked(self.source, start, end) else {
@@ -562,7 +562,7 @@ impl<'a> AnalysisVisitor<'a> {
             start: range.start,
             end: range.end,
             replacement: replacement.to_owned(),
-            category: category.into(),
+            category,
             label: label.into(),
         });
     }
@@ -706,7 +706,7 @@ impl<'a> AnalysisVisitor<'a> {
             preceding_space(self.source.as_bytes(), token.start),
             end,
             "",
-            "clause",
+            NativeEditCategory::Clause,
             label,
         );
     }
@@ -767,7 +767,7 @@ impl<'a> AnalysisVisitor<'a> {
             return;
         };
         let start = preceding_space(self.source.as_bytes(), token.start);
-        self.add_edit_bytes(start, body_end, "", "clause", label);
+        self.add_edit_bytes(start, body_end, "", NativeEditCategory::Clause, label);
     }
 
     fn select_scope(&self, select: &Select) -> Option<(usize, usize)> {
@@ -935,7 +935,7 @@ impl<'a> AnalysisVisitor<'a> {
             preceding_space(self.source.as_bytes(), group_start),
             end,
             "",
-            "clause",
+            NativeEditCategory::Clause,
             "remove-group_by",
         );
     }
@@ -1201,7 +1201,7 @@ impl<'a> AnalysisVisitor<'a> {
                 (spans[index - 1].1, spans[index].1)
             };
             if self.find_comma(range.0, range.1).is_some() {
-                self.add_edit_bytes(range.0, range.1, "", "list", label);
+                self.add_edit_bytes(range.0, range.1, "", NativeEditCategory::List, label);
             }
         }
     }
@@ -1492,7 +1492,7 @@ impl<'a> AnalysisVisitor<'a> {
                         preceding_space(self.source.as_bytes(), token.start),
                         end,
                         "",
-                        "clause",
+                        NativeEditCategory::Clause,
                         "remove-limit",
                     );
                 }
@@ -1502,7 +1502,7 @@ impl<'a> AnalysisVisitor<'a> {
                             preceding_space(self.source.as_bytes(), token.start),
                             end,
                             "",
-                            "clause",
+                            NativeEditCategory::Clause,
                             "remove-offset",
                         );
                     }
@@ -1524,7 +1524,7 @@ impl<'a> AnalysisVisitor<'a> {
                     preceding_space(self.source.as_bytes(), token.start),
                     end,
                     "",
-                    "clause",
+                    NativeEditCategory::Clause,
                     "remove-limit",
                 );
             }
@@ -1590,7 +1590,13 @@ impl<'a> AnalysisVisitor<'a> {
         }
         for replacement in ["INT", "TEXT", "REAL", "BOOLEAN"] {
             if replacement.len() < end - start {
-                self.add_edit_bytes(start, end, replacement, "type", "simplify-data_type");
+                self.add_edit_bytes(
+                    start,
+                    end,
+                    replacement,
+                    NativeEditCategory::Type,
+                    "simplify-data_type",
+                );
             }
         }
         if let Some(token) = self.tokens.iter().find(|token| {
@@ -1598,7 +1604,13 @@ impl<'a> AnalysisVisitor<'a> {
         }) {
             if let Some(replacement) = self.source.get(token.start..token.end).map(str::to_owned) {
                 if replacement.len() < end - start {
-                    self.add_edit_bytes(start, end, &replacement, "type", "simplify-data_type");
+                    self.add_edit_bytes(
+                        start,
+                        end,
+                        &replacement,
+                        NativeEditCategory::Type,
+                        "simplify-data_type",
+                    );
                 }
             }
         }
@@ -1640,7 +1652,13 @@ impl Visitor for AnalysisVisitor<'_> {
             if let (Some((with_start, _)), Some(body_start)) =
                 (self.mapped_span(with.with_token.0.span), body_start)
             {
-                self.add_edit_bytes(with_start, body_start, "", "list", "remove-with");
+                self.add_edit_bytes(
+                    with_start,
+                    body_start,
+                    "",
+                    NativeEditCategory::List,
+                    "remove-with",
+                );
             }
         } else {
             self.scopes.push(CteScope {
@@ -1720,7 +1738,13 @@ impl Visitor for AnalysisVisitor<'_> {
             for join in &table.joins {
                 if let (Some(start), Some(end)) = (previous_end, self.join_end(join)) {
                     if start < end {
-                        self.add_edit_bytes(start, end, "", "list", "remove-join");
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            "",
+                            NativeEditCategory::List,
+                            "remove-join",
+                        );
                         previous_end = Some(end);
                     }
                 }
@@ -1779,7 +1803,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             opt_start,
                             opt_end,
                             "",
-                            "constraint",
+                            NativeEditCategory::Constraint,
                             "remove-column_constraint",
                         );
                     }
@@ -1790,7 +1814,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                 edit_start,
                                 end,
                                 "",
-                                "constraint",
+                                NativeEditCategory::Constraint,
                                 "remove-column_constraint",
                             );
                         }
@@ -1802,7 +1826,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             "",
-                            "constraint",
+                            NativeEditCategory::Constraint,
                             "remove-table_constraint",
                         );
                     }
@@ -1819,7 +1843,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                 opt_start,
                                 opt_end,
                                 "",
-                                "constraint",
+                                NativeEditCategory::Constraint,
                                 "remove-column_constraint",
                             );
                         }
@@ -1831,7 +1855,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                     edit_start,
                                     end,
                                     "",
-                                    "constraint",
+                                    NativeEditCategory::Constraint,
                                     "remove-column_constraint",
                                 );
                             }
@@ -1897,7 +1921,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-binary_expression",
                         );
                     }
@@ -1906,7 +1930,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-binary_expression",
                         );
                     }
@@ -1919,7 +1943,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-unary_expression",
                         );
                     }
@@ -1928,7 +1952,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-unary_expression",
                         );
                     }
@@ -1943,13 +1967,18 @@ impl Visitor for AnalysisVisitor<'_> {
                         start,
                         end,
                         replacement,
-                        "expression",
+                        NativeEditCategory::Expression,
                         "simplify-parenthesized_expression",
                     );
                 }
             }
             Expr::Exists { .. } => {
-                self.add_expression_edit(expr, "0", "expression", "simplify-exists");
+                self.add_expression_edit(
+                    expr,
+                    "0",
+                    NativeEditCategory::Expression,
+                    "simplify-exists",
+                );
             }
             Expr::Subquery(query) => {
                 if let Some(literal) = scalar_literal(query) {
@@ -1961,7 +1990,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-scalar-subquery",
                         );
                     }
@@ -1979,7 +2008,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-in_list",
                         );
                     }
@@ -1988,7 +2017,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-in_list",
                         );
                     }
@@ -2001,7 +2030,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-in_subquery",
                         );
                     }
@@ -2010,7 +2039,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-in_subquery",
                         );
                     }
@@ -2029,7 +2058,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                 start,
                                 end,
                                 replacement,
-                                "expression",
+                                NativeEditCategory::Expression,
                                 "simplify-between",
                             );
                         }
@@ -2039,7 +2068,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-between",
                         );
                     }
@@ -2048,10 +2077,22 @@ impl Visitor for AnalysisVisitor<'_> {
             Expr::Like { expr: inner, .. } | Expr::ILike { expr: inner, .. } => {
                 if let Some((start, end)) = self.expression_source_span(expr) {
                     if let Some(replacement) = self.expression_source_slice(inner) {
-                        self.add_edit_bytes(start, end, replacement, "expression", "simplify-like");
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            NativeEditCategory::Expression,
+                            "simplify-like",
+                        );
                     }
                     for replacement in ["1", "0"] {
-                        self.add_edit_bytes(start, end, replacement, "expression", "simplify-like");
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            replacement,
+                            NativeEditCategory::Expression,
+                            "simplify-like",
+                        );
                     }
                 }
             }
@@ -2062,7 +2103,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-is_null",
                         );
                     }
@@ -2071,7 +2112,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-is_null",
                         );
                     }
@@ -2089,7 +2130,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                 start,
                                 end,
                                 replacement,
-                                "expression",
+                                NativeEditCategory::Expression,
                                 "simplify-case_result",
                             );
                         }
@@ -2100,7 +2141,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                 start,
                                 end,
                                 replacement,
-                                "expression",
+                                NativeEditCategory::Expression,
                                 "simplify-case_else",
                             );
                         }
@@ -2110,7 +2151,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-case_literal",
                         );
                     }
@@ -2134,7 +2175,7 @@ impl Visitor for AnalysisVisitor<'_> {
                                         start,
                                         end,
                                         replacement,
-                                        "expression",
+                                        NativeEditCategory::Expression,
                                         "simplify-function_to_argument",
                                     );
                                 }
@@ -2148,7 +2189,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             start,
                             end,
                             replacement,
-                            "expression",
+                            NativeEditCategory::Expression,
                             "simplify-function_literal",
                         );
                     }
@@ -2192,7 +2233,13 @@ impl AnalysisVisitor<'_> {
         };
         for replacement in replacements {
             if replacement.len() < end - start {
-                self.add_edit_bytes(start, end, replacement, "literal", "simplify-literal");
+                self.add_edit_bytes(
+                    start,
+                    end,
+                    replacement,
+                    NativeEditCategory::Literal,
+                    "simplify-literal",
+                );
             }
         }
     }

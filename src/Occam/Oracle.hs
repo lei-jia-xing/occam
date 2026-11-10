@@ -33,6 +33,18 @@ import Control.Exception (
     uninterruptibleMask_,
  )
 import Control.Monad (unless)
+import Data.Aeson (
+    FromJSON (..),
+    FromJSONKey (..),
+    FromJSONKeyFunction (..),
+    ToJSON (..),
+    ToJSONKey (..),
+    ToJSONKeyFunction (..),
+    Value (String),
+    withText,
+ )
+import Data.Aeson.Encoding qualified as Encoding
+import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -404,7 +416,40 @@ data OracleStatus
     | Rejected
     | TimedOut
     | InfrastructureError
+    | Interrupted
     deriving (Eq, Ord, Show)
+
+oracleStatusName :: OracleStatus -> Text
+oracleStatusName Accepted = "accepted"
+oracleStatusName Rejected = "rejected"
+oracleStatusName TimedOut = "timed-out"
+oracleStatusName InfrastructureError = "infrastructure-error"
+oracleStatusName Interrupted = "interrupted"
+
+parseOracleStatusName :: Text -> Maybe OracleStatus
+parseOracleStatusName "accepted" = Just Accepted
+parseOracleStatusName "rejected" = Just Rejected
+parseOracleStatusName "timed-out" = Just TimedOut
+parseOracleStatusName "infrastructure-error" = Just InfrastructureError
+parseOracleStatusName "interrupted" = Just Interrupted
+parseOracleStatusName _ = Nothing
+
+instance ToJSON OracleStatus where
+    toJSON = String . oracleStatusName
+
+instance FromJSON OracleStatus where
+    parseJSON = withText "OracleStatus" $ \name ->
+        maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
+
+instance ToJSONKey OracleStatus where
+    toJSONKey =
+        ToJSONKeyText
+            (Key.fromText . oracleStatusName)
+            (Encoding.text . oracleStatusName)
+
+instance FromJSONKey OracleStatus where
+    fromJSONKey = FromJSONKeyTextParser $ \name ->
+        maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 
 classifyOracleObservation :: OracleObservation -> OracleStatus
 classifyOracleObservation observation = case observation of

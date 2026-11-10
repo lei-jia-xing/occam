@@ -16,6 +16,7 @@ import Occam qualified
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationStatus (..),
     parseSQLDialect,
     parseSearchStrategy,
  )
@@ -388,7 +389,7 @@ runEvalWithLogger logger Options {..} = do
 
 completedAndValidated :: BenchmarkMetric -> Bool
 completedAndValidated metric =
-    evaluationStatus (metricEvaluationMetrics metric) == "completed"
+    evaluationStatus (metricEvaluationMetrics metric) == EvaluationCompleted
         && evaluationValidationPassed (metricEvaluationMetrics metric)
 
 runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)

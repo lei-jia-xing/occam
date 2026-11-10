@@ -41,6 +41,7 @@ import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
 import Occam.Parser (
     ParsedSQL (..),
     ParserEdit (..),
+    ParserEditCategory (..),
     SQLDialect (..),
     StatementFacts (..),
     StatementUnit (..),
@@ -882,12 +883,12 @@ reduceIterationWithConfig config logger oracle initialSQL = do
 
 pruneClauses :: SQLDialect -> Oracle -> ByteString -> IO ByteString
 pruneClauses dialect oracle =
-    reduceSyntaxWithDialect nullLogger dialect oracle ((== "clause") . parserEditCategory)
+    reduceSyntaxWithDialect nullLogger dialect oracle ((== EditClause) . parserEditCategory)
 
 -- Expression-only public pass.
 simplifyExpressions :: SQLDialect -> Oracle -> ByteString -> IO ByteString
 simplifyExpressions dialect oracle =
-    reduceSyntaxWithDialect nullLogger dialect oracle ((== "expression") . parserEditCategory)
+    reduceSyntaxWithDialect nullLogger dialect oracle ((== EditExpression) . parserEditCategory)
 
 reduceSyntaxWithDialect ::
     Logger -> SQLDialect -> Oracle -> (ParserEdit -> Bool) -> ByteString -> IO ByteString

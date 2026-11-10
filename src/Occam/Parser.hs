@@ -8,12 +8,21 @@ module Occam.Parser (
     StatementUnit (..),
     StatementFacts (..),
     ParserEdit (..),
+    ParserEditCategory (..),
     parseSQL,
     countStatements,
 ) where
 
 import Control.Exception (finally)
-import Data.Aeson (FromJSON (..), eitherDecodeStrict', withObject, (.:), (.:?))
+import Data.Aeson (
+    FromJSON (..),
+    ToJSON (..),
+    eitherDecodeStrict',
+    withObject,
+    withText,
+    (.:),
+    (.:?),
+ )
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -81,11 +90,44 @@ data StatementFacts = StatementFacts
     }
     deriving (Eq, Show)
 
+data ParserEditCategory
+    = EditExpression
+    | EditClause
+    | EditConstraint
+    | EditList
+    | EditType
+    | EditLiteral
+    deriving (Eq, Ord, Show)
+
+instance ToJSON ParserEditCategory where
+    toJSON category = toJSON (editCategoryName category)
+
+instance FromJSON ParserEditCategory where
+    parseJSON = withText "ParserEditCategory" $ \name ->
+        maybe (fail ("unknown parser edit category: " <> T.unpack name)) pure (parseEditCategoryName name)
+
+editCategoryName :: ParserEditCategory -> Text
+editCategoryName EditExpression = "expression"
+editCategoryName EditClause = "clause"
+editCategoryName EditConstraint = "constraint"
+editCategoryName EditList = "list"
+editCategoryName EditType = "type"
+editCategoryName EditLiteral = "literal"
+
+parseEditCategoryName :: Text -> Maybe ParserEditCategory
+parseEditCategoryName "expression" = Just EditExpression
+parseEditCategoryName "clause" = Just EditClause
+parseEditCategoryName "constraint" = Just EditConstraint
+parseEditCategoryName "list" = Just EditList
+parseEditCategoryName "type" = Just EditType
+parseEditCategoryName "literal" = Just EditLiteral
+parseEditCategoryName _ = Nothing
+
 data ParserEdit = ParserEdit
     { parserEditStart :: !Int
     , parserEditEnd :: !Int
     , parserEditReplacement :: !ByteString
-    , parserEditCategory :: !Text
+    , parserEditCategory :: !ParserEditCategory
     , parserEditLabel :: !Text
     }
     deriving (Eq, Show)

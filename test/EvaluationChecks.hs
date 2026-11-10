@@ -11,6 +11,8 @@ import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationResult (..),
+    EvaluationStatus (..),
+    MinimalityClaim (..),
     parseSQLDialect,
     runEvaluatedReduction,
     sqlDialectName,
@@ -48,7 +50,7 @@ tests =
             assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
             assertEqual "two validation calls reserved" 2 (evaluationValidationRepeats metrics)
             assertBool "last repeated target validation passes" (evaluationValidationPassed metrics)
-            assertEqual "budget exhaustion is reported" "execution-budget" (evaluationStatus metrics)
+            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget (evaluationStatus metrics)
             assertEqual "uncached profile records no hits" 0 (evaluationCacheHits metrics)
             assertEqual
                 "outcome category counts every real reduction attempt"
@@ -86,7 +88,7 @@ tests =
                     let metrics = evaluationMetrics result
                     assertEqual
                         "an exhausted execution cap is not a wall timeout"
-                        "execution-budget"
+                        EvaluationExecutionBudget
                         (evaluationStatus metrics)
                     assertEqual "preflight consumed the only allowed execution" 0 (evaluationOracleAttempts metrics)
                     assertEqual "no reducer subprocess started" 0 (evaluationDatabaseObservations metrics)
@@ -109,12 +111,12 @@ tests =
                 runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
             let metrics = evaluationMetrics result
             assertEqual "checkpoint remains the last accepted SQL" candidate (evaluatedSQL result)
-            assertEqual "timeout is not reported as completion" "timeout" (evaluationStatus metrics)
+            assertEqual "timeout is not reported as completion" EvaluationTimeout (evaluationStatus metrics)
             assertBool "final candidate still receives repeated validation" (evaluationValidationPassed metrics)
             assertEqual "audit did not finish" False (evaluationAuditCompleted metrics)
             assertEqual
                 "truncated reductions are not called minimal"
-                "not-established"
+                MinimalityNotEstablished
                 (evaluationMinimalityClaim metrics)
         , testCase "wall-budget cancellation counts an oracle process already started" $ do
             let initial = "SELECT 1;\n"
@@ -130,7 +132,7 @@ tests =
             assertEqual "oracle process start survives cancellation" 1 (evaluationDatabaseObservations metrics)
             assertEqual
                 "timeout prevents a minimality claim"
-                "not-established"
+                MinimalityNotEstablished
                 (evaluationMinimalityClaim metrics)
         , testCase "audit removals replace the selected reduction result" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
@@ -151,7 +153,7 @@ tests =
             assertBool "audit completed" (evaluationAuditCompleted metrics)
             assertEqual
                 "audit fixed point is claimed minimal"
-                "statement-deletion-1-minimal"
+                StatementDeletionOneMinimal
                 (evaluationMinimalityClaim metrics)
             assertBool "audit result passed independent final validation" (evaluationValidationPassed metrics)
         , testCase "parser transport failures preserve the last accepted checkpoint" $ do
@@ -170,7 +172,7 @@ tests =
                 assertEqual "failed parser input cannot overwrite the accepted checkpoint" candidate saved
                 pure value
             let metrics = evaluationMetrics result
-            assertEqual "parser failure is reported" "error" (evaluationStatus metrics)
+            assertEqual "parser failure is reported" EvaluationError (evaluationStatus metrics)
             assertEqual "evaluation returns the last accepted SQL" candidate (evaluatedSQL result)
         , testCase "dialect flags parse to their dependency dialect" $ do
             assertEqual "generic dialect" (Right GenericSQL) (parseSQLDialect "generic")

@@ -97,12 +97,23 @@ struct NativeAction {
     name: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEditCategory {
+    Expression,
+    Clause,
+    Constraint,
+    List,
+    Type,
+    Literal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct NativeEdit {
     start: usize,
     end: usize,
     replacement: String,
-    category: Cow<'static, str>,
+    category: NativeEditCategory,
     label: Cow<'static, str>,
 }
 
@@ -218,7 +229,7 @@ mod tests {
             .iter()
             .flat_map(|unit| unit.facts.iter())
             .flat_map(|facts| &facts.edits)
-            .filter(|edit| edit.category == "type")
+            .filter(|edit| edit.category == NativeEditCategory::Type)
             .map(|edit| &type_sql[edit.start..edit.end])
             .collect();
         assert!(type_slices.contains(&"VARCHAR(255)"), "{type_slices:?}");
@@ -585,7 +596,10 @@ mod tests {
         let subquery = "task_id IN (SELECT task_id FROM sub_items WHERE status = 'crashed_worker')";
         let mut simplified_subquery = false;
 
-        for edit in edits.iter().filter(|edit| edit.category == "expression") {
+        for edit in edits
+            .iter()
+            .filter(|edit| edit.category == NativeEditCategory::Expression)
+        {
             let candidate = format!(
                 "{}{}{}",
                 &sql[..edit.start],
@@ -661,7 +675,7 @@ mod tests {
         let literal_edit = edits
             .iter()
             .find(|edit| {
-                edit.category == "literal"
+                edit.category == NativeEditCategory::Literal
                     && &sql[edit.start..edit.end] == "TRUE"
                     && edit.replacement == "0"
             })
@@ -950,7 +964,7 @@ mod tests {
         let edits = &units[0].facts.as_ref().unwrap().edits;
         let constraint_edits: Vec<_> = edits
             .iter()
-            .filter(|e| e.category == "constraint")
+            .filter(|e| e.category == NativeEditCategory::Constraint)
             .collect();
         assert!(constraint_edits
             .iter()

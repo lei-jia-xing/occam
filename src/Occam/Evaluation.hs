@@ -6,6 +6,10 @@ module Occam.Evaluation (
     EvaluationMetrics (..),
     EvaluationPoint (..),
     EvaluationResult (..),
+    EvaluationStatus (..),
+    MinimalityClaim (..),
+    evaluationStatusName,
+    minimalityClaimName,
     parseSearchStrategy,
     searchStrategyName,
     parseSQLDialect,
@@ -24,7 +28,7 @@ import Control.Exception (
     try,
  )
 import Control.Monad (unless, when)
-import Data.Aeson (FromJSON, ToJSON, Value, object, toJSON, (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withText, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -43,6 +47,7 @@ import Occam.Oracle (
     OracleConfig (..),
     OracleObservation (..),
     OracleObservationDetails (..),
+    OracleStatus (..),
     classifyOracleObservation,
     observeExternalOracleDetailedWith,
     oracleObservationMatches,
@@ -70,6 +75,60 @@ data EvaluationConfig = EvaluationConfig
 
 instance ToJSON EvaluationConfig
 instance FromJSON EvaluationConfig
+
+data EvaluationStatus
+    = EvaluationCompleted
+    | EvaluationTimeout
+    | EvaluationExecutionBudget
+    | EvaluationError
+    | EvaluationValidationFailed
+    | EvaluationValidationIncomplete
+    deriving (Eq, Ord, Show)
+
+evaluationStatusName :: EvaluationStatus -> Text
+evaluationStatusName EvaluationCompleted = "completed"
+evaluationStatusName EvaluationTimeout = "timeout"
+evaluationStatusName EvaluationExecutionBudget = "execution-budget"
+evaluationStatusName EvaluationError = "error"
+evaluationStatusName EvaluationValidationFailed = "validation-failed"
+evaluationStatusName EvaluationValidationIncomplete = "validation-incomplete"
+
+parseEvaluationStatusName :: Text -> Maybe EvaluationStatus
+parseEvaluationStatusName "completed" = Just EvaluationCompleted
+parseEvaluationStatusName "timeout" = Just EvaluationTimeout
+parseEvaluationStatusName "execution-budget" = Just EvaluationExecutionBudget
+parseEvaluationStatusName "error" = Just EvaluationError
+parseEvaluationStatusName "validation-failed" = Just EvaluationValidationFailed
+parseEvaluationStatusName "validation-incomplete" = Just EvaluationValidationIncomplete
+parseEvaluationStatusName _ = Nothing
+
+instance ToJSON EvaluationStatus where
+    toJSON = toJSON . evaluationStatusName
+
+instance FromJSON EvaluationStatus where
+    parseJSON = withText "EvaluationStatus" $ \name ->
+        maybe (fail ("unknown evaluation status: " <> T.unpack name)) pure (parseEvaluationStatusName name)
+
+data MinimalityClaim
+    = StatementDeletionOneMinimal
+    | MinimalityNotEstablished
+    deriving (Eq, Ord, Show)
+
+minimalityClaimName :: MinimalityClaim -> Text
+minimalityClaimName StatementDeletionOneMinimal = "statement-deletion-1-minimal"
+minimalityClaimName MinimalityNotEstablished = "not-established"
+
+parseMinimalityClaimName :: Text -> Maybe MinimalityClaim
+parseMinimalityClaimName "statement-deletion-1-minimal" = Just StatementDeletionOneMinimal
+parseMinimalityClaimName "not-established" = Just MinimalityNotEstablished
+parseMinimalityClaimName _ = Nothing
+
+instance ToJSON MinimalityClaim where
+    toJSON = toJSON . minimalityClaimName
+
+instance FromJSON MinimalityClaim where
+    parseJSON = withText "MinimalityClaim" $ \name ->
+        maybe (fail ("unknown minimality claim: " <> T.unpack name)) pure (parseMinimalityClaimName name)
 
 parseSearchStrategy :: String -> Either String SearchStrategy
 parseSearchStrategy value = case map toLower value of
@@ -143,7 +202,7 @@ instance ToJSON EvaluationPoint
 instance FromJSON EvaluationPoint
 
 data EvaluationMetrics = EvaluationMetrics
-    { evaluationStatus :: !Text
+    { evaluationStatus :: !EvaluationStatus
     , evaluationFailure :: !(Maybe Text)
     , evaluationCacheUsed :: !Bool
     , evaluationBudget :: !EvaluationConfig
@@ -161,7 +220,7 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationTimedOutObservations :: !Int
     , evaluationResetFailures :: !Int
     , evaluationOracleErrors :: !Int
-    , evaluationOracleOutcomes :: !(Map Text Int)
+    , evaluationOracleOutcomes :: !(Map OracleStatus Int)
     , evaluationCacheHits :: !Int
     , evaluationCacheMisses :: !Int
     , evaluationValidationRepeats :: !Int
@@ -171,12 +230,12 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationValidationObservations :: !Int
     , evaluationValidationDatabaseObservations :: !Int
     , evaluationValidationErrors :: !Int
-    , evaluationValidationOutcomes :: !(Map Text Int)
+    , evaluationValidationOutcomes :: !(Map OracleStatus Int)
     , evaluationValidationPassed :: !Bool
     , evaluationAuditSeconds :: !Double
     , evaluationAuditChecks :: !Int
     , evaluationAuditCompleted :: !Bool
-    , evaluationMinimalityClaim :: !Text
+    , evaluationMinimalityClaim :: !MinimalityClaim
     , evaluationCurve :: ![EvaluationPoint]
     , evaluationStages :: ![Value]
     }
@@ -231,13 +290,13 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
     timedOutRef <- newIORef (0 :: Int)
     resetFailureRef <- newIORef (0 :: Int)
     errorsRef <- newIORef (0 :: Int)
-    outcomesRef <- newIORef Map.empty
+    outcomesRef <- newIORef (Map.empty :: Map OracleStatus Int)
     oracleSecondsRef <- newIORef (0.0 :: Double)
     resetSecondsRef <- newIORef (0.0 :: Double)
     validationObsRef <- newIORef (0 :: Int)
     validationDatabaseRef <- newIORef (0 :: Int)
     validationErrorsRef <- newIORef (0 :: Int)
-    validationOutcomesRef <- newIORef Map.empty
+    validationOutcomesRef <- newIORef (Map.empty :: Map OracleStatus Int)
     validationRejectedRef <- newIORef False
     validationOracleSecondsRef <- newIORef (0.0 :: Double)
     validationResetSecondsRef <- newIORef (0.0 :: Double)
@@ -282,11 +341,11 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             fromInteger (max 0 (min micros (toInteger (maxBound :: Int))))
         recordOutcome outcomes observation =
             modifyIORef' outcomes $
-                Map.insertWith (+) (T.pack (show (classifyOracleObservation observation))) 1
+                Map.insertWith (+) (classifyOracleObservation observation) 1
         recordInterrupted = do
             modifyIORef' timedOutRef (+ 1)
             modifyIORef' errorsRef (+ 1)
-            modifyIORef' outcomesRef (Map.insertWith (+) "interrupted" 1)
+            modifyIORef' outcomesRef (Map.insertWith (+) Interrupted 1)
         recordReductionObservation profile = do
             let observation = detailedObservation profile
                 micros = fromIntegral
@@ -417,12 +476,12 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
     reductionEnd <- ticks
     let reductionSeconds = seconds reductionStart reductionEnd
     (status, failure) <- case reductionOutcome of
-        Right (Just _) -> pure ("completed", Nothing)
-        Right Nothing -> pure ("timeout", Just "Shared wall-clock budget expired during reduction")
+        Right (Just _) -> pure (EvaluationCompleted, Nothing)
+        Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction")
         Left err
-            | Just (ExecutionBudgetReached _) <- fromException err -> pure ("execution-budget", Nothing)
+            | Just (ExecutionBudgetReached _) <- fromException err -> pure (EvaluationExecutionBudget, Nothing)
             | Just asyncErr <- fromException err -> throwIO (asyncErr :: AsyncException)
-            | otherwise -> pure ("error", Just (T.pack (displayException err)))
+            | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)))
 
     acceptedFinal <- readIORef acceptedRef
     auditResult <- readIORef auditResultRef
@@ -505,11 +564,11 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
     auditCompleted <- readIORef auditCompletedRef
     totalEnd <- ticks
     let finalStatus
-            | status /= "completed" = status
-            | not validationPassed && validationRejected = "validation-failed"
-            | not validationPassed && validationObservations < 2 = "validation-incomplete"
-            | not validationPassed = "validation-failed"
-            | otherwise = "completed"
+            | status /= EvaluationCompleted = status
+            | not validationPassed && validationRejected = EvaluationValidationFailed
+            | not validationPassed && validationObservations < 2 = EvaluationValidationIncomplete
+            | not validationPassed = EvaluationValidationFailed
+            | otherwise = EvaluationCompleted
         finalFailure =
             case failure of
                 Just err -> Just err
@@ -562,8 +621,8 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
                 , evaluationAuditCompleted = auditCompleted
                 , evaluationMinimalityClaim =
                     if validationPassed && auditCompleted && auditResultIsFinal
-                        then "statement-deletion-1-minimal"
-                        else "not-established"
+                        then StatementDeletionOneMinimal
+                        else MinimalityNotEstablished
                 , evaluationCurve = curve
                 , evaluationStages = stages
                 }
