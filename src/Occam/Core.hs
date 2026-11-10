@@ -2,7 +2,10 @@ module Occam.Core (
     StatementId (..),
     Statement (..),
     Span (..),
-    ObjectName,
+    ObjectName (..),
+    BarrierReason (..),
+    ActionTarget (..),
+    targetObjectName,
     ObjectKind (..),
     DependencyType (..),
     ObjectAction (..),
@@ -27,7 +30,32 @@ data Statement = Statement
     }
     deriving (Eq, Show)
 
-type ObjectName = Text
+newtype ObjectName = ObjectName {objectNameParts :: [Text]}
+    deriving (Eq, Ord, Show)
+
+data BarrierReason
+    = UnknownStatementBarrier
+    | SyntaxErrorBarrier
+    | UnknownRelationBarrier
+    | UnknownDDLBarrier
+    | UnknownDMLBarrier
+    | UnknownDropBarrier
+    | UnknownAlterBarrier
+    | UnknownViewBarrier
+    | UnknownIndexBarrier
+    | UnknownTriggerBarrier
+    | UnknownTruncateBarrier
+    deriving (Eq, Ord, Show)
+
+data ActionTarget
+    = ObjectTarget !ObjectName
+    | ColumnTarget !ObjectName !Text
+    | BarrierTarget !BarrierReason
+    deriving (Eq, Ord, Show)
+
+targetObjectName :: ActionTarget -> Maybe ObjectName
+targetObjectName (ObjectTarget name) = Just name
+targetObjectName _ = Nothing
 
 data ObjectKind
     = TableObject
@@ -63,6 +91,6 @@ data DependencyType
 data ObjectAction = ObjectAction
     { actionKind :: !ObjectKind
     , actionType :: !DependencyType
-    , actionName :: !ObjectName
+    , actionTarget :: !ActionTarget
     }
     deriving (Eq, Ord, Show)

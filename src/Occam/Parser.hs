@@ -34,9 +34,12 @@ import Data.Word (Word8)
 import Foreign (Ptr, alloca, castPtr, nullPtr, peek, poke)
 import Foreign.C.Types (CInt (..), CSize (..), CUInt (..))
 import Occam.Core (
+    ActionTarget (..),
+    BarrierReason (..),
     DependencyType (..),
     ObjectAction (..),
     ObjectKind (..),
+    ObjectName (..),
     Span (..),
     Statement (..),
     StatementId (..),
@@ -167,7 +170,8 @@ instance FromJSON NativeFacts where
                 kind <- maybe (fail "sqlparser returned an unknown object kind") pure (parseObjectKind kindText)
                 actionType <-
                     maybe (fail "sqlparser returned an unknown dependency action") pure (parseActionType actionText)
-                pure (ObjectAction kind actionType name)
+                target <- either fail pure (parseActionTarget kind name)
+                pure (ObjectAction kind actionType target)
 
 instance FromJSON ParserEdit where
     parseJSON = withObject "ParserEdit" $ \object ->
@@ -308,6 +312,60 @@ makeUnits source = go 0 1
 
         nativeEdits (NativeFacts _ edits) = edits
         makeFacts (NativeFacts actions edits) = StatementFacts actions edits
+
+-- The Rust frontend serializes canonical names as escaped dot-separated
+-- identifiers. Decode that external representation exactly once here so the
+-- rest of the reducer only sees structured names.
+parseActionTarget :: ObjectKind -> Text -> Either String ActionTarget
+parseActionTarget BarrierObject name = BarrierTarget <$> parseBarrierReason name
+parseActionTarget ColumnObject name = parseColumnTarget name
+parseActionTarget _ name = Right (ObjectTarget (parseObjectName name))
+
+parseObjectName :: Text -> ObjectName
+parseObjectName name =
+    ObjectName (map T.pack (segments (T.unpack name)))
+    where
+        segments [] = []
+        segments chars =
+            let (part, rest) = segment [] chars
+             in reverse part : case rest of
+                    [] -> []
+                    _ : more -> segments more
+
+        segment acc [] = (acc, [])
+        segment acc ['\\'] = ('\\' : acc, [])
+        segment acc ('\\' : c : rest) = segment (c : acc) rest
+        segment acc ('.' : rest) = (acc, '.' : rest)
+        segment acc (c : rest) = segment (c : acc) rest
+
+parseIdentifier :: Text -> Text
+parseIdentifier = T.pack . go . T.unpack
+    where
+        go [] = []
+        go ['\\'] = ['\\']
+        go ('\\' : c : rest) = c : go rest
+        go (c : rest) = c : go rest
+
+parseColumnTarget :: Text -> Either String ActionTarget
+parseColumnTarget name =
+    let (table, suffix) = T.breakOn "\x1f" name
+     in if T.null suffix
+            then Left "sqlparser returned a column action without a table qualifier"
+            else Right (ColumnTarget (parseObjectName table) (parseIdentifier (T.drop 1 suffix)))
+
+parseBarrierReason :: Text -> Either String BarrierReason
+parseBarrierReason "__unknown_stmt_barrier__" = Right UnknownStatementBarrier
+parseBarrierReason "__syntax_error_barrier__" = Right SyntaxErrorBarrier
+parseBarrierReason "__unknown_relation_barrier__" = Right UnknownRelationBarrier
+parseBarrierReason "__unknown_ddl_barrier__" = Right UnknownDDLBarrier
+parseBarrierReason "__unknown_dml_barrier__" = Right UnknownDMLBarrier
+parseBarrierReason "__unknown_drop_barrier__" = Right UnknownDropBarrier
+parseBarrierReason "__unknown_alter_barrier__" = Right UnknownAlterBarrier
+parseBarrierReason "__unknown_view_barrier__" = Right UnknownViewBarrier
+parseBarrierReason "__unknown_index_barrier__" = Right UnknownIndexBarrier
+parseBarrierReason "__unknown_trigger_barrier__" = Right UnknownTriggerBarrier
+parseBarrierReason "__unknown_truncate_barrier__" = Right UnknownTruncateBarrier
+parseBarrierReason name = Left ("sqlparser returned an unknown barrier: " <> T.unpack name)
 
 parseObjectKind :: Text -> Maybe ObjectKind
 parseObjectKind "table" = Just TableObject

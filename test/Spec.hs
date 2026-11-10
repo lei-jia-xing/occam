@@ -19,7 +19,15 @@ import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (CacheStats (..), memoizeOracle, memoizeOracleWith)
-import Occam.Core (DependencyType (..), ObjectAction (..), ObjectKind (..), StatementId (..))
+import Occam.Core (
+    ActionTarget (..),
+    DependencyType (..),
+    ObjectAction (..),
+    ObjectKind (..),
+    ObjectName (..),
+    StatementId (..),
+    targetObjectName,
+ )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Logger (nullLogger)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), parseSQL)
@@ -145,15 +153,16 @@ phase2Tests =
                     queryActions = Map.findWithDefault [] queryId (graphActions graph)
                     uses =
                         Set.fromList
-                            [ actionName action
+                            [ name
                             | action <- queryActions
                             , actionType action == UseDep
                             , actionKind action == TableObject
+                            , Just name <- [targetObjectName (actionTarget action)]
                             ]
                     deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
                 assertEqual
                     "Only external base tables are query reads"
-                    (Set.fromList ["base_a", "base_b", "base_c"])
+                    (Set.fromList [ObjectName ["base_a"], ObjectName ["base_b"], ObjectName ["base_c"]])
                     uses
                 assertEqual
                     "Query depends on each referenced base table definition"
@@ -498,7 +507,11 @@ phase7Tests =
                 assertBool
                     "INSERT ... ON DUPLICATE KEY UPDATE should record ModDep on items"
                     ( any
-                        (\act -> actionKind act == TableObject && actionType act == ModDep && actionName act == "items")
+                        ( \act ->
+                            actionKind act == TableObject
+                                && actionType act == ModDep
+                                && actionTarget act == ObjectTarget (ObjectName ["items"])
+                        )
                         actionsS2
                     )
                 assertBool
@@ -578,7 +591,7 @@ phase7Tests =
                     depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
                 assertBool
                     "TRUNCATE should have ModDep on items"
-                    (any (\a -> actionType a == ModDep && actionName a == "items") actsS2)
+                    (any (\a -> actionType a == ModDep && actionTarget a == ObjectTarget (ObjectName ["items"])) actsS2)
                 assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
         , testCase "DuckDB dialect parses range and list comprehension syntax" $ do
             let script = "SELECT * FROM range(10); SELECT [x + 1 FOR x IN [1, 2, 3]];"
@@ -704,7 +717,7 @@ instance Arbitrary ArbitraryAction where
         pure (ArbitraryAction k t name)
 
 toObjectAction :: ArbitraryAction -> ObjectAction
-toObjectAction (ArbitraryAction k t name) = ObjectAction k t name
+toObjectAction (ArbitraryAction k t name) = ObjectAction k t (ObjectTarget (ObjectName [name]))
 
 newtype SmallActionGraph = SmallActionGraph [[ArbitraryAction]]
     deriving (Show)

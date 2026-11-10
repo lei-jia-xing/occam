@@ -7,7 +7,16 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing, maybeToList)
 import Data.Set qualified as Set
-import Occam.Core (DependencyType (..), ObjectAction (..), ObjectKind (..), StatementId (..))
+import Data.Text (Text)
+import Occam.Core (
+    ActionTarget (..),
+    DependencyType (..),
+    ObjectAction (..),
+    ObjectKind (..),
+    ObjectName (..),
+    StatementId (..),
+    targetObjectName,
+ )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
 import Test.QuickCheck (Gen, Property, arbitrary, chooseInt, counterexample, forAll, listOf, resize)
@@ -15,6 +24,12 @@ import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
+
+objectAction :: ObjectKind -> DependencyType -> ObjectName -> ObjectAction
+objectAction kind dependency name = ObjectAction kind dependency (ObjectTarget name)
+
+columnAction :: ObjectKind -> DependencyType -> ObjectName -> Text -> ObjectAction
+columnAction kind dependency table column = ObjectAction kind dependency (ColumnTarget table column)
 
 tests :: TestTree
 tests =
@@ -40,7 +55,7 @@ tests =
                 qualifiedReads = dependenciesFor (StatementId 8) graph
             assertBool
                 "quoted dots stay inside one identifier and quoted PostgreSQL case is preserved"
-                (ObjectAction TableObject DefDep "sales.Order\\.Item" `elem` names)
+                (objectAction TableObject DefDep (ObjectName ["sales", "Order.Item"]) `elem` names)
             assertBool
                 "qualified read depends on only its schema's table"
                 (has (StatementId 1) readDeps && not (has (StatementId 2) readDeps))
@@ -97,15 +112,16 @@ tests =
             let queryActions = actionsFor (StatementId 4) graph
                 tableReads =
                     Set.fromList
-                        [ actionName action
+                        [ name
                         | action <- queryActions
                         , actionKind action == TableObject
                         , actionType action == UseDep
+                        , Just name <- [targetObjectName (actionTarget action)]
                         ]
                 deps = dependenciesFor (StatementId 4) graph
             assertEqual
                 "CTE references are not external table reads"
-                (Set.fromList ["inside_cte", "nested_cte"])
+                (Set.fromList [ObjectName ["inside_cte"], ObjectName ["nested_cte"]])
                 tableReads
             assertBool
                 "the nested query does not bind to the shadowed base table"
@@ -142,10 +158,10 @@ tests =
                 queryActions = actionsFor (StatementId 4) graph
             assertBool
                 "rename target retains the source schema"
-                (ObjectAction TableObject RenameToDep "accounting.new_name" `elem` renameActions)
+                (objectAction TableObject RenameToDep (ObjectName ["accounting", "new_name"]) `elem` renameActions)
             assertBool
                 "later query resolves against the renamed generation"
-                (ObjectAction TableObject UseDep "accounting.new_name" `elem` queryActions)
+                (objectAction TableObject UseDep (ObjectName ["accounting", "new_name"]) `elem` queryActions)
             assertBool
                 "later query depends on rename"
                 (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
@@ -177,21 +193,33 @@ tests =
             graph <- analyze PostgreSQL sql
             let actions = actionsFor (StatementId 3) graph
                 tableActions = [action | action <- actions, actionKind action == TableObject]
-                writes = Set.fromList [actionName action | action <- tableActions, actionType action == ModDep]
-                readTables = Set.fromList [actionName action | action <- tableActions, actionType action == UseDep]
+                writes =
+                    Set.fromList
+                        [ name
+                        | action <- tableActions
+                        , actionType action == ModDep
+                        , Just name <- [targetObjectName (actionTarget action)]
+                        ]
+                readTables =
+                    Set.fromList
+                        [ name
+                        | action <- tableActions
+                        , actionType action == UseDep
+                        , Just name <- [targetObjectName (actionTarget action)]
+                        ]
                 columnWrites =
                     Set.fromList
-                        [ actionName action
+                        [ actionTarget action
                         | action <- actions
                         , actionKind action == ColumnObject
                         , actionType action == ModDep
                         ]
                 deps = dependenciesFor (StatementId 3) graph
-            assertEqual "only the insert target is modified" (Set.singleton "destination") writes
-            assertEqual "the SELECT input is a source read" (Set.singleton "source") readTables
+            assertEqual "only the insert target is modified" (Set.singleton (ObjectName ["destination"])) writes
+            assertEqual "the SELECT input is a source read" (Set.singleton (ObjectName ["source"])) readTables
             assertEqual
                 "only explicit target columns are written"
-                (Set.singleton "destination\x1fid")
+                (Set.singleton (ColumnTarget (ObjectName ["destination"]) "id"))
                 columnWrites
             assertEqual
                 "source reads do not depend on the insert"
@@ -206,7 +234,7 @@ tests =
             let actions = actionsFor (StatementId 2) graph
             assertBool
                 "TRUNCATE modifies its target table"
-                (ObjectAction TableObject ModDep "items" `elem` actions)
+                (objectAction TableObject ModDep (ObjectName ["items"]) `elem` actions)
             assertBool
                 "TRUNCATE depends on the table definition"
                 (has (StatementId 1) (dependenciesFor (StatementId 2) graph))
@@ -232,7 +260,7 @@ tests =
                 afterSessionChange = dependenciesFor (StatementId 11) graph
             assertBool
                 "ROLLBACK TO is recognized from this statement, not the whole script"
-                (ObjectAction TransactionObject TxRollbackToDep "s" `elem` savepointActions)
+                (objectAction TransactionObject TxRollbackToDep (ObjectName ["s"]) `elem` savepointActions)
             assertBool
                 "savepoint snapshot retains the earlier write"
                 (has (StatementId 3) afterSavepointRollback)
@@ -261,7 +289,7 @@ tests =
             let releaseActions = actionsFor (StatementId 4) graph
             assertBool
                 "RELEASE is extracted from its statement"
-                (ObjectAction TransactionObject TxReleaseDep "s" `elem` releaseActions)
+                (objectAction TransactionObject TxReleaseDep (ObjectName ["s"]) `elem` releaseActions)
             assertBool
                 "released savepoint writes remain in the catalog"
                 (has (StatementId 3) (dependenciesFor (StatementId 6) graph))
@@ -289,7 +317,7 @@ tests =
                         ]
             assertBool
                 "index name is not confused with its target table"
-                (ObjectAction IndexObject DefDep "ix" `elem` actionsFor (StatementId 2) graph)
+                (objectAction IndexObject DefDep (ObjectName ["ix"]) `elem` actionsFor (StatementId 2) graph)
             assertEqual
                 "index creation reads its table"
                 (Set.singleton (StatementId 1))
@@ -430,17 +458,29 @@ tests =
                 (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 8])
                 (dependenciesFor (StatementId 9) graph)
         , testCase "table writes retain related indexes, triggers, and column definitions" $ do
-            let table = ObjectAction TableObject DefDep "t"
-                column = ObjectAction ColumnObject DefDep "t\x1fid"
-                index = ObjectAction IndexObject DefDep "ix_t_id"
-                trigger = ObjectAction TriggerObject DefDep "tr_t"
+            let table = objectAction TableObject DefDep (ObjectName ["t"])
+                column = columnAction ColumnObject DefDep (ObjectName ["t"]) "id"
+                index = objectAction IndexObject DefDep (ObjectName ["ix_t_id"])
+                trigger = objectAction TriggerObject DefDep (ObjectName ["tr_t"])
                 graph =
                     buildGraph
                         [ (StatementId 1, [table, column])
-                        , (StatementId 2, [ObjectAction TableObject UseDep "t", index])
-                        , (StatementId 3, [ObjectAction TableObject UseDep "t", trigger])
-                        , (StatementId 4, [ObjectAction TableObject ModDep "t", ObjectAction ColumnObject ModDep "t\x1fid"])
-                        , (StatementId 5, [ObjectAction TableObject UseDep "t", ObjectAction ColumnObject UseDep "t\x1fid"])
+                        , (StatementId 2, [objectAction TableObject UseDep (ObjectName ["t"]), index])
+                        , (StatementId 3, [objectAction TableObject UseDep (ObjectName ["t"]), trigger])
+                        ,
+                            ( StatementId 4
+                            ,
+                                [ objectAction TableObject ModDep (ObjectName ["t"])
+                                , columnAction ColumnObject ModDep (ObjectName ["t"]) "id"
+                                ]
+                            )
+                        ,
+                            ( StatementId 5
+                            ,
+                                [ objectAction TableObject UseDep (ObjectName ["t"])
+                                , columnAction ColumnObject UseDep (ObjectName ["t"]) "id"
+                                ]
+                            )
                         ]
                 writeDeps = dependenciesFor (StatementId 4) graph
                 readDeps = dependenciesFor (StatementId 5) graph
@@ -478,8 +518,8 @@ tests =
                 depsS3 = dependenciesFor (StatementId 3) graph
             assertBool
                 "ClickHouse preserves unquoted table and column identifier case"
-                ( ObjectAction TableObject DefDep "EventsLog" `elem` actionsS1
-                    && ObjectAction ColumnObject DefDep "EventsLog\USEventId" `elem` actionsS1
+                ( objectAction TableObject DefDep (ObjectName ["EventsLog"]) `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["EventsLog"]) "EventId" `elem` actionsS1
                 )
             assertBool "SELECT EventId depends on EventsLog" (has (StatementId 1) depsS3)
             assertBool "SELECT EventId has no dependency on OtherLog" (not (has (StatementId 2) depsS3))
@@ -498,15 +538,15 @@ tests =
                 depsS4 = dependenciesFor (StatementId 4) graph
             assertBool
                 "Oracle normalizes unquoted identifiers to lower case and preserves quoted identifier case"
-                ( ObjectAction TableObject DefDep "dept" `elem` actionsS1
-                    && ObjectAction ColumnObject DefDep "dept\USDeptId" `elem` actionsS1
-                    && ObjectAction ColumnObject DefDep "dept\USdeptname" `elem` actionsS1
+                ( objectAction TableObject DefDep (ObjectName ["dept"]) `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["dept"]) "DeptId" `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["dept"]) "deptname" `elem` actionsS1
                 )
             assertBool "SELECT from dept depends on dept" (has (StatementId 1) depsS3)
             assertBool "SELECT from dept does not depend on other" (not (has (StatementId 2) depsS3))
             assertBool
                 "SELECT from dual records UseDep on dual"
-                (ObjectAction TableObject UseDep "dual" `elem` actionsS4)
+                (objectAction TableObject UseDep (ObjectName ["dual"]) `elem` actionsS4)
             assertBool
                 "SELECT from dual does not depend on other tables"
                 (not (has (StatementId 1) depsS4 || has (StatementId 2) depsS4))
@@ -522,8 +562,8 @@ tests =
                 depsS3 = dependenciesFor (StatementId 3) graph
             assertBool
                 "MsSql captures DefDep for bracketed table and columns"
-                ( ObjectAction TableObject DefDep "dbo.users" `elem` actionsS1
-                    && ObjectAction ColumnObject DefDep "dbo.users\USUserId" `elem` actionsS1
+                ( objectAction TableObject DefDep (ObjectName ["dbo", "users"]) `elem` actionsS1
+                    && columnAction ColumnObject DefDep (ObjectName ["dbo", "users"]) "UserId" `elem` actionsS1
                 )
             assertBool "SELECT from users depends on users" (has (StatementId 1) depsS3)
             assertBool "SELECT from users does not depend on other" (not (has (StatementId 2) depsS3))
@@ -593,10 +633,10 @@ tests =
                 actions = actionsFor (StatementId 4) graph
             assertBool
                 "MERGE has ModDep on target_tbl"
-                (ObjectAction TableObject ModDep "target_tbl" `elem` actions)
+                (objectAction TableObject ModDep (ObjectName ["target_tbl"]) `elem` actions)
             assertBool
                 "MERGE has UseDep on source_tbl"
-                (ObjectAction TableObject UseDep "source_tbl" `elem` actions)
+                (objectAction TableObject UseDep (ObjectName ["source_tbl"]) `elem` actions)
             assertBool "MERGE depends on target_tbl definition" (has (StatementId 1) mergeDeps)
             assertBool "MERGE depends on source_tbl definition" (has (StatementId 2) mergeDeps)
             assertBool "MERGE does not depend on untouched_tbl" (not (has (StatementId 3) mergeDeps))

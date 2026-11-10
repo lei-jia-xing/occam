@@ -13,18 +13,21 @@ module Occam.Dependency (
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, isNothing, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isNothing, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Occam.Core (
+    ActionTarget (..),
+    BarrierReason (..),
     DependencyType (..),
     ObjectAction (..),
     ObjectKind (..),
-    ObjectName,
+    ObjectName (..),
     Statement (..),
     StatementId (..),
+    targetObjectName,
  )
 import Occam.Parser (StatementFacts (..), StatementUnit (..))
 
@@ -59,36 +62,19 @@ isBarrierAction act =
 isSessionAction :: ObjectAction -> Bool
 isSessionAction act = actionKind act == SessionVariableObject
 
--- Canonical object names use escaped dots and backslashes between dialect
--- parsing and the catalog. Quoted/case-folding decisions happen in Occam.Parser.
-canonicalParts :: Text -> [Text]
-canonicalParts = go . T.unpack
-    where
-        go chars =
-            let (part, rest) = segment [] chars
-             in T.pack (reverse part) : case rest of
-                    [] -> []
-                    _ : more -> go more
+-- Canonical names arrive from the frontend as escaped dot-separated
+-- identifiers and are parsed into structured parts at the Parser boundary.
+isQualifiedName :: ObjectName -> Bool
+isQualifiedName (ObjectName parts) = length parts > 1
 
-        segment acc [] = (acc, [])
-        segment acc ('\\' : c : rest) = segment (c : '\\' : acc) rest
-        segment acc ['\\'] = ('\\' : acc, [])
-        segment acc ('.' : rest) = (acc, '.' : rest)
-        segment acc (c : rest) = segment (c : acc) rest
-
-isQualifiedName :: Text -> Bool
-isQualifiedName name = length (canonicalParts name) > 1
-
-lastNamePart :: Text -> Text
-lastNamePart name =
-    case canonicalParts name of
-        [] -> name
-        parts -> last parts
+lastNamePart :: ObjectName -> ObjectName
+lastNamePart name@(ObjectName []) = name
+lastNamePart (ObjectName parts) = ObjectName [last parts]
 
 qualifyRename :: ObjectName -> ObjectName -> ObjectName
-qualifyRename oldName newName
-    | isQualifiedName oldName && not (isQualifiedName newName) =
-        T.intercalate "." (init (canonicalParts oldName) ++ [newName])
+qualifyRename (ObjectName oldParts) newName@(ObjectName newParts)
+    | length oldParts > 1 && length newParts <= 1 =
+        ObjectName (init oldParts ++ newParts)
     | otherwise = newName
 
 -- ----------------------------------------------------------------------------
@@ -99,9 +85,11 @@ extractActions :: StatementUnit -> [ObjectAction]
 extractActions unit =
     maybe
         [ ObjectAction BarrierObject BarrierDep $
-            if isNothing (unitParseError unit)
-                then "__unknown_stmt_barrier__"
-                else "__syntax_error_barrier__"
+            BarrierTarget
+                ( if isNothing (unitParseError unit)
+                    then UnknownStatementBarrier
+                    else SyntaxErrorBarrier
+                )
         ]
         factActions
         (unitFacts unit)
@@ -147,7 +135,7 @@ buildGraph stmtActions =
 
 data ObjectKey
     = ObjectKey !ObjectKind !ObjectName
-    | ColumnKey !ObjectKey !ObjectName
+    | ColumnKey !ObjectKey !Text
     deriving (Eq, Ord, Show)
 
 data ObjectState = ObjectState
@@ -242,7 +230,7 @@ needsCatalogBarrier state = any uncertain
             | otherwise = False
         liveMatches dependency action =
             filter (isLiveKey (scanCatalog state)) $
-                matchingKeys state TableObject dependency (actionName action)
+                matchingKeys state TableObject dependency (actionTarget action)
 
 processObjectActions :: StatementId -> [ObjectAction] -> ScanState -> (Set StatementId, ScanState)
 processObjectActions sid actions state =
@@ -272,7 +260,7 @@ processAction sid priorState stmtActions (deps, state) act
             DefDep ->
                 let catalog = scanCatalog state
                     keys = definitionKeys catalog stmtActions act
-                    sources = viewSources (scanCatalog priorState) stmtActions (actionName act)
+                    sources = viewSources (scanCatalog priorState) stmtActions (actionTarget act)
                     newObject = ObjectState (Just sid) Nothing Nothing sources False
                     catalog0 =
                         if actionKind act `elem` [TableObject, TemporaryTableObject]
@@ -294,7 +282,11 @@ processAction sid priorState stmtActions (deps, state) act
                         if actionKind act /= TableObject
                             || any (\action -> actionKind action == IndexObject && actionType action == DefDep) stmtActions
                             then Set.empty
-                            else boundIndexDependencies (scanCatalog priorState) (actionName act)
+                            else
+                                maybe
+                                    Set.empty
+                                    (boundIndexDependencies (scanCatalog priorState))
+                                    (targetObjectName (actionTarget act))
                  in (Set.union deps (Set.union objectDeps indexDeps), state)
             ModDep ->
                 let priorDeps = dependenciesForAction priorState act
@@ -328,12 +320,27 @@ processRenames ::
 processRenames sid priorState actions state =
     foldl' rename (Set.empty, state) (zip sources targets)
     where
-        sources = [actionName a | a <- actions, actionKind a == TableObject, actionType a == RenameFromDep]
-        targets = [actionName a | a <- actions, actionKind a == TableObject, actionType a == RenameToDep]
+        sources =
+            [ name
+            | a <- actions
+            , actionKind a == TableObject
+            , actionType a == RenameFromDep
+            , ObjectTarget name <- [actionTarget a]
+            ]
+        targets =
+            [ name
+            | a <- actions
+            , actionKind a == TableObject
+            , actionType a == RenameToDep
+            , ObjectTarget name <- [actionTarget a]
+            ]
 
         rename (deps, current) (oldName, newName) =
             let catalog = scanCatalog priorState
-                oldKeys = filter (isLiveKey catalog) (matchingKeys priorState TableObject RenameFromDep oldName)
+                oldKeys =
+                    filter
+                        (isLiveKey catalog)
+                        (matchingKeys priorState TableObject RenameFromDep (ObjectTarget oldName))
                 sourceKeys = if null oldKeys then [ObjectKey TableObject oldName] else oldKeys
                 sourceDeps =
                     Set.unions
@@ -365,12 +372,12 @@ processRenames sid priorState actions state =
 
 dependenciesForAction :: ScanState -> ObjectAction -> Set StatementId
 dependenciesForAction state act =
-    let keys = matchingKeys state (actionKind act) (actionType act) (actionName act)
+    let keys = matchingKeys state (actionKind act) (actionType act) (actionTarget act)
         catalog = scanCatalog state
         objectDeps = Set.unions [recursiveDependencies catalog Set.empty key | key <- keys]
         relationDeps =
-            case (actionKind act, actionType act) of
-                (TableObject, ModDep) -> boundObjectDependencies catalog (actionName act)
+            case (actionKind act, actionType act, actionTarget act) of
+                (TableObject, ModDep, ObjectTarget name) -> boundObjectDependencies catalog name
                 _ -> Set.empty
      in Set.union objectDeps relationDeps
 
@@ -391,7 +398,7 @@ recursiveDependencies catalog seen key
                                         (recursiveDependencies catalog seen' sourceKey)
                                         (boundDependencies catalog ((== IndexObject) . objectKind) sourceKey)
                                     | source <- Set.toList (objectSources object)
-                                    , sourceKey <- either (matchingKeysInCatalog catalog TableObject UseDep) (: []) source
+                                    , sourceKey <- either (matchingKeysInCatalog catalog TableObject UseDep . ObjectTarget) (: []) source
                                     ]
                             else Set.empty
                  in Set.union here sources
@@ -404,7 +411,7 @@ stateDependenciesInObject :: ObjectState -> Set StatementId
 stateDependenciesInObject object =
     Set.fromList (catMaybes [objectDefinition object, objectLastWrite object, objectRestored object])
 
-matchingKeys :: ScanState -> ObjectKind -> DependencyType -> ObjectName -> [ObjectKey]
+matchingKeys :: ScanState -> ObjectKind -> DependencyType -> ActionTarget -> [ObjectKey]
 matchingKeys state = matchingKeysInCatalog (scanCatalog state)
 
 isLiveKey :: Catalog -> ObjectKey -> Bool
@@ -412,28 +419,31 @@ isLiveKey catalog key =
     maybe False (not . objectDropped) (Map.lookup key (catalogObjects catalog))
 
 definitionKeys :: Catalog -> [ObjectAction] -> ObjectAction -> [ObjectKey]
-definitionKeys catalog actions action
-    | actionKind action /= ColumnObject = [ObjectKey (actionKind action) (actionName action)]
-    | T.null suffix = [ObjectKey ColumnObject (actionName action)]
-    | otherwise = [ColumnKey owner (T.drop 1 suffix) | owner <- owners]
+definitionKeys catalog actions action =
+    case (actionKind action, actionTarget action) of
+        (ColumnObject, ColumnTarget table column) ->
+            [ColumnKey owner column | owner <- owners table]
+        (_, ObjectTarget name) -> [ObjectKey (actionKind action) name]
+        (_, BarrierTarget _) -> []
+        (_, ColumnTarget _ _) -> []
     where
-        (table, suffix) = T.breakOn "\x1f" (actionName action)
-        declared =
+        declared table =
             [ ObjectKey (actionKind definition) table
             | definition <- actions
             , actionType definition == DefDep
             , actionKind definition `elem` [TableObject, TemporaryTableObject]
-            , actionName definition == table
+            , actionTarget definition == ObjectTarget table
             ]
-        resolved = filter (isLiveKey catalog) (matchingKeysInCatalog catalog TableObject UseDep table)
-        owners
-            | not (null declared) = declared
-            | not (null resolved) = resolved
+        resolved table =
+            filter (isLiveKey catalog) (matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget table))
+        owners table
+            | not (null (declared table)) = declared table
+            | not (null (resolved table)) = resolved table
             | otherwise = [ObjectKey TableObject table]
 
 actionKeys :: ScanState -> ObjectAction -> [ObjectKey]
 actionKeys state action =
-    case matchingKeys state (actionKind action) (actionType action) (actionName action) of
+    case matchingKeys state (actionKind action) (actionType action) (actionTarget action) of
         [] -> definitionKeys (scanCatalog state) [] action
         keys -> keys
 
@@ -460,17 +470,17 @@ prepareDefinition sid catalog key =
              in removeRelationsForTable key cleared
         ColumnKey _ _ -> catalog
 
-matchingKeysInCatalog :: Catalog -> ObjectKind -> DependencyType -> ObjectName -> [ObjectKey]
-matchingKeysInCatalog catalog ColumnObject dependency name
-    | not (T.null suffix) =
-        [ key
-        | owner <- matchingKeysInCatalog catalog TableObject dependency table
-        , let key = ColumnKey owner (T.drop 1 suffix)
-        , Map.member key (catalogObjects catalog)
-        ]
-    where
-        (table, suffix) = T.breakOn "\x1f" name
-matchingKeysInCatalog catalog kind dependency name =
+matchingKeysInCatalog :: Catalog -> ObjectKind -> DependencyType -> ActionTarget -> [ObjectKey]
+matchingKeysInCatalog _ _ _ (BarrierTarget _) = []
+matchingKeysInCatalog catalog ColumnObject dependency (ColumnTarget table column) =
+    [ key
+    | owner <- matchingKeysInCatalog catalog TableObject dependency (ObjectTarget table)
+    , let key = ColumnKey owner column
+    , Map.member key (catalogObjects catalog)
+    ]
+matchingKeysInCatalog catalog kind dependency (ColumnTarget table _) =
+    matchingKeysInCatalog catalog kind dependency (ObjectTarget table)
+matchingKeysInCatalog catalog kind dependency (ObjectTarget name) =
     let available = Map.keys (catalogObjects catalog)
         acceptableKinds = case (kind, dependency) of
             (TableObject, UseDep) -> [TableObject, TemporaryTableObject, ViewObject]
@@ -501,10 +511,9 @@ matchingKeysInCatalog catalog kind dependency name =
      in if shouldPreferTemp then tempMatches else matches
 
 isTemporarySchema :: ObjectName -> Bool
-isTemporarySchema name =
-    case canonicalParts name of
-        schema : _ -> schema == "temp" || schema == "pg_temp" || "pg_temp_" `T.isPrefixOf` schema
-        [] -> False
+isTemporarySchema (ObjectName (schema : _)) =
+    schema == "temp" || schema == "pg_temp" || "pg_temp_" `T.isPrefixOf` schema
+isTemporarySchema (ObjectName []) = False
 
 -- Without a known search_path, an unqualified name can resolve in any schema.
 namesMayReferToEachOther :: ObjectName -> ObjectName -> Bool
@@ -588,14 +597,14 @@ bindCascades _sid actions catalog =
             [ parent
             | act <- actions
             , actionType act == CascadeDep
-            , parent <- matchingKeysInCatalog catalog TableObject UseDep (actionName act)
+            , parent <- matchingKeysInCatalog catalog TableObject UseDep (actionTarget act)
             ]
         localTables =
             [ key
             | act <- actions
             , actionType act `elem` [DefDep, ModDep]
             , actionKind act `elem` [TableObject, TemporaryTableObject]
-            , key <- matchingKeysInCatalog catalog (actionKind act) (actionType act) (actionName act)
+            , key <- matchingKeysInCatalog catalog (actionKind act) (actionType act) (actionTarget act)
             ]
      in if null cascadeParents || null localTables
             then catalog
@@ -617,13 +626,13 @@ recordOnCommit _sid actions state =
                     [ key
                     | act <- actions
                     , actionType act == OnCommitDropDep
-                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionName act)
+                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionTarget act)
                     ]
                 deleteKeys =
                     [ key
                     | act <- actions
                     , actionType act == OnCommitDeleteRowsDep
-                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionName act)
+                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionTarget act)
                     ]
                 frame' =
                     frame
@@ -685,7 +694,7 @@ bindRelations _ key actions catalog =
             | action <- actions
             , actionKind action == TableObject
             , actionType action == UseDep
-            , owner <- matchingKeysInCatalog catalog TableObject UseDep (actionName action)
+            , owner <- matchingKeysInCatalog catalog TableObject UseDep (actionTarget action)
             , isLiveKey catalog owner
             ]
         withoutOldBinding =
@@ -703,14 +712,14 @@ boundIndexDependencies :: Catalog -> ObjectName -> Set StatementId
 boundIndexDependencies catalog table =
     Set.unions
         [ boundDependencies catalog ((== IndexObject) . objectKind) owner
-        | owner <- matchingKeysInCatalog catalog TableObject UseDep table
+        | owner <- matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget table)
         ]
 
 boundObjectDependencies :: Catalog -> ObjectName -> Set StatementId
 boundObjectDependencies catalog table =
     Set.unions
         [ boundDependencies catalog (const True) owner
-        | owner <- matchingKeysInCatalog catalog TableObject ModDep table
+        | owner <- matchingKeysInCatalog catalog TableObject ModDep (ObjectTarget table)
         ]
 
 boundDependencies :: Catalog -> (ObjectKey -> Bool) -> ObjectKey -> Set StatementId
@@ -721,10 +730,10 @@ boundDependencies catalog include owner =
         , include key
         ]
 
-viewSources :: Catalog -> [ObjectAction] -> ObjectName -> Set (Either ObjectName ObjectKey)
-viewSources catalog actions view =
+viewSources :: Catalog -> [ObjectAction] -> ActionTarget -> Set (Either ObjectName ObjectKey)
+viewSources catalog actions viewTarget =
     if any
-        (\act -> actionKind act == ViewObject && actionType act == DefDep && actionName act == view)
+        (\act -> actionKind act == ViewObject && actionType act == DefDep && actionTarget act == viewTarget)
         actions
         then
             Set.fromList
@@ -732,8 +741,9 @@ viewSources catalog actions view =
                 | act <- actions
                 , actionKind act == TableObject
                 , actionType act == UseDep
-                , source <- case matchingKeysInCatalog catalog TableObject UseDep (actionName act) of
-                    [] -> [Left (actionName act)]
+                , ObjectTarget sourceName <- [actionTarget act]
+                , source <- case matchingKeysInCatalog catalog TableObject UseDep (actionTarget act) of
+                    [] -> [Left sourceName]
                     keys -> map Right keys
                 ]
         else Set.empty
@@ -868,8 +878,10 @@ txCommandFromAction act
             TxBeginDep -> Just TxBegin
             TxCommitDep -> Just TxCommit
             TxRollbackDep -> Just TxRollback
-            TxSavepointDep -> Just (TxSavepoint (actionName act))
-            TxRollbackToDep -> Just (TxRollbackTo (actionName act))
-            TxReleaseDep -> Just (TxRelease (actionName act))
+            TxSavepointDep -> Just (TxSavepoint (savepointName act))
+            TxRollbackToDep -> Just (TxRollbackTo (savepointName act))
+            TxReleaseDep -> Just (TxRelease (savepointName act))
             _ -> Nothing
     | otherwise = Nothing
+    where
+        savepointName action = fromMaybe (ObjectName []) (targetObjectName (actionTarget action))
