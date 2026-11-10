@@ -12,7 +12,14 @@ import Data.Text.Encoding qualified as TE
 import Occam.Core (StatementId (..))
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Logger (nullLogger)
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), countStatements, parseSQL)
+import Occam.Parser (
+    ParsedSQL (..),
+    ParserError (..),
+    ParserErrorKind (..),
+    SQLDialect (..),
+    countStatements,
+    parseSQL,
+ )
 import Occam.Reducer (
     Oracle,
     OracleInconclusiveError,
@@ -369,7 +376,7 @@ tests =
             assertEqual "invalid syntax does not turn statement count into zero" 2 invalidCount
             invalidUtf8 <- countStatements SQLite (BS.pack [255])
             case invalidUtf8 of
-                Left _ -> pure ()
+                Left err -> assertEqual "invalid UTF-8 has a typed parser error" ParserInvalidUtf8 (parserErrorKind err)
                 Right count -> assertFailure ("invalid UTF-8 unexpectedly counted as " ++ show count)
         , testCase "reducer propagates parser transport failures" $ do
             let invalidUtf8 = BS.pack [255]

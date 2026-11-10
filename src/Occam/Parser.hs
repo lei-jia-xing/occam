@@ -4,6 +4,7 @@ module Occam.Parser (
     SQLDialect (..),
     defaultSQLDialect,
     ParserError (..),
+    ParserErrorKind (..),
     ParsedSQL (..),
     StatementUnit (..),
     StatementFacts (..),
@@ -69,8 +70,21 @@ data SQLDialect
 defaultSQLDialect :: SQLDialect
 defaultSQLDialect = GenericSQL
 
+data ParserErrorKind
+    = ParserInvalidArguments
+    | ParserInvalidDialect
+    | ParserInvalidUtf8
+    | ParserNativeFailure
+    | ParserNativePanic
+    | ParserNullResult
+    | ParserDecodeFailure
+    | ParserInvalidSourceRange
+    | ParserInvalidEditRange
+    | ParserUnknownFailure !Int
+    deriving (Eq, Show)
+
 data ParserError = ParserError
-    { parserErrorCode :: !Int
+    { parserErrorKind :: !ParserErrorKind
     , parserErrorMessage :: !Text
     }
     deriving (Eq, Show)
@@ -213,13 +227,13 @@ parseSQL dialect sql =
                     pointer <- peek outputPointer
                     length' <- peek outputLength
                     if pointer == nullPtr
-                        then pure (Left (ParserError 6 "sqlparser returned a null result buffer"))
+                        then pure (Left (ParserError ParserNullResult "sqlparser returned a null result buffer"))
                         else do
                             let free = c_freeSQL pointer length'
                                 decode = do
                                     bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
                                     case eitherDecodeStrict' bytes of
-                                        Left message -> pure (Left (ParserError 7 (T.pack message)))
+                                        Left message -> pure (Left (ParserError ParserDecodeFailure (T.pack message)))
                                         Right (NativeResponse units) ->
                                             pure $ ParsedSQL <$> makeUnits sql units
                             finally decode free
@@ -230,17 +244,17 @@ parseSQL dialect sql =
                 poke messageLength 0
                 errorStatus <- c_parseError status messagePointer messageLength
                 if errorStatus /= 0
-                    then pure (ParserError (fromIntegral status) "sqlparser native parser failed")
+                    then pure (ParserError (parserErrorKindFromStatus status) "sqlparser native parser failed")
                     else do
                         pointer <- peek messagePointer
                         length' <- peek messageLength
                         if pointer == nullPtr
-                            then pure (ParserError (fromIntegral status) "sqlparser native parser failed")
+                            then pure (ParserError (parserErrorKindFromStatus status) "sqlparser native parser failed")
                             else do
                                 let free = c_freeSQL pointer length'
                                     decode = do
                                         bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
-                                        pure (ParserError (fromIntegral status) (TE.decodeUtf8Lenient bytes))
+                                        pure (ParserError (parserErrorKindFromStatus status) (TE.decodeUtf8Lenient bytes))
                                 finally decode free
 
 countStatements :: SQLDialect -> ByteString -> IO (Either ParserError Int)
@@ -255,13 +269,30 @@ countStatements dialect sql =
 
 simpleNativeError :: CInt -> IO ParserError
 simpleNativeError status =
-    pure $ case status of
-        1 -> ParserError 1 "invalid native parser arguments"
-        2 -> ParserError 2 "invalid SQL dialect code"
-        3 -> ParserError 3 "SQL input is not valid UTF-8"
-        4 -> ParserError 4 "sqlparser native parser failed"
-        5 -> ParserError 5 "sqlparser native parser panicked"
-        _ -> ParserError (fromIntegral status) "unknown sqlparser native error"
+    let kind = parserErrorKindFromStatus status
+     in pure (ParserError kind (parserErrorMessageFor kind))
+
+parserErrorKindFromStatus :: CInt -> ParserErrorKind
+parserErrorKindFromStatus status = case status of
+    1 -> ParserInvalidArguments
+    2 -> ParserInvalidDialect
+    3 -> ParserInvalidUtf8
+    4 -> ParserNativeFailure
+    5 -> ParserNativePanic
+    _ -> ParserUnknownFailure (fromIntegral status)
+
+parserErrorMessageFor :: ParserErrorKind -> Text
+parserErrorMessageFor ParserInvalidArguments = "invalid native parser arguments"
+parserErrorMessageFor ParserInvalidDialect = "invalid SQL dialect code"
+parserErrorMessageFor ParserInvalidUtf8 = "SQL input is not valid UTF-8"
+parserErrorMessageFor ParserNativeFailure = "sqlparser native parser failed"
+parserErrorMessageFor ParserNativePanic = "sqlparser native parser panicked"
+parserErrorMessageFor ParserNullResult = "sqlparser returned a null result buffer"
+parserErrorMessageFor ParserDecodeFailure = "sqlparser returned malformed JSON"
+parserErrorMessageFor ParserInvalidSourceRange = "sqlparser returned an invalid source byte range"
+parserErrorMessageFor ParserInvalidEditRange = "sqlparser returned an invalid edit range"
+parserErrorMessageFor (ParserUnknownFailure code) =
+    "unknown sqlparser native error " <> T.pack (show code)
 
 dialectCode :: SQLDialect -> CUInt
 dialectCode GenericSQL = 0
@@ -290,11 +321,11 @@ makeUnits source = go 0 1
         go _ _ [] = Right []
         go previousEnd index (native : rest)
             | start < 0 || start >= end || end > sourceLength || start < previousEnd =
-                Left (ParserError 8 "sqlparser returned an invalid source byte range")
+                Left (ParserError ParserInvalidSourceRange "sqlparser returned an invalid source byte range")
             | not (isBoundary start && isBoundary end) =
-                Left (ParserError 8 "sqlparser returned a source range splitting UTF-8")
+                Left (ParserError ParserInvalidSourceRange "sqlparser returned a source range splitting UTF-8")
             | maybe False (not . all (validEdit start end) . nativeEdits) (nativeFacts native) =
-                Left (ParserError 11 "sqlparser returned an invalid edit range")
+                Left (ParserError ParserInvalidEditRange "sqlparser returned an invalid edit range")
             | otherwise = do
                 let statement = Statement (StatementId index) (Span start end) (BS.take (end - start) (BS.drop start source))
                     facts = fmap makeFacts (nativeFacts native)
