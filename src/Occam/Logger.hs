@@ -50,6 +50,7 @@ data LogLevel
     deriving (Eq, Ord, Show, Read, Generic)
 
 instance ToJSON LogLevel where
+    toJSON :: LogLevel -> Value
     toJSON LevelDebug = "debug"
     toJSON LevelInfo = "info"
     toJSON LevelWarn = "warn"

@@ -59,10 +59,10 @@ import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), proc, 
 #else
 import System.Directory (findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removePathForcibly)
 import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
-import System.Posix.Signals (sigKILL, sigTERM, signalProcessGroup)
+import System.Posix.Signals (nullSignal, sigKILL, sigTERM, signalProcessGroup)
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (ProcessID)
-import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, proc, shell, waitForProcess, withCreateProcess)
+import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, getProcessExitCode, proc, shell, waitForProcess, withCreateProcess)
 #endif
 import System.Timeout (timeout)
 
@@ -178,11 +178,29 @@ cleanupOwnedGroup mPid ph = mask_ do
         Just pid -> do
             termSent <- tryIOException (signalProcessGroup sigTERM pid)
             case termSent of
-                Right () -> uninterruptibleMask_ (threadDelay 50000)
+                Right () -> uninterruptibleMask_ (waitForGroupTermination pid ph 50)
                 Left _ -> pure ()
             ignoreIOException (signalProcessGroup sigKILL pid)
     _ <- timeout 1000000 (waitForProcess ph)
     pure ()
+
+{- | Give a cooperative process group a short grace period after SIGTERM.
+Poll instead of sleeping for the full delay so fast oracles do not pay it on
+every invocation.
+-}
+waitForGroupTermination :: ProcessID -> ProcessHandle -> Int -> IO ()
+waitForGroupTermination pid ph remaining
+    | remaining <= 0 = pure ()
+    | otherwise = do
+        leaderExited <- getProcessExitCode ph
+        case leaderExited of
+            Just _ -> pure ()
+            Nothing -> do
+                groupAlive <- tryIOException (signalProcessGroup nullSignal pid)
+                case groupAlive of
+                    Left _ -> pure ()
+                    Right () ->
+                        threadDelay 1000 >> waitForGroupTermination pid ph (remaining - 1)
 #endif
 
 withWorker :: IO a -> (IO a -> IO b) -> IO b
