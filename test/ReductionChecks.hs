@@ -25,7 +25,6 @@ import Occam.Reducer (
     OracleInconclusiveError,
     OracleOutcome (..),
     ReductionConfig (..),
-    SearchStrategy (..),
     defaultReductionConfig,
     oracleFromPredicate,
     reduceSQL,
@@ -100,27 +99,7 @@ tests =
                 "the unrestricted fallback/audit composition leaves this result unchanged"
                 closure
                 audited
-        , testCase "Weighted and CDD searches preserve the predicate-required statement" $ do
-            let target = BSC.concat ["SELECT 'sentinel", BS.replicate 256 120, "';\n"]
-                sql = BSC.concat ["SELECT 1;\nSELECT 2;\nSELECT 3;\nSELECT 4;\n", target]
-                oracle = predicateOracle (BSC.isInfixOf "sentinel")
-            weighted <- statementDdmin GenericSQL WeightedDD oracle sql
-            cdd <- statementDdmin GenericSQL CDD oracle sql
-            dom <- statementDdmin GenericSQL DominatorDD oracle sql
-            assertBool
-                "weighted search keeps the predicate-required statement"
-                (BSC.isInfixOf "sentinel" weighted)
-            assertBool "CDD keeps the predicate-required statement" (BSC.isInfixOf "sentinel" cdd)
-            assertBool "DominatorDD keeps the predicate-required statement" (BSC.isInfixOf "sentinel" dom)
-            assertBool "weighted search removes irrelevant statements" (BS.length weighted < BS.length sql)
-            assertBool "CDD removes irrelevant statements" (BS.length cdd < BS.length sql)
-            assertBool "DominatorDD removes irrelevant statements" (BS.length dom < BS.length sql)
-            assertBool
-                "weighted search removes the unrelated first statement"
-                (not (BSC.isInfixOf "SELECT 1" weighted))
-            assertBool "CDD removes the unrelated first statement" (not (BSC.isInfixOf "SELECT 1" cdd))
-            assertBool "DominatorDD removes the unrelated first statement" (not (BSC.isInfixOf "SELECT 1" dom))
-        , testCase "Dominator-guided closure search prunes unneeded independent subgraphs" $ do
+        , testCase "Closure search prunes unneeded independent subgraphs" $ do
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE unneeded_tbl (id INT);"
@@ -134,14 +113,13 @@ tests =
                     predicateOracle (\candidate -> BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)
                 config =
                     defaultReductionConfig
-                        { reductionSearch = DominatorDD
-                        , reductionIntraStatement = False
+                        { reductionIntraStatement = False
                         , reductionUnrestricted = False
                         }
             reduced <- reduceSQLWithConfig config nullLogger oracle sql
             assertBool "keeps crash table" (BSC.isInfixOf "crash_tbl" reduced)
             assertBool "keeps crash value" (BSC.isInfixOf "42" reduced)
-            assertBool "eliminates unneeded dominator subgraph" (not (BSC.isInfixOf "unneeded_tbl" reduced))
+            assertBool "eliminates unneeded subgraph" (not (BSC.isInfixOf "unneeded_tbl" reduced))
         , testCase "Constraint stripping and deeper branch pruning simplify table definitions and expressions" $ do
             let sql =
                     BSC.unlines
@@ -200,14 +178,14 @@ tests =
             let bytes = BSC.pack "SELECT 11;\r\nSELECT 22;\n"
                 firstStatement = BSC.pack "SELECT 11;\r\n"
                 keepFirst = predicateOracle (BSC.isInfixOf "SELECT 11")
-            byteResult <- statementDdmin GenericSQL CountDD keepFirst bytes
+            byteResult <- statementDdmin GenericSQL keepFirst bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
         , testCase "statement deletion removes exactly its own terminator and separator" $ do
             let sql = BSC.pack "SELECT 1;\r\n\r\nSELECT 2;\r\nSELECT 3;\r\n"
                 oracle =
                     predicateOracle
                         (\candidate -> BSC.isInfixOf "SELECT 2" candidate && BSC.isInfixOf "SELECT 3" candidate)
-            reduced <- statementDdmin GenericSQL CountDD oracle sql
+            reduced <- statementDdmin GenericSQL oracle sql
             assertEqual
                 "the removed statement takes its CRLF and blank separator with it"
                 (BSC.pack "SELECT 2;\r\nSELECT 3;\r\n")
@@ -282,7 +260,7 @@ tests =
                 oracle = predicateOracle (\candidate -> BS.isInfixOf trigger candidate && BS.isInfixOf target candidate)
             statementCount <- countOrFail SQLite sql
             assertEqual "table, trigger, target, and following SELECT are four source units" 4 statementCount
-            reduced <- statementDdmin SQLite CountDD oracle sql
+            reduced <- statementDdmin SQLite oracle sql
             assertEqual "the trigger is one source statement and retained bytes are untouched" expected reduced
         , testCase "Statement counting follows each selected SQL dialect" $ do
             sqliteCount <- countOrFail SQLite "SELECT /*; block */ 'a;b'; -- line; comment\nSELECT [g;h];"

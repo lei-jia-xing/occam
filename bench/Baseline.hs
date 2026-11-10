@@ -5,7 +5,7 @@ module Baseline (
 
 import Data.ByteString (ByteString)
 import Occam.Parser (SQLDialect)
-import Occam.Reducer (Oracle, SearchStrategy (CountDD), statementAudit, statementDdmin)
+import Occam.Reducer (Oracle, statementAudit, statementDdmin)
 
 {- | Baseline 1 (Sequential Statement Deletion):
 Loops through statements one by one, attempts removing statement i.
@@ -19,4 +19,4 @@ Delta-debug the same top-level statement units used by the shared reducer,
 without dependency awareness or syntax-level rewrites.
 -}
 runNaiveDdmin :: SQLDialect -> Oracle -> ByteString -> IO ByteString
-runNaiveDdmin dialect = statementDdmin dialect CountDD
+runNaiveDdmin = statementDdmin

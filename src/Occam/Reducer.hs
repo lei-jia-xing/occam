@@ -4,7 +4,6 @@ module Occam.Reducer (
     OracleInconclusiveError (..),
     oracleAccepts,
     oracleFromPredicate,
-    SearchStrategy (..),
     ReductionConfig (..),
     defaultReductionConfig,
     isValidClosure,
@@ -89,19 +88,11 @@ oracleFromPredicate predicate candidate = do
     accepted <- predicate candidate
     pure (if accepted then OracleAccepted else OracleRejected)
 
-data SearchStrategy
-    = CountDD
-    | WeightedDD
-    | CDD
-    | DominatorDD
-    deriving (Eq, Show)
-
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
     , reductionClosure :: !Bool
     , reductionIntraStatement :: !Bool
     , reductionUnrestricted :: !Bool
-    , reductionSearch :: !SearchStrategy
     , reductionDialect :: !SQLDialect
     }
     deriving (Eq, Show)
@@ -113,7 +104,6 @@ defaultReductionConfig =
         , reductionClosure = True
         , reductionIntraStatement = True
         , reductionUnrestricted = True
-        , reductionSearch = CountDD
         , reductionDialect = defaultSQLDialect
         }
 
@@ -203,104 +193,10 @@ partitionChunks n xs
             (chunk, rest) = splitAt chunkSize xs
          in chunk : partitionChunks (n - 1) rest
 
-statementByteWeight :: ByteString -> Statement -> Int
--- WeightedDD balances contiguous groups by each statement's byte-span weight.
--- Its partitioning is inspired by Wddmin (Zhou et al., arXiv:2411.19410), not a token-weight claim.
-statementByteWeight _ statement =
+statementSpanBytes :: Statement -> Int
+statementSpanBytes statement =
     let Span start end = stmtSpan statement
      in end - start
-
-weightedChunks :: Int -> (a -> Int) -> [a] -> [[a]]
-weightedChunks n weight items
-    | null items = []
-    | n <= 1 = [items]
-    | otherwise = split (min n (length items)) items
-    where
-        split parts remaining
-            | parts <= 1 = [remaining]
-            | null remaining = []
-            | otherwise =
-                let totalWeight = sum (map (toInteger . max 1 . weight) remaining)
-                    maxCut = length remaining - (parts - 1)
-                    cutAt = closestWeightCut parts totalWeight maxCut remaining
-                    (chunk, rest) = splitAt cutAt remaining
-                 in chunk : split (parts - 1) rest
-
-        closestWeightCut parts totalWeight maxCut remaining =
-            let (_, _, bestCut, _) =
-                    foldl'
-                        (chooseCut parts totalWeight)
-                        (0, 0, 1, Nothing)
-                        (zip [1 .. maxCut] (take maxCut remaining))
-             in bestCut
-
-        chooseCut parts totalWeight (_, previousWeight, bestCut, bestScore) (index, item) =
-            let prefixWeight = previousWeight + toInteger (max 1 (weight item))
-                score = abs (prefixWeight * toInteger parts - totalWeight)
-             in case bestScore of
-                    Nothing -> (index, prefixWeight, index, Just score)
-                    Just previous
-                        | score < previous -> (index, prefixWeight, index, Just score)
-                    _ -> (index, prefixWeight, bestCut, bestScore)
-
-chunksFor ::
-    Maybe DependencyGraph -> SearchStrategy -> Int -> ByteString -> [Statement] -> [[Statement]]
-chunksFor _ CountDD count _ = partitionChunks count
-chunksFor _ WeightedDD count source = weightedChunks count (statementByteWeight source)
-chunksFor _ CDD count _ = partitionChunks count
-chunksFor (Just graph) DominatorDD count _ = dominatorChunks graph count
-chunksFor Nothing DominatorDD count _ = partitionChunks count
-
-dominatorChunks :: DependencyGraph -> Int -> [Statement] -> [[Statement]]
-dominatorChunks graph n current
-    | n <= 1 || length current <= 1 = [current]
-    | otherwise =
-        let currentIds = statementIds current
-            stmtMap = Map.fromList [(stmtId s, s) | s <- current]
-            restrictedEdges =
-                Map.fromList
-                    [ (sid, Set.intersection (Map.findWithDefault Set.empty sid (graphEdges graph)) currentIds)
-                    | sid <- Set.toList currentIds
-                    ]
-            hasDependent sid =
-                any (Set.member sid) (Map.elems restrictedEdges)
-            sinks = filter (not . hasDependent) (Set.toList currentIds)
-         in if null sinks || length sinks == 1
-                then partitionChunks n current
-                else
-                    let slices =
-                            [ (sink, backwardSlice sink graph `Set.intersection` currentIds)
-                            | sink <- sinks
-                            ]
-                        exclusiveClusters =
-                            [ excl
-                            | (sink, sl) <- slices
-                            , let others = Set.unions [sl' | (s', sl') <- slices, s' /= sink]
-                            , let excl = Set.difference sl others
-                            , not (Set.null excl)
-                            ]
-                        allExclusive = Set.unions exclusiveClusters
-                        shared = Set.difference currentIds allExclusive
-                        clusters =
-                            [ [stmt | sid <- Set.toList excl, Just stmt <- [Map.lookup sid stmtMap]]
-                            | excl <- exclusiveClusters
-                            ]
-                                ++ [ [stmt | sid <- Set.toList shared, Just stmt <- [Map.lookup sid stmtMap]]
-                                   | not (Set.null shared)
-                                   ]
-                        clusterHeadId cl = case cl of (s : _) -> stmtId s; [] -> StatementId 0
-                        orderedClusters =
-                            sortOn clusterHeadId (filter (not . null) clusters)
-                     in packClusters n orderedClusters
-
-packClusters :: Int -> [[Statement]] -> [[Statement]]
-packClusters n clusters
-    | n <= 1 = [concat clusters]
-    | n >= length clusters = clusters
-    | otherwise =
-        let targetSize = (length clusters + n - 1) `div` n
-            (chunk, rest) = splitAt targetSize clusters
-         in concat chunk : packClusters (n - 1) rest
 
 statementIds :: [Statement] -> Set StatementId
 statementIds = Set.fromList . map stmtId
@@ -308,16 +204,16 @@ statementIds = Set.fromList . map stmtId
 statementSQL :: ByteString -> [Statement] -> [Statement] -> ByteString
 statementSQL = cutRemovedStatements
 
--- | Closure-constrained delta debugging, retaining the historical CountDD API.
+-- | Closure-constrained delta debugging.
 closureDdmin :: Oracle -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
-closureDdmin = closureDdminWithLogger nullLogger CountDD
+closureDdmin = closureDdminWithLogger nullLogger
 
 closureDdminWithLogger ::
-    Logger -> SearchStrategy -> Oracle -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
-closureDdminWithLogger logger strategy oracle baseSQL initialStatements graph = do
+    Logger -> Oracle -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
+closureDdminWithLogger logger oracle baseSQL initialStatements graph = do
     closureCache <- newIORef Map.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
-    let weights = Map.fromList [(stmtId s, statementByteWeight baseSQL s) | s <- initialStatements]
+    let weights = Map.fromList [(stmtId s, statementSpanBytes s) | s <- initialStatements]
         buildCandidate current seedIds = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
             cached <- readIORef closureCache
@@ -347,8 +243,6 @@ closureDdminWithLogger logger strategy oracle baseSQL initialStatements graph = 
                 else pure Nothing
     result <-
         searchStatements
-            (Just graph)
-            strategy
             buildCandidate
             oracle
             baseSQL
@@ -359,12 +253,7 @@ closureDdminWithLogger logger strategy oracle baseSQL initialStatements graph = 
         logger
         "occam::reducer"
         "Closure search summary"
-        [ ("strategy", toJSON (T.pack (show strategy)))
-        ,
-            ( "partition_weight"
-            , toJSON (if strategy == WeightedDD then ("statement-bytes" :: T.Text) else "statement-count")
-            )
-        , ("closure_requests", toJSON (closureRequests stats))
+        [ ("closure_requests", toJSON (closureRequests stats))
         , ("closure_cache_hits", toJSON (closureCacheHits stats))
         , ("closure_gain_statements", toJSON (closureGainStatements stats))
         , ("closure_gain_bytes", toJSON (closureGainBytes stats))
@@ -393,28 +282,21 @@ newFeedback :: IO Feedback
 newFeedback = Feedback <$> newIORef Set.empty <*> newIORef Set.empty <*> newIORef Map.empty
 
 searchStatements ::
-    Maybe DependencyGraph ->
-    SearchStrategy ->
     CandidateBuilder ->
     Oracle ->
     ByteString ->
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements maybeGraph strategy buildCandidate oracle baseSQL allStatements initialStatements = do
+searchStatements buildCandidate oracle baseSQL allStatements initialStatements = do
     feedback <- newFeedback
-    case strategy of
-        CDD -> searchCDD feedback buildCandidate oracle baseSQL allStatements initialStatements
-        _ ->
-            searchDDMin
-                maybeGraph
-                feedback
-                strategy
-                buildCandidate
-                oracle
-                baseSQL
-                allStatements
-                initialStatements
+    searchDDMin
+        feedback
+        buildCandidate
+        oracle
+        baseSQL
+        allStatements
+        initialStatements
 
 type CandidateBuilder = [Statement] -> Set StatementId -> IO (Maybe [Statement])
 
@@ -423,21 +305,19 @@ plainCandidate current keptIds =
     pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
 
 searchDDMin ::
-    Maybe DependencyGraph ->
     Feedback ->
-    SearchStrategy ->
     CandidateBuilder ->
     Oracle ->
     ByteString ->
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin maybeGraph feedback strategy buildCandidate oracle baseSQL allStatements = go 2
+searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
     where
         go _ [] = pure []
         go granularity current = do
             let n = min (length current) (max 1 granularity)
-                chunks = chunksFor maybeGraph strategy n baseSQL current
+                chunks = partitionChunks n current
             subset <- trySubsets current chunks
             case subset of
                 Just reduced -> go 2 reduced
@@ -501,91 +381,9 @@ searchDDMin maybeGraph feedback strategy buildCandidate oracle baseSQL allStatem
                                                             _ -> pure ()
                                                         pure Nothing
 
-searchCDD ::
-    Feedback ->
-    CandidateBuilder ->
-    Oracle ->
-    ByteString ->
-    [Statement] ->
-    [Statement] ->
-    IO [Statement]
-searchCDD feedback buildCandidate oracle baseSQL allStatements = rounds 0
-    where
-        rounds _ [] = pure []
-        rounds roundNumber current = do
-            let subsetSize = cddSubsetSize roundNumber (length current)
-                partitions = chunksOf subsetSize current
-            afterRound <- tryPartitions current partitions
-            if subsetSize <= 1
-                then pure afterRound
-                else rounds (roundNumber + 1) afterRound
-
-        tryPartitions current [] = pure current
-        tryPartitions current (partition : rest)
-            | null current = pure []
-            | otherwise = do
-                let retainedIds = statementIds current `Set.difference` statementIds partition
-                    removedIds = statementIds partition
-                essential <- readIORef (fbEssentialStatements feedback)
-                failed <- readIORef (fbFailedRemovals feedback)
-                if (Set.size removedIds == 1 && any (`Set.member` essential) (Set.toList removedIds))
-                    || Set.member removedIds failed
-                    then tryPartitions current rest
-                    else do
-                        maybeKept <- buildCandidate current retainedIds
-                        case maybeKept of
-                            Nothing -> tryPartitions current rest
-                            Just kept -> do
-                                let currentSQL = statementSQL baseSQL allStatements current
-                                    candidateSQL = statementSQL baseSQL allStatements kept
-                                if BS.length candidateSQL >= BS.length currentSQL
-                                    then tryPartitions current rest
-                                    else do
-                                        evaluated <- readIORef (fbEvaluated feedback)
-                                        case Map.lookup candidateSQL evaluated of
-                                            Just CandidateAccepted -> tryPartitions kept rest
-                                            Just CandidateRejected -> tryPartitions current rest
-                                            Nothing -> do
-                                                ok <- oracleAccepts oracle candidateSQL
-                                                let verdict = if ok then CandidateAccepted else CandidateRejected
-                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL verdict)
-                                                case verdict of
-                                                    CandidateAccepted -> tryPartitions kept rest
-                                                    CandidateRejected -> do
-                                                        modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
-                                                        case Set.toList removedIds of
-                                                            [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
-                                                            _ -> pure ()
-                                                        tryPartitions current rest
-
-        chunksOf size xs
-            | null xs = []
-            | otherwise =
-                let (chunk, rest) = splitAt (max 1 size) xs
-                 in chunk : chunksOf size rest
-
-{- | Counter-Based Delta Debugging (CDD), following Algorithm 2 of Zhang et al.,
-"Toward a Better Understanding of Probabilistic Delta Debugging",
-arXiv:2408.04735v4 (2025), https://arxiv.org/abs/2408.04735v4.
-This uses p0 = 0.25 and the paper's approximate round multiplier 1.582.
--}
-cddSubsetSize :: Int -> Int -> Int
-cddSubsetSize roundNumber count
-    | count <= 1 = 1
-    | estimatedProbability >= 1 = 1
-    | otherwise = bestSize [1 .. count] 1
-    where
-        estimatedProbability :: Double
-        estimatedProbability = 0.25 * (1.582 ** fromIntegral roundNumber)
-        gain size = fromIntegral size * ((1 - estimatedProbability) ** fromIntegral size)
-        bestSize [] currentBest = currentBest
-        bestSize (size : sizes) currentBest
-            | gain size > gain currentBest = bestSize sizes size
-            | otherwise = bestSize sizes currentBest
-
 -- | Graph-free statement ddmin over original top-level statement byte spans.
-statementDdmin :: SQLDialect -> SearchStrategy -> Oracle -> ByteString -> IO ByteString
-statementDdmin dialect strategy oracle initialSQL = do
+statementDdmin :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+statementDdmin dialect oracle initialSQL = do
     initialOK <- oracleAccepts oracle initialSQL
     if not initialOK
         then pure initialSQL
@@ -593,7 +391,7 @@ statementDdmin dialect strategy oracle initialSQL = do
             units <- parseUnitsOrThrow dialect initialSQL
             let allStatements = map unitStatement units
             reduced <-
-                searchStatements Nothing strategy plainCandidate oracle initialSQL allStatements allStatements
+                searchStatements plainCandidate oracle initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
 -- | Sequential one-statement deletion to a fixed point; the empty candidate is allowed.
@@ -782,8 +580,8 @@ sliceWithAnalysis logger oracle analysis sql = do
                         else keep sql
 
 closureSearchWithAnalysis ::
-    Logger -> SearchStrategy -> Oracle -> ByteString -> SQLAnalysis -> IO ByteString
-closureSearchWithAnalysis logger strategy oracle sql analysis =
+    Logger -> Oracle -> ByteString -> SQLAnalysis -> IO ByteString
+closureSearchWithAnalysis logger oracle sql analysis =
     let statements = analyzedStatements analysis
      in if null statements
             then pure sql
@@ -791,7 +589,6 @@ closureSearchWithAnalysis logger strategy oracle sql analysis =
                 retained <-
                     closureDdminWithLogger
                         logger
-                        strategy
                         oracle
                         sql
                         statements
@@ -821,12 +618,6 @@ reduceSQLWithConfig config logger oracle initialSQL = do
                 "Starting reduction iteration"
                 [ ("iteration", toJSON iteration)
                 , ("bytes", toJSON (BS.length currentSQL))
-                , ("strategy", toJSON (T.pack (show (reductionSearch config))))
-                ,
-                    ( "partition_weight"
-                    , toJSON
-                        (if reductionSearch config == WeightedDD then ("statement-bytes" :: T.Text) else "statement-count")
-                    )
                 , ("slicing", toJSON (reductionSlicing config))
                 , ("closure", toJSON (reductionClosure config))
                 , ("unrestricted", toJSON (reductionUnrestricted config))
@@ -862,19 +653,19 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                     case reusableAnalysis of
                         Just cached -> pure cached
                         Nothing -> analyzeSQL logger (reductionDialect config) sliced
-                closureSearchWithAnalysis logger (reductionSearch config) oracle sliced analysis
+                closureSearchWithAnalysis logger oracle sliced analysis
             else
                 timedStage
                     logger
                     "graph-free-statement-search"
-                    (statementDdmin (reductionDialect config) (reductionSearch config) oracle sliced)
+                    (statementDdmin (reductionDialect config) oracle sliced)
     fallback <-
         if reductionClosure config && reductionUnrestricted config
             then
                 timedStage
                     logger
                     "unrestricted-fallback"
-                    (statementDdmin (reductionDialect config) (reductionSearch config) oracle searched)
+                    (statementDdmin (reductionDialect config) oracle searched)
             else pure searched
     interleaveStages fallback
     where

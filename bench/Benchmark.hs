@@ -20,7 +20,6 @@ import Occam.Evaluation (
     EvaluationMetrics (..),
     EvaluationResult (..),
     runEvaluatedReduction,
-    searchStrategyName,
     sqlDialectName,
  )
 import Occam.Logger (Logger)
@@ -29,9 +28,7 @@ import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     Oracle,
     ReductionConfig (..),
-    SearchStrategy (..),
     reduceSQLWithConfig,
-    statementDdmin,
  )
 import System.FilePath ((</>))
 
@@ -93,13 +90,6 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
                 }
         pipeline name artifact config useCache =
             (name, artifact, useCache, reductionSettings useCache config, reduceSQLWithConfig config)
-        statementTrack name artifact strategy =
-            ( name
-            , artifact
-            , cacheEnabled
-            , statementSettings dialect cacheEnabled strategy
-            , \_ oracle input -> statementDdmin dialect strategy oracle input
-            )
         profiles =
             [ pipeline "Occam" "occam" baseConfig cacheEnabled
             ,
@@ -113,11 +103,9 @@ runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDi
                 ( "B2 (Statement ddmin)"
                 , "b2-statement-ddmin"
                 , cacheEnabled
-                , statementSettings dialect cacheEnabled CountDD
+                , statementSettings dialect cacheEnabled
                 , \_ oracle input -> runNaiveDdmin dialect oracle input
                 )
-            , statementTrack "WeightedDD (statement ddmin)" "weighted-dd" WeightedDD
-            , statementTrack "CDD (statement ddmin)" "cdd" CDD
             , pipeline "Shared (no slicing)" "ablation-no-slicing" noSlicing cacheEnabled
             , pipeline "Shared (no closure)" "ablation-no-closure" noClosure cacheEnabled
             , pipeline
@@ -164,7 +152,7 @@ runSingleAlgorithmBenchmark dialect baselineIdx evaluationConfig oracleConfig lo
                 ( "B2 (Statement ddmin)"
                 , "b2-statement-ddmin"
                 , cacheEnabled
-                , statementSettings dialect cacheEnabled CountDD
+                , statementSettings dialect cacheEnabled
                 , \_ oracle input -> runNaiveDdmin dialect oracle input
                 )
         _ -> ioError (userError "baseline index must be 1 or 2")
@@ -238,7 +226,6 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "intra_statement" .= reductionIntraStatement
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled
-        , "search_strategy" .= searchStrategyName reductionSearch
         , "dialect" .= sqlDialectName reductionDialect
         ]
 
@@ -251,12 +238,11 @@ statementOnlySettings dialect cacheEnabled strategy =
         , "dialect" .= sqlDialectName dialect
         ]
 
-statementSettings :: SQLDialect -> Bool -> SearchStrategy -> Value
-statementSettings dialect cacheEnabled strategy =
+statementSettings :: SQLDialect -> Bool -> Value
+statementSettings dialect cacheEnabled =
     object
         [ "kind" .= ("statement-ddmin" :: Text)
         , "unit" .= ("top-level-statement" :: Text)
-        , "search_strategy" .= searchStrategyName strategy
         , "cache" .= cacheEnabled
         , "dialect" .= sqlDialectName dialect
         ]

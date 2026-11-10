@@ -10,8 +10,6 @@ module Occam.Evaluation (
     MinimalityClaim (..),
     evaluationStatusName,
     minimalityClaimName,
-    parseSearchStrategy,
-    searchStrategyName,
     parseSQLDialect,
     sqlDialectName,
     runEvaluatedReduction,
@@ -57,7 +55,6 @@ import Occam.Reducer (
     AuditStats (..),
     Oracle,
     OracleOutcome (..),
-    SearchStrategy (..),
     statementAuditWithLogger,
  )
 import System.Directory (renameFile)
@@ -131,20 +128,6 @@ instance FromJSON MinimalityClaim where
     parseJSON = withText "MinimalityClaim" $ \name ->
         maybe (fail ("unknown minimality claim: " <> T.unpack name)) pure (parseMinimalityClaimName name)
 
-parseSearchStrategy :: String -> Either String SearchStrategy
-parseSearchStrategy value = case map toLower value of
-    "count-dd" -> Right CountDD
-    "weighted-dd" -> Right WeightedDD
-    "cdd" -> Right CDD
-    "dominator-dd" -> Right DominatorDD
-    "dominator" -> Right DominatorDD
-    _ -> Left "Expected count-dd, weighted-dd, cdd, or dominator-dd"
-
-searchStrategyName :: SearchStrategy -> Text
-searchStrategyName CountDD = "count-dd"
-searchStrategyName WeightedDD = "weighted-dd"
-searchStrategyName CDD = "cdd"
-searchStrategyName DominatorDD = "dominator-dd"
 parseSQLDialect :: String -> Either String SQLDialect
 parseSQLDialect value = case map toLower value of
     "generic" -> Right GenericSQL

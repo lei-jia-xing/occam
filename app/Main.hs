@@ -24,9 +24,7 @@ import Occam.Evaluation (
     EvaluationStatus (..),
     evaluationStatusName,
     parseSQLDialect,
-    parseSearchStrategy,
     runEvaluatedReduction,
-    searchStrategyName,
     sqlDialectName,
  )
 import Occam.Logger (
@@ -47,7 +45,6 @@ import Occam.Oracle (
 import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     ReductionConfig (..),
-    SearchStrategy (..),
     defaultReductionConfig,
     reduceSQLWithConfig,
  )
@@ -108,7 +105,6 @@ data ReductionOptions = ReductionOptions
     , optIntraStatement :: !Bool
     , optUnrestricted :: !Bool
     , optCache :: !Bool
-    , optSearchStrategy :: !SearchStrategy
     , optDialect :: !SQLDialect
     }
     deriving (Eq, Show)
@@ -220,14 +216,6 @@ reductionOptionsParser =
         <*> toggle True "intra-statement" "no-intra-statement" "intra-statement reductions"
         <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
         <*> toggle True "cache" "no-cache" "candidate caching"
-        <*> option
-            (eitherReader parseSearchStrategy)
-            ( long "search-strategy"
-                <> metavar "STRATEGY"
-                <> value CountDD
-                <> showDefault
-                <> help "Search strategy: count-dd, weighted-dd, cdd, or dominator-dd"
-            )
         <*> option
             (eitherReader parseSQLDialect)
             ( long "dialect"
@@ -531,7 +519,6 @@ toReductionConfig ReductionOptions {..} =
         , reductionClosure = optClosure
         , reductionIntraStatement = optIntraStatement
         , reductionUnrestricted = optUnrestricted
-        , reductionSearch = optSearchStrategy
         , reductionDialect = optDialect
         }
 
@@ -543,6 +530,5 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "intra_statement" .= reductionIntraStatement
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled
-        , "search_strategy" .= searchStrategyName reductionSearch
         , "dialect" .= sqlDialectName reductionDialect
         ]
