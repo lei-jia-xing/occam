@@ -1,6 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -104,7 +101,7 @@ instance ToJSON EvaluationStatus where
     toJSON = toJSON . evaluationStatusName
 
 instance FromJSON EvaluationStatus where
-    parseJSON = withText "EvaluationStatus" $ \name ->
+    parseJSON = withText "EvaluationStatus" \name ->
         maybe (fail ("unknown evaluation status: " <> T.unpack name)) pure (parseEvaluationStatusName name)
 
 data MinimalityClaim
@@ -125,7 +122,7 @@ instance ToJSON MinimalityClaim where
     toJSON = toJSON . minimalityClaimName
 
 instance FromJSON MinimalityClaim where
-    parseJSON = withText "MinimalityClaim" $ \name ->
+    parseJSON = withText "MinimalityClaim" \name ->
         maybe (fail ("unknown minimality claim: " <> T.unpack name)) pure (parseMinimalityClaimName name)
 
 parseSQLDialect :: String -> Either String SQLDialect
@@ -389,7 +386,7 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
                 accepted = outcome == OracleAccepted
             when (persistCheckpoint && accepted) $ checkpointIfSmaller acceptedRef checkpoint candidate
             now <- ticks
-            modifyIORef' curveRef $ \points ->
+            modifyIORef' curveRef \points ->
                 EvaluationPoint
                     { pointElapsedSeconds = seconds reductionStart now
                     , pointCallIndex = callIndex + 1
@@ -620,7 +617,7 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
 
         checkpointIfSmaller acceptedRef path candidate = do
             current <- readIORef acceptedRef
-            when (BS.length candidate < BS.length current) $ do
+            when (BS.length candidate < BS.length current) do
                 let temporary = path ++ ".tmp"
                 BS.writeFile temporary candidate
                 renameFile temporary path

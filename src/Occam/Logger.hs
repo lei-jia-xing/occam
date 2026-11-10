@@ -1,8 +1,3 @@
-{-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 module Occam.Logger (
     LogLevel (..),
     LogFormat (..),
@@ -135,7 +130,7 @@ withLogger cfg action = do
     noColor <- lookupEnv "NO_COLOR"
     let colorSupported = isTTY && isNothing noColor && logUseColor cfg
         resolvedCfg = cfg {logUseColor = colorSupported}
-    bracket (newStdoutLoggerSet defaultBufSize) rmLoggerSet $ \lset -> do
+    bracket (newStdoutLoggerSet defaultBufSize) rmLoggerSet \lset -> do
         logger <- newFastLogger resolvedCfg lset
         res <- action logger
         loggerFlush logger

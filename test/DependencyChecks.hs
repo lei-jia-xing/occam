@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module DependencyChecks (tests) where
 
 import Data.ByteString (ByteString)

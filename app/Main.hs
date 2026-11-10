@@ -1,8 +1,3 @@
-{-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 module Main (main) where
 
 import Control.Applicative ((<|>))
@@ -281,7 +276,8 @@ runOccam opts@Options {..} = do
                 , logFormat = effectiveFormat
                 , logUseColor = True
                 }
-    withLogger logCfg $ \logger -> runOccamWithLogger logger opts
+        runWithLogger logger = runOccamWithLogger logger opts
+    withLogger logCfg runWithLogger
 
 runOccamWithLogger :: Logger -> Options -> IO ()
 runOccamWithLogger logger Options {..} = do
@@ -294,12 +290,12 @@ runOccamWithLogger logger Options {..} = do
             finiteTimeout optTimeoutSecs
                 && maybe True finiteTimeout optBudgetSecs
                 && maybe True (> 0) optMaxOracleExecutions
-    unless validBudget $ do
+    unless validBudget do
         hPutStrLn stderr "Error: timeout, budget, and execution limits must be positive"
         exitFailure
 
     fileExists <- doesFileExist optInputFile
-    unless fileExists $ do
+    unless fileExists do
         logError logger "occam::cli" ("Error: Input file not found: " <> T.pack optInputFile)
         hPutStrLn stderr ("Error: Input file not found: " ++ optInputFile)
         exitFailure
@@ -308,7 +304,7 @@ runOccamWithLogger logger Options {..} = do
     initialStmts <- countStatementsForCLI logger dialect initialSQL
     let initialBytes = BS.length initialSQL
 
-    when (not optQuiet && optLogFormat == FormatText) $ do
+    when (not optQuiet && optLogFormat == FormatText) do
         putStrLn "======================================================================"
         putStrLn $ "Occam v" ++ Occam.version ++ " starting reduction"
         putStrLn "======================================================================"
@@ -465,7 +461,7 @@ runOccamWithLogger logger Options {..} = do
         , ("elapsed_seconds", toJSON (evaluationTotalSeconds evaluation))
         ]
 
-    when (not optQuiet && optLogFormat == FormatText) $ do
+    when (not optQuiet && optLogFormat == FormatText) do
         putStrLn "----------------------------------------------------------------------"
         putStrLn "Reduction Finished"
         putStrLn "======================================================================"

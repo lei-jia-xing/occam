@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 module Fuzz (fuzzTests, generativeFuzzTests, main) where
 
 import Data.ByteString (ByteString)

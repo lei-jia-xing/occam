@@ -1,5 +1,3 @@
-{-# LANGUAGE ForeignFunctionInterface #-}
-
 module Occam.Parser (
     SQLDialect (..),
     defaultSQLDialect,
@@ -120,7 +118,7 @@ instance ToJSON ParserEditCategory where
     toJSON category = toJSON (editCategoryName category)
 
 instance FromJSON ParserEditCategory where
-    parseJSON = withText "ParserEditCategory" $ \name ->
+    parseJSON = withText "ParserEditCategory" \name ->
         maybe (fail ("unknown parser edit category: " <> T.unpack name)) pure (parseEditCategoryName name)
 
 editCategoryName :: ParserEditCategory -> Text
@@ -161,10 +159,10 @@ data NativeUnit = NativeUnit
 data NativeFacts = NativeFacts ![ObjectAction] ![ParserEdit]
 
 instance FromJSON NativeResponse where
-    parseJSON = withObject "NativeResponse" $ \object -> NativeResponse <$> object .: "units"
+    parseJSON = withObject "NativeResponse" \object -> NativeResponse <$> object .: "units"
 
 instance FromJSON NativeUnit where
-    parseJSON = withObject "NativeUnit" $ \object ->
+    parseJSON = withObject "NativeUnit" \object ->
         NativeUnit
             <$> object .: "start"
             <*> object .: "end"
@@ -172,12 +170,12 @@ instance FromJSON NativeUnit where
             <*> object .:? "facts"
 
 instance FromJSON NativeFacts where
-    parseJSON = withObject "NativeFacts" $ \object -> do
+    parseJSON = withObject "NativeFacts" \object -> do
         actions <- object .: "actions"
         edits <- object .: "edits"
         NativeFacts <$> traverse parseAction actions <*> pure edits
         where
-            parseAction = withObject "ObjectAction" $ \action -> do
+            parseAction = withObject "ObjectAction" \action -> do
                 kindText <- action .: "kind"
                 actionText <- action .: "action"
                 name <- action .: "name"
@@ -188,7 +186,7 @@ instance FromJSON NativeFacts where
                 pure (ObjectAction kind actionType target)
 
 instance FromJSON ParserEdit where
-    parseJSON = withObject "ParserEdit" $ \object ->
+    parseJSON = withObject "ParserEdit" \object ->
         ParserEdit
             <$> object .: "start"
             <*> object .: "end"
@@ -210,8 +208,8 @@ foreign import ccall unsafe "occam_sql_free"
 
 parseSQL :: SQLDialect -> ByteString -> IO (Either ParserError ParsedSQL)
 parseSQL dialect sql =
-    BSU.unsafeUseAsCStringLen sql $ \(input, inputLength) ->
-        alloca $ \outputPointer -> alloca $ \outputLength -> do
+    BSU.unsafeUseAsCStringLen sql \(input, inputLength) ->
+        alloca \outputPointer -> alloca \outputLength -> do
             poke outputPointer nullPtr
             poke outputLength 0
             status <-
@@ -239,7 +237,7 @@ parseSQL dialect sql =
                             finally decode free
     where
         nativeError status =
-            alloca $ \messagePointer -> alloca $ \messageLength -> do
+            alloca \messagePointer -> alloca \messageLength -> do
                 poke messagePointer nullPtr
                 poke messageLength 0
                 errorStatus <- c_parseError status messagePointer messageLength
@@ -259,8 +257,8 @@ parseSQL dialect sql =
 
 countStatements :: SQLDialect -> ByteString -> IO (Either ParserError Int)
 countStatements dialect sql =
-    BSU.unsafeUseAsCStringLen sql $ \(input, inputLength) ->
-        alloca $ \countPointer -> do
+    BSU.unsafeUseAsCStringLen sql \(input, inputLength) ->
+        alloca \countPointer -> do
             poke countPointer 0
             status <- c_countSQL (castPtr input) (fromIntegral inputLength) (dialectCode dialect) countPointer
             if status /= 0

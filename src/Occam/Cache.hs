@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-
 module Occam.Cache (
     CacheStats (..),
     memoizeOracle,

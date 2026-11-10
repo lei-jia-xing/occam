@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 module Main (main) where
 
 import Benchmark (BenchmarkMetric (..), runComparisonBenchmark, runSingleAlgorithmBenchmark)
@@ -248,7 +245,8 @@ runEval opts@Options {..} = do
                 , logFormat = effectiveFormat
                 , logUseColor = True
                 }
-    withLogger logCfg $ \logger -> runEvalWithLogger logger opts
+        runWithLogger logger = runEvalWithLogger logger opts
+    withLogger logCfg runWithLogger
 
 runEvalWithLogger :: Logger -> Options -> IO ()
 runEvalWithLogger logger Options {..} = do
@@ -267,11 +265,11 @@ runEvalWithLogger logger Options {..} = do
         failWith "Error: timeout, budget, and execution limits must be positive"
 
     exists <- doesFileExist optInputFile
-    unless exists $ do
+    unless exists do
         logError logger "occam::eval" ("Error: Input file does not exist: " <> T.pack optInputFile)
         failWith $ "Error: Input file does not exist: " ++ optInputFile
     initialSQL <- BS.readFile optInputFile
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
         putStrLn "======================================================================"
         putStrLn ("Occam-Eval v" ++ Occam.version ++ " - Comparative Evaluation Runner")
         putStrLn "======================================================================"
@@ -362,7 +360,7 @@ runEvalWithLogger logger Options {..} = do
         "Benchmark evaluation finished"
         [("out_file", toJSON (optOutDir </> "benchmark.json"))]
 
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
         putStrLn "----------------------------------------------------------------------"
         putStrLn "Benchmark Complete!"
         putStrLn "======================================================================"
@@ -370,7 +368,7 @@ runEvalWithLogger logger Options {..} = do
         putStrLn "======================================================================"
     BSL.putStr jsonData
     putStrLn ""
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) $ do
+    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
         putStrLn "======================================================================"
         putStrLn $ "  Artifact: " ++ (optOutDir </> "benchmark.json")
         putStrLn "======================================================================"

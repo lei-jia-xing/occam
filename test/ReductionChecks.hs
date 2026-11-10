@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module ReductionChecks (tests) where
 
 import Control.Exception (IOException, try)

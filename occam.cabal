@@ -31,8 +31,17 @@ common warnings
                  -Wincomplete-uni-patterns -Wmissing-export-lists
                  -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
 
+common language
+    default-language: GHC2024
+    default-extensions:
+        BlockArguments
+        DeriveAnyClass
+        LambdaCase
+        OverloadedStrings
+        RecordWildCards
+
 library
-    import:           warnings
+    import:           warnings, language
     exposed-modules:  Occam
                     , Occam.Cache
                     , Occam.Core
@@ -57,15 +66,10 @@ library
     if !os(windows)
         build-depends: unix >= 2.7 && < 2.9
     hs-source-dirs:   src
-    default-language: GHC2021
-    default-extensions:
-        OverloadedStrings
-        RecordWildCards
-        LambdaCase
     extra-bundled-libraries: Coccam_sqlparser
 
 executable occam
-    import:           warnings
+    import:           warnings, language
     main-is:          Main.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
@@ -78,11 +82,10 @@ executable occam
                     , optparse-applicative >= 0.17 && < 0.19
                     , aeson >= 2.0
     hs-source-dirs:   app
-    default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
 executable occam-eval
-    import:           warnings
+    import:           warnings, language
     main-is:          Main.hs
     other-modules:    Baseline
                     , Benchmark
@@ -97,12 +100,10 @@ executable occam-eval
                     , time
                     , aeson
                     , optparse-applicative >= 0.17 && < 0.19
-    default-language: GHC2021
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
 test-suite occam-fuzz
-    import:           warnings
-    default-language: GHC2021
+    import:           warnings, language
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     other-modules:    Fuzz
@@ -119,8 +120,7 @@ test-suite occam-fuzz
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
 test-suite occam-test
-    import:           warnings
-    default-language: GHC2021
+    import:           warnings, language
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test bench
     other-modules:    Baseline

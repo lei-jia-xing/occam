@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module EvaluationChecks (tests) where
 
 import Control.Concurrent (threadDelay)

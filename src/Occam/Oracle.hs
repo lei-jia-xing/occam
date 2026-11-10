@@ -1,7 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 module Occam.Oracle (
     OracleConfig (..),
@@ -74,7 +71,7 @@ executeReset :: Maybe String -> IO Bool
 executeReset Nothing = pure True
 executeReset (Just cmd) =
     handle (\(_ :: IOException) -> pure False) $
-        withCandidateWorkdir $ \workDir -> do
+        withCandidateWorkdir \workDir -> do
             childEnv <- candidateEnvironment workDir
             result <-
                 runProcessGroup
@@ -118,8 +115,8 @@ runProcessGroupWithStart ::
 runProcessGroupWithStart onStarted timeoutMicros command input
     | timeoutMicros <= 0 = pure (False, Nothing)
     | otherwise =
-        mask $ \restore ->
-            withCreateProcess process $ \mbIn mbOut mbErr ph ->
+        mask \restore ->
+            withCreateProcess process \mbIn mbOut mbErr ph ->
                 case (mbIn, mbOut, mbErr) of
                     (Just hIn, Just hOut, Just hErr) -> do
                         groupId <- getOwnedGroup ph
@@ -133,9 +130,9 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                 restore $
                                     timeout
                                         timeoutMicros
-                                        ( withWorker (readInfrastructureDiagnostic hOut) $ \readOut ->
-                                            withWorker (readInfrastructureDiagnostic hErr) $ \readErr ->
-                                                withWorker (writePipe hIn input) $ \writeInput -> do
+                                        ( withWorker (readInfrastructureDiagnostic hOut) \readOut ->
+                                            withWorker (readInfrastructureDiagnostic hErr) \readErr ->
+                                                withWorker (writePipe hIn input) \writeInput -> do
                                                     exitCode <- waitForProcess ph
                                                     writeInput
                                                     out <- readOut
@@ -175,7 +172,7 @@ getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
 getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
 
 cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO ()
-cleanupOwnedGroup mPid ph = mask_ $ do
+cleanupOwnedGroup mPid ph = mask_ do
     case mPid of
         Nothing -> pure ()
         Just pid -> do
@@ -346,7 +343,7 @@ observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
     if oracleTimeoutMicros <= 0
         then finish OracleTimedOut 0 Nothing
         else do
-            attempt <- tryIOException $ withCandidateWorkdir $ \workDir -> do
+            attempt <- tryIOException $ withCandidateWorkdir \workDir -> do
                 childEnv <- candidateEnvironment workDir
                 (resetResult, resetElapsed) <- case oracleResetCommand of
                     Nothing -> pure (Right (Just ExitSuccess), 0)
@@ -438,7 +435,7 @@ instance ToJSON OracleStatus where
     toJSON = String . oracleStatusName
 
 instance FromJSON OracleStatus where
-    parseJSON = withText "OracleStatus" $ \name ->
+    parseJSON = withText "OracleStatus" \name ->
         maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 
 instance ToJSONKey OracleStatus where
@@ -448,7 +445,7 @@ instance ToJSONKey OracleStatus where
             (Encoding.text . oracleStatusName)
 
 instance FromJSONKey OracleStatus where
-    fromJSONKey = FromJSONKeyTextParser $ \name ->
+    fromJSONKey = FromJSONKeyTextParser \name ->
         maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 
 classifyOracleObservation :: OracleObservation -> OracleStatus

@@ -642,13 +642,13 @@ reduceIterationWithConfig ::
 reduceIterationWithConfig config logger oracle initialSQL = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
-            then timedStage logger "backward-slicing" $ do
+            then timedStage logger "backward-slicing" do
                 analysis <- analyzeSQL logger (reductionDialect config) initialSQL
                 sliceWithAnalysis logger oracle analysis initialSQL
             else pure (initialSQL, Nothing)
     searched <-
         if reductionClosure config
-            then timedStage logger "closure-search" $ do
+            then timedStage logger "closure-search" do
                 analysis <-
                     case reusableAnalysis of
                         Just cached -> pure cached
