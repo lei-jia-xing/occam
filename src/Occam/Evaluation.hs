@@ -36,7 +36,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
-import Occam.Cache (CacheStats (..), memoizeOracleWith)
+import Occam.Cache (CacheAdmission (..), CacheMode (..), CacheStats (..), memoizeOracleWith)
 import Occam.Logger (Logger (..), logInfo')
 import Occam.Oracle (
     OracleConfig (..),
@@ -366,9 +366,9 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             maybe Map.empty (Map.singleton initialSQL) preflightObservation
     (cachedObservation, getCacheStats) <-
         memoizeOracleWith
-            (evaluationCacheEnabled config)
+            (if evaluationCacheEnabled config then CacheEnabled else CacheDisabled)
             precomputedObservations
-            isCompleted
+            cacheCompletedObservation
             runObservation
     reductionStart <- ticks
     let measuredOracle persistCheckpoint candidate = do
@@ -632,9 +632,9 @@ event level component message metadata =
         , "metadata" .= object [(Key.fromText key, value) | (key, value) <- metadata]
         ]
 
-isCompleted :: OracleObservation -> Bool
-isCompleted OracleFinished {} = True
-isCompleted _ = False
+cacheCompletedObservation :: OracleObservation -> CacheAdmission
+cacheCompletedObservation OracleFinished {} = CacheAdmit
+cacheCompletedObservation _ = CacheReject
 
 oracleOutcome :: OracleObservation -> OracleOutcome
 oracleOutcome observation = case classifyOracleObservation observation of

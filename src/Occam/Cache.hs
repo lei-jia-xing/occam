@@ -1,4 +1,6 @@
 module Occam.Cache (
+    CacheMode (..),
+    CacheAdmission (..),
     CacheStats (..),
     memoizeOracle,
     memoizeOracleWith,
@@ -13,6 +15,12 @@ import Data.Map.Strict qualified as Map
 import GHC.Generics (Generic)
 import Occam.Reducer (Oracle, OracleOutcome (..))
 
+data CacheMode = CacheEnabled | CacheDisabled
+    deriving (Eq, Show)
+
+data CacheAdmission = CacheAdmit | CacheReject
+    deriving (Eq, Show)
+
 data CacheStats = CacheStats
     { cacheHits :: !Int
     , cacheMisses :: !Int
@@ -26,9 +34,10 @@ instance FromJSON CacheStats
 never cached, so a timeout cannot become an authoritative fact.
 -}
 memoizeOracle :: Oracle -> IO (Oracle, IO CacheStats)
-memoizeOracle = memoizeOracleWith True Map.empty isConclusive
+memoizeOracle = memoizeOracleWith CacheEnabled Map.empty admission
     where
-        isConclusive outcome = outcome /= OracleInconclusive
+        admission OracleInconclusive = CacheReject
+        admission _ = CacheAdmit
 
 {- | Memoize completed results, starting from a set of observations that are
 already known to be authoritative. Precomputed entries are served even when
@@ -37,34 +46,35 @@ entries, and re-running them would only duplicate work. They are not counted as
 cache hits while memoization is disabled, so @--no-cache@ metrics stay honest.
 -}
 memoizeOracleWith ::
-    Bool ->
+    CacheMode ->
     Map ByteString a ->
-    (a -> Bool) ->
+    (a -> CacheAdmission) ->
     (ByteString -> IO a) ->
     IO (ByteString -> IO a, IO CacheStats)
-memoizeOracleWith enabled precomputed cacheResult oracle = do
+memoizeOracleWith mode precomputed admission oracle = do
     cacheRef <- newIORef precomputed
     hitsRef <- newIORef (0 :: Int)
     missesRef <- newIORef (0 :: Int)
-    let cachedOracle sql
-            | not enabled =
-                case Map.lookup sql precomputed of
-                    Just res -> pure res
-                    Nothing -> do
-                        modifyIORef' missesRef (+ 1)
-                        oracle sql
-            | otherwise = do
-                cache <- readIORef cacheRef
-                case Map.lookup sql cache of
-                    Just res -> do
-                        modifyIORef' hitsRef (+ 1)
-                        pure res
-                    Nothing -> do
-                        modifyIORef' missesRef (+ 1)
-                        res <- oracle sql
-                        when (cacheResult res) $
-                            modifyIORef' cacheRef (Map.insert sql res)
-                        pure res
+    let cachedOracle sql =
+            case mode of
+                CacheDisabled ->
+                    case Map.lookup sql precomputed of
+                        Just res -> pure res
+                        Nothing -> do
+                            modifyIORef' missesRef (+ 1)
+                            oracle sql
+                CacheEnabled -> do
+                    cache <- readIORef cacheRef
+                    case Map.lookup sql cache of
+                        Just res -> do
+                            modifyIORef' hitsRef (+ 1)
+                            pure res
+                        Nothing -> do
+                            modifyIORef' missesRef (+ 1)
+                            res <- oracle sql
+                            when (admission res == CacheAdmit) $
+                                modifyIORef' cacheRef (Map.insert sql res)
+                            pure res
         getStats = do
             hits <- readIORef hitsRef
             misses <- readIORef missesRef

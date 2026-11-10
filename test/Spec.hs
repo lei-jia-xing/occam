@@ -16,7 +16,13 @@ import DependencyChecks qualified
 import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
-import Occam.Cache (CacheStats (..), memoizeOracle, memoizeOracleWith)
+import Occam.Cache (
+    CacheAdmission (..),
+    CacheMode (..),
+    CacheStats (..),
+    memoizeOracle,
+    memoizeOracleWith,
+ )
 import Occam.Core (
     ActionTarget (..),
     DependencyType (..),
@@ -405,9 +411,9 @@ phase6Tests =
                     pure False
             (cachedOracle, getStats) <-
                 memoizeOracleWith
-                    False
+                    CacheDisabled
                     (Map.singleton "SELECT 1;" True)
-                    (const True)
+                    (const CacheAdmit)
                     mockOracle
             seeded <- cachedOracle "SELECT 1;"
             assertEqual "precomputed observation is returned" True seeded
