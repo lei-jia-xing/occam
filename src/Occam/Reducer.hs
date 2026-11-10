@@ -1,5 +1,9 @@
 module Occam.Reducer (
     Oracle,
+    OracleOutcome (..),
+    OracleInconclusiveError (..),
+    oracleAccepts,
+    oracleFromPredicate,
     SearchStrategy (..),
     ReductionConfig (..),
     defaultReductionConfig,
@@ -19,6 +23,7 @@ module Occam.Reducer (
     AuditStats (..),
 ) where
 
+import Control.Exception (Exception, throwIO)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -50,8 +55,39 @@ import Occam.Parser (
  )
 import Occam.Slicer (backwardSlice)
 
--- | The oracle returns True exactly when the complete candidate satisfies the user's predicate.
-type Oracle = ByteString -> IO Bool
+{- | The oracle classifies a complete candidate. Inconclusive results must not
+be silently treated as rejections because that would make reductions depend
+on timeouts or infrastructure failures.
+-}
+data OracleOutcome
+    = OracleAccepted
+    | OracleRejected
+    | OracleInconclusive
+    deriving (Eq, Ord, Show)
+
+type Oracle = ByteString -> IO OracleOutcome
+
+data OracleInconclusiveError = OracleInconclusiveError
+    deriving (Show)
+
+instance Exception OracleInconclusiveError
+
+-- | Require a definite oracle decision, aborting the reduction otherwise.
+oracleAccepts :: Oracle -> ByteString -> IO Bool
+oracleAccepts oracle candidate = do
+    outcome <- oracle candidate
+    case outcome of
+        OracleAccepted -> pure True
+        OracleRejected -> pure False
+        OracleInconclusive -> throwIO OracleInconclusiveError
+
+{- | Lift a total Boolean predicate into an oracle. Use this only at
+integration boundaries that cannot report timeouts or infrastructure errors.
+-}
+oracleFromPredicate :: (ByteString -> IO Bool) -> Oracle
+oracleFromPredicate predicate candidate = do
+    accepted <- predicate candidate
+    pure (if accepted then OracleAccepted else OracleRejected)
 
 data SearchStrategy
     = CountDD
@@ -445,7 +481,7 @@ searchDDMin maybeGraph feedback strategy buildCandidate oracle baseSQL allStatem
                                             Just True -> pure (Just kept)
                                             Just False -> pure Nothing
                                             Nothing -> do
-                                                ok <- oracle candidateSQL
+                                                ok <- oracleAccepts oracle candidateSQL
                                                 modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
                                                 if ok
                                                     then pure (Just kept)
@@ -501,7 +537,7 @@ searchCDD feedback buildCandidate oracle baseSQL allStatements = rounds 0
                                             Just True -> tryPartitions kept rest
                                             Just False -> tryPartitions current rest
                                             Nothing -> do
-                                                ok <- oracle candidateSQL
+                                                ok <- oracleAccepts oracle candidateSQL
                                                 modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL ok)
                                                 if ok
                                                     then tryPartitions kept rest
@@ -540,7 +576,7 @@ cddSubsetSize roundNumber count
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> SearchStrategy -> Oracle -> ByteString -> IO ByteString
 statementDdmin dialect strategy oracle initialSQL = do
-    initialOK <- oracle initialSQL
+    initialOK <- oracleAccepts oracle initialSQL
     if not initialOK
         then pure initialSQL
         else do
@@ -557,7 +593,7 @@ statementAudit dialect oracle initialSQL = fst <$> statementAuditWithLogger null
 statementAuditWithLogger ::
     Logger -> SQLDialect -> Oracle -> ByteString -> IO (ByteString, AuditStats)
 statementAuditWithLogger logger dialect oracle initialSQL = do
-    initialOK <- oracle initialSQL
+    initialOK <- oracleAccepts oracle initialSQL
     outcome <-
         if initialOK
             then loop initialSQL 0 0 0
@@ -589,7 +625,7 @@ statementAuditWithLogger logger dialect oracle initialSQL = do
                         if BS.length candidateSQL >= BS.length currentSQL
                             then go currentSQL current rest attempts removals
                             else do
-                                ok <- oracle candidateSQL
+                                ok <- oracleAccepts oracle candidateSQL
                                 if ok
                                     then go candidateSQL kept rest (attempts + 1) (removals + 1)
                                     else go currentSQL current rest (attempts + 1) removals
@@ -623,7 +659,7 @@ findInterestingPrefix oracle baseSQL statements = go 1
             | otherwise = do
                 let prefix = take prefixLength statements
                     candidate = statementSQL baseSQL statements prefix
-                ok <- oracle candidate
+                ok <- oracleAccepts oracle candidate
                 if ok
                     then case reverse prefix of
                         statement : _ -> pure (Just (statement, candidate, prefixLength), prefixLength)
@@ -700,7 +736,7 @@ sliceWithAnalysis logger oracle analysis sql = do
                 (lastRetained, lastCandidate) = sliceFor lastStatement
             lastAccepted <-
                 if BS.length lastCandidate < BS.length sql
-                    then oracle lastCandidate
+                    then oracleAccepts oracle lastCandidate
                     else pure False
             let tryPrefix bestCandidate = do
                     (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
@@ -712,7 +748,7 @@ sliceWithAnalysis logger oracle analysis sql = do
                                 then pure bestCandidate
                                 else do
                                     let reusedPrefixResult = candidate == prefixSQL
-                                    ok <- if reusedPrefixResult then pure True else oracle candidate
+                                    ok <- if reusedPrefixResult then pure True else oracleAccepts oracle candidate
                                     logInfo'
                                         logger
                                         "occam::reducer"
@@ -763,7 +799,7 @@ reduceSQLWithLogger dialect =
 
 reduceSQLWithConfig :: ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
 reduceSQLWithConfig config logger oracle initialSQL = do
-    initialOK <- oracle initialSQL
+    initialOK <- oracleAccepts oracle initialSQL
     if not initialOK
         then do
             logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
@@ -924,7 +960,7 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                     then tryEdits stats currentSQL rest
                     else do
                         started <- getMonotonicTimeNSec
-                        ok <- oracle candidate
+                        ok <- oracleAccepts oracle candidate
                         finished <- getMonotonicTimeNSec
                         modifyIORef'
                             stats

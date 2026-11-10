@@ -24,7 +24,7 @@ import Occam.Oracle (
     prepareOracle,
  )
 import Occam.Parser (SQLDialect (..))
-import Occam.Reducer (reduceSQL)
+import Occam.Reducer (oracleFromPredicate, reduceSQL)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
@@ -164,7 +164,7 @@ tests =
                 config = evaluationConfig False Nothing Nothing
                 action _ oracle = do
                     _ <- oracle candidate
-                    reduceSQL SQLite (const (pure True)) invalidUtf8
+                    reduceSQL SQLite (oracleFromPredicate (const (pure True))) invalidUtf8
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action

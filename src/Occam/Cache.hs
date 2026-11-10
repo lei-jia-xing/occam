@@ -13,7 +13,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import GHC.Generics (Generic)
-import Occam.Reducer (Oracle)
+import Occam.Reducer (Oracle, OracleOutcome (..))
 
 data CacheStats = CacheStats
     { cacheHits :: !Int
@@ -24,9 +24,13 @@ data CacheStats = CacheStats
 instance ToJSON CacheStats
 instance FromJSON CacheStats
 
--- | Memoize completed results. Failed actions are counted as misses but never cached.
+{- | Memoize definite results. Inconclusive outcomes are counted as misses but
+never cached, so a timeout cannot become an authoritative fact.
+-}
 memoizeOracle :: Oracle -> IO (Oracle, IO CacheStats)
-memoizeOracle = memoizeOracleWith True Map.empty (const True)
+memoizeOracle = memoizeOracleWith True Map.empty isConclusive
+    where
+        isConclusive outcome = outcome /= OracleInconclusive
 
 {- | Memoize completed results, starting from a set of observations that are
 already known to be authoritative. Precomputed entries are served even when

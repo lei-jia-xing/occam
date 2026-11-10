@@ -32,7 +32,7 @@ import Data.Char (toUpper)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
-import Occam.Reducer (Oracle, reduceSQL)
+import Occam.Reducer (oracleFromPredicate, reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -55,7 +55,7 @@ import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
 data SeedScenario = SeedScenario
     { seedName :: !Text
     , seedSQL :: !ByteString
-    , seedOracle :: !Oracle
+    , seedOracle :: !(ByteString -> IO Bool)
     }
 
 instance Show SeedScenario where
@@ -377,7 +377,7 @@ prop_deadTablesPruned = forAll (elements seedPool) $ \seed ->
     forAll (injectDeadTables (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -389,7 +389,7 @@ prop_bloatExpressionsSimplified = forAll (elements seedPool) $ \seed ->
     forAll (bloatExpressions (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -401,7 +401,7 @@ prop_optionalClausesPruned = forAll (elements seedPool) $ \seed ->
     forAll (injectOptionalClauses (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -414,7 +414,7 @@ prop_lexicalNoiseSoundness = forAll (elements seedPool) $ \seed ->
     forAll (injectLexicalNoise (seedSQL seed)) $ \s_mutated -> monadicIO $ do
         origOk <- run (seedOracle seed s_mutated)
         assert origOk
-        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
         crashPreserved <- run (seedOracle seed s_red)
         monitor (counterexample "Crash was not preserved: oracle returned False")
         assert crashPreserved
@@ -430,7 +430,7 @@ prop_mutationRecovery = forAll (elements seedPool) $ \seed ->
         unless origOk $
             monitor (counterexample "Mutated SQL failed initial crash oracle check")
         assert origOk
-        s_red <- run (reduceSQL SQLite (seedOracle seed) s_mutated)
+        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
         -- 1. Crash is strictly preserved
         crashPreserved <- run (seedOracle seed s_red)
         unless crashPreserved $

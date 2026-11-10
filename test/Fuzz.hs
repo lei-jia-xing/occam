@@ -11,7 +11,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
-import Occam.Reducer (Oracle, reduceSQL)
+import Occam.Reducer (Oracle, oracleAccepts, oracleFromPredicate, reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -493,8 +493,9 @@ evalTargetCondition (TargetExpr tbl exprSnippet) bs =
             && exprSnippet `BSC.isInfixOf` bs
 
 makeScriptOracle :: FuzzScript -> Oracle
-makeScriptOracle FuzzScript {..} bs =
-    pure (evalTargetCondition (targetKind scriptTarget) bs)
+makeScriptOracle FuzzScript {..} =
+    oracleFromPredicate $ \bs ->
+        pure (evalTargetCondition (targetKind scriptTarget) bs)
 
 -- ----------------------------------------------------------------------------
 -- QuickCheck Properties
@@ -535,7 +536,7 @@ prop_oracleSoundness script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
     reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
-    sound <- run (oracle reducedSQL)
+    sound <- run (oracleAccepts oracle reducedSQL)
     monitor
         ( counterexample
             ( "Oracle returned False on reduced SQL:\n"
@@ -588,7 +589,7 @@ prop_heavyFuzzAllInvariants script = monadicIO $ do
         oracle = makeScriptOracle script
     reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
     valid <- run (checkParserValidity SQLite reducedSQL)
-    sound <- run (oracle reducedSQL)
+    sound <- run (oracleAccepts oracle reducedSQL)
     let mono = BSC.length reducedSQL <= BSC.length initialSQL
     secondReducedSQL <- run (reduceSQL SQLite oracle reducedSQL)
     let idem = secondReducedSQL == reducedSQL

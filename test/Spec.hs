@@ -99,7 +99,7 @@ phase1Tests =
             let kept = TE.encodeUtf8 "SELECT 'café' AS kept, a FROM"
                 sql = kept <> " (SELECT 42 AS a,99 AS b);\r\n"
                 expected = kept <> " (SELECT 42 AS a);\r\n"
-                oracle candidate = pure (BS.isInfixOf kept candidate && BSC.isInfixOf "42 AS a" candidate)
+                oracle = oracleFromPredicate $ \candidate -> pure (BS.isInfixOf kept candidate && BSC.isInfixOf "42 AS a" candidate)
                 config =
                     defaultReductionConfig
                         { reductionSlicing = False
@@ -222,13 +222,13 @@ phase3Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
                         ]
-                oracle sql = do
+                oracle = oracleFromPredicate $ \sql -> do
                     let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT" sql && BSC.isInfixOf "WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
             reduced <- reduceSQL GenericSQL oracle script
-            ok <- oracle reduced
+            ok <- oracleAccepts oracle reduced
             assertBool "Reduced SQL failed to satisfy the crash oracle" ok
             assertBool "Table t2 was not pruned" (not (BSC.isInfixOf "t2" reduced))
             assertBool "Index i1 was not pruned" (not (BSC.isInfixOf "i1" reduced))
@@ -242,7 +242,7 @@ phase3Tests =
         , testCase "Expression simplification unit test" $ do
             let complexExprSQL = "SELECT * FROM t1 WHERE (a + 10) > 0 AND 1 = 1;"
                 exprOracle sql = pure (BSC.isInfixOf "a" sql && BSC.isInfixOf "> 0" sql)
-            simplifiedExpr <- simplifyExpressions GenericSQL exprOracle complexExprSQL
+            simplifiedExpr <- simplifyExpressions GenericSQL (oracleFromPredicate exprOracle) complexExprSQL
             assertBool "Failed to simplify 1 = 1" (not (BSC.isInfixOf "1 = 1" simplifiedExpr))
             assertBool "Failed to simplify + 10" (not (BSC.isInfixOf "10" simplifiedExpr))
         ]
@@ -360,12 +360,12 @@ phase6Tests =
                     modifyIORef' callCountRef (+ 1)
                     pure (BSC.isInfixOf "CRASH" sql)
 
-            (cachedOracle, getStats) <- memoizeOracle mockOracle
+            (cachedOracle, getStats) <- memoizeOracle (oracleFromPredicate mockOracle)
 
             -- 1. Initial queries (all misses)
-            r1 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r1 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "First query should return True" True r1
-            r2 <- cachedOracle "SELECT 1;"
+            r2 <- oracleAccepts cachedOracle "SELECT 1;"
             assertEqual "Second query should return False" False r2
 
             calls1 <- readIORef callCountRef
@@ -376,11 +376,11 @@ phase6Tests =
             assertEqual "cacheMisses should be 2" 2 (cacheMisses stats1)
 
             -- 2. Repeated queries (all hits)
-            r3 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r3 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "Cached query 1 should return True" True r3
-            r4 <- cachedOracle "SELECT 1;"
+            r4 <- oracleAccepts cachedOracle "SELECT 1;"
             assertEqual "Cached query 2 should return False" False r4
-            r5 <- cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r5 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "Cached query 1 (second time) should return True" True r5
 
             calls2 <- readIORef callCountRef
@@ -391,7 +391,7 @@ phase6Tests =
             assertEqual "cacheMisses should remain 2" 2 (cacheMisses stats2)
 
             -- 3. Another new query (miss)
-            r6 <- cachedOracle "SELECT 2;"
+            r6 <- oracleAccepts cachedOracle "SELECT 2;"
             assertEqual "New query should return False" False r6
 
             calls3 <- readIORef callCountRef
@@ -426,6 +426,21 @@ phase6Tests =
             stats <- getStats
             assertEqual "precomputed lookups are not cache hits when disabled" 0 (cacheHits stats)
             assertEqual "only the real query is a miss" 1 (cacheMisses stats)
+        , testCase "inconclusive outcomes are not cached as authoritative" $ do
+            callCountRef <- newIORef (0 :: Int)
+            let outcomeOracle _ = do
+                    modifyIORef' callCountRef (+ 1)
+                    pure OracleInconclusive
+            (cachedOracle, getStats) <- memoizeOracle outcomeOracle
+            first <- cachedOracle "SELECT 1;"
+            assertEqual "first call stays inconclusive" OracleInconclusive first
+            second <- cachedOracle "SELECT 1;"
+            assertEqual "second call stays inconclusive" OracleInconclusive second
+            calls <- readIORef callCountRef
+            assertEqual "inconclusive result is re-observed" 2 calls
+            stats <- getStats
+            assertEqual "inconclusive results are misses" 2 (cacheMisses stats)
+            assertEqual "inconclusive results are not hits" 0 (cacheHits stats)
         , testCase "Late-query slicing completes within a linear oracle allowance" $ do
             let required =
                     [ "CREATE TABLE needed (v INT);"
@@ -448,7 +463,7 @@ phase6Tests =
                                 ++ show allowance
                             )
                     pure (all (`BSC.isInfixOf` candidate) required)
-            (oracle, _) <- memoizeOracle check
+            (oracle, _) <- memoizeOracle (oracleFromPredicate check)
             reduced <-
                 reduceSQLWithConfig
                     defaultReductionConfig {reductionIntraStatement = False, reductionUnrestricted = False}
@@ -665,13 +680,13 @@ phase8Tests =
                         , "CREATE TABLE t3 (d INT);"
                         , "SELECT * FROM t1 WHERE a > 0;"
                         ]
-                oracle sql = do
+                oracle = oracleFromPredicate $ \sql -> do
                     let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
             reduced <- runSequentialDrop GenericSQL oracle script
-            ok <- oracle reduced
+            ok <- oracleAccepts oracle reduced
             assertBool "B1 reduced SQL must satisfy oracle" ok
             assertBool "Dead table t2 should be removed by B1" (not (BSC.isInfixOf "t2" reduced))
             assertBool "Dead table t3 should be removed by B1" (not (BSC.isInfixOf "t3" reduced))
@@ -687,13 +702,13 @@ phase8Tests =
                         , "CREATE TABLE t3 (d INT);"
                         , "SELECT * FROM t1 WHERE a > 0;"
                         ]
-                oracle sql = do
+                oracle = oracleFromPredicate $ \sql -> do
                     let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
             reduced <- runNaiveDdmin GenericSQL oracle script
-            ok <- oracle reduced
+            ok <- oracleAccepts oracle reduced
             assertBool "B2 reduced SQL must satisfy oracle" ok
             assertBool "Dead table t2 should be removed by B2" (not (BSC.isInfixOf "t2" reduced))
             assertBool "Dead table t3 should be removed by B2" (not (BSC.isInfixOf "t3" reduced))
@@ -827,10 +842,13 @@ instance Arbitrary TestOracle where
             ]
 
 runTestOracle :: TestOracle -> Oracle
-runTestOracle OracleAlwaysTrue = const (pure True)
-runTestOracle OracleAlwaysFalse = const (pure False)
-runTestOracle (OracleContains needle) = \s -> pure (needle `BSC.isInfixOf` s)
-runTestOracle (OracleMinLength minLen) = \s -> pure (BS.length s >= minLen)
+runTestOracle = oracleFromPredicate . runTestPredicate
+
+runTestPredicate :: TestOracle -> BS.ByteString -> IO Bool
+runTestPredicate OracleAlwaysTrue = const (pure True)
+runTestPredicate OracleAlwaysFalse = const (pure False)
+runTestPredicate (OracleContains needle) = \s -> pure (needle `BSC.isInfixOf` s)
+runTestPredicate (OracleMinLength minLen) = \s -> pure (BS.length s >= minLen)
 
 newtype TestScript = TestScript BSC.ByteString
     deriving (Show)

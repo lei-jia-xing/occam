@@ -27,7 +27,7 @@ import Control.Exception (
     throwIO,
     try,
  )
-import Control.Monad (unless, when)
+import Control.Monad (when)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withText, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
@@ -56,6 +56,7 @@ import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     AuditStats (..),
     Oracle,
+    OracleOutcome (..),
     SearchStrategy (..),
     statementAuditWithLogger,
  )
@@ -401,7 +402,8 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             result <- cachedObservation candidate
             after <- getCacheStats
             let hit = cacheHits after > cacheHits before
-                accepted = oracleObservationMatches result
+                outcome = oracleOutcome result
+                accepted = outcome == OracleAccepted
             when (persistCheckpoint && accepted) $ checkpointIfSmaller acceptedRef checkpoint candidate
             now <- ticks
             modifyIORef' curveRef $ \points ->
@@ -415,7 +417,7 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
                     , pointAccepted = accepted
                     }
                     : points
-            pure accepted
+            pure outcome
         captureLogger =
             parentLogger
                 { loggerAction = \level component message metadata -> do
@@ -429,9 +431,9 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             let auditOracle candidate = do
                     priorChecks <- readIORef auditChecksRef
                     modifyIORef' auditChecksRef (+ 1)
-                    accepted <- measuredOracle True candidate
-                    when (priorChecks == 0) (writeIORef auditInitialAcceptedRef accepted)
-                    pure accepted
+                    outcome <- measuredOracle True candidate
+                    when (priorChecks == 0) (writeIORef auditInitialAcceptedRef (outcome == OracleAccepted))
+                    pure outcome
                 finishAudit = do
                     auditEnd <- ticks
                     let elapsed = seconds auditStart auditEnd
@@ -517,25 +519,25 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
                                     let observation = OracleTimedOut
                                     modifyIORef' validationErrorsRef (+ 1)
                                     recordOutcome validationOutcomesRef observation
-                                    pure (Just False)
+                                    pure (Just OracleInconclusive)
                                 Just profile -> do
                                     let observation = detailedObservation profile
                                         micros = fromIntegral
                                     modifyIORef' validationResetSecondsRef (+ micros (resetElapsedMicros profile) / 1000000)
                                     modifyIORef' validationOracleSecondsRef (+ maybe 0 micros (oracleElapsedMicros profile) / 1000000)
                                     recordOutcome validationOutcomesRef observation
-                                    case observation of
-                                        OracleFinished _ -> do
-                                            let accepted = oracleObservationMatches observation
-                                            unless accepted (writeIORef validationRejectedRef True)
-                                            pure (Just accepted)
-                                        OracleTimedOut -> modifyIORef' validationErrorsRef (+ 1) >> pure (Just False)
-                                        OracleResetFailed -> modifyIORef' validationErrorsRef (+ 1) >> pure (Just False)
-                                        OracleIOFailed _ -> modifyIORef' validationErrorsRef (+ 1) >> pure (Just False)
+                                    case oracleOutcome observation of
+                                        OracleAccepted -> pure (Just OracleAccepted)
+                                        OracleRejected -> do
+                                            writeIORef validationRejectedRef True
+                                            pure (Just OracleRejected)
+                                        OracleInconclusive -> do
+                                            modifyIORef' validationErrorsRef (+ 1)
+                                            pure (Just OracleInconclusive)
         validateTwice candidate = do
             first <- validateOnce candidate
             second <- validateOnce candidate
-            pure (first == Just True && second == Just True)
+            pure (first == Just OracleAccepted && second == Just OracleAccepted)
     validationPassed <- validateTwice finalSQL
     cacheStats <- getCacheStats
     curve <- reverse <$> readIORef curveRef
@@ -653,3 +655,11 @@ event level component message metadata =
 isCompleted :: OracleObservation -> Bool
 isCompleted OracleFinished {} = True
 isCompleted _ = False
+
+oracleOutcome :: OracleObservation -> OracleOutcome
+oracleOutcome observation = case classifyOracleObservation observation of
+    Accepted -> OracleAccepted
+    Rejected -> OracleRejected
+    TimedOut -> OracleInconclusive
+    InfrastructureError -> OracleInconclusive
+    Interrupted -> OracleInconclusive
