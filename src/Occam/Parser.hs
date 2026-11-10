@@ -319,6 +319,7 @@ makeUnits source = go 0 1
 parseActionTarget :: ObjectKind -> Text -> Either String ActionTarget
 parseActionTarget BarrierObject name = BarrierTarget <$> parseBarrierReason name
 parseActionTarget ColumnObject name = parseColumnTarget name
+parseActionTarget _ "" = Right NoTarget
 parseActionTarget _ name = Right (ObjectTarget (parseObjectName name))
 
 parseObjectName :: Text -> ObjectName

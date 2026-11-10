@@ -51,6 +51,7 @@ data ActionTarget
     = ObjectTarget !ObjectName
     | ColumnTarget !ObjectName !Text
     | BarrierTarget !BarrierReason
+    | NoTarget
     deriving (Eq, Ord, Show)
 
 targetObjectName :: ActionTarget -> Maybe ObjectName

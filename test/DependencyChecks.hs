@@ -255,9 +255,17 @@ tests =
                         ]
             graph <- analyze PostgreSQL sql
             let savepointActions = actionsFor (StatementId 6) graph
+                beginActions = actionsFor (StatementId 2) graph
+                rollbackActions = actionsFor (StatementId 8) graph
                 afterSavepointRollback = dependenciesFor (StatementId 7) graph
                 afterTransactionRollback = dependenciesFor (StatementId 9) graph
                 afterSessionChange = dependenciesFor (StatementId 11) graph
+            assertBool
+                "BEGIN has no object target"
+                (ObjectAction TransactionObject TxBeginDep NoTarget `elem` beginActions)
+            assertBool
+                "ROLLBACK has no object target"
+                (ObjectAction TransactionObject TxRollbackDep NoTarget `elem` rollbackActions)
             assertBool
                 "ROLLBACK TO is recognized from this statement, not the whole script"
                 (objectAction TransactionObject TxRollbackToDep (ObjectName ["s"]) `elem` savepointActions)

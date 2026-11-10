@@ -447,6 +447,7 @@ definitionKeys catalog actions action =
         (_, ObjectTarget name) -> [ObjectKey (actionKind action) name]
         (_, BarrierTarget _) -> []
         (_, ColumnTarget _ _) -> []
+        (_, NoTarget) -> []
     where
         declared table =
             [ ObjectKey (actionKind definition) table
@@ -493,6 +494,7 @@ prepareDefinition sid catalog key =
 
 matchingKeysInCatalog :: Catalog -> ObjectKind -> DependencyType -> ActionTarget -> [ObjectKey]
 matchingKeysInCatalog _ _ _ (BarrierTarget _) = []
+matchingKeysInCatalog _ _ _ NoTarget = []
 matchingKeysInCatalog catalog ColumnObject dependency (ColumnTarget table column) =
     [ key
     | owner <- matchingKeysInCatalog catalog TableObject dependency (ObjectTarget table)
