@@ -159,30 +159,33 @@ closeSet :: DependencyGraph -> Set StatementId -> Set StatementId
 closeSet graph roots =
     Set.unions [backwardSlice sid graph | sid <- Set.toList roots]
 
--- | Cut removed statement spans without unparsing or changing retained bytes.
+{- | Cut removed statements without unparsing or changing retained bytes.
+
+Each statement owns the source bytes from its first token up to the first
+token of the next statement, or to end-of-input for the final statement. That
+partition includes the statement's own terminator and separator, so removing
+a statement cannot leave an orphaned delimiter or blank line behind. The
+partition is exact: it never inspects or rewrites the bytes it keeps.
+-}
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
-    cutSpans (map (absorbTrailing baseSQL) removedSpans) baseSQL
+    cutSpans removedSpans baseSQL
     where
         keptIds = Set.fromList (map stmtId keptStatements)
+        sourceLength = BS.length baseSQL
+        indexed = zip [0 :: Int ..] allStatements
+        nextStart index =
+            case drop (index + 1) allStatements of
+                next : _ -> spanStartByte (stmtSpan next)
+                [] -> sourceLength
+        deletionSpan (index, statement) =
+            let Span start _ = stmtSpan statement
+             in Span start (nextStart index)
         removedSpans =
-            [ stmtSpan statement
-            | statement <- allStatements
+            [ deletionSpan entry
+            | entry@(_, statement) <- indexed
             , Set.notMember (stmtId statement) keptIds
             ]
-
-absorbTrailing :: ByteString -> Span -> Span
-absorbTrailing source (Span start end) =
-    let sourceLength = BS.length source
-        afterSemicolon =
-            if end < sourceLength && BS.index source end == 59
-                then end + 1
-                else end
-        afterNewline =
-            if afterSemicolon < sourceLength && BS.index source afterSemicolon == 10
-                then afterSemicolon + 1
-                else afterSemicolon
-     in Span start afterNewline
 
 cutSpans :: [Span] -> ByteString -> ByteString
 cutSpans spans source =
@@ -203,8 +206,8 @@ partitionChunks n xs
 statementByteWeight :: ByteString -> Statement -> Int
 -- WeightedDD balances contiguous groups by each statement's byte-span weight.
 -- Its partitioning is inspired by Wddmin (Zhou et al., arXiv:2411.19410), not a token-weight claim.
-statementByteWeight source statement =
-    let Span start end = absorbTrailing source (stmtSpan statement)
+statementByteWeight _ statement =
+    let Span start end = stmtSpan statement
      in end - start
 
 weightedChunks :: Int -> (a -> Int) -> [a] -> [[a]]
@@ -768,17 +771,15 @@ sliceWithAnalysis logger oracle analysis sql = do
                                     if ok && BS.length candidate < bestLen
                                         then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
                                         else pure bestCandidate
-            if lastAccepted && length lastRetained <= 2
-                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
-                else do
-                    let initialBest = if lastAccepted then Just lastCandidate else Nothing
-                    better <- tryPrefix initialBest
-                    case better of
-                        Just result -> keep result
-                        Nothing ->
-                            if lastAccepted
-                                then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
-                                else keep sql
+            let initialBest = if lastAccepted then Just lastCandidate else Nothing
+            better <- tryPrefix initialBest
+            case better of
+                Just result
+                    | Just result /= initialBest -> keep result
+                _ ->
+                    if lastAccepted
+                        then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
+                        else keep sql
 
 closureSearchWithAnalysis ::
     Logger -> SearchStrategy -> Oracle -> ByteString -> SQLAnalysis -> IO ByteString

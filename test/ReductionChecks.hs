@@ -202,6 +202,16 @@ tests =
                 keepFirst = predicateOracle (BSC.isInfixOf "SELECT 11")
             byteResult <- statementDdmin GenericSQL CountDD keepFirst bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
+        , testCase "statement deletion removes exactly its own terminator and separator" $ do
+            let sql = BSC.pack "SELECT 1;\r\n\r\nSELECT 2;\r\nSELECT 3;\r\n"
+                oracle =
+                    predicateOracle
+                        (\candidate -> BSC.isInfixOf "SELECT 2" candidate && BSC.isInfixOf "SELECT 3" candidate)
+            reduced <- statementDdmin GenericSQL CountDD oracle sql
+            assertEqual
+                "the removed statement takes its CRLF and blank separator with it"
+                (BSC.pack "SELECT 2;\r\nSELECT 3;\r\n")
+                reduced
         , testCase "CTE removal preserves a required sibling and untouched source bytes" $ do
             let prefix = TE.encodeUtf8 "-- café\n"
                 kept = "kept AS (SELECT 42 AS value)"
