@@ -138,12 +138,20 @@ data ObjectKey
     | ColumnKey !ObjectKey !Text
     deriving (Eq, Ord, Show)
 
+data ObjectSource
+    = UnresolvedSource !ObjectName
+    | ResolvedSource !ObjectKey
+    deriving (Eq, Ord, Show)
+
+data ObjectLifecycle = ObjectLive | ObjectDropped
+    deriving (Eq, Show)
+
 data ObjectState = ObjectState
     { objectDefinition :: !(Maybe StatementId)
     , objectLastWrite :: !(Maybe StatementId)
     , objectRestored :: !(Maybe StatementId)
-    , objectSources :: !(Set (Either ObjectName ObjectKey))
-    , objectDropped :: !Bool
+    , objectSources :: !(Set ObjectSource)
+    , objectLifecycle :: !ObjectLifecycle
     }
     deriving (Eq, Show)
 
@@ -261,7 +269,7 @@ processAction sid priorState stmtActions (deps, state) act
                 let catalog = scanCatalog state
                     keys = definitionKeys catalog stmtActions act
                     sources = viewSources (scanCatalog priorState) stmtActions (actionTarget act)
-                    newObject = ObjectState (Just sid) Nothing Nothing sources False
+                    newObject = ObjectState (Just sid) Nothing Nothing sources ObjectLive
                     catalog0 =
                         if actionKind act `elem` [TableObject, TemporaryTableObject]
                             then foldl' (prepareDefinition sid) catalog keys
@@ -358,7 +366,7 @@ processRenames sid priorState actions state =
                                         { catalogObjects =
                                             Map.insert
                                                 targetKey
-                                                (ObjectState (Just sid) Nothing Nothing Set.empty False)
+                                                (ObjectState (Just sid) Nothing Nothing Set.empty ObjectLive)
                                                 (catalogObjects cleanTarget)
                                         , catalogRelations =
                                             moveRelations sourceKey targetKey (catalogRelations catalog) (catalogRelations cleanTarget)
@@ -398,7 +406,10 @@ recursiveDependencies catalog seen key
                                         (recursiveDependencies catalog seen' sourceKey)
                                         (boundDependencies catalog ((== IndexObject) . objectKind) sourceKey)
                                     | source <- Set.toList (objectSources object)
-                                    , sourceKey <- either (matchingKeysInCatalog catalog TableObject UseDep . ObjectTarget) (: []) source
+                                    , sourceKey <- case source of
+                                        UnresolvedSource name ->
+                                            matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget name)
+                                        ResolvedSource resolvedKey -> [resolvedKey]
                                     ]
                             else Set.empty
                  in Set.union here sources
@@ -416,7 +427,7 @@ matchingKeys state = matchingKeysInCatalog (scanCatalog state)
 
 isLiveKey :: Catalog -> ObjectKey -> Bool
 isLiveKey catalog key =
-    maybe False (not . objectDropped) (Map.lookup key (catalogObjects catalog))
+    maybe False ((== ObjectLive) . objectLifecycle) (Map.lookup key (catalogObjects catalog))
 
 definitionKeys :: Catalog -> [ObjectAction] -> ObjectAction -> [ObjectKey]
 definitionKeys catalog actions action =
@@ -454,7 +465,7 @@ prepareDefinition sid catalog key =
             let alias = ObjectKey kind (lastNamePart name)
                 retireAlias =
                     isQualifiedName name
-                        && maybe False objectDropped (Map.lookup alias (catalogObjects catalog))
+                        && maybe False ((== ObjectDropped) . objectLifecycle) (Map.lookup alias (catalogObjects catalog))
                 retired =
                     if retireAlias
                         then
@@ -536,7 +547,7 @@ writeObjects sid keys catalog =
             }
     where
         write objects key =
-            let old = Map.findWithDefault (ObjectState Nothing Nothing Nothing Set.empty False) key objects
+            let old = Map.findWithDefault (ObjectState Nothing Nothing Nothing Set.empty ObjectLive) key objects
              in Map.insert key old {objectLastWrite = Just sid, objectRestored = Nothing} objects
 
 transitiveCascades :: [ObjectKey] -> Map ObjectKey (Set ObjectKey) -> [ObjectKey]
@@ -561,7 +572,7 @@ dropObjects sid keys catalog =
                 }
 
         dropOne objects key =
-            Map.insert key (ObjectState (Just sid) Nothing Nothing Set.empty True) objects
+            Map.insert key (ObjectState (Just sid) Nothing Nothing Set.empty ObjectDropped) objects
 
         removeObjectBindings relations key =
             Map.mapMaybe
@@ -672,7 +683,7 @@ moveTableColumns sid oldKey newKey sourceCatalog targetCatalog =
             [ column
             | (ColumnKey owner column, object) <- Map.toList (catalogObjects sourceCatalog)
             , owner == oldKey
-            , not (objectDropped object)
+            , objectLifecycle object == ObjectLive
             ]
         cleanTarget = resetTableColumns sid newKey targetCatalog
         movedObjects =
@@ -680,7 +691,7 @@ moveTableColumns sid oldKey newKey sourceCatalog targetCatalog =
                 ( \objects column ->
                     Map.insert
                         (ColumnKey newKey column)
-                        (ObjectState (Just sid) Nothing Nothing Set.empty False)
+                        (ObjectState (Just sid) Nothing Nothing Set.empty ObjectLive)
                         objects
                 )
                 (catalogObjects cleanTarget)
@@ -730,7 +741,7 @@ boundDependencies catalog include owner =
         , include key
         ]
 
-viewSources :: Catalog -> [ObjectAction] -> ActionTarget -> Set (Either ObjectName ObjectKey)
+viewSources :: Catalog -> [ObjectAction] -> ActionTarget -> Set ObjectSource
 viewSources catalog actions viewTarget =
     if any
         (\act -> actionKind act == ViewObject && actionType act == DefDep && actionTarget act == viewTarget)
@@ -743,8 +754,8 @@ viewSources catalog actions viewTarget =
                 , actionType act == UseDep
                 , ObjectTarget sourceName <- [actionTarget act]
                 , source <- case matchingKeysInCatalog catalog TableObject UseDep (actionTarget act) of
-                    [] -> [Left sourceName]
-                    keys -> map Right keys
+                    [] -> [UnresolvedSource sourceName]
+                    keys -> map ResolvedSource keys
                 ]
         else Set.empty
 
@@ -758,13 +769,13 @@ updateViewSources oldKey newKey catalog =
                 (catalogObjects catalog)
         }
     where
-        replaceSource (Right key) =
-            Set.singleton (Right (if key == oldKey then newKey else key))
-        replaceSource source@(Left name) =
+        replaceSource (ResolvedSource key) =
+            Set.singleton (ResolvedSource (if key == oldKey then newKey else key))
+        replaceSource source@(UnresolvedSource name) =
             case (oldKey, newKey) of
                 (ObjectKey _ oldName, ObjectKey _ newName)
                     | namesMayReferToEachOther oldName name ->
-                        Set.fromList [source, Left newName]
+                        Set.fromList [source, UnresolvedSource newName]
                 _ -> Set.singleton source
 
 moveRelations ::
