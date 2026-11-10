@@ -162,11 +162,21 @@ data Catalog = Catalog
     }
     deriving (Eq, Show)
 
+data TxOrigin = TxStartedByBegin | TxStartedBySavepoint
+    deriving (Eq, Show)
+
+data Savepoint = Savepoint
+    { savepointObject :: !ObjectName
+    , savepointSnapshot :: !Catalog
+    , savepointStatementId :: !StatementId
+    }
+    deriving (Eq, Show)
+
 data TxFrame = TxFrame
     { txBeginSid :: !StatementId
     , txStart :: !Catalog
-    , txSavepoints :: ![(ObjectName, Catalog, StatementId)]
-    , txImplicitSavepoint :: !Bool
+    , txSavepoints :: ![Savepoint]
+    , txOrigin :: !TxOrigin
     , txOnCommitDrop :: !(Set ObjectKey)
     , txOnCommitDeleteRows :: !(Set ObjectKey)
     }
@@ -816,7 +826,7 @@ applyTransactionControl _sid actions state =
             case scanTransactions state of
                 [] ->
                     ( Set.empty
-                    , state {scanTransactions = [TxFrame _sid snapshot [] False Set.empty Set.empty]}
+                    , state {scanTransactions = [TxFrame _sid snapshot [] TxStartedByBegin Set.empty Set.empty]}
                     )
                 _ -> (Set.empty, state)
         apply TxCommit =
@@ -844,24 +854,24 @@ applyTransactionControl _sid actions state =
                     ( Set.singleton (txBeginSid frame)
                     , state
                         { scanTransactions =
-                            frame {txSavepoints = txSavepoints frame ++ [(name, snapshot, _sid)]} : rest
+                            frame {txSavepoints = txSavepoints frame ++ [Savepoint name snapshot _sid]} : rest
                         }
                     )
                 [] ->
                     ( Set.empty
                     , state
                         { scanTransactions =
-                            [TxFrame _sid snapshot [(name, snapshot, _sid)] True Set.empty Set.empty]
+                            [TxFrame _sid snapshot [Savepoint name snapshot _sid] TxStartedBySavepoint Set.empty Set.empty]
                         }
                     )
         apply (TxRollbackTo name) =
             case scanTransactions state of
                 frame : rest ->
-                    case break (\(n, _, _) -> n == name) (reverse (txSavepoints frame)) of
-                        (_, (savedName, saved, spSid) : older) ->
-                            let retained = reverse older ++ [(savedName, saved, spSid)]
-                                restored = restoreCatalog _sid saved (scanCatalog state)
-                             in ( Set.singleton spSid
+                    case break (\savepoint -> savepointObject savepoint == name) (reverse (txSavepoints frame)) of
+                        (_, saved : older) ->
+                            let retained = reverse older ++ [saved]
+                                restored = restoreCatalog _sid (savepointSnapshot saved) (scanCatalog state)
+                             in ( Set.singleton (savepointStatementId saved)
                                 , state
                                     { scanCatalog = restored
                                     , scanTransactions = frame {txSavepoints = retained} : rest
@@ -872,14 +882,14 @@ applyTransactionControl _sid actions state =
         apply (TxRelease name) =
             case scanTransactions state of
                 frame : rest ->
-                    case break (\(n, _, _) -> n == name) (reverse (txSavepoints frame)) of
-                        (_, (_, _, spSid) : older) ->
+                    case break (\savepoint -> savepointObject savepoint == name) (reverse (txSavepoints frame)) of
+                        (_, savepoint : older) ->
                             let retained = reverse older
                                 transactions =
-                                    if txImplicitSavepoint frame && null retained
+                                    if txOrigin frame == TxStartedBySavepoint && null retained
                                         then rest
                                         else frame {txSavepoints = retained} : rest
-                             in (Set.singleton spSid, state {scanTransactions = transactions})
+                             in (Set.singleton (savepointStatementId savepoint), state {scanTransactions = transactions})
                         _ -> (Set.empty, state)
                 [] -> (Set.empty, state)
 txCommandFromAction :: ObjectAction -> Maybe TxCommand
