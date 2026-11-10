@@ -2,14 +2,6 @@
 #+AUTHOR: Hunter
 #+TODO: TODO(t) IN_PROGRESS(i) | DONE(d) BLOCKED(b)
 
-* Direction (2026-11-06)
-Goal: Minimize SQL programs from large-scale fuzz testing while preserving a user-supplied interestingness predicate.
-Research question: Can SQL state dependencies reduce DBMS executions and reset costs while producing smaller SQL test cases with the same target behavior?
-Scope: Existing fuzz SQL, setup state, and an oracle -> reduced SQL that still satisfies that oracle. Collecting real DBMS crashes is not required.
-Scale: Both statements per input and inputs per corpus matter.
-Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale workloads -> Comparative evaluation -> Formal verification.
-- Archived DONE items are historical notes, not claims about current APIs. Crash-reporting, debugger, signature-matching, and crash-harvesting prototypes were removed during the predicate-only cutover.
-
 * 1. Frontend & CST Surgery (Tree-sitter)                              :ARCHIVE:
 ** DONE Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
 ** DONE Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
@@ -142,7 +134,7 @@ Order: Reliable fuzz-to-reduction -> SQL reduction quality -> Large-scale worklo
 ** DONE Drop ceremonial certificate.json exporter
 - Removed redundant certificate.json export, secondary AST re-parsing, and fake audit traces from Occam CLI (YAGNI).
 
-* 22. Algorithm & Semantic Precision
+* 22. Algorithm & Semantic Precision                                   :ARCHIVE:
 ** DONE De-escalate conservative barriers for transactions, triggers, and DDL
 - De-escalated TransactionObject from global script barriers: transactions only bind their frame (BEGIN/COMMIT/ROLLBACK) and precisely restored tables without fencing unrelated tables.
 - Refined Rust AST actions for EXPLAIN queries, table alterations, sequences, and types to prevent false barriers.
