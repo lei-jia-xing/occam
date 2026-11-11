@@ -56,10 +56,10 @@
 ** DONE Heavy multi-statement fuzz golden tests in test/golden/
 - Crash-oracle simulation and crash-specific soundness experiments from earlier iterations are not current features.
 
-* 11. Optional Fuzz Producers (SQLsmith & SQLancer)                    :ARCHIVE:
-** DONE Add optional upstream SQLsmith and SQLancer driver scripts.
-- SQLsmith can dump generated queries; the SQLancer driver records its fuzzer log and does not harvest crash cases or build a reduction corpus.
-- The SQLancer source fetch/build attempt timed out; runtime integration remains unverified.
+* 11. Optional Fuzz Producer (SQLsmith)                                :ARCHIVE:
+** DONE Add optional upstream SQLsmith driver script.
+- SQLsmith can dump generated queries for the external-predicate pipeline.
+- The unverified SQLancer producer driver was removed; the optional SQLancer reducer comparison remains in benchmarks/upstream/sqlancer_adapter.sh.
 
 * 12. Prototype Reducer Comparison (Synthetic Predicate)                 :ARCHIVE:
 - Optional external SQLancer reducer integration remains unverified; see Comparative Evaluation.
