@@ -445,10 +445,10 @@ pub(super) fn analyze_statement(
                     trigger,
                 ));
                 add_table_use(&mut actions, table);
-                if let Some(reference) = &create.referenced_table_name {
-                    if let Some(reference) = from_name(reference, dialect) {
-                        add_table_use(&mut actions, reference);
-                    }
+                if let Some(reference) = &create.referenced_table_name
+                    && let Some(reference) = from_name(reference, dialect)
+                {
+                    add_table_use(&mut actions, reference);
                 }
                 for reference in relation_names(&visitor, &[]) {
                     add_table_use(&mut actions, reference);
@@ -464,10 +464,10 @@ pub(super) fn analyze_statement(
                     NativeActionType::Drop,
                     trigger,
                 ));
-                if let Some(table) = &drop_trigger.table_name {
-                    if let Some(table) = from_name(table, dialect) {
-                        add_table_use(&mut actions, table);
-                    }
+                if let Some(table) = &drop_trigger.table_name
+                    && let Some(table) = from_name(table, dialect)
+                {
+                    add_table_use(&mut actions, table);
                 }
             } else {
                 actions.insert(barrier("__unknown_drop_barrier__"));
@@ -748,16 +748,16 @@ pub(super) fn analyze_statement(
                     actions.insert(barrier("__unknown_relation_barrier__"));
                 }
                 for clause in &merge.clauses {
-                    if let sqlparser::ast::MergeAction::Update(update) = &clause.action {
-                        if let sqlparser::ast::MergeUpdateKind::Set(assignments) = &update.kind {
-                            for assignment in assignments {
-                                add_assignment_columns(
-                                    &mut actions,
-                                    &target,
-                                    &assignment.target,
-                                    dialect,
-                                );
-                            }
+                    if let sqlparser::ast::MergeAction::Update(update) = &clause.action
+                        && let sqlparser::ast::MergeUpdateKind::Set(assignments) = &update.kind
+                    {
+                        for assignment in assignments {
+                            add_assignment_columns(
+                                &mut actions,
+                                &target,
+                                &assignment.target,
+                                dialect,
+                            );
                         }
                     }
                 }

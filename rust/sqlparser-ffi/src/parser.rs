@@ -1,5 +1,5 @@
 use crate::actions::analyze_statement;
-use crate::source::{dialect, token_positions, ByteSpan, SourceMap, TokenKind};
+use crate::source::{ByteSpan, SourceMap, TokenKind, dialect, token_positions};
 use crate::{DialectKind, NativeUnit};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};

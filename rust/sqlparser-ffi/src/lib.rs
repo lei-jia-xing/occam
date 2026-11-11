@@ -398,15 +398,29 @@ mod tests {
         }));
 
         for (dialect, insert) in [
-            (DialectKind::PostgreSql, "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET extra = excluded.extra;"),
-            (DialectKind::MySql, "INSERT INTO t (id) VALUES (1) ON DUPLICATE KEY UPDATE extra = VALUES(extra);"),
+            (
+                DialectKind::PostgreSql,
+                "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET extra = excluded.extra;",
+            ),
+            (
+                DialectKind::MySql,
+                "INSERT INTO t (id) VALUES (1) ON DUPLICATE KEY UPDATE extra = VALUES(extra);",
+            ),
         ] {
             let units = parse_units(insert, dialect).unwrap();
-            assert!(units[0].facts.as_ref().unwrap().actions.iter().any(|action| {
-                action.kind == NativeObjectKind::Column
-                    && action.action == NativeActionType::Mod
-                    && action.name == "t\u{1f}extra"
-            }));
+            assert!(
+                units[0]
+                    .facts
+                    .as_ref()
+                    .unwrap()
+                    .actions
+                    .iter()
+                    .any(|action| {
+                        action.kind == NativeObjectKind::Column
+                            && action.action == NativeActionType::Mod
+                            && action.name == "t\u{1f}extra"
+                    })
+            );
         }
 
         let group_sql = "SELECT a FROM t GROUP BY ALL;";
@@ -475,28 +489,32 @@ mod tests {
     fn cascading_foreign_keys_and_on_commit_actions() {
         let sql = "CREATE TABLE child (p_id INT REFERENCES parent(id) ON DELETE CASCADE); CREATE TEMPORARY TABLE temp_tbl (x INT) ON COMMIT DROP;";
         let units = parse_units(sql, DialectKind::PostgreSql).unwrap();
-        assert!(units[0]
-            .facts
-            .as_ref()
-            .unwrap()
-            .actions
-            .iter()
-            .any(|action| {
-                action.kind == NativeObjectKind::Table
-                    && action.action == NativeActionType::Cascade
-                    && action.name == "parent"
-            }));
-        assert!(units[1]
-            .facts
-            .as_ref()
-            .unwrap()
-            .actions
-            .iter()
-            .any(|action| {
-                action.kind == NativeObjectKind::TemporaryTable
-                    && action.action == NativeActionType::OnCommitDrop
-                    && action.name == "pg_temp.temp_tbl"
-            }));
+        assert!(
+            units[0]
+                .facts
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .any(|action| {
+                    action.kind == NativeObjectKind::Table
+                        && action.action == NativeActionType::Cascade
+                        && action.name == "parent"
+                })
+        );
+        assert!(
+            units[1]
+                .facts
+                .as_ref()
+                .unwrap()
+                .actions
+                .iter()
+                .any(|action| {
+                    action.kind == NativeObjectKind::TemporaryTable
+                        && action.action == NativeActionType::OnCommitDrop
+                        && action.name == "pg_temp.temp_tbl"
+                })
+        );
     }
 
     #[test]
@@ -1036,20 +1054,26 @@ mod tests {
             .iter()
             .filter(|e| e.category == NativeEditCategory::Constraint)
             .collect();
-        assert!(constraint_edits
-            .iter()
-            .any(|e| e.label == "remove-column_constraint"));
-        assert!(constraint_edits
-            .iter()
-            .any(|e| e.label == "remove-table_constraint"));
+        assert!(
+            constraint_edits
+                .iter()
+                .any(|e| e.label == "remove-column_constraint")
+        );
+        assert!(
+            constraint_edits
+                .iter()
+                .any(|e| e.label == "remove-table_constraint")
+        );
 
         let expr_sql = "SELECT CASE WHEN a = 1 THEN 42 ELSE 0 END, COALESCE(x, y), z IS NOT NULL, b BETWEEN 1 AND 10 FROM t;";
         let expr_units = parse_units(expr_sql, DialectKind::Generic).unwrap();
         let expr_edits = &expr_units[0].facts.as_ref().unwrap().edits;
         assert!(expr_edits.iter().any(|e| e.label == "simplify-case_result"));
-        assert!(expr_edits
-            .iter()
-            .any(|e| e.label == "simplify-function_to_argument"));
+        assert!(
+            expr_edits
+                .iter()
+                .any(|e| e.label == "simplify-function_to_argument")
+        );
         assert!(expr_edits.iter().any(|e| e.label == "simplify-is_null"));
         assert!(expr_edits.iter().any(|e| e.label == "simplify-between"));
     }
@@ -1065,11 +1089,15 @@ mod tests {
             .map(|edit| &sql[edit.start..edit.end])
             .collect();
         assert_eq!(removed.len(), 2);
-        assert!(removed
-            .iter()
-            .any(|text| text.contains("CONSTRAINT pk PRIMARY KEY (id)")));
-        assert!(removed
-            .iter()
-            .any(|text| { text.contains("CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id)") }));
+        assert!(
+            removed
+                .iter()
+                .any(|text| text.contains("CONSTRAINT pk PRIMARY KEY (id)"))
+        );
+        assert!(
+            removed
+                .iter()
+                .any(|text| { text.contains("CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id)") })
+        );
     }
 }
