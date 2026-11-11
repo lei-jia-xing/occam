@@ -151,3 +151,26 @@
 ** DONE Interleave statement audit and intra-statement rewrites to a global fixed point
 - Interleaved statement audit and intra-statement syntax rewrites into a simultaneous global fixed-point loop.
 - Ensured monotonic byte reduction and verified termination at the true fixed point.
+
+* 23. DBMS Semantic Alignment
+- Principle: the Rust frontend owns dialect/server semantics and emits a typed,
+  lossless fact IR; the Haskell graph builder stays dialect-agnostic. Unsupported
+  constructs use scoped barriers, not global ones.
+** TODO Make the fact IR lossless
+- Carry session values, write kinds, drop/truncate modes and transaction effects
+  instead of only `{kind, action, name}`.
+** TODO Make identifier folding object-class and configuration aware
+- Cover MySQL `lower_case_table_names`, BigQuery table/column case, DuckDB/MsSql
+  quoted identifiers and SQLite quoted identifiers.
+** TODO Model session state and search path
+- Consume `SET search_path`, `USE` and `CURRENT_SCHEMA`; resolve unqualified
+  names by search path instead of matching every schema.
+** TODO Model dialect transaction semantics
+- MySQL/Oracle DDL and TRUNCATE implicit commit; nested BEGIN policy; savepoint
+  snapshots include ON COMMIT registrations.
+** TODO Model constraints, triggers and data-modifying CTEs
+- Foreign-key identity and DROP CONSTRAINT; trigger body effects; CTE-local
+  INSERT/UPDATE/DELETE.
+** TODO Add a real-DBMS conformance matrix
+- Compare catalog state per statement prefix; keep text-pattern mechanics
+  separate from DBMS execution evidence.
