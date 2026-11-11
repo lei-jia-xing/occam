@@ -28,25 +28,25 @@ fn dialect_from_code(code: u32) -> Option<DialectKind> {
     }
 }
 
-unsafe fn put_bytes(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize) {
+unsafe fn put_bytes(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize) { unsafe {
     let mut bytes = bytes.into_boxed_slice();
     *out_len = bytes.len();
     *out_data = bytes.as_mut_ptr();
     std::mem::forget(bytes);
-}
+}}
 
 /// Parses SQL and returns its statement facts as JSON.
 ///
 /// # Safety
 /// For nonzero `len`, `data` must point to `len` readable bytes. Non-null output pointers must point to writable storage.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_parse(
     data: *const u8,
     len: usize,
     dialect_code: u32,
     out_data: *mut *mut u8,
     out_len: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if out_data.is_null() || out_len.is_null() {
             return Err(1);
@@ -70,18 +70,18 @@ pub unsafe extern "C" fn occam_sql_parse(
         Err(_) => 5,
         Ok(Ok(())) => 0,
     }
-}
+}}
 
 /// Converts a native parser status code into an owned error message.
 ///
 /// # Safety
 /// Non-null output pointers must point to writable storage.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_parse_error(
     code: i32,
     out_data: *mut *mut u8,
     out_len: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let message = match code {
         1 => "invalid native parser arguments",
         2 => "invalid SQL dialect code",
@@ -95,19 +95,19 @@ pub unsafe extern "C" fn occam_sql_parse_error(
     }
     put_bytes(message.as_bytes().to_vec(), out_data, out_len);
     0
-}
+}}
 
 /// Counts statements using the selected sqlparser dialect.
 ///
 /// # Safety
 /// For nonzero `len`, `data` must point to `len` readable bytes, and a non-null `out_count` must point to writable storage.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_count(
     data: *const u8,
     len: usize,
     dialect_code: u32,
     out_count: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if data.is_null() && len != 0 {
             return Err(1);
@@ -131,15 +131,15 @@ pub unsafe extern "C" fn occam_sql_count(
         Ok(Err(code)) => code,
         Err(_) => 5,
     }
-}
+}}
 
 /// Frees a buffer returned by one of the native parser functions.
 ///
 /// # Safety
 /// For non-null `data`, `len` must match a buffer returned by `occam_sql_parse` or `occam_sql_parse_error`.
-#[no_mangle]
-pub unsafe extern "C" fn occam_sql_free(data: *mut u8, len: usize) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn occam_sql_free(data: *mut u8, len: usize) { unsafe {
     if !data.is_null() {
         drop(Vec::from_raw_parts(data, len, len));
     }
-}
+}}
