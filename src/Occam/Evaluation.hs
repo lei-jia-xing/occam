@@ -120,6 +120,7 @@ parseMinimalityClaimName "not-established" = Just MinimalityNotEstablished
 parseMinimalityClaimName _ = Nothing
 
 instance ToJSON MinimalityClaim where
+    toJSON :: MinimalityClaim -> Value
     toJSON = toJSON . minimalityClaimName
 
 instance FromJSON MinimalityClaim where

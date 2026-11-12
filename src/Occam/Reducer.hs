@@ -36,7 +36,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam.Core (Span (..), Statement (..), StatementId (..))
+import Occam.Core (SessionInit (..), Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
@@ -49,6 +49,7 @@ import Occam.Parser (
     SQLDialect (..),
     StatementFacts (..),
     StatementUnit (..),
+    defaultParseOptions,
     defaultSQLDialect,
     parseSQL,
  )
@@ -126,12 +127,12 @@ timedStage logger stage action = do
     logStage logger stage (finished - started)
     pure result
 
-parseUnitsOrThrow :: SQLDialect -> ByteString -> IO [StatementUnit]
+parseUnitsOrThrow :: SQLDialect -> ByteString -> IO (SessionInit, [StatementUnit])
 parseUnitsOrThrow dialect sql = do
-    parsed <- parseSQL dialect sql
+    parsed <- parseSQL (defaultParseOptions dialect) sql
     case parsed of
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
-        Right result -> pure (parsedUnits result)
+        Right result -> pure (parsedInitialSession result, parsedUnits result)
 
 {- | A retained candidate set K is closed iff every kept statement's direct
 predecessors are also retained.
@@ -390,7 +391,7 @@ statementDdmin dialect oracle initialSQL = do
     if not initialOK
         then pure initialSQL
         else do
-            units <- parseUnitsOrThrow dialect initialSQL
+            (_, units) <- parseUnitsOrThrow dialect initialSQL
             let allStatements = map unitStatement units
             reduced <-
                 searchStatements plainCandidate oracle initialSQL allStatements allStatements
@@ -407,7 +408,7 @@ statementAuditWithLogger logger dialect oracle initialSQL = do
     outcome <-
         if initialOK
             then do
-                units <- parseUnitsOrThrow dialect initialSQL
+                (_, units) <- parseUnitsOrThrow dialect initialSQL
                 let statements = map unitStatement units
                 loop initialSQL statements (statementIds statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
@@ -508,9 +509,9 @@ data SQLAnalysis = SQLAnalysis
 analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
 analyzeSQL logger dialect sql = do
     started <- getMonotonicTimeNSec
-    units <- parseUnitsOrThrow dialect sql
+    (initialSession, units) <- parseUnitsOrThrow dialect sql
     let statements = map unitStatement units
-        graph = analyzeStatements units
+        graph = analyzeStatements initialSession units
     graph `seq` pure ()
     finished <- getMonotonicTimeNSec
     let elapsed = finished - started
@@ -767,7 +768,7 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
     pure result
     where
         go stats currentSQL = do
-            units <- parseUnitsOrThrow dialect currentSQL
+            (_, units) <- parseUnitsOrThrow dialect currentSQL
             let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
             reduced <- tryEdits stats currentSQL edits
             maybe (pure currentSQL) (go stats) reduced

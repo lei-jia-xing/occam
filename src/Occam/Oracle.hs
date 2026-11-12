@@ -450,6 +450,7 @@ parseOracleStatusName "interrupted" = Just Interrupted
 parseOracleStatusName _ = Nothing
 
 instance ToJSON OracleStatus where
+    toJSON :: OracleStatus -> Value
     toJSON = String . oracleStatusName
 
 instance FromJSON OracleStatus where
@@ -457,12 +458,14 @@ instance FromJSON OracleStatus where
         maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 
 instance ToJSONKey OracleStatus where
+    toJSONKey :: ToJSONKeyFunction OracleStatus
     toJSONKey =
         ToJSONKeyText
             (Key.fromText . oracleStatusName)
             (Encoding.text . oracleStatusName)
 
 instance FromJSONKey OracleStatus where
+    fromJSONKey :: FromJSONKeyFunction OracleStatus
     fromJSONKey = FromJSONKeyTextParser \name ->
         maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 

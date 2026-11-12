@@ -171,6 +171,3 @@
 ** TODO Model constraints, triggers and data-modifying CTEs
 - Foreign-key identity and DROP CONSTRAINT; trigger body effects; CTE-local
   INSERT/UPDATE/DELETE.
-** TODO Add a real-DBMS conformance matrix
-- Compare catalog state per statement prefix; keep text-pattern mechanics
-  separate from DBMS execution evidence.

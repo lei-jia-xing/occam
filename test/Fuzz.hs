@@ -7,7 +7,13 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import MutationalFuzz (mutationalFuzzTests)
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
+import Occam.Parser (
+    ParsedSQL (..),
+    SQLDialect (..),
+    StatementUnit (..),
+    defaultParseOptions,
+    parseSQL,
+ )
 import Occam.Reducer (Oracle, oracleAccepts, oracleFromPredicate, reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
@@ -500,7 +506,7 @@ makeScriptOracle FuzzScript {..} =
 
 checkParserValidity :: SQLDialect -> ByteString -> IO Bool
 checkParserValidity dialect sql = do
-    result <- parseSQL dialect sql
+    result <- parseSQL (defaultParseOptions dialect) sql
     pure $ case result of
         Left _ -> False
         Right parsed -> all validUnit (parsedUnits parsed)
