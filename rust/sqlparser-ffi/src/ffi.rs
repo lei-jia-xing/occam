@@ -37,7 +37,7 @@ fn session_search_path_entry(value: &str, rules: &IdentifierRules) -> SearchPath
     }
 }
 
-fn session_init(config: &ParseConfig) -> SessionInit {
+pub(crate) fn session_init(config: &ParseConfig) -> SessionInit {
     let rules = IdentifierRules::for_dialect(config.dialect, &config.server);
     SessionInit {
         namespace_prefix: config
@@ -58,7 +58,10 @@ fn session_init(config: &ParseConfig) -> SessionInit {
             .as_ref()
             .map(|user| session_config_ident(user, &rules)),
         autocommit: config.server.autocommit,
-        foreign_key_checks: config.server.foreign_key_checks,
+        foreign_key_checks: config
+            .server
+            .foreign_key_checks
+            .unwrap_or(config.dialect != DialectKind::SQLite),
         variables: config.server.variables.clone(),
     }
 }

@@ -76,7 +76,7 @@ import Occam.Core (
     nameText,
  )
 import Occam.Core qualified as Core
-import Occam.Parser (StatementFacts (..), StatementUnit (..))
+import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
 -- ----------------------------------------------------------------------------
 -- Public graph
@@ -314,16 +314,14 @@ sessionFromInit SessionInit {..} =
         , sessSessionUser = sessionCurrentUser
         , sessAutocommit = sessionAutocommit
         , sessVariables = Map.map SessionText sessionVariables
-        , sessForeignKeyChecks = initialForeignKeyChecks
-        , sessInitialForeignKeyChecks = initialForeignKeyChecks
+        , sessForeignKeyChecks = sessionForeignKeyChecks
+        , sessInitialForeignKeyChecks = sessionForeignKeyChecks
         , sessTxNamespacePrefix = Nothing
         , sessTxSearchPath = Nothing
         , sessTxSessionUser = Nothing
         , sessTxCurrentUser = Nothing
         , sessTxVariables = Map.empty
         }
-    where
-        initialForeignKeyChecks = fromMaybe True sessionForeignKeyChecks
 
 effectiveNamespacePrefix :: SessionState -> [Ident]
 effectiveNamespacePrefix state =
@@ -372,8 +370,8 @@ data Savepoint = Savepoint
 data TxFrame = TxFrame
     { frameId :: !Int
     , frameExplicit :: !Bool
-    , -- SQL Server nests `BEGIN`/`COMMIT` through `@@TRANCOUNT`; an inner
-      -- `COMMIT` only decrements the count. Other dialects keep this at 1.
+    , -- Nested transactions increment this counter; a commit only closes the
+      -- outermost frame when the counter reaches zero.
       frameNesting :: !Int
     , frameBegin :: !(Maybe StatementId)
     , frameCatalog :: !Catalog
@@ -598,8 +596,8 @@ resolveRelationKeys session catalog (NameRef name temporary)
     | temporary = [RelationKey True name]
     | length (nameParts name) > 1 = [RelationKey False name]
     | Map.member temporaryKey relations = [temporaryKey]
-    -- A namespace prefix (MySQL @USE db@) is an exact current database, not an
-    -- open search path: unqualified names must not leak into other databases.
+    -- A namespace prefix is an exact current database, not an open search
+    -- path: unqualified names must not leak into other databases.
     | not (null prefixKeys) = prefixKeys
     | null (effectiveSearchPath session) =
         case wildcardMatches of
@@ -957,8 +955,8 @@ constraintCouplingColumns constraint =
         UsingIndexConstraint {} -> []
         OtherConstraint _ -> []
 
-{- | Columns referenced in the parent table. PostgreSQL allows the column list
-to be omitted, in which case the parent's primary key is referenced.
+{- | Columns referenced in the parent table. When the fact IR omits the parent
+column list, the parent's primary key is referenced.
 -}
 referencedParentColumns :: SessionState -> Catalog -> ForeignKey -> [Ident]
 referencedParentColumns session catalog foreignKey
@@ -1112,7 +1110,7 @@ constraintNameIdent constraint =
         ForeignKeyConstraint foreignKey -> foreignKeyName foreignKey
         CheckConstraint name _ _ -> name
         IndexConstraint name _ _ -> name
-        UsingIndexConstraint name _ _ -> name
+        UsingIndexConstraint name _ _ _ -> name
         OtherConstraint name -> name
 
 constraintColumnsOf :: Constraint -> [Ident]
@@ -1147,8 +1145,8 @@ renameConstraintChildColumns rename constraint =
             CheckConstraint name (map rename columns) notValid
         IndexConstraint name columns unique ->
             IndexConstraint name (map rename columns) unique
-        UsingIndexConstraint name index primary ->
-            UsingIndexConstraint name index primary
+        UsingIndexConstraint name index primary placement ->
+            UsingIndexConstraint name index primary placement
         OtherConstraint name -> OtherConstraint name
 
 -- ----------------------------------------------------------------------------
@@ -1227,12 +1225,13 @@ graph builder must not invent columns for it.
 resolveUsingIndex :: SessionState -> Catalog -> RelationKey -> Constraint -> Constraint
 resolveUsingIndex session catalog tableKey constraint =
     case constraint of
-        UsingIndexConstraint name index role ->
+        UsingIndexConstraint name index role placement ->
             let unqualifiedIndexKeys =
                     resolveIndexKeys session catalog (NamedIndex (Name [index]))
                 tableName = relationKeyName tableKey
-                -- PostgreSQL and SQLite look the index up in the schema of the
-                -- table being altered, not the search path.
+                -- The frontend records whether an unqualified index name
+                -- resolves in the altered table's schema or in the current
+                -- schema.
                 tableSchemaIndexKeys =
                     case nameParts tableName of
                         _schema : _table : _ ->
@@ -1242,9 +1241,12 @@ resolveUsingIndex session catalog tableKey constraint =
                                 (NamedIndex (Name (init (nameParts tableName) ++ [index])))
                         _ -> []
                 indexKeys =
-                    case tableSchemaIndexKeys of
-                        [] -> unqualifiedIndexKeys
-                        keys -> keys
+                    case placement of
+                        IndexTableSchema ->
+                            case tableSchemaIndexKeys of
+                                [] -> unqualifiedIndexKeys
+                                keys -> keys
+                        IndexCurrentSchema -> unqualifiedIndexKeys
                 columns =
                     concat
                         [ indexStateColumns state
@@ -1355,7 +1357,7 @@ processDefineTable sid eval definition =
                                 case tableOnCommit definition of
                                     Just OnCommitDrop -> evalFrameId eval
                                     _ -> Nothing
-                            , relTransactional = fromMaybe True (tableTransactional definition)
+                            , relTransactional = tableTransactional definition
                             , relConstraints = constraintKeys
                             }
                     catalog3 = insertRelation key relation catalog2
@@ -1414,9 +1416,8 @@ processDefineIndex sid eval definition =
     let session = evalSession eval
         catalog = evalCatalog eval
         tableKeys = resolveRelationKeys session catalog (indexTable definition)
-        -- PostgreSQL and SQLite create an unqualified index in the schema of
-        -- the table; Oracle creates it in the current schema instead. The
-        -- frontend records which rule applies.
+        -- The frontend records whether an unqualified index name resolves in
+        -- the table's schema or in the current schema.
         indexKeys =
             case (indexRef definition, indexSchemaPlacement definition, tableKeys) of
                 (NamedIndex name@(Name [_]), IndexTableSchema, tableKey : _)
@@ -1664,7 +1665,7 @@ processDefineSequence sid eval definition =
                 (Just sid)
                 Set.empty
                 Nothing
-                (fromMaybe True (sequenceTransactional definition))
+                (sequenceTransactional definition)
         catalog1 =
             catalog
                 { catalogSequences = Map.insert key state (catalogSequences catalog)
@@ -2632,8 +2633,8 @@ renameConstraintName name constraint =
             CheckConstraint (Just name) columns notValid
         IndexConstraint _ columns unique ->
             IndexConstraint (Just name) columns unique
-        UsingIndexConstraint _ index primary ->
-            UsingIndexConstraint (Just name) index primary
+        UsingIndexConstraint _ index primary placement ->
+            UsingIndexConstraint (Just name) index primary placement
         OtherConstraint _ -> OtherConstraint (Just name)
 
 {- | Clear @NOT VALID@ after a successful @VALIDATE CONSTRAINT@. Only foreign
@@ -3059,7 +3060,7 @@ schemaContains (Name schemaParts) (Name objectParts) =
 processRename :: StatementId -> Eval -> RenameOp -> Eval
 processRename sid eval renameOp =
     case renameOp of
-        RenameRelation from to ->
+        RenameRelation from to placement ->
             let session = evalSession eval
                 catalog = evalCatalog eval
                 keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog from)
@@ -3074,7 +3075,7 @@ processRename sid eval renameOp =
                                 (relationKeyTemp oldKey)
                                 (qualifyRenameName (relationKeyName oldKey) to)
                         (catalog1, relation1) =
-                            moveRelationObjects sid oldKey newKey relation currentCatalog
+                            moveRelationObjects placement sid oldKey newKey relation currentCatalog
                         relation2 =
                             relation1
                                 { relSchemaWrites = Set.insert sid (relSchemaWrites relation1)
@@ -3176,15 +3177,16 @@ processRename sid eval renameOp =
              in foldl' stepKey eval keys
 
 moveRelationObjects ::
+    IndexSchemaPlacement ->
     StatementId ->
     RelationKey ->
     RelationKey ->
     RelationState ->
     Catalog ->
     (Catalog, RelationState)
-moveRelationObjects _sid oldKey newKey relation catalog =
+moveRelationObjects placement _sid oldKey newKey relation catalog =
     let (catalog1, newIndexes) =
-            foldl' (moveIndex oldKey newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
+            foldl' (moveIndex placement oldKey newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
         (catalog2, newTriggers) =
             foldl' (moveTrigger oldKey newKey) (catalog1, Set.empty) (Set.toList (relTriggers relation))
         (catalog3, newConstraints) =
@@ -3197,20 +3199,24 @@ moveRelationObjects _sid oldKey newKey relation catalog =
                 }
      in (catalog3, relation1)
     where
-        moveIndex _old new (current, keys) indexKey =
+        moveIndex schemaPlacement _old new (current, keys) indexKey =
             case Map.lookup indexKey (catalogIndexes current) of
                 Nothing -> (current, keys)
                 Just state ->
                     let newIndexKey =
                             case indexKey of
                                 NamedIndexKey name ->
-                                    -- PostgreSQL indexes move with their table and
-                                    -- stay in the table's schema.
-                                    case (nameParts name, nameParts (relationKeyName new)) of
-                                        ([_], newParts)
-                                            | length newParts > 1 ->
-                                                NamedIndexKey (Name (init newParts ++ nameParts name))
-                                        _ -> NamedIndexKey name
+                                    case schemaPlacement of
+                                        IndexTableSchema ->
+                                            -- The table-schema placement moves
+                                            -- an unqualified index with the
+                                            -- table into the table's schema.
+                                            case (nameParts name, nameParts (relationKeyName new)) of
+                                                ([_], newParts)
+                                                    | length newParts > 1 ->
+                                                        NamedIndexKey (Name (init newParts ++ nameParts name))
+                                                _ -> NamedIndexKey name
+                                        IndexCurrentSchema -> NamedIndexKey name
                                 TableIndexKey _ ident -> TableIndexKey new ident
                         state1 = state {indexStateTable = Just new}
                      in ( current
@@ -3666,9 +3672,9 @@ applyTxEffect sid state effect =
                      in state' {scanTransactions = [frame]}
                 frame : rest
                     | policy == BeginCommitActive ->
-                        -- MySQL/SQLite-style `START TRANSACTION` commits the
-                        -- pending transaction (including an implicit
-                        -- autocommit-off frame) and starts a fresh one.
+                        -- A `START TRANSACTION`-style begin commits the pending
+                        -- transaction (including an implicit autocommit-off
+                        -- frame) and starts a fresh one.
                         applyTxEffect sid (commitFrame sid state) (TxBegin BeginIgnore)
                     | not (frameExplicit frame) ->
                         state

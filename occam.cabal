@@ -45,6 +45,7 @@ library
     exposed-modules:  Occam
                     , Occam.Cache
                     , Occam.Core
+                    , Occam.Facts
                     , Occam.Dependency
                     , Occam.Evaluation
                     , Occam.Logger

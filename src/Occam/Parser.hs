@@ -111,6 +111,12 @@ import Occam.Core (
     ViewDef (..),
     WriteKind (..),
  )
+import Occam.Facts (
+    ParserEdit (..),
+    ParserEditCategory (..),
+    StatementFacts (..),
+    StatementUnit (..),
+ )
 
 -- Keep dialect selection at the frontend boundary: parsing and every derived
 -- fact use the same selected sqlparser dialect.
@@ -237,61 +243,6 @@ data ParserError = ParserError
 data ParsedSQL = ParsedSQL
     { parsedInitialSession :: !SessionInit
     , parsedUnits :: ![StatementUnit]
-    }
-    deriving (Eq, Show)
-
-data StatementUnit = StatementUnit
-    { unitStatement :: !Statement
-    , unitFacts :: !(Maybe StatementFacts)
-    , unitParseError :: !(Maybe Text)
-    }
-    deriving (Eq, Show)
-
-data StatementFacts = StatementFacts
-    { factSemantics :: !SemanticFacts
-    , factEdits :: ![ParserEdit]
-    }
-    deriving (Eq, Show)
-
-data ParserEditCategory
-    = EditExpression
-    | EditClause
-    | EditConstraint
-    | EditList
-    | EditType
-    | EditLiteral
-    deriving (Eq, Ord, Show)
-
-instance ToJSON ParserEditCategory where
-    toJSON category = toJSON (editCategoryName category)
-
-instance FromJSON ParserEditCategory where
-    parseJSON = withText "ParserEditCategory" \name ->
-        maybe (fail ("unknown parser edit category: " <> T.unpack name)) pure (parseEditCategoryName name)
-
-editCategoryName :: ParserEditCategory -> Text
-editCategoryName EditExpression = "expression"
-editCategoryName EditClause = "clause"
-editCategoryName EditConstraint = "constraint"
-editCategoryName EditList = "list"
-editCategoryName EditType = "type"
-editCategoryName EditLiteral = "literal"
-
-parseEditCategoryName :: Text -> Maybe ParserEditCategory
-parseEditCategoryName "expression" = Just EditExpression
-parseEditCategoryName "clause" = Just EditClause
-parseEditCategoryName "constraint" = Just EditConstraint
-parseEditCategoryName "list" = Just EditList
-parseEditCategoryName "type" = Just EditType
-parseEditCategoryName "literal" = Just EditLiteral
-parseEditCategoryName _ = Nothing
-
-data ParserEdit = ParserEdit
-    { parserEditStart :: !Int
-    , parserEditEnd :: !Int
-    , parserEditReplacement :: !ByteString
-    , parserEditCategory :: !ParserEditCategory
-    , parserEditLabel :: !Text
     }
     deriving (Eq, Show)
 
@@ -497,6 +448,7 @@ instance FromJSON Constraint where
                     <$> objectValue .: "name"
                     <*> objectValue .: "index"
                     <*> objectValue .: "primary"
+                    <*> objectValue .: "schema_placement"
             "other" -> OtherConstraint <$> objectValue .: "name"
             _ -> fail ("unknown constraint kind: " <> T.unpack tag)
 
@@ -734,7 +686,11 @@ instance FromJSON RenameOp where
     parseJSON = withObject "RenameOp" \objectValue -> do
         tag <- objectValue .: "rename"
         case tag of
-            "relation" -> RenameRelation <$> objectValue .: "from" <*> objectValue .: "to"
+            "relation" ->
+                RenameRelation
+                    <$> objectValue .: "from"
+                    <*> objectValue .: "to"
+                    <*> objectValue .: "index_schema_placement"
             "column" ->
                 RenameColumnOp
                     <$> objectValue .: "table"
@@ -907,15 +863,6 @@ instance FromJSON ScopedBarrier where
             <$> objectValue .: "scope"
             <*> objectValue .: "reason"
             <*> objectValue .: "detail"
-
-instance FromJSON ParserEdit where
-    parseJSON = withObject "ParserEdit" \objectValue ->
-        ParserEdit
-            <$> objectValue .: "start"
-            <*> objectValue .: "end"
-            <*> (TE.encodeUtf8 <$> objectValue .: "replacement")
-            <*> objectValue .: "category"
-            <*> objectValue .: "label"
 
 foreign import ccall safe "occam_sql_parse"
     c_parseSQL :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt

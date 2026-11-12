@@ -118,7 +118,7 @@ data SessionInit = SessionInit
     , sessionSearchPath :: ![SearchPathEntry]
     , sessionCurrentUser :: !(Maybe Ident)
     , sessionAutocommit :: !Bool
-    , sessionForeignKeyChecks :: !(Maybe Bool)
+    , sessionForeignKeyChecks :: !Bool
     , sessionVariables :: !(Map Text Text)
     }
     deriving (Eq, Show)
@@ -154,7 +154,7 @@ data Constraint
     | ForeignKeyConstraint !ForeignKey
     | CheckConstraint !(Maybe Ident) ![Ident] !ConstraintValidity
     | IndexConstraint !(Maybe Ident) ![Ident] !IndexUniqueness
-    | UsingIndexConstraint !(Maybe Ident) !Ident !IndexRole
+    | UsingIndexConstraint !(Maybe Ident) !Ident !IndexRole !IndexSchemaPlacement
     | OtherConstraint !(Maybe Ident)
     deriving (Eq, Show)
 
@@ -188,7 +188,7 @@ data ColumnDef = ColumnDef
 data TableDef = TableDef
     { tableName :: !Name
     , tableTemporary :: !Bool
-    , tableTransactional :: !(Maybe Bool)
+    , tableTransactional :: !Bool
     , tableColumns :: ![ColumnDef]
     , tableConstraints :: ![Constraint]
     , tableSources :: ![ReadFact]
@@ -285,7 +285,7 @@ data DmlEvent
 data SequenceDef = SequenceDef
     { sequenceName :: !Name
     , sequenceTemporary :: !Bool
-    , sequenceTransactional :: !(Maybe Bool)
+    , sequenceTransactional :: !Bool
     }
     deriving (Eq, Show)
 
@@ -352,7 +352,7 @@ data DropObject
     deriving (Eq, Ord, Show)
 
 data RenameOp
-    = RenameRelation !NameRef !Name
+    = RenameRelation !NameRef !Name !IndexSchemaPlacement
     | RenameColumnOp !NameRef !Ident !Ident
     deriving (Eq, Show)
 
@@ -423,7 +423,7 @@ data SessionEffect
     | SetAutocommit !SessionScope !Bool
     | SetForeignKeyChecks !SessionScope !Bool
     | {- | Restore @foreign_keys@/@foreign_key_checks@ to the session's initial
-      configuration, which is dialect-dependent (SQLite defaults to OFF).
+      configuration as resolved by the frontend.
       -}
       ResetForeignKeyChecks !SessionScope
     | ResetVariable !SessionScope !Name

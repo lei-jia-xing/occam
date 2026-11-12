@@ -326,7 +326,7 @@ mod tests {
             })
             .expect("rename op");
         match renamed {
-            RenameOp::Relation { from, to } => {
+            RenameOp::Relation { from, to, .. } => {
                 assert_eq!(name_text(&from.name), "old.schema.t");
                 assert_eq!(name_text(to), "old.schema.new.name");
             }
@@ -1355,6 +1355,98 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn session_init_resolves_the_dialect_foreign_key_default() {
+        let config = |dialect, foreign_key_checks| ParseConfig {
+            dialect,
+            server: ServerConfig {
+                foreign_key_checks,
+                ..ServerConfig::default()
+            },
+        };
+        assert!(
+            !crate::ffi::session_init(&config(DialectKind::SQLite, None)).foreign_key_checks,
+            "SQLite defaults foreign_keys to OFF"
+        );
+        assert!(
+            crate::ffi::session_init(&config(DialectKind::PostgreSql, None)).foreign_key_checks,
+            "PostgreSQL defaults foreign_key_checks to ON"
+        );
+        assert!(
+            !crate::ffi::session_init(&config(DialectKind::PostgreSql, Some(false)))
+                .foreign_key_checks,
+            "an explicit server setting overrides the dialect default"
+        );
+        assert!(
+            crate::ffi::session_init(&config(DialectKind::SQLite, Some(true))).foreign_key_checks,
+            "an explicit SQLite setting overrides the dialect default"
+        );
+    }
+
+    #[test]
+    fn using_index_and_rename_carry_index_schema_placement() {
+        let using_index = |dialect| {
+            let units = parse(
+                "CREATE TABLE s.t (a INT); ALTER TABLE s.t ADD PRIMARY KEY USING INDEX t_idx;",
+                dialect,
+            )
+            .unwrap();
+            facts(&units[1])
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    CatalogOp::AlterTable(alter) => {
+                        alter.changes.iter().find_map(|change| match change {
+                            AlterChange::AddConstraint {
+                                constraint:
+                                    Constraint::UsingIndex {
+                                        schema_placement, ..
+                                    },
+                            } => Some(*schema_placement),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("using-index constraint")
+        };
+        assert_eq!(
+            using_index(DialectKind::Oracle),
+            IndexSchemaPlacement::CurrentSchema
+        );
+        assert_eq!(
+            using_index(DialectKind::PostgreSql),
+            IndexSchemaPlacement::TableSchema
+        );
+
+        let rename_placement = |dialect| {
+            let units = parse(
+                "CREATE TABLE s.t (a INT); ALTER TABLE s.t RENAME TO u;",
+                dialect,
+            )
+            .unwrap();
+            facts(&units[1])
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    CatalogOp::Rename(RenameOp::Relation {
+                        index_schema_placement,
+                        ..
+                    }) => Some(*index_schema_placement),
+                    _ => None,
+                })
+                .expect("rename op")
+        };
+        assert_eq!(
+            rename_placement(DialectKind::Oracle),
+            IndexSchemaPlacement::CurrentSchema
+        );
+        assert_eq!(
+            rename_placement(DialectKind::PostgreSql),
+            IndexSchemaPlacement::TableSchema
+        );
     }
 
     #[test]

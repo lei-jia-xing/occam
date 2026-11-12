@@ -767,7 +767,7 @@ factOp fact =
                 TableDef
                     { tableName = Name [Ident name]
                     , tableTemporary = False
-                    , tableTransactional = Nothing
+                    , tableTransactional = True
                     , tableColumns = [ColumnDef (Ident "id") False False False []]
                     , tableConstraints = []
                     , tableSources = []
@@ -814,7 +814,7 @@ buildFactGraph rawFacts =
         ]
 
 defaultSessionInit :: SessionInit
-defaultSessionInit = SessionInit [] [] Nothing True Nothing Map.empty
+defaultSessionInit = SessionInit [] [] Nothing True True Map.empty
 
 -- Data.Graph independently computes reachability along each statement's predecessors.
 backwardReachabilityOracle ::
