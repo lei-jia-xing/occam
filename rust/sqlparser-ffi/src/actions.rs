@@ -2280,7 +2280,7 @@ fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bool {
             | Statement::DropFunction(_)
             | Statement::DropProcedure { .. }
             | Statement::AlterTable(_)
-            | Statement::AlterView { .. }
+            | Statement::AlterView(_)
             | Statement::AlterIndex { .. }
             | Statement::AlterSchema(_)
             | Statement::RenameTable(_)
@@ -2939,18 +2939,19 @@ pub(super) fn analyze_statement(
                 }
             }
         }
-        Statement::AlterView {
-            name: view_name,
-            columns,
-            ..
-        } => {
+        Statement::AlterView(alter_view) => {
+            let view_name = &alter_view.name;
+            let columns = match &alter_view.operation {
+                sqlparser::ast::AlterViewOperation::As { columns, .. } => columns.clone(),
+                _ => Vec::new(),
+            };
             let excluded = [view_name.span()];
             let sources = visitor_reads(&visitor, &excluded, ir::ReadMode::Schema);
             if let Some((name, temporary)) = definition_name(view_name, dialect, rules, false) {
                 facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
                     name,
                     temporary,
-                    materialized: false,
+                    materialized: alter_view.materialized,
                     columns: columns
                         .iter()
                         .map(|column| canonical_ident(column, rules, ir::IdentifierClass::Column))

@@ -4,7 +4,7 @@ use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
 use crate::{DialectKind, NativeEdit, NativeEditCategory};
 use sqlparser::ast::{
     AlterTableOperation, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
-    GroupByWithModifier, LimitClause, ObjectName, OffsetRows, Query, Select, SelectItem,
+    GroupByWithModifier, InTarget, LimitClause, ObjectName, OffsetRows, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableConstraint, TableFactor,
     TableWithJoins, ValueWithSpan, Visitor,
 };
@@ -547,10 +547,11 @@ impl<'a> AnalysisVisitor<'a> {
                     self.binary_operator_span(expr, pattern, &[keyword])
                 }
             }
-            Expr::InUnnest {
+            Expr::In {
                 expr,
-                array_expr,
+                target: InTarget::Unnest(array_expr),
                 negated,
+                ..
             } => {
                 let words = if *negated {
                     &["NOT", "IN"][..]
@@ -569,7 +570,11 @@ impl<'a> AnalysisVisitor<'a> {
                 self.words_between(expr_end, range.0, &["COLLATE"])?;
                 Some((start, range.1))
             }
-            Expr::InSubquery { expr, subquery, .. } => {
+            Expr::In {
+                expr,
+                target: InTarget::Subquery(subquery),
+                ..
+            } => {
                 let (start, _) = self.expression_source_span(expr)?;
                 let range = self.mapped_span(subquery.span())?;
                 let opening = self.previous_significant(range.0)?;
@@ -579,11 +584,24 @@ impl<'a> AnalysisVisitor<'a> {
                 let pair = self.matching_parentheses(range.0, range.1, opening.start)?;
                 Some((start, pair.end))
             }
-            Expr::InList { expr, list, .. } => {
+            Expr::In {
+                expr,
+                target: InTarget::List(list),
+                ..
+            } => {
                 let (start, left_end) = self.expression_source_span(expr)?;
                 let (_, last_end) = self.expression_source_span(list.last()?)?;
                 let pair = self.matching_parentheses(left_end, last_end, left_end)?;
                 Some((start, pair.end))
+            }
+            Expr::In {
+                expr,
+                target: InTarget::Table { name, .. },
+                ..
+            } => {
+                let (start, _) = self.expression_source_span(expr)?;
+                let range = self.mapped_span(name.span())?;
+                Some((start, range.1))
             }
             Expr::Cast {
                 kind,
@@ -1215,7 +1233,8 @@ impl<'a> AnalysisVisitor<'a> {
                 partitions,
                 json_path,
                 sample,
-                index_hints,
+                index_directives,
+                inheritance,
             } => {
                 if args.is_some()
                     || !with_hints.is_empty()
@@ -1224,7 +1243,8 @@ impl<'a> AnalysisVisitor<'a> {
                     || !partitions.is_empty()
                     || json_path.is_some()
                     || sample.is_some()
-                    || !index_hints.is_empty()
+                    || !index_directives.is_empty()
+                    || inheritance.is_some()
                 {
                     return None;
                 }
@@ -1672,6 +1692,12 @@ impl<'a> AnalysisVisitor<'a> {
             sqlparser::ast::JoinConstraint::Using(columns) => {
                 let first = self.mapped_span(columns.first()?.span())?;
                 let last = self.mapped_span(columns.last()?.span())?;
+                self.matching_parentheses(first.0, last.1, relation_end)
+                    .map(|pair| pair.end)
+            }
+            sqlparser::ast::JoinConstraint::UsingAlias(columns, alias) => {
+                let first = self.mapped_span(columns.first()?.span())?;
+                let last = self.mapped_span(alias.span)?;
                 self.matching_parentheses(first.0, last.1, relation_end)
                     .map(|pair| pair.end)
             }
@@ -2288,14 +2314,16 @@ impl Visitor for AnalysisVisitor<'_> {
                     );
                 }
             }
-            Expr::InList {
-                expr: inner, list, ..
+            Expr::In {
+                expr: left,
+                target: InTarget::List(list),
+                ..
             } => {
                 self.list_edits("remove-in_list", list, |visitor, item| {
                     visitor.expression_source_span(item)
                 });
                 if let Some((start, end)) = self.expression_source_span(expr) {
-                    if let Some(replacement) = self.expression_source_slice(inner) {
+                    if let Some(replacement) = self.expression_source_slice(left) {
                         self.add_edit_bytes(
                             start,
                             end,
@@ -2315,9 +2343,13 @@ impl Visitor for AnalysisVisitor<'_> {
                     }
                 }
             }
-            Expr::InSubquery { expr: inner, .. } => {
+            Expr::In {
+                expr: left,
+                target: InTarget::Subquery(_),
+                ..
+            } => {
                 if let Some((start, end)) = self.expression_source_span(expr) {
-                    if let Some(replacement) = self.expression_source_slice(inner) {
+                    if let Some(replacement) = self.expression_source_slice(left) {
                         self.add_edit_bytes(
                             start,
                             end,
