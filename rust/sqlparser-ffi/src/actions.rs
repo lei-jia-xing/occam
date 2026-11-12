@@ -759,6 +759,7 @@ fn constraint_from_table(
                 .map(|name| canonical_ident(name, rules, ir::IdentifierClass::Other)),
             index: canonical_ident(&using.index_name, rules, ir::IdentifierClass::Other),
             primary: true,
+            schema_placement: index_schema_placement(dialect),
         }),
         TableConstraint::UniqueUsingIndex(using) => Some(ir::Constraint::UsingIndex {
             name: using
@@ -767,6 +768,7 @@ fn constraint_from_table(
                 .map(|name| canonical_ident(name, rules, ir::IdentifierClass::Other)),
             index: canonical_ident(&using.index_name, rules, ir::IdentifierClass::Other),
             primary: false,
+            schema_placement: index_schema_placement(dialect),
         }),
     }
 }
@@ -900,30 +902,33 @@ fn table_definition(
     })
 }
 
-fn table_transactional(dialect: DialectKind, temporary: bool) -> Option<bool> {
-    match dialect {
-        DialectKind::MySql => Some(!temporary),
-        DialectKind::Oracle
-        | DialectKind::ClickHouse
-        | DialectKind::Hive
-        | DialectKind::Spark
-        | DialectKind::Databricks
-        | DialectKind::Snowflake => Some(false),
-        _ => Some(true),
+fn table_transactional(dialect: DialectKind, temporary: bool) -> bool {
+    if dialect == DialectKind::MySql {
+        !temporary
+    } else {
+        !matches!(
+            dialect,
+            DialectKind::Oracle
+                | DialectKind::ClickHouse
+                | DialectKind::Hive
+                | DialectKind::Spark
+                | DialectKind::Databricks
+                | DialectKind::Snowflake
+        )
     }
 }
 
-fn sequence_transactional(dialect: DialectKind) -> Option<bool> {
-    match dialect {
+fn sequence_transactional(dialect: DialectKind) -> bool {
+    !matches!(
+        dialect,
         DialectKind::Oracle
-        | DialectKind::MySql
-        | DialectKind::ClickHouse
-        | DialectKind::Hive
-        | DialectKind::Spark
-        | DialectKind::Databricks
-        | DialectKind::Snowflake => Some(false),
-        _ => Some(true),
-    }
+            | DialectKind::MySql
+            | DialectKind::ClickHouse
+            | DialectKind::Hive
+            | DialectKind::Spark
+            | DialectKind::Databricks
+            | DialectKind::Snowflake
+    )
 }
 
 fn index_ref(name: &ir::Name, table: Option<&ir::NameRef>, dialect: DialectKind) -> ir::IndexRef {
@@ -2513,6 +2518,7 @@ fn alter_change(
                 ops.push(ir::CatalogOp::Rename(ir::RenameOp::Relation {
                     from: table.clone(),
                     to: qualify_rename(&table.name, name),
+                    index_schema_placement: index_schema_placement(dialect),
                 }));
             } else {
                 barriers.push(relation_barrier(
@@ -2618,7 +2624,7 @@ pub(super) fn analyze_statement(
     }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
-    let transactional = sequence_transactional(dialect).unwrap_or(true);
+    let transactional = sequence_transactional(dialect);
     for sequence in sequence_writes_for_statement(statement, dialect, rules) {
         facts
             .ops
@@ -2923,6 +2929,7 @@ pub(super) fn analyze_statement(
                             .push(ir::CatalogOp::Rename(ir::RenameOp::Relation {
                                 from: from.clone(),
                                 to: qualify_rename(&from.name, to),
+                                index_schema_placement: index_schema_placement(dialect),
                             }));
                     }
                     _ => facts.barriers.push(global_barrier(

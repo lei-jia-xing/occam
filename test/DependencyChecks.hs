@@ -135,7 +135,7 @@ isTruncateKind TruncateWrite {} = True
 isTruncateKind _ = False
 
 defaultSessionInit :: SessionInit
-defaultSessionInit = SessionInit [] [] Nothing True Nothing Map.empty
+defaultSessionInit = SessionInit [] [] Nothing True True Map.empty
 
 -- ----------------------------------------------------------------------------
 -- Tests
@@ -383,6 +383,7 @@ tests =
                 ( RenameRelation
                     (ref ["accounting", "old_name"])
                     (objectName ["accounting", "new_name"])
+                    IndexTableSchema
                     `elem` renamesFor (StatementId 3) graph
                 )
             assertBool
@@ -391,6 +392,37 @@ tests =
             assertBool
                 "later query depends on rename"
                 (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+        , testCase "relation renames carry the frontend index placement" $ do
+            let oracleSql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA s;"
+                        , "CREATE TABLE s.t (a INT);"
+                        , "ALTER TABLE s.t RENAME TO u;"
+                        ]
+                postgresSql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA s;"
+                        , "CREATE TABLE s.t (a INT);"
+                        , "ALTER TABLE s.t RENAME TO u;"
+                        ]
+            oracleGraph <- analyze Oracle oracleSql
+            postgresGraph <- analyze PostgreSQL postgresSql
+            assertBool
+                "Oracle renames record current-schema index placement"
+                ( RenameRelation
+                    (ref ["S", "T"])
+                    (objectName ["S", "U"])
+                    IndexCurrentSchema
+                    `elem` renamesFor (StatementId 3) oracleGraph
+                )
+            assertBool
+                "PostgreSQL renames record table-schema index placement"
+                ( RenameRelation
+                    (ref ["s", "t"])
+                    (objectName ["s", "u"])
+                    IndexTableSchema
+                    `elem` renamesFor (StatementId 3) postgresGraph
+                )
         , testCase "temporary tables shadow unqualified names, not explicit schemas" $ do
             let sql =
                     BSC.unlines
@@ -691,7 +723,7 @@ tests =
                     TableDef
                         (objectName ["t"])
                         False
-                        Nothing
+                        True
                         [ColumnDef (Ident "id") False False False []]
                         []
                         []
@@ -1238,7 +1270,9 @@ tests =
                 ( case opsFor (StatementId 3) graph of
                     [AlterTableOp alter] ->
                         case alterTableChanges alter of
-                            [AddConstraint (UsingIndexConstraint (Just (Ident "t_pk")) (Ident "t_id_idx") PrimaryIndex)] -> True
+                            [ AddConstraint
+                                    (UsingIndexConstraint (Just (Ident "t_pk")) (Ident "t_id_idx") PrimaryIndex IndexTableSchema)
+                                ] -> True
                             _ -> False
                     _ -> False
                 )
@@ -1257,6 +1291,20 @@ tests =
             assertBool
                 "a read of the coupled column depends on the update through the schema-local index constraint"
                 (has (StatementId 6) (dependenciesFor (StatementId 7) graph))
+        , testCase "USING INDEX resolves an Oracle current-schema index" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA s;"
+                        , "CREATE TABLE s.t (a INT, b INT);"
+                        , "CREATE UNIQUE INDEX idx ON s.t (a, b);"
+                        , "ALTER TABLE s.t ADD PRIMARY KEY USING INDEX idx;"
+                        , "UPDATE s.t SET a = 1;"
+                        , "SELECT b FROM s.t;"
+                        ]
+            graph <- analyze Oracle sql
+            assertBool
+                "a read of the coupled column depends on the update through the current-schema index constraint"
+                (has (StatementId 5) (dependenciesFor (StatementId 6) graph))
         , testCase "DROP SCHEMA RESTRICT keeps a non-empty schema intact" $ do
             let sql =
                     BSC.unlines
@@ -1485,6 +1533,32 @@ tests =
             assertBool
                 "the default enabled state keeps the cascade after reset"
                 (has (StatementId 5) enabledDeps)
+        , testCase "SQLite foreign keys default to disabled" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+                enabledSql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "PRAGMA foreign_keys = 1;"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+            defaultGraph <- analyze SQLite sql
+            enabledGraph <- analyze SQLite enabledSql
+            let defaultDeps = dependenciesFor (StatementId 4) defaultGraph
+                enabledDeps' = dependenciesFor (StatementId 5) enabledGraph
+            assertBool
+                "the SQLite default does not cascade the parent delete"
+                (not (has (StatementId 3) defaultDeps))
+            assertBool
+                "an explicit PRAGMA foreign_keys = 1 restores cascading"
+                (has (StatementId 4) enabledDeps')
         , testCase "plain view definitions bind schema while later reads follow data" $ do
             let sql =
                     BSC.unlines

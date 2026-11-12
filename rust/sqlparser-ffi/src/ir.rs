@@ -25,8 +25,8 @@ pub struct ServerConfig {
     pub current_user: Option<String>,
     #[serde(default = "default_true")]
     pub autocommit: bool,
-    /// Initial `foreign_key_checks`/`foreign_keys` session setting, when the
-    /// caller knows it explicitly. `None` means the server default (`true`).
+    /// Initial `foreign_key_checks`/`foreign_keys` session setting. `None`
+    /// uses the dialect's server default.
     pub foreign_key_checks: Option<bool>,
     pub variables: BTreeMap<String, String>,
     /// MySQL `lower_case_table_names`: 0 = case-sensitive, 1 = stored lower,
@@ -103,7 +103,8 @@ pub struct SessionInit {
     pub search_path: Vec<SearchPathEntry>,
     pub current_user: Option<Ident>,
     pub autocommit: bool,
-    pub foreign_key_checks: Option<bool>,
+    /// Concrete initial value after applying the dialect's server default.
+    pub foreign_key_checks: bool,
     pub variables: BTreeMap<String, String>,
 }
 
@@ -140,7 +141,7 @@ pub enum CatalogOp {
 pub struct TableDef {
     pub name: Name,
     pub temporary: bool,
-    pub transactional: Option<bool>,
+    pub transactional: bool,
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<Constraint>,
     pub sources: Vec<ReadFact>,
@@ -187,6 +188,8 @@ pub enum Constraint {
         name: Option<Ident>,
         index: Ident,
         primary: bool,
+        /// Where an unqualified index name is resolved.
+        schema_placement: IndexSchemaPlacement,
     },
     Other {
         name: Option<Ident>,
@@ -332,7 +335,7 @@ pub enum TriggerEffect {
 pub struct SequenceDef {
     pub name: Name,
     pub temporary: bool,
-    pub transactional: Option<bool>,
+    pub transactional: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -487,6 +490,8 @@ pub enum RenameOp {
     Relation {
         from: NameRef,
         to: Name,
+        /// Where an unqualified index owned by the table is resolved.
+        index_schema_placement: IndexSchemaPlacement,
     },
     Column {
         table: NameRef,
