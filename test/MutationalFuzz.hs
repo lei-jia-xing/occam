@@ -29,7 +29,13 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.Char (toUpper)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), StatementUnit (..), parseSQL)
+import Occam.Parser (
+    ParsedSQL (..),
+    SQLDialect (..),
+    StatementUnit (..),
+    defaultParseOptions,
+    parseSQL,
+ )
 import Occam.Reducer (oracleFromPredicate, reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
@@ -359,7 +365,7 @@ compositeMutate initialSQL = do
 
 checkParserValidity :: SQLDialect -> ByteString -> IO Bool
 checkParserValidity dialect sql = do
-    result <- parseSQL dialect sql
+    result <- parseSQL (defaultParseOptions dialect) sql
     pure $ case result of
         Left _ -> False
         Right parsed -> all validUnit (parsedUnits parsed)

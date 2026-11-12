@@ -1,24 +1,36 @@
 use crate::actions::analyze_statement;
-use crate::source::{dialect, token_positions, ByteSpan, SourceMap, TokenKind};
+use crate::edits::AnalysisContext;
+use crate::ir::{IdentifierRules, ParseConfig};
+use crate::source::{ByteSpan, SourceMap, TokenKind, dialect, token_positions};
 use crate::{DialectKind, NativeUnit};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
-pub(super) fn parse_units(source: &str, kind: DialectKind) -> Result<Vec<NativeUnit>, String> {
+pub(super) fn parse_units(source: &str, config: &ParseConfig) -> Result<Vec<NativeUnit>, String> {
     let mut units = Vec::new();
-    walk_units(source, kind, true, |unit| units.push(unit))?;
+    walk_units(source, config, true, |unit| units.push(unit))?;
     Ok(units)
 }
 
 pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, String> {
-    walk_units(source, kind, false, |_| {})
+    walk_units(
+        source,
+        &ParseConfig {
+            dialect: kind,
+            server: Default::default(),
+        },
+        false,
+        |_| {},
+    )
 }
 
 fn walk_units(
     source: &str,
-    kind: DialectKind,
+    config: &ParseConfig,
     detailed: bool,
     mut emit: impl FnMut(NativeUnit),
 ) -> Result<usize, String> {
+    let kind = config.dialect;
+    let rules = IdentifierRules::for_dialect(kind, &config.server);
     let dialect = dialect(kind);
     let mut tokenizer = Tokenizer::new(dialect, source);
     let mut tokens = Vec::new();
@@ -151,15 +163,24 @@ fn walk_units(
             let facts = if has_parse_error {
                 None
             } else {
+                let statement = statement.as_ref().ok_or_else(|| {
+                    "sqlparser returned no statement for error-free unit".to_string()
+                })?;
+                let source_map = source_map
+                    .as_ref()
+                    .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
                 let token_start = positions.partition_point(|token| token.start < start);
                 let token_end = positions.partition_point(|token| token.end <= end);
                 let facts = analyze_statement(
-                    statement.as_ref().unwrap(),
-                    kind,
-                    source,
-                    source_map.as_ref().unwrap(),
-                    &positions[token_start..token_end],
-                    ByteSpan { start, end },
+                    statement,
+                    AnalysisContext {
+                        dialect: kind,
+                        rules: &rules,
+                        source,
+                        source_map,
+                        tokens: &positions[token_start..token_end],
+                        unit: ByteSpan { start, end },
+                    },
                 );
                 for edit in &facts.edits {
                     if edit.start < start

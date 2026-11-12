@@ -16,6 +16,7 @@ import Occam.Parser (
     ParserErrorKind (..),
     SQLDialect (..),
     countStatements,
+    defaultParseOptions,
     parseSQL,
  )
 import Occam.Reducer (
@@ -44,11 +45,11 @@ tests =
                         , "CREATE TABLE unrelated (id INT);"
                         , "SELECT needed.id FROM needed;"
                         ]
-            result <- parseSQL SQLite sql
+            result <- parseSQL (defaultParseOptions SQLite) sql
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed -> do
-                    let graph = analyzeStatements (parsedUnits parsed)
+                    let graph = analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed)
                         dependencies = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
                     assertBool "query should depend on its referenced table" (Set.member (StatementId 1) dependencies)
                     assertBool

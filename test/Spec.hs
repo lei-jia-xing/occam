@@ -24,17 +24,25 @@ import Occam.Cache (
     memoizeOracleWith,
  )
 import Occam.Core (
-    ActionTarget (..),
-    DependencyType (..),
-    ObjectAction (..),
-    ObjectKind (..),
-    ObjectName (..),
+    CatalogOp (..),
+    ColumnDef (..),
+    ConflictAction (..),
+    DataWrite (..),
+    Ident (..),
+    Name (..),
+    NameRef (..),
+    ReadFact (..),
+    ReadMode (..),
+    SemanticFacts (..),
+    SessionInit (..),
     StatementId (..),
-    targetObjectName,
+    TableDef (..),
+    WriteKind (..),
+    nameText,
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Logger (nullLogger)
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), parseSQL)
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
 import Occam.Reducer
 import Occam.Slicer
 import OracleChecks qualified
@@ -67,6 +75,13 @@ import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
+
+emptySemanticFacts :: SemanticFacts
+emptySemanticFacts = SemanticFacts [] [] [] [] []
+
+isTruncateKind :: WriteKind -> Bool
+isTruncateKind TruncateWrite {} = True
+isTruncateKind _ = False
 
 main :: IO ()
 main = defaultMain tests
@@ -154,19 +169,16 @@ phase2Tests =
                         ]
             withGraph GenericSQL script $ \graph -> do
                 let queryId = StatementId 4
-                    queryActions = Map.findWithDefault [] queryId (graphActions graph)
+                    queryFacts = Map.findWithDefault emptySemanticFacts queryId (graphFacts graph)
                     uses =
                         Set.fromList
-                            [ name
-                            | action <- queryActions
-                            , actionType action == UseDep
-                            , actionKind action == TableObject
-                            , Just name <- [targetObjectName (actionTarget action)]
+                            [ nameText (nameRefName (readSource readFact))
+                            | ReadOp readFact <- factOps queryFacts
                             ]
                     deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
                 assertEqual
                     "Only external base tables are query reads"
-                    (Set.fromList [ObjectName ["base_a"], ObjectName ["base_b"], ObjectName ["base_c"]])
+                    (Set.fromList ["base_a", "base_b", "base_c"])
                     uses
                 assertEqual
                     "Query depends on each referenced base table definition"
@@ -521,17 +533,17 @@ phase7Tests =
                         , "INSERT INTO `items` VALUES (1, 2) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`);"
                         ]
             withGraph MySQL script $ \graph -> do
-                let actionsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                let factsS2 = Map.findWithDefault emptySemanticFacts (StatementId 2) (graphFacts graph)
                     depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    writes = [write | WriteDataOp write <- factOps factsS2]
                 assertBool
-                    "INSERT ... ON DUPLICATE KEY UPDATE should record ModDep on items"
+                    "INSERT ... ON DUPLICATE KEY UPDATE should record a conflict-update write on items"
                     ( any
-                        ( \act ->
-                            actionKind act == TableObject
-                                && actionType act == ModDep
-                                && actionTarget act == ObjectTarget (ObjectName ["items"])
+                        ( \write ->
+                            dataWriteTarget write == NameRef (Name [Ident "items"]) False
+                                && dataWriteKind write == InsertWrite ConflictUpdate
                         )
-                        actionsS2
+                        writes
                     )
                 assertBool
                     "INSERT ... ON DUPLICATE KEY UPDATE should depend on CREATE TABLE"
@@ -606,22 +618,29 @@ phase7Tests =
                         , "TRUNCATE TABLE items;"
                         ]
             withGraph SQLite script $ \graph -> do
-                let actsS2 = Map.findWithDefault [] (StatementId 2) (graphActions graph)
+                let factsS2 = Map.findWithDefault emptySemanticFacts (StatementId 2) (graphFacts graph)
                     depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
+                    writes = [write | WriteDataOp write <- factOps factsS2]
                 assertBool
-                    "TRUNCATE should have ModDep on items"
-                    (any (\a -> actionType a == ModDep && actionTarget a == ObjectTarget (ObjectName ["items"])) actsS2)
+                    "TRUNCATE should record a truncate write on items"
+                    ( any
+                        ( \write ->
+                            dataWriteTarget write == NameRef (Name [Ident "items"]) False
+                                && isTruncateKind (dataWriteKind write)
+                        )
+                        writes
+                    )
                 assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
         , testCase "DuckDB dialect parses range and list comprehension syntax" $ do
             let script = "SELECT * FROM range(10); SELECT [x + 1 FOR x IN [1, 2, 3]];"
-            result <- parseSQL DuckDB script
+            result <- parseSQL (defaultParseOptions DuckDB) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "DuckDB parses two statement units" 2 (length (parsedUnits parsed))
         , testCase "ClickHouse dialect parses numbers and engine clauses" $ do
             let script = "CREATE TABLE t (id UInt64) ENGINE = MergeTree() ORDER BY id; SELECT number FROM numbers(5);"
-            result <- parseSQL ClickHouse script
+            result <- parseSQL (defaultParseOptions ClickHouse) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
@@ -632,28 +651,28 @@ phase7Tests =
                     \CREATE TABLE emp (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100));\n\
                     \SELECT a.id, b.name FROM a, b WHERE a.id = b.id(+);\n\
                     \SELECT id, name FROM emp START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id;"
-            result <- parseSQL Oracle script
+            result <- parseSQL (defaultParseOptions Oracle) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "Oracle parses four statement units" 4 (length (parsedUnits parsed))
         , testCase "MsSql dialect parses bracketed identifiers and TOP clauses" $ do
             let script = "SELECT TOP 10 [id], [val] FROM [dbo].[my_table];\nSELECT 1;"
-            result <- parseSQL MsSql script
+            result <- parseSQL (defaultParseOptions MsSql) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "MsSql parses two statement units" 2 (length (parsedUnits parsed))
         , testCase "BigQuery dialect parses backtick qualified identifiers" $ do
             let script = "SELECT `x` FROM `project.dataset.table`;\nSELECT 42;"
-            result <- parseSQL BigQuery script
+            result <- parseSQL (defaultParseOptions BigQuery) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
                     assertEqual "BigQuery parses two statement units" 2 (length (parsedUnits parsed))
         , testCase "Snowflake dialect parses double-quoted identifiers" $ do
             let script = "SELECT \"ColA\" FROM \"Db\".\"Schema\".\"MyTable\";\nSELECT 1;"
-            result <- parseSQL Snowflake script
+            result <- parseSQL (defaultParseOptions Snowflake) script
             case result of
                 Left err -> assertFailure ("SQL parser transport error: " ++ show err)
                 Right parsed ->
@@ -662,10 +681,10 @@ phase7Tests =
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()
 withGraph dialect source action = do
-    result <- parseSQL dialect source
+    result <- parseSQL (defaultParseOptions dialect) source
     case result of
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-        Right parsed -> action (analyzeStatements (parsedUnits parsed))
+        Right parsed -> action (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
 -- ----------------------------------------------------------------------------
 -- Phase 8: Baselines & Benchmark Runner
@@ -725,35 +744,77 @@ phase8Tests =
 -- Property Tests: Invariants of Reducer & DAG
 -- ----------------------------------------------------------------------------
 
-data ArbitraryAction = ArbitraryAction !ObjectKind !DependencyType !T.Text
+data ArbitraryFact
+    = DefineTableFact !T.Text
+    | WriteTableFact !T.Text
+    | ReadTableFact !T.Text
     deriving (Eq, Show)
 
-instance Arbitrary ArbitraryAction where
+instance Arbitrary ArbitraryFact where
     arbitrary = do
-        k <- elements [TableObject, ColumnObject, IndexObject, ViewObject, BarrierObject]
-        t <- elements [DefDep, UseDep, ModDep, BarrierDep]
-        name <- elements ["t1", "t2", "t3", "v1", "c1", "__barrier__"]
-        pure (ArbitraryAction k t name)
+        name <- elements ["t1", "t2", "t3"]
+        oneof
+            [ pure (DefineTableFact name)
+            , pure (WriteTableFact name)
+            , pure (ReadTableFact name)
+            ]
 
-toObjectAction :: ArbitraryAction -> ObjectAction
-toObjectAction (ArbitraryAction k t name) = ObjectAction k t (ObjectTarget (ObjectName [name]))
+factOp :: ArbitraryFact -> CatalogOp
+factOp fact =
+    case fact of
+        DefineTableFact name ->
+            DefineTableOp
+                TableDef
+                    { tableName = Name [Ident name]
+                    , tableTemporary = False
+                    , tableTransactional = Nothing
+                    , tableColumns = [ColumnDef (Ident "id") False False False []]
+                    , tableConstraints = []
+                    , tableSources = []
+                    , tableLike = Nothing
+                    , tableOnCommit = Nothing
+                    , tableIfNotExists = False
+                    , tableOrReplace = False
+                    }
+        WriteTableFact name ->
+            WriteDataOp
+                DataWrite
+                    { dataWriteTarget = NameRef (Name [Ident name]) False
+                    , dataWriteKind = InsertWrite ConflictError
+                    , dataWriteColumns = []
+                    , dataWriteUnqualifiedColumns = []
+                    , dataWriteReads = []
+                    }
+        ReadTableFact name ->
+            ReadOp
+                ReadFact
+                    { readSource = NameRef (Name [Ident name]) False
+                    , readMode = ReadData
+                    , readColumns = []
+                    }
 
-newtype SmallActionGraph = SmallActionGraph [[ArbitraryAction]]
+newtype SmallFactGraph = SmallFactGraph [[ArbitraryFact]]
     deriving (Show)
 
-instance Arbitrary SmallActionGraph where
+instance Arbitrary SmallFactGraph where
     arbitrary = do
         statementCount <- chooseInt (2, 8)
-        SmallActionGraph <$> vectorOf statementCount (resize 8 arbitrary)
-    shrink (SmallActionGraph statements) =
-        [SmallActionGraph smaller | smaller <- shrink statements, not (null smaller)]
+        SmallFactGraph <$> vectorOf statementCount (resize 8 arbitrary)
+    shrink (SmallFactGraph statements) =
+        [SmallFactGraph smaller | smaller <- shrink statements, not (null smaller)]
 
-buildActionGraph :: [[ArbitraryAction]] -> DependencyGraph
-buildActionGraph rawActions =
+buildFactGraph :: [[ArbitraryFact]] -> DependencyGraph
+buildFactGraph rawFacts =
     buildGraph
-        [ (StatementId sid, map toObjectAction actions)
-        | (sid, actions) <- zip [1 ..] rawActions
+        defaultSessionInit
+        [ ( StatementId sid
+          , emptySemanticFacts {factOps = map factOp facts}
+          )
+        | (sid, facts) <- zip [1 ..] rawFacts
         ]
+
+defaultSessionInit :: SessionInit
+defaultSessionInit = SessionInit [] [] Nothing True Nothing Map.empty
 
 -- Data.Graph independently computes reachability along each statement's predecessors.
 backwardReachabilityOracle ::
@@ -777,9 +838,9 @@ backwardReachabilityOracle dependencyGraph =
      in Map.fromSet reachableFrom (graphStmts dependencyGraph)
 
 -- Prop 1: DAG Acyclicity
-prop_dagAcyclicity :: [[ArbitraryAction]] -> Property
-prop_dagAcyclicity rawActions =
-    let graph = buildActionGraph rawActions
+prop_dagAcyclicity :: [[ArbitraryFact]] -> Property
+prop_dagAcyclicity rawFacts =
+    let graph = buildFactGraph rawFacts
         edges = Map.toList (graphEdges graph)
         strictlyBackwards (StatementId j, preds) =
             all (\(StatementId i) -> i < j) (Set.toList preds)
@@ -788,9 +849,9 @@ prop_dagAcyclicity rawActions =
             (all strictlyBackwards edges)
 
 -- Prop 2: Backward slices exactly match graph reachability
-prop_backwardSliceSoundness :: SmallActionGraph -> Property
-prop_backwardSliceSoundness (SmallActionGraph rawActions) =
-    let graph = buildActionGraph rawActions
+prop_backwardSliceSoundness :: SmallFactGraph -> Property
+prop_backwardSliceSoundness (SmallFactGraph rawFacts) =
+    let graph = buildFactGraph rawFacts
         expectedByTarget = backwardReachabilityOracle graph
         mismatches =
             [ (target, Set.difference expected actual, Set.difference actual expected)
@@ -808,9 +869,9 @@ prop_backwardSliceSoundness (SmallActionGraph rawActions) =
             (null mismatches)
 
 -- Prop 2b: Set closure exactly matches reachability for every valid root subset
-prop_closeSetReachability :: SmallActionGraph -> Property
-prop_closeSetReachability (SmallActionGraph rawActions) =
-    let graph = buildActionGraph rawActions
+prop_closeSetReachability :: SmallFactGraph -> Property
+prop_closeSetReachability (SmallFactGraph rawFacts) =
+    let graph = buildFactGraph rawFacts
         expectedByTarget = backwardReachabilityOracle graph
         rootSets = map Set.fromList (subsequences (Set.toList (graphStmts graph)))
         mismatches =

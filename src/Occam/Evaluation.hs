@@ -98,6 +98,7 @@ parseEvaluationStatusName "validation-incomplete" = Just EvaluationValidationInc
 parseEvaluationStatusName _ = Nothing
 
 instance ToJSON EvaluationStatus where
+    toJSON :: EvaluationStatus -> Value
     toJSON = toJSON . evaluationStatusName
 
 instance FromJSON EvaluationStatus where
@@ -119,6 +120,7 @@ parseMinimalityClaimName "not-established" = Just MinimalityNotEstablished
 parseMinimalityClaimName _ = Nothing
 
 instance ToJSON MinimalityClaim where
+    toJSON :: MinimalityClaim -> Value
     toJSON = toJSON . minimalityClaimName
 
 instance FromJSON MinimalityClaim where
@@ -172,7 +174,7 @@ data EvaluationPoint = EvaluationPoint
     { pointElapsedSeconds :: !Double
     , pointCallIndex :: !Int
     , pointCandidateBytes :: !Int
-    , pointCandidateStatements :: !Int
+    , pointCandidateStatements :: !(Maybe Int)
     , pointCandidateTokens :: !(Maybe Int)
     , pointCacheHit :: !Bool
     , pointAccepted :: !Bool
@@ -375,15 +377,22 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             before <- getCacheStats
             callIndex <- readIORef callIndexRef
             modifyIORef' callIndexRef (+ 1)
-            statementsResult <- countStatements dialect candidate
-            statements <- case statementsResult of
-                Left err -> ioError (userError ("SQL parser failed while counting statements: " ++ show err))
-                Right count -> pure count
             result <- cachedObservation candidate
             after <- getCacheStats
             let hit = cacheHits after > cacheHits before
                 outcome = oracleOutcome result
                 accepted = outcome == OracleAccepted
+            -- Statement counts are diagnostic only. Parsing every candidate just
+            -- to fill the curve can cost more than the reduction search itself,
+            -- so only pay for the count on candidates that were accepted.
+            statements <-
+                if accepted
+                    then do
+                        statementsResult <- countStatements dialect candidate
+                        pure $ case statementsResult of
+                            Left _ -> Nothing
+                            Right count -> Just count
+                    else pure Nothing
             when (persistCheckpoint && accepted) $ checkpointIfSmaller acceptedRef checkpoint candidate
             now <- ticks
             modifyIORef' curveRef \points ->

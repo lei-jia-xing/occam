@@ -16,7 +16,7 @@ cabal run occam -- input.sql \
   --out /tmp/occam-result
 ```
 
-`--reset` is optional. The initial input must pass before reduction. Per-call, total-time, and uncached-execution budgets include the initial and final checks; when budgets permit, Occam performs two uncached final validations. On exhaustion, it preserves the last accepted SQL and reports a nonzero status. `stats.json` reports available measurements; tokens can be unknown.
+`--reset` is optional. The initial input must pass before reduction. Per-call, total-time, and uncached-execution budgets include the initial and final checks; when budgets permit, Occam performs two uncached final validations. On exhaustion, it preserves the last accepted SQL and reports a nonzero status. `stats.json` reports available measurements; per-candidate statement counts and tokens can be unknown.
 
 `stats.json`'s `evaluation_metrics` keeps reset timings distinct: `evaluationPreflightResetSeconds` (initial/preflight), `evaluationResetSeconds` (reduction), and `evaluationValidationResetSeconds` (final validation); `evaluationPreflightOracleSeconds` records initial predicate time. Sum reset phases once; unavailable optional preflight measurements serialize as `null`. Final-validation wall time is reserved only for calls actually scheduled, so zero scheduled calls reserve zero. If initial preflight consumes the execution cap, Occam reports `execution-budget`, performs no reduction/final calls, and preserves the accepted checkpoint.
 

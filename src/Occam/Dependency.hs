@@ -1,38 +1,90 @@
+{-# LANGUAGE RecordWildCards #-}
+
 module Occam.Dependency (
-    ObjectName,
-    ObjectKind (..),
-    DependencyType (..),
-    ObjectAction (..),
     DependencyGraph (..),
     emptyGraph,
-    isBarrierAction,
-    extractActions,
     buildGraph,
     analyzeStatements,
 ) where
 
+import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Occam.Core (
-    ActionTarget (..),
+    AlterChange (..),
+    AlterTable (..),
     BarrierReason (..),
-    DependencyType (..),
-    ObjectAction (..),
-    ObjectKind (..),
-    ObjectName (..),
+    BarrierScope (..),
+    BeginPolicy (..),
+    CatalogOp (..),
+    ColumnDef (..),
+    ConflictAction (..),
+    Constraint (..),
+    ConstraintRef (..),
+    ConstraintValidity (..),
+    DataWrite (..),
+    DeleteScope (..),
+    DmlEvent (..),
+    DropMode (..),
+    DropObject (..),
+    DropOp (..),
+    ForeignKey (..),
+    Ident (..),
+    IndexDef (..),
+    IndexRef (..),
+    IndexRole (..),
+    IndexSchemaPlacement (..),
+    Name (..),
+    NameRef (..),
+    OnCommitAction (..),
+    ReadFact (..),
+    ReadMode (..),
+    ReferentialAction (..),
+    RefreshOp (..),
+    RelationKind (..),
+    RenameOp (..),
+    SchemaDef (..),
+    ScopedBarrier (..),
+    SearchPathEntry (..),
+    SearchPathValue (..),
+    SemanticFacts (..),
+    SequenceDef (..),
+    SequenceWrite (..),
+    SessionEffect (..),
+    SessionInit (..),
+    SessionScope (..),
+    SessionValue (..),
     Statement (..),
     StatementId (..),
-    targetObjectName,
+    TableDef (..),
+    TriggerBody (..),
+    TriggerDef (..),
+    TriggerEffect (..),
+    TriggerEvent (..),
+    TriggerRef (..),
+    TriggerTiming (..),
+    TruncateBehavior (..),
+    TruncateIdentity (..),
+    TxEffect (..),
+    TypeDef (..),
+    ViewDef (..),
+    WriteKind (..),
+    nameText,
  )
+import Occam.Core qualified as Core
 import Occam.Parser (StatementFacts (..), StatementUnit (..))
+
+-- ----------------------------------------------------------------------------
+-- Public graph
+-- ----------------------------------------------------------------------------
 
 data DependencyGraph = DependencyGraph
     { graphStmts :: !(Set StatementId)
-    , graphActions :: !(Map StatementId [ObjectAction])
+    , graphFacts :: !(Map StatementId SemanticFacts)
     , graphEdges :: !(Map StatementId (Set StatementId))
     , graphBarrierActions :: !Int
     , graphBarrierStatements :: !Int
@@ -45,7 +97,7 @@ emptyGraph :: DependencyGraph
 emptyGraph =
     DependencyGraph
         { graphStmts = Set.empty
-        , graphActions = Map.empty
+        , graphFacts = Map.empty
         , graphEdges = Map.empty
         , graphBarrierActions = 0
         , graphBarrierStatements = 0
@@ -53,872 +105,4071 @@ emptyGraph =
         , graphEdgeCount = 0
         }
 
-isBarrierAction :: ObjectAction -> Bool
-isBarrierAction act =
-    actionKind act `elem` [BarrierObject, SessionVariableObject]
-        || actionType act == BarrierDep
-
-isSessionAction :: ObjectAction -> Bool
-isSessionAction act = actionKind act == SessionVariableObject
-
--- Canonical names arrive from the frontend as escaped dot-separated
--- identifiers and are parsed into structured parts at the Parser boundary.
-isQualifiedName :: ObjectName -> Bool
-isQualifiedName (ObjectName parts) = length parts > 1
-
-lastNamePart :: ObjectName -> ObjectName
-lastNamePart name@(ObjectName []) = name
-lastNamePart (ObjectName parts) = ObjectName [last parts]
-
-qualifyRename :: ObjectName -> ObjectName -> ObjectName
-qualifyRename (ObjectName oldParts) newName@(ObjectName newParts)
-    | length oldParts > 1 && length newParts <= 1 =
-        ObjectName (init oldParts ++ newParts)
-    | otherwise = newName
-
 -- ----------------------------------------------------------------------------
--- sqlparser-derived facts
+-- Canonical catalog keys
 -- ----------------------------------------------------------------------------
 
-extractActions :: StatementUnit -> [ObjectAction]
-extractActions unit =
-    maybe
-        [ ObjectAction BarrierObject BarrierDep $
-            BarrierTarget
-                ( if isNothing (unitParseError unit)
-                    then UnknownStatementBarrier
-                    else SyntaxErrorBarrier
-                )
-        ]
-        factActions
-        (unitFacts unit)
+data RelationKey = RelationKey
+    { relationKeyTemp :: !Bool
+    , relationKeyName :: !Name
+    }
+    deriving (Eq, Ord, Show)
 
-data TxCommand
-    = TxBegin
-    | TxCommit
-    | TxRollback
-    | TxSavepoint !ObjectName
-    | TxRollbackTo !ObjectName
-    | TxRelease !ObjectName
-    deriving (Eq, Show)
+data IndexKey
+    = NamedIndexKey !Name
+    | TableIndexKey !RelationKey !Ident
+    deriving (Eq, Ord, Show)
 
--- Facts were parsed once with the selected dialect; graph construction stays
--- independent of SQL syntax and retains object generations and transaction snapshots.
-analyzeStatements :: [StatementUnit] -> DependencyGraph
-analyzeStatements units =
-    buildGraph
-        [ (stmtId (unitStatement unit), extractActions unit)
-        | unit <- units
-        ]
+data TriggerKey
+    = NamedTriggerKey !Name
+    | TableTriggerKey !RelationKey !Ident
+    deriving (Eq, Ord, Show)
 
--- ----------------------------------------------------------------------------
--- Dependency DAG Construction
--- ----------------------------------------------------------------------------
+data SequenceKey = SequenceKey
+    { sequenceKeyTemp :: !Bool
+    , sequenceKeyName :: !Name
+    }
+    deriving (Eq, Ord, Show)
 
-{- | Builds dependencies between definitions, reads, writes, and conservative
-   sequence barriers. Definitions replace the current object generation.
--}
-buildGraph :: [(StatementId, [ObjectAction])] -> DependencyGraph
-buildGraph stmtActions =
-    let (_state, edges, barrierEdges, barrierStatements, barrierActions) =
-            foldl' processStmt (initialState, Map.empty, 0, 0, 0) stmtActions
-     in DependencyGraph
-            { graphStmts = Set.fromList (map fst stmtActions)
-            , graphActions = Map.fromList stmtActions
-            , graphEdges = edges
-            , graphBarrierActions = barrierActions
-            , graphBarrierStatements = barrierStatements
-            , graphBarrierEdges = barrierEdges
-            , graphEdgeCount = sum (map Set.size (Map.elems edges))
-            }
+data ConstraintIdentity
+    = NamedConstraint !Ident
+    | UnnamedConstraint !StatementId !Int
+    deriving (Eq, Ord, Show)
+
+data ConstraintKey = ConstraintKey
+    { constraintKeyTable :: !RelationKey
+    , constraintKeyIdentity :: !ConstraintIdentity
+    }
+    deriving (Eq, Ord, Show)
 
 data ObjectKey
-    = ObjectKey !ObjectKind !ObjectName
-    | ColumnKey !ObjectKey !Text
+    = BarrierRelationKey !RelationKey
+    | BarrierIndexKey !IndexKey
+    | BarrierTriggerKey !TriggerKey
+    | BarrierSequenceKey !SequenceKey
+    | BarrierTypeKey !Name
+    | BarrierSchemaKey !Name
+    | BarrierConstraintKey !ConstraintKey
     deriving (Eq, Ord, Show)
 
-data ObjectSource
-    = UnresolvedSource !ObjectName
-    | ResolvedSource !ObjectKey
+data BarrierKey
+    = GlobalBarrierKey
+    | SessionBarrierKey
+    | TransactionBarrierKey
+    | RelationBarrierKey !RelationKey
+    | SchemaBarrierKey !Name
+    | ObjectBarrierKey !ObjectKey
     deriving (Eq, Ord, Show)
 
-data ObjectLifecycle = ObjectLive | ObjectDropped
+-- ----------------------------------------------------------------------------
+-- Catalog state
+-- ----------------------------------------------------------------------------
+
+data RelationState = RelationState
+    { relKind :: !RelationKind
+    , relDefinition :: !(Maybe StatementId)
+    , relColumns :: !(Set Ident)
+    , relDataWrites :: !(Set StatementId)
+    , relColumnWrites :: !(Map Ident (Set StatementId))
+    , relSchemaWrites :: !(Set StatementId)
+    , relRestoredBy :: !(Maybe StatementId)
+    , relSources :: !(Set RelationKey)
+    , relUnresolvedSources :: !(Set NameRef)
+    , -- The reads that defined a view or table source, retaining the columns
+      -- used so column drops can distinguish dependent from unaffected views.
+      relSourceReads :: ![ReadFact]
+    , relOnCommit :: !(Maybe OnCommitAction)
+    , relOnCommitFrameId :: !(Maybe Int)
+    , relTransactional :: !Bool
+    , relIndexes :: !(Set IndexKey)
+    , relTriggers :: !(Set TriggerKey)
+    , relConstraints :: !(Set ConstraintKey)
+    }
     deriving (Eq, Show)
 
-data ObjectState = ObjectState
-    { objectDefinition :: !(Maybe StatementId)
-    , objectLastWrite :: !(Maybe StatementId)
-    , objectRestored :: !(Maybe StatementId)
-    , objectSources :: !(Set ObjectSource)
-    , objectLifecycle :: !ObjectLifecycle
+data IndexState = IndexState
+    { indexDefinition :: !(Maybe StatementId)
+    , indexStateTable :: !(Maybe RelationKey)
+    , indexStateColumns :: ![Ident]
+    , indexRestoredBy :: !(Maybe StatementId)
+    }
+    deriving (Eq, Show)
+
+data TriggerState = TriggerState
+    { triggerDefinition :: !(Maybe StatementId)
+    , triggerStateTable :: !(Maybe RelationKey)
+    , triggerStateTiming :: !TriggerTiming
+    , triggerStateEvents :: ![TriggerEvent]
+    , triggerStateWhenReads :: ![ReadFact]
+    , triggerStateBody :: !TriggerBody
+    , triggerRestoredBy :: !(Maybe StatementId)
+    }
+    deriving (Eq, Show)
+
+data SequenceState = SequenceState
+    { sequenceDefinition :: !(Maybe StatementId)
+    , sequenceWrites :: !(Set StatementId)
+    , sequenceRestoredBy :: !(Maybe StatementId)
+    , sequenceStateTransactional :: !Bool
+    }
+    deriving (Eq, Show)
+
+data ConstraintState = ConstraintState
+    { constraintStateTable :: !RelationKey
+    , constraintDefinition :: !(Maybe StatementId)
+    , constraintValue :: !Constraint
+    , constraintRestoredBy :: !(Maybe StatementId)
+    }
+    deriving (Eq, Show)
+
+data DefinitionState = DefinitionState
+    { definitionStatement :: !(Maybe StatementId)
+    , definitionRestoredBy :: !(Maybe StatementId)
     }
     deriving (Eq, Show)
 
 data Catalog = Catalog
-    { catalogObjects :: !(Map ObjectKey ObjectState)
-    , catalogRelations :: !(Map ObjectKey (Set ObjectKey))
-    , catalogCascades :: !(Map ObjectKey (Set ObjectKey))
+    { catalogRelations :: !(Map RelationKey RelationState)
+    , catalogIndexes :: !(Map IndexKey IndexState)
+    , catalogTriggers :: !(Map TriggerKey TriggerState)
+    , catalogSequences :: !(Map SequenceKey SequenceState)
+    , catalogConstraints :: !(Map ConstraintKey ConstraintState)
+    , catalogTypes :: !(Map Name DefinitionState)
+    , catalogSchemas :: !(Map Name DefinitionState)
+    , catalogNextUnnamedConstraint :: !Int
+    {- ^ Monotonic serial used to give unnamed constraints distinct identities.
+    A per-statement index is not enough: one statement can add several
+    constraints through separate @ADD COLUMN@ changes.
+    -}
     }
     deriving (Eq, Show)
 
-data TxOrigin = TxStartedByBegin | TxStartedBySavepoint
+emptyCatalog :: Catalog
+emptyCatalog =
+    Catalog
+        { catalogRelations = Map.empty
+        , catalogIndexes = Map.empty
+        , catalogTriggers = Map.empty
+        , catalogSequences = Map.empty
+        , catalogConstraints = Map.empty
+        , catalogTypes = Map.empty
+        , catalogSchemas = Map.empty
+        , catalogNextUnnamedConstraint = 0
+        }
+
+newRelation :: RelationKind -> RelationState
+newRelation kind =
+    RelationState
+        { relKind = kind
+        , relDefinition = Nothing
+        , relColumns = Set.empty
+        , relDataWrites = Set.empty
+        , relColumnWrites = Map.empty
+        , relSchemaWrites = Set.empty
+        , relRestoredBy = Nothing
+        , relSources = Set.empty
+        , relUnresolvedSources = Set.empty
+        , relSourceReads = []
+        , relOnCommit = Nothing
+        , relOnCommitFrameId = Nothing
+        , relTransactional = True
+        , relIndexes = Set.empty
+        , relTriggers = Set.empty
+        , relConstraints = Set.empty
+        }
+
+-- ----------------------------------------------------------------------------
+-- Session and transaction state
+-- ----------------------------------------------------------------------------
+
+data SessionState = SessionState
+    { sessNamespacePrefix :: ![Ident]
+    , sessSearchPath :: ![SearchPathEntry]
+    , sessCurrentUser :: !(Maybe Ident)
+    , -- The user that authenticated the connection. `RESET SESSION
+      -- AUTHORIZATION` restores both users from it.
+      sessAuthenticatedUser :: !(Maybe Ident)
+    , -- The current session_user, changed by `SET SESSION AUTHORIZATION`.
+      sessSessionUser :: !(Maybe Ident)
+    , sessAutocommit :: !Bool
+    , sessVariables :: !(Map Text SessionValue)
+    , sessForeignKeyChecks :: !Bool
+    , -- The configured start value, restored by RESET foreign_keys and RESET ALL.
+      sessInitialForeignKeyChecks :: !Bool
+    , sessTxNamespacePrefix :: !(Maybe [Ident])
+    , sessTxSearchPath :: !(Maybe [SearchPathEntry])
+    , sessTxSessionUser :: !(Maybe (Maybe Ident))
+    , sessTxCurrentUser :: !(Maybe (Maybe Ident))
+    , sessTxVariables :: !(Map Text SessionValue)
+    }
     deriving (Eq, Show)
 
+sessionFromInit :: SessionInit -> SessionState
+sessionFromInit SessionInit {..} =
+    SessionState
+        { sessNamespacePrefix = sessionNamespacePrefix
+        , sessSearchPath = sessionSearchPath
+        , sessCurrentUser = sessionCurrentUser
+        , sessAuthenticatedUser = sessionCurrentUser
+        , sessSessionUser = sessionCurrentUser
+        , sessAutocommit = sessionAutocommit
+        , sessVariables = Map.map SessionText sessionVariables
+        , sessForeignKeyChecks = initialForeignKeyChecks
+        , sessInitialForeignKeyChecks = initialForeignKeyChecks
+        , sessTxNamespacePrefix = Nothing
+        , sessTxSearchPath = Nothing
+        , sessTxSessionUser = Nothing
+        , sessTxCurrentUser = Nothing
+        , sessTxVariables = Map.empty
+        }
+    where
+        initialForeignKeyChecks = fromMaybe True sessionForeignKeyChecks
+
+effectiveNamespacePrefix :: SessionState -> [Ident]
+effectiveNamespacePrefix state =
+    fromMaybe (sessNamespacePrefix state) (sessTxNamespacePrefix state)
+
+effectiveCurrentUser :: SessionState -> Maybe Ident
+effectiveCurrentUser state =
+    fromMaybe (sessCurrentUser state) (sessTxCurrentUser state)
+
+effectiveSessionUser :: SessionState -> Maybe Ident
+effectiveSessionUser state =
+    fromMaybe (sessSessionUser state) (sessTxSessionUser state)
+
+{- | Resolve the symbolic search path against the current user. An empty list
+means "unknown" and makes unqualified resolution conservative, as does an
+unresolved @$user@ entry.
+-}
+effectiveSearchPath :: SessionState -> [Name]
+effectiveSearchPath state =
+    case fromMaybe (sessSearchPath state) (sessTxSearchPath state) of
+        [] -> []
+        entries -> fromMaybe [] (traverse resolveEntry entries)
+    where
+        resolveEntry (SearchPathName name) = Just name
+        resolveEntry SearchPathCurrentUser =
+            Name . pure <$> effectiveCurrentUser state
+
+clearTransactionSession :: SessionState -> SessionState
+clearTransactionSession state =
+    state
+        { sessTxNamespacePrefix = Nothing
+        , sessTxSearchPath = Nothing
+        , sessTxSessionUser = Nothing
+        , sessTxCurrentUser = Nothing
+        , sessTxVariables = Map.empty
+        }
+
 data Savepoint = Savepoint
-    { savepointObject :: !ObjectName
-    , savepointSnapshot :: !Catalog
-    , savepointStatementId :: !StatementId
+    { savepointName :: !Ident
+    , savepointCatalog :: !Catalog
+    , savepointSession :: !SessionState
+    , savepointStatement :: !StatementId
     }
     deriving (Eq, Show)
 
 data TxFrame = TxFrame
-    { txBeginSid :: !StatementId
-    , txStart :: !Catalog
-    , txSavepoints :: ![Savepoint]
-    , txOrigin :: !TxOrigin
-    , txOnCommitDrop :: !(Set ObjectKey)
-    , txOnCommitDeleteRows :: !(Set ObjectKey)
+    { frameId :: !Int
+    , frameExplicit :: !Bool
+    , -- SQL Server nests `BEGIN`/`COMMIT` through `@@TRANCOUNT`; an inner
+      -- `COMMIT` only decrements the count. Other dialects keep this at 1.
+      frameNesting :: !Int
+    , frameBegin :: !(Maybe StatementId)
+    , frameCatalog :: !Catalog
+    , frameSession :: !SessionState
+    , frameSavepoints :: ![Savepoint]
     }
     deriving (Eq, Show)
 
 data ScanState = ScanState
     { scanCatalog :: !Catalog
+    , scanSession :: !SessionState
     , scanTransactions :: ![TxFrame]
-    , scanLastBarrier :: !(Maybe StatementId)
+    , scanNextFrameId :: !Int
+    , scanLastBarriers :: !(Map BarrierKey StatementId)
+    , scanTouchers :: !(Map BarrierKey (Set StatementId))
     , scanPriorStatements :: !(Set StatementId)
     }
 
-initialState :: ScanState
-initialState =
-    ScanState
-        { scanCatalog = Catalog Map.empty Map.empty Map.empty
-        , scanTransactions = []
-        , scanLastBarrier = Nothing
-        , scanPriorStatements = Set.empty
+initialScanState :: SessionInit -> ScanState
+initialScanState initSession =
+    let session = sessionFromInit initSession
+        state =
+            ScanState
+                { scanCatalog = emptyCatalog
+                , scanSession = session
+                , scanTransactions = []
+                , scanNextFrameId = 1
+                , scanLastBarriers = Map.empty
+                , scanTouchers = Map.empty
+                , scanPriorStatements = Set.empty
+                }
+     in if sessAutocommit session
+            then state
+            else
+                state
+                    { scanTransactions =
+                        [ TxFrame
+                            { frameId = 0
+                            , frameExplicit = False
+                            , frameNesting = 1
+                            , frameBegin = Nothing
+                            , frameCatalog = emptyCatalog
+                            , frameSession = session
+                            , frameSavepoints = []
+                            }
+                        ]
+                    }
+
+-- ----------------------------------------------------------------------------
+-- Evaluation accumulator
+-- ----------------------------------------------------------------------------
+
+data Eval = Eval
+    { evalDeps :: !(Set StatementId)
+    , evalTouches :: !(Set BarrierKey)
+    , evalBarriers :: ![ScopedBarrier]
+    , evalCatalog :: !Catalog
+    , evalSession :: !SessionState
+    , evalVisitedTriggers :: !(Set TriggerKey)
+    , evalVisitedWrites :: !(Set (RelationKey, WriteSignature))
+    , evalFrameId :: !(Maybe Int)
+    , evalSessionTouched :: !Bool
+    }
+
+initialEval :: StatementId -> ScanState -> Eval
+initialEval _ state =
+    Eval
+        { evalDeps = Set.empty
+        , evalTouches = Set.empty
+        , evalBarriers = []
+        , evalCatalog = scanCatalog state
+        , evalSession = scanSession state
+        , evalVisitedTriggers = Set.empty
+        , evalVisitedWrites = Set.empty
+        , evalFrameId = frameId <$> listToMaybe (scanTransactions state)
+        , evalSessionTouched = False
         }
 
-processStmt ::
+addDeps :: Set StatementId -> Eval -> Eval
+addDeps deps eval = eval {evalDeps = Set.union deps (evalDeps eval)}
+
+addTouch :: BarrierKey -> Eval -> Eval
+addTouch key eval = eval {evalTouches = Set.insert key (evalTouches eval)}
+
+addTouches :: [BarrierKey] -> Eval -> Eval
+addTouches keys eval = eval {evalTouches = Set.union (Set.fromList keys) (evalTouches eval)}
+
+addBarrier :: ScopedBarrier -> Eval -> Eval
+addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
+
+evalToState :: Eval -> ScanState -> ScanState
+evalToState eval state =
+    state
+        { scanCatalog = evalCatalog eval
+        , scanSession = evalSession eval
+        }
+
+-- ----------------------------------------------------------------------------
+-- Graph construction
+-- ----------------------------------------------------------------------------
+
+extractFacts :: StatementUnit -> SemanticFacts
+extractFacts unit =
+    maybe
+        SemanticFacts
+            { factOps = []
+            , factSession = []
+            , factPreTx = []
+            , factPostTx = []
+            , factBarriers =
+                [ ScopedBarrier
+                    GlobalScope
+                    (if isJust (unitParseError unit) then SyntaxErrorBarrier else UnknownStatementBarrier)
+                    Nothing
+                ]
+            }
+        factSemantics
+        (unitFacts unit)
+
+analyzeStatements :: SessionInit -> [StatementUnit] -> DependencyGraph
+analyzeStatements initialSession units =
+    buildGraph
+        initialSession
+        [ (stmtId (unitStatement unit), extractFacts unit)
+        | unit <- units
+        ]
+
+buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
+buildGraph initialSession stmtFacts =
+    let (_, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
+            foldl' step (initialScanState initialSession, Map.empty, 0, 0, 0) stmtFacts
+     in DependencyGraph
+            { graphStmts = Set.fromList (map fst stmtFacts)
+            , graphFacts = Map.fromList stmtFacts
+            , graphEdges = edges
+            , graphBarrierActions = barrierActionCount
+            , graphBarrierStatements = barrierStmtCount
+            , graphBarrierEdges = barrierEdgeCount
+            , graphEdgeCount = sum (map Set.size (Map.elems edges))
+            }
+
+step ::
     (ScanState, Map StatementId (Set StatementId), Int, Int, Int) ->
-    (StatementId, [ObjectAction]) ->
+    (StatementId, SemanticFacts) ->
     (ScanState, Map StatementId (Set StatementId), Int, Int, Int)
-processStmt (state, edgeMap, barrierEdgeCount, barrierStmtCount, barrierActionCount) (sid, actions) =
+step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) (sid, facts) =
     let
-        declaredBarriers = length (filter isBarrierAction actions)
-        catalogBarrier = declaredBarriers == 0 && needsCatalogBarrier state actions
-        hasBarrier = declaredBarriers > 0 || catalogBarrier
-        isSessionOnly = declaredBarriers > 0 && all isSessionAction (filter isBarrierAction actions)
-        barrierDeps =
-            if hasBarrier
-                then
-                    if isSessionOnly
-                        then maybe Set.empty Set.singleton (scanLastBarrier state)
-                        else scanPriorStatements state
-                else maybe Set.empty Set.singleton (scanLastBarrier state)
-        (objectDeps, state') = processObjectActions sid actions state
-        (controlDeps, state'') = applyTransactionControl sid actions state'
-        allDeps = Set.delete sid (Set.unions [barrierDeps, objectDeps, controlDeps])
-        edgeMap' = Map.insert sid allDeps edgeMap
-        state''' =
-            state''
-                { scanLastBarrier = if hasBarrier then Just sid else scanLastBarrier state''
-                , scanPriorStatements = Set.insert sid (scanPriorStatements state'')
+        (state1, _) = ensureFrame priorState
+        state2 = applyTxEffects sid (factPreTx facts) state1
+        state3 = ensureFrameForOps state2
+        eval0 = initialEval sid state3
+        eval1 = foldl' (processOp sid) eval0 (factOps facts)
+        eval1' = foldl' (flip addBarrier) eval1 (factBarriers facts)
+        (eval2, sessionTouched) = applySessionEffects sid (factSession facts) eval1'
+        state4 = evalToState eval2 state3
+        state5 = settleAutocommit sid state3 state4
+        state6 = applyTxEffects sid (factPostTx facts) state5
+        eval3 =
+            eval2
+                { evalCatalog = scanCatalog state6
+                , evalSession = scanSession state6
                 }
-        newBarrierEdges = Set.size (Set.difference barrierDeps (Set.union objectDeps controlDeps))
-        actionBarriers = declaredBarriers + fromEnum catalogBarrier
+        (deps, state7, newBarrierEdges, hasBarrier, barrierActions) =
+            finalizeStatement sid eval3 sessionTouched priorState state6
+        state8 = finishStatement sid state7
+        edges' = Map.insert sid deps edges
      in
-        ( state'''
-        , edgeMap'
+        ( state8
+        , edges'
         , barrierEdgeCount + newBarrierEdges
         , barrierStmtCount + if hasBarrier then 1 else 0
-        , barrierActionCount + actionBarriers
+        , barrierActionCount + barrierActions
         )
 
-needsCatalogBarrier :: ScanState -> [ObjectAction] -> Bool
-needsCatalogBarrier state = any uncertain
-    where
-        uncertain action
-            | actionKind action /= TableObject = False
-            | actionType action == ModDep =
-                any ((== ViewObject) . objectKind) (liveMatches UseDep action)
-            | actionType action `elem` [DropDep, RenameFromDep] =
-                case liveMatches (actionType action) action of
-                    _ : _ : _ -> True
-                    _ -> False
-            | otherwise = False
-        liveMatches dependency action =
-            filter (isLiveKey (scanCatalog state)) $
-                matchingKeys state TableObject dependency (actionTarget action)
+-- ----------------------------------------------------------------------------
+-- Name resolution
+-- ----------------------------------------------------------------------------
 
-processObjectActions :: StatementId -> [ObjectAction] -> ScanState -> (Set StatementId, ScanState)
-processObjectActions sid actions state =
-    let
-        priorState = state
-        nonRename = filter (\act -> actionType act `notElem` [RenameFromDep, RenameToDep]) actions
-        (actionDeps, state') =
-            foldl' (processAction sid priorState actions) (Set.empty, state) nonRename
-        (renameDeps, state'') = processRenames sid priorState actions state'
-        catalogWithCascades = bindCascades sid actions (scanCatalog state'')
-        state''' = state'' {scanCatalog = catalogWithCascades}
-        state4 = recordOnCommit sid actions state'''
-     in
-        (Set.union actionDeps renameDeps, state4)
+nameSuffix :: Name -> Name -> Bool
+nameSuffix (Name requested) (Name stored) =
+    length requested <= length stored
+        && drop (length stored - length requested) stored == requested
 
-processAction ::
-    StatementId ->
-    ScanState ->
-    [ObjectAction] ->
-    (Set StatementId, ScanState) ->
-    ObjectAction ->
-    (Set StatementId, ScanState)
-processAction sid priorState stmtActions (deps, state) act
-    | actionKind act `elem` [SessionVariableObject, TransactionObject] = (deps, state)
+qualifyDefinitionName :: SessionState -> Name -> Bool -> Name
+qualifyDefinitionName session name@(Name parts) temporary
+    | temporary = name
+    | length parts /= 1 = name
     | otherwise =
-        case actionType act of
-            DefDep ->
-                let catalog = scanCatalog state
-                    keys = definitionKeys catalog stmtActions act
-                    sources = viewSources (scanCatalog priorState) stmtActions (actionTarget act)
-                    newObject = ObjectState (Just sid) Nothing Nothing sources ObjectLive
-                    catalog0 =
-                        if actionKind act `elem` [TableObject, TemporaryTableObject]
-                            then foldl' (prepareDefinition sid) catalog keys
-                            else catalog
-                    catalog' =
-                        catalog0
-                            { catalogObjects =
-                                foldl' (\objects key -> Map.insert key newObject objects) (catalogObjects catalog0) keys
-                            }
-                    catalog'' =
-                        if actionKind act `elem` [IndexObject, TriggerObject]
-                            then foldl' (\current key -> bindRelations sid key stmtActions current) catalog' keys
-                            else catalog'
-                 in (deps, state {scanCatalog = catalog''})
-            UseDep ->
-                let objectDeps = dependenciesForAction priorState act
-                    indexDeps =
-                        if actionKind act /= TableObject
-                            || any (\action -> actionKind action == IndexObject && actionType action == DefDep) stmtActions
-                            then Set.empty
-                            else
-                                maybe
-                                    Set.empty
-                                    (boundIndexDependencies (scanCatalog priorState))
-                                    (targetObjectName (actionTarget act))
-                 in (Set.union deps (Set.union objectDeps indexDeps), state)
-            ModDep ->
-                let priorDeps = dependenciesForAction priorState act
-                    keys = actionKeys priorState act
-                    catalog' = writeObjects sid keys (scanCatalog state)
-                 in (Set.union deps priorDeps, state {scanCatalog = catalog'})
-            DropDep ->
-                let priorDeps = dependenciesForAction priorState act
-                    keys = actionKeys priorState act
-                    catalog' = dropObjects sid keys (scanCatalog state)
-                 in (Set.union deps priorDeps, state {scanCatalog = catalog'})
-            BarrierDep -> (deps, state)
-            RenameFromDep -> (deps, state)
-            RenameToDep -> (deps, state)
-            TxBeginDep -> (deps, state)
-            TxCommitDep -> (deps, state)
-            TxRollbackDep -> (deps, state)
-            TxSavepointDep -> (deps, state)
-            TxRollbackToDep -> (deps, state)
-            TxReleaseDep -> (deps, state)
-            CascadeDep -> (deps, state)
-            OnCommitDropDep -> (deps, state)
-            OnCommitDeleteRowsDep -> (deps, state)
+        case effectiveNamespacePrefix session of
+            prefix@(_ : _) -> Name (prefix ++ parts)
+            [] ->
+                case effectiveSearchPath session of
+                    Name searchParts : _ | not (null searchParts) -> Name (searchParts ++ parts)
+                    _ -> name
 
-processRenames ::
-    StatementId ->
-    ScanState ->
-    [ObjectAction] ->
-    ScanState ->
-    (Set StatementId, ScanState)
-processRenames sid priorState actions state =
-    foldl' rename (Set.empty, state) (zip sources targets)
+qualifyObjectName :: SessionState -> Name -> Name
+qualifyObjectName session name = qualifyDefinitionName session name False
+
+qualifyReferenceName :: SessionState -> Name -> Name
+qualifyReferenceName = qualifyObjectName
+
+qualifyRenameName :: Name -> Name -> Name
+qualifyRenameName (Name oldParts) newName@(Name newParts)
+    | length oldParts > 1 && length newParts == 1 =
+        Name (init oldParts ++ newParts)
+    | otherwise = newName
+
+relationFallbackKey :: SessionState -> NameRef -> RelationKey
+relationFallbackKey session (NameRef name temporary)
+    | temporary = RelationKey True name
+    | length (nameParts name) > 1 = RelationKey False name
+    | otherwise = RelationKey False (qualifyReferenceName session name)
+
+sequenceFallbackKey :: SessionState -> NameRef -> SequenceKey
+sequenceFallbackKey session (NameRef name temporary)
+    | temporary = SequenceKey True name
+    | length (nameParts name) > 1 = SequenceKey False name
+    | otherwise = SequenceKey False (qualifyReferenceName session name)
+
+resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
+resolveRelationKeys session catalog (NameRef name temporary)
+    | temporary = [RelationKey True name]
+    | length (nameParts name) > 1 = [RelationKey False name]
+    | Map.member temporaryKey relations = [temporaryKey]
+    -- A namespace prefix (MySQL @USE db@) is an exact current database, not an
+    -- open search path: unqualified names must not leak into other databases.
+    | not (null prefixKeys) = prefixKeys
+    | null (effectiveSearchPath session) =
+        case wildcardMatches of
+            [] -> [fallbackKey]
+            matches -> matches
+    | otherwise =
+        case firstExisting searchKeys of
+            Just key -> [key]
+            Nothing -> [fallbackKey]
     where
-        sources =
-            [ name
-            | a <- actions
-            , actionKind a == TableObject
-            , actionType a == RenameFromDep
-            , ObjectTarget name <- [actionTarget a]
-            ]
-        targets =
-            [ name
-            | a <- actions
-            , actionKind a == TableObject
-            , actionType a == RenameToDep
-            , ObjectTarget name <- [actionTarget a]
+        relations = catalogRelations catalog
+        temporaryKey = RelationKey True name
+        fallbackKey = relationFallbackKey session (NameRef name temporary)
+        prefixKeys =
+            case effectiveNamespacePrefix session of
+                [] -> []
+                prefix -> [RelationKey False (Name (prefix ++ nameParts name))]
+        searchKeys =
+            prefixKeys
+                ++ [ RelationKey False (Name (nameParts entry ++ nameParts name))
+                   | entry <- effectiveSearchPath session
+                   ]
+                ++ [RelationKey False name]
+        firstExisting = find (`Map.member` relations)
+        wildcardMatches =
+            [ key
+            | key@(RelationKey False stored) <- Map.keys relations
+            , nameSuffix name stored
             ]
 
-        rename (deps, current) (oldName, newName) =
-            let catalog = scanCatalog priorState
-                oldKeys =
-                    filter
-                        (isLiveKey catalog)
-                        (matchingKeys priorState TableObject RenameFromDep (ObjectTarget oldName))
-                sourceKeys = if null oldKeys then [ObjectKey TableObject oldName] else oldKeys
+resolveSequenceKeys :: SessionState -> Catalog -> NameRef -> [SequenceKey]
+resolveSequenceKeys session catalog (NameRef name temporary)
+    | temporary = [SequenceKey True name]
+    | length (nameParts name) > 1 = [SequenceKey False name]
+    | Map.member temporaryKey sequences = [temporaryKey]
+    | not (null prefixKeys) = prefixKeys
+    | null (effectiveSearchPath session) =
+        case wildcardMatches of
+            [] -> [fallbackKey]
+            matches -> matches
+    | otherwise =
+        case firstExisting searchKeys of
+            Just key -> [key]
+            Nothing -> [fallbackKey]
+    where
+        sequences = catalogSequences catalog
+        temporaryKey = SequenceKey True name
+        fallbackKey = sequenceFallbackKey session (NameRef name temporary)
+        prefixKeys =
+            case effectiveNamespacePrefix session of
+                [] -> []
+                prefix -> [SequenceKey False (Name (prefix ++ nameParts name))]
+        searchKeys =
+            prefixKeys
+                ++ [ SequenceKey False (Name (nameParts entry ++ nameParts name))
+                   | entry <- effectiveSearchPath session
+                   ]
+                ++ [SequenceKey False name]
+        firstExisting = find (`Map.member` sequences)
+        wildcardMatches =
+            [ key
+            | key@(SequenceKey False stored) <- Map.keys sequences
+            , nameSuffix name stored
+            ]
+
+resolveIndexKeys :: SessionState -> Catalog -> IndexRef -> [IndexKey]
+resolveIndexKeys session catalog indexRef =
+    case indexRef of
+        NamedIndex name ->
+            [ NamedIndexKey resolved
+            | resolved <- resolveSchemaObjectName session (schemaIndexNames catalog) name
+            ]
+        TableIndex table ident ->
+            [ TableIndexKey relationKey ident
+            | relationKey <- resolveRelationKeys session catalog table
+            ]
+
+resolveTriggerKeys :: SessionState -> Catalog -> TriggerRef -> [TriggerKey]
+resolveTriggerKeys session catalog triggerRef =
+    case triggerRef of
+        NamedTrigger name ->
+            [ NamedTriggerKey resolved
+            | resolved <- resolveSchemaObjectName session (schemaTriggerNames catalog) name
+            ]
+        TableTrigger table ident ->
+            [ TableTriggerKey relationKey ident
+            | relationKey <- resolveRelationKeys session catalog table
+            ]
+
+{- | Resolve a schema-level object name (index or schema-scoped trigger) using
+the same namespace/search-path rules as relations.
+-}
+resolveSchemaObjectName :: SessionState -> [Name] -> Name -> [Name]
+resolveSchemaObjectName session existing name@(Name parts)
+    | length parts > 1 = [name]
+    | not (null prefixKeys) = prefixKeys
+    | null (effectiveSearchPath session) =
+        case wildcardMatches of
+            [] -> [fallback]
+            matches -> matches
+    | otherwise =
+        case firstExisting searchKeys of
+            Just matched -> [matched]
+            Nothing -> [fallback]
+    where
+        fallback = qualifyObjectName session name
+        prefixKeys =
+            case effectiveNamespacePrefix session of
+                [] -> []
+                prefix -> [Name (prefix ++ parts)]
+        searchKeys =
+            prefixKeys
+                ++ [ Name (nameParts entry ++ parts)
+                   | entry <- effectiveSearchPath session
+                   ]
+                ++ [name]
+        existingSet = Set.fromList existing
+        firstExisting = find (`Set.member` existingSet)
+        wildcardMatches =
+            [ stored
+            | stored <- Set.toList existingSet
+            , nameSuffix name stored
+            ]
+
+schemaIndexNames :: Catalog -> [Name]
+schemaIndexNames catalog =
+    [ name
+    | NamedIndexKey name <- Map.keys (catalogIndexes catalog)
+    ]
+
+schemaTriggerNames :: Catalog -> [Name]
+schemaTriggerNames catalog =
+    [ name
+    | NamedTriggerKey name <- Map.keys (catalogTriggers catalog)
+    ]
+
+resolveConstraintKeys :: SessionState -> Catalog -> ConstraintRef -> [ConstraintKey]
+resolveConstraintKeys session catalog (ConstraintRef table name) =
+    [ ConstraintKey relationKey (NamedConstraint name)
+    | relationKey <- resolveRelationKeys session catalog table
+    ]
+
+resolveObjectKeys :: SessionState -> Catalog -> Core.ObjectRef -> [ObjectKey]
+resolveObjectKeys session catalog objectRef =
+    case objectRef of
+        Core.ObjectRelation relation ->
+            map BarrierRelationKey (resolveRelationKeys session catalog relation)
+        Core.ObjectIndex index ->
+            map BarrierIndexKey (resolveIndexKeys session catalog index)
+        Core.ObjectTrigger trigger ->
+            map BarrierTriggerKey (resolveTriggerKeys session catalog trigger)
+        Core.ObjectSequence sequenceRef ->
+            map BarrierSequenceKey (resolveSequenceKeys session catalog sequenceRef)
+        Core.ObjectType name -> [BarrierTypeKey name]
+        Core.ObjectSchema name -> [BarrierSchemaKey name]
+        Core.ObjectConstraint constraintRef ->
+            map BarrierConstraintKey (resolveConstraintKeys session catalog constraintRef)
+
+-- ----------------------------------------------------------------------------
+-- Barrier keys and matching
+-- ----------------------------------------------------------------------------
+
+barrierKeyMatches :: BarrierKey -> BarrierKey -> Bool
+barrierKeyMatches (SchemaBarrierKey left) (SchemaBarrierKey right) =
+    nameSuffix left right || nameSuffix right left
+barrierKeyMatches left right = left == right
+
+relationSchemaBarrierKeys :: RelationKey -> [BarrierKey]
+relationSchemaBarrierKeys (RelationKey _ name) =
+    map SchemaBarrierKey (dedupe (prefixes ++ lastPrefix))
+    where
+        parts = nameParts name
+        prefixes = [Name (take n parts) | n <- [1 .. length parts - 1]]
+        lastPrefix =
+            [ Name [last (init parts)]
+            | length parts > 1
+            ]
+
+dedupe :: (Ord a) => [a] -> [a]
+dedupe = Set.toList . Set.fromList
+
+relationTouchKeys :: RelationKey -> [BarrierKey]
+relationTouchKeys key =
+    RelationBarrierKey key
+        : ObjectBarrierKey (BarrierRelationKey key)
+        : relationSchemaBarrierKeys key
+
+indexTouchKeys :: IndexKey -> Maybe RelationKey -> [BarrierKey]
+indexTouchKeys key table =
+    ObjectBarrierKey (BarrierIndexKey key)
+        : maybe [] relationTouchKeys table
+
+triggerTouchKeys :: TriggerKey -> Maybe RelationKey -> [BarrierKey]
+triggerTouchKeys key table =
+    ObjectBarrierKey (BarrierTriggerKey key)
+        : maybe [] relationTouchKeys table
+
+sequenceTouchKeys :: SequenceKey -> [BarrierKey]
+sequenceTouchKeys key = [ObjectBarrierKey (BarrierSequenceKey key)]
+
+typeTouchKeys :: Name -> [BarrierKey]
+typeTouchKeys name = [ObjectBarrierKey (BarrierTypeKey name)]
+
+schemaTouchKeys :: Name -> [BarrierKey]
+schemaTouchKeys name = [ObjectBarrierKey (BarrierSchemaKey name), SchemaBarrierKey name]
+
+barrierKeysForScope :: SessionState -> Catalog -> BarrierScope -> [BarrierKey]
+barrierKeysForScope session catalog scope =
+    case scope of
+        GlobalScope -> [GlobalBarrierKey]
+        SessionStateScope -> [SessionBarrierKey]
+        TransactionStateScope -> [TransactionBarrierKey]
+        RelationScope relation ->
+            map RelationBarrierKey (resolveRelationKeys session catalog relation)
+        SchemaScope name -> [SchemaBarrierKey name]
+        ObjectScope objectRef ->
+            map ObjectBarrierKey (resolveObjectKeys session catalog objectRef)
+
+lastBarrierDeps :: ScanState -> [BarrierKey] -> Set StatementId
+lastBarrierDeps state keys =
+    Set.fromList
+        [ sid
+        | key <- keys
+        , Just sid <- [Map.lookup key (scanLastBarriers state)]
+        ]
+
+touchersForBarrier :: ScanState -> BarrierKey -> Set StatementId
+touchersForBarrier state key =
+    Set.unions
+        [ touchers
+        | (candidate, touchers) <- Map.toList (scanTouchers state)
+        , barrierKeyMatches key candidate
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Catalog helpers
+-- ----------------------------------------------------------------------------
+
+lookupRelation :: Catalog -> RelationKey -> Maybe RelationState
+lookupRelation catalog key = Map.lookup key (catalogRelations catalog)
+
+insertRelation :: RelationKey -> RelationState -> Catalog -> Catalog
+insertRelation key relation catalog =
+    catalog {catalogRelations = Map.insert key relation (catalogRelations catalog)}
+
+deleteRelation :: RelationKey -> Catalog -> Catalog
+deleteRelation key catalog =
+    catalog {catalogRelations = Map.delete key (catalogRelations catalog)}
+
+deleteIndex :: IndexKey -> Catalog -> Catalog
+deleteIndex key catalog =
+    catalog {catalogIndexes = Map.delete key (catalogIndexes catalog)}
+
+deleteTrigger :: TriggerKey -> Catalog -> Catalog
+deleteTrigger key catalog =
+    catalog {catalogTriggers = Map.delete key (catalogTriggers catalog)}
+
+deleteSequence :: SequenceKey -> Catalog -> Catalog
+deleteSequence key catalog =
+    catalog {catalogSequences = Map.delete key (catalogSequences catalog)}
+
+deleteConstraint :: ConstraintKey -> Catalog -> Catalog
+deleteConstraint key catalog =
+    catalog
+        { catalogConstraints = Map.delete key (catalogConstraints catalog)
+        , catalogRelations =
+            Map.adjust
+                (\relation -> relation {relConstraints = Set.delete key (relConstraints relation)})
+                (constraintKeyTable key)
+                (catalogRelations catalog)
+        }
+
+relationDefinitionDeps :: Catalog -> RelationKey -> Set StatementId
+relationDefinitionDeps catalog key =
+    case lookupRelation catalog key of
+        Nothing -> Set.empty
+        Just relation ->
+            Set.fromList
+                ( catMaybes
+                    [ relDefinition relation
+                    , relRestoredBy relation
+                    ]
+                )
+                `Set.union` relSchemaWrites relation
+
+relationColumnWriteDeps ::
+    SessionState -> Catalog -> RelationKey -> RelationState -> [Ident] -> Set StatementId
+relationColumnWriteDeps session catalog key relation columns
+    | null columns = Set.unions (Map.elems (relColumnWrites relation))
+    | otherwise =
+        Set.unions
+            [ Map.findWithDefault Set.empty column (relColumnWrites relation)
+            | column <- Set.toList (coupledWriteColumns session catalog key columns)
+            ]
+
+{- | Expand written columns through the constraints they participate in. A
+write to one column of a composite primary key, unique constraint, foreign key,
+or check constraint can affect rows selected through the other columns, so
+column-level dependency tracking must not treat those columns as independent.
+-}
+coupledWriteColumns :: SessionState -> Catalog -> RelationKey -> [Ident] -> Set Ident
+coupledWriteColumns session catalog key columns
+    | null columns = Set.empty
+    | otherwise =
+        let written = Set.fromList columns
+            relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
+            localSets =
+                [ constraintCouplingColumns (constraintValue state)
+                | constraintKey <- Set.toList (relConstraints relation)
+                , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
+                ]
+                    ++ [ -- A self-referential foreign key links its child and
+                       -- parent columns inside the same relation, so they must
+                       -- expand together instead of as disjoint candidates.
+                       foreignKeyChildColumns foreignKey
+                        ++ referencedParentColumns session catalog foreignKey
+                       | (_, state, foreignKey) <- allForeignKeys catalog
+                       , constraintStateTable state == key
+                       , key
+                            `elem` resolveRelationKeys
+                                session
+                                catalog
+                                (foreignKeyParent foreignKey)
+                       ]
+            parentSets =
+                [ referencedParentColumns session catalog foreignKey
+                | (_, state, foreignKey) <- allForeignKeys catalog
+                , constraintStateTable state /= key
+                , key
+                    `elem` resolveRelationKeys
+                        session
+                        catalog
+                        (foreignKeyParent foreignKey)
+                ]
+            candidates = map Set.fromList (localSets ++ parentSets)
+            expand current =
+                let next =
+                        Set.unions
+                            [ candidate
+                            | candidate <- candidates
+                            , not (Set.null (Set.intersection current candidate))
+                            ]
+                    expanded = Set.union current next
+                 in if expanded == current then current else expand expanded
+         in expand written
+
+constraintCouplingColumns :: Constraint -> [Ident]
+constraintCouplingColumns constraint =
+    case constraint of
+        PrimaryKeyConstraint _ columns -> columns
+        UniqueConstraint _ columns -> columns
+        ForeignKeyConstraint foreignKey -> foreignKeyChildColumns foreignKey
+        CheckConstraint _ columns _ -> columns
+        IndexConstraint _ columns _ -> columns
+        UsingIndexConstraint {} -> []
+        OtherConstraint _ -> []
+
+{- | Columns referenced in the parent table. PostgreSQL allows the column list
+to be omitted, in which case the parent's primary key is referenced.
+-}
+referencedParentColumns :: SessionState -> Catalog -> ForeignKey -> [Ident]
+referencedParentColumns session catalog foreignKey
+    | not (null (foreignKeyParentColumns foreignKey)) =
+        foreignKeyParentColumns foreignKey
+    | otherwise =
+        concat
+            [ keyColumns
+            | parentKey <-
+                resolveRelationKeys
+                    session
+                    catalog
+                    (foreignKeyParent foreignKey)
+            , (_, state) <- Map.toList (catalogConstraints catalog)
+            , constraintStateTable state == parentKey
+            , PrimaryKeyConstraint _ keyColumns <- [constraintValue state]
+            ]
+
+relationIndexDeps :: Catalog -> RelationState -> Set StatementId
+relationIndexDeps catalog relation =
+    Set.unions
+        [ Set.fromList (catMaybes [indexDefinition index, indexRestoredBy index])
+        | key <- Set.toList (relIndexes relation)
+        , Just index <- [Map.lookup key (catalogIndexes catalog)]
+        ]
+
+relationTriggerDeps :: Catalog -> RelationState -> Set StatementId
+relationTriggerDeps catalog relation =
+    Set.unions
+        [ Set.fromList (catMaybes [triggerDefinition trigger, triggerRestoredBy trigger])
+        | key <- Set.toList (relTriggers relation)
+        , Just trigger <- [Map.lookup key (catalogTriggers catalog)]
+        ]
+
+relationReadDeps :: SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Set StatementId
+relationReadDeps session catalog key mode columns =
+    go Set.empty key
+    where
+        go seen current
+            | Set.member current seen = Set.empty
+            | otherwise =
+                case lookupRelation catalog current of
+                    Nothing -> Set.empty
+                    Just relation ->
+                        let seen' = Set.insert current seen
+                            base =
+                                relationDefinitionDeps catalog current
+                                    `Set.union` relationIndexDeps catalog relation
+                            dataDeps =
+                                case mode of
+                                    ReadData ->
+                                        relDataWrites relation
+                                            `Set.union` relationColumnWriteDeps session catalog current relation columns
+                                    ReadSchema -> Set.empty
+                            sourceDeps =
+                                Set.unions
+                                    [ go seen' source
+                                    | source <- Set.toList (relSources relation)
+                                    ]
+                            -- A source that did not exist when the view was defined
+                            -- is resolved against the catalog at read time, so a
+                            -- later definition is still followed.
+                            unresolvedDeps =
+                                Set.unions
+                                    [ go seen' sourceKey
+                                    | reference <- Set.toList (relUnresolvedSources relation)
+                                    , sourceKey <- resolveRelationKeys session catalog reference
+                                    , Map.member sourceKey (catalogRelations catalog)
+                                    ]
+                         in base `Set.union` dataDeps `Set.union` sourceDeps `Set.union` unresolvedDeps
+
+relationWriteDeps ::
+    SessionState -> Catalog -> RelationKey -> WriteKind -> [Ident] -> Set StatementId
+relationWriteDeps session catalog key kind columns =
+    case lookupRelation catalog key of
+        Nothing -> Set.empty
+        Just relation ->
+            let base =
+                    relationDefinitionDeps catalog key
+                        `Set.union` relationIndexDeps catalog relation
+                        `Set.union` relationTriggerDeps catalog relation
+                writes =
+                    case kind of
+                        TruncateWrite {} -> Set.empty
+                        _ ->
+                            relDataWrites relation
+                                `Set.union` relationColumnWriteDeps session catalog key relation columns
                 sourceDeps =
                     Set.unions
-                        [ Set.union (stateDependencies priorState key) (boundDependencies catalog (const True) key)
-                        | key <- sourceKeys
+                        [ relationReadDeps session catalog source ReadData []
+                        | source <- Set.toList (relSources relation)
                         ]
-                move currentCatalog sourceKey =
-                    case sourceKey of
-                        ObjectKey kind storedName ->
-                            let targetKey = ObjectKey kind (qualifyRename storedName newName)
-                                dropped = dropObjects sid [sourceKey] currentCatalog
-                                cleanTarget = prepareDefinition sid dropped targetKey
-                                withTarget =
-                                    cleanTarget
-                                        { catalogObjects =
-                                            Map.insert
-                                                targetKey
-                                                (ObjectState (Just sid) Nothing Nothing Set.empty ObjectLive)
-                                                (catalogObjects cleanTarget)
-                                        , catalogRelations =
-                                            moveRelations sourceKey targetKey (catalogRelations catalog) (catalogRelations cleanTarget)
-                                        , catalogCascades =
-                                            moveCascades sourceKey targetKey (catalogCascades catalog) (catalogCascades cleanTarget)
-                                        }
-                                withSources = updateViewSources sourceKey targetKey withTarget
-                             in moveTableColumns sid sourceKey targetKey catalog withSources
-                        ColumnKey _ _ -> currentCatalog
-             in (Set.union deps sourceDeps, current {scanCatalog = foldl' move (scanCatalog current) sourceKeys})
+                unresolvedDeps =
+                    Set.unions
+                        [ relationReadDeps session catalog sourceKey ReadData []
+                        | reference <- Set.toList (relUnresolvedSources relation)
+                        , sourceKey <- resolveRelationKeys session catalog reference
+                        , Map.member sourceKey (catalogRelations catalog)
+                        ]
+             in base `Set.union` writes `Set.union` sourceDeps `Set.union` unresolvedDeps
 
-dependenciesForAction :: ScanState -> ObjectAction -> Set StatementId
-dependenciesForAction state act =
-    let keys = matchingKeys state (actionKind act) (actionType act) (actionTarget act)
-        catalog = scanCatalog state
-        objectDeps = Set.unions [recursiveDependencies catalog Set.empty key | key <- keys]
-        relationDeps =
-            case (actionKind act, actionType act, actionTarget act) of
-                (TableObject, ModDep, ObjectTarget name) -> boundObjectDependencies catalog name
-                _ -> Set.empty
-     in Set.union objectDeps relationDeps
+relationAllDeps :: SessionState -> Catalog -> RelationKey -> Set StatementId
+relationAllDeps session catalog key =
+    relationReadDeps session catalog key ReadData []
+        `Set.union` relationWriteDeps session catalog key (DeleteWrite DeleteFilteredRows) []
 
-recursiveDependencies :: Catalog -> Set ObjectKey -> ObjectKey -> Set StatementId
-recursiveDependencies catalog seen key
-    | Set.member key seen = Set.empty
-    | otherwise =
-        case Map.lookup key (catalogObjects catalog) of
-            Nothing -> Set.empty
-            Just object ->
-                let here = stateDependenciesInObject object
-                    seen' = Set.insert key seen
-                    sources =
-                        if objectKind key == ViewObject
-                            then
-                                Set.unions
-                                    [ Set.union
-                                        (recursiveDependencies catalog seen' sourceKey)
-                                        (boundDependencies catalog ((== IndexObject) . objectKind) sourceKey)
-                                    | source <- Set.toList (objectSources object)
-                                    , sourceKey <- case source of
-                                        UnresolvedSource name ->
-                                            matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget name)
-                                        ResolvedSource resolvedKey -> [resolvedKey]
-                                    ]
-                            else Set.empty
-                 in Set.union here sources
-
-stateDependencies :: ScanState -> ObjectKey -> Set StatementId
-stateDependencies state key =
-    maybe Set.empty stateDependenciesInObject (Map.lookup key (catalogObjects (scanCatalog state)))
-
-stateDependenciesInObject :: ObjectState -> Set StatementId
-stateDependenciesInObject object =
-    Set.fromList (catMaybes [objectDefinition object, objectLastWrite object, objectRestored object])
-
-matchingKeys :: ScanState -> ObjectKind -> DependencyType -> ActionTarget -> [ObjectKey]
-matchingKeys state = matchingKeysInCatalog (scanCatalog state)
-
-isLiveKey :: Catalog -> ObjectKey -> Bool
-isLiveKey catalog key =
-    maybe False ((== ObjectLive) . objectLifecycle) (Map.lookup key (catalogObjects catalog))
-
-definitionKeys :: Catalog -> [ObjectAction] -> ObjectAction -> [ObjectKey]
-definitionKeys catalog actions action =
-    case (actionKind action, actionTarget action) of
-        (ColumnObject, ColumnTarget table column) ->
-            [ColumnKey owner column | owner <- owners table]
-        (_, ObjectTarget name) -> [ObjectKey (actionKind action) name]
-        (_, BarrierTarget _) -> []
-        (_, ColumnTarget _ _) -> []
-        (_, NoTarget) -> []
-    where
-        declared table =
-            [ ObjectKey (actionKind definition) table
-            | definition <- actions
-            , actionType definition == DefDep
-            , actionKind definition `elem` [TableObject, TemporaryTableObject]
-            , actionTarget definition == ObjectTarget table
-            ]
-        resolved table =
-            filter (isLiveKey catalog) (matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget table))
-        owners table
-            | not (null (declared table)) = declared table
-            | not (null (resolved table)) = resolved table
-            | otherwise = [ObjectKey TableObject table]
-
-actionKeys :: ScanState -> ObjectAction -> [ObjectKey]
-actionKeys state action =
-    case matchingKeys state (actionKind action) (actionType action) (actionTarget action) of
-        [] -> definitionKeys (scanCatalog state) [] action
-        keys -> keys
-
-prepareDefinition :: StatementId -> Catalog -> ObjectKey -> Catalog
-prepareDefinition sid catalog key =
-    case key of
-        ObjectKey kind name ->
-            let alias = ObjectKey kind (lastNamePart name)
-                retireAlias =
-                    isQualifiedName name
-                        && maybe False ((== ObjectDropped) . objectLifecycle) (Map.lookup alias (catalogObjects catalog))
-                retired =
-                    if retireAlias
-                        then
-                            catalog
-                                { catalogObjects = Map.delete alias (catalogObjects catalog)
-                                , catalogRelations = Map.delete alias (catalogRelations catalog)
-                                }
-                        else catalog
-                cleared =
-                    if Map.member key (catalogObjects catalog)
-                        then resetTableColumns sid key retired
-                        else retired
-             in removeRelationsForTable key cleared
-        ColumnKey _ _ -> catalog
-
-matchingKeysInCatalog :: Catalog -> ObjectKind -> DependencyType -> ActionTarget -> [ObjectKey]
-matchingKeysInCatalog _ _ _ (BarrierTarget _) = []
-matchingKeysInCatalog _ _ _ NoTarget = []
-matchingKeysInCatalog catalog ColumnObject dependency (ColumnTarget table column) =
-    [ key
-    | owner <- matchingKeysInCatalog catalog TableObject dependency (ObjectTarget table)
-    , let key = ColumnKey owner column
-    , Map.member key (catalogObjects catalog)
-    ]
-matchingKeysInCatalog catalog kind dependency (ColumnTarget table _) =
-    matchingKeysInCatalog catalog kind dependency (ObjectTarget table)
-matchingKeysInCatalog catalog kind dependency (ObjectTarget name) =
-    let available = Map.keys (catalogObjects catalog)
-        acceptableKinds = case (kind, dependency) of
-            (TableObject, UseDep) -> [TableObject, TemporaryTableObject, ViewObject]
-            (TableObject, ModDep) -> [TableObject, TemporaryTableObject, ViewObject]
-            (TableObject, _) -> [TableObject, TemporaryTableObject]
-            _ -> [kind]
-        matches =
-            [ key
-            | key@(ObjectKey keyKind objectName) <- available
-            , keyKind `elem` acceptableKinds
-            , temporaryReferenceMatches key name
-            , isJust (nameMatch name objectName)
-            ]
-     in preferTemporaryScope catalog kind dependency matches
-
-{- | A temporary definition carries an explicit temporary schema name. A
-qualified reference must name that object exactly; an unqualified reference
-can still resolve to it through the search path.
--}
-temporaryReferenceMatches :: ObjectKey -> ObjectName -> Bool
-temporaryReferenceMatches (ObjectKey TemporaryTableObject stored) requested =
-    not (isQualifiedName requested) || stored == requested
-temporaryReferenceMatches _ _ = True
-
-{- | Without a known search_path, an unqualified name can resolve in any
-schema, while a qualified name must match the stored identity exactly.
--}
-data NameMatch
-    = ExactNameMatch
-    | SearchPathNameMatch
-    deriving (Eq, Ord, Show)
-
-nameMatch :: ObjectName -> ObjectName -> Maybe NameMatch
-nameMatch requested stored
-    | requested == stored = Just ExactNameMatch
-    | not (isQualifiedName requested) || not (isQualifiedName stored) =
-        if lastNamePart requested == lastNamePart stored
-            then Just SearchPathNameMatch
-            else Nothing
-    | otherwise = Nothing
-
-{- | Live temporary definitions take precedence for unqualified relation
-references, matching the search path that places the temporary schema first.
--}
-preferTemporaryScope :: Catalog -> ObjectKind -> DependencyType -> [ObjectKey] -> [ObjectKey]
-preferTemporaryScope catalog kind dependency matches
-    | kind /= TableObject = matches
-    | dependency `notElem` [UseDep, ModDep, DropDep, RenameFromDep] = matches
-    | null liveTemporary = matches
-    | otherwise = liveTemporary
-    where
-        liveTemporary =
-            [ key
-            | key@(ObjectKey TemporaryTableObject _) <- matches
-            , isLiveKey catalog key
-            ]
-
-objectKind :: ObjectKey -> ObjectKind
-objectKind (ObjectKey kind _) = kind
-objectKind (ColumnKey _ _) = ColumnObject
-
-writeObjects :: StatementId -> [ObjectKey] -> Catalog -> Catalog
-writeObjects sid keys catalog =
-    let allKeys = transitiveCascades keys (catalogCascades catalog)
-     in catalog
-            { catalogObjects =
-                foldl' write (catalogObjects catalog) allKeys
-            }
-    where
-        write objects key =
-            let old = Map.findWithDefault (ObjectState Nothing Nothing Nothing Set.empty ObjectLive) key objects
-             in Map.insert key old {objectLastWrite = Just sid, objectRestored = Nothing} objects
-
-transitiveCascades :: [ObjectKey] -> Map ObjectKey (Set ObjectKey) -> [ObjectKey]
-transitiveCascades initial cascades = go (Set.fromList initial) initial
-    where
-        go visited [] = Set.toList visited
-        go visited (k : rest) =
-            let children = Map.findWithDefault Set.empty k cascades
-                newChildren = Set.difference children visited
-                visited' = Set.union visited newChildren
-             in go visited' (rest ++ Set.toList newChildren)
-
-dropObjects :: StatementId -> [ObjectKey] -> Catalog -> Catalog
-dropObjects sid keys catalog =
-    foldl' resetDroppedTable catalog' keys
-    where
-        catalog' =
-            catalog
-                { catalogObjects = foldl' dropOne (catalogObjects catalog) keys
-                , catalogRelations = foldl' removeObjectBindings (catalogRelations catalog) keys
-                , catalogCascades = foldl' removeCascadeBindings (catalogCascades catalog) keys
+applyWriteState :: StatementId -> WriteKind -> [Ident] -> RelationState -> RelationState
+applyWriteState sid kind columns relation =
+    case kind of
+        InsertWrite _ ->
+            relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+        MergeWrite ->
+            relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+        DeleteWrite scope
+            | scope == DeleteAllRows ->
+                relation
+                    { relDataWrites = Set.singleton sid
+                    , relColumnWrites = Map.empty
+                    }
+            | otherwise ->
+                relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+        UpdateWrite
+            | null columns ->
+                relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+            | otherwise ->
+                relation
+                    { relColumnWrites =
+                        foldl'
+                            (\current column -> Map.insertWith Set.union column (Set.singleton sid) current)
+                            (relColumnWrites relation)
+                            columns
+                    }
+        TruncateWrite {} ->
+            relation
+                { relDataWrites = Set.singleton sid
+                , relColumnWrites = Map.empty
                 }
 
-        dropOne objects key =
-            Map.insert key (ObjectState (Just sid) Nothing Nothing Set.empty ObjectDropped) objects
+allForeignKeys :: Catalog -> [(ConstraintKey, ConstraintState, ForeignKey)]
+allForeignKeys catalog =
+    [ (key, state, foreignKey)
+    | (key, state) <- Map.toList (catalogConstraints catalog)
+    , ForeignKeyConstraint foreignKey <- [constraintValue state]
+    ]
 
-        removeObjectBindings relations key =
-            Map.mapMaybe
-                (\bound -> let kept = Set.delete key bound in if Set.null kept then Nothing else Just kept)
-                relations
+constraintNameIdent :: Constraint -> Maybe Ident
+constraintNameIdent constraint =
+    case constraint of
+        PrimaryKeyConstraint name _ -> name
+        UniqueConstraint name _ -> name
+        ForeignKeyConstraint foreignKey -> foreignKeyName foreignKey
+        CheckConstraint name _ _ -> name
+        IndexConstraint name _ _ -> name
+        UsingIndexConstraint name _ _ -> name
+        OtherConstraint name -> name
 
-        removeCascadeBindings cascades key =
-            let withoutKey = Map.delete key cascades
-             in Map.mapMaybe
-                    (\bound -> let kept = Set.delete key bound in if Set.null kept then Nothing else Just kept)
-                    withoutKey
+constraintColumnsOf :: Constraint -> [Ident]
+constraintColumnsOf constraint =
+    case constraint of
+        PrimaryKeyConstraint _ columns -> columns
+        UniqueConstraint _ columns -> columns
+        ForeignKeyConstraint foreignKey -> foreignKeyChildColumns foreignKey
+        CheckConstraint _ columns _ -> columns
+        IndexConstraint _ columns _ -> columns
+        UsingIndexConstraint {} -> []
+        OtherConstraint _ -> []
 
-        resetDroppedTable current key
-            | objectKind key `elem` [TableObject, TemporaryTableObject] =
-                removeCascadesForTable key (removeRelationsForTable key (resetTableColumns sid key current))
-            | otherwise = current
+{- | Rename the columns owned by the table that defines the constraint. For a
+foreign key that is only the child side: the referenced parent columns belong
+to another table and must not change. Self-referential foreign keys are
+updated on both sides by 'processRename'.
+-}
+renameConstraintChildColumns :: (Ident -> Ident) -> Constraint -> Constraint
+renameConstraintChildColumns rename constraint =
+    case constraint of
+        PrimaryKeyConstraint name columns ->
+            PrimaryKeyConstraint name (map rename columns)
+        UniqueConstraint name columns ->
+            UniqueConstraint name (map rename columns)
+        ForeignKeyConstraint foreignKey ->
+            ForeignKeyConstraint
+                foreignKey
+                    { foreignKeyChildColumns = map rename (foreignKeyChildColumns foreignKey)
+                    }
+        CheckConstraint name columns notValid ->
+            CheckConstraint name (map rename columns) notValid
+        IndexConstraint name columns unique ->
+            IndexConstraint name (map rename columns) unique
+        UsingIndexConstraint name index primary ->
+            UsingIndexConstraint name index primary
+        OtherConstraint name -> OtherConstraint name
 
-removeRelationsForTable :: ObjectKey -> Catalog -> Catalog
-removeRelationsForTable table catalog =
-    catalog
-        { catalogRelations = Map.delete table (catalogRelations catalog)
-        }
+-- ----------------------------------------------------------------------------
+-- Catalog operation dispatch
+-- ----------------------------------------------------------------------------
 
-removeCascadesForTable :: ObjectKey -> Catalog -> Catalog
-removeCascadesForTable table catalog =
-    catalog
-        { catalogCascades = Map.delete table (catalogCascades catalog)
-        }
+processOp :: StatementId -> Eval -> CatalogOp -> Eval
+processOp sid eval op =
+    case op of
+        DefineTableOp definition -> processDefineTable sid eval definition
+        DefineViewOp definition -> processDefineView sid eval definition
+        DefineIndexOp definition -> processDefineIndex sid eval definition
+        DefineTriggerOp definition -> processDefineTrigger sid eval definition
+        DefineSequenceOp definition -> processDefineSequence sid eval definition
+        DefineTypeOp definition -> processDefineType sid eval definition
+        DefineSchemaOp definition -> processDefineSchema sid eval definition
+        ReadOp readFact -> processRead sid eval readFact
+        WriteDataOp write -> processDataWrite sid eval write
+        WriteSequenceOp write -> processSequenceWrite sid eval write
+        AlterTableOp alter -> processAlterTable sid eval alter
+        DropCatalogOp dropOp -> processDrop sid eval dropOp
+        RenameOp renameOp -> processRename sid eval renameOp
+        RefreshCatalogOp refresh -> processRefresh sid eval refresh
 
-bindCascades :: StatementId -> [ObjectAction] -> Catalog -> Catalog
-bindCascades _sid actions catalog =
-    let cascadeParents =
-            [ parent
-            | act <- actions
-            , actionType act == CascadeDep
-            , parent <- matchingKeysInCatalog catalog TableObject UseDep (actionTarget act)
-            ]
-        localTables =
-            [ key
-            | act <- actions
-            , actionType act `elem` [DefDep, ModDep]
-            , actionKind act `elem` [TableObject, TemporaryTableObject]
-            , key <- matchingKeysInCatalog catalog (actionKind act) (actionType act) (actionTarget act)
-            ]
-     in if null cascadeParents || null localTables
-            then catalog
-            else
-                let cascades' =
-                        foldl'
-                            ( \cascades pKey ->
-                                foldl' (\c locKey -> Map.insertWith Set.union pKey (Set.singleton locKey) c) cascades localTables
-                            )
-                            (catalogCascades catalog)
-                            cascadeParents
-                 in catalog {catalogCascades = cascades'}
+-- ----------------------------------------------------------------------------
+-- Definitions
+-- ----------------------------------------------------------------------------
 
-recordOnCommit :: StatementId -> [ObjectAction] -> ScanState -> ScanState
-recordOnCommit _sid actions state =
-    case scanTransactions state of
-        frame : rest ->
-            let dropKeys =
-                    [ key
-                    | act <- actions
-                    , actionType act == OnCommitDropDep
-                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionTarget act)
-                    ]
-                deleteKeys =
-                    [ key
-                    | act <- actions
-                    , actionType act == OnCommitDeleteRowsDep
-                    , key <- matchingKeysInCatalog (scanCatalog state) TemporaryTableObject DefDep (actionTarget act)
-                    ]
-                frame' =
-                    frame
-                        { txOnCommitDrop = Set.union (txOnCommitDrop frame) (Set.fromList dropKeys)
-                        , txOnCommitDeleteRows = Set.union (txOnCommitDeleteRows frame) (Set.fromList deleteKeys)
-                        }
-             in state {scanTransactions = frame' : rest}
-        [] -> state
+clearRelationObjects :: RelationKey -> Catalog -> Catalog
+clearRelationObjects key catalog =
+    case lookupRelation catalog key of
+        Nothing -> catalog
+        Just relation ->
+            let withoutIndexes =
+                    foldl' (flip deleteIndex) catalog (Set.toList (relIndexes relation))
+                withoutTriggers =
+                    foldl' (flip deleteTrigger) withoutIndexes (Set.toList (relTriggers relation))
+                withoutConstraints =
+                    foldl' (flip deleteConstraint) withoutTriggers (Set.toList (relConstraints relation))
+             in deleteRelation key withoutConstraints
 
-moveCascades ::
-    ObjectKey ->
-    ObjectKey ->
-    Map ObjectKey (Set ObjectKey) ->
-    Map ObjectKey (Set ObjectKey) ->
-    Map ObjectKey (Set ObjectKey)
-moveCascades oldKey newKey sourceCascades targetCascades =
-    let updatedParent =
-            case Map.lookup oldKey sourceCascades of
-                Nothing -> targetCascades
-                Just bound -> Map.insertWith Set.union newKey bound (Map.delete oldKey targetCascades)
-     in Map.map (Set.map (\k -> if k == oldKey then newKey else k)) updatedParent
-
-resetTableColumns :: StatementId -> ObjectKey -> Catalog -> Catalog
-resetTableColumns sid table catalog =
-    catalog
-        { catalogObjects =
-            Map.filterWithKey keepColumn (catalogObjects catalog)
-        }
+installConstraints ::
+    SessionState ->
+    StatementId ->
+    RelationKey ->
+    [Constraint] ->
+    Catalog ->
+    (Catalog, Set ConstraintKey)
+installConstraints session sid key constraints catalog =
+    let (catalog', keys, _) =
+            foldl' install (catalog, Set.empty, catalogNextUnnamedConstraint catalog) constraints
+     in (catalog', keys)
     where
-        keepColumn (ColumnKey owner _) object =
-            owner /= table || objectDefinition object == Just sid
-        keepColumn _ _ = True
-
-moveTableColumns :: StatementId -> ObjectKey -> ObjectKey -> Catalog -> Catalog -> Catalog
-moveTableColumns sid oldKey newKey sourceCatalog targetCatalog =
-    let sourceColumns =
-            [ column
-            | (ColumnKey owner column, object) <- Map.toList (catalogObjects sourceCatalog)
-            , owner == oldKey
-            , objectLifecycle object == ObjectLive
-            ]
-        cleanTarget = resetTableColumns sid newKey targetCatalog
-        movedObjects =
-            foldl'
-                ( \objects column ->
-                    Map.insert
-                        (ColumnKey newKey column)
-                        (ObjectState (Just sid) Nothing Nothing Set.empty ObjectLive)
-                        objects
+        install (current, keys, next) constraint =
+            let resolved = resolveUsingIndex session current key constraint
+                (identity, next') =
+                    case constraintNameIdent resolved of
+                        Just name -> (NamedConstraint name, next)
+                        Nothing -> (UnnamedConstraint sid next, next + 1)
+                constraintKey = ConstraintKey key identity
+                state = ConstraintState key (Just sid) resolved Nothing
+             in ( current
+                    { catalogConstraints =
+                        Map.insert constraintKey state (catalogConstraints current)
+                    , catalogNextUnnamedConstraint = next'
+                    }
+                , Set.insert constraintKey keys
+                , next'
                 )
-                (catalogObjects cleanTarget)
-                sourceColumns
-     in cleanTarget {catalogObjects = movedObjects}
 
-bindRelations :: StatementId -> ObjectKey -> [ObjectAction] -> Catalog -> Catalog
-bindRelations _ key actions catalog =
-    let tables =
-            [ owner
-            | action <- actions
-            , actionKind action == TableObject
-            , actionType action == UseDep
-            , owner <- matchingKeysInCatalog catalog TableObject UseDep (actionTarget action)
-            , isLiveKey catalog owner
+{- | Resolve @PRIMARY KEY USING INDEX@ / @UNIQUE USING INDEX@ to a concrete
+key constraint using the index's columns. An index that cannot be found is
+kept as an opaque constraint: the server would reject the statement, and the
+graph builder must not invent columns for it.
+-}
+resolveUsingIndex :: SessionState -> Catalog -> RelationKey -> Constraint -> Constraint
+resolveUsingIndex session catalog tableKey constraint =
+    case constraint of
+        UsingIndexConstraint name index role ->
+            let unqualifiedIndexKeys =
+                    resolveIndexKeys session catalog (NamedIndex (Name [index]))
+                tableName = relationKeyName tableKey
+                -- PostgreSQL and SQLite look the index up in the schema of the
+                -- table being altered, not the search path.
+                tableSchemaIndexKeys =
+                    case nameParts tableName of
+                        _schema : _table : _ ->
+                            resolveIndexKeys
+                                session
+                                catalog
+                                (NamedIndex (Name (init (nameParts tableName) ++ [index])))
+                        _ -> []
+                indexKeys =
+                    case tableSchemaIndexKeys of
+                        [] -> unqualifiedIndexKeys
+                        keys -> keys
+                columns =
+                    concat
+                        [ indexStateColumns state
+                        | indexKey <- indexKeys
+                        , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
+                        ]
+             in if null columns
+                    then OtherConstraint name
+                    else
+                        if role == PrimaryIndex
+                            then PrimaryKeyConstraint name columns
+                            else UniqueConstraint name columns
+        other -> other
+
+tableConstraintValues :: TableDef -> [Constraint]
+tableConstraintValues definition =
+    tableConstraints definition
+        ++ [ ForeignKeyConstraint foreignKey
+           | column <- tableColumns definition
+           , foreignKey <- columnReferences column
+           ]
+
+foreignKeyParentDeps :: SessionState -> Catalog -> [Constraint] -> Set StatementId
+foreignKeyParentDeps session catalog constraints =
+    Set.unions
+        [ relationReadDeps session catalog parentKey ReadSchema []
+        | ForeignKeyConstraint foreignKey <- constraints
+        , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+        ]
+
+resolvedSourceKeys :: SessionState -> Catalog -> [ReadFact] -> Set RelationKey
+resolvedSourceKeys session catalog readFacts =
+    Set.fromList
+        [ key
+        | readFact <- readFacts
+        , key <- resolveRelationKeys session catalog (readSource readFact)
+        , Map.member key (catalogRelations catalog)
+        ]
+
+unresolvedSourceRefs :: SessionState -> Catalog -> [ReadFact] -> Set NameRef
+unresolvedSourceRefs session catalog readFacts =
+    Set.fromList
+        [ readSource readFact
+        | readFact <- readFacts
+        , null
+            [ key
+            | key <- resolveRelationKeys session catalog (readSource readFact)
+            , Map.member key (catalogRelations catalog)
             ]
-        withoutOldBinding =
-            Map.mapMaybe
-                (\bound -> let kept = Set.delete key bound in if Set.null kept then Nothing else Just kept)
-                (catalogRelations catalog)
-        relations' =
+        ]
+
+processDefineTable :: StatementId -> Eval -> TableDef -> Eval
+processDefineTable sid eval definition =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        key =
+            RelationKey
+                (tableTemporary definition)
+                (qualifyDefinitionName session (tableName definition) (tableTemporary definition))
+        existing = lookupRelation catalog key
+        evalReads = foldl' (processRead sid) eval (tableSources definition)
+        likeDeps =
+            case tableLike definition of
+                Nothing -> Set.empty
+                Just reference ->
+                    Set.unions
+                        [ relationReadDeps session catalog source ReadSchema []
+                        | source <- resolveRelationKeys session catalog reference
+                        ]
+        existingDeps =
+            if isJust existing
+                then relationAllDeps session catalog key
+                else Set.empty
+        constraintValues = tableConstraintValues definition
+        parentDeps = foreignKeyParentDeps session catalog constraintValues
+        eval1 =
+            addTouches
+                (relationTouchKeys key)
+                (addDeps (likeDeps `Set.union` existingDeps `Set.union` parentDeps) evalReads)
+        unresolved = unresolvedSourceRefs session catalog (tableSources definition)
+        eval2 =
             foldl'
-                (\relations table -> Map.insertWith Set.union table (Set.singleton key) relations)
-                withoutOldBinding
-                tables
-     in catalog {catalogRelations = relations'}
-
-boundIndexDependencies :: Catalog -> ObjectName -> Set StatementId
-boundIndexDependencies catalog table =
-    Set.unions
-        [ boundDependencies catalog ((== IndexObject) . objectKind) owner
-        | owner <- matchingKeysInCatalog catalog TableObject UseDep (ObjectTarget table)
-        ]
-
-boundObjectDependencies :: Catalog -> ObjectName -> Set StatementId
-boundObjectDependencies catalog table =
-    Set.unions
-        [ boundDependencies catalog (const True) owner
-        | owner <- matchingKeysInCatalog catalog TableObject ModDep (ObjectTarget table)
-        ]
-
-boundDependencies :: Catalog -> (ObjectKey -> Bool) -> ObjectKey -> Set StatementId
-boundDependencies catalog include owner =
-    Set.unions
-        [ maybe Set.empty stateDependenciesInObject (Map.lookup key (catalogObjects catalog))
-        | key <- Set.toList (Map.findWithDefault Set.empty owner (catalogRelations catalog))
-        , include key
-        ]
-
-viewSources :: Catalog -> [ObjectAction] -> ActionTarget -> Set ObjectSource
-viewSources catalog actions viewTarget =
-    if any
-        (\act -> actionKind act == ViewObject && actionType act == DefDep && actionTarget act == viewTarget)
-        actions
-        then
-            Set.fromList
-                [ source
-                | act <- actions
-                , actionKind act == TableObject
-                , actionType act == UseDep
-                , ObjectTarget sourceName <- [actionTarget act]
-                , source <- case matchingKeysInCatalog catalog TableObject UseDep (actionTarget act) of
-                    [] -> [UnresolvedSource sourceName]
-                    keys -> map ResolvedSource keys
+                (flip addBarrier)
+                eval1
+                [ ScopedBarrier
+                    (RelationScope reference)
+                    UnresolvedViewSourceBarrier
+                    (Just ("unresolved source of table " <> nameText (tableName definition)))
+                | reference <- Set.toList unresolved
                 ]
-        else Set.empty
+     in if tableIfNotExists definition && isJust existing
+            then eval2
+            else
+                let catalog1 = insertRelation key (newRelation TableRelation) (clearRelationObjects key catalog)
+                    (catalog2, constraintKeys) =
+                        installConstraints session sid key constraintValues catalog1
+                    relation =
+                        (newRelation TableRelation)
+                            { relDefinition = Just sid
+                            , relColumns =
+                                Set.fromList (map columnName (tableColumns definition))
+                            , relSources =
+                                resolvedSourceKeys session catalog (tableSources definition)
+                            , relUnresolvedSources = unresolved
+                            , relSourceReads = tableSources definition
+                            , relOnCommit = tableOnCommit definition
+                            , relOnCommitFrameId =
+                                case tableOnCommit definition of
+                                    Just OnCommitDrop -> evalFrameId eval
+                                    _ -> Nothing
+                            , relTransactional = fromMaybe True (tableTransactional definition)
+                            , relConstraints = constraintKeys
+                            }
+                    catalog3 = insertRelation key relation catalog2
+                 in eval2 {evalCatalog = catalog3}
 
-updateViewSources :: ObjectKey -> ObjectKey -> Catalog -> Catalog
-updateViewSources oldKey newKey catalog =
-    catalog
-        { catalogObjects =
-            Map.map
-                ( \object -> object {objectSources = Set.unions (map replaceSource (Set.toList (objectSources object)))}
-                )
-                (catalogObjects catalog)
-        }
-    where
-        replaceSource (ResolvedSource key) =
-            Set.singleton (ResolvedSource (if key == oldKey then newKey else key))
-        replaceSource source@(UnresolvedSource name) =
-            case (oldKey, newKey) of
-                (ObjectKey _ oldName, ObjectKey _ newName)
-                    | isJust (nameMatch oldName name) ->
-                        Set.fromList [source, UnresolvedSource newName]
-                _ -> Set.singleton source
-
-moveRelations ::
-    ObjectKey ->
-    ObjectKey ->
-    Map ObjectKey (Set ObjectKey) ->
-    Map ObjectKey (Set ObjectKey) ->
-    Map ObjectKey (Set ObjectKey)
-moveRelations oldKey newKey sourceRelations targetRelations =
-    case Map.lookup oldKey sourceRelations of
-        Nothing -> targetRelations
-        Just bound -> Map.insertWith Set.union newKey bound targetRelations
-
-restoreCatalog :: StatementId -> Catalog -> Catalog -> Catalog
-restoreCatalog sid targetCatalog currentCatalog =
-    let modifiedKeys =
-            [ key
-            | (key, obj) <- Map.toList (catalogObjects targetCatalog)
-            , Map.lookup key (catalogObjects currentCatalog) /= Just obj
-            ]
-        restoredObjects =
+processDefineView :: StatementId -> Eval -> ViewDef -> Eval
+processDefineView sid eval definition =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        key =
+            RelationKey
+                (viewTemporary definition)
+                (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
+        existing = lookupRelation catalog key
+        evalReads = foldl' (processRead sid) eval (viewSources definition)
+        existingDeps =
+            if isJust existing
+                then relationAllDeps session catalog key
+                else Set.empty
+        eval1 =
+            addTouches
+                (relationTouchKeys key)
+                (addDeps existingDeps evalReads)
+        unresolved = unresolvedSourceRefs session catalog (viewSources definition)
+        eval2 =
             foldl'
-                (flip (Map.adjust (\obj -> obj {objectRestored = Just sid})))
-                (catalogObjects targetCatalog)
-                modifiedKeys
-     in targetCatalog {catalogObjects = restoredObjects}
+                (flip addBarrier)
+                eval1
+                [ ScopedBarrier
+                    (RelationScope reference)
+                    UnresolvedViewSourceBarrier
+                    (Just ("unresolved source of view " <> nameText (viewName definition)))
+                | reference <- Set.toList unresolved
+                ]
+     in if viewIfNotExists definition && isJust existing
+            then eval2
+            else
+                let kind =
+                        if viewMaterialized definition
+                            then MaterializedViewRelation
+                            else ViewRelation
+                    relation =
+                        (newRelation kind)
+                            { relDefinition = Just sid
+                            , relColumns = Set.fromList (viewColumns definition)
+                            , relSources =
+                                resolvedSourceKeys session catalog (viewSources definition)
+                            , relUnresolvedSources = unresolved
+                            , relSourceReads = viewSources definition
+                            }
+                    catalog1 = insertRelation key relation (clearRelationObjects key catalog)
+                 in eval2 {evalCatalog = catalog1}
 
-applyTransactionControl ::
-    StatementId -> [ObjectAction] -> ScanState -> (Set StatementId, ScanState)
-applyTransactionControl _sid actions state =
-    case mapMaybe txCommandFromAction actions of
-        command : _ -> apply command
-        [] -> (Set.empty, state)
+processDefineIndex :: StatementId -> Eval -> IndexDef -> Eval
+processDefineIndex sid eval definition =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        tableKeys = resolveRelationKeys session catalog (indexTable definition)
+        -- PostgreSQL and SQLite create an unqualified index in the schema of
+        -- the table; Oracle creates it in the current schema instead. The
+        -- frontend records which rule applies.
+        indexKeys =
+            case (indexRef definition, indexSchemaPlacement definition, tableKeys) of
+                (NamedIndex name@(Name [_]), IndexTableSchema, tableKey : _)
+                    | length (nameParts (relationKeyName tableKey)) > 1 ->
+                        [ NamedIndexKey
+                            ( Name
+                                ( init (nameParts (relationKeyName tableKey))
+                                    ++ nameParts name
+                                )
+                            )
+                        ]
+                _ -> resolveIndexKeys session catalog (indexRef definition)
+        tableDeps =
+            Set.unions
+                [ relationReadDeps session catalog tableKey ReadData (indexColumns definition)
+                | tableKey <- tableKeys
+                ]
+        stepKey current indexKey =
+            let existing = Map.lookup indexKey (catalogIndexes (evalCatalog current))
+                existingDeps =
+                    maybe
+                        Set.empty
+                        (Set.fromList . catMaybes . (\state -> [indexDefinition state, indexRestoredBy state]))
+                        existing
+                current1 =
+                    addTouches
+                        (indexTouchKeys indexKey (listToMaybe tableKeys))
+                        (addDeps (tableDeps `Set.union` existingDeps) current)
+             in if indexIfNotExists definition && isJust existing
+                    then current1
+                    else
+                        let oldTableKeys =
+                                case existing >>= indexStateTable of
+                                    Nothing -> []
+                                    Just oldTableKey -> [oldTableKey]
+                            catalog0 =
+                                foldl'
+                                    ( \catalog' oldTableKey ->
+                                        catalog'
+                                            { catalogRelations =
+                                                Map.adjust
+                                                    (\relation -> relation {relIndexes = Set.delete indexKey (relIndexes relation)})
+                                                    oldTableKey
+                                                    (catalogRelations catalog')
+                                            }
+                                    )
+                                    (evalCatalog current1)
+                                    oldTableKeys
+                            catalog1 =
+                                catalog0
+                                    { catalogIndexes =
+                                        Map.insert
+                                            indexKey
+                                            (IndexState (Just sid) (listToMaybe tableKeys) (indexColumns definition) Nothing)
+                                            (catalogIndexes catalog0)
+                                    }
+                            catalog2 =
+                                foldl'
+                                    ( \catalog' tableKey ->
+                                        catalog'
+                                            { catalogRelations =
+                                                Map.adjust
+                                                    (\relation -> relation {relIndexes = Set.insert indexKey (relIndexes relation)})
+                                                    tableKey
+                                                    (catalogRelations catalog')
+                                            }
+                                    )
+                                    catalog1
+                                    tableKeys
+                         in current1 {evalCatalog = catalog2}
+     in foldl' stepKey eval indexKeys
+
+triggerBodyDeps :: SessionState -> Catalog -> TriggerBody -> Set StatementId
+triggerBodyDeps session catalog body =
+    case body of
+        TriggerInline effects ->
+            Set.unions (map effectDeps effects)
+        TriggerFunction _ _ -> Set.empty
+        TriggerOpaque -> Set.empty
     where
-        snapshot = scanCatalog state
+        effectDeps effect =
+            case effect of
+                TriggerDml event ->
+                    Set.unions
+                        [ relationAllDeps session catalog key
+                        | key <- resolveRelationKeys session catalog (dmlEventTarget event)
+                        ]
+                TriggerRead readFact ->
+                    Set.unions
+                        [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact)
+                        | key <- resolveRelationKeys session catalog (readSource readFact)
+                        ]
+                TriggerWriteSequence write ->
+                    sequenceWriteDeps session catalog (sequenceWriteTarget write)
+                TriggerSession _ -> Set.empty
+                TriggerBarrier _ -> Set.empty
 
-        apply TxBegin =
-            case scanTransactions state of
-                [] ->
-                    ( Set.empty
-                    , state {scanTransactions = [TxFrame _sid snapshot [] TxStartedByBegin Set.empty Set.empty]}
+dmlEventTarget :: DmlEvent -> NameRef
+dmlEventTarget event =
+    case event of
+        DmlInsert target _ -> target
+        DmlUpdate target _ -> target
+        DmlMerge target _ -> target
+        DmlDelete target _ -> target
+        DmlTruncate target _ -> target
+
+sequenceWriteDeps :: SessionState -> Catalog -> NameRef -> Set StatementId
+sequenceWriteDeps session catalog target =
+    Set.unions
+        [ Set.fromList
+            ( catMaybes
+                [ sequenceDefinition state
+                , sequenceRestoredBy state
+                ]
+            )
+            `Set.union` sequenceWrites state
+        | key <- resolveSequenceKeys session catalog target
+        , Just state <- [Map.lookup key (catalogSequences catalog)]
+        ]
+
+processDefineTrigger :: StatementId -> Eval -> TriggerDef -> Eval
+processDefineTrigger sid eval definition =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        triggerKeys = resolveTriggerKeys session catalog (triggerRef definition)
+        tableKeys = resolveRelationKeys session catalog (triggerTable definition)
+        tableDeps =
+            Set.unions
+                [ relationAllDeps session catalog tableKey
+                | tableKey <- tableKeys
+                ]
+        referencedDeps =
+            case triggerReferencedTable definition of
+                Nothing -> Set.empty
+                Just reference ->
+                    Set.unions
+                        [ relationAllDeps session catalog tableKey
+                        | tableKey <- resolveRelationKeys session catalog reference
+                        ]
+        bodyDeps = triggerBodyDeps session catalog (triggerBody definition)
+        whenDeps =
+            Set.unions
+                [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact)
+                | readFact <- triggerWhenReads definition
+                , key <- resolveRelationKeys session catalog (readSource readFact)
+                ]
+        eval0 =
+            case triggerBody definition of
+                TriggerFunction name _ ->
+                    -- The function body is opaque to the catalog model. Treat
+                    -- the trigger definition like an unknown statement so the
+                    -- function definition and other prior catalog state are
+                    -- retained.
+                    addBarrier
+                        ( ScopedBarrier
+                            GlobalScope
+                            UnsupportedTriggerBodyBarrier
+                            (Just ("trigger function " <> nameText name))
+                        )
+                        eval
+                _ -> eval
+        eval1 =
+            addTouches
+                (concatMap (`triggerTouchKeys` listToMaybe tableKeys) triggerKeys)
+                (addDeps (tableDeps `Set.union` referencedDeps `Set.union` bodyDeps `Set.union` whenDeps) eval0)
+        stepKey current triggerKey =
+            let existing = Map.lookup triggerKey (catalogTriggers (evalCatalog current))
+                existingDeps =
+                    maybe
+                        Set.empty
+                        (Set.fromList . catMaybes . (\state -> [triggerDefinition state, triggerRestoredBy state]))
+                        existing
+                current1 = addDeps existingDeps current
+             in if triggerIfNotExists definition && isJust existing
+                    then current1
+                    else
+                        let oldTableKeys =
+                                case existing >>= triggerStateTable of
+                                    Nothing -> []
+                                    Just oldTableKey -> [oldTableKey]
+                            catalog0 =
+                                foldl'
+                                    ( \catalog' oldTableKey ->
+                                        catalog'
+                                            { catalogRelations =
+                                                Map.adjust
+                                                    (\relation -> relation {relTriggers = Set.delete triggerKey (relTriggers relation)})
+                                                    oldTableKey
+                                                    (catalogRelations catalog')
+                                            }
+                                    )
+                                    (evalCatalog current1)
+                                    oldTableKeys
+                            catalog1 =
+                                catalog0
+                                    { catalogTriggers =
+                                        Map.insert
+                                            triggerKey
+                                            ( TriggerState
+                                                (Just sid)
+                                                (listToMaybe tableKeys)
+                                                (triggerTiming definition)
+                                                (triggerEvents definition)
+                                                (triggerWhenReads definition)
+                                                (triggerBody definition)
+                                                Nothing
+                                            )
+                                            (catalogTriggers catalog0)
+                                    }
+                            catalog2 =
+                                foldl'
+                                    ( \catalog' tableKey ->
+                                        catalog'
+                                            { catalogRelations =
+                                                Map.adjust
+                                                    (\relation -> relation {relTriggers = Set.insert triggerKey (relTriggers relation)})
+                                                    tableKey
+                                                    (catalogRelations catalog')
+                                            }
+                                    )
+                                    catalog1
+                                    tableKeys
+                         in current1 {evalCatalog = catalog2}
+     in foldl' stepKey eval1 triggerKeys
+
+processDefineSequence :: StatementId -> Eval -> SequenceDef -> Eval
+processDefineSequence sid eval definition =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        key =
+            SequenceKey
+                (sequenceTemporary definition)
+                (qualifyDefinitionName session (sequenceName definition) (sequenceTemporary definition))
+        existing = Map.lookup key (catalogSequences catalog)
+        existingDeps =
+            maybe
+                Set.empty
+                ( Set.fromList
+                    . catMaybes
+                    . (\sequenceState -> [sequenceDefinition sequenceState, sequenceRestoredBy sequenceState])
+                )
+                existing
+        state =
+            SequenceState
+                (Just sid)
+                Set.empty
+                Nothing
+                (fromMaybe True (sequenceTransactional definition))
+        catalog1 =
+            catalog
+                { catalogSequences = Map.insert key state (catalogSequences catalog)
+                }
+     in (addTouches (sequenceTouchKeys key) (addDeps existingDeps eval))
+            { evalCatalog = catalog1
+            }
+
+processDefineType :: StatementId -> Eval -> TypeDef -> Eval
+processDefineType sid eval definition =
+    let catalog = evalCatalog eval
+        name = typeName definition
+        existing = Map.lookup name (catalogTypes catalog)
+        existingDeps =
+            maybe
+                Set.empty
+                (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                existing
+        catalog1 =
+            catalog
+                { catalogTypes =
+                    Map.insert name (DefinitionState (Just sid) Nothing) (catalogTypes catalog)
+                }
+     in (addTouches (typeTouchKeys name) (addDeps existingDeps eval))
+            { evalCatalog = catalog1
+            }
+
+processDefineSchema :: StatementId -> Eval -> SchemaDef -> Eval
+processDefineSchema sid eval definition =
+    let catalog = evalCatalog eval
+        name = schemaName definition
+        existing = Map.lookup name (catalogSchemas catalog)
+        existingDeps =
+            maybe
+                Set.empty
+                (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                existing
+        catalog1 =
+            catalog
+                { catalogSchemas =
+                    Map.insert name (DefinitionState (Just sid) Nothing) (catalogSchemas catalog)
+                }
+     in (addTouches (schemaTouchKeys name) (addDeps existingDeps eval))
+            { evalCatalog = catalog1
+            }
+
+-- ----------------------------------------------------------------------------
+-- Reads
+-- ----------------------------------------------------------------------------
+
+processRead :: StatementId -> Eval -> ReadFact -> Eval
+processRead _ eval readFact =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        relationKeys =
+            filter
+                (`Map.member` catalogRelations catalog)
+                (resolveRelationKeys session catalog (readSource readFact))
+        sequenceKeys =
+            filter
+                (`Map.member` catalogSequences catalog)
+                (resolveSequenceKeys session catalog (readSource readFact))
+        evalRelations =
+            foldl'
+                ( \current key ->
+                    addTouches
+                        (relationTouchKeys key)
+                        ( addDeps
+                            (relationReadDeps session catalog key (readMode readFact) (readColumns readFact))
+                            current
+                        )
+                )
+                eval
+                relationKeys
+        evalSequences =
+            foldl'
+                ( \current key ->
+                    addTouches
+                        (sequenceTouchKeys key)
+                        (addDeps (sequenceReadDeps catalog key) current)
+                )
+                evalRelations
+                sequenceKeys
+        unresolvedBarriers =
+            [ ScopedBarrier
+                (RelationScope reference)
+                UnresolvedViewSourceBarrier
+                (Just ("unresolved source of " <> nameText (nameRefName (readSource readFact))))
+            | key <- relationKeys
+            , Just relation <- [Map.lookup key (catalogRelations catalog)]
+            , reference <- Set.toList (relUnresolvedSources relation)
+            , null
+                [ sourceKey
+                | sourceKey <- resolveRelationKeys session catalog reference
+                , Map.member sourceKey (catalogRelations catalog)
+                ]
+            ]
+        evalBarriers = foldl' (flip addBarrier) evalSequences unresolvedBarriers
+     in if null relationKeys && null sequenceKeys
+            then
+                addTouch
+                    (RelationBarrierKey (relationFallbackKey session (readSource readFact)))
+                    evalBarriers
+            else evalBarriers
+
+sequenceReadDeps :: Catalog -> SequenceKey -> Set StatementId
+sequenceReadDeps catalog key =
+    case Map.lookup key (catalogSequences catalog) of
+        Nothing -> Set.empty
+        Just state ->
+            Set.fromList
+                ( catMaybes
+                    [ sequenceDefinition state
+                    , sequenceRestoredBy state
+                    ]
+                )
+                `Set.union` sequenceWrites state
+
+-- ----------------------------------------------------------------------------
+-- Data writes
+-- ----------------------------------------------------------------------------
+
+data DmlTag
+    = TagInsert
+    | TagUpdate ![Ident]
+    | TagDelete
+    | TagMerge
+    | TagTruncate
+    deriving (Eq, Show)
+
+data WriteSignature
+    = InsertSignature
+    | UpdateSignature !(Set Ident)
+    | DeleteSignature !DeleteScope
+    | MergeSignature
+    | TruncateSignature
+    deriving (Eq, Ord, Show)
+
+writeSignature :: WriteKind -> [Ident] -> WriteSignature
+writeSignature kind columns =
+    case kind of
+        InsertWrite _ -> InsertSignature
+        UpdateWrite -> UpdateSignature (Set.fromList columns)
+        DeleteWrite scope -> DeleteSignature scope
+        MergeWrite -> MergeSignature
+        TruncateWrite {} -> TruncateSignature
+
+dmlTagFor :: WriteKind -> [Ident] -> DmlTag
+dmlTagFor kind columns =
+    case kind of
+        InsertWrite _ -> TagInsert
+        UpdateWrite -> TagUpdate columns
+        DeleteWrite _ -> TagDelete
+        MergeWrite -> TagMerge
+        TruncateWrite {} -> TagTruncate
+
+eventMatches :: DmlTag -> TriggerEvent -> Bool
+eventMatches tag event =
+    case (tag, event) of
+        (TagInsert, TriggerInsert) -> True
+        (TagUpdate columns, TriggerUpdate triggerColumns) ->
+            null columns
+                || null triggerColumns
+                || not (Set.null (Set.intersection (Set.fromList columns) (Set.fromList triggerColumns)))
+        (TagDelete, TriggerDelete) -> True
+        -- A MERGE may execute INSERT, UPDATE, and DELETE actions, so it may
+        -- fire any of those trigger events.
+        (TagMerge, TriggerInsert) -> True
+        (TagMerge, TriggerUpdate _) -> True
+        (TagMerge, TriggerDelete) -> True
+        (TagTruncate, TriggerTruncate) -> True
+        _ -> False
+
+matchingTriggers :: Catalog -> RelationKey -> DmlTag -> [(TriggerKey, TriggerState)]
+matchingTriggers catalog key tag =
+    case lookupRelation catalog key of
+        Nothing -> []
+        Just relation ->
+            [ (triggerKey, trigger)
+            | triggerKey <- Set.toList (relTriggers relation)
+            , Just trigger <- [Map.lookup triggerKey (catalogTriggers catalog)]
+            , any (eventMatches tag) (triggerStateEvents trigger)
+            , triggerStateTiming trigger /= TriggerInsteadOf
+                || relKind relation `elem` [ViewRelation, MaterializedViewRelation]
+            ]
+
+processDataWrite :: StatementId -> Eval -> DataWrite -> Eval
+processDataWrite sid eval write =
+    let evalReads = foldl' (processRead sid) eval (dataWriteReads write)
+        session = evalSession evalReads
+        catalog = evalCatalog evalReads
+        targetKeys = resolveRelationKeys session catalog (dataWriteTarget write)
+        unqualified = dataWriteUnqualifiedColumns write
+        writeColumns key =
+            let knownColumns =
+                    maybe Set.empty relColumns (lookupRelation catalog key)
+                resolved
+                    | Set.null knownColumns = unqualified
+                    | otherwise = filter (`Set.member` knownColumns) unqualified
+             in dataWriteColumns write ++ resolved
+        applyTarget current key =
+            let columns = writeColumns key
+             in -- An unqualified assignment that names none of this target's
+                -- columns belongs to a different table in a multi-table update.
+                if null columns && not (null unqualified)
+                    then current
+                    else writeRelation sid current key (dataWriteKind write) columns
+     in foldl' applyTarget evalReads targetKeys
+
+writeRelation :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
+writeRelation sid eval key kind columns =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
+        tag = dmlTagFor kind columns
+        matching = matchingTriggers catalog key tag
+        insteadOf = [triggerKey | (triggerKey, trigger) <- matching, triggerStateTiming trigger == TriggerInsteadOf]
+        isView = relKind relation `elem` [ViewRelation, MaterializedViewRelation]
+        suppressOriginal = isView && not (null insteadOf)
+        signature = writeSignature kind columns
+        evalMarked =
+            eval
+                { evalVisitedWrites =
+                    Set.insert (key, signature) (evalVisitedWrites eval)
+                }
+        evalDeps =
+            addTouches
+                (relationTouchKeys key)
+                (addDeps (relationWriteDeps session catalog key kind columns) evalMarked)
+        evalWrite =
+            if suppressOriginal
+                then evalDeps
+                else
+                    evalDeps
+                        { evalCatalog =
+                            insertRelation key (applyWriteState sid kind columns relation) (evalCatalog evalDeps)
+                        }
+        evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
+        evalCascades = applyForeignKeys sid evalTriggers key kind columns
+     in if isView && null insteadOf
+            then addViewWriteBarriers evalCascades key
+            else evalCascades
+
+addViewWriteBarriers :: Eval -> RelationKey -> Eval
+addViewWriteBarriers eval key =
+    foldl'
+        (flip addBarrier)
+        eval
+        [ ScopedBarrier
+            (RelationScope (NameRef (relationKeyName source) (relationKeyTemp source)))
+            WriteThroughViewBarrier
+            (Just "write through view")
+        | source <- Set.toList (transitiveSources (evalCatalog eval) key)
+        ]
+
+transitiveSources :: Catalog -> RelationKey -> Set RelationKey
+transitiveSources catalog = go Set.empty
+    where
+        go seen current
+            | Set.member current seen = Set.empty
+            | otherwise =
+                case lookupRelation catalog current of
+                    Nothing -> Set.singleton current
+                    Just relation ->
+                        Set.insert current $
+                            Set.unions
+                                [ go (Set.insert current seen) source
+                                | source <- Set.toList (relSources relation)
+                                ]
+
+-- ----------------------------------------------------------------------------
+-- Triggers
+-- ----------------------------------------------------------------------------
+
+expandTrigger :: StatementId -> Eval -> TriggerKey -> Eval
+expandTrigger sid eval triggerKey
+    | Set.member triggerKey (evalVisitedTriggers eval) = eval
+    | otherwise =
+        case Map.lookup triggerKey (catalogTriggers (evalCatalog eval)) of
+            Nothing -> eval
+            Just trigger ->
+                let tableKey = triggerStateTable trigger
+                    eval1 =
+                        eval
+                            { evalVisitedTriggers =
+                                Set.insert triggerKey (evalVisitedTriggers eval)
+                            }
+                    definitionDeps =
+                        Set.fromList
+                            ( catMaybes
+                                [ triggerDefinition trigger
+                                , triggerRestoredBy trigger
+                                ]
+                            )
+                    eval2 =
+                        addTouches
+                            (triggerTouchKeys triggerKey tableKey)
+                            (addDeps definitionDeps eval1)
+                    eval3 =
+                        foldl'
+                            (processRead sid)
+                            eval2
+                            (triggerStateWhenReads trigger)
+                 in case triggerStateBody trigger of
+                        TriggerInline effects ->
+                            foldl' (processTriggerEffect sid) eval3 effects
+                        TriggerFunction name _ ->
+                            addBarrier
+                                ( ScopedBarrier
+                                    GlobalScope
+                                    UnsupportedTriggerBodyBarrier
+                                    (Just ("trigger function " <> nameText name))
+                                )
+                                eval3
+                        TriggerOpaque ->
+                            addBarrier
+                                (ScopedBarrier GlobalScope OpaqueTriggerBodyBarrier Nothing)
+                                eval3
+
+processTriggerEffect :: StatementId -> Eval -> TriggerEffect -> Eval
+processTriggerEffect sid eval effect =
+    case effect of
+        TriggerDml event -> processDmlEvent sid eval event
+        TriggerRead readFact -> processRead sid eval readFact
+        TriggerWriteSequence write -> processSequenceWrite sid eval write
+        TriggerSession sessionEffect ->
+            let (eval', _) = applySessionEffects sid [sessionEffect] eval
+             in eval' {evalSessionTouched = True}
+        TriggerBarrier scoped -> addBarrier scoped eval
+
+processDmlEvent :: StatementId -> Eval -> DmlEvent -> Eval
+processDmlEvent sid eval event =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        (target, kind, columns) =
+            case event of
+                DmlInsert target' columns' ->
+                    (target', InsertWrite ConflictError, columns')
+                DmlUpdate target' columns' ->
+                    (target', UpdateWrite, columns')
+                DmlMerge target' columns' ->
+                    (target', MergeWrite, columns')
+                DmlDelete target' scope ->
+                    (target', DeleteWrite scope, [])
+                DmlTruncate target' behavior ->
+                    (target', TruncateWrite behavior ContinueIdentity, [])
+     in foldl'
+            (\current key -> writeRelation sid current key kind columns)
+            eval
+            (resolveRelationKeys session catalog target)
+
+-- ----------------------------------------------------------------------------
+-- Sequences
+-- ----------------------------------------------------------------------------
+
+processSequenceWrite :: StatementId -> Eval -> SequenceWrite -> Eval
+processSequenceWrite sid eval write =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        keys = resolveSequenceKeys session catalog (sequenceWriteTarget write)
+        transactional = sequenceWriteTransactional write
+        stepKey current key =
+            let existing = Map.lookup key (catalogSequences (evalCatalog current))
+                state =
+                    fromMaybe
+                        (SequenceState Nothing Set.empty Nothing transactional)
+                        existing
+                deps =
+                    Set.fromList
+                        ( catMaybes
+                            [ sequenceDefinition state
+                            , sequenceRestoredBy state
+                            ]
+                        )
+                        `Set.union` sequenceWrites state
+                state' = state {sequenceWrites = Set.insert sid (sequenceWrites state)}
+                catalog1 =
+                    (evalCatalog current)
+                        { catalogSequences =
+                            Map.insert key state' (catalogSequences (evalCatalog current))
+                        }
+             in (addTouches (sequenceTouchKeys key) (addDeps deps current))
+                    { evalCatalog = catalog1
+                    }
+     in foldl' stepKey eval keys
+
+-- ----------------------------------------------------------------------------
+-- Foreign keys
+-- ----------------------------------------------------------------------------
+
+applyForeignKeys :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
+applyForeignKeys sid eval key kind columns
+    | not (sessForeignKeyChecks (evalSession eval)) = eval
+    | otherwise =
+        let evalChecks = applyChildChecks sid eval key kind columns
+            evalActions = applyParentActions sid evalChecks key kind columns
+         in evalActions
+
+applyChildChecks :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
+applyChildChecks _sid eval key kind _columns =
+    case kind of
+        InsertWrite _ -> checkParents
+        UpdateWrite -> checkParents
+        MergeWrite -> checkParents
+        _ -> eval
+    where
+        catalog = evalCatalog eval
+        session = evalSession eval
+        checkParents =
+            foldl'
+                ( \current (_, state, foreignKey) ->
+                    if constraintStateTable state == key
+                        then
+                            addDeps
+                                ( Set.unions
+                                    [ relationReadDeps session catalog parentKey ReadData []
+                                    | parentKey <-
+                                        resolveRelationKeys
+                                            session
+                                            catalog
+                                            (foreignKeyParent foreignKey)
+                                    ]
+                                )
+                                current
+                        else current
+                )
+                eval
+                (allForeignKeys catalog)
+
+applyParentActions :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
+applyParentActions sid eval key kind columns =
+    case kind of
+        DeleteWrite _ ->
+            foldl'
+                (\current item -> parentAction current key (DeleteWrite DeleteAllRows) [] item)
+                eval
+                (allForeignKeys catalog)
+        UpdateWrite ->
+            foldl'
+                (\current item -> parentAction current key UpdateWrite columns item)
+                eval
+                (allForeignKeys catalog)
+        TruncateWrite behavior _ ->
+            if behavior == TruncateCascade
+                then
+                    foldl'
+                        ( \current (_, state, foreignKey) ->
+                            if parentMatches state foreignKey
+                                then
+                                    writeChild
+                                        current
+                                        (constraintStateTable state)
+                                        (TruncateWrite TruncateCascade ContinueIdentity)
+                                        []
+                                else current
+                        )
+                        eval
+                        (allForeignKeys catalog)
+                else
+                    -- Without CASCADE the server refuses to truncate a parent
+                    -- that is still referenced. The statement therefore depends
+                    -- on the referencing table and its foreign key constraint.
+                    foldl'
+                        ( \current (_, state, foreignKey) ->
+                            if parentMatches state foreignKey
+                                then
+                                    let childKey = constraintStateTable state
+                                        constraintDeps =
+                                            Set.fromList
+                                                ( catMaybes
+                                                    [ constraintDefinition state
+                                                    , constraintRestoredBy state
+                                                    ]
+                                                )
+                                        childDeps =
+                                            relationReadDeps
+                                                session
+                                                catalog
+                                                childKey
+                                                ReadSchema
+                                                []
+                                     in addDeps (childDeps `Set.union` constraintDeps) current
+                                else current
+                        )
+                        eval
+                        (allForeignKeys catalog)
+        _ -> eval
+    where
+        catalog = evalCatalog eval
+        session = evalSession eval
+
+        parentMatches _state foreignKey =
+            key
+                `elem` resolveRelationKeys
+                    session
+                    catalog
+                    (foreignKeyParent foreignKey)
+
+        parentAction current parentKey action updatedParentColumns (_, state, foreignKey)
+            | not (parentMatches state foreignKey) = current
+            | not (foreignKeyEventMatches action updatedParentColumns parentKey state foreignKey) = current
+            | otherwise =
+                case referentialAction action foreignKey of
+                    Cascade ->
+                        case action of
+                            DeleteWrite _ ->
+                                writeChild current (constraintStateTable state) (DeleteWrite DeleteAllRows) []
+                            UpdateWrite ->
+                                writeChild
+                                    current
+                                    (constraintStateTable state)
+                                    UpdateWrite
+                                    (foreignKeyChildColumns foreignKey)
+                            _ -> current
+                    SetNull ->
+                        writeChild
+                            current
+                            (constraintStateTable state)
+                            UpdateWrite
+                            (foreignKeyChildColumns foreignKey)
+                    SetDefault ->
+                        writeChild
+                            current
+                            (constraintStateTable state)
+                            UpdateWrite
+                            (foreignKeyChildColumns foreignKey)
+                    Restrict ->
+                        addDeps
+                            (relationReadDeps session catalog (constraintStateTable state) ReadData [])
+                            current
+                    NoAction ->
+                        addDeps
+                            (relationReadDeps session catalog (constraintStateTable state) ReadData [])
+                            current
+
+        foreignKeyEventMatches action updatedParentColumns _parentKey _state foreignKey =
+            case action of
+                DeleteWrite _ -> True
+                UpdateWrite ->
+                    let relevant = referencedParentColumns session catalog foreignKey
+                     in null updatedParentColumns
+                            || null relevant
+                            || not
+                                ( Set.null
+                                    ( Set.intersection
+                                        (Set.fromList updatedParentColumns)
+                                        (Set.fromList relevant)
+                                    )
+                                )
+                _ -> False
+
+        referentialAction action foreignKey =
+            case action of
+                DeleteWrite _ -> foreignKeyOnDelete foreignKey
+                UpdateWrite -> foreignKeyOnUpdate foreignKey
+                _ -> NoAction
+
+        writeChild current childKey childKind childColumns =
+            let signature = writeSignature childKind childColumns
+             in if Set.member (childKey, signature) (evalVisitedWrites current)
+                    then current
+                    else writeRelation sid current childKey childKind childColumns
+
+-- ----------------------------------------------------------------------------
+-- ALTER TABLE
+-- ----------------------------------------------------------------------------
+
+relationConstraintDeps :: Catalog -> RelationState -> Set StatementId
+relationConstraintDeps catalog relation =
+    Set.unions
+        [ Set.fromList
+            ( catMaybes
+                [ constraintDefinition state
+                , constraintRestoredBy state
+                ]
+            )
+        | key <- Set.toList (relConstraints relation)
+        , Just state <- [Map.lookup key (catalogConstraints catalog)]
+        ]
+
+introducedForeignKeysOf :: AlterChange -> [ForeignKey]
+introducedForeignKeysOf change =
+    case change of
+        AddConstraint (ForeignKeyConstraint foreignKey) -> [foreignKey]
+        AddColumn column constraints ->
+            [foreignKey | ForeignKeyConstraint foreignKey <- constraints]
+                ++ columnReferences column
+        _ -> []
+
+{- | Views that read the dropped column, directly or through another view.
+The retained read columns make this precise for direct reads; transitive
+view dependencies are over-approximated because column lineage is not
+modelled.
+-}
+dropColumnDependentViews :: SessionState -> Catalog -> RelationKey -> Ident -> [RelationKey]
+dropColumnDependentViews session catalog tableKey column =
+    [ viewKey
+    | viewKey <- Map.keys (catalogRelations catalog)
+    , viewKey /= tableKey
+    , viewDependsOnColumn session catalog Set.empty tableKey column viewKey
+    ]
+
+viewDependsOnColumn ::
+    SessionState ->
+    Catalog ->
+    Set RelationKey ->
+    RelationKey ->
+    Ident ->
+    RelationKey ->
+    Bool
+viewDependsOnColumn session catalog visited tableKey column viewKey
+    | Set.member viewKey visited = False
+    | otherwise =
+        case Map.lookup viewKey (catalogRelations catalog) of
+            Just relation
+                | relKind relation `elem` [ViewRelation, MaterializedViewRelation] ->
+                    let seen = Set.insert viewKey visited
+                        sourceReads =
+                            [ (readFact, resolveRelationKeys session catalog (readSource readFact))
+                            | readFact <- relSourceReads relation
+                            ]
+                        direct =
+                            any
+                                ( \(readFact, keys) ->
+                                    tableKey `elem` keys
+                                        && (null (readColumns readFact) || column `elem` readColumns readFact)
+                                )
+                                sourceReads
+                        transitive =
+                            any
+                                ( \(_, keys) ->
+                                    any
+                                        ( \sourceKey ->
+                                            sourceKey /= tableKey
+                                                && viewDependsOnColumn session catalog seen tableKey column sourceKey
+                                        )
+                                        keys
+                                )
+                                sourceReads
+                        unresolved =
+                            any
+                                ( \reference ->
+                                    tableKey `elem` resolveRelationKeys session catalog reference
+                                )
+                                (Set.toList (relUnresolvedSources relation))
+                        noReadInfo =
+                            tableKey `Set.member` relSources relation
+                                && not (any (\(_, keys) -> tableKey `elem` keys) sourceReads)
+                     in direct || transitive || unresolved || noReadInfo
+            _ -> False
+
+processAlterTable :: StatementId -> Eval -> AlterTable -> Eval
+processAlterTable sid eval alter =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        keys = resolveRelationKeys session catalog (alterTableTarget alter)
+        changes = alterTableChanges alter
+        introducedForeignKeys =
+            concatMap introducedForeignKeysOf changes
+        foreignKeyDeps =
+            Set.unions
+                [ relationReadDeps
+                    session
+                    catalog
+                    parentKey
+                    ( if foreignKeyNotValid foreignKey
+                        then ReadSchema
+                        else ReadData
                     )
-                _ -> (Set.empty, state)
-        apply TxCommit =
-            case scanTransactions state of
-                frame : rest ->
-                    let catalog = scanCatalog state
-                        droppedCatalog = dropObjects _sid (Set.toList (txOnCommitDrop frame)) catalog
-                        truncatedCatalog = writeObjects _sid (Set.toList (txOnCommitDeleteRows frame)) droppedCatalog
-                     in (Set.singleton (txBeginSid frame), state {scanCatalog = truncatedCatalog, scanTransactions = rest})
-                [] -> (Set.empty, state)
-        apply TxRollback =
-            case scanTransactions state of
-                frame : rest ->
-                    let restored = restoreCatalog _sid (txStart frame) (scanCatalog state)
-                     in ( Set.singleton (txBeginSid frame)
-                        , state
-                            { scanCatalog = restored
-                            , scanTransactions = rest
+                    []
+                | foreignKey <- introducedForeignKeys
+                , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+                ]
+        stepKey current key =
+            let currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+                validationDeps =
+                    Set.unions
+                        [ relationReadDeps session currentCatalog parentKey ReadData []
+                        | ValidateConstraint name <- changes
+                        , constraintKey <- Set.toList (relConstraints relation)
+                        , constraintKeyIdentity constraintKey == NamedConstraint name
+                        , Just state <- [Map.lookup constraintKey (catalogConstraints currentCatalog)]
+                        , ForeignKeyConstraint foreignKey <- [constraintValue state]
+                        , parentKey <-
+                            resolveRelationKeys
+                                session
+                                currentCatalog
+                                (foreignKeyParent foreignKey)
+                        ]
+                dropColumnViewDeps =
+                    Set.unions
+                        [ Set.unions
+                            [ relationAllDeps session currentCatalog viewKey
+                                `Set.union` relationConstraintDeps currentCatalog viewRelation
+                            | viewKey <- dropColumnDependentViews session currentCatalog key column
+                            , Just viewRelation <- [lookupRelation currentCatalog viewKey]
+                            ]
+                        | DropColumn column _ <- changes
+                        ]
+                deps =
+                    relationAllDeps session currentCatalog key
+                        `Set.union` relationConstraintDeps currentCatalog relation
+                        `Set.union` foreignKeyDeps
+                        `Set.union` validationDeps
+                        `Set.union` dropColumnViewDeps
+                current1 =
+                    addTouches
+                        (relationTouchKeys key)
+                        (addDeps deps current)
+                (catalog1, relation1) =
+                    foldl'
+                        (applyAlterChange session sid key)
+                        (currentCatalog, relation)
+                        changes
+                relation2 =
+                    relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
+             in current1 {evalCatalog = insertRelation key relation2 catalog1}
+     in foldl' stepKey eval keys
+
+applyAlterChange ::
+    SessionState ->
+    StatementId ->
+    RelationKey ->
+    (Catalog, RelationState) ->
+    AlterChange ->
+    (Catalog, RelationState)
+applyAlterChange session sid key (catalog, relation) change =
+    case change of
+        AddColumn column constraints ->
+            let allConstraints =
+                    constraints
+                        ++ [ForeignKeyConstraint foreignKey | foreignKey <- columnReferences column]
+                (catalog1, keys) = installConstraints session sid key allConstraints catalog
+             in ( catalog1
+                , relation
+                    { relColumns = Set.insert (columnName column) (relColumns relation)
+                    , relConstraints = Set.union keys (relConstraints relation)
+                    }
+                )
+        DropColumn column cascade ->
+            let isParentColumn foreignKey =
+                    column `elem` referencedParentColumns session catalog foreignKey
+                        && key
+                            `elem` resolveRelationKeys
+                                session
+                                catalog
+                                (foreignKeyParent foreignKey)
+                -- Indexes and constraints inside this table are always dropped
+                -- with the column, even without CASCADE.
+                sameTableKeys =
+                    [ constraintKey
+                    | constraintKey <- Set.toList (relConstraints relation)
+                    , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
+                    , let constraint = constraintValue state
+                    , column `elem` constraintColumnsOf constraint
+                        || case constraint of
+                            ForeignKeyConstraint foreignKey -> isParentColumn foreignKey
+                            _ -> False
+                    ]
+                sameTableIndexes =
+                    [ indexKey
+                    | indexKey <- Set.toList (relIndexes relation)
+                    , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
+                    , indexStateTable state == Just key
+                    , column `elem` indexStateColumns state
+                    ]
+                -- Foreign keys in other tables that reference this column as
+                -- a parent column are external dependents. Without CASCADE the
+                -- server rejects the drop, so the whole catalog must stay
+                -- unchanged; with CASCADE the constraints are removed.
+                crossTableKeys =
+                    [ constraintKey
+                    | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+                    , constraintStateTable state /= key
+                    , ForeignKeyConstraint foreignKey <- [constraintValue state]
+                    , isParentColumn foreignKey
+                    ]
+                -- A self-referential foreign key still makes the dropped
+                -- column a referenced parent column. It must block a RESTRICT
+                -- drop just like a foreign key from another table.
+                selfParentKeys =
+                    [ constraintKey
+                    | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+                    , constraintStateTable state == key
+                    , ForeignKeyConstraint foreignKey <- [constraintValue state]
+                    , isParentColumn foreignKey
+                    ]
+                -- Views retain the columns they read from each source, so a
+                -- view that only uses other columns does not block the drop.
+                -- A source with no retained read information is treated as
+                -- dependent, which is the sound over-approximation.
+                dependentViews = dropColumnDependentViews session catalog key column
+                hasExternalDependents =
+                    not (null crossTableKeys)
+                        || not (null selfParentKeys)
+                        || not (null dependentViews)
+                removedKeys =
+                    sameTableKeys
+                        ++ if cascade
+                            then crossTableKeys ++ selfParentKeys
+                            else []
+                catalog1 =
+                    if cascade
+                        then
+                            foldl'
+                                (flip (removeRelationCascade session sid DropCascade))
+                                catalog
+                                dependentViews
+                        else catalog
+             in if not cascade && hasExternalDependents
+                    then (catalog, relation)
+                    else
+                        ( foldl'
+                            (flip deleteIndex)
+                            (foldl' (flip deleteConstraint) catalog1 removedKeys)
+                            sameTableIndexes
+                        , relation
+                            { relColumns = Set.delete column (relColumns relation)
+                            , relColumnWrites = Map.delete column (relColumnWrites relation)
+                            , relConstraints =
+                                Set.difference (relConstraints relation) (Set.fromList removedKeys)
+                            , relIndexes =
+                                Set.difference (relIndexes relation) (Set.fromList sameTableIndexes)
                             }
                         )
-                [] -> (Set.empty, state)
-        apply (TxSavepoint name) =
-            case scanTransactions state of
-                frame : rest ->
-                    ( Set.singleton (txBeginSid frame)
-                    , state
-                        { scanTransactions =
-                            frame {txSavepoints = txSavepoints frame ++ [Savepoint name snapshot _sid]} : rest
-                        }
-                    )
-                [] ->
-                    ( Set.empty
-                    , state
-                        { scanTransactions =
-                            [TxFrame _sid snapshot [Savepoint name snapshot _sid] TxStartedBySavepoint Set.empty Set.empty]
-                        }
-                    )
-        apply (TxRollbackTo name) =
-            case scanTransactions state of
-                frame : rest ->
-                    case break (\savepoint -> savepointObject savepoint == name) (reverse (txSavepoints frame)) of
-                        (_, saved : older) ->
-                            let retained = reverse older ++ [saved]
-                                restored = restoreCatalog _sid (savepointSnapshot saved) (scanCatalog state)
-                             in ( Set.singleton (savepointStatementId saved)
-                                , state
-                                    { scanCatalog = restored
-                                    , scanTransactions = frame {txSavepoints = retained} : rest
+        AddConstraint constraint ->
+            let (catalog1, keys) = installConstraints session sid key [constraint] catalog
+             in ( catalog1
+                , relation {relConstraints = Set.union keys (relConstraints relation)}
+                )
+        DropConstraint name cascade ->
+            let matching =
+                    [ constraintKey
+                    | constraintKey <- Set.toList (relConstraints relation)
+                    , constraintKeyIdentity constraintKey == NamedConstraint name
+                    ]
+                -- Only primary-key and unique constraints can be referenced by
+                -- a foreign key. The referenced column set decides whether a
+                -- given foreign key depends on the dropped constraint; an
+                -- omitted parent column list means the parent primary key.
+                dropTarget droppedState =
+                    case constraintValue droppedState of
+                        PrimaryKeyConstraint _ columns ->
+                            Just (True, Set.fromList columns)
+                        UniqueConstraint _ columns ->
+                            Just (False, Set.fromList columns)
+                        _ -> Nothing
+                dependsOn (primary, targetColumns) keyValue =
+                    let parentColumns = Set.fromList (foreignKeyParentColumns keyValue)
+                     in key
+                            `elem` resolveRelationKeys
+                                session
+                                catalog
+                                (foreignKeyParent keyValue)
+                            && if Set.null parentColumns
+                                then primary
+                                else parentColumns == targetColumns
+                dependentKeys =
+                    Set.toList . Set.fromList $
+                        [ foreignKey
+                        | droppedKey <- matching
+                        , Just droppedState <- [Map.lookup droppedKey (catalogConstraints catalog)]
+                        , Just target <- [dropTarget droppedState]
+                        , not (Set.null (snd target))
+                        , (foreignKey, state) <- Map.toList (catalogConstraints catalog)
+                        , foreignKey `notElem` matching
+                        , ForeignKeyConstraint keyValue <- [constraintValue state]
+                        , dependsOn target keyValue
+                        ]
+                removedKeys = matching ++ dependentKeys
+                catalog1 = foldl' (flip deleteConstraint) catalog removedKeys
+             in if not cascade && not (null dependentKeys)
+                    then (catalog, relation)
+                    else
+                        ( catalog1
+                        , relation
+                            { relConstraints =
+                                Set.difference (relConstraints relation) (Set.fromList removedKeys)
+                            }
+                        )
+        RenameConstraint from to ->
+            let matching =
+                    [ constraintKey
+                    | constraintKey <- Set.toList (relConstraints relation)
+                    , constraintKeyIdentity constraintKey == NamedConstraint from
+                    ]
+                renameOne catalog' constraintKey =
+                    case Map.lookup constraintKey (catalogConstraints catalog') of
+                        Nothing -> catalog'
+                        Just state ->
+                            let newKey = ConstraintKey key (NamedConstraint to)
+                                newState =
+                                    state
+                                        { constraintStateTable = key
+                                        , constraintValue = renameConstraintName to (constraintValue state)
+                                        }
+                             in catalog'
+                                    { catalogConstraints =
+                                        Map.insert
+                                            newKey
+                                            newState
+                                            (Map.delete constraintKey (catalogConstraints catalog'))
                                     }
-                                )
-                        _ -> (Set.singleton (txBeginSid frame), state)
-                [] -> (Set.empty, state)
-        apply (TxRelease name) =
-            case scanTransactions state of
-                frame : rest ->
-                    case break (\savepoint -> savepointObject savepoint == name) (reverse (txSavepoints frame)) of
-                        (_, savepoint : older) ->
-                            let retained = reverse older
-                                transactions =
-                                    if txOrigin frame == TxStartedBySavepoint && null retained
-                                        then rest
-                                        else frame {txSavepoints = retained} : rest
-                             in (Set.singleton (savepointStatementId savepoint), state {scanTransactions = transactions})
-                        _ -> (Set.empty, state)
-                [] -> (Set.empty, state)
-txCommandFromAction :: ObjectAction -> Maybe TxCommand
-txCommandFromAction act
-    | actionKind act == TransactionObject =
-        case actionType act of
-            TxBeginDep -> Just TxBegin
-            TxCommitDep -> Just TxCommit
-            TxRollbackDep -> Just TxRollback
-            TxSavepointDep -> Just (TxSavepoint (savepointName act))
-            TxRollbackToDep -> Just (TxRollbackTo (savepointName act))
-            TxReleaseDep -> Just (TxRelease (savepointName act))
-            _ -> Nothing
-    | otherwise = Nothing
+                catalog1 = foldl' renameOne catalog matching
+                newKeys = Set.fromList [ConstraintKey key (NamedConstraint to) | _ <- matching]
+             in ( catalog1
+                , relation
+                    { relConstraints =
+                        Set.union
+                            newKeys
+                            (Set.difference (relConstraints relation) (Set.fromList matching))
+                    }
+                )
+        ValidateConstraint name ->
+            let matching =
+                    [ constraintKey
+                    | constraintKey <- Set.toList (relConstraints relation)
+                    , constraintKeyIdentity constraintKey == NamedConstraint name
+                    ]
+                catalog1 =
+                    foldl'
+                        ( \current constraintKey ->
+                            current
+                                { catalogConstraints =
+                                    Map.adjust
+                                        ( \state ->
+                                            state
+                                                { constraintValue =
+                                                    validateConstraintValue (constraintValue state)
+                                                }
+                                        )
+                                        constraintKey
+                                        (catalogConstraints current)
+                                }
+                        )
+                        catalog
+                        matching
+             in (catalog1, relation)
+        DropIndexChange name ->
+            let indexKeys =
+                    [ indexKey
+                    | indexKey <- Set.toList (relIndexes relation)
+                    , indexKeyName indexKey == name
+                    ]
+                catalog1 = foldl' (flip deleteIndex) catalog indexKeys
+             in ( catalog1
+                , relation
+                    { relIndexes =
+                        Set.difference (relIndexes relation) (Set.fromList indexKeys)
+                    }
+                )
+        AlterColumn column _detail ->
+            (catalog, relation {relColumns = Set.insert column (relColumns relation)})
+        OtherChange _ -> (catalog, relation)
+
+renameConstraintName :: Ident -> Constraint -> Constraint
+renameConstraintName name constraint =
+    case constraint of
+        PrimaryKeyConstraint _ columns -> PrimaryKeyConstraint (Just name) columns
+        UniqueConstraint _ columns -> UniqueConstraint (Just name) columns
+        ForeignKeyConstraint foreignKey ->
+            ForeignKeyConstraint foreignKey {foreignKeyName = Just name}
+        CheckConstraint _ columns notValid ->
+            CheckConstraint (Just name) columns notValid
+        IndexConstraint _ columns unique ->
+            IndexConstraint (Just name) columns unique
+        UsingIndexConstraint _ index primary ->
+            UsingIndexConstraint (Just name) index primary
+        OtherConstraint _ -> OtherConstraint (Just name)
+
+{- | Clear @NOT VALID@ after a successful @VALIDATE CONSTRAINT@. Only foreign
+key and check constraints carry that flag.
+-}
+validateConstraintValue :: Constraint -> Constraint
+validateConstraintValue constraint =
+    case constraint of
+        ForeignKeyConstraint foreignKey ->
+            ForeignKeyConstraint foreignKey {foreignKeyNotValid = False}
+        CheckConstraint name columns _ ->
+            CheckConstraint name columns ConstraintValid
+        other -> other
+
+indexKeyName :: IndexKey -> Ident
+indexKeyName indexKey =
+    case indexKey of
+        NamedIndexKey (Name parts) ->
+            fromMaybe (Ident "") (lastMaybe parts)
+        TableIndexKey _ name -> name
+
+lastMaybe :: [a] -> Maybe a
+lastMaybe [] = Nothing
+lastMaybe values = Just (last values)
+
+-- ----------------------------------------------------------------------------
+-- DROP
+-- ----------------------------------------------------------------------------
+
+processDrop :: StatementId -> Eval -> DropOp -> Eval
+processDrop sid eval dropOp =
+    foldl' (dropOne sid (dropMode dropOp)) eval (dropObjects dropOp)
+
+{- | Dropping a relation can change how unqualified names resolve, because a
+temporary or schema-qualified relation may have been shadowing another one.
+Record the drop as a schema write on every relation whose name could have been
+affected, so later reads keep a sound dependency on the drop.
+
+The final name component is what an unqualified reference matches; comparing
+only full suffixes would miss a schema-qualified relation shadowing a relation
+of the same name in another schema.
+-}
+markResolutionChange :: StatementId -> RelationKey -> Catalog -> Catalog
+markResolutionChange sid dropped catalog =
+    catalog
+        { catalogRelations =
+            Map.mapWithKey adjust (catalogRelations catalog)
+        }
     where
-        savepointName action = fromMaybe (ObjectName []) (targetObjectName (actionTarget action))
+        droppedName = relationKeyName dropped
+        adjust key relation
+            | key /= dropped
+            , lastPart droppedName == lastPart (relationKeyName key)
+                || nameSuffix droppedName (relationKeyName key)
+                || nameSuffix (relationKeyName key) droppedName =
+                relation {relSchemaWrites = Set.insert sid (relSchemaWrites relation)}
+            | otherwise = relation
+        lastPart (Name parts) = lastMaybe parts
+
+dropOne :: StatementId -> DropMode -> Eval -> DropObject -> Eval
+dropOne sid mode eval object =
+    case object of
+        DropRelation reference _kind ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = resolveRelationKeys session catalog reference
+                existing = filter (`Map.member` catalogRelations catalog) keys
+             in if null existing
+                    then addTouch (RelationBarrierKey (relationFallbackKey session reference)) eval
+                    else
+                        foldl'
+                            ( \current key ->
+                                let currentCatalog = evalCatalog current
+                                    relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+                                    deps =
+                                        relationAllDeps session currentCatalog key
+                                            `Set.union` relationConstraintDeps currentCatalog relation
+                                    current1 =
+                                        addTouches
+                                            (relationTouchKeys key)
+                                            (addDeps deps current)
+                                 in current1
+                                        { evalCatalog =
+                                            removeRelationCascade
+                                                session
+                                                sid
+                                                mode
+                                                key
+                                                (markResolutionChange sid key (evalCatalog current1))
+                                        }
+                            )
+                            eval
+                            existing
+        DropIndex reference ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = resolveIndexKeys session catalog reference
+                stepKey current key =
+                    case Map.lookup key (catalogIndexes (evalCatalog current)) of
+                        Nothing -> current
+                        Just state ->
+                            let tableDeps =
+                                    maybe Set.empty (relationAllDeps session (evalCatalog current)) (indexStateTable state)
+                                deps =
+                                    Set.fromList
+                                        ( catMaybes
+                                            [ indexDefinition state
+                                            , indexRestoredBy state
+                                            ]
+                                        )
+                                        `Set.union` tableDeps
+                                catalog1 =
+                                    deleteIndex key (evalCatalog current)
+                                catalog2 =
+                                    case indexStateTable state of
+                                        Nothing -> catalog1
+                                        Just tableKey ->
+                                            catalog1
+                                                { catalogRelations =
+                                                    Map.adjust
+                                                        (\relation -> relation {relIndexes = Set.delete key (relIndexes relation)})
+                                                        tableKey
+                                                        (catalogRelations catalog1)
+                                                }
+                             in (addTouches (indexTouchKeys key (indexStateTable state)) (addDeps deps current))
+                                    { evalCatalog = catalog2
+                                    }
+             in foldl' stepKey eval keys
+        DropTrigger reference ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = resolveTriggerKeys session catalog reference
+                stepKey current key =
+                    case Map.lookup key (catalogTriggers (evalCatalog current)) of
+                        Nothing -> current
+                        Just state ->
+                            let tableDeps =
+                                    maybe Set.empty (relationAllDeps session (evalCatalog current)) (triggerStateTable state)
+                                deps =
+                                    Set.fromList
+                                        ( catMaybes
+                                            [ triggerDefinition state
+                                            , triggerRestoredBy state
+                                            ]
+                                        )
+                                        `Set.union` tableDeps
+                                catalog1 = deleteTrigger key (evalCatalog current)
+                                catalog2 =
+                                    case triggerStateTable state of
+                                        Nothing -> catalog1
+                                        Just tableKey ->
+                                            catalog1
+                                                { catalogRelations =
+                                                    Map.adjust
+                                                        (\relation -> relation {relTriggers = Set.delete key (relTriggers relation)})
+                                                        tableKey
+                                                        (catalogRelations catalog1)
+                                                }
+                             in (addTouches (triggerTouchKeys key (triggerStateTable state)) (addDeps deps current))
+                                    { evalCatalog = catalog2
+                                    }
+             in foldl' stepKey eval keys
+        DropSequence reference ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = resolveSequenceKeys session catalog reference
+                stepKey current key =
+                    case Map.lookup key (catalogSequences (evalCatalog current)) of
+                        Nothing -> current
+                        Just state ->
+                            let deps =
+                                    Set.fromList
+                                        ( catMaybes
+                                            [ sequenceDefinition state
+                                            , sequenceRestoredBy state
+                                            ]
+                                        )
+                                        `Set.union` sequenceWrites state
+                             in (addTouches (sequenceTouchKeys key) (addDeps deps current))
+                                    { evalCatalog = deleteSequence key (evalCatalog current)
+                                    }
+             in foldl' stepKey eval keys
+        DropType name ->
+            let catalog = evalCatalog eval
+                key = qualifyObjectName (evalSession eval) name
+                deps =
+                    maybe
+                        Set.empty
+                        (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                        (Map.lookup key (catalogTypes catalog))
+             in (addTouches (typeTouchKeys key) (addDeps deps eval))
+                    { evalCatalog =
+                        catalog {catalogTypes = Map.delete key (catalogTypes catalog)}
+                    }
+        DropSchema name ->
+            let catalog = evalCatalog eval
+                session = evalSession eval
+                -- Schema names are not resolved through search_path.
+                key = name
+                contents = schemaContents catalog key
+                schemaDeps =
+                    maybe
+                        Set.empty
+                        (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                        (Map.lookup key (catalogSchemas catalog))
+                deps = schemaDeps `Set.union` schemaContentsDeps session catalog contents
+                catalog1 =
+                    case mode of
+                        DropCascade ->
+                            foldl'
+                                (flip (markResolutionChange sid))
+                                (removeSchemaCascade session sid key catalog)
+                                (contentsRelations contents)
+                        DropRestrict
+                            -- A non-empty schema makes the server reject the
+                            -- drop, so the catalog must stay unchanged.
+                            | schemaContentsEmpty contents ->
+                                catalog {catalogSchemas = Map.delete key (catalogSchemas catalog)}
+                            | otherwise -> catalog
+             in (addTouches (schemaTouchKeys key) (addDeps deps eval))
+                    { evalCatalog = catalog1
+                    }
+
+removeRelationCascade ::
+    SessionState -> StatementId -> DropMode -> RelationKey -> Catalog -> Catalog
+removeRelationCascade session _sid mode = go Set.empty
+    where
+        go seen currentKey catalog
+            | Set.member currentKey seen = catalog
+            | otherwise =
+                let seen' = Set.insert currentKey seen
+                    dependentViews =
+                        [ viewKey
+                        | (viewKey, relation) <- Map.toList (catalogRelations catalog)
+                        , viewKey /= currentKey
+                        , currentKey `Set.member` relSources relation
+                            || any
+                                ( \reference ->
+                                    currentKey `elem` resolveRelationKeys session catalog reference
+                                )
+                                (Set.toList (relUnresolvedSources relation))
+                        ]
+                    foreignKeys =
+                        [ constraintKey
+                        | (constraintKey, state, foreignKey) <- allForeignKeys catalog
+                        , constraintStateTable state /= currentKey
+                        , currentKey
+                            `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+                        ]
+                 in case mode of
+                        DropRestrict
+                            -- The server rejects the drop while dependents exist.
+                            | not (null dependentViews) || not (null foreignKeys) -> catalog
+                            | otherwise -> clearRelationObjects currentKey catalog
+                        DropCascade ->
+                            let catalog1 =
+                                    foldl'
+                                        (flip (go seen'))
+                                        catalog
+                                        dependentViews
+                                catalog2 = foldl' (flip deleteConstraint) catalog1 foreignKeys
+                             in clearRelationObjects currentKey catalog2
+
+data SchemaContents = SchemaContents
+    { contentsRelations :: ![RelationKey]
+    , contentsSequences :: ![SequenceKey]
+    , contentsIndexes :: ![IndexKey]
+    , contentsTriggers :: ![TriggerKey]
+    , contentsTypes :: ![Name]
+    , contentsSchemas :: ![Name]
+    }
+
+schemaContents :: Catalog -> Name -> SchemaContents
+schemaContents catalog schema =
+    SchemaContents
+        { contentsRelations =
+            [ key
+            | key <- Map.keys (catalogRelations catalog)
+            , schemaContains schema (relationKeyName key)
+            ]
+        , contentsSequences =
+            [ key
+            | key <- Map.keys (catalogSequences catalog)
+            , schemaContains schema (sequenceKeyName key)
+            ]
+        , contentsIndexes =
+            [ key
+            | key <- Map.keys (catalogIndexes catalog)
+            , indexKeyInSchema schema key
+            ]
+        , contentsTriggers =
+            [ key
+            | key <- Map.keys (catalogTriggers catalog)
+            , triggerKeyInSchema schema key
+            ]
+        , contentsTypes =
+            [ name
+            | name <- Map.keys (catalogTypes catalog)
+            , schemaContains schema name
+            ]
+        , contentsSchemas =
+            [ name
+            | name <- Map.keys (catalogSchemas catalog)
+            , schemaContains schema name
+            ]
+        }
+
+schemaContentsEmpty :: SchemaContents -> Bool
+schemaContentsEmpty contents =
+    null (contentsRelations contents)
+        && null (contentsSequences contents)
+        && null (contentsIndexes contents)
+        && null (contentsTriggers contents)
+        && null (contentsTypes contents)
+        && null (contentsSchemas contents)
+
+schemaContentsDeps :: SessionState -> Catalog -> SchemaContents -> Set StatementId
+schemaContentsDeps session catalog contents =
+    Set.unions
+        [ relationAllDeps session catalog relationKey
+            `Set.union` relationConstraintDeps catalog relation
+        | relationKey <- contentsRelations contents
+        , Just relation <- [lookupRelation catalog relationKey]
+        ]
+        `Set.union` Set.unions
+            [ Set.fromList
+                ( catMaybes
+                    [ sequenceDefinition state
+                    , sequenceRestoredBy state
+                    ]
+                )
+                `Set.union` sequenceWrites state
+            | sequenceKey <- contentsSequences contents
+            , Just state <- [Map.lookup sequenceKey (catalogSequences catalog)]
+            ]
+        `Set.union` Set.unions
+            [ Set.fromList
+                ( catMaybes
+                    [ indexDefinition state
+                    , indexRestoredBy state
+                    ]
+                )
+                `Set.union` maybe
+                    Set.empty
+                    (relationAllDeps session catalog)
+                    (indexStateTable state)
+            | indexKey <- contentsIndexes contents
+            , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
+            ]
+        `Set.union` Set.unions
+            [ Set.fromList
+                ( catMaybes
+                    [ triggerDefinition state
+                    , triggerRestoredBy state
+                    ]
+                )
+                `Set.union` maybe
+                    Set.empty
+                    (relationAllDeps session catalog)
+                    (triggerStateTable state)
+            | triggerKey <- contentsTriggers contents
+            , Just state <- [Map.lookup triggerKey (catalogTriggers catalog)]
+            ]
+        `Set.union` Set.unions
+            [ Set.fromList
+                ( catMaybes
+                    [ definitionStatement state
+                    , definitionRestoredBy state
+                    ]
+                )
+            | typeName <- contentsTypes contents
+            , Just state <- [Map.lookup typeName (catalogTypes catalog)]
+            ]
+        `Set.union` Set.unions
+            [ Set.fromList
+                ( catMaybes
+                    [ definitionStatement state
+                    , definitionRestoredBy state
+                    ]
+                )
+            | schemaName <- contentsSchemas contents
+            , Just state <- [Map.lookup schemaName (catalogSchemas catalog)]
+            ]
+
+removeSchemaCascade :: SessionState -> StatementId -> Name -> Catalog -> Catalog
+removeSchemaCascade session sid schema catalog =
+    let contents = schemaContents catalog schema
+        catalog1 =
+            foldl'
+                (flip (removeRelationCascade session sid DropCascade))
+                catalog
+                (contentsRelations contents)
+        catalog2 = foldl' (flip deleteSequence) catalog1 (contentsSequences contents)
+        catalog3 = foldl' (flip deleteIndex) catalog2 (contentsIndexes contents)
+        catalog4 = foldl' (flip deleteTrigger) catalog3 (contentsTriggers contents)
+     in catalog4
+            { catalogTypes =
+                foldl' (flip Map.delete) (catalogTypes catalog4) (contentsTypes contents)
+            , catalogSchemas =
+                foldl' (flip Map.delete) (catalogSchemas catalog4) (contentsSchemas contents)
+            }
+
+indexKeyInSchema :: Name -> IndexKey -> Bool
+indexKeyInSchema schema key =
+    case key of
+        NamedIndexKey name -> schemaContains schema name
+        TableIndexKey relation _ -> schemaContains schema (relationKeyName relation)
+
+triggerKeyInSchema :: Name -> TriggerKey -> Bool
+triggerKeyInSchema schema key =
+    case key of
+        NamedTriggerKey name -> schemaContains schema name
+        TableTriggerKey relation _ -> schemaContains schema (relationKeyName relation)
+
+schemaContains :: Name -> Name -> Bool
+schemaContains (Name schemaParts) (Name objectParts) =
+    take (length schemaParts) objectParts == schemaParts
+
+-- ----------------------------------------------------------------------------
+-- RENAME
+-- ----------------------------------------------------------------------------
+
+processRename :: StatementId -> Eval -> RenameOp -> Eval
+processRename sid eval renameOp =
+    case renameOp of
+        RenameRelation from to ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog from)
+                stepKey current oldKey =
+                    let currentCatalog = evalCatalog current
+                        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog oldKey)
+                        deps =
+                            relationAllDeps session currentCatalog oldKey
+                                `Set.union` relationConstraintDeps currentCatalog relation
+                        newKey =
+                            RelationKey
+                                (relationKeyTemp oldKey)
+                                (qualifyRenameName (relationKeyName oldKey) to)
+                        (catalog1, relation1) =
+                            moveRelationObjects sid oldKey newKey relation currentCatalog
+                        relation2 =
+                            relation1
+                                { relSchemaWrites = Set.insert sid (relSchemaWrites relation1)
+                                }
+                        catalog2 =
+                            updateForeignKeyParents
+                                session
+                                currentCatalog
+                                oldKey
+                                newKey
+                                ( updateTriggerRelations
+                                    session
+                                    currentCatalog
+                                    oldKey
+                                    newKey
+                                    ( updateViewSources
+                                        session
+                                        currentCatalog
+                                        oldKey
+                                        newKey
+                                        (insertRelation newKey relation2 (deleteRelation oldKey catalog1))
+                                    )
+                                )
+                     in (addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey) (addDeps deps current))
+                            { evalCatalog = catalog2
+                            }
+             in foldl' stepKey eval keys
+        RenameColumnOp table from to ->
+            let session = evalSession eval
+                catalog = evalCatalog eval
+                keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog table)
+                stepKey current key =
+                    let currentCatalog = evalCatalog current
+                        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+                        deps =
+                            relationAllDeps session currentCatalog key
+                                `Set.union` relationConstraintDeps currentCatalog relation
+                        renameColumn column
+                            | column == from = to
+                            | otherwise = column
+                        relation1 =
+                            relation
+                                { relColumns =
+                                    Set.insert to (Set.delete from (relColumns relation))
+                                , relColumnWrites =
+                                    case Map.lookup from (relColumnWrites relation) of
+                                        Nothing -> relColumnWrites relation
+                                        Just writes ->
+                                            Map.insertWith
+                                                Set.union
+                                                to
+                                                writes
+                                                (Map.delete from (relColumnWrites relation))
+                                , relSchemaWrites = Set.insert sid (relSchemaWrites relation)
+                                }
+                        catalog1 =
+                            currentCatalog
+                                { catalogConstraints =
+                                    Map.map
+                                        ( \state ->
+                                            let childRenamed =
+                                                    if constraintStateTable state == key
+                                                        then
+                                                            state
+                                                                { constraintValue =
+                                                                    renameConstraintChildColumns
+                                                                        renameColumn
+                                                                        (constraintValue state)
+                                                                }
+                                                        else state
+                                             in renameForeignKeyParentColumn
+                                                    session
+                                                    currentCatalog
+                                                    key
+                                                    renameColumn
+                                                    childRenamed
+                                        )
+                                        (catalogConstraints currentCatalog)
+                                , catalogIndexes =
+                                    Map.map
+                                        ( \state ->
+                                            if indexStateTable state == Just key
+                                                then state {indexStateColumns = map renameColumn (indexStateColumns state)}
+                                                else state
+                                        )
+                                        (catalogIndexes currentCatalog)
+                                , catalogTriggers =
+                                    Map.map
+                                        (renameTriggerColumns session currentCatalog key renameColumn)
+                                        (catalogTriggers currentCatalog)
+                                , catalogRelations =
+                                    Map.map
+                                        (renameSourceReadColumns session currentCatalog key renameColumn)
+                                        (catalogRelations currentCatalog)
+                                }
+                     in (addTouches (relationTouchKeys key) (addDeps deps current))
+                            { evalCatalog = insertRelation key relation1 catalog1
+                            }
+             in foldl' stepKey eval keys
+
+moveRelationObjects ::
+    StatementId ->
+    RelationKey ->
+    RelationKey ->
+    RelationState ->
+    Catalog ->
+    (Catalog, RelationState)
+moveRelationObjects _sid oldKey newKey relation catalog =
+    let (catalog1, newIndexes) =
+            foldl' (moveIndex oldKey newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
+        (catalog2, newTriggers) =
+            foldl' (moveTrigger oldKey newKey) (catalog1, Set.empty) (Set.toList (relTriggers relation))
+        (catalog3, newConstraints) =
+            foldl' (moveConstraint oldKey newKey) (catalog2, Set.empty) (Set.toList (relConstraints relation))
+        relation1 =
+            relation
+                { relIndexes = newIndexes
+                , relTriggers = newTriggers
+                , relConstraints = newConstraints
+                }
+     in (catalog3, relation1)
+    where
+        moveIndex _old new (current, keys) indexKey =
+            case Map.lookup indexKey (catalogIndexes current) of
+                Nothing -> (current, keys)
+                Just state ->
+                    let newIndexKey =
+                            case indexKey of
+                                NamedIndexKey name ->
+                                    -- PostgreSQL indexes move with their table and
+                                    -- stay in the table's schema.
+                                    case (nameParts name, nameParts (relationKeyName new)) of
+                                        ([_], newParts)
+                                            | length newParts > 1 ->
+                                                NamedIndexKey (Name (init newParts ++ nameParts name))
+                                        _ -> NamedIndexKey name
+                                TableIndexKey _ ident -> TableIndexKey new ident
+                        state1 = state {indexStateTable = Just new}
+                     in ( current
+                            { catalogIndexes =
+                                Map.insert newIndexKey state1 (Map.delete indexKey (catalogIndexes current))
+                            }
+                        , Set.insert newIndexKey keys
+                        )
+        moveTrigger _old new (current, keys) triggerKey =
+            case Map.lookup triggerKey (catalogTriggers current) of
+                Nothing -> (current, keys)
+                Just state ->
+                    let newTriggerKey =
+                            case triggerKey of
+                                NamedTriggerKey name -> NamedTriggerKey name
+                                TableTriggerKey _ ident -> TableTriggerKey new ident
+                        state1 = state {triggerStateTable = Just new}
+                     in ( current
+                            { catalogTriggers =
+                                Map.insert newTriggerKey state1 (Map.delete triggerKey (catalogTriggers current))
+                            }
+                        , Set.insert newTriggerKey keys
+                        )
+        moveConstraint _old new (current, keys) constraintKey =
+            case Map.lookup constraintKey (catalogConstraints current) of
+                Nothing -> (current, keys)
+                Just state ->
+                    let newConstraintKey = ConstraintKey new (constraintKeyIdentity constraintKey)
+                        state1 = state {constraintStateTable = new}
+                     in ( current
+                            { catalogConstraints =
+                                Map.insert
+                                    newConstraintKey
+                                    state1
+                                    (Map.delete constraintKey (catalogConstraints current))
+                            }
+                        , Set.insert newConstraintKey keys
+                        )
+
+updateViewSources :: SessionState -> Catalog -> RelationKey -> RelationKey -> Catalog -> Catalog
+updateViewSources session resolutionCatalog oldKey newKey catalog =
+    catalog
+        { catalogRelations =
+            Map.map
+                ( \relation ->
+                    relation
+                        { relSources =
+                            if Set.member oldKey (relSources relation)
+                                then Set.insert newKey (Set.delete oldKey (relSources relation))
+                                else relSources relation
+                        , relUnresolvedSources =
+                            Set.map updateUnresolved (relUnresolvedSources relation)
+                        , relSourceReads =
+                            map updateRead (relSourceReads relation)
+                        }
+                )
+                (catalogRelations catalog)
+        }
+    where
+        newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+        updateUnresolved reference
+            | resolveRelationKeys session resolutionCatalog reference == [oldKey] =
+                newReference
+            | otherwise = reference
+        updateRead readFact
+            | oldKey `elem` resolveRelationKeys session resolutionCatalog (readSource readFact) =
+                readFact {readSource = newReference}
+            | otherwise = readFact
+
+updateForeignKeyParents ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    RelationKey ->
+    Catalog ->
+    Catalog
+updateForeignKeyParents session resolutionCatalog oldKey newKey catalog =
+    catalog
+        { catalogConstraints =
+            Map.map adjust (catalogConstraints catalog)
+        }
+    where
+        adjust state =
+            case constraintValue state of
+                ForeignKeyConstraint foreignKey
+                    | resolveRelationKeys session resolutionCatalog (foreignKeyParent foreignKey) == [oldKey] ->
+                        state
+                            { constraintValue =
+                                ForeignKeyConstraint
+                                    foreignKey
+                                        { foreignKeyParent =
+                                            NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+                                        }
+                            }
+                _ -> state
+
+renameSourceReadColumns ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    (Ident -> Ident) ->
+    RelationState ->
+    RelationState
+renameSourceReadColumns session catalog key rename relation =
+    relation
+        { relSourceReads = map renameRead (relSourceReads relation)
+        }
+    where
+        renameRead readFact
+            | key `elem` resolveRelationKeys session catalog (readSource readFact) =
+                readFact {readColumns = map rename (readColumns readFact)}
+            | otherwise = readFact
+
+renameTriggerColumns ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    (Ident -> Ident) ->
+    TriggerState ->
+    TriggerState
+renameTriggerColumns session catalog key rename state =
+    state
+        { triggerStateWhenReads = map renameRead (triggerStateWhenReads state)
+        , triggerStateBody = renameBody (triggerStateBody state)
+        }
+    where
+        resolvesToKey reference =
+            resolveRelationKeys session catalog reference == [key]
+        renameRead readFact
+            | resolvesToKey (readSource readFact) =
+                readFact {readColumns = map rename (readColumns readFact)}
+            | otherwise = readFact
+        renameEvent event =
+            case event of
+                DmlInsert target columns
+                    | resolvesToKey target -> DmlInsert target (map rename columns)
+                DmlUpdate target columns
+                    | resolvesToKey target -> DmlUpdate target (map rename columns)
+                DmlMerge target columns
+                    | resolvesToKey target -> DmlMerge target (map rename columns)
+                other -> other
+        renameEffect effect =
+            case effect of
+                TriggerDml event -> TriggerDml (renameEvent event)
+                TriggerRead readFact -> TriggerRead (renameRead readFact)
+                other -> other
+        renameBody body =
+            case body of
+                TriggerInline effects -> TriggerInline (map renameEffect effects)
+                other -> other
+
+renameTriggerRelations ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    RelationKey ->
+    TriggerState ->
+    TriggerState
+renameTriggerRelations session resolutionCatalog oldKey newKey state =
+    state
+        { triggerStateWhenReads = map renameRead (triggerStateWhenReads state)
+        , triggerStateBody = renameBody (triggerStateBody state)
+        }
+    where
+        newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+        resolvesToOld reference =
+            resolveRelationKeys session resolutionCatalog reference == [oldKey]
+        renameRead readFact
+            | resolvesToOld (readSource readFact) = readFact {readSource = newReference}
+            | otherwise = readFact
+        renameEvent event =
+            case event of
+                DmlInsert target columns
+                    | resolvesToOld target -> DmlInsert newReference columns
+                DmlUpdate target columns
+                    | resolvesToOld target -> DmlUpdate newReference columns
+                DmlMerge target columns
+                    | resolvesToOld target -> DmlMerge newReference columns
+                DmlDelete target allRows
+                    | resolvesToOld target -> DmlDelete newReference allRows
+                DmlTruncate target cascade
+                    | resolvesToOld target -> DmlTruncate newReference cascade
+                other -> other
+        renameEffect effect =
+            case effect of
+                TriggerDml event -> TriggerDml (renameEvent event)
+                TriggerRead readFact -> TriggerRead (renameRead readFact)
+                other -> other
+        renameBody body =
+            case body of
+                TriggerInline effects -> TriggerInline (map renameEffect effects)
+                other -> other
+
+updateTriggerRelations ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    RelationKey ->
+    Catalog ->
+    Catalog
+updateTriggerRelations session resolutionCatalog oldKey newKey catalog =
+    catalog
+        { catalogTriggers =
+            Map.map
+                (renameTriggerRelations session resolutionCatalog oldKey newKey)
+                (catalogTriggers catalog)
+        }
+
+renameForeignKeyParentColumn ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    (Ident -> Ident) ->
+    ConstraintState ->
+    ConstraintState
+renameForeignKeyParentColumn session catalog key rename state =
+    case constraintValue state of
+        ForeignKeyConstraint foreignKey
+            | key `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey) ->
+                state
+                    { constraintValue =
+                        ForeignKeyConstraint
+                            foreignKey
+                                { foreignKeyParentColumns =
+                                    map rename (foreignKeyParentColumns foreignKey)
+                                }
+                    }
+        _ -> state
+
+-- ----------------------------------------------------------------------------
+-- REFRESH
+-- ----------------------------------------------------------------------------
+
+processRefresh :: StatementId -> Eval -> RefreshOp -> Eval
+processRefresh sid eval refresh =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        keys =
+            filter
+                (`Map.member` catalogRelations catalog)
+                (resolveRelationKeys session catalog (refreshTarget refresh))
+        stepKey current key =
+            let currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+                deps = relationReadDeps session currentCatalog key ReadData []
+                relation1 =
+                    relation
+                        { relDataWrites = Set.singleton sid
+                        , relColumnWrites = Map.empty
+                        }
+             in (addTouches (relationTouchKeys key) (addDeps deps current))
+                    { evalCatalog = insertRelation key relation1 currentCatalog
+                    }
+     in foldl' stepKey eval keys
+
+-- ----------------------------------------------------------------------------
+-- Session effects
+-- ----------------------------------------------------------------------------
+
+applySessionEffects :: StatementId -> [SessionEffect] -> Eval -> (Eval, Bool)
+applySessionEffects _ effects eval =
+    let eval' =
+            foldl'
+                ( \current effect ->
+                    let session' = applySessionEffect effect (evalSession current)
+                     in current
+                            { evalSession = session'
+                            , evalTouches = Set.insert SessionBarrierKey (evalTouches current)
+                            , evalSessionTouched = True
+                            }
+                )
+                eval
+                effects
+     in (eval', evalSessionTouched eval')
+
+applySessionEffect :: SessionEffect -> SessionState -> SessionState
+applySessionEffect effect session =
+    case effect of
+        SetVariable scope name value ->
+            setVariable scope (nameText name) value session
+        SetSearchPath scope path ->
+            setSearchPath scope path session
+        SetNamespace scope prefix ->
+            case scope of
+                ScopeSession -> session {sessNamespacePrefix = prefix}
+                ScopeGlobal -> session
+                _ -> session {sessTxNamespacePrefix = Just prefix}
+        SetSessionUser scope user ->
+            setSessionUser scope (Just user) session
+        ResetSessionUser scope ->
+            setSessionUser scope (sessAuthenticatedUser session) session
+        SetCurrentUser scope user ->
+            setCurrentUser scope (Just user) session
+        ResetCurrentUser scope ->
+            setCurrentUser scope (effectiveSessionUser session) session
+        SetAutocommit scope value ->
+            case scope of
+                ScopeSession -> session {sessAutocommit = value}
+                _ -> session
+        SetForeignKeyChecks scope value ->
+            case scope of
+                ScopeSession -> session {sessForeignKeyChecks = value}
+                _ -> session
+        ResetForeignKeyChecks scope ->
+            case scope of
+                ScopeSession ->
+                    session
+                        { sessForeignKeyChecks =
+                            sessInitialForeignKeyChecks session
+                        }
+                _ -> session
+        ResetVariable scope name ->
+            let key = nameText name
+             in case scope of
+                    ScopeSession ->
+                        session {sessVariables = Map.delete key (sessVariables session)}
+                    ScopeGlobal -> session
+                    _ ->
+                        session {sessTxVariables = Map.delete key (sessTxVariables session)}
+        ResetAll scope ->
+            case scope of
+                ScopeSession ->
+                    session
+                        { sessSearchPath = []
+                        , sessVariables = Map.empty
+                        , sessForeignKeyChecks =
+                            sessInitialForeignKeyChecks session
+                        }
+                ScopeGlobal -> session
+                _ ->
+                    session
+                        { sessTxSearchPath = Nothing
+                        , sessTxNamespacePrefix = Nothing
+                        , sessTxCurrentUser = Nothing
+                        , sessTxVariables = Map.empty
+                        }
+
+setSearchPath :: SessionScope -> SearchPathValue -> SessionState -> SessionState
+setSearchPath scope path session =
+    case scope of
+        ScopeSession -> session {sessSearchPath = entries}
+        ScopeGlobal -> session
+        _ -> session {sessTxSearchPath = Just entries}
+    where
+        entries =
+            case path of
+                SearchPathDefault -> []
+                SearchPathExplicit values -> values
+
+-- | @SET SESSION AUTHORIZATION@ changes both session_user and current_user.
+setSessionUser :: SessionScope -> Maybe Ident -> SessionState -> SessionState
+setSessionUser scope user session =
+    case scope of
+        ScopeSession ->
+            session
+                { sessSessionUser = user
+                , sessCurrentUser = user
+                }
+        ScopeGlobal -> session
+        _ ->
+            session
+                { sessTxSessionUser = Just user
+                , sessTxCurrentUser = Just user
+                }
+
+setCurrentUser :: SessionScope -> Maybe Ident -> SessionState -> SessionState
+setCurrentUser scope user session =
+    case scope of
+        ScopeSession -> session {sessCurrentUser = user}
+        ScopeGlobal -> session
+        _ -> session {sessTxCurrentUser = Just user}
+
+setVariable :: SessionScope -> Text -> SessionValue -> SessionState -> SessionState
+setVariable scope key value session =
+    let update current =
+            case value of
+                SessionDefault -> Map.delete key current
+                _ -> Map.insert key value current
+     in case scope of
+            ScopeSession -> session {sessVariables = update (sessVariables session)}
+            ScopeGlobal -> session
+            _ -> session {sessTxVariables = update (sessTxVariables session)}
+
+-- ----------------------------------------------------------------------------
+-- Transaction frames
+-- ----------------------------------------------------------------------------
+
+createFrame :: ScanState -> Bool -> Maybe StatementId -> (TxFrame, ScanState)
+createFrame state explicit begin =
+    let identifier = scanNextFrameId state
+        frame =
+            TxFrame
+                { frameId = identifier
+                , frameExplicit = explicit
+                , frameNesting = 1
+                , frameBegin = begin
+                , frameCatalog = scanCatalog state
+                , frameSession = scanSession state
+                , frameSavepoints = []
+                }
+     in (frame, state {scanNextFrameId = identifier + 1})
+
+ensureFrame :: ScanState -> (ScanState, TxFrame)
+ensureFrame state =
+    case scanTransactions state of
+        frame : _ -> (state, frame)
+        [] ->
+            let (frame, state') =
+                    createFrame state (not (sessAutocommit (scanSession state))) Nothing
+             in (state' {scanTransactions = [frame]}, frame)
+
+ensureFrameForOps :: ScanState -> ScanState
+ensureFrameForOps = fst . ensureFrame
+
+finishStatement :: StatementId -> ScanState -> ScanState
+finishStatement sid state =
+    case scanTransactions state of
+        frame : _
+            | not (frameExplicit frame)
+            , null (frameSavepoints frame)
+            , sessAutocommit (scanSession state) ->
+                finishStatement sid (commitFrame sid state)
+        []
+            | not (sessAutocommit (scanSession state)) ->
+                let (frame, state') = createFrame state False Nothing
+                 in state' {scanTransactions = [frame]}
+        _ -> state
+
+settleAutocommit :: StatementId -> ScanState -> ScanState -> ScanState
+settleAutocommit sid prior next
+    | sessAutocommit (scanSession prior) == sessAutocommit (scanSession next) = next
+    | sessAutocommit (scanSession next) =
+        case scanTransactions next of
+            frame : _ | not (frameExplicit frame) -> commitFrame sid next
+            _ -> next
+    | otherwise =
+        case scanTransactions next of
+            [] ->
+                let (frame, state') = createFrame next False Nothing
+                 in state' {scanTransactions = [frame]}
+            _ -> next
+
+applyTxEffects :: StatementId -> [TxEffect] -> ScanState -> ScanState
+applyTxEffects sid effects state = foldl' (applyTxEffect sid) state effects
+
+applyTxEffect :: StatementId -> ScanState -> TxEffect -> ScanState
+applyTxEffect sid state effect =
+    case effect of
+        TxBegin policy ->
+            case scanTransactions state of
+                [] ->
+                    let (frame, state') = createFrame state True (Just sid)
+                     in state' {scanTransactions = [frame]}
+                frame : rest
+                    | policy == BeginCommitActive ->
+                        -- MySQL/SQLite-style `START TRANSACTION` commits the
+                        -- pending transaction (including an implicit
+                        -- autocommit-off frame) and starts a fresh one.
+                        applyTxEffect sid (commitFrame sid state) (TxBegin BeginIgnore)
+                    | not (frameExplicit frame) ->
+                        state
+                            { scanTransactions =
+                                frame
+                                    { frameExplicit = True
+                                    , frameBegin = Just sid
+                                    , frameNesting =
+                                        if policy == BeginIgnore
+                                            then frameNesting frame + 1
+                                            else frameNesting frame
+                                    }
+                                    : rest
+                            }
+                    | policy == BeginIgnore ->
+                        state
+                            { scanTransactions =
+                                frame {frameNesting = frameNesting frame + 1} : rest
+                            }
+                    | otherwise -> state
+        TxCommit chain ->
+            case scanTransactions state of
+                frame : rest
+                    | frameNesting frame > 1 ->
+                        state
+                            { scanTransactions =
+                                frame {frameNesting = frameNesting frame - 1} : rest
+                            }
+                _ ->
+                    let state' = commitFrame sid state
+                     in if chain
+                            then
+                                let (frame, state'') = createFrame state' True (Just sid)
+                                 in state'' {scanTransactions = frame : scanTransactions state'}
+                            else state'
+        TxRollbackAll -> rollbackFrame sid state
+        TxRollbackTo name -> rollbackTo sid name state
+        TxSavepoint name -> savepoint sid name state
+        TxReleaseSavepoint name -> releaseSavepoint sid name state
+        TxSetReadOnly value ->
+            state
+                { scanSession =
+                    (scanSession state)
+                        { sessTxVariables =
+                            Map.insert
+                                "transaction_read_only"
+                                (SessionBool value)
+                                (sessTxVariables (scanSession state))
+                        }
+                }
+
+savepoint :: StatementId -> Ident -> ScanState -> ScanState
+savepoint sid name state =
+    let (state1, frame) = ensureFrame state
+        saved =
+            Savepoint
+                { savepointName = name
+                , savepointCatalog = scanCatalog state1
+                , savepointSession = scanSession state1
+                , savepointStatement = sid
+                }
+        frame1 = frame {frameSavepoints = saved : frameSavepoints frame}
+     in state1 {scanTransactions = frame1 : drop 1 (scanTransactions state1)}
+
+rollbackTo :: StatementId -> Ident -> ScanState -> ScanState
+rollbackTo sid name state =
+    case scanTransactions state of
+        [] -> state
+        frame : rest ->
+            case break ((== name) . savepointName) (frameSavepoints frame) of
+                (_, []) -> state
+                (_, saved : older) ->
+                    let catalog1 =
+                            restoreCatalog sid (savepointCatalog saved) (scanCatalog state)
+                        session1 = savepointSession saved
+                        frame1 = frame {frameSavepoints = saved : older}
+                     in state
+                            { scanCatalog = catalog1
+                            , scanSession = session1
+                            , scanTransactions = frame1 : rest
+                            }
+
+releaseSavepoint :: StatementId -> Ident -> ScanState -> ScanState
+releaseSavepoint sid name state =
+    case scanTransactions state of
+        [] -> state
+        frame : rest ->
+            case break ((== name) . savepointName) (frameSavepoints frame) of
+                (_, []) -> state
+                (_, _released : older) ->
+                    let frame1 = frame {frameSavepoints = older}
+                        state1 = state {scanTransactions = frame1 : rest}
+                     in if not (frameExplicit frame) && null older
+                            then commitFrame sid state1
+                            else state1
+
+commitFrame :: StatementId -> ScanState -> ScanState
+commitFrame sid state =
+    case scanTransactions state of
+        [] -> state
+        frame : rest ->
+            let catalog1 = applyOnCommit sid (frameId frame) (scanSession state) (scanCatalog state)
+                session1 = clearTransactionSession (scanSession state)
+             in state
+                    { scanCatalog = catalog1
+                    , scanSession = session1
+                    , scanTransactions = rest
+                    }
+
+rollbackFrame :: StatementId -> ScanState -> ScanState
+rollbackFrame sid state =
+    case scanTransactions state of
+        [] -> state
+        frame : rest ->
+            let catalog1 = restoreCatalog sid (frameCatalog frame) (scanCatalog state)
+                session1 = frameSession frame
+             in state
+                    { scanCatalog = catalog1
+                    , scanSession = session1
+                    , scanTransactions = rest
+                    }
+
+applyOnCommit :: StatementId -> Int -> SessionState -> Catalog -> Catalog
+applyOnCommit sid transactionId session catalog =
+    let relations =
+            Map.map
+                ( \relation ->
+                    case relOnCommit relation of
+                        Just OnCommitDeleteRows ->
+                            relation
+                                { relDataWrites = Set.empty
+                                , relColumnWrites = Map.empty
+                                }
+                        _ -> relation
+                )
+                (catalogRelations catalog)
+        dropKeys =
+            [ key
+            | (key, relation) <- Map.toList relations
+            , relOnCommit relation == Just OnCommitDrop
+            , relOnCommitFrameId relation == Just transactionId
+            ]
+        catalog1 = catalog {catalogRelations = relations}
+     in foldl'
+            (flip (removeRelationCascade session sid DropCascade))
+            catalog1
+            dropKeys
+
+-- ----------------------------------------------------------------------------
+-- Transactional rollback
+-- ----------------------------------------------------------------------------
+
+restoreCatalog :: StatementId -> Catalog -> Catalog -> Catalog
+restoreCatalog sid snapshot current =
+    Catalog
+        { catalogRelations =
+            restoreRelationMap sid (catalogRelations snapshot) (catalogRelations current)
+        , catalogIndexes =
+            restoreIndexMap sid snapshot current
+        , catalogTriggers =
+            restoreTriggerMap sid snapshot current
+        , catalogSequences =
+            restoreSequenceMap sid (catalogSequences snapshot) (catalogSequences current)
+        , catalogConstraints =
+            restoreConstraintMap sid snapshot current
+        , catalogTypes =
+            restoreDefinitionMap sid (catalogTypes snapshot) (catalogTypes current)
+        , catalogSchemas =
+            restoreDefinitionMap sid (catalogSchemas snapshot) (catalogSchemas current)
+        , catalogNextUnnamedConstraint =
+            max
+                (catalogNextUnnamedConstraint snapshot)
+                (catalogNextUnnamedConstraint current)
+        }
+
+restoreRelationMap ::
+    StatementId ->
+    Map RelationKey RelationState ->
+    Map RelationKey RelationState ->
+    Map RelationKey RelationState
+restoreRelationMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
+        , entry <- restoreRelationKey key
+        ]
+    where
+        restoreRelationKey key =
+            case (Map.lookup key snapshot, Map.lookup key current) of
+                (Just old, Just new)
+                    | nonTransactionalRelation old new -> [(key, new)]
+                    | otherwise -> [(key, mark old (Just new))]
+                (Just old, Nothing)
+                    | nonTransactionalRelation old (newRelation (relKind old)) -> []
+                    | otherwise -> [(key, mark old Nothing)]
+                (Nothing, Just new)
+                    | nonTransactionalRelation (newRelation (relKind new)) new -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripRelationRestored new /= stripRelationRestored old
+             in if changed
+                    then old {relRestoredBy = Just sid}
+                    else old
+
+nonTransactionalRelation :: RelationState -> RelationState -> Bool
+nonTransactionalRelation left right =
+    not (relTransactional left) || not (relTransactional right)
+
+stripRelationRestored :: RelationState -> RelationState
+stripRelationRestored relation = relation {relRestoredBy = Nothing}
+
+restoreIndexMap ::
+    StatementId ->
+    Catalog ->
+    Catalog ->
+    Map IndexKey IndexState
+restoreIndexMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
+        , entry <- restoreIndexKey key
+        ]
+    where
+        oldMap = catalogIndexes snapshot
+        newMap = catalogIndexes current
+        restoreIndexKey key =
+            case (Map.lookup key oldMap, Map.lookup key newMap) of
+                (Just old, Just new)
+                    | nonTransactionalIndex snapshot current old new -> [(key, new)]
+                    | otherwise -> [(key, mark old (Just new))]
+                (Just old, Nothing)
+                    | nonTransactionalIndex snapshot current old (IndexState Nothing Nothing [] Nothing) -> []
+                    | otherwise -> [(key, mark old Nothing)]
+                (Nothing, Just new)
+                    | nonTransactionalIndex snapshot current (IndexState Nothing Nothing [] Nothing) new -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripIndexRestored new /= stripIndexRestored old
+             in if changed
+                    then old {indexRestoredBy = Just sid}
+                    else old
+
+nonTransactionalIndex :: Catalog -> Catalog -> IndexState -> IndexState -> Bool
+nonTransactionalIndex snapshot current left right =
+    not (indexTransactionalIn snapshot left)
+        || not (indexTransactionalIn current right)
+
+indexTransactionalIn :: Catalog -> IndexState -> Bool
+indexTransactionalIn catalog state =
+    case indexStateTable state of
+        Nothing -> True
+        Just key -> maybe True relTransactional (lookupRelation catalog key)
+
+stripIndexRestored :: IndexState -> IndexState
+stripIndexRestored state = state {indexRestoredBy = Nothing}
+
+restoreTriggerMap ::
+    StatementId ->
+    Catalog ->
+    Catalog ->
+    Map TriggerKey TriggerState
+restoreTriggerMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
+        , entry <- restoreTriggerKey key
+        ]
+    where
+        oldMap = catalogTriggers snapshot
+        newMap = catalogTriggers current
+        restoreTriggerKey key =
+            case (Map.lookup key oldMap, Map.lookup key newMap) of
+                (Just old, Just new)
+                    | nonTransactionalTrigger snapshot current old new -> [(key, new)]
+                    | otherwise -> [(key, mark old (Just new))]
+                (Just old, Nothing)
+                    | nonTransactionalTrigger snapshot current old emptyTrigger -> []
+                    | otherwise -> [(key, mark old Nothing)]
+                (Nothing, Just new)
+                    | nonTransactionalTrigger snapshot current emptyTrigger new -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripTriggerRestored new /= stripTriggerRestored old
+             in if changed
+                    then old {triggerRestoredBy = Just sid}
+                    else old
+
+emptyTrigger :: TriggerState
+emptyTrigger =
+    TriggerState Nothing Nothing TriggerBefore [] [] TriggerOpaque Nothing
+
+nonTransactionalTrigger :: Catalog -> Catalog -> TriggerState -> TriggerState -> Bool
+nonTransactionalTrigger snapshot current left right =
+    not (triggerTransactionalIn snapshot left)
+        || not (triggerTransactionalIn current right)
+
+triggerTransactionalIn :: Catalog -> TriggerState -> Bool
+triggerTransactionalIn catalog state =
+    case triggerStateTable state of
+        Nothing -> True
+        Just key -> maybe True relTransactional (lookupRelation catalog key)
+
+stripTriggerRestored :: TriggerState -> TriggerState
+stripTriggerRestored state = state {triggerRestoredBy = Nothing}
+
+restoreSequenceMap ::
+    StatementId ->
+    Map SequenceKey SequenceState ->
+    Map SequenceKey SequenceState ->
+    Map SequenceKey SequenceState
+restoreSequenceMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
+        , entry <- restoreSequenceKey key
+        ]
+    where
+        restoreSequenceKey key =
+            case (Map.lookup key snapshot, Map.lookup key current) of
+                (Just old, Just new)
+                    | not (sequenceStateTransactional old)
+                        || not (sequenceStateTransactional new) ->
+                        [(key, new)]
+                    | otherwise -> [(key, mark old (Just new))]
+                (Just old, Nothing)
+                    | not (sequenceStateTransactional old) -> []
+                    | otherwise -> [(key, mark old Nothing)]
+                (Nothing, Just new)
+                    | not (sequenceStateTransactional new) -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripSequenceRestored new /= stripSequenceRestored old
+             in if changed
+                    then old {sequenceRestoredBy = Just sid}
+                    else old
+
+stripSequenceRestored :: SequenceState -> SequenceState
+stripSequenceRestored state = state {sequenceRestoredBy = Nothing}
+
+restoreConstraintMap ::
+    StatementId ->
+    Catalog ->
+    Catalog ->
+    Map ConstraintKey ConstraintState
+restoreConstraintMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
+        , entry <- restoreConstraintKey key
+        ]
+    where
+        oldMap = catalogConstraints snapshot
+        newMap = catalogConstraints current
+        restoreConstraintKey key =
+            case (Map.lookup key oldMap, Map.lookup key newMap) of
+                (Just old, Just new)
+                    | nonTransactionalConstraint snapshot current old new -> [(key, new)]
+                    | otherwise -> [(key, mark old (Just new))]
+                (Just old, Nothing)
+                    | nonTransactionalConstraint snapshot current old emptyConstraint -> []
+                    | otherwise -> [(key, mark old Nothing)]
+                (Nothing, Just new)
+                    | nonTransactionalConstraint snapshot current emptyConstraint new -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripConstraintRestored new /= stripConstraintRestored old
+             in if changed
+                    then old {constraintRestoredBy = Just sid}
+                    else old
+
+emptyConstraint :: ConstraintState
+emptyConstraint =
+    ConstraintState (RelationKey False (Name [])) Nothing (OtherConstraint Nothing) Nothing
+
+nonTransactionalConstraint :: Catalog -> Catalog -> ConstraintState -> ConstraintState -> Bool
+nonTransactionalConstraint snapshot current left right =
+    not (constraintTransactionalIn snapshot left)
+        || not (constraintTransactionalIn current right)
+
+constraintTransactionalIn :: Catalog -> ConstraintState -> Bool
+constraintTransactionalIn catalog state =
+    maybe True relTransactional (lookupRelation catalog (constraintStateTable state))
+
+stripConstraintRestored :: ConstraintState -> ConstraintState
+stripConstraintRestored state = state {constraintRestoredBy = Nothing}
+
+restoreDefinitionMap ::
+    StatementId ->
+    Map Name DefinitionState ->
+    Map Name DefinitionState ->
+    Map Name DefinitionState
+restoreDefinitionMap sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
+        , entry <- restoreDefinitionKey key
+        ]
+    where
+        restoreDefinitionKey key =
+            case (Map.lookup key snapshot, Map.lookup key current) of
+                (Just old, Just new) -> [(key, mark old (Just new))]
+                (Just old, Nothing) -> [(key, mark old Nothing)]
+                (Nothing, _) -> []
+        mark old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            stripDefinitionRestored new /= stripDefinitionRestored old
+             in if changed
+                    then old {definitionRestoredBy = Just sid}
+                    else old
+
+stripDefinitionRestored :: DefinitionState -> DefinitionState
+stripDefinitionRestored state = state {definitionRestoredBy = Nothing}
+
+-- ----------------------------------------------------------------------------
+-- Statement barrier finalization
+-- ----------------------------------------------------------------------------
+
+finalizeStatement ::
+    StatementId ->
+    Eval ->
+    Bool ->
+    ScanState ->
+    ScanState ->
+    (Set StatementId, ScanState, Int, Bool, Int)
+finalizeStatement sid eval sessionTouched priorState resolutionState =
+    let declared = evalBarriers eval
+        resolutionSession = scanSession resolutionState
+        resolutionCatalog = scanCatalog resolutionState
+        barrierKeys =
+            concatMap
+                (barrierKeysForScope resolutionSession resolutionCatalog . barrierScope)
+                declared
+        touchedKeys = Set.toList (evalTouches eval)
+        baseDeps =
+            lastBarrierDeps
+                priorState
+                [GlobalBarrierKey, SessionBarrierKey, TransactionBarrierKey]
+        touchDeps = lastBarrierDeps priorState touchedKeys
+        declaredDeps =
+            Set.unions
+                [ if key == GlobalBarrierKey
+                    then scanPriorStatements priorState
+                    else touchersForBarrier priorState key
+                | key <- barrierKeys
+                ]
+        hasGlobal = any ((== GlobalScope) . barrierScope) declared
+        globalDeps = if hasGlobal then scanPriorStatements priorState else Set.empty
+        barrierDeps =
+            Set.unions [baseDeps, touchDeps, declaredDeps, globalDeps]
+        objectDeps = evalDeps eval
+        allDeps = Set.delete sid (Set.union objectDeps barrierDeps)
+        barrierEdges =
+            Set.size (Set.delete sid (Set.difference barrierDeps objectDeps))
+        sessionKeys = [SessionBarrierKey | sessionTouched]
+        registrationKeys = barrierKeys ++ sessionKeys
+        lastBarriers =
+            foldl'
+                (\current key -> Map.insert key sid current)
+                (scanLastBarriers priorState)
+                registrationKeys
+        allTouched =
+            Set.union (evalTouches eval) (Set.fromList registrationKeys)
+        touchers =
+            foldl'
+                (\current key -> Map.insertWith Set.union key (Set.singleton sid) current)
+                (scanTouchers priorState)
+                (Set.toList allTouched)
+        state' =
+            resolutionState
+                { scanLastBarriers = lastBarriers
+                , scanTouchers = touchers
+                , scanPriorStatements = Set.insert sid (scanPriorStatements priorState)
+                }
+        hasBarrier = not (null declared) || sessionTouched
+        barrierActions = length declared + if sessionTouched then 1 else 0
+     in (allDeps, state', barrierEdges, hasBarrier, barrierActions)

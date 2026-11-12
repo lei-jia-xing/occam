@@ -36,7 +36,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam.Core (Span (..), Statement (..), StatementId (..))
+import Occam.Core (SessionInit (..), Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
@@ -49,10 +49,11 @@ import Occam.Parser (
     SQLDialect (..),
     StatementFacts (..),
     StatementUnit (..),
+    defaultParseOptions,
     defaultSQLDialect,
     parseSQL,
  )
-import Occam.Slicer (backwardSlice)
+import Occam.Slicer (backwardSlice, backwardSliceMany)
 
 {- | The oracle classifies a complete candidate. Inconclusive results must not
 be silently treated as rejections because that would make reductions depend
@@ -126,12 +127,12 @@ timedStage logger stage action = do
     logStage logger stage (finished - started)
     pure result
 
-parseUnitsOrThrow :: SQLDialect -> ByteString -> IO [StatementUnit]
+parseUnitsOrThrow :: SQLDialect -> ByteString -> IO (SessionInit, [StatementUnit])
 parseUnitsOrThrow dialect sql = do
-    parsed <- parseSQL dialect sql
+    parsed <- parseSQL (defaultParseOptions dialect) sql
     case parsed of
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
-        Right result -> pure (parsedUnits result)
+        Right result -> pure (parsedInitialSession result, parsedUnits result)
 
 {- | A retained candidate set K is closed iff every kept statement's direct
 predecessors are also retained.
@@ -146,8 +147,7 @@ isValidClosure DependencyGraph {..} kept =
 
 -- | Transitive backward closure of a set of statement IDs.
 closeSet :: DependencyGraph -> Set StatementId -> Set StatementId
-closeSet graph roots =
-    Set.unions [backwardSlice sid graph | sid <- Set.toList roots]
+closeSet graph roots = backwardSliceMany roots graph
 
 {- | Cut removed statements without unparsing or changing retained bytes.
 
@@ -188,10 +188,13 @@ partitionChunks :: Int -> [a] -> [[a]]
 partitionChunks n xs
     | n <= 1 = [xs]
     | null xs = []
-    | otherwise =
-        let chunkSize = (length xs + n - 1) `div` n
-            (chunk, rest) = splitAt chunkSize xs
-         in chunk : partitionChunks (n - 1) rest
+    | otherwise = go n (length xs) xs
+    where
+        go _ _ [] = []
+        go remaining total rest =
+            let chunkSize = (total + remaining - 1) `div` remaining
+                (chunk, next) = splitAt chunkSize rest
+             in chunk : go (remaining - 1) (total - chunkSize) next
 
 statementSpanBytes :: Statement -> Int
 statementSpanBytes statement =
@@ -388,7 +391,7 @@ statementDdmin dialect oracle initialSQL = do
     if not initialOK
         then pure initialSQL
         else do
-            units <- parseUnitsOrThrow dialect initialSQL
+            (_, units) <- parseUnitsOrThrow dialect initialSQL
             let allStatements = map unitStatement units
             reduced <-
                 searchStatements plainCandidate oracle initialSQL allStatements allStatements
@@ -404,39 +407,62 @@ statementAuditWithLogger logger dialect oracle initialSQL = do
     initialOK <- oracleAccepts oracle initialSQL
     outcome <-
         if initialOK
-            then loop initialSQL 0 0 0
+            then do
+                (_, units) <- parseUnitsOrThrow dialect initialSQL
+                let statements = map unitStatement units
+                loop initialSQL statements (statementIds statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
     logAuditStats logger (snd outcome)
     pure outcome
     where
-        loop current passCount attemptCount removalCount = do
-            units <- parseUnitsOrThrow dialect current
-            let statements = map unitStatement units
-            if null statements
-                then pure (current, AuditStats passCount attemptCount removalCount True)
-                else do
-                    (nextSQL, attempts, removals) <- auditPass current statements statements
-                    let nextPassCount = passCount + 1
-                    if removals > 0
-                        then loop nextSQL nextPassCount (attemptCount + attempts) (removalCount + removals)
-                        else pure (current, AuditStats nextPassCount (attemptCount + attempts) removalCount True)
+        -- The audit only removes whole statements, and those statements keep
+        -- their original byte spans. Parse once, then track the retained set.
+        loop baseSQL allStatements kept passCount attemptCount removalCount
+            | Set.null kept =
+                pure
+                    ( renderKept baseSQL allStatements kept
+                    , AuditStats passCount attemptCount removalCount True
+                    )
+            | otherwise = do
+                (nextKept, attempts, removals) <- auditPass baseSQL allStatements kept
+                let nextPassCount = passCount + 1
+                if removals > 0
+                    then
+                        loop
+                            baseSQL
+                            allStatements
+                            nextKept
+                            nextPassCount
+                            (attemptCount + attempts)
+                            (removalCount + removals)
+                    else
+                        pure
+                            ( renderKept baseSQL allStatements nextKept
+                            , AuditStats nextPassCount (attemptCount + attempts) removalCount True
+                            )
 
-        auditPass baseSQL allStatements candidates = go (statementSQL baseSQL allStatements allStatements) allStatements candidates 0 0
+        auditPass baseSQL allStatements kept = go (renderKept baseSQL allStatements kept) kept allStatements 0 0
             where
-                go currentSQL _ [] attempts removals = pure (currentSQL, attempts, removals)
-                go currentSQL current (statement : rest) attempts removals
-                    | Set.notMember (stmtId statement) (statementIds current) =
-                        go currentSQL current rest attempts removals
+                go _ currentKept [] attempts removals = pure (currentKept, attempts, removals)
+                go currentSQL currentKept (statement : rest) attempts removals
+                    | Set.notMember (stmtId statement) currentKept =
+                        go currentSQL currentKept rest attempts removals
                     | otherwise = do
-                        let kept = filter ((/= stmtId statement) . stmtId) current
-                            candidateSQL = statementSQL baseSQL allStatements kept
+                        let kept' = Set.delete (stmtId statement) currentKept
+                            candidateSQL = renderKept baseSQL allStatements kept'
                         if BS.length candidateSQL >= BS.length currentSQL
-                            then go currentSQL current rest attempts removals
+                            then go currentSQL currentKept rest attempts removals
                             else do
                                 ok <- oracleAccepts oracle candidateSQL
                                 if ok
-                                    then go candidateSQL kept rest (attempts + 1) (removals + 1)
-                                    else go currentSQL current rest (attempts + 1) removals
+                                    then go candidateSQL kept' rest (attempts + 1) (removals + 1)
+                                    else go currentSQL currentKept rest (attempts + 1) removals
+
+        renderKept baseSQL allStatements kept =
+            statementSQL
+                baseSQL
+                allStatements
+                (filter (\statement -> Set.member (stmtId statement) kept) allStatements)
 
 data AuditStats = AuditStats
     { auditPasses :: !Int
@@ -483,9 +509,9 @@ data SQLAnalysis = SQLAnalysis
 analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
 analyzeSQL logger dialect sql = do
     started <- getMonotonicTimeNSec
-    units <- parseUnitsOrThrow dialect sql
+    (initialSession, units) <- parseUnitsOrThrow dialect sql
     let statements = map unitStatement units
-        graph = analyzeStatements units
+        graph = analyzeStatements initialSession units
     graph `seq` pure ()
     finished <- getMonotonicTimeNSec
     let elapsed = finished - started
@@ -742,7 +768,7 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
     pure result
     where
         go stats currentSQL = do
-            units <- parseUnitsOrThrow dialect currentSQL
+            (_, units) <- parseUnitsOrThrow dialect currentSQL
             let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
             reduced <- tryEdits stats currentSQL edits
             maybe (pure currentSQL) (go stats) reduced
