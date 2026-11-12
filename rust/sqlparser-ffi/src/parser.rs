@@ -163,15 +163,21 @@ fn walk_units(
             let facts = if has_parse_error {
                 None
             } else {
+                let statement = statement.as_ref().ok_or_else(|| {
+                    "sqlparser returned no statement for error-free unit".to_string()
+                })?;
+                let source_map = source_map
+                    .as_ref()
+                    .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
                 let token_start = positions.partition_point(|token| token.start < start);
                 let token_end = positions.partition_point(|token| token.end <= end);
                 let facts = analyze_statement(
-                    statement.as_ref().unwrap(),
+                    statement,
                     AnalysisContext {
                         dialect: kind,
                         rules: &rules,
                         source,
-                        source_map: source_map.as_ref().unwrap(),
+                        source_map,
                         tokens: &positions[token_start..token_end],
                         unit: ByteSpan { start, end },
                     },

@@ -96,6 +96,11 @@ fn dialect_from_code(code: u32) -> Option<DialectKind> {
 
 unsafe fn put_bytes(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize) {
     unsafe {
+        if bytes.is_empty() {
+            *out_len = 0;
+            *out_data = std::ptr::null_mut();
+            return;
+        }
         let mut bytes = bytes.into_boxed_slice();
         *out_len = bytes.len();
         *out_data = bytes.as_mut_ptr();
@@ -221,7 +226,7 @@ pub unsafe extern "C" fn occam_sql_count(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_free(data: *mut u8, len: usize) {
     unsafe {
-        if !data.is_null() {
+        if !data.is_null() && len > 0 {
             drop(Vec::from_raw_parts(data, len, len));
         }
     }
@@ -286,5 +291,32 @@ mod tests {
         let init = session_init(&config);
         assert_eq!(init.namespace_prefix[0].0, "Tenant");
         assert_eq!(init.current_user.expect("current user").0, "MixedUser");
+    }
+
+    #[test]
+    fn empty_output_buffers_are_null_and_free_is_safe() {
+        let mut data = std::ptr::null_mut();
+        let mut len = 0;
+        unsafe {
+            put_bytes(Vec::new(), &mut data, &mut len);
+        }
+        assert!(data.is_null());
+        assert_eq!(len, 0);
+        unsafe {
+            occam_sql_free(data, len);
+        }
+    }
+
+    #[test]
+    fn non_empty_output_buffers_round_trip() {
+        let mut data = std::ptr::null_mut();
+        let mut len = 0;
+        unsafe {
+            put_bytes(b"abc".to_vec(), &mut data, &mut len);
+        }
+        assert!(!data.is_null());
+        assert_eq!(len, 3);
+        let bytes = unsafe { Vec::from_raw_parts(data, len, len) };
+        assert_eq!(bytes, b"abc");
     }
 }
