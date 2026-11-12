@@ -53,7 +53,7 @@ jobs:
           cabal-version: 'latest'
 
       - name: Cache Cabal
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cabal/packages
