@@ -31,11 +31,37 @@ Each predicate call gets a fresh `OCCAM_WORKDIR`, also used for `TMP`, `TMPDIR`,
 - Graph-guided search first tests the last statement's backward slice; rejection falls back to linear prefix search without assuming a monotone predicate. Unrestricted deletion and a fixed-point statement audit follow; byte-preserving passes reduce projections, VALUES rows, CTEs, joins, clauses, types, literals, and literal scalar subqueries. These are local guarantees, not a global minimum.
 - External predicates define the behavior being preserved; Occam does not launch or configure a DBMS.
 
-The frontend uses the selected Generic, PostgreSQL, MySQL, SQLite, DuckDB, ClickHouse, Oracle, ANSI, BigQuery, Databricks, Hive, MsSql, Redshift, Snowflake, Spark, or Teradata dialect. Statement-local SQL parse errors stay attached to their source units; FFI/transport failures remain separate. Unknown dependency effects stay conservative, and the supplied predicate decides every candidate.
+## Dialect semantic coverage
 
-Unproved scalar-function effects and deferred expressions in stored definitions (including sequence defaults) remain opaque, rather than being assumed pure or executed at definition time. PostgreSQL/Redshift sequence calls are precise only for explicit `pg_catalog.nextval`/`setval`/`currval` with provable literal names (including text/regclass casts); unqualified or custom calls, dynamic targets, and `lastval` remain opaque. Oracle/Snowflake unquoted sequence pseudocolumns retain their distinct syntax; ambiguous quoted members remain opaque. Unsupported view changes preserve existing lineage behind a fence; recognized view renames move it rather than replacing it with an empty definition.
+The frontend pins `sqlparser-rs` 0.64.0 and selects one of the 16 dialects below. **Syntax accepted**, **modeled dependency effects**, and **opaque effects** are different outcomes: parser acceptance is not evidence that an engine accepts the SQL or that every effect is modeled. Statement-local syntax errors retain their source units; FFI/transport failures remain separate.
 
-Unsupported session/transaction changes and generic variable `SET`/`RESET` effects also establish the global fence: recording a value alone does not model its effects on parsing, triggers, writes, or transaction behavior. Dedicated modeled settings retain their narrower semantics; unknown state changes do not leave the catalog falsely precise.
+Recognized AST paths share named table/view/index/trigger/sequence/type/schema definitions, drops, selected column/constraint alterations and renames, DML targets, query sources, lexical CTE/alias scopes, and transaction/session facts. These are dependency models, not a SQL interpreter. Dialect-specific paths are grouped here:
+
+| Selected dialects | Shared paths and important specializations |
+| --- | --- |
+| Generic, ANSI, Teradata | Shared AST effect extraction with selected identifier folding; no inferred engine-specific meaning for `SELECT INTO` or `USE`. |
+| PostgreSQL, Redshift | Quoted/unquoted identifier rules, search paths, table-target `SELECT INTO`, transaction/savepoint snapshots, and provable qualified sequence calls. |
+| MySQL | Configurable `lower_case_table_names` for relation/namespace parts; multi-table UPDATE/DELETE targets; implicit DDL commits; optionless `CREATE DATABASE` and simple one-level `USE`. |
+| SQLite, DuckDB | Case-insensitive identifier matching and CTAS snapshots; dedicated SQLite foreign-key PRAGMA effects; explicit two-part DuckDB `USE catalog.schema`. |
+| Oracle, Snowflake | Upper-folded unquoted identifiers and sequence pseudocolumn syntax; Oracle implicit DDL commits; complete two-part Snowflake schema selection. |
+| ClickHouse, Hive, Spark, Databricks | Shared named DDL/DML/query extraction; simple one-level ClickHouse/Hive namespaces and complete two-part Spark/Databricks namespaces. Persistent routing and partition/overwrite effects below remain opaque. |
+| BigQuery | Separate relation/column case rules and shared AST/source extraction; partial namespace changes are not assumed complete. |
+| MsSql | Case-insensitive matching, UPDATE-FROM alias resolution, and table-target `SELECT INTO`; `USE database` alone is opaque because the current schema is not proven. |
+
+Newly completed dependency behavior:
+
+- `(TABLE t)`, nested/CTE/set-operation TABLE bodies, and `CREATE TABLE copied AS TABLE t` retain their source rows. TABLE and `SELECT *`/qualified `t.*` retain whole-row dependencies even alongside explicit predicates or ordering, without expanding an unrelated qualified source's columns.
+- Direct standalone `SELECT a INTO copied FROM src` creates a snapshot in PostgreSQL/Redshift/MsSql. Procedural variables, nested/set-operation INTO contexts, and other dialect meanings remain opaque.
+- CTAS `WITH NO DATA` binds source schema without consuming source rows. CTAS and materialized-view reads/writes no longer follow later base-table data changes; ordinary views remain live. `REFRESH MATERIALIZED VIEW` explicitly reads recorded sources, distinguishing `WITH DATA` from `WITH NO DATA`.
+- `ALTER VIEW s.v SET SCHEMA destination` preserves lineage at the new name; unqualified renames retain the resolved source schema. Recognized schema-owned definitions, namespace selection, and moves retain schema-generation dependencies. Ambiguous mutation targets are fenced instead of mutating every possible match.
+
+Unproved scalar routines and deferred stored expressions (including sequence defaults) remain opaque. PostgreSQL/Redshift sequence calls are precise only for explicit `pg_catalog.nextval`/`setval`/`currval` with provable literal names, including supported text/regclass casts; unqualified/custom calls, dynamic targets, and `lastval` remain opaque. Nontransactional sequence advances inside an explicit transaction or with autocommit disabled are fenced: durable values across rollback/drop/recreation are not modeled as transactional rows. Oracle/Snowflake unquoted sequence pseudocolumns retain their distinct syntax; ambiguous quoted members remain opaque.
+
+Other explicit opaque boundaries include privileges/routine statements, unsupported session/transaction settings and generic variable `SET`/`RESET`, partial/default namespace changes, COPY/bulk/external-I/O forms, INSERT overwrite/partition/multi-table forms, DML `OUTPUT INTO`, table inheritance/`PARTITION OF`, persistent `CREATE VIEW ... TO` routing, unproved table functions/computed row expansion, unsupported view changes, and option-bearing database creation. Unknown global effects establish the persistent fence described above; recording a name or setting is not a substitute for modeling its effects.
+
+Parser limits remain independent: the selected frontend rejects standalone `TABLE t`, although `(TABLE t)` and the nested forms above parse; the probed CTAS `WITH NO DATA` form is rejected under Snowflake. Conversely, cross-dialect parser acceptance of REFRESH/ALTER VIEW does not establish DBMS validity.
+
+Proof boundaries: the batch passed 99 dependency tests, a 16-dialect graph smoke, and 640 selected-frontend syntax/fact probes before the whole-row correction. That correction passed six targeted consumer scope/TABLE checks and five native alias/LATERAL checks. The final temporary-schema alias normalization then passed a rebuilt, row-seeded whole-row regression covering five queries; the earlier checks were not rerun. Real SQLite and DuckDB CLI reductions preserved populated CTAS snapshots and passed final validation twice each before these whole-row corrections; these are not execution proofs for the other selected dialects.
 
 ## Building
 

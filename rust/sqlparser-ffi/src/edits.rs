@@ -1,5 +1,6 @@
 use crate::actions::{
-    SequenceEffect, canonical_ident_string, is_dml_statement, name_parts, sequence_expr_effect,
+    SequenceEffect, canonical_ident_string, is_dml_statement, name_parts, relation_from_parts,
+    relation_ref, sequence_expr_effect,
 };
 use crate::ir;
 use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
@@ -47,12 +48,20 @@ pub(super) struct AliasScope {
 /// lexical scope and table-factor position that determine which qualifiers may
 /// refer to it.
 pub(super) struct RelationUse {
-    pub(super) name: ObjectName,
+    pub(super) name: Option<ir::NameRef>,
     pub(super) span: Span,
     pub(super) is_cte: bool,
     pub(super) scope: usize,
     pub(super) alias: Option<String>,
     pub(super) factor: usize,
+}
+
+pub(super) enum WholeRowUse {
+    Source(Span),
+    Projection {
+        qualifier: Vec<String>,
+        scope: usize,
+    },
 }
 
 /// Everything needed to analyze one parsed statement against its source unit.
@@ -120,8 +129,10 @@ pub(super) struct AnalysisVisitor<'a> {
     pub(super) unmodeled_relation_spans: Vec<Span>,
     pub(super) unmodeled_table_source: bool,
     pub(super) has_function: bool,
+    pub(super) select_into_count: usize,
     /// Column reference and the alias scope in which it appeared.
     pub(super) columns: Vec<(Vec<String>, usize)>,
+    pub(super) whole_rows: Vec<WholeRowUse>,
     pub(super) aliases: Vec<AliasScope>,
     alias_scope_stack: Vec<usize>,
     /// The `Select`-level alias scope for each open `Query`. Set operations
@@ -151,7 +162,9 @@ impl<'a> AnalysisVisitor<'a> {
             unmodeled_relation_spans: Vec::new(),
             unmodeled_table_source: false,
             has_function: false,
+            select_into_count: 0,
             columns: Vec::new(),
+            whole_rows: Vec::new(),
             aliases: vec![AliasScope {
                 parent: None,
                 aliases: Vec::new(),
@@ -167,6 +180,70 @@ impl<'a> AnalysisVisitor<'a> {
             tokens: context.tokens,
             unit: context.unit,
         }
+    }
+
+    fn record_table_commands(&mut self, body: &SetExpr) {
+        if self.nested_dml_depth > 0 {
+            return;
+        }
+        match body {
+            SetExpr::Table(table) => {
+                if let Some(name) = &table.table_name {
+                    let parts = table
+                        .schema_name
+                        .iter()
+                        .chain(std::iter::once(name))
+                        .map(|ident| {
+                            ir::Ident(canonical_ident_string(
+                                ident,
+                                self.rules,
+                                ir::IdentifierClass::Relation,
+                            ))
+                        })
+                        .collect();
+                    let span = table
+                        .schema_name
+                        .as_ref()
+                        .map_or(name.span, |schema| schema.span.union(&name.span));
+                    self.record_relation(Some(relation_from_parts(parts, self.dialect)), span);
+                    self.whole_rows.push(WholeRowUse::Source(span));
+                } else {
+                    self.unmodeled_table_source = true;
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.record_table_commands(left);
+                self.record_table_commands(right);
+            }
+            // Nested Query nodes get their own CTE and alias scope on visit.
+            _ => {}
+        }
+    }
+
+    fn record_relation(&mut self, name: Option<ir::NameRef>, span: Span) {
+        let is_cte = name.as_ref().is_some_and(|reference| {
+            !reference.temp
+                && self.is_cte_reference(
+                    &reference.name.0,
+                    self.mapped_span(span).map_or(0, |span| span.0),
+                )
+        });
+        let (factor, alias) = match &self.current_relation {
+            Some((relation_span, factor, alias)) if *relation_span == span => {
+                let result = (*factor, alias.clone());
+                self.current_relation = None;
+                result
+            }
+            _ => (0, None),
+        };
+        self.relations.push(RelationUse {
+            name,
+            span,
+            is_cte,
+            scope: self.current_alias_scope(),
+            alias,
+            factor,
+        });
     }
 
     fn current_alias_scope(&self) -> usize {
@@ -200,10 +277,7 @@ impl<'a> AnalysisVisitor<'a> {
         }
     }
 
-    fn is_cte_reference(&self, name: &ObjectName, start: usize) -> bool {
-        let Some(parts) = name_parts(name, self.rules, crate::ir::IdentifierClass::Relation) else {
-            return false;
-        };
+    fn is_cte_reference(&self, parts: &[ir::Ident], start: usize) -> bool {
         if parts.len() != 1 {
             return false;
         }
@@ -1857,6 +1931,7 @@ impl Visitor for AnalysisVisitor<'_> {
                 body_spans: Vec::new(),
             });
         }
+        self.record_table_commands(&query.body);
         let query_scope = self.query_source_scope(query);
         if let Some(order) = &query.order_by
             && let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope)
@@ -1938,6 +2013,37 @@ impl Visitor for AnalysisVisitor<'_> {
             });
             self.alias_scope_stack.push(scope);
             *slot = Some(scope);
+        }
+        if self.nested_dml_depth == 0 && select.into.is_some() {
+            self.select_into_count += 1;
+        }
+        if self.nested_dml_depth == 0 {
+            for item in &select.projection {
+                let qualifier = match item {
+                    SelectItem::Wildcard(_) => Vec::new(),
+                    SelectItem::QualifiedWildcard(
+                        SelectItemQualifiedWildcardKind::ObjectName(name),
+                        _,
+                    ) => match name_parts(name, self.rules, ir::IdentifierClass::Relation) {
+                        Some(parts) => parts.into_iter().map(|part| part.0).collect(),
+                        None => {
+                            self.unmodeled_table_source = true;
+                            continue;
+                        }
+                    },
+                    // Computed row expansion has no proven base-relation
+                    // lineage; do not guess which correlated row it exposes.
+                    SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(_), _) => {
+                        self.unmodeled_table_source = true;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                self.whole_rows.push(WholeRowUse::Projection {
+                    qualifier,
+                    scope: self.current_alias_scope(),
+                });
+            }
         }
         self.list_edits(
             "remove-select_expression",
@@ -2121,8 +2227,8 @@ impl Visitor for AnalysisVisitor<'_> {
                         self.record_alias(alias, None);
                     }
                 } else if let Some(alias) = alias {
-                    let target = name_parts(name, self.rules, crate::ir::IdentifierClass::Relation)
-                        .map(|parts| parts.into_iter().map(|part| part.0).collect());
+                    let target = relation_ref(name, self.dialect, self.rules)
+                        .map(|reference| reference.name.0.into_iter().map(|part| part.0).collect());
                     self.record_alias(alias, target);
                 }
             }
@@ -2176,26 +2282,10 @@ impl Visitor for AnalysisVisitor<'_> {
         if self.nested_dml_depth > 0 {
             return std::ops::ControlFlow::Continue(());
         }
-        let is_cte = self.is_cte_reference(
-            relation,
-            self.mapped_span(relation.span()).map_or(0, |span| span.0),
+        self.record_relation(
+            relation_ref(relation, self.dialect, self.rules),
+            relation.span(),
         );
-        let (factor, alias) = match &self.current_relation {
-            Some((span, factor, alias)) if *span == relation.span() => {
-                let result = (*factor, alias.clone());
-                self.current_relation = None;
-                result
-            }
-            _ => (0, None),
-        };
-        self.relations.push(RelationUse {
-            name: relation.clone(),
-            span: relation.span(),
-            is_cte,
-            scope: self.current_alias_scope(),
-            alias,
-            factor,
-        });
         std::ops::ControlFlow::Continue(())
     }
 

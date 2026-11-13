@@ -433,6 +433,7 @@ data Eval = Eval
     , evalVisitedTriggers :: !(Set TriggerKey)
     , evalVisitedWrites :: !(Set (RelationKey, WriteSignature))
     , evalFrameId :: !(Maybe Int)
+    , evalTransactionActive :: !Bool
     , evalSessionTouched :: !Bool
     }
 
@@ -447,6 +448,9 @@ initialEval _ state =
         , evalVisitedTriggers = Set.empty
         , evalVisitedWrites = Set.empty
         , evalFrameId = frameId <$> listToMaybe (scanTransactions state)
+        , evalTransactionActive =
+            any frameExplicit (scanTransactions state)
+                || not (sessAutocommit (scanSession state))
         , evalSessionTouched = False
         }
 
@@ -461,6 +465,19 @@ addTouches keys eval = eval {evalTouches = Set.union (Set.fromList keys) (evalTo
 
 addBarrier :: ScopedBarrier -> Eval -> Eval
 addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
+
+ambiguousMutation :: Eval -> Eval
+ambiguousMutation =
+    addBarrier
+        (ScopedBarrier GlobalScope UnknownStatementBarrier (Just "ambiguous catalog mutation target"))
+
+-- Resolution may union possible read sources, but a mutation cannot apply to
+-- every possible target. Explicit multi-target SQL emits one operation each.
+mutateResolved :: (Eval -> key -> Eval) -> Eval -> [key] -> Eval
+mutateResolved apply eval keys =
+    case keys of
+        _ : _ : _ -> ambiguousMutation eval
+        _ -> foldl' apply eval keys
 
 evalToState :: Eval -> ScanState -> ScanState
 evalToState eval state =
@@ -804,6 +821,20 @@ typeTouchKeys name = [ObjectBarrierKey (BarrierTypeKey name)]
 schemaTouchKeys :: Name -> [BarrierKey]
 schemaTouchKeys name = [ObjectBarrierKey (BarrierSchemaKey name), SchemaBarrierKey name]
 
+-- All namespace parts use the frontend's relation identifier rules.
+namespaceDeps :: Catalog -> [Ident] -> Set StatementId
+namespaceDeps catalog parts =
+    Set.fromList
+        [ sid
+        | count <- [1 .. length parts]
+        , Just state <- [Map.lookup (Name (take count parts)) (catalogSchemas catalog)]
+        , sid <- catMaybes [definitionStatement state, definitionRestoredBy state]
+        ]
+
+schemaPrefixDeps :: Catalog -> Name -> Set StatementId
+schemaPrefixDeps catalog (Name parts) =
+    namespaceDeps catalog (take (length parts - 1) parts)
+
 barrierKeysForScope :: SessionState -> Catalog -> BarrierScope -> [BarrierKey]
 barrierKeysForScope session catalog scope =
     case scope of
@@ -1011,10 +1042,14 @@ relationReadDeps session catalog key mode columns =
                                         relDataWrites relation
                                             `Set.union` relationColumnWriteDeps session catalog current relation columns
                                     ReadSchema -> Set.empty
+                            -- Tables populated by CTAS and materialized views
+                            -- are snapshots. Their creation/refresh statement
+                            -- already depends on the source data it evaluated.
                             sourceDeps =
                                 Set.unions
                                     [ go seen' source
-                                    | source <- Set.toList (relSources relation)
+                                    | relKind relation == ViewRelation
+                                    , source <- Set.toList (relSources relation)
                                     ]
                             -- A source that did not exist when the view was defined
                             -- is resolved against the catalog at read time, so a
@@ -1022,7 +1057,8 @@ relationReadDeps session catalog key mode columns =
                             unresolvedDeps =
                                 Set.unions
                                     [ go seen' sourceKey
-                                    | reference <- Set.toList (relUnresolvedSources relation)
+                                    | relKind relation == ViewRelation
+                                    , reference <- Set.toList (relUnresolvedSources relation)
                                     , sourceKey <- resolveRelationKeys session catalog reference
                                     , Map.member sourceKey (catalogRelations catalog)
                                     ]
@@ -1047,12 +1083,14 @@ relationWriteDeps session catalog key kind columns =
                 sourceDeps =
                     Set.unions
                         [ relationReadDeps session catalog source ReadData []
-                        | source <- Set.toList (relSources relation)
+                        | relKind relation == ViewRelation
+                        , source <- Set.toList (relSources relation)
                         ]
                 unresolvedDeps =
                     Set.unions
                         [ relationReadDeps session catalog sourceKey ReadData []
-                        | reference <- Set.toList (relUnresolvedSources relation)
+                        | relKind relation == ViewRelation
+                        , reference <- Set.toList (relUnresolvedSources relation)
                         , sourceKey <- resolveRelationKeys session catalog reference
                         , Map.member sourceKey (catalogRelations catalog)
                         ]
@@ -1325,7 +1363,14 @@ processDefineTable sid eval definition =
         eval1 =
             addTouches
                 (relationTouchKeys key)
-                (addDeps (likeDeps `Set.union` existingDeps `Set.union` parentDeps) evalReads)
+                ( addDeps
+                    ( likeDeps
+                        `Set.union` existingDeps
+                        `Set.union` parentDeps
+                        `Set.union` schemaPrefixDeps catalog (relationKeyName key)
+                    )
+                    evalReads
+                )
         unresolved = unresolvedSourceRefs session catalog (tableSources definition)
         eval2 =
             foldl'
@@ -1380,7 +1425,7 @@ processDefineView sid eval definition =
         eval1 =
             addTouches
                 (relationTouchKeys key)
-                (addDeps existingDeps evalReads)
+                (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (relationKeyName key)) evalReads)
         unresolved = unresolvedSourceRefs session catalog (viewSources definition)
         eval2 =
             foldl'
@@ -1442,10 +1487,14 @@ processDefineIndex sid eval definition =
                         Set.empty
                         (Set.fromList . catMaybes . (\state -> [indexDefinition state, indexRestoredBy state]))
                         existing
+                ownerName =
+                    case indexKey of
+                        NamedIndexKey name -> name
+                        TableIndexKey table _ -> relationKeyName table
                 current1 =
                     addTouches
                         (indexTouchKeys indexKey (listToMaybe tableKeys))
-                        (addDeps (tableDeps `Set.union` existingDeps) current)
+                        (addDeps (tableDeps `Set.union` existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current)
              in if indexIfNotExists definition && isJust existing
                     then current1
                     else
@@ -1488,7 +1537,9 @@ processDefineIndex sid eval definition =
                                     catalog1
                                     tableKeys
                          in current1 {evalCatalog = catalog2}
-     in foldl' stepKey eval indexKeys
+     in case tableKeys of
+            _ : _ : _ -> ambiguousMutation eval
+            _ -> mutateResolved stepKey eval indexKeys
 
 triggerBodyDeps :: SessionState -> Catalog -> TriggerBody -> Set StatementId
 triggerBodyDeps session catalog body =
@@ -1590,7 +1641,11 @@ processDefineTrigger sid eval definition =
                         Set.empty
                         (Set.fromList . catMaybes . (\state -> [triggerDefinition state, triggerRestoredBy state]))
                         existing
-                current1 = addDeps existingDeps current
+                ownerName =
+                    case triggerKey of
+                        NamedTriggerKey name -> name
+                        TableTriggerKey table _ -> relationKeyName table
+                current1 = addDeps (existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current
              in if triggerIfNotExists definition && isJust existing
                     then current1
                     else
@@ -1641,7 +1696,9 @@ processDefineTrigger sid eval definition =
                                     catalog1
                                     tableKeys
                          in current1 {evalCatalog = catalog2}
-     in foldl' stepKey eval1 triggerKeys
+     in case tableKeys of
+            _ : _ : _ -> ambiguousMutation eval
+            _ -> mutateResolved stepKey eval1 triggerKeys
 
 processDefineSequence :: StatementId -> Eval -> SequenceDef -> Eval
 processDefineSequence sid eval definition =
@@ -1670,14 +1727,17 @@ processDefineSequence sid eval definition =
             catalog
                 { catalogSequences = Map.insert key state (catalogSequences catalog)
                 }
-     in (addTouches (sequenceTouchKeys key) (addDeps existingDeps eval))
+     in ( addTouches
+            (sequenceTouchKeys key)
+            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (sequenceKeyName key)) eval)
+        )
             { evalCatalog = catalog1
             }
 
 processDefineType :: StatementId -> Eval -> TypeDef -> Eval
 processDefineType sid eval definition =
     let catalog = evalCatalog eval
-        name = typeName definition
+        name = qualifyObjectName (evalSession eval) (typeName definition)
         existing = Map.lookup name (catalogTypes catalog)
         existingDeps =
             maybe
@@ -1689,7 +1749,10 @@ processDefineType sid eval definition =
                 { catalogTypes =
                     Map.insert name (DefinitionState (Just sid) Nothing) (catalogTypes catalog)
                 }
-     in (addTouches (typeTouchKeys name) (addDeps existingDeps eval))
+     in ( addTouches
+            (typeTouchKeys name)
+            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name) eval)
+        )
             { evalCatalog = catalog1
             }
 
@@ -1704,11 +1767,17 @@ processDefineSchema sid eval definition =
                 (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
                 existing
         catalog1 =
-            catalog
-                { catalogSchemas =
-                    Map.insert name (DefinitionState (Just sid) Nothing) (catalogSchemas catalog)
-                }
-     in (addTouches (schemaTouchKeys name) (addDeps existingDeps eval))
+            if isJust existing
+                then catalog
+                else
+                    catalog
+                        { catalogSchemas =
+                            Map.insert name (DefinitionState (Just sid) Nothing) (catalogSchemas catalog)
+                        }
+     in ( addTouches
+            (schemaTouchKeys name)
+            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name) eval)
+        )
             { evalCatalog = catalog1
             }
 
@@ -1756,6 +1825,7 @@ processRead _ eval readFact =
                 (Just ("unresolved source of " <> nameText (nameRefName (readSource readFact))))
             | key <- relationKeys
             , Just relation <- [Map.lookup key (catalogRelations catalog)]
+            , relKind relation == ViewRelation
             , reference <- Set.toList (relUnresolvedSources relation)
             , null
                 [ sourceKey
@@ -1873,7 +1943,7 @@ processDataWrite sid eval write =
                 if null columns && not (null unqualified)
                     then current
                     else writeRelation sid current key (dataWriteKind write) columns
-     in foldl' applyTarget evalReads targetKeys
+     in mutateResolved applyTarget evalReads targetKeys
 
 writeRelation :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
 writeRelation sid eval key kind columns =
@@ -2012,7 +2082,7 @@ processDmlEvent sid eval event =
                     (target', DeleteWrite scope, [])
                 DmlTruncate target' behavior ->
                     (target', TruncateWrite behavior ContinueIdentity, [])
-     in foldl'
+     in mutateResolved
             (\current key -> writeRelation sid current key kind columns)
             eval
             (resolveRelationKeys session catalog target)
@@ -2050,7 +2120,20 @@ processSequenceWrite sid eval write =
              in (addTouches (sequenceTouchKeys key) (addDeps deps current))
                     { evalCatalog = catalog1
                     }
-     in foldl' stepKey eval keys
+        evalWrites = mutateResolved stepKey eval keys
+     in if not transactional && evalTransactionActive eval
+            then
+                -- ponytail: durable sequence values across DDL rollback need
+                -- generation history; retain the script instead of restoring
+                -- their values as if they were ordinary transactional rows.
+                addBarrier
+                    ( ScopedBarrier
+                        GlobalScope
+                        UnsupportedTransactionBarrier
+                        (Just "nontransactional sequence values in a transaction")
+                    )
+                    evalWrites
+            else evalWrites
 
 -- ----------------------------------------------------------------------------
 -- Foreign keys
@@ -2384,7 +2467,7 @@ processAlterTable sid eval alter =
                 relation2 =
                     relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
              in current1 {evalCatalog = insertRelation key relation2 catalog1}
-     in foldl' stepKey eval keys
+     in mutateResolved stepKey eval keys
 
 applyAlterChange ::
     SessionState ->
@@ -2705,7 +2788,7 @@ dropOne sid mode eval object =
              in if null existing
                     then addTouch (RelationBarrierKey (relationFallbackKey session reference)) eval
                     else
-                        foldl'
+                        mutateResolved
                             ( \current key ->
                                 let currentCatalog = evalCatalog current
                                     relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
@@ -2762,7 +2845,7 @@ dropOne sid mode eval object =
                              in (addTouches (indexTouchKeys key (indexStateTable state)) (addDeps deps current))
                                     { evalCatalog = catalog2
                                     }
-             in foldl' stepKey eval keys
+             in mutateResolved stepKey eval keys
         DropTrigger reference ->
             let session = evalSession eval
                 catalog = evalCatalog eval
@@ -2796,7 +2879,7 @@ dropOne sid mode eval object =
                              in (addTouches (triggerTouchKeys key (triggerStateTable state)) (addDeps deps current))
                                     { evalCatalog = catalog2
                                     }
-             in foldl' stepKey eval keys
+             in mutateResolved stepKey eval keys
         DropSequence reference ->
             let session = evalSession eval
                 catalog = evalCatalog eval
@@ -2816,7 +2899,7 @@ dropOne sid mode eval object =
                              in (addTouches (sequenceTouchKeys key) (addDeps deps current))
                                     { evalCatalog = deleteSequence key (evalCatalog current)
                                     }
-             in foldl' stepKey eval keys
+             in mutateResolved stepKey eval keys
         DropType name ->
             let catalog = evalCatalog eval
                 key = qualifyObjectName (evalSession eval) name
@@ -2870,6 +2953,7 @@ removeRelationCascade session _sid mode = go Set.empty
                         [ viewKey
                         | (viewKey, relation) <- Map.toList (catalogRelations catalog)
                         , viewKey /= currentKey
+                        , relKind relation `elem` [ViewRelation, MaterializedViewRelation]
                         , currentKey `Set.member` relSources relation
                             || any
                                 ( \reference ->
@@ -3070,6 +3154,7 @@ processRename sid eval renameOp =
                         deps =
                             relationAllDeps session currentCatalog oldKey
                                 `Set.union` relationConstraintDeps currentCatalog relation
+                                `Set.union` schemaPrefixDeps currentCatalog (relationKeyName newKey)
                         newKey =
                             RelationKey
                                 (relationKeyTemp oldKey)
@@ -3102,7 +3187,7 @@ processRename sid eval renameOp =
                      in (addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey) (addDeps deps current))
                             { evalCatalog = catalog2
                             }
-             in foldl' stepKey eval keys
+             in mutateResolved stepKey eval keys
         RenameColumnOp table from to ->
             let session = evalSession eval
                 catalog = evalCatalog eval
@@ -3174,7 +3259,7 @@ processRename sid eval renameOp =
                      in (addTouches (relationTouchKeys key) (addDeps deps current))
                             { evalCatalog = insertRelation key relation1 catalog1
                             }
-             in foldl' stepKey eval keys
+             in mutateResolved stepKey eval keys
 
 moveRelationObjects ::
     IndexSchemaPlacement ->
@@ -3461,16 +3546,19 @@ processRefresh sid eval refresh =
         stepKey current key =
             let currentCatalog = evalCatalog current
                 relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
-                deps = relationReadDeps session currentCatalog key ReadData []
+                mode = refreshSourceMode refresh
+                deps = relationReadDeps session currentCatalog key ReadSchema []
+                sourceReads = [readFact {readMode = mode} | readFact <- relSourceReads relation]
+                evalReads = foldl' (processRead sid) current sourceReads
                 relation1 =
                     relation
                         { relDataWrites = Set.singleton sid
                         , relColumnWrites = Map.empty
                         }
-             in (addTouches (relationTouchKeys key) (addDeps deps current))
+             in (addTouches (relationTouchKeys key) (addDeps deps evalReads))
                     { evalCatalog = insertRelation key relation1 currentCatalog
                     }
-     in foldl' stepKey eval keys
+     in mutateResolved stepKey eval keys
 
 -- ----------------------------------------------------------------------------
 -- Session effects
@@ -3482,7 +3570,16 @@ applySessionEffects _ effects eval =
             foldl'
                 ( \current effect ->
                     let session' = applySessionEffect effect (evalSession current)
-                     in current
+                        schemaDeps =
+                            case effect of
+                                SetNamespace _ _ -> namespaceDeps (evalCatalog current) (effectiveNamespacePrefix session')
+                                SetSearchPath _ _ -> searchPathDeps current session'
+                                SetSessionUser _ _ -> searchPathDeps current session'
+                                ResetSessionUser _ -> searchPathDeps current session'
+                                SetCurrentUser _ _ -> searchPathDeps current session'
+                                ResetCurrentUser _ -> searchPathDeps current session'
+                                _ -> Set.empty
+                     in (addDeps schemaDeps current)
                             { evalSession = session'
                             , evalTouches = Set.insert SessionBarrierKey (evalTouches current)
                             , evalSessionTouched = True
@@ -3491,6 +3588,9 @@ applySessionEffects _ effects eval =
                 eval
                 effects
      in (eval', evalSessionTouched eval')
+    where
+        searchPathDeps current session =
+            Set.unions [namespaceDeps (evalCatalog current) parts | Name parts <- effectiveSearchPath session]
 
 applySessionEffect :: SessionEffect -> SessionState -> SessionState
 applySessionEffect effect session =

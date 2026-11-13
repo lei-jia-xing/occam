@@ -699,7 +699,8 @@ instance FromJSON RenameOp where
             _ -> fail ("unknown rename kind: " <> T.unpack tag)
 
 instance FromJSON RefreshOp where
-    parseJSON = withObject "RefreshOp" \objectValue -> RefreshOp <$> objectValue .: "target"
+    parseJSON = withObject "RefreshOp" \objectValue ->
+        RefreshOp <$> objectValue .: "target" <*> objectValue .: "source_mode"
 
 instance FromJSON CatalogOp where
     parseJSON = withObject "CatalogOp" \objectValue -> do

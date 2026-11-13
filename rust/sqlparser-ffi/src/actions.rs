@@ -77,8 +77,17 @@ pub(super) fn name_parts(
     }
     name.0
         .iter()
-        .map(|part| match part {
-            ObjectNamePart::Identifier(ident) => Some(canonical_ident(ident, rules, class)),
+        .enumerate()
+        .map(|(index, part)| match part {
+            ObjectNamePart::Identifier(ident) => Some(canonical_ident(
+                ident,
+                rules,
+                if index + 1 < name.0.len() {
+                    ir::IdentifierClass::Relation
+                } else {
+                    class
+                },
+            )),
             ObjectNamePart::Function(_) => None,
         })
         .collect()
@@ -112,17 +121,23 @@ fn strip_temp_schema(parts: &mut Vec<ir::Ident>, dialect: DialectKind) -> bool {
     }
 }
 
-fn relation_ref(
+pub(super) fn relation_from_parts(mut parts: Vec<ir::Ident>, dialect: DialectKind) -> ir::NameRef {
+    let temp = strip_temp_schema(&mut parts, dialect);
+    ir::NameRef {
+        name: ir::Name(parts),
+        temp,
+    }
+}
+
+pub(super) fn relation_ref(
     name: &ObjectName,
     dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> Option<ir::NameRef> {
-    let mut parts = name_parts(name, rules, ir::IdentifierClass::Relation)?;
-    let temp = strip_temp_schema(&mut parts, dialect);
-    Some(ir::NameRef {
-        name: ir::Name(parts),
-        temp,
-    })
+    Some(relation_from_parts(
+        name_parts(name, rules, ir::IdentifierClass::Relation)?,
+        dialect,
+    ))
 }
 
 fn definition_name(
@@ -355,25 +370,27 @@ pub(super) fn sequence_expr_effect(
     }
 }
 
+pub(super) fn select_output_columns(
+    select: &Select,
+    rules: &ir::IdentifierRules,
+) -> Option<Vec<ir::Ident>> {
+    let mut columns = Vec::new();
+    for item in &select.projection {
+        let ident = match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident,
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents.last()?,
+            SelectItem::ExprWithAlias { alias, .. } => alias,
+            // A partial projection is not a closed-world column set.
+            _ => return None,
+        };
+        columns.push(canonical_ident(ident, rules, ir::IdentifierClass::Column));
+    }
+    Some(columns)
+}
+
 fn set_expr_output_columns(expr: &SetExpr, rules: &ir::IdentifierRules) -> Option<Vec<ir::Ident>> {
     match expr {
-        SetExpr::Select(select) => {
-            let mut columns = Vec::new();
-            for item in &select.projection {
-                let ident = match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident,
-                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents.last()?,
-                    SelectItem::ExprWithAlias { alias, .. } => alias,
-                    // A wildcard or an unnamed computed expression makes the
-                    // projection shape unknowable from the AST. Returning a
-                    // partial list would let downstream code treat the known
-                    // names as a closed-world column set.
-                    _ => return None,
-                };
-                columns.push(canonical_ident(ident, rules, ir::IdentifierClass::Column));
-            }
-            Some(columns)
-        }
+        SetExpr::Select(select) => select_output_columns(select, rules),
         SetExpr::Query(query) => set_expr_output_columns(&query.body, rules),
         SetExpr::SetOperation { left, right, .. } => {
             let columns = set_expr_output_columns(left, rules)?;
@@ -393,6 +410,68 @@ fn set_expr_output_columns(expr: &SetExpr, rules: &ir::IdentifierRules) -> Optio
 
 fn query_output_columns(query: &Query, rules: &ir::IdentifierRules) -> Option<Vec<ir::Ident>> {
     set_expr_output_columns(&query.body, rules)
+}
+
+fn select_into_definition(
+    select: &Select,
+    dialect: DialectKind,
+    rules: &ir::IdentifierRules,
+) -> Option<ir::TableDef> {
+    // Other dialects use the same AST for variable assignment. Parser
+    // acceptance alone does not establish table-creation semantics.
+    if !matches!(
+        dialect,
+        DialectKind::PostgreSql | DialectKind::Redshift | DialectKind::MsSql
+    ) {
+        return None;
+    }
+    let into = select.into.as_ref()?;
+    let [target] = into.targets.as_slice() else {
+        return None;
+    };
+    let parts = match target {
+        Expr::Identifier(ident) => std::slice::from_ref(ident),
+        Expr::CompoundIdentifier(parts) => parts.as_slice(),
+        _ => return None,
+    };
+    if parts
+        .iter()
+        .any(|ident| ident.quote_style.is_none() && ident.value.starts_with('@'))
+    {
+        return None;
+    }
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut parts = parts
+        .iter()
+        .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Relation))
+        .collect();
+    let schema_temp = strip_temp_schema(&mut parts, dialect);
+    let name = ir::Name(parts);
+    let temporary = into.temporary || schema_temp;
+    Some(ir::TableDef {
+        name,
+        temporary,
+        transactional: table_transactional(dialect, temporary),
+        columns: select_output_columns(select, rules)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| ir::ColumnDef {
+                name,
+                not_null: false,
+                has_default: false,
+                generated: false,
+                references: Vec::new(),
+            })
+            .collect(),
+        constraints: Vec::new(),
+        sources: Vec::new(),
+        like: None,
+        on_commit: None,
+        if_not_exists: false,
+        or_replace: false,
+    })
 }
 
 fn qualify_rename(old: &ir::Name, new: ir::Name) -> ir::Name {
@@ -423,14 +502,6 @@ fn barrier(
 
 fn global_barrier(reason: ir::BarrierReason, detail: Option<String>) -> ir::ScopedBarrier {
     barrier(ir::BarrierScope::Global, reason, detail)
-}
-
-fn relation_barrier(
-    relation: ir::NameRef,
-    reason: ir::BarrierReason,
-    detail: Option<String>,
-) -> ir::ScopedBarrier {
-    barrier(ir::BarrierScope::Relation { relation }, reason, detail)
 }
 
 fn read_fact(source: ir::NameRef, mode: ir::ReadMode, columns: Vec<ir::Ident>) -> ir::ReadFact {
@@ -472,11 +543,11 @@ fn relation_visible(
 /// Resolve a one-part qualifier through the lexical alias scopes starting at
 /// `from`. Returns the scope that defined the alias and its target, if any.
 /// Alias limits on derived-table scopes hide later or non-LATERAL siblings.
-fn resolve_alias(
+fn resolve_alias<'a>(
     qualifier: &str,
     from: usize,
-    aliases: &[crate::edits::AliasScope],
-) -> Option<(usize, Option<Vec<String>>)> {
+    aliases: &'a [crate::edits::AliasScope],
+) -> Option<(usize, Option<&'a [String]>)> {
     let mut current = Some(from);
     let mut incoming_limit: Option<usize> = None;
     while let Some(scope) = current {
@@ -489,7 +560,7 @@ fn resolve_alias(
             .rev()
             .find(|(name, _)| name == qualifier)
         {
-            return Some((scope, target.clone()));
+            return Some((scope, target.as_deref()));
         }
         current = entry.parent;
         incoming_limit = entry.parent_alias_limit;
@@ -497,49 +568,70 @@ fn resolve_alias(
     None
 }
 
+fn relation_qualifier_matches(
+    relation: &ir::NameRef,
+    usage: &crate::edits::RelationUse,
+    qualifier: &[String],
+    column_scope: usize,
+    aliases: &[crate::edits::AliasScope],
+) -> bool {
+    if qualifier.is_empty() {
+        relation_visible(usage.scope, usage.factor, column_scope, aliases)
+    } else if qualifier.len() == 1 {
+        match resolve_alias(&qualifier[0], column_scope, aliases) {
+            Some((alias_scope, Some(target))) => {
+                alias_scope == usage.scope
+                    && target.iter().map(String::as_str).eq(relation
+                        .name
+                        .0
+                        .iter()
+                        .map(|part| part.0.as_str()))
+            }
+            Some((_, None)) => false,
+            None => {
+                usage.alias.is_none()
+                    && relation_visible(usage.scope, usage.factor, column_scope, aliases)
+                    && relation.name.last().map(|part| part.0.as_str())
+                        == Some(qualifier[0].as_str())
+            }
+        }
+    } else {
+        usage.alias.is_none()
+            && relation_visible(usage.scope, usage.factor, column_scope, aliases)
+            && qualifier.iter().map(String::as_str).eq(relation
+                .name
+                .0
+                .iter()
+                .map(|part| part.0.as_str()))
+    }
+}
+
 fn relation_columns(
     relation: &ir::NameRef,
-    relation_scope: usize,
-    relation_alias: Option<&str>,
-    relation_factor: usize,
+    usage: &crate::edits::RelationUse,
     columns: &[(Vec<String>, usize)],
+    whole_rows: &[crate::edits::WholeRowUse],
     aliases: &[crate::edits::AliasScope],
 ) -> Vec<ir::Ident> {
-    let relation_parts: Vec<&str> = relation.name.0.iter().map(|part| part.0.as_str()).collect();
+    if whole_rows.iter().any(|whole_row| match whole_row {
+        crate::edits::WholeRowUse::Source(span) => *span == usage.span,
+        crate::edits::WholeRowUse::Projection { qualifier, scope } => {
+            if qualifier.is_empty() {
+                usage.scope == *scope
+            } else {
+                relation_qualifier_matches(relation, usage, qualifier, *scope, aliases)
+            }
+        }
+    }) {
+        return Vec::new();
+    }
     let mut result = Vec::new();
     let mut seen = HashSet::new();
     for (parts, column_scope) in columns {
         let Some((column, qualifier)) = parts.split_last() else {
             continue;
         };
-        let matches = if qualifier.is_empty() {
-            relation_visible(relation_scope, relation_factor, *column_scope, aliases)
-        } else if qualifier.len() == 1 {
-            match resolve_alias(&qualifier[0], *column_scope, aliases) {
-                Some((alias_scope, Some(target))) => {
-                    alias_scope == relation_scope
-                        && target
-                            .iter()
-                            .map(String::as_str)
-                            .eq(relation_parts.iter().copied())
-                }
-                Some((_, None)) => false,
-                None => {
-                    // An alias hides the original relation name in its scope.
-                    relation_alias.is_none()
-                        && relation_visible(relation_scope, relation_factor, *column_scope, aliases)
-                        && relation_parts.last().copied() == Some(qualifier[0].as_str())
-                }
-            }
-        } else {
-            relation_alias.is_none()
-                && relation_visible(relation_scope, relation_factor, *column_scope, aliases)
-                && qualifier
-                    .iter()
-                    .map(String::as_str)
-                    .eq(relation_parts.iter().copied())
-        };
-        if matches {
+        if relation_qualifier_matches(relation, usage, qualifier, *column_scope, aliases) {
             let column = ir::Ident(column.clone());
             if seen.insert(column.clone()) {
                 result.push(column);
@@ -549,12 +641,12 @@ fn relation_columns(
     result
 }
 
-fn visitor_relations(
-    collector: &AnalysisVisitor<'_>,
+fn visitor_relations<'a>(
+    collector: &'a AnalysisVisitor<'_>,
     excluded: &[Span],
-) -> Vec<(ir::NameRef, Span, usize, Option<String>, usize)> {
-    let mut relations: Vec<(ir::NameRef, Span, usize, Option<String>, usize)> = Vec::new();
-    let mut seen: HashSet<(ir::NameRef, usize, Option<String>, usize)> = HashSet::new();
+) -> Vec<(&'a ir::NameRef, &'a crate::edits::RelationUse)> {
+    let mut relations = Vec::new();
+    let mut seen = HashSet::new();
     for relation in &collector.relations {
         if relation.is_cte
             || excluded.contains(&relation.span)
@@ -562,21 +654,15 @@ fn visitor_relations(
         {
             continue;
         }
-        if let Some(reference) = relation_ref(&relation.name, collector.dialect, collector.rules) {
+        if let Some(reference) = &relation.name {
             let key = (
-                reference.clone(),
+                reference,
                 relation.scope,
-                relation.alias.clone(),
+                relation.alias.as_deref(),
                 relation.factor,
             );
             if seen.insert(key) {
-                relations.push((
-                    reference,
-                    relation.span,
-                    relation.scope,
-                    relation.alias.clone(),
-                    relation.factor,
-                ));
+                relations.push((reference, relation));
             }
         }
     }
@@ -590,9 +676,7 @@ fn has_unmodeled_relation(collector: &AnalysisVisitor<'_>, excluded: &[Span]) ->
             .iter()
             .any(|span| !excluded.contains(span))
         || collector.relations.iter().any(|relation| {
-            !relation.is_cte
-                && !excluded.contains(&relation.span)
-                && relation_ref(&relation.name, collector.dialect, collector.rules).is_none()
+            !relation.is_cte && !excluded.contains(&relation.span) && relation.name.is_none()
         })
 }
 
@@ -616,16 +700,15 @@ fn visitor_reads(
 ) -> Vec<ir::ReadFact> {
     visitor_relations(collector, excluded)
         .into_iter()
-        .map(|(reference, _, scope, alias, factor)| {
+        .map(|(reference, usage)| {
             let columns = relation_columns(
-                &reference,
-                scope,
-                alias.as_deref(),
-                factor,
+                reference,
+                usage,
                 &collector.columns,
+                &collector.whole_rows,
                 &collector.aliases,
             );
-            read_fact(reference, mode, columns)
+            read_fact(reference.clone(), mode, columns)
         })
         .collect()
 }
@@ -2188,11 +2271,29 @@ fn reset_effects(
 
 fn use_effect(
     use_statement: &Use,
+    dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> (Vec<ir::SessionEffect>, Vec<ir::ScopedBarrier>) {
     match use_statement {
         Use::Object(name) | Use::Schema(name) | Use::Database(name) | Use::Catalog(name) => {
-            match name_parts(name, rules, ir::IdentifierClass::Relation) {
+            let namespace = name_parts(name, rules, ir::IdentifierClass::Relation).filter(
+                |parts| match dialect {
+                    DialectKind::MySql | DialectKind::ClickHouse | DialectKind::Hive => {
+                        parts.len() == 1 && !matches!(use_statement, Use::Catalog(_))
+                    }
+                    DialectKind::DuckDB => {
+                        parts.len() == 2 && matches!(use_statement, Use::Object(_))
+                    }
+                    DialectKind::Snowflake => {
+                        parts.len() == 2 && matches!(use_statement, Use::Object(_) | Use::Schema(_))
+                    }
+                    DialectKind::Databricks | DialectKind::Spark => {
+                        parts.len() == 2 && !matches!(use_statement, Use::Catalog(_))
+                    }
+                    _ => false,
+                },
+            );
+            match namespace {
                 Some(namespace) => (
                     vec![ir::SessionEffect::SetNamespace {
                         scope: ir::SessionScope::Session,
@@ -2210,11 +2311,11 @@ fn use_effect(
             }
         }
         Use::Default => (
-            vec![ir::SessionEffect::SetNamespace {
-                scope: ir::SessionScope::Session,
-                namespace: Vec::new(),
-            }],
             Vec::new(),
+            vec![global_barrier(
+                ir::BarrierReason::UnknownSessionEffect,
+                Some("unmodeled default namespace".to_string()),
+            )],
         ),
         Use::Role(name) => (
             vec![ir::SessionEffect::SetVariable {
@@ -2389,7 +2490,7 @@ fn drop_object_for(
             name: name_from_object(name, rules, ir::IdentifierClass::Other)?,
         }),
         ObjectType::Schema | ObjectType::Database => Some(ir::DropObject::Schema {
-            name: name_from_object(name, rules, ir::IdentifierClass::Other)?,
+            name: name_from_object(name, rules, ir::IdentifierClass::Relation)?,
         }),
         _ => None,
     }
@@ -2527,6 +2628,7 @@ fn alter_change(
         AlterTableOperation::Refresh { .. } => {
             ops.push(ir::CatalogOp::Refresh(ir::RefreshOp {
                 target: table.clone(),
+                source_mode: ir::ReadMode::Data,
             }));
         }
         AlterTableOperation::ValidateConstraint { name, .. } => {
@@ -2616,7 +2718,10 @@ pub(super) fn analyze_statement(
     }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
-    let transactional = sequence_transactional(dialect);
+    // Sequence value changes survive rollback in PostgreSQL/Redshift even
+    // though creation and removal of the sequence itself are transactional.
+    let transactional = sequence_transactional(dialect)
+        && !matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift);
     let sequences = sequence_effects_for_statement(statement, dialect, rules);
     for sequence in sequences.writes {
         facts
@@ -2652,6 +2757,33 @@ pub(super) fn analyze_statement(
             Some("unmodeled routine or deferred expression effects".to_string()),
         ));
     }
+    if visitor.select_into_count > 0
+        && !matches!(statement, Statement::Query(_) | Statement::Explain { .. })
+    {
+        facts.barriers.push(global_barrier(
+            ir::BarrierReason::UnknownDml,
+            Some("SELECT INTO outside a standalone query".to_string()),
+        ));
+    }
+    let output = match statement {
+        Statement::Insert(insert) => insert.output.as_ref(),
+        Statement::Update(update) => update.output.as_ref(),
+        Statement::Delete(delete) => delete.output.as_ref(),
+        Statement::Merge(merge) => merge.output.as_ref(),
+        _ => None,
+    };
+    if matches!(
+        output,
+        Some(OutputClause::Output {
+            into_table: Some(_),
+            ..
+        })
+    ) {
+        facts.barriers.push(global_barrier(
+            ir::BarrierReason::UnknownDml,
+            Some("unmodeled OUTPUT INTO target".to_string()),
+        ));
+    }
     if implicit_commit(dialect, statement) {
         // The statement runs in its own implicit transaction: close any active
         // transaction before it and the implicit one after it.
@@ -2661,18 +2793,62 @@ pub(super) fn analyze_statement(
     match statement {
         Statement::Query(query) => {
             let nested = collect_dml_in_query(query);
-            add_reads(&mut facts, visitor_reads(&visitor, &[], ir::ReadMode::Data));
+            let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
+            let into_table = match query.body.as_ref() {
+                SetExpr::Select(select) if visitor.select_into_count == 1 => {
+                    select_into_definition(select, dialect, rules)
+                }
+                _ => None,
+            };
+            if let Some(mut table) = into_table {
+                table.sources = reads;
+                facts.ops.push(ir::CatalogOp::DefineTable(table));
+            } else {
+                if visitor.select_into_count > 0 {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDml,
+                        Some(
+                            "unmodeled SELECT INTO target, dialect, or nested context".to_string(),
+                        ),
+                    ));
+                }
+                add_reads(&mut facts, reads);
+            }
             add_unmodeled_barriers(&mut facts, &visitor, &[]);
             merge_nested(&mut facts, nested, context);
         }
         Statement::CreateTable(create) => {
-            let nested = create
-                .query
+            if create
+                .inherits
                 .as_ref()
-                .map(|query| collect_dml_in_query(query))
-                .unwrap_or_default();
+                .is_some_and(|parents| !parents.is_empty())
+                || create.partition_of.is_some()
+            {
+                facts.barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownDdl,
+                    Some("unmodeled inherited or partitioned table effects".to_string()),
+                ));
+            }
+            let with_data = create
+                .with_data
+                .as_ref()
+                .is_none_or(|with_data| with_data.data);
+            let nested = if with_data {
+                create
+                    .query
+                    .as_ref()
+                    .map(|query| collect_dml_in_query(query))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let excluded: Vec<Span> = vec![create.name.span()];
-            let mut sources = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
+            let source_mode = if with_data {
+                ir::ReadMode::Data
+            } else {
+                ir::ReadMode::Schema
+            };
+            let mut sources = visitor_reads(&visitor, &excluded, source_mode);
             let like = create.like.as_ref().and_then(|like| {
                 let name = match like {
                     CreateTableLikeKind::Plain(like) | CreateTableLikeKind::Parenthesized(like) => {
@@ -2768,13 +2944,10 @@ pub(super) fn analyze_statement(
                     if_not_exists: create.if_not_exists,
                     or_replace: create.or_replace || create.or_alter,
                 }));
-                if let Some(target) = &create.to
-                    && let Some(target) = relation_ref(target, dialect, rules)
-                {
-                    facts.barriers.push(relation_barrier(
-                        target,
+                if create.to.is_some() {
+                    facts.barriers.push(global_barrier(
                         ir::BarrierReason::WriteThroughView,
-                        Some("CREATE VIEW ... TO".to_string()),
+                        Some("unmodeled persistent CREATE VIEW ... TO routing".to_string()),
                     ));
                 }
             } else {
@@ -3014,6 +3187,29 @@ pub(super) fn analyze_statement(
                         )),
                     }
                 }
+                AlterViewOperation::SetSchema { schema_name } => {
+                    let target = relation_ref(view_name, dialect, rules).and_then(|from| {
+                        let mut to =
+                            name_from_object(schema_name, rules, ir::IdentifierClass::Relation)?;
+                        to.0.push(last_ident(&from.name)?);
+                        Some((from, to))
+                    });
+                    match target {
+                        Some((from, to)) => {
+                            facts
+                                .ops
+                                .push(ir::CatalogOp::Rename(ir::RenameOp::Relation {
+                                    from,
+                                    to,
+                                    index_schema_placement: index_schema_placement(dialect),
+                                }));
+                        }
+                        None => facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownView,
+                            Some(statement.to_string()),
+                        )),
+                    }
+                }
                 AlterViewOperation::RenameColumn {
                     old_column_name,
                     new_column_name,
@@ -3044,6 +3240,21 @@ pub(super) fn analyze_statement(
                     Some(statement.to_string()),
                 )),
             }
+        }
+        Statement::Insert(insert)
+            if insert.overwrite
+                || insert.partitioned.is_some()
+                || insert.multi_table_insert_type.is_some()
+                || !insert.multi_table_into_clauses.is_empty()
+                || !insert.multi_table_when_clauses.is_empty()
+                || insert.multi_table_else_clause.is_some() =>
+        {
+            add_reads(&mut facts, visitor_reads(&visitor, &[], ir::ReadMode::Data));
+            add_unmodeled_barriers(&mut facts, &visitor, &[]);
+            facts.barriers.push(global_barrier(
+                ir::BarrierReason::UnknownDml,
+                Some("unmodeled overwrite, partition, or multi-table INSERT".to_string()),
+            ));
         }
         Statement::Insert(insert) => {
             let target_name = table_object_name(&insert.table);
@@ -3219,7 +3430,7 @@ pub(super) fn analyze_statement(
             facts.barriers.extend(barriers);
         }
         Statement::Use(use_statement) => {
-            let (effects, barriers) = use_effect(use_statement, rules);
+            let (effects, barriers) = use_effect(use_statement, dialect, rules);
             facts.session.extend(effects);
             facts.barriers.extend(barriers);
         }
@@ -3390,13 +3601,65 @@ pub(super) fn analyze_statement(
                 ));
             }
         }
+        Statement::RefreshMaterializedView(refresh) => {
+            if let Some(target) = relation_ref(&refresh.name, dialect, rules) {
+                facts.ops.push(ir::CatalogOp::Refresh(ir::RefreshOp {
+                    target,
+                    source_mode: if refresh.with_data == Some(false) {
+                        ir::ReadMode::Schema
+                    } else {
+                        ir::ReadMode::Data
+                    },
+                }));
+            } else {
+                facts.barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownView,
+                    Some(refresh.name.to_string()),
+                ));
+            }
+        }
+        Statement::CreateDatabase {
+            db_name,
+            location: None,
+            managed_location: None,
+            or_replace: false,
+            transient: false,
+            clone: None,
+            data_retention_time_in_days: None,
+            max_data_extension_time_in_days: None,
+            external_volume: None,
+            catalog: None,
+            replace_invalid_characters: None,
+            default_ddl_collation: None,
+            storage_serialization_policy: None,
+            comment: None,
+            default_charset: None,
+            default_collation: None,
+            catalog_sync: None,
+            catalog_sync_namespace_mode: None,
+            catalog_sync_namespace_flatten_delimiter: None,
+            with_tags: None,
+            with_contacts: None,
+            ..
+        } if dialect == DialectKind::MySql => {
+            if let Some(name) = name_from_object(db_name, rules, ir::IdentifierClass::Relation) {
+                facts
+                    .ops
+                    .push(ir::CatalogOp::DefineSchema(ir::SchemaDef { name }));
+            } else {
+                facts.barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownDdl,
+                    Some(statement.to_string()),
+                ));
+            }
+        }
         Statement::CreateSchema { schema_name, .. } => {
             let name = match schema_name {
                 SchemaName::Simple(name) => {
-                    name_from_object(name, rules, ir::IdentifierClass::Other)
+                    name_from_object(name, rules, ir::IdentifierClass::Relation)
                 }
                 SchemaName::NamedAuthorization(name, _) => {
-                    name_from_object(name, rules, ir::IdentifierClass::Other)
+                    name_from_object(name, rules, ir::IdentifierClass::Relation)
                 }
                 SchemaName::UnnamedAuthorization(_) => None,
             };

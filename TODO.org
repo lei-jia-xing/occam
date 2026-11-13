@@ -153,21 +153,47 @@
 - Ensured monotonic byte reduction and verified termination at the true fixed point.
 
 * 23. DBMS Semantic Alignment
-- Principle: the Rust frontend owns dialect/server semantics and emits a typed,
-  lossless fact IR; the Haskell graph builder stays dialect-agnostic. Unsupported
-  constructs use scoped barriers, not global ones.
-** TODO Make the fact IR lossless
-- Carry session values, write kinds, drop/truncate modes and transaction effects
-  instead of only `{kind, action, name}`.
-** TODO Make identifier folding object-class and configuration aware
-- Cover MySQL `lower_case_table_names`, BigQuery table/column case, DuckDB/MsSql
-  quoted identifiers and SQLite quoted identifiers.
-** TODO Model session state and search path
-- Consume `SET search_path`, `USE` and `CURRENT_SCHEMA`; resolve unqualified
-  names by search path instead of matching every schema.
-** TODO Model dialect transaction semantics
-- MySQL/Oracle DDL and TRUNCATE implicit commit; nested BEGIN policy; savepoint
-  snapshots include ON COMMIT registrations.
-** TODO Model constraints, triggers and data-modifying CTEs
-- Foreign-key identity and DROP CONSTRAINT; trigger body effects; CTE-local
-  INSERT/UPDATE/DELETE.
+- Principle: the Rust frontend owns dialect/server semantics and emits typed
+  facts for modeled effects; the Haskell graph builder stays dialect-agnostic.
+  Distinguish parser acceptance, modeled effects and opaque effects. Scoped
+  barriers apply only where their scope is proven; unknown global effects
+  establish a persistent fence through later statements.
+- Coverage and proof boundaries for all 16 selected dialects are in README.md,
+  "Dialect semantic coverage"; parser support is not engine-validity evidence.
+** TODO Extend the typed fact IR only for additionally proven effects
+- Already represented: session values, DML/write kinds, drop/truncate modes,
+  transaction effects, schema ownership and refresh source mode. TABLE sources,
+  whole-row projections (including qualified temporary aliases), direct
+  table-target SELECT INTO, CTAS WITH NO DATA,
+  snapshot/live source lifetimes and ALTER VIEW schema moves now have consumer
+  regressions. Unknown effects are preserved, not silently discarded.
+- Remaining opaque: external/bulk I/O, partition/overwrite/multi-table INSERT,
+  OUTPUT INTO sinks, table inheritance/partition relationships, persistent view
+  routing and computed row expansion without proven lineage.
+** TODO Extend identifier and namespace rules only where context is proven
+- Already modeled: object-class/configuration-aware folding, MySQL
+  lower_case_table_names (namespace parts included), BigQuery table/column case,
+  and case-insensitive quoted matching for SQLite/DuckDB/MsSql.
+- Simple MySQL database creation/USE and complete supported namespace paths
+  retain schema generations. Partial multi-level USE/default-schema transitions
+  remain opaque; ambiguous destructive targets fence rather than mutate all
+  possible matches. Option-bearing database creation remains opaque.
+** TODO Extend session state beyond the dedicated modeled settings
+- Already modeled: search paths including symbolic current-user entries,
+  namespace changes with proven context, role/session-user identity and
+  dedicated autocommit/foreign-key settings.
+- Generic variable SET/RESET, unknown settings and unproved session effects
+  remain globally fenced; a recorded value alone is not semantic support.
+** TODO Resolve durable sequence values without weakening rollback safety
+- Already modeled: MySQL/Oracle implicit DDL commits, nested-BEGIN policies,
+  savepoint/catalog snapshots and ON COMMIT registrations.
+- PostgreSQL sequence DDL stays transactional, but value advances do not.
+  Qualified provable sequence advances inside transactions/autocommit-off now
+  establish explicit uncertainty, including drop/recreate/rollback cases;
+  durable generation history is not claimed.
+** TODO Extend stored-expression, constraint and trigger effects
+- Already modeled: foreign-key identity/cascades, constraint changes, recognized
+  inline trigger effects and data-modifying CTEs.
+- Unproved routines, deferred defaults/expressions, opaque trigger bodies and
+  privilege effects remain fenced. Do not treat accepted syntax or stored
+  definitions as proof that their later effects are modeled.

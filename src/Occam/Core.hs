@@ -356,7 +356,10 @@ data RenameOp
     | RenameColumnOp !NameRef !Ident !Ident
     deriving (Eq, Show)
 
-newtype RefreshOp = RefreshOp {refreshTarget :: NameRef}
+data RefreshOp = RefreshOp
+    { refreshTarget :: !NameRef
+    , refreshSourceMode :: !ReadMode
+    }
     deriving (Eq, Show)
 
 data CatalogOp

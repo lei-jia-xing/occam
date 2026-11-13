@@ -503,6 +503,7 @@ pub enum RenameOp {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefreshOp {
     pub target: NameRef,
+    pub source_mode: ReadMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -587,6 +587,7 @@ tests =
                 )
                 [ (PostgreSQL, "CREATE EXTENSION hstore;", "hidden_view")
                 , (PostgreSQL, "GRANT SELECT ON t TO PUBLIC;", "hidden_view")
+                , (PostgreSQL, "CREATE TABLE hidden_view (b INT) INHERITS (t);", "hidden_view")
                 , (PostgreSQL, "SELECT mutate_t();", "t")
                 , (SQLite, "PRAGMA recursive_triggers=0;", "hidden_view")
                 ]
@@ -1571,6 +1572,277 @@ tests =
             assertBool
                 "an explicit PRAGMA foreign_keys = 1 restores cascading"
                 (has (StatementId 4) enabledDeps')
+        , testCase "TABLE query bodies retain external sources without capturing CTE shadows" $
+            mapM_
+                ( \(query, expectedWrites) -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE TABLE t (a INT);"
+                                , "CREATE TABLE u (a INT);"
+                                , "INSERT INTO t VALUES (1);"
+                                , "INSERT INTO u VALUES (2);"
+                                , query
+                                ]
+                    let deps = backwardSlice (StatementId 5) graph
+                    assertBool
+                        ("TABLE query reaches exactly its source writes: " ++ BSC.unpack query)
+                        (all (\sid -> has (StatementId sid) deps == (sid `elem` expectedWrites)) [3, 4])
+                )
+                [ ("(TABLE t);", [3])
+                , ("SELECT * FROM (TABLE t) AS q;", [3])
+                , ("(TABLE t) UNION ALL TABLE u;", [3, 4])
+                , ("WITH u AS (TABLE t) TABLE u;", [3])
+                , ("CREATE TABLE copied AS TABLE t;", [3])
+                ]
+        , testCase "whole-row projections retain nonpredicate columns without broadening other sources" $
+            mapM_
+                ( \(query, readsWholeRow) -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE TEMP TABLE t (a INT, b INT);"
+                                , "CREATE TABLE u (a INT, b INT);"
+                                , "INSERT INTO t VALUES (1, 0);"
+                                , "INSERT INTO u VALUES (1, 0);"
+                                , "UPDATE t SET b = 1;"
+                                , "UPDATE u SET b = 2;"
+                                , query
+                                ]
+                    let deps = backwardSlice (StatementId 7) graph
+                    assertEqual
+                        ("whole-row projection retains updates outside its predicate: " ++ BSC.unpack query)
+                        readsWholeRow
+                        (has (StatementId 5) deps)
+                    assertBool
+                        "an unrelated or join-key-only source does not contribute its other-column update"
+                        (not (has (StatementId 6) deps))
+                )
+                [ ("(TABLE t) ORDER BY a;", True)
+                , ("SELECT * FROM t WHERE a = 1;", True)
+                , ("SELECT t.* FROM t JOIN u ON t.a = u.a WHERE t.a = 1;", True)
+                , ("SELECT t.a FROM t JOIN u ON t.a = u.a WHERE t.a = 1;", False)
+                , ("SELECT q.* FROM pg_temp.t AS q WHERE a = 1;", True)
+                ]
+        , testCase "SELECT INTO creates a data snapshot only in table-target dialects" $
+            mapM_
+                ( \dialect -> do
+                    graph <-
+                        analyzeParsed dialect $
+                            BSC.unlines
+                                [ "CREATE TABLE src (a INT);"
+                                , "CREATE TABLE unrelated (a INT);"
+                                , "INSERT INTO src VALUES (1);"
+                                , "SELECT a INTO copied FROM src;"
+                                , "INSERT INTO src VALUES (2);"
+                                , "INSERT INTO unrelated VALUES (3);"
+                                , "SELECT a FROM copied;"
+                                ]
+                    let deps = backwardSlice (StatementId 7) graph
+                    assertBool
+                        "copied rows retain their source definition and initial data"
+                        (all (\sid -> has (StatementId sid) deps) [1, 3, 4])
+                    assertBool
+                        "copied rows do not become a live view or a global fence"
+                        (all (\sid -> not (has (StatementId sid) deps)) [2, 5, 6])
+                )
+                [PostgreSQL, Redshift, MsSql]
+        , testCase "procedural SELECT INTO targets preserve hidden session effects" $
+            mapM_
+                ( \(dialect, operation) -> do
+                    graph <-
+                        analyzeParsed dialect $
+                            BSC.unlines
+                                [ "CREATE TABLE src (a INT);"
+                                , "INSERT INTO src VALUES (1);"
+                                , operation
+                                , "SELECT 0;"
+                                ]
+                    let deps = backwardSlice (StatementId 4) graph
+                    assertBool
+                        ("constant query stays behind procedural INTO: " ++ BSC.unpack operation)
+                        (all (\sid -> has (StatementId sid) deps) [1, 2, 3])
+                )
+                [ (MySQL, "SELECT a INTO @v FROM src;")
+                , (Oracle, "SELECT a INTO v FROM src;")
+                , (PostgreSQL, "SELECT a INTO @v FROM src;")
+                , (PostgreSQL, "SELECT * FROM (SELECT a INTO copied FROM src) AS q;")
+                ]
+        , testCase "CTAS NO DATA binds schema while data copies remain isolated snapshots" $
+            mapM_
+                ( \(suffix, keepsInitialData) -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE TABLE src (a INT);"
+                                , "INSERT INTO src VALUES (1);"
+                                , "CREATE TABLE copied AS SELECT a FROM src" <> suffix <> ";"
+                                , "INSERT INTO src VALUES (2);"
+                                , "SELECT a FROM copied;"
+                                , "INSERT INTO copied VALUES (3);"
+                                , "SELECT a FROM copied;"
+                                ]
+                    let deps = backwardSlice (StatementId 5) graph
+                    assertBool
+                        "copy retains its own creation and source schema"
+                        (has (StatementId 1) deps && has (StatementId 3) deps)
+                    assertEqual
+                        "only populated creation consumes initial source rows"
+                        keepsInitialData
+                        (has (StatementId 2) deps)
+                    assertBool
+                        "later source rows do not enter the copy"
+                        (not (has (StatementId 4) deps))
+                    let modifiedDeps = backwardSlice (StatementId 7) graph
+                    assertBool
+                        "writing the snapshot retains its own rows without reopening live source data"
+                        (has (StatementId 6) modifiedDeps && not (has (StatementId 4) modifiedDeps))
+                )
+                [("", True), (" WITH NO DATA", False)]
+        , testCase "materialized refresh captures source rows at refresh time only" $ do
+            graph <-
+                analyzeParsed PostgreSQL $
+                    BSC.unlines
+                        [ "CREATE TABLE src (a INT);"
+                        , "CREATE MATERIALIZED VIEW mv AS SELECT a FROM src;"
+                        , "INSERT INTO src VALUES (1);"
+                        , "REFRESH MATERIALIZED VIEW mv WITH DATA;"
+                        , "INSERT INTO src VALUES (2);"
+                        , "SELECT a FROM mv;"
+                        , "REFRESH MATERIALIZED VIEW mv WITH NO DATA;"
+                        , "SELECT a FROM mv;"
+                        ]
+            let populatedDeps = backwardSlice (StatementId 6) graph
+                emptyDeps = backwardSlice (StatementId 8) graph
+            assertBool
+                "populated refresh retains the refresh-time source write"
+                (has (StatementId 3) populatedDeps && has (StatementId 4) populatedDeps)
+            assertBool
+                "materialized rows do not follow later source writes"
+                (not (has (StatementId 5) populatedDeps))
+            assertBool
+                "NO DATA refresh retains creation and its schema transition"
+                (all (\sid -> has (StatementId sid) emptyDeps) [1, 2, 7])
+            assertBool
+                "NO DATA refresh discards previous refresh data dependencies"
+                (all (\sid -> not (has (StatementId sid) emptyDeps)) [3, 4, 5])
+        , testCase "view namespace transitions preserve live sources without unrelated state" $
+            mapM_
+                ( \(alteration, target) -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE SCHEMA s;"
+                                , "CREATE SCHEMA dest;"
+                                , "CREATE TABLE src (a INT);"
+                                , "CREATE TABLE unrelated (a INT);"
+                                , "CREATE VIEW s.v AS SELECT a FROM src;"
+                                , alteration
+                                , "INSERT INTO src VALUES (1);"
+                                , "INSERT INTO unrelated VALUES (2);"
+                                , "SELECT a FROM " <> target <> ";"
+                                ]
+                    let deps = backwardSlice (StatementId 9) graph
+                    assertBool
+                        "moved view retains its definition, transition and current source rows"
+                        (all (\sid -> has (StatementId sid) deps) [3, 5, 6, 7])
+                    assertBool
+                        "modeled view transition does not fence unrelated rows"
+                        (not (has (StatementId 8) deps))
+                )
+                [ ("ALTER VIEW s.v SET SCHEMA dest;", "dest.v")
+                , ("ALTER VIEW s.v RENAME TO renamed;", "s.renamed")
+                ]
+        , testCase "MySQL database creation owns qualified table state without fencing unrelated data" $ do
+            graph <-
+                analyzeParsed MySQL $
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (a INT);"
+                        , "INSERT INTO unrelated VALUES (1);"
+                        , "CREATE DATABASE tenant;"
+                        , "CREATE TABLE tenant.t (a INT);"
+                        , "INSERT INTO tenant.t VALUES (2);"
+                        , "SELECT a FROM tenant.t;"
+                        ]
+            let deps = backwardSlice (StatementId 6) graph
+            assertBool
+                "qualified table reads retain database and table creation plus rows"
+                (all (\sid -> has (StatementId sid) deps) [3, 4, 5])
+            assertBool
+                "database creation does not impose a global dependency"
+                (not (has (StatementId 1) deps) && not (has (StatementId 2) deps))
+        , testCase "MySQL case-sensitive namespace selection retains only its matching database" $ do
+            graph <-
+                analyzeParsed MySQL $
+                    BSC.unlines
+                        [ "CREATE DATABASE Tenant;"
+                        , "CREATE DATABASE tenant;"
+                        , "USE Tenant;"
+                        , "CREATE TABLE t (a INT);"
+                        , "INSERT INTO t VALUES (1);"
+                        , "SELECT a FROM Tenant.t;"
+                        ]
+            let deps = backwardSlice (StatementId 6) graph
+            assertBool
+                "selected namespace creation and USE reach its qualified rows"
+                (all (\sid -> has (StatementId sid) deps) [1, 3, 4, 5])
+            assertBool
+                "lower_case_table_names zero does not merge distinct database names"
+                (not (has (StatementId 2) deps))
+        , testCase "partial namespace selection keeps unknown default-schema effects opaque" $ do
+            graph <-
+                analyzeParsed MsSql $
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT);"
+                        , "INSERT INTO t VALUES (1);"
+                        , "USE tenant;"
+                        , "SELECT 0;"
+                        ]
+            assertBool
+                "a database-only USE cannot be treated as a complete relation namespace"
+                (all (\sid -> has (StatementId sid) (backwardSlice (StatementId 4) graph)) [1, 2, 3])
+        , testCase "ambiguous destructive targets preserve possible state across later writes" $ do
+            graph <-
+                analyzeParsed PostgreSQL $
+                    BSC.unlines
+                        [ "CREATE SCHEMA a;"
+                        , "CREATE SCHEMA b;"
+                        , "CREATE TABLE a.t (x INT);"
+                        , "CREATE TABLE b.t (x INT);"
+                        , "INSERT INTO a.t VALUES (1);"
+                        , "INSERT INTO b.t VALUES (2);"
+                        , "SET search_path TO a, b;"
+                        , "DROP TABLE t;"
+                        , "INSERT INTO b.t VALUES (3);"
+                        , "SELECT x FROM b.t;"
+                        ]
+            let deps = backwardSlice (StatementId 10) graph
+            assertBool
+                "an unresolved destructive choice cannot erase either candidate or later writes"
+                (all (\sid -> has (StatementId sid) deps) [3, 4, 5, 6, 8, 9])
+        , testCase "unmodeled dialect DML effects fence hidden target consumers" $
+            mapM_
+                ( \(dialect, operation) -> do
+                    graph <-
+                        analyzeParsed dialect $
+                            BSC.unlines
+                                [ "CREATE TABLE src (a INT);"
+                                , "CREATE TABLE sink (a INT);"
+                                , "INSERT INTO src VALUES (1);"
+                                , operation
+                                , "SELECT a FROM sink;"
+                                ]
+                    let deps = backwardSlice (StatementId 5) graph
+                    assertBool
+                        "hidden effects retain operation and its preceding state"
+                        (all (\sid -> has (StatementId sid) deps) [1, 2, 3, 4])
+                )
+                [ (Hive, "INSERT OVERWRITE TABLE src SELECT a FROM sink;")
+                , (MySQL, "INSERT INTO src PARTITION (p0) SELECT a FROM sink;")
+                , (Hive, "INSERT INTO src PARTITION (a) SELECT a FROM sink;")
+                , (Snowflake, "INSERT ALL INTO src VALUES (1) INTO sink VALUES (2) SELECT 1;")
+                , (MsSql, "UPDATE src SET a = 2 OUTPUT inserted.a INTO sink;")
+                ]
         , testCase "plain view definitions bind schema while later reads follow data" $ do
             let sql =
                     BSC.unlines
@@ -1730,6 +2002,29 @@ tests =
             assertBool
                 "Oracle NEXTVAL depends on the sequence definition"
                 (has (StatementId 1) (dependenciesFor (StatementId 2) oracleGraph))
+        , testCase "PostgreSQL sequence advances survive rollback and sequence generation restoration" $
+            mapM_
+                ( \betweenAdvanceAndRollback -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines $
+                                [ "CREATE SEQUENCE s;"
+                                , "BEGIN;"
+                                , "SELECT pg_catalog.nextval('s');"
+                                ]
+                                    ++ betweenAdvanceAndRollback
+                                    ++ [ "ROLLBACK;"
+                                       , "SELECT pg_catalog.currval('s');"
+                                       ]
+                    let finalId = StatementId (5 + length betweenAdvanceAndRollback)
+                        deps = backwardSlice finalId graph
+                    assertBool
+                        "rollback does not erase the durable sequence advance"
+                        (has (StatementId 3) deps)
+                )
+                [ []
+                , ["DROP SEQUENCE s;", "CREATE SEQUENCE s;"]
+                ]
         , testCase "dynamic and session sequence reads retain preceding sequence effects" $
             mapM_
                 ( \expression -> do
