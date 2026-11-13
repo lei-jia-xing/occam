@@ -6,6 +6,7 @@ import Distribution.Simple.LocalBuildInfo (
     LocalBuildInfo,
     componentBuildDir,
     withLibLBI,
+    withProfLib,
  )
 import Distribution.Simple.UserHooks (buildHook)
 #if MIN_VERSION_Cabal(3, 14, 0)
@@ -40,8 +41,10 @@ buildRust package localBuildInfo hooks flags = do
         ]
     withLibLBI package localBuildInfo $ \_ component -> do
         let dir = buildDirectory localBuildInfo component
+            archive = "rust/sqlparser-ffi/target/release/liboccam_sqlparser.a"
         createDirectoryIfMissing True dir
-        copyFile
-            "rust/sqlparser-ffi/target/release/liboccam_sqlparser.a"
-            (dir </> "libCoccam_sqlparser.a")
+        copyFile archive (dir </> "libCoccam_sqlparser.a")
+        if withProfLib localBuildInfo
+            then copyFile archive (dir </> "libCoccam_sqlparser_p.a")
+            else pure ()
     buildHook simpleUserHooks package localBuildInfo hooks flags

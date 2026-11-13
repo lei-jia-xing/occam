@@ -90,6 +90,36 @@ Prepare/build native executables first. Workload preparation and profile output 
 
 Measured results, per-input distributions, 90 configured profile/strategy records, limitations and replayable evidence: [2026-11-07 evaluation](results/2026-11-07/README.md). Timeout checkpoints are validated separately, never relabeled completed.
 
+## GHC flamegraph
+
+This checks the GHC 9.10 `.prof` → SVG toolchain on one generated SQLite-rowset input; it is not a performance baseline. Install `ghc-prof-flamegraph` separately from project dependencies:
+
+```bash
+set -e
+TOOL_DIR=$(mktemp -d /tmp/ghc-prof-flamegraph.XXXXXX)
+BUILD_DIR=$(mktemp -d /tmp/occam-ghc-profile-build.XXXXXX)
+OUT_DIR=$(mktemp -d /tmp/occam-ghc-profile.XXXXXX)
+cabal install ghc-prof-flamegraph-0.2.0.1 --installdir="$TOOL_DIR" --overwrite-policy=always
+cabal build exe:occam --builddir="$BUILD_DIR" --enable-profiling --enable-executable-profiling \
+  --ghc-options='-O2 -fprof-late' --disable-executable-stripping
+BIN=$(cabal list-bin exe:occam --builddir="$BUILD_DIR")
+python3 benchmarks/tools/p2_scale_study.py prepare "$OUT_DIR/study" --corpus-size 1
+ORACLE=$(jq -r '.cases[] | select(.id=="statements-4096") | .oracle_command' "$OUT_DIR/study/scale.json")
+set +e
+(cd "$OUT_DIR" && env -u GHCRTS "$BIN" +RTS -N1 -P -RTS "$OUT_DIR/study/statements-4096.sql" \
+  --oracle "$ORACLE" --dialect sqlite --timeout 1 --budget 10 --max-oracle-executions 100 \
+  --log-format json --out "$OUT_DIR/run")
+status=$?
+set -e
+printf 'bounded smoke exit=%s (inspect run/stats.json; timeout is not completion evidence)\n' "$status"
+"$TOOL_DIR/ghc-prof-flamegraph" --time "$OUT_DIR/occam.prof" \
+  --flamegraph-option=--fonttype=sans-serif -o "$OUT_DIR/cpu-time.svg"
+"$TOOL_DIR/ghc-prof-flamegraph" --alloc "$OUT_DIR/occam.prof" \
+  --flamegraph-option=--fonttype=sans-serif -o "$OUT_DIR/haskell-allocation.svg"
+```
+
+The setup links the same, uninstrumented Rust release archive under Cabal's `_p` library name; this does not profile Rust. GHC time profiles exclude safe foreign-call CPU (`c_parseSQL`), child-oracle time and Rust allocations; allocation is cumulative Haskell heap, not live heap. Treat these graphs as Haskell diagnostics, not whole-process timing.
+
 ## Optional upstream comparisons
 
 Prepare upstream sources/dependencies **outside** the measured reduction. SQLancer requires a Git checkout at [`a7d60ee`](https://github.com/sqlancer/sqlancer/tree/a7d60ee450e6a22ca38599c14e984a49773f4745), a JDK, and its built JAR/dependency directory. Set `SQLANCER_SOURCE` and run `mvn -q -Dmaven.test.skip=true package -f "$SQLANCER_SOURCE/pom.xml"` once before the comparison; the adapter no longer fetches or rebuilds on each input. It compiles the small Reproducer adapter per invocation, inside the shared deadline.

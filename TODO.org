@@ -197,3 +197,184 @@
 - Unproved routines, deferred defaults/expressions, opaque trigger bodies and
   privilege effects remain fenced. Do not treat accepted syntax or stored
   definitions as proof that their later effects are modeled.
+
+* 24. Benchmark & Performance Engineering
+** TODO [#A] Define experiment lines and reduction tracks
+- Define exactly two experiment lines: internal Occam experiments (full reducer
+  and controlled ablations) and external reducer comparisons. Keep separate
+  experiment definitions and result/report identities.
+- An experiment selects one line and homogeneous profiles; never combine both
+  lines in a leaderboard. CLI/native/API execution mode is orthogonal to line.
+  Shared runner, qualified cases, predicate, resource, and evidence contracts
+  are allowed; external candidate construction/search must remain independent.
+- Within each declared cohort/budget, compare validated output quality against
+  end-to-end cost and completion: bytes and reliable statement/token counts
+  where supported, wall time, and actual uncached predicate executions/reset
+  scope. State phases, validation, count/debit scope, and statement-only versus
+  full-AST coverage.
+- Do not invent universal parse-success or scalar scores, or claim byte-only
+  formatter advantage. A reduction is not a global minimum, SQL-semantic
+  validity, or bug reproduction.
+** BLOCKED [#A] Select primary DBMS and representative evidence scope
+- Owner review must select engine/version, setup, and workload sources.
+  PostgreSQL with SQLite execution controls is only a bounded proposal; parser
+  support and synthetic fixtures do not establish evidence.
+- Acceptance: record the selected scope and rationale, or explicitly limit
+  claims until representative evidence exists. Do not require crash cases or
+  an arbitrary corpus-size target.
+** TODO [#A] Qualify workload provenance and predicate/reset contracts
+- For each selected case, preserve exact SQL bytes/checksum, origin and lineage,
+  property to preserve, workload-family rationale, dialect, DBMS/version/setup,
+  and predicate/reset fingerprints and isolation contract. Pin deterministic
+  source, parameters, and seed where generated.
+- Include positive and negative predicate controls and case-specific
+  contamination/reset/restoration checks. These qualify the selected
+  predicate/reset path, not universal oracle correctness; crash harvesting is
+  out of scope.
+- The reducer/runner must not infer diagnostic categories from raw predicate
+  stdout/stderr or exit status; a case predicate may inspect target DB output
+  per its declared contract. The generic predicate-exit rule remains: status
+  0 accepts, any nonzero/signal rejects; no exit codes are reserved globally.
+- For an already-selected relational/metamorphic case, document the proven
+  relation and comparison semantics (bag/order, duplicates, NULL as relevant);
+  require both branches to succeed from equivalent DB state. This conditional
+  paired-success requirement does not apply to diagnostic-only cases.
+- Acceptance: record initial acceptance and fresh-state final validation.
+  External predicate/reset owns DB isolation. Keep text-marker mechanics
+  distinct from execution evidence.
+** TODO [#A] Use one control plane for selected experiment lines
+- Use one runner/control plane for either selected line; prepare upstream
+  checkouts, builds, adapters, and workloads outside timed measurement. The
+  runner owns resources and outer outcomes; each reducer owns its search and
+  candidate semantics; the external predicate/reset owns DB execution/reset.
+- Trial Nix using the existing lock for one selected DBMS and one qualified
+  case; do not require full-project packaging or historical-version builds.
+  Whether Nix becomes a benchmark prerequisite remains an explicit decision.
+- Trial acceptance: run from a clean environment without undeclared host tools,
+  identify resolved binaries and dependency/build inputs outside the lock, and
+  record preparation/rebuild cost separately from measured runs. Materialize
+  dependencies before timing and invoke resolved binaries directly. Record an
+  adopt/defer decision and maintenance cost; Nix is not DB/profile isolation.
+- Clean up owned process groups, containers, and resources on the declared
+  platform; record cleanup failures. Do not promise to kill escaped or
+  reparented descendants, or identical cleanup behavior on every OS.
+- Acceptance: preserve line-specific accounting and validation boundaries.
+  Distinguish rejection, timeout/checkpoint, tool, infrastructure, and cleanup
+  failures.
+** TODO [#A] Isolate each measured profile execution
+- Use an immutable profile configuration and a fresh child per case × profile
+  × repetition, including native/API variants. Each measured child runs exactly
+  one explicitly named profile; never combine profiles in one measured worker.
+  Each child gets fresh runtime, cache, counters, budget, and physical preflight.
+  Run final checks only when status/budget permit; never reuse another run's
+  preflight/final check. Give each child its own output directory and artifacts.
+- Record a structured terminal observation (including budget/timeout) separately
+  from process exit status; a failed child must not erase other batch results.
+  Preserve production CLI nonzero-on-exhaustion/checkpoint and generic predicate
+  contract: 0 accepts; any nonzero/signal rejects; output is opaque.
+- Prove DB fixture/reset isolation at case effect scope; a new process or
+  directory alone is insufficient. Read-only inputs and binaries may be shared.
+- Serialize measurements by default. Record CPU/thread settings, repetitions,
+  order, warm-up and cache policy; a fresh process is not a cold OS page cache.
+  Run instrumented diagnostics separately from normal score runs.
+- Acceptance: a two-run probe dirties fixture, cache/counters, and artifact
+  state in run one and proves run two starts clean. Retain isolation/reset
+  evidence and cleanup outcomes. Preserve timeout versus validated-partial
+  status; never promote a checkpoint to completed.
+** TODO [#A] Preserve immutable per-run evidence
+- Store versioned raw records/artifacts with case, line, profile, repetition,
+  child and isolation/reset identities; input/output checksums; execution mode;
+  score-versus-diagnostic mode; tool/toolchain/environment; exact command,
+  options, resources, validation phases, and count/debit scope. Unknown metrics
+  remain null, not zero.
+- Internal ablations record the base config and one mechanism difference.
+  External runs record upstream checkout, local patch, executable, options,
+  and adapter fingerprints.
+- Resolve the already-selected source/patch, toolchain/build flags, and
+  executable before timing; record resolved path and identity/hash where
+  available, and invoke that binary directly (no per-candidate builds).
+- Preserve all actual parsing, normalization, search, and preflight costs;
+  do not silently subtract them.
+- `validated-complete` requires completed reduction and fresh successful final
+  checks. Timeout/budget checkpoints retain timeout/incomplete status. Never
+  override outer timeout or infrastructure failure with a stale profile.
+- Acceptance: every result traces to raw records/artifacts; partial accepted
+  checkpoints retain validation state and are never promoted to completion.
+** TODO [#B] Add evidence-led profiling early
+- Start when the foundation contract, first qualified case, and raw-run capture
+  exist; do not wait for full rewrite or external-tool selection. Keep
+  instrumented profiles separate from normal score runs. Capture Haskell
+  CPU/allocation and, where supported, Linux `perf` for CLI/Rust FFI; attribute
+  child predicate/reset costs separately.
+- Acceptance: retain symbolized profiles with exact cases, binaries, flags,
+  and limits; state GHC safe-FFI, Rust, and child-process blind spots. The
+  generated GHC flamegraph smoke remains toolchain proof, not a baseline.
+** TODO [#B] Run controlled internal controls and ablations
+- B1/B2 currently alias Occam's `statementAudit`/`statementDdmin`; retain them
+  only for a named internal question. Never brand them as external baselines;
+  B2 alone does not isolate AST gains.
+- Before naming a profile, verify and record its effective ordered passes,
+  fallback, audit/fixed-point behavior, and minimality claim. Do not presume
+  an all-off Boolean config equals statement ddmin or count duplicate
+  effective configurations as separate controls without a named reason;
+  merge only after verified equivalence.
+- Compare full Occam with one feature-off profile at a time, holding other
+  passes and cache policy fixed except the named mechanism. Do not create a
+  full cross-product or pool statement-only and full-AST results.
+- Acceptance: report paired mechanism deltas only within matched internal
+  profiles, cases, repetitions, and resource/validation protocol.
+** TODO [#B] Qualify and compare independent external reducers
+- Compare the production Occam CLI with separately implemented upstream
+  parser/candidate/search algorithms. Verify independent search before
+  admission; record commit, dirty/local patch, executable, options, adapter,
+  and configuration fingerprints. SQLreduce/SQLancer remain conditional
+  candidates; choose no tool before the blocked DBMS/workload scope is resolved.
+- Use the exact same full input, setup, predicate, and declared budget. If a
+  reducer cannot handle a full script, record unsupported or define a
+  query-only cohort used identically for every tool; never substitute a
+  tool-specific input. External tools may use declared native capabilities and
+  cache policies; do not force Occam passes onto them.
+- Record observed token/statement/AST granularity, syntax/dependency awareness
+  where verified, dialect/full-script coverage, and formatting behavior as
+  capabilities, not mandatory tiers or presumed winners.
+- Prepare checkout/build/adapter compilation before timing. Do not silently
+  exclude actual input parsing, normalization, search, or per-run preflight.
+  Verify fresh predicate results. Report byte and structural quality for
+  formatters; do not claim byte-only superiority.
+- Acceptance: share count protocol only where comparable and state differences.
+  Admit no arbitrary tool zoo; preserve unsupported outcomes in the denominator.
+** TODO [#B] Derive strictly partitioned reports from raw evidence
+- Trace records by unique run/profile/repetition/child IDs. Pair only by
+  matched case/input checksum, experiment line, predicate/reset identity,
+  scope, repetition/block, and compatible budget/resource/count protocol.
+  Profile/tool/child IDs are comparison sides, not equality keys.
+- Report internal mechanism deltas separately from external tool comparisons;
+  keep score and diagnostic runs separate. Never aggregate or rank across
+  experiment lines.
+- Preserve matched cases, cohorts, related lineages, failures, unsupported and
+  missing cases. Distinguish batch makespan from summed worker time; never run
+  predicates in the reporter or silently normalize unlike protocols.
+- Acceptance: allow distinct profiles/tools/children to be compared when
+  protocol-compatible; reject cross-line and incompatible-protocol pairs.
+  Reports derive reproducibly from immutable raw records and retain incomplete
+  outcomes and denominators.
+** TODO [#B] Cut over benchmark entrypoints and retire redundant paths
+- Migrate single-input/generation (`benchmarks/live_fuzz_pipeline.sh`,
+  `benchmarks/tools/fuzz_generator.py`); batch/study
+  (`benchmarks/fuzz_corpus/run_docker_benchmark.py`,
+  `benchmarks/tools/p2_scale_study.py`); evaluation (`bench/Baseline.hs`,
+  `bench/Benchmark.hs`, `bench/Main.hs`, `occam.cabal`, `test/Spec.hs`);
+  wrappers (`benchmarks/run_all.sh`, `benchmarks/report.sh`,
+  `benchmarks/docker_run.sh`, root `Dockerfile.benchmark`,
+  `harness/docker_entrypoint.sh`).
+- Migrate selected optional paths only: `benchmarks/upstream/oracle_exec.py`,
+  `oracle_test.py`, `sqlancer_adapter.sh`, `sqlreduce_adapter.py`, and
+  `harness/sqlsmith_driver.sh`. Update `benchmarks/README.md`,
+  `harness/README.md`, root `README.md`, and focused tests
+  (`benchmarks/test_report_pairing.py`, `test_semantic_boundaries.py`,
+  `test_oracle_test.py`, `test_oracle_exec.py`, `test_p2_scale_study.py`).
+- Retire B1/B2 aliases/branding and mixed-profile orchestration; add no
+  compatibility shim. Preserve old artifacts only as labeled history, not
+  current baseline evidence. Keep safety-contract tests for the new boundaries.
+- Acceptance: document one supported orchestration path and provision only
+  selected-scope engines/tools. Old filenames and CLI are not commitments.
