@@ -1,4 +1,6 @@
-use crate::actions::{canonical_ident_string, is_dml_statement, name_parts, sequence_expr_ref};
+use crate::actions::{
+    SequenceEffect, canonical_ident_string, is_dml_statement, name_parts, sequence_expr_effect,
+};
 use crate::ir;
 use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
 use crate::{DialectKind, NativeEdit, NativeEditCategory};
@@ -68,6 +70,8 @@ pub(super) struct SequenceVisitor<'a> {
     dialect: DialectKind,
     rules: &'a crate::ir::IdentifierRules,
     pub(super) writes: Vec<ir::NameRef>,
+    pub(super) reads: Vec<ir::NameRef>,
+    pub(super) unknown: bool,
     seen: HashSet<ir::NameRef>,
 }
 
@@ -77,6 +81,8 @@ impl<'a> SequenceVisitor<'a> {
             dialect,
             rules,
             writes: Vec::new(),
+            reads: Vec::new(),
+            unknown: false,
             seen: HashSet::new(),
         }
     }
@@ -86,10 +92,14 @@ impl Visitor for SequenceVisitor<'_> {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
-        if let Some(sequence) = sequence_expr_ref(expr, self.dialect, self.rules)
-            && self.seen.insert(sequence.clone())
-        {
-            self.writes.push(sequence);
+        match sequence_expr_effect(expr, self.dialect, self.rules) {
+            Some(SequenceEffect::Write(sequence)) if self.seen.insert(sequence.clone()) => {
+                self.writes.push(sequence);
+            }
+            Some(SequenceEffect::Read(sequence)) => self.reads.push(sequence),
+            Some(SequenceEffect::Unknown) => self.unknown = true,
+            None if matches!(expr, Expr::Function(_)) => self.unknown = true,
+            _ => {}
         }
         std::ops::ControlFlow::Continue(())
     }
@@ -109,6 +119,7 @@ pub(super) struct AnalysisVisitor<'a> {
     pub(super) relations: Vec<RelationUse>,
     pub(super) unmodeled_relation_spans: Vec<Span>,
     pub(super) unmodeled_table_source: bool,
+    pub(super) has_function: bool,
     /// Column reference and the alias scope in which it appeared.
     pub(super) columns: Vec<(Vec<String>, usize)>,
     pub(super) aliases: Vec<AliasScope>,
@@ -139,6 +150,7 @@ impl<'a> AnalysisVisitor<'a> {
             relations: Vec::new(),
             unmodeled_relation_spans: Vec::new(),
             unmodeled_table_source: false,
+            has_function: false,
             columns: Vec::new(),
             aliases: vec![AliasScope {
                 parent: None,
@@ -2199,6 +2211,19 @@ impl Visitor for AnalysisVisitor<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        self.has_function |= match expr {
+            Expr::Function(_) => true,
+            Expr::CompoundIdentifier(idents)
+                if matches!(self.dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
+            {
+                idents.len() > 1
+                    && idents.last().is_some_and(|ident| {
+                        ident.value.eq_ignore_ascii_case("nextval")
+                            || ident.value.eq_ignore_ascii_case("currval")
+                    })
+            }
+            _ => false,
+        };
         let record_columns = self.nested_dml_depth == 0;
         let scope = self.current_alias_scope();
         match expr {

@@ -15,7 +15,6 @@ module Occam.Oracle (
     prepareOracle,
 ) where
 
-import Control.Applicative ((<|>))
 import Control.Concurrent (forkFinally, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
 import Control.Exception (
     IOException,
@@ -44,7 +43,6 @@ import Data.Aeson.Encoding qualified as Encoding
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.ByteString.Char8 qualified as BSC
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -64,6 +62,7 @@ import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (ProcessID)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, getProcessExitCode, proc, shell, waitForProcess, withCreateProcess)
 #endif
+import System.IO.Error (isResourceVanishedError)
 import System.Timeout (timeout)
 
 -- | Run a database/environment reset command in an owned process group.
@@ -79,7 +78,7 @@ executeReset (Just cmd) =
                     ((shell cmd) {env = Just childEnv})
                     BS.empty
             pure $ case result of
-                Just (ExitSuccess, _, _) -> True
+                Just ExitSuccess -> True
                 _ -> False
 
 data OracleObservationDetails = OracleObservationDetails
@@ -90,19 +89,14 @@ data OracleObservationDetails = OracleObservationDetails
     }
     deriving (Eq, Show)
 
-type CapturedProcess = (ExitCode, Maybe Text, Maybe Text)
-
 defaultResetTimeoutMicros :: Int
 defaultResetTimeoutMicros = 30000000
-
-maxInfrastructureMessageBytes :: Int
-maxInfrastructureMessageBytes = 2 * 1024 * 1024
 
 {- | Oracle and reset children get a fresh process group. Ordinary descendants
 inherit ownership and are terminated on completion/timeout; children that call
 setsid escape it and are outside the supported Linux/POSIX contract.
 -}
-runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe CapturedProcess)
+runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe ExitCode)
 runProcessGroup timeoutMicros command input =
     snd <$> runProcessGroupWithStart (pure ()) timeoutMicros command input
 
@@ -111,7 +105,7 @@ runProcessGroupWithStart ::
     Int ->
     CreateProcess ->
     ByteString ->
-    IO (Bool, Maybe CapturedProcess)
+    IO (Bool, Maybe ExitCode)
 runProcessGroupWithStart onStarted timeoutMicros command input
     | timeoutMicros <= 0 = pure (False, Nothing)
     | otherwise =
@@ -130,14 +124,14 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                 restore $
                                     timeout
                                         timeoutMicros
-                                        ( withWorker (readInfrastructureDiagnostic hOut) \readOut ->
-                                            withWorker (readInfrastructureDiagnostic hErr) \readErr ->
+                                        ( withWorker (drainOutput hOut) \readOut ->
+                                            withWorker (drainOutput hErr) \readErr ->
                                                 withWorker (writePipe hIn input) \writeInput -> do
                                                     exitCode <- waitForProcess ph
                                                     writeInput
-                                                    out <- readOut
-                                                    err <- readErr
-                                                    pure (exitCode, out, err)
+                                                    readOut
+                                                    readErr
+                                                    pure exitCode
                                         )
                             )
                                 `onException` cleanup
@@ -214,70 +208,15 @@ withWorker action use =
         (killThread . fst)
         (\(_, result) -> use (readMVar result >>= either throwIO pure))
 
-readInfrastructureDiagnostic :: Handle -> IO (Maybe Text)
-readInfrastructureDiagnostic h = go BS.empty Nothing
-    where
-        marker = "OCCAM_INFRASTRUCTURE:"
-        overlapLimit = BS.length marker - 1
-
-        go :: ByteString -> Maybe ([ByteString], Int, Bool) -> IO (Maybe Text)
-        go pending diagnostic = do
-            chunk <- BS.hGetSome h 32768
-            if BS.null chunk
-                then pure (diagnosticText diagnostic)
-                else case diagnostic of
-                    Just (_, _, True) -> go BS.empty diagnostic
-                    Just (pieces, size, False) ->
-                        go BS.empty (Just (appendDiagnostic pieces size chunk))
-                    Nothing ->
-                        case boundaryRemainder pending chunk of
-                            Just remainder ->
-                                go BS.empty (Just (appendDiagnostic [] 0 (BS.drop remainder chunk)))
-                            Nothing ->
-                                let (_, rest) = BSC.breakSubstring marker chunk
-                                 in if BS.null rest
-                                        then go (nextPending pending chunk) Nothing
-                                        else
-                                            go
-                                                BS.empty
-                                                (Just (appendDiagnostic [] 0 (BS.drop (BS.length marker) rest)))
-
-        boundaryRemainder :: ByteString -> ByteString -> Maybe Int
-        boundaryRemainder pending chunk = seek (min (BS.length pending) overlapLimit)
-            where
-                seek overlap
-                    | overlap <= 0 = Nothing
-                    | BS.drop (BS.length pending - overlap) pending == BS.take overlap marker
-                        && BS.take (BS.length marker - overlap) chunk == BS.drop overlap marker =
-                        Just (BS.length marker - overlap)
-                    | otherwise = seek (overlap - 1)
-
-        nextPending :: ByteString -> ByteString -> ByteString
-        nextPending pending chunk
-            | BS.length chunk >= overlapLimit =
-                BS.drop (BS.length chunk - overlapLimit) chunk
-            | otherwise =
-                let keepFromPending = min (BS.length pending) (overlapLimit - BS.length chunk)
-                 in BS.drop (BS.length pending - keepFromPending) pending <> chunk
-
-        appendDiagnostic :: [ByteString] -> Int -> ByteString -> ([ByteString], Int, Bool)
-        appendDiagnostic pieces size chunk =
-            let (line, newline) = BSC.break (== '\n') chunk
-                kept = BS.take (max 0 (maxInfrastructureMessageBytes - size)) line
-                newSize = size + BS.length kept
-                newPieces = if BS.null kept then pieces else kept : pieces
-                complete = not (BS.null newline) || newSize >= maxInfrastructureMessageBytes
-             in (newPieces, newSize, complete)
-
-        diagnosticText :: Maybe ([ByteString], Int, Bool) -> Maybe Text
-        diagnosticText Nothing = Nothing
-        diagnosticText (Just (pieces, _, _)) =
-            Just (T.strip . T.pack . BSC.unpack . BS.concat $ reverse pieces)
+drainOutput :: Handle -> IO ()
+drainOutput h = do
+    chunk <- BS.hGetSome h 32768
+    unless (BS.null chunk) (drainOutput h)
 
 writePipe :: Handle -> ByteString -> IO ()
 writePipe h bytes =
     handle
-        (\(_ :: IOException) -> pure ())
+        (\err -> if isResourceVanishedError err then pure () else throwIO err)
         ( do
             unless (BS.null bytes) (BS.hPut h bytes)
             hFlush h
@@ -379,10 +318,7 @@ observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
                                             BS.empty
                         resetEnded <- getMonotonicTimeNSec
                         let duration = elapsedMicros resetStarted resetEnded
-                        pure
-                            ( fmap (fmap (\(code, _, _) -> code)) result
-                            , duration
-                            )
+                        pure (result, duration)
                 case resetResult of
                     Left err -> pure (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
                     Right Nothing -> pure (OracleTimedOut, resetElapsed, Nothing)
@@ -408,10 +344,7 @@ observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
                                         ( case oracleResult of
                                             Left err -> OracleIOFailed (T.pack (show err))
                                             Right (_, Nothing) -> OracleTimedOut
-                                            Right (_, Just (code', out, err))
-                                                | Just message <- infrastructureMessage out err ->
-                                                    OracleIOFailed message
-                                                | otherwise -> OracleFinished code'
+                                            Right (_, Just code') -> OracleFinished code'
                                         , resetElapsed
                                         , case oracleResult of
                                             Right (True, _) -> Just oracleElapsed
@@ -476,9 +409,6 @@ classifyOracleObservation observation = case observation of
     OracleIOFailed _ -> InfrastructureError
     OracleFinished ExitSuccess -> Accepted
     OracleFinished _ -> Rejected
-
-infrastructureMessage :: Maybe Text -> Maybe Text -> Maybe Text
-infrastructureMessage = (<|>)
 
 -- ----------------------------------------------------------------------------
 -- External interestingness predicate

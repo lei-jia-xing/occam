@@ -19,9 +19,6 @@ from typing import Any
 
 OUTPUT_CHUNK_BYTES = 32768
 AUDIT_TAIL_BYTES = 8192
-DIAGNOSTIC_BYTES = 8192
-
-INFRASTRUCTURE_MARKER = b"OCCAM_INFRASTRUCTURE:"
 
 
 class InterruptedCall(Exception):
@@ -48,15 +45,6 @@ def append_tail(tail: bytearray, chunk: bytes) -> None:
     del tail[:-AUDIT_TAIL_BYTES]
 
 
-def append_diagnostic(diagnostic: bytearray, chunk: bytes) -> bool:
-    newline = chunk.find(b"\n")
-    complete = newline >= 0
-    if complete:
-        chunk = chunk[: newline + 1]
-    remaining = max(0, DIAGNOSTIC_BYTES - len(diagnostic))
-    diagnostic.extend(chunk[:remaining])
-    return complete or len(diagnostic) >= DIAGNOSTIC_BYTES
-
 
 def run_command(
     command: str,
@@ -72,9 +60,6 @@ def run_command(
             "returncode": 124,
             "stdout": b"",
             "stderr": b"",
-            "stdout_diagnostic": None,
-            "stderr_diagnostic": None,
-            "infrastructure_marker": False,
         }
     try:
         process = subprocess.Popen(
@@ -92,17 +77,11 @@ def run_command(
             "returncode": None,
             "stdout": b"",
             "stderr": str(exc).encode(),
-            "stdout_diagnostic": None,
-            "stderr_diagnostic": None,
-            "infrastructure_marker": False,
         }
 
     def new_capture() -> dict[str, Any]:
         return {
             "tail": bytearray(),
-            "marker": False,
-            "diagnostic": bytearray(),
-            "diagnostic_complete": False,
             "error": None,
             "lock": threading.Lock(),
         }
@@ -111,7 +90,6 @@ def run_command(
     stderr_capture = new_capture()
 
     def drain_output(source: Any, capture: dict[str, Any]) -> None:
-        pending = b""
         try:
             while True:
                 chunk = source.read1(OUTPUT_CHUNK_BYTES)
@@ -119,19 +97,6 @@ def run_command(
                     break
                 with capture["lock"]:
                     append_tail(capture["tail"], chunk)
-                    if not capture["marker"]:
-                        scanned = pending + chunk
-                        marker_index = scanned.find(INFRASTRUCTURE_MARKER)
-                        if marker_index >= 0:
-                            capture["marker"] = True
-                            capture["diagnostic_complete"] = append_diagnostic(
-                                capture["diagnostic"],
-                                scanned[marker_index:],
-                            )
-                        else:
-                            pending = scanned[-(len(INFRASTRUCTURE_MARKER) - 1) :]
-                    elif not capture["diagnostic_complete"]:
-                        capture["diagnostic_complete"] = append_diagnostic(capture["diagnostic"], chunk)
         except Exception as exc:
             with capture["lock"]:
                 capture["error"] = exc
@@ -203,13 +168,9 @@ def run_command(
 
     with stdout_capture["lock"]:
         stdout_tail = bytes(stdout_capture["tail"])
-        stdout_marker = stdout_capture["marker"]
-        stdout_message = bytes(stdout_capture["diagnostic"]) if stdout_marker else None
         stdout_error = stdout_capture["error"]
     with stderr_capture["lock"]:
         stderr_tail = bytes(stderr_capture["tail"])
-        stderr_marker = stderr_capture["marker"]
-        stderr_message = bytes(stderr_capture["diagnostic"]) if stderr_marker else None
         stderr_error = stderr_capture["error"]
     if stdout_error is not None:
         raise stdout_error
@@ -226,9 +187,6 @@ def run_command(
         "returncode": 124 if timed_out else process.returncode,
         "stdout": stdout_tail,
         "stderr": stderr_tail,
-        "stdout_diagnostic": stdout_message,
-        "stderr_diagnostic": stderr_message,
-        "infrastructure_marker": stdout_marker or stderr_marker,
     }
 
 
@@ -251,9 +209,6 @@ def main() -> int:
     returncode: int | None = None
     stdout = bytearray()
     stderr = bytearray()
-    infrastructure_marker = False
-    stdout_diagnostic: bytes | None = None
-    stderr_diagnostic: bytes | None = None
 
     reset_attempted = False
     reset_elapsed_sec: float | None = None
@@ -285,16 +240,10 @@ def main() -> int:
                 reset_status = reset["status"]
                 append_tail(stdout, reset["stdout"])
                 append_tail(stderr, reset["stderr"])
-                stdout_diagnostic = reset["stdout_diagnostic"]
-                stderr_diagnostic = reset["stderr_diagnostic"]
-                infrastructure_marker |= reset["infrastructure_marker"]
                 if reset["status"] == "completed" and reset["returncode"] != 0:
                     reset_status = "failed"
-                    reset_error = b"OCCAM_INFRASTRUCTURE: reset failed\n"
+                    reset_error = b"reset failed\n"
                     append_tail(stderr, reset_error)
-
-
-                    infrastructure_marker = True
                     status = "tool-error"
                     returncode = 125
                 elif reset["status"] == "timeout":
@@ -303,10 +252,8 @@ def main() -> int:
                 elif reset["status"] != "completed":
                     status = "tool-error"
                     returncode = 125
-                    reset_error = b"OCCAM_INFRASTRUCTURE: reset failed\n"
+                    reset_error = b"reset failed\n"
                     append_tail(stderr, reset_error)
-
-                    infrastructure_marker = True
                 if reset["status"] == "completed" and reset["returncode"] == 0:
                     result = run_command(command, args.cwd.resolve(), environment, deadline, sql)
                 else:
@@ -317,19 +264,14 @@ def main() -> int:
             if result is not None:
                 append_tail(stdout, result["stdout"])
                 append_tail(stderr, result["stderr"])
-                stdout_diagnostic = stdout_diagnostic or result["stdout_diagnostic"]
-                stderr_diagnostic = stderr_diagnostic or result["stderr_diagnostic"]
-                infrastructure_marker |= result["infrastructure_marker"]
                 if result["status"] == "timeout":
                     status = "timeout"
                     returncode = 124
                 elif result["status"] == "tool-error":
                     status = "tool-error"
                     returncode = 125
-                    oracle_error = b"OCCAM_INFRASTRUCTURE: oracle invocation failed\n"
+                    oracle_error = b"oracle invocation failed\n"
                     append_tail(stderr, oracle_error)
-
-                    infrastructure_marker = True
                 else:
                     returncode = result["returncode"]
                     status = "accepted" if returncode == 0 else "rejected"
@@ -343,22 +285,13 @@ def main() -> int:
     except Exception as exc:
         status = "tool-error"
         returncode = 125
-        error_output = f"OCCAM_INFRASTRUCTURE: {exc}\n".encode()
+        error_output = f"{exc}\n".encode()
         append_tail(stderr, error_output)
-
-        infrastructure_marker = True
     stdout_output = bytes(stdout)
     stderr_output = bytes(stderr)
-    if stdout_diagnostic and stdout_diagnostic not in stdout_output:
-        stdout_output = stdout_diagnostic + (b"" if stdout_diagnostic.endswith(b"\n") else b"\n") + stdout_output
-    if stderr_diagnostic and stderr_diagnostic not in stderr_output:
-        stderr_output = stderr_diagnostic + (b"" if stderr_diagnostic.endswith(b"\n") else b"\n") + stderr_output
 
     stdout_text = bytes(stdout).decode(errors="replace")
     stderr_text = bytes(stderr).decode(errors="replace")
-    if infrastructure_marker:
-        status = "tool-error"
-        returncode = 125
 
     record: dict[str, Any] = {
         "digest": hashlib.sha256(sql).hexdigest(),
@@ -370,12 +303,6 @@ def main() -> int:
         "reset_elapsed_sec": reset_elapsed_sec,
         "reset_status": reset_status,
         "stdout": stdout_text[-AUDIT_TAIL_BYTES:],
-        "stdout_diagnostic": stdout_diagnostic.decode(errors="replace")
-        if stdout_diagnostic is not None
-        else None,
-        "stderr_diagnostic": stderr_diagnostic.decode(errors="replace")
-        if stderr_diagnostic is not None
-        else None,
         "stderr": stderr_text[-AUDIT_TAIL_BYTES:],
     }
     args.audit.parent.mkdir(parents=True, exist_ok=True)

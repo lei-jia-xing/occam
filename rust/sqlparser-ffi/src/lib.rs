@@ -1350,11 +1350,55 @@ mod tests {
         assert!(matches!(
             facts(&units[0]).barriers.as_slice(),
             [ScopedBarrier {
-                scope: BarrierScope::SessionState,
+                scope: BarrierScope::Global,
                 reason: BarrierReason::UnknownSessionEffect,
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn unmodeled_state_changes_preserve_global_uncertainty() {
+        for (dialect, sql) in [
+            (DialectKind::SQLite, "PRAGMA foreign_keys = 1;"),
+            (DialectKind::PostgreSql, "SET search_path TO public;"),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        for (dialect, sql) in [
+            (DialectKind::SQLite, "PRAGMA recursive_triggers = 0;"),
+            (DialectKind::SQLite, "PRAGMA writable_schema = 1;"),
+            (
+                DialectKind::PostgreSql,
+                "SET session_replication_role = replica;",
+            ),
+            (DialectKind::PostgreSql, "RESET session_replication_role;"),
+            (DialectKind::PostgreSql, "RESET ALL;"),
+            (DialectKind::PostgreSql, "SET search_path TO 42;"),
+            (DialectKind::SQLite, "PRAGMA foreign_keys = ?;"),
+            (
+                DialectKind::PostgreSql,
+                "SET TRANSACTION SNAPSHOT 'snapshot';",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "BEGIN ISOLATION LEVEL SERIALIZABLE;",
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(
+                facts(&units[0])
+                    .barriers
+                    .iter()
+                    .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -1699,7 +1743,7 @@ mod tests {
     #[test]
     fn sequence_literals_use_identifier_parsing() {
         let units = parse(
-            "SELECT nextval('tenant.\"MixedSeq\"');",
+            "SELECT pg_catalog.nextval('tenant.\"MixedSeq\"');",
             DialectKind::PostgreSql,
         )
         .unwrap();
@@ -1709,9 +1753,9 @@ mod tests {
         );
 
         for sql in [
-            "SELECT nextval('a\"b\"c');",
-            "SELECT nextval('foo bar.seq');",
-            "SELECT nextval('\"\"');",
+            "SELECT pg_catalog.nextval('a\"b\"c');",
+            "SELECT pg_catalog.nextval('foo bar.seq');",
+            "SELECT pg_catalog.nextval('\"\"');",
         ] {
             let units = parse(sql, DialectKind::PostgreSql).unwrap();
             assert!(
@@ -2008,19 +2052,125 @@ mod tests {
 
     #[test]
     fn nextval_writes_sequence_state() {
-        let units = parse("SELECT nextval('s');", DialectKind::PostgreSql).unwrap();
-        assert_eq!(sequences(facts(&units[0])), vec!["s".to_string()]);
+        for sql in [
+            "SELECT pg_catalog.nextval('s');",
+            "SELECT pg_catalog.nextval('s'::regclass);",
+            "SELECT pg_catalog.nextval(CAST(('s') AS TEXT));",
+            "SELECT pg_catalog.setval('s', 42);",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert_eq!(sequences(facts(&units[0])), vec!["s".to_string()], "{sql}");
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
 
         let units = parse("SELECT s.NEXTVAL FROM DUAL;", DialectKind::Oracle).unwrap();
         assert_eq!(sequences(facts(&units[0])), vec!["S".to_string()]);
     }
 
     #[test]
+    fn sequence_state_reads_and_unknown_calls_are_preserved() {
+        for (dialect, sql, name) in [
+            (
+                DialectKind::PostgreSql,
+                "SELECT pg_catalog.currval('s'::regclass);",
+                "s",
+            ),
+            (DialectKind::Oracle, "SELECT s.CURRVAL FROM DUAL;", "S"),
+            (DialectKind::Snowflake, "SELECT s.CURRVAL;", "S"),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(sequences(facts(&units[0])).is_empty(), "{sql}");
+            assert!(
+                relation_reads(facts(&units[0])).contains(&name.to_string()),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT pg_catalog.nextval(seq_name) FROM seqs;",
+            "SELECT pg_catalog.nextval(seqs.seq_name) FROM seqs;",
+            "SELECT pg_catalog.nextval(seq_name::regclass) FROM seqs;",
+            "SELECT pg_catalog.setval(seq_name::regclass, 42) FROM seqs;",
+            "SELECT pg_catalog.currval(seq_name) FROM seqs;",
+            "SELECT pg_catalog.lastval();",
+            "SELECT pg_catalog.nextval('long_seq'::varchar(1));",
+            "SELECT pg_catalog.nextval('s'::custom_type);",
+            "SELECT nextval('s');",
+            "SELECT currval('s');",
+            "SELECT setval('s', 42);",
+            "SELECT tenant.nextval('s');",
+            "SELECT \"NEXTVAL\"('s');",
+            "SELECT mutate_t();",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            let facts = facts(&units[0]);
+            assert!(sequences(facts).is_empty(), "{sql}");
+            assert!(
+                facts
+                    .barriers
+                    .iter()
+                    .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
+                "{sql}"
+            );
+        }
+        for dialect in [DialectKind::Oracle, DialectKind::Snowflake] {
+            for sql in [
+                "SELECT s.\"NEXTVAL\" FROM s;",
+                "SELECT s.\"currval\" FROM s;",
+            ] {
+                let units = parse(sql, dialect).unwrap();
+                let facts = facts(&units[0]);
+                assert!(sequences(facts).is_empty(), "{sql}");
+                assert!(
+                    facts
+                        .barriers
+                        .iter()
+                        .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_functions_are_opaque_but_plain_explain_does_not_execute_them() {
+        for sql in [
+            "CREATE TABLE t (id BIGINT DEFAULT pg_catalog.nextval('s'));",
+            "CREATE VIEW v AS SELECT pg_catalog.nextval('s');",
+            "CREATE VIEW v AS SELECT mutate_t();",
+            "ALTER TABLE t ALTER COLUMN id SET DEFAULT pg_catalog.nextval('s');",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            let facts = facts(&units[0]);
+            assert!(sequences(facts).is_empty(), "{sql}");
+            assert!(
+                facts
+                    .barriers
+                    .iter()
+                    .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
+                "{sql}"
+            );
+        }
+        let units = parse("EXPLAIN SELECT mutate_t();", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        let units = parse(
+            "EXPLAIN ANALYZE SELECT mutate_t();",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(
+            facts(&units[0])
+                .barriers
+                .iter()
+                .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) })
+        );
+    }
+
+    #[test]
     fn sequence_state_advances_only_for_evaluated_ddl() {
         for sql in [
-            "CREATE MATERIALIZED VIEW mv AS SELECT nextval('s');",
-            "CREATE TABLE t AS SELECT nextval('s');",
-            "ALTER TABLE t ADD COLUMN c INT DEFAULT nextval('s');",
+            "CREATE MATERIALIZED VIEW mv AS SELECT pg_catalog.nextval('s');",
+            "CREATE TABLE t AS SELECT pg_catalog.nextval('s');",
+            "ALTER TABLE t ADD COLUMN c INT DEFAULT pg_catalog.nextval('s');",
         ] {
             let units = parse(sql, DialectKind::PostgreSql).unwrap();
             assert_eq!(
@@ -2031,9 +2181,9 @@ mod tests {
         }
 
         for sql in [
-            "CREATE VIEW v AS SELECT nextval('s');",
-            "CREATE TABLE t AS SELECT nextval('s') WITH NO DATA;",
-            "ALTER TABLE t ALTER COLUMN c SET DEFAULT nextval('s');",
+            "CREATE VIEW v AS SELECT pg_catalog.nextval('s');",
+            "CREATE TABLE t AS SELECT pg_catalog.nextval('s') WITH NO DATA;",
+            "ALTER TABLE t ALTER COLUMN c SET DEFAULT pg_catalog.nextval('s');",
         ] {
             let units = parse(sql, DialectKind::PostgreSql).unwrap();
             assert!(

@@ -283,7 +283,7 @@ def main():
         try:
             return (oracle if sys.argv[1] == "oracle" else reset)(sys.argv[2])
         except Exception as exc:
-            print(f"OCCAM_INFRASTRUCTURE: study {sys.argv[1]}: {exc}", file=sys.stderr)
+            print(f"study {sys.argv[1]}: {exc}", file=sys.stderr)
             return 125
     import argparse
     import math

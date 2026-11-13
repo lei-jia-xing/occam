@@ -30,6 +30,7 @@ tests =
                     [ ("cat >/dev/null; printf '{opaque output'; exit 0", True)
                     , ("exit 1", False)
                     , ("exit 139", False)
+                    , ("exit 125", False)
                     , ("kill -TERM $$", False)
                     ]
           , testCase "initial SQL must satisfy the same predicate before reduction" $ do
@@ -73,6 +74,18 @@ posixTests =
                     assertBool
                         "total elapsed time is shorter than its measured components"
                         (totalElapsedMicros details >= resetElapsedMicros details + oracleMicros)
+        , testCase "predicates may close stdin early without changing their exit verdict" $
+            mapM_
+                ( \(exitStatus, expected) -> do
+                    let command = "exec 0<&-; sleep 0.05; exit " ++ exitStatus
+                        cfg = OracleConfig "sh" ["-c", command] 2000000 Nothing
+                        input = BS.replicate (4 * 1024 * 1024) 120
+                    observation <- observeExternalOracle cfg input
+                    assertEqual "early stdin closure must preserve the predicate exit" expected observation
+                )
+                [ ("0", OracleFinished ExitSuccess)
+                , ("1", OracleFinished (ExitFailure 1))
+                ]
         , testCase "large binary output is drained and bounded while stdin is written" $ do
             let command =
                     "import sys; sys.stdout.buffer.write(b'{'*3145728); sys.stdout.flush(); sys.stderr.buffer.write(b'x'*3145728); sys.stderr.flush(); data=sys.stdin.buffer.read(); sys.exit(0 if data == bytes(range(256))*4096 else 1)"
@@ -81,17 +94,6 @@ posixTests =
             details <- observeExternalOracleDetailed cfg input
             assertEqual "output parsing, pipe deadlock, or input corruption changed the predicate" (OracleFinished ExitSuccess) (detailedObservation details)
             assertBool "oracle process start was not counted" (isJust (oracleElapsedMicros details))
-        , testCase "late infrastructure diagnostics remain visible after bounded output" $ do
-            let command =
-                    "import sys,time; s=sys.stdout.buffer; s.write(b'x'*2097152); s.flush(); "
-                        ++ "s.write(b'OCCAM_INFRA'); s.flush(); time.sleep(0.05); "
-                        ++ "s.write(b'STRUCTURE: late diagnostic\\n'); s.flush()"
-                cfg = OracleConfig "python3" ["-c", command] 5000000 Nothing
-            details <- observeExternalOracleDetailed cfg BS.empty
-            assertEqual
-                "late marker must remain an infrastructure error"
-                InfrastructureError
-                (classifyOracleObservation (detailedObservation details))
         , testCase "relative commands retain caller paths and each candidate gets fresh state" $ do
             let reset = "test \"$PWD\" = \"$OCCAM_ORIGINAL_CWD\" && : > \"$OCCAM_WORKDIR/reset.ready\""
                 command =

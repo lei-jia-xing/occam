@@ -182,7 +182,7 @@ def read_jsonl_since(path: Path, offset: int) -> list[dict[str, Any]]:
 
 
 def run_exit_oracle(oracle: str, candidate: Path, cwd: Path, deadline: float,
-                    call_timeout: float, audit_file: Path) -> tuple[bool | None, float, str | None]:
+                    call_timeout: float, audit_file: Path) -> tuple[str, float, str | None]:
     try:
         audit_offset = audit_file.stat().st_size
     except OSError:
@@ -190,24 +190,28 @@ def run_exit_oracle(oracle: str, candidate: Path, cwd: Path, deadline: float,
     command = ["bash", "-c", "exec " + oracle + ' "$1"', "oracle", str(candidate.resolve())]
     outcome = command_result(command, cwd, deadline, call_timeout, allow_nonzero=True)
     if outcome["status"] == "timeout":
-        return None, outcome["elapsed"], "oracle call timed out"
+        return "timeout", outcome["elapsed"], "oracle call timed out"
     if outcome["status"] == "tool-error":
-        return None, outcome["elapsed"], outcome["stderr"] or "oracle invocation failed"
+        return "tool-error", outcome["elapsed"], outcome["stderr"] or "oracle invocation failed"
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
     wrapper_record = next(
-        (row for row in reversed(read_jsonl_since(audit_file, audit_offset)) if row.get("phase") == "validation"),
+        (row for row in reversed(read_jsonl_since(audit_file, audit_offset))
+         if row.get("phase") == "validation"
+         and row.get("digest") == digest),
         None,
     )
-    if wrapper_record is not None:
-        if wrapper_record.get("status") == "timeout":
-            return None, outcome["elapsed"], "oracle call timed out"
-        if wrapper_record.get("status") == "interrupted":
-            return None, outcome["elapsed"], "oracle call interrupted"
-        if wrapper_record.get("status") == "tool-error":
-            return None, outcome["elapsed"], outcome["stderr"] or "oracle infrastructure failure"
-    if "OCCAM_INFRASTRUCTURE:" in outcome["stdout"] or "OCCAM_INFRASTRUCTURE:" in outcome["stderr"]:
-        return None, outcome["elapsed"], outcome["stderr"] or outcome["stdout"] or "oracle infrastructure failure"
-    return outcome["returncode"] == 0, outcome["elapsed"], (
-        None if outcome["returncode"] == 0 else "configured exit-code oracle rejected the candidate"
+    if wrapper_record is None or wrapper_record.get("status") not in {
+        "accepted", "rejected", "timeout", "interrupted", "tool-error"
+    }:
+        return "tool-error", outcome["elapsed"], "predicate wrapper audit is missing or unrecognized"
+    if wrapper_record["status"] == "timeout":
+        return "timeout", outcome["elapsed"], "oracle call timed out"
+    if wrapper_record["status"] == "interrupted":
+        return "timeout", outcome["elapsed"], "oracle call interrupted"
+    if wrapper_record["status"] == "tool-error":
+        return "tool-error", outcome["elapsed"], outcome["stderr"] or "oracle infrastructure failure"
+    return wrapper_record["status"], outcome["elapsed"], (
+        None if wrapper_record["status"] == "accepted" else "configured exit-code oracle rejected the candidate"
     )
 
 
@@ -523,14 +527,14 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         root, str(raw_oracle), audit_file, oracle_timeout, scenario, reset_command, "validation"
     )
 
-    valid, validation_elapsed, validation_error = run_exit_oracle(
+    validation_status, validation_elapsed, validation_error = run_exit_oracle(
         validation_oracle, source_file, root, deadline, oracle_timeout, audit_file)
 
     validation_calls += 1
     validation_time += validation_elapsed
-    if valid is None:
+    if validation_status in {"timeout", "tool-error"}:
         record.update({
-            "status": "timeout" if "timed out" in (validation_error or "") or "budget" in (validation_error or "") else "tool-error",
+            "status": validation_status,
             "status_reason": validation_error,
             "validation_calls": validation_calls,
             "validation_time_sec": round(validation_time, 4),
@@ -539,7 +543,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         })
         set_no_reducer_reset_metrics(record, reset_configured)
         return record
-    if not valid:
+    if validation_status == "rejected":
         record.update({
             "status": "invalid-result",
             "status_reason": "input did not satisfy its configured oracle",
@@ -578,7 +582,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             str(binaries[tool]), str(source_file), "--oracle", reducer_oracle, "--out", str(tool_dir),
             "--timeout", str(oracle_timeout), "--budget", str(remaining),
         ]
-        command += ["--dialect", dialect_key if dialect_key in {"postgres", "mysql", "sqlite"} else "generic"]
+        command += ["--dialect", dialect_key]
         if max_oracle_executions is not None:
             command += ["--max-oracle-executions", str(max_oracle_executions)]
         if tool == "ddmin":
@@ -747,7 +751,29 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         outcome["status"] = "tool-error"
         outcome["status_reason"] = "reducer exited successfully without its required SQL output"
 
-    if tool in {"occam", "ddmin"} and candidate_path and candidate_path.is_file():
+    audit_records = read_jsonl(audit_file)
+    native_rows = [row for row in audit_records if row.get("phase") == "reducer"]
+    native_inconclusive = [
+        row for row in native_rows
+        if tool in {"occam", "ddmin"} and row.get("status") in {"timeout", "interrupted", "tool-error"}
+    ]
+    if native_inconclusive:
+        failed = any(row.get("status") == "tool-error" for row in native_inconclusive)
+        outcome.update({
+            "status": "tool-error" if failed else "timeout",
+            "status_reason": "native predicate wrapper reported an inconclusive observation",
+        })
+
+    native_audit_complete = (
+        native_profile_fresh
+        and internal_expected_rows is not None
+        and len(native_rows) == internal_expected_rows
+        and all(row.get("status") in {"accepted", "rejected"} for row in native_rows)
+    )
+    if tool in {"occam", "ddmin"} and outcome["status"] == "completed" and not native_audit_complete:
+        outcome.update({"status": "tool-error", "status_reason": "native predicate audit is incomplete"})
+
+    if tool in {"occam", "ddmin"} and native_audit_complete and candidate_path and candidate_path.is_file():
         shutil.copyfile(candidate_path, checkpoint)
 
     call_records = read_jsonl(calls_file)
@@ -756,25 +782,27 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
             outcome.update({"status": "execution-budget", "status_reason": "max oracle executions reached"})
         elif any(row.get("status") == "tool-error" for row in call_records):
             outcome.update({"status": "tool-error", "status_reason": "predicate infrastructure failure"})
+        elif any(row.get("status") == "timeout" for row in call_records):
+            outcome.update({"status": "timeout", "status_reason": "predicate call timed out"})
 
     tool_status = outcome["status"]
     if tool_status == "completed" and outcome["returncode"] == 0:
         candidate_bytes = candidate_path.read_bytes() if candidate_path and candidate_path.is_file() else original
         candidate.write_bytes(candidate_bytes)
-        valid, final_validation_elapsed, validation_error = run_exit_oracle(
+        validation_status, final_validation_elapsed, validation_error = run_exit_oracle(
             validation_oracle, candidate, root, deadline, oracle_timeout, audit_file)
         validation_calls += 1
         validation_time += final_validation_elapsed
-        if valid is True:
+        if validation_status == "accepted":
             record.update({
                 "status": "completed",
                 "tool_candidate_valid": True,
                 "predicate_passed": True,
                 "checkpoint_used": "tool-result",
             })
-        elif valid is None:
+        elif validation_status in {"timeout", "tool-error"}:
             record.update({
-                "status": "timeout" if "timed out" in (validation_error or "") or "budget" in (validation_error or "") else "tool-error",
+                "status": validation_status,
                 "status_reason": validation_error,
                 "tool_candidate_valid": None,
                 "predicate_passed": None,

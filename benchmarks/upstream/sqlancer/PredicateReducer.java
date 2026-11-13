@@ -370,7 +370,7 @@ public final class PredicateReducer {
                         writeCandidate(output, state.getState().getStatements());
                     }
                 }
-                if (status.equals("timeout") && (checks == 0 || budgetExpired())) {
+                if (status.equals("timeout")) {
                     stopCode = 124;
                 }
                 return status.equals("accepted");

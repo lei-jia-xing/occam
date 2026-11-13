@@ -4141,23 +4141,25 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
                 priorState
                 [GlobalBarrierKey, SessionBarrierKey, TransactionBarrierKey]
         touchDeps = lastBarrierDeps priorState touchedKeys
+        hasGlobalFence = Map.member GlobalBarrierKey (scanLastBarriers priorState)
         declaredDeps =
             Set.unions
                 [ if key == GlobalBarrierKey
-                    then scanPriorStatements priorState
+                    then if hasGlobalFence then Set.empty else scanPriorStatements priorState
                     else touchersForBarrier priorState key
                 | key <- barrierKeys
                 ]
-        hasGlobal = any ((== GlobalScope) . barrierScope) declared
-        globalDeps = if hasGlobal then scanPriorStatements priorState else Set.empty
         barrierDeps =
-            Set.unions [baseDeps, touchDeps, declaredDeps, globalDeps]
+            Set.unions [baseDeps, touchDeps, declaredDeps]
         objectDeps = evalDeps eval
         allDeps = Set.delete sid (Set.union objectDeps barrierDeps)
         barrierEdges =
             Set.size (Set.delete sid (Set.difference barrierDeps objectDeps))
         sessionKeys = [SessionBarrierKey | sessionTouched]
-        registrationKeys = barrierKeys ++ sessionKeys
+        -- NOTE: unknown effects serialize the remaining script; recover
+        -- precision only when those effects can be represented in the catalog.
+        inheritedGlobal = [GlobalBarrierKey | hasGlobalFence]
+        registrationKeys = barrierKeys ++ sessionKeys ++ inheritedGlobal
         lastBarriers =
             foldl'
                 (\current key -> Map.insert key sid current)

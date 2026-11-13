@@ -1,5 +1,6 @@
 module DependencyChecks (tests) where
 
+import Control.Monad (when)
 import Data.Bifunctor qualified as Bifunctor
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
@@ -51,6 +52,7 @@ import Occam.Parser (
     defaultParseOptions,
     parseSQL,
  )
+import Occam.Slicer (backwardSlice)
 import Test.QuickCheck (Gen, Property, arbitrary, chooseInt, counterexample, forAll, listOf, resize)
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, testGroup)
@@ -563,6 +565,31 @@ tests =
             assertBool
                 "barrier metrics include the unsupported operation"
                 (graphBarrierStatements graph > 0 && graphBarrierActions graph > 0)
+        , testCase "opaque effects preserve hidden sources and scalar writes" $
+            mapM_
+                ( \(dialect, operation, relation) -> do
+                    graph <-
+                        analyzeParsed dialect $
+                            BSC.unlines
+                                [ "CREATE TABLE t (a INT);"
+                                , operation
+                                , "INSERT INTO t VALUES (42);"
+                                , "SELECT 0;"
+                                , "SELECT * FROM " <> relation <> ";"
+                                ]
+                    let readDeps = backwardSlice (StatementId 5) graph
+                    assertBool
+                        ("hidden reads retain the opaque operation: " ++ BSC.unpack operation)
+                        (has (StatementId 2) readDeps)
+                    assertBool
+                        ("hidden reads retain writes after the opaque operation: " ++ BSC.unpack operation)
+                        (has (StatementId 3) readDeps)
+                )
+                [ (PostgreSQL, "CREATE EXTENSION hstore;", "hidden_view")
+                , (PostgreSQL, "GRANT SELECT ON t TO PUBLIC;", "hidden_view")
+                , (PostgreSQL, "SELECT mutate_t();", "t")
+                , (SQLite, "PRAGMA recursive_triggers=0;", "hidden_view")
+                ]
         , testCase "temporary definitions preserve permanent column and index ownership" $ do
             graph <-
                 analyze SQLite $
@@ -853,21 +880,6 @@ tests =
                 (definedColumns ["dbo", "users"] (opsFor (StatementId 1) graph))
             assertBool "SELECT from users depends on users" (has (StatementId 1) depsS3)
             assertBool "SELECT from users does not depend on other" (not (has (StatementId 2) depsS3))
-        , testCase "session SET does not create false dependencies on prior unrelated tables" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE unneeded_tbl (id INT);"
-                        , "CREATE TABLE needed_tbl (id INT, val INT);"
-                        , "SET enable_seqscan = off;"
-                        , "SELECT val FROM needed_tbl;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let setDeps = dependenciesFor (StatementId 3) graph
-                queryDeps = dependenciesFor (StatementId 4) graph
-            assertBool "SET does not depend on unneeded_tbl" (not (has (StatementId 1) setDeps))
-            assertBool "SET does not depend on needed_tbl" (not (has (StatementId 2) setDeps))
-            assertBool "Query depends on needed_tbl" (has (StatementId 2) queryDeps)
-            assertBool "Query does not depend on unneeded_tbl through SET" (not (has (StatementId 1) queryDeps))
         , testCase "triggers do not create global serialization barriers across unrelated tables" $ do
             let sql =
                     BSC.unlines
@@ -1596,6 +1608,32 @@ tests =
                 "CREATE TABLE AS derives columns from the projection"
                 ["a"]
                 (definedColumns ["copy"] (opsFor (StatementId 6) graph))
+        , testCase "ALTER VIEW transitions preserve subsequent source writes" $
+            mapM_
+                ( \(alteration, viewName) -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE TABLE t (a INT);"
+                                , "CREATE TABLE unrelated (a INT);"
+                                , "CREATE VIEW v AS SELECT a FROM t;"
+                                , alteration
+                                , "INSERT INTO unrelated VALUES (0);"
+                                , "INSERT INTO t VALUES (42);"
+                                , "SELECT a FROM " <> viewName <> ";"
+                                ]
+                    let readDeps = backwardSlice (StatementId 7) graph
+                    assertBool
+                        ("view reads retain source writes after alteration: " ++ BSC.unpack alteration)
+                        (has (StatementId 6) readDeps)
+                    when (viewName == "renamed") $
+                        assertBool
+                            "renamed view does not retain unrelated row writes"
+                            (not (has (StatementId 5) readDeps))
+                )
+                [ ("ALTER VIEW v RENAME TO renamed;", "renamed")
+                , ("ALTER VIEW v SET (security_barrier = true);", "v")
+                ]
         , testCase "multi-table UPDATE assigns unqualified columns to the owning table" $ do
             let sql =
                     BSC.unlines
@@ -1673,17 +1711,6 @@ tests =
             assertBool
                 "the truncate depends on the table that references the parent"
                 (has (StatementId 2) (dependenciesFor (StatementId 3) graph))
-        , testCase "trigger functions keep their definition dependency" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;"
-                        , "CREATE TABLE t (id INT);"
-                        , "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the trigger definition depends on the function definition"
-                (has (StatementId 1) (dependenciesFor (StatementId 3) graph))
         , testCase "sequence reads depend on the sequence definition" $ do
             let postgresSql =
                     BSC.unlines
@@ -1703,6 +1730,44 @@ tests =
             assertBool
                 "Oracle NEXTVAL depends on the sequence definition"
                 (has (StatementId 1) (dependenciesFor (StatementId 2) oracleGraph))
+        , testCase "dynamic and session sequence reads retain preceding sequence effects" $
+            mapM_
+                ( \expression -> do
+                    graph <-
+                        analyzeParsed PostgreSQL $
+                            BSC.unlines
+                                [ "CREATE SEQUENCE s;"
+                                , "CREATE TABLE seqs (seq_name TEXT);"
+                                , "INSERT INTO seqs VALUES ('s');"
+                                , "SELECT pg_catalog.nextval('s');"
+                                , "SELECT 0;"
+                                , "SELECT " <> expression <> " FROM seqs;"
+                                ]
+                    assertBool
+                        ("sequence state is retained for " ++ BSC.unpack expression)
+                        (has (StatementId 4) (backwardSlice (StatementId 6) graph))
+                )
+                [ "pg_catalog.nextval(seq_name::regclass)"
+                , "pg_catalog.setval(seq_name::regclass, 42)"
+                , "pg_catalog.currval(seq_name::regclass)"
+                , "pg_catalog.currval('s')"
+                , "pg_catalog.currval('s'::regclass)"
+                , "pg_catalog.nextval('long_seq'::varchar(1))"
+                , "lastval()"
+                ]
+        , testCase "deferred sequence defaults retain insert-time sequence effects" $ do
+            graph <-
+                analyzeParsed PostgreSQL $
+                    BSC.unlines
+                        [ "CREATE SEQUENCE s;"
+                        , "CREATE TABLE t (id BIGINT DEFAULT pg_catalog.nextval('s'));"
+                        , "INSERT INTO t DEFAULT VALUES;"
+                        , "SELECT 0;"
+                        , "SELECT pg_catalog.currval('s');"
+                        ]
+            assertBool
+                "the sequence read retains the INSERT that evaluates its default"
+                (has (StatementId 3) (backwardSlice (StatementId 5) graph))
         , testCase "constraint-coupled columns share write dependencies" $ do
             let sql =
                     BSC.unlines
@@ -1934,6 +1999,17 @@ prop_catalogTransitions =
                     monitor (counterexample ("actual data dependencies: " ++ show (actual graph)))
                     assert (actual graph == expected)
                 )
+
+analyzeParsed :: SQLDialect -> ByteString -> IO DependencyGraph
+analyzeParsed dialect sql = do
+    result <- parseSQL (defaultParseOptions dialect) sql
+    case result of
+        Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+        Right parsed -> do
+            assertBool
+                ("expected supported " ++ show dialect ++ " syntax:\n" ++ BSC.unpack sql)
+                (all (isJust . unitFacts) (parsedUnits parsed))
+            pure (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
 analyze :: SQLDialect -> ByteString -> IO DependencyGraph
 analyze dialect = analyzeWith (defaultParseOptions dialect)

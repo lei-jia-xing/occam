@@ -90,9 +90,7 @@ def main():
                 terminate_checker()
         checks += 1
         if result == 124:
-            if checks <= 2 or time.monotonic() >= args.deadline:
-                raise ReductionStopped(124, "initial predicate or total tool budget timed out")
-            return "rejected"
+            raise ReductionStopped(124, "predicate call timed out")
         if result in {125, 126}:
             raise ReductionStopped(result, "predicate infrastructure failure" if result == 125 else "max oracle executions reached")
         if result not in {0, 1}:

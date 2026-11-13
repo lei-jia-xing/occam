@@ -225,10 +225,7 @@ fn literal_relation_name(value: &str, rules: &ir::IdentifierRules) -> Option<ir:
     Some(ir::Name(parts))
 }
 
-pub(super) fn sequence_ref_from_expr(
-    expr: &Expr,
-    rules: &ir::IdentifierRules,
-) -> Option<ir::NameRef> {
+fn sequence_ref_from_expr(expr: &Expr, rules: &ir::IdentifierRules) -> Option<ir::NameRef> {
     match expr {
         Expr::Value(value) => match &value.value {
             Value::SingleQuotedString(name)
@@ -236,114 +233,123 @@ pub(super) fn sequence_ref_from_expr(
             | Value::EscapedStringLiteral(name) => {
                 literal_relation_name(name, rules).map(|name| ir::NameRef { name, temp: false })
             }
-            Value::DoubleQuotedString(name) | Value::TripleDoubleQuotedString(name) => {
-                let ident = Ident::with_quote('"', name);
-                Some(ir::NameRef {
-                    name: ir::Name(vec![canonical_ident(
-                        &ident,
-                        rules,
-                        ir::IdentifierClass::Relation,
-                    )]),
-                    temp: false,
-                })
-            }
             _ => None,
         },
-        Expr::Identifier(ident) => Some(ir::NameRef {
-            name: ir::Name(vec![canonical_ident(
-                ident,
-                rules,
-                ir::IdentifierClass::Relation,
-            )]),
-            temp: false,
-        }),
-        Expr::CompoundIdentifier(idents) if !idents.is_empty() => Some(ir::NameRef {
-            name: ir::Name(
-                idents
-                    .iter()
-                    .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Relation))
-                    .collect(),
-            ),
-            temp: false,
-        }),
-        Expr::Cast { expr, .. } | Expr::Nested(expr) => sequence_ref_from_expr(expr, rules),
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type: DataType::Regclass | DataType::Text,
+            format: None,
+        }
+        | Expr::Nested(expr) => sequence_ref_from_expr(expr, rules),
         _ => None,
     }
 }
 
-pub(super) fn sequence_function_ref(
+pub(super) enum SequenceEffect {
+    Write(ir::NameRef),
+    Read(ir::NameRef),
+    Unknown,
+}
+
+fn sequence_function_effect(
     function: &Function,
     rules: &ir::IdentifierRules,
-) -> Option<ir::NameRef> {
-    let name = match function.name.0.last()? {
+) -> Option<SequenceEffect> {
+    let ident = match function.name.0.last()? {
         ObjectNamePart::Identifier(ident) => ident,
         ObjectNamePart::Function(_) => return None,
     };
-    if !matches!(
-        name.value.to_ascii_lowercase().as_str(),
-        "nextval" | "setval"
-    ) {
-        return None;
+    let name = ["nextval", "setval", "currval", "lastval"]
+        .into_iter()
+        .find(|name| ident.value.eq_ignore_ascii_case(name))?;
+    // Only explicit pg_catalog qualification and the builtin spelling prove
+    // meaning; unqualified names may resolve to user-defined overloads.
+    let builtin_ident = |ident: &Ident, expected: &str| {
+        if ident.quote_style.is_some() {
+            ident.value == expected
+        } else {
+            ident.value.eq_ignore_ascii_case(expected)
+        }
+    };
+    let builtin = builtin_ident(ident, name)
+        && match function.name.0.as_slice() {
+            [ObjectNamePart::Identifier(schema), _] => builtin_ident(schema, "pg_catalog"),
+            _ => false,
+        };
+    if !builtin {
+        return Some(SequenceEffect::Unknown);
     }
     let arguments = match &function.args {
-        FunctionArguments::List(list) => &list.args,
-        FunctionArguments::None | FunctionArguments::Subquery(_) => return None,
-    };
-    let argument = match arguments.first()? {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-        | FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(expr),
-            ..
+        FunctionArguments::List(list)
+            if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
+        {
+            &list.args
         }
-        | FunctionArg::ExprNamed {
-            arg: FunctionArgExpr::Expr(expr),
-            ..
-        } => expr,
-        _ => return None,
+        _ => return Some(SequenceEffect::Unknown),
     };
-    sequence_ref_from_expr(argument, rules)
+    let valid_arity = match name {
+        "nextval" | "currval" => arguments.len() == 1,
+        "setval" => matches!(arguments.len(), 2 | 3),
+        // lastval depends on whichever sequence last advanced in this session.
+        _ => false,
+    };
+    if !valid_arity {
+        return Some(SequenceEffect::Unknown);
+    }
+    let reference = match &arguments[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => sequence_ref_from_expr(expr, rules),
+        _ => None,
+    };
+    Some(match reference {
+        Some(reference) if name == "currval" => SequenceEffect::Read(reference),
+        Some(reference) => SequenceEffect::Write(reference),
+        None => SequenceEffect::Unknown,
+    })
 }
 
-/// Oracle exposes sequence state through `seq.NEXTVAL` rather than a function.
-pub(super) fn sequence_nextval_ref(
-    idents: &[Ident],
-    rules: &ir::IdentifierRules,
-) -> Option<ir::NameRef> {
+/// Oracle and Snowflake expose sequence state through `seq.NEXTVAL` /
+/// `seq.CURRVAL` rather than PostgreSQL's functions.
+fn sequence_member_effect(idents: &[Ident], rules: &ir::IdentifierRules) -> Option<SequenceEffect> {
     let (last, name) = idents.split_last()?;
-    if !last.value.eq_ignore_ascii_case("nextval") || name.is_empty() {
+    if !(last.value.eq_ignore_ascii_case("nextval") || last.value.eq_ignore_ascii_case("currval"))
+        || name.is_empty()
+    {
         return None;
     }
-    Some(ir::NameRef {
+    if last.quote_style.is_some() {
+        return Some(SequenceEffect::Unknown);
+    }
+    let reference = ir::NameRef {
         name: ir::Name(
             name.iter()
                 .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Relation))
                 .collect(),
         ),
         temp: false,
+    };
+    Some(if last.value.eq_ignore_ascii_case("currval") {
+        SequenceEffect::Read(reference)
+    } else {
+        SequenceEffect::Write(reference)
     })
 }
 
-/// A sequence state change expressed by an evaluated expression. PostgreSQL
-/// and Redshift use `nextval`/`setval`; Oracle and Snowflake use
-/// `seq.NEXTVAL`.
-pub(super) fn sequence_expr_ref(
+pub(super) fn sequence_expr_effect(
     expr: &Expr,
     dialect: DialectKind,
     rules: &ir::IdentifierRules,
-) -> Option<ir::NameRef> {
+) -> Option<SequenceEffect> {
     match expr {
         Expr::CompoundIdentifier(idents)
             if matches!(dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
         {
-            sequence_nextval_ref(idents, rules)
+            sequence_member_effect(idents, rules)
         }
         Expr::Function(function)
-            if matches!(
-                dialect,
-                DialectKind::PostgreSql | DialectKind::Redshift | DialectKind::Generic
-            ) =>
+            if matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift) =>
         {
-            sequence_function_ref(function, rules)
+            sequence_function_effect(function, rules)
         }
         _ => None,
     }
@@ -425,14 +431,6 @@ fn relation_barrier(
     detail: Option<String>,
 ) -> ir::ScopedBarrier {
     barrier(ir::BarrierScope::Relation { relation }, reason, detail)
-}
-
-fn session_barrier(reason: ir::BarrierReason, detail: Option<String>) -> ir::ScopedBarrier {
-    barrier(ir::BarrierScope::SessionState, reason, detail)
-}
-
-fn transaction_barrier(reason: ir::BarrierReason, detail: Option<String>) -> ir::ScopedBarrier {
-    barrier(ir::BarrierScope::TransactionState, reason, detail)
 }
 
 fn read_fact(source: ir::NameRef, mode: ir::ReadMode, columns: Vec<ir::Ident>) -> ir::ReadFact {
@@ -1844,7 +1842,7 @@ fn set_effects(
     let Some(name) = name_from_object(variable, rules, ir::IdentifierClass::Other) else {
         return (
             Vec::new(),
-            vec![session_barrier(
+            vec![global_barrier(
                 ir::BarrierReason::UnknownSessionEffect,
                 Some(variable.to_string()),
             )],
@@ -1862,7 +1860,7 @@ fn set_effects(
             ),
             None => (
                 Vec::new(),
-                vec![session_barrier(
+                vec![global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,
                     Some("SET search_path with a non-name value".to_string()),
                 )],
@@ -1872,7 +1870,7 @@ fn set_effects(
             let Some(value) = values.first().and_then(expr_bool) else {
                 return (
                     Vec::new(),
-                    vec![session_barrier(
+                    vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some("SET foreign_keys with a non-boolean value".to_string()),
                     )],
@@ -1887,7 +1885,7 @@ fn set_effects(
             let Some(value) = values.first().and_then(expr_bool) else {
                 return (
                     Vec::new(),
-                    vec![session_barrier(
+                    vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some("SET autocommit with a non-boolean value".to_string()),
                     )],
@@ -2019,7 +2017,7 @@ fn set_statement_effects(
         Set::SetSessionParam(kind) => match kind {
             SetSessionParamKind::Generic(generic) => {
                 if generic.names.is_empty() {
-                    barriers.push(session_barrier(
+                    barriers.push(global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some("SET with no session parameter name".to_string()),
                     ));
@@ -2038,7 +2036,7 @@ fn set_statement_effects(
                 let Some(object) =
                     name_from_object(&identity.obj, rules, ir::IdentifierClass::Relation)
                 else {
-                    barriers.push(session_barrier(
+                    barriers.push(global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some(identity.obj.to_string()),
                     ));
@@ -2081,7 +2079,7 @@ fn set_statement_effects(
             session,
         } => {
             if snapshot.is_some() {
-                barriers.push(transaction_barrier(
+                barriers.push(global_barrier(
                     ir::BarrierReason::UnsupportedTransaction,
                     Some("SET TRANSACTION SNAPSHOT".to_string()),
                 ));
@@ -2114,7 +2112,7 @@ fn set_statement_effects(
                             transactions.push(ir::TxEffect::SetReadOnly { value: false });
                         }
                     }
-                    TransactionMode::IsolationLevel(level) => barriers.push(transaction_barrier(
+                    TransactionMode::IsolationLevel(level) => barriers.push(global_barrier(
                         ir::BarrierReason::UnsupportedTransaction,
                         Some(format!("ISOLATION LEVEL {level}")),
                     )),
@@ -2166,7 +2164,7 @@ fn reset_effects(
                 }
                 None => (
                     Vec::new(),
-                    vec![session_barrier(
+                    vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some(name.to_string()),
                     )],
@@ -2204,7 +2202,7 @@ fn use_effect(
                 ),
                 None => (
                     Vec::new(),
-                    vec![session_barrier(
+                    vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some(name.to_string()),
                     )],
@@ -2240,7 +2238,7 @@ fn use_effect(
         ),
         Use::SecondaryRoles(_) => (
             Vec::new(),
-            vec![session_barrier(
+            vec![global_barrier(
                 ir::BarrierReason::UnknownSessionEffect,
                 Some("USE SECONDARY ROLES".to_string()),
             )],
@@ -2455,8 +2453,7 @@ fn alter_change(
                 }
                 changes.push(ir::AlterChange::AddConstraint { constraint });
             } else {
-                barriers.push(relation_barrier(
-                    table.clone(),
+                barriers.push(global_barrier(
                     ir::BarrierReason::UnknownAlter,
                     Some(operation.to_string()),
                 ));
@@ -2521,8 +2518,7 @@ fn alter_change(
                     index_schema_placement: index_schema_placement(dialect),
                 }));
             } else {
-                barriers.push(relation_barrier(
-                    table.clone(),
+                barriers.push(global_barrier(
                     ir::BarrierReason::UnknownAlter,
                     Some(operation.to_string()),
                 ));
@@ -2538,8 +2534,7 @@ fn alter_change(
                 name: canonical_ident(name, rules, ir::IdentifierClass::Other),
             });
         }
-        _ => barriers.push(relation_barrier(
-            table.clone(),
+        _ => barriers.push(global_barrier(
             ir::BarrierReason::UnknownAlter,
             Some(operation.to_string()),
         )),
@@ -2547,19 +2542,16 @@ fn alter_change(
     (changes, ops, barriers)
 }
 
-/// Whether evaluating the statement advances a sequence. Definition-time
-/// expressions (`CREATE TABLE ... DEFAULT nextval(...)`, view definitions,
-/// index expressions) are not evaluated, so they do not write sequence state.
-/// Sequence state changes caused by evaluating a statement. Definition-time
+/// Sequence effects caused by evaluating a statement. Definition-time
 /// expressions (`CREATE TABLE ... DEFAULT nextval(...)`, view definitions,
 /// index expressions) are not evaluated. `ALTER TABLE ... ADD COLUMN ...
 /// DEFAULT` is evaluated for existing rows and therefore does advance the
 /// sequence; `ALTER COLUMN ... SET DEFAULT` does not.
-fn sequence_writes_for_statement(
+fn sequence_effects_for_statement<'a>(
     statement: &Statement,
     dialect: DialectKind,
-    rules: &ir::IdentifierRules,
-) -> Vec<ir::NameRef> {
+    rules: &'a ir::IdentifierRules,
+) -> SequenceVisitor<'a> {
     let mut visitor = SequenceVisitor::new(dialect, rules);
     match statement {
         Statement::Query(_)
@@ -2596,7 +2588,7 @@ fn sequence_writes_for_statement(
         }
         _ => {}
     }
-    visitor.writes
+    visitor
 }
 
 pub(super) fn analyze_statement(
@@ -2625,13 +2617,40 @@ pub(super) fn analyze_statement(
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
     let transactional = sequence_transactional(dialect);
-    for sequence in sequence_writes_for_statement(statement, dialect, rules) {
+    let sequences = sequence_effects_for_statement(statement, dialect, rules);
+    for sequence in sequences.writes {
         facts
             .ops
             .push(ir::CatalogOp::WriteSequence(ir::SequenceWrite {
                 sequence,
                 transactional,
             }));
+    }
+    for sequence in sequences.reads {
+        facts.ops.push(ir::CatalogOp::Read(read_fact(
+            sequence,
+            ir::ReadMode::Data,
+            Vec::new(),
+        )));
+    }
+    // Stored expressions are not propagated by the catalog model. Fence their
+    // later execution without pretending a definition executes them now.
+    let deferred_function = visitor.has_function
+        && !matches!(
+            statement,
+            Statement::Query(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Merge(_)
+                | Statement::Call(_)
+                | Statement::Explain { .. }
+        );
+    if sequences.unknown || deferred_function {
+        facts.barriers.push(global_barrier(
+            ir::BarrierReason::UnknownStatement,
+            Some("unmodeled routine or deferred expression effects".to_string()),
+        ));
     }
     if implicit_commit(dialect, statement) {
         // The statement runs in its own implicit transaction: close any active
@@ -2941,30 +2960,89 @@ pub(super) fn analyze_statement(
         }
         Statement::AlterView(alter_view) => {
             let view_name = &alter_view.name;
-            let columns = match &alter_view.operation {
-                sqlparser::ast::AlterViewOperation::As { columns, .. } => columns.clone(),
-                _ => Vec::new(),
-            };
-            let excluded = [view_name.span()];
-            let sources = visitor_reads(&visitor, &excluded, ir::ReadMode::Schema);
-            if let Some((name, temporary)) = definition_name(view_name, dialect, rules, false) {
-                facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
-                    name,
-                    temporary,
-                    materialized: alter_view.materialized,
-                    columns: columns
-                        .iter()
-                        .map(|column| canonical_ident(column, rules, ir::IdentifierClass::Column))
-                        .collect(),
-                    sources,
-                    if_not_exists: false,
-                    or_replace: true,
-                }));
-            } else {
-                facts.barriers.push(global_barrier(
+            match &alter_view.operation {
+                AlterViewOperation::As { columns, query, .. } => {
+                    let excluded = [view_name.span()];
+                    let sources = visitor_reads(&visitor, &excluded, ir::ReadMode::Schema);
+                    if let Some((name, temporary)) =
+                        definition_name(view_name, dialect, rules, false)
+                    {
+                        let columns = if columns.is_empty() {
+                            query_output_columns(query, rules).unwrap_or_default()
+                        } else {
+                            columns
+                                .iter()
+                                .map(|column| {
+                                    canonical_ident(column, rules, ir::IdentifierClass::Column)
+                                })
+                                .collect()
+                        };
+                        facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
+                            name,
+                            temporary,
+                            materialized: alter_view.materialized,
+                            columns,
+                            sources,
+                            if_not_exists: false,
+                            or_replace: true,
+                        }));
+                        add_unmodeled_barriers(&mut facts, &visitor, &excluded);
+                    } else {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownView,
+                            Some(statement.to_string()),
+                        ));
+                    }
+                }
+                AlterViewOperation::RenameTo { new_name } => {
+                    match (
+                        relation_ref(view_name, dialect, rules),
+                        name_from_object(new_name, rules, ir::IdentifierClass::Relation),
+                    ) {
+                        (Some(from), Some(to)) => {
+                            facts
+                                .ops
+                                .push(ir::CatalogOp::Rename(ir::RenameOp::Relation {
+                                    from,
+                                    to,
+                                    index_schema_placement: index_schema_placement(dialect),
+                                }))
+                        }
+                        _ => facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownView,
+                            Some(statement.to_string()),
+                        )),
+                    }
+                }
+                AlterViewOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                } => {
+                    if let Some(table) = relation_ref(view_name, dialect, rules) {
+                        facts.ops.push(ir::CatalogOp::Rename(ir::RenameOp::Column {
+                            table,
+                            from: canonical_ident(
+                                old_column_name,
+                                rules,
+                                ir::IdentifierClass::Column,
+                            ),
+                            to: canonical_ident(
+                                new_column_name,
+                                rules,
+                                ir::IdentifierClass::Column,
+                            ),
+                        }));
+                    } else {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownView,
+                            Some(statement.to_string()),
+                        ));
+                    }
+                }
+                _ => facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownView,
                     Some(statement.to_string()),
-                ));
+                )),
             }
         }
         Statement::Insert(insert) => {
@@ -3122,11 +3200,7 @@ pub(super) fn analyze_statement(
                             reads: Vec::new(),
                         }));
                     }
-                    None => facts.barriers.push(relation_barrier(
-                        ir::NameRef {
-                            name: ir::Name(vec![ir::Ident(table.name.to_string())]),
-                            temp: false,
-                        },
+                    None => facts.barriers.push(global_barrier(
                         ir::BarrierReason::UnknownTruncate,
                         Some(table.to_string()),
                     )),
@@ -3169,14 +3243,14 @@ pub(super) fn analyze_statement(
                                 value,
                             });
                         }
-                        None => facts.barriers.push(session_barrier(
+                        None => facts.barriers.push(global_barrier(
                             ir::BarrierReason::UnknownSessionEffect,
                             Some(statement.to_string()),
                         )),
                     }
                 }
             } else {
-                facts.barriers.push(session_barrier(
+                facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,
                     Some(statement.to_string()),
                 ));
@@ -3200,7 +3274,7 @@ pub(super) fn analyze_statement(
                                 .post_tx
                                 .push(ir::TxEffect::SetReadOnly { value: false });
                         } else {
-                            facts.barriers.push(transaction_barrier(
+                            facts.barriers.push(global_barrier(
                                 ir::BarrierReason::UnsupportedTransaction,
                                 Some(mode.to_string()),
                             ));
@@ -3336,18 +3410,25 @@ pub(super) fn analyze_statement(
                 )),
             }
         }
-        Statement::Comment { .. }
-        | Statement::Grant { .. }
-        | Statement::Revoke { .. }
-        | Statement::Analyze { .. }
-        | Statement::Vacuum(_)
-        | Statement::Lock(_)
-        | Statement::LockTables { .. }
-        | Statement::UnlockTables => {}
         _ => facts.barriers.push(global_barrier(
             ir::BarrierReason::UnknownStatement,
             Some(statement.to_string()),
         )),
+    }
+    // Generic variables are recorded, but their effects on parsing, writes,
+    // triggers, and transaction behavior are not represented by the catalog.
+    if facts.session.iter().any(|effect| {
+        matches!(
+            effect,
+            ir::SessionEffect::SetVariable { .. }
+                | ir::SessionEffect::ResetVariable { .. }
+                | ir::SessionEffect::ResetAll { .. }
+        )
+    }) {
+        facts.barriers.push(global_barrier(
+            ir::BarrierReason::UnknownSessionEffect,
+            Some("unmodeled session variable effects".to_string()),
+        ));
     }
     // A sequence can be referenced from both the outer statement and a nested
     // DML statement that is analyzed separately (for example a data-modifying

@@ -125,10 +125,7 @@ def main() -> int:
             )
             try:
                 stdout, stderr = process.communicate(timeout=min(args.timeout, remaining))
-                if "OCCAM_INFRASTRUCTURE:" in stdout or "OCCAM_INFRASTRUCTURE:" in stderr:
-                    status = "tool-error"
-                else:
-                    status = "accepted" if process.returncode == 0 else "rejected"
+                status = "accepted" if process.returncode == 0 else "rejected"
             except (subprocess.TimeoutExpired, InterruptedError) as exc:
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 stdout = (getattr(exc, "stdout", None) or b"")
@@ -147,14 +144,18 @@ def main() -> int:
                 (
                     row
                     for row in reversed(read_jsonl_since(args.oracle_audit, audit_offset))
-                    if row.get("phase") == "reducer"
+                    if row.get("phase") == "reducer" and row.get("digest") == digest
                 ),
                 None,
             )
-            if wrapper_record is not None:
-                if wrapper_record.get("status") in {"timeout", "interrupted"}:
+            if status not in {"timeout", "tool-error"}:
+                if wrapper_record is None or wrapper_record.get("status") not in {
+                    "accepted", "rejected", "timeout", "interrupted", "tool-error"
+                }:
+                    status = "tool-error"
+                elif wrapper_record["status"] in {"timeout", "interrupted"}:
                     status = "timeout"
-                elif wrapper_record.get("status") == "tool-error":
+                elif wrapper_record["status"] == "tool-error":
                     status = "tool-error"
 
     if status == "accepted" and time.monotonic() >= args.deadline:
