@@ -209,7 +209,7 @@ PRAGMA user_version=42;
     print(json.dumps({group: len(entries) for group, entries in groups.items()}, sort_keys=True))
 
 
-def profiles(manifest, binary, output, timeout, budget, executions):
+def profiles(manifest, binary, output, timeout, budget, executions, profile_names):
     import subprocess
     import time
     runner = runner_module()
@@ -223,47 +223,49 @@ def profiles(manifest, binary, output, timeout, budget, executions):
     validated = 0
     with (output / "results.jsonl").open("w") as stream:
         for entry in entries:
-            case_dir = output / entry["id"]
-            case_dir.mkdir(exist_ok=True)
-            command = [str(binary), entry["file"], "--oracle", entry["oracle_command"], "--dialect", "sqlite",
-                       "--timeout", str(timeout), "--budget", str(budget), "--max-oracle-executions", str(executions),
-                       "--log-format", "json", "--out", str(case_dir)]
-            if entry.get("reset_command"):
-                command += ["--reset", entry["reset_command"]]
-            (case_dir / "command.json").write_text(json.dumps(command) + "\n")
-            result = subprocess.run(command, cwd=ROOT, env=dict(os.environ, GHCRTS="-N1"), capture_output=True, text=True)
-            (case_dir / "stdout.log").write_text(result.stdout)
-            (case_dir / "stderr.log").write_text(result.stderr)
-            native = runner.read_json(case_dir / "benchmark.json")
-            if not isinstance(native, list) or not native:
-                row = runner.base_record(entry, "occam-eval/profiles", timeout, budget, executions)
-                row.update({"status": "tool-error", "status_reason": result.stderr.strip() or "native profiles missing",
-                            "validation_calls": None, "wall_time_sec": None})
-                stream.write(json.dumps(row, sort_keys=True) + "\n")
-                stream.flush()
-                records += 1
-                statuses["tool-error"] = statuses.get("tool-error", 0) + 1
-                continue
             original = Path(entry["file"]).read_bytes()
-            for metric in native:
-                evaluation = metric["metricEvaluationMetrics"]
-                row = runner.base_record(entry, metric["metricAlgorithm"], timeout, budget, executions)
-                runner.set_size_metrics(row, original, Path(metric["metricSQLArtifact"]).read_bytes(), "sqlite")
-                row.update({"status": evaluation["evaluationStatus"], "status_reason": evaluation["evaluationFailure"],
-                            "predicate_passed": evaluation["evaluationValidationPassed"] if evaluation["evaluationStatus"] == "completed" else None,
-                            "native_validation_passed": evaluation["evaluationValidationPassed"],
-                            "oracle_calls": evaluation["evaluationDatabaseObservations"], "oracle_timeouts": evaluation["evaluationTimedOutObservations"],
-                            "oracle_cache_hits": evaluation["evaluationCacheHits"], "validation_calls": evaluation["evaluationValidationDatabaseObservations"],
-                            "preflight_calls_debited": evaluation["evaluationBudget"]["evaluationPreflightAttempts"],
-                            "preflight_scope": "one physical shared preflight per case; same debit per profile",
-                            "validation_time_sec": evaluation["evaluationValidationSeconds"], "reset_time_sec": evaluation["evaluationResetSeconds"],
-                            "reset_calls": None if entry.get("reset_command") else 0,
-                            "reset_accounting": "native reduction resets measured; call count uninstrumented" if entry.get("reset_command") else "no reset command; database setup internal to predicate",
-                            "native_process_returncode": result.returncode,
-                            "reduction_time_sec": evaluation["evaluationReductionSeconds"], "wall_time_sec": evaluation["evaluationTotalSeconds"],
-                            "result_file": metric["metricSQLArtifact"], "native_metrics_file": metric["metricMetricsArtifact"],
-                            "settings": metric["metricReductionSettings"], "parameters": entry["parameters"],
-                            "reduction_track": entry.get("reduction_track", "whole_script")})
+            for index, profile_name in enumerate(profile_names, 1):
+                case_dir = output / entry["id"] / f"profile-{index}"
+                case_dir.mkdir(parents=True)
+                command = [str(binary), entry["file"], "--profile", profile_name,
+                           "--oracle", entry["oracle_command"], "--dialect", entry["dialect"],
+                           "--timeout", str(timeout), "--budget", str(budget),
+                           "--max-oracle-executions", str(executions),
+                           "--log-format", "json", "--out", str(case_dir)]
+                if entry.get("reset_command"):
+                    command += ["--reset", entry["reset_command"]]
+                (case_dir / "command.json").write_text(json.dumps(command) + "\n")
+                result = subprocess.run(command, cwd=ROOT, env=dict(os.environ, GHCRTS="-N1"), capture_output=True, text=True)
+                (case_dir / "stdout.log").write_text(result.stdout)
+                (case_dir / "stderr.log").write_text(result.stderr)
+                native = runner.read_json(case_dir / "benchmark.json")
+                row = runner.base_record(entry, profile_name, timeout, budget, executions)
+                row.update({"experiment_line": "internal", "profile": profile_name,
+                            "native_process_returncode": result.returncode})
+                metric = native[0] if isinstance(native, list) and len(native) == 1 and isinstance(native[0], dict) else None
+                if metric is None or metric.get("metricAlgorithm") != profile_name or metric.get("metricExperimentLine") != "internal":
+                    row.update({"status": "tool-error", "status_reason": result.stderr.strip() or "selected internal profile missing",
+                                "validation_calls": None, "wall_time_sec": None})
+                else:
+                    evaluation = metric["metricEvaluationMetrics"]
+                    runner.set_size_metrics(row, original, Path(metric["metricSQLArtifact"]).read_bytes(), entry["dialect"])
+                    status = evaluation["evaluationStatus"]
+                    if status == "completed" and result.returncode != 0:
+                        status = "tool-error"
+                    row.update({"status": status, "status_reason": evaluation["evaluationFailure"] or (result.stderr.strip() if status == "tool-error" else None),
+                                "predicate_passed": evaluation["evaluationValidationPassed"] if status == "completed" else None,
+                                "native_validation_passed": evaluation["evaluationValidationPassed"],
+                                "oracle_calls": evaluation["evaluationDatabaseObservations"], "oracle_timeouts": evaluation["evaluationTimedOutObservations"],
+                                "oracle_cache_hits": evaluation["evaluationCacheHits"], "validation_calls": evaluation["evaluationValidationDatabaseObservations"],
+                                "preflight_calls_debited": evaluation["evaluationBudget"]["evaluationPreflightAttempts"],
+                                "preflight_scope": "one physical preflight per profile process",
+                                "validation_time_sec": evaluation["evaluationValidationSeconds"], "reset_time_sec": evaluation["evaluationResetSeconds"],
+                                "reset_calls": None if entry.get("reset_command") else 0,
+                                "reset_accounting": "native reduction resets measured; call count uninstrumented" if entry.get("reset_command") else "no reset command; database setup internal to predicate",
+                                "reduction_time_sec": evaluation["evaluationReductionSeconds"], "wall_time_sec": evaluation["evaluationTotalSeconds"],
+                                "result_file": metric["metricSQLArtifact"], "native_metrics_file": metric["metricMetricsArtifact"],
+                                "settings": metric["metricReductionSettings"], "parameters": entry["parameters"],
+                                "reduction_track": entry.get("reduction_track", "whole_script")})
                 stream.write(json.dumps(row, sort_keys=True) + "\n")
                 stream.flush()
                 records += 1
@@ -296,6 +298,7 @@ def main():
     profile_parser.add_argument("manifest", type=Path)
     profile_parser.add_argument("--binary", type=Path, required=True)
     profile_parser.add_argument("--out", type=Path, required=True)
+    profile_parser.add_argument("--profile", action="append", required=True, help="One internal profile per child; repeat to select more")
     profile_parser.add_argument("--timeout", type=float, default=2)
     profile_parser.add_argument("--budget", type=float, default=30)
     profile_parser.add_argument("--max-oracle-executions", type=int, default=500)
@@ -307,7 +310,7 @@ def main():
     else:
         if not math.isfinite(args.timeout) or not math.isfinite(args.budget) or args.timeout <= 0 or args.budget <= 0 or args.max_oracle_executions < 1:
             parser.error("limits must be positive")
-        profiles(args.manifest.resolve(), args.binary.resolve(), args.out.resolve(), args.timeout, args.budget, args.max_oracle_executions)
+        profiles(args.manifest.resolve(), args.binary.resolve(), args.out.resolve(), args.timeout, args.budget, args.max_oracle_executions, args.profile)
     return 0
 
 

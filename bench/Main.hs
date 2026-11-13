@@ -1,7 +1,13 @@
 module Main (main) where
 
-import Benchmark (BenchmarkMetric (..), runComparisonBenchmark, runSingleAlgorithmBenchmark)
-import Control.Applicative ((<|>))
+import Benchmark (
+    BenchmarkMetric (..),
+    Profile,
+    parseProfile,
+    profileCacheEnabled,
+    profileName,
+    runProfileBenchmark,
+ )
 import Control.Monad (unless, when)
 import Data.Aeson (encode, toJSON)
 import Data.ByteString qualified as BS
@@ -22,7 +28,6 @@ import Occam.Logger (
     LogLevel (..),
     Logger,
     logError,
-    logInfo,
     logInfo',
     withLogger,
  )
@@ -32,14 +37,12 @@ import Occam.Oracle (
     prepareOracle,
  )
 import Occam.Parser (SQLDialect (..))
-import Occam.Reducer (ReductionConfig (..), defaultReductionConfig)
 import Options.Applicative (
     Parser,
     ParserInfo,
     auto,
     eitherReader,
     execParser,
-    flag',
     fullDesc,
     header,
     help,
@@ -71,23 +74,13 @@ data Options = Options
     , optOutDir :: !FilePath
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
-    , optBaseline :: !(Maybe Int)
+    , optProfile :: !Profile
     , optLogLevel :: !String
     , optLogFormat :: !String
     , optVerbose :: !Bool
     , optQuiet :: !Bool
     , optBudgetSecs :: !(Maybe Double)
     , optMaxOracleExecutions :: !(Maybe Int)
-    , optReductionOptions :: !ReductionOptions
-    }
-    deriving (Eq, Show)
-
-data ReductionOptions = ReductionOptions
-    { optSlicing :: !Bool
-    , optClosure :: !Bool
-    , optIntraStatement :: !Bool
-    , optUnrestricted :: !Bool
-    , optCache :: !Bool
     , optDialect :: !SQLDialect
     }
     deriving (Eq, Show)
@@ -126,13 +119,11 @@ optionsParser =
                 <> showDefault
                 <> help "Per-execution timeout in seconds"
             )
-        <*> optional
-            ( option
-                auto
-                ( long "baseline"
-                    <> metavar "N"
-                    <> help "Run only specific baseline (1: Sequential, 2: Statement ddmin)"
-                )
+        <*> option
+            (eitherReader parseProfile)
+            ( long "profile"
+                <> metavar "PROFILE"
+                <> help "Run one internal profile (e.g. full, graph-off, statement-ddmin)"
             )
         <*> strOption
             ( long "log-level"
@@ -173,16 +164,6 @@ optionsParser =
                     <> help "Maximum uncached oracle attempts including the initial check and final validation"
                 )
             )
-        <*> reductionOptionsParser
-
-reductionOptionsParser :: Parser ReductionOptions
-reductionOptionsParser =
-    ReductionOptions
-        <$> toggle True "slicing" "no-slicing" "dependency slicing"
-        <*> toggle True "closure" "no-closure" "dependency closure"
-        <*> toggle True "intra-statement" "no-intra-statement" "intra-statement reductions"
-        <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
-        <*> toggle True "cache" "no-cache" "candidate caching"
         <*> option
             (eitherReader parseSQLDialect)
             ( long "dialect"
@@ -192,12 +173,6 @@ reductionOptionsParser =
                 <> help
                     "SQL dependency dialect: generic, postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
             )
-
-toggle :: Bool -> String -> String -> String -> Parser Bool
-toggle defaultValue enableName disableName description =
-    flag' True (long enableName <> help ("Enable " ++ description))
-        <|> flag' False (long disableName <> help ("Disable " ++ description))
-        <|> pure defaultValue
 
 parseLogLevel :: String -> LogLevel
 parseLogLevel s = case map toLower s of
@@ -225,8 +200,8 @@ optsInfo =
     info
         (optionsParser <**> versionOption <**> helper)
         ( fullDesc
-            <> progDesc "Occam-Eval: Comparative Evaluation Tool for Occam vs Baselines"
-            <> header ("Occam-Eval v" ++ Occam.version ++ " - Benchmark runner for SQL test case reduction")
+            <> progDesc "Occam-Eval: Run one internal reducer control or ablation"
+            <> header ("Occam-Eval v" ++ Occam.version ++ " - Isolated internal profile worker")
         )
 
 main :: IO ()
@@ -250,8 +225,6 @@ runEval opts@Options {..} = do
 
 runEvalWithLogger :: Logger -> Options -> IO ()
 runEvalWithLogger logger Options {..} = do
-    when (maybe False (`notElem` [1, 2]) optBaseline) $
-        failWith "Error: baseline must be 1 (Sequential) or 2 (Statement ddmin)"
     let finiteTimeout seconds =
             seconds > 0
                 && not (isNaN seconds || isInfinite seconds)
@@ -271,8 +244,7 @@ runEvalWithLogger logger Options {..} = do
     initialSQL <- BS.readFile optInputFile
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
         putStrLn "======================================================================"
-        putStrLn ("Occam-Eval v" ++ Occam.version ++ " - Comparative Evaluation Runner")
-        putStrLn "======================================================================"
+        putStrLn ("Occam-Eval v" ++ Occam.version ++ " - Internal Profile Worker")
         putStrLn $ "  Input SQL:      " ++ optInputFile
         putStrLn $ "  Output Dir:     " ++ optOutDir
         putStrLn $ "  Oracle Command: " ++ optOracleCmd
@@ -309,7 +281,7 @@ runEvalWithLogger logger Options {..} = do
                 (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
         evaluationConfig =
             EvaluationConfig
-                { evaluationCacheEnabled = optCache optReductionOptions
+                { evaluationCacheEnabled = profileCacheEnabled optProfile
                 , evaluationTotalTimeoutMicros = round . (* 1000000) <$> optBudgetSecs
                 , evaluationMaxOracleExecutions = optMaxOracleExecutions
                 , evaluationPreflightMicros = preflightMicros
@@ -317,7 +289,6 @@ runEvalWithLogger logger Options {..} = do
                 , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
                 , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
-        reductionConfig = toReductionConfig optReductionOptions
 
     logInfo'
         logger
@@ -330,41 +301,33 @@ runEvalWithLogger logger Options {..} = do
         ]
     createDirectoryIfMissing True optOutDir
 
-    metrics <- case optBaseline of
-        Just baseline -> do
-            logInfo'
-                logger
-                "occam::eval"
-                "Running single algorithm benchmark"
-                [("baseline_idx", toJSON baseline)]
-            metric <-
-                runSingleAlgorithmBenchmark
-                    (optDialect optReductionOptions)
-                    baseline
-                    evaluationConfig
-                    baseOracleConfig
-                    logger
-                    initialSQL
-                    optOutDir
-            reducedSQL <- BS.readFile (metricSQLArtifact metric)
-            BS.writeFile (optOutDir </> "minimal.sql") reducedSQL
-            pure [metric]
-        Nothing -> do
-            logInfo logger "occam::eval" "Running comparative reducer and ablation profiles"
-            runComparisonBenchmark evaluationConfig baseOracleConfig logger reductionConfig initialSQL optOutDir
-    let jsonData = encode metrics
+    logInfo'
+        logger
+        "occam::eval"
+        "Running one internal profile"
+        [("profile", toJSON (profileName optProfile))]
+    metric <-
+        runProfileBenchmark
+            optProfile
+            optDialect
+            evaluationConfig
+            baseOracleConfig
+            logger
+            initialSQL
+            optOutDir
+    let jsonData = encode [metric]
     BSL.writeFile (optOutDir </> "benchmark.json") jsonData
     logInfo'
         logger
         "occam::eval"
-        "Benchmark evaluation finished"
+        "Internal profile result written"
         [("out_file", toJSON (optOutDir </> "benchmark.json"))]
 
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
         putStrLn "----------------------------------------------------------------------"
-        putStrLn "Benchmark Complete!"
+        putStrLn "Internal Profile Result"
         putStrLn "======================================================================"
-        putStrLn "Comparative Benchmark Results (JSON)"
+        putStrLn "Internal Profile Metrics (JSON)"
         putStrLn "======================================================================"
     BSL.putStr jsonData
     putStrLn ""
@@ -372,8 +335,8 @@ runEvalWithLogger logger Options {..} = do
         putStrLn "======================================================================"
         putStrLn $ "  Artifact: " ++ (optOutDir </> "benchmark.json")
         putStrLn "======================================================================"
-    unless (all completedAndValidated metrics) $
-        failWith "Error: one or more benchmark profiles did not complete repeated target validation"
+    unless (completedAndValidated metric) $
+        failWith "Error: selected profile did not complete repeated target validation"
 
 completedAndValidated :: BenchmarkMetric -> Bool
 completedAndValidated metric =
@@ -387,16 +350,6 @@ runWithinBudget started (Just totalMicros) action = do
     let remaining = max 0 (totalMicros - (now - started) `div` 1000)
         timeoutMicros = fromInteger (min remaining (toInteger (maxBound :: Int)))
     timeout timeoutMicros action
-
-toReductionConfig :: ReductionOptions -> ReductionConfig
-toReductionConfig ReductionOptions {..} =
-    defaultReductionConfig
-        { reductionSlicing = optSlicing
-        , reductionClosure = optClosure
-        , reductionIntraStatement = optIntraStatement
-        , reductionUnrestricted = optUnrestricted
-        , reductionDialect = optDialect
-        }
 
 failWith :: String -> IO a
 failWith message = hPutStrLn stderr message >> exitFailure

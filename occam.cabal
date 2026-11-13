@@ -88,8 +88,7 @@ executable occam
 executable occam-eval
     import:           warnings, language
     main-is:          Main.hs
-    other-modules:    Baseline
-                    , Benchmark
+    other-modules:    Benchmark
     hs-source-dirs:   bench
     build-depends:    base >= 4.18 && < 5
                     , occam
@@ -124,8 +123,7 @@ test-suite occam-test
     import:           warnings, language
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test bench
-    other-modules:    Baseline
-                    , Benchmark
+    other-modules:    Benchmark
                     , Fuzz
                     , MutationalFuzz
                     , DependencyChecks

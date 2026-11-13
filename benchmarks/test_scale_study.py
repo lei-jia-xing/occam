@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import closing
 
-from benchmarks.tools import p2_scale_study as study
+from benchmarks.tools import scale_study as study
 
 
 class SQLiteStudyResetTests(unittest.TestCase):

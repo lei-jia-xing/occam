@@ -1,15 +1,18 @@
 module Benchmark (
     BenchmarkMetric (..),
-    runComparisonBenchmark,
-    runSingleAlgorithmBenchmark,
+    Profile (..),
+    parseProfile,
+    profileName,
+    profileCacheEnabled,
+    runProfileBenchmark,
 ) where
 
-import Baseline (runNaiveDdmin, runSequentialDrop)
 import Data.Aeson (FromJSON, ToJSON, Value, encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
+import Data.Text qualified as T
 import GHC.Generics (Generic)
 import Occam.Evaluation (
     EvaluationConfig (..),
@@ -24,12 +27,16 @@ import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
     Oracle,
     ReductionConfig (..),
+    defaultReductionConfig,
     reduceSQLWithConfig,
+    statementAudit,
+    statementDdmin,
  )
 import System.FilePath ((</>))
 
 data BenchmarkMetric = BenchmarkMetric
     { metricAlgorithm :: !Text
+    , metricExperimentLine :: !Text
     , metricInitialBytes :: !Int
     , metricReducedBytes :: !Int
     , metricByteReduction :: !Double
@@ -50,109 +57,101 @@ instance FromJSON BenchmarkMetric
 
 type BenchmarkAction = Logger -> Oracle -> ByteString -> IO ByteString
 
-type BenchmarkProfile = (Text, FilePath, Bool, Value, BenchmarkAction)
+type BenchmarkProfile = (Text, Bool, Value, BenchmarkAction)
 
-runComparisonBenchmark ::
-    EvaluationConfig ->
-    OracleConfig ->
-    Logger ->
-    ReductionConfig ->
-    ByteString ->
-    FilePath ->
-    IO [BenchmarkMetric]
-runComparisonBenchmark evaluationConfig oracleConfig logger baseConfig sql outDir = do
-    let dialect = reductionDialect baseConfig
-    initialStmts <- countStatementsOrFail dialect sql
-    let cacheEnabled = evaluationCacheEnabled evaluationConfig
-        noSlicing = baseConfig {reductionSlicing = False}
-        noClosure = baseConfig {reductionClosure = False}
-        noSlicingOrClosure = baseConfig {reductionSlicing = False, reductionClosure = False}
-        noIntra = baseConfig {reductionIntraStatement = False}
-        hardClosure = baseConfig {reductionClosure = True, reductionUnrestricted = False}
-        unrestrictedFallback = baseConfig {reductionClosure = True, reductionUnrestricted = True}
-        plainStatementDdmin =
-            baseConfig
-                { reductionSlicing = False
-                , reductionClosure = False
-                , reductionIntraStatement = False
-                , reductionUnrestricted = False
-                }
-        intraStatementTrack =
-            baseConfig
-                { reductionSlicing = False
-                , reductionClosure = False
-                , reductionIntraStatement = True
-                , reductionUnrestricted = False
-                }
-        pipeline name artifact config useCache =
-            (name, artifact, useCache, reductionSettings useCache config, reduceSQLWithConfig config)
-        profiles =
-            [ pipeline "Occam" "occam" baseConfig cacheEnabled
-            ,
-                ( "B1 (Sequential)"
-                , "b1-sequential"
-                , cacheEnabled
-                , statementOnlySettings dialect cacheEnabled "sequential-deletion"
-                , \_ oracle input -> runSequentialDrop dialect oracle input
-                )
-            ,
-                ( "B2 (Statement ddmin)"
-                , "b2-statement-ddmin"
-                , cacheEnabled
-                , statementSettings dialect cacheEnabled
-                , \_ oracle input -> runNaiveDdmin dialect oracle input
-                )
-            , pipeline "Shared (no slicing)" "ablation-no-slicing" noSlicing cacheEnabled
-            , pipeline "Shared (no closure)" "ablation-no-closure" noClosure cacheEnabled
-            , pipeline
-                "Shared (no slicing or closure)"
-                "ablation-no-slicing-no-closure"
-                noSlicingOrClosure
-                cacheEnabled
-            , pipeline "Shared (no intra-statement)" "ablation-no-intra-statement" noIntra cacheEnabled
-            , pipeline "Shared (hard closure)" "closure-hard" hardClosure cacheEnabled
-            , pipeline "Shared (unrestricted fallback)" "closure-unrestricted" unrestrictedFallback cacheEnabled
-            , pipeline "Shared (plain statement ddmin)" "shared-statement-ddmin" plainStatementDdmin cacheEnabled
-            , pipeline "Shared (intra/expression)" "shared-intra-expression" intraStatementTrack cacheEnabled
-            , pipeline
-                (if cacheEnabled then "Occam (cache disabled)" else "Occam (cache enabled)")
-                "ablation-cache"
-                baseConfig
-                (not cacheEnabled)
-            ]
-    mapM (runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir) profiles
+data Profile
+    = Full
+    | Sequential
+    | StatementDdmin
+    | NoSlicing
+    | NoClosure
+    | GraphOff
+    | NoIntra
+    | HardClosure
+    | StatementFixedPoint
+    | StatementWithSyntax
+    | NoCache
+    deriving (Eq, Show, Enum, Bounded)
 
-runSingleAlgorithmBenchmark ::
+profileName :: Profile -> Text
+profileName = \case
+    Full -> "full"
+    Sequential -> "sequential"
+    StatementDdmin -> "statement-ddmin"
+    NoSlicing -> "no-slicing"
+    NoClosure -> "no-closure"
+    GraphOff -> "graph-off"
+    NoIntra -> "no-intra"
+    HardClosure -> "hard-closure"
+    StatementFixedPoint -> "statement-ddmin-fixed-point"
+    StatementWithSyntax -> "statement-ddmin-with-syntax"
+    NoCache -> "no-cache"
+
+parseProfile :: String -> Either String Profile
+parseProfile name =
+    case lookup (T.pack name) [(profileName profile, profile) | profile <- [minBound .. maxBound]] of
+        Just profile -> Right profile
+        Nothing ->
+            Left
+                ( "Unknown internal profile; choose one of: "
+                    ++ T.unpack (T.intercalate ", " (map profileName [minBound .. maxBound]))
+                )
+
+profileCacheEnabled :: Profile -> Bool
+profileCacheEnabled profile = profile /= NoCache
+
+runProfileBenchmark ::
+    Profile ->
     SQLDialect ->
-    Int ->
     EvaluationConfig ->
     OracleConfig ->
     Logger ->
     ByteString ->
     FilePath ->
     IO BenchmarkMetric
-runSingleAlgorithmBenchmark dialect baselineIdx evaluationConfig oracleConfig logger sql outDir = do
+runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql outDir = do
     initialStmts <- countStatementsOrFail dialect sql
-    let cacheEnabled = evaluationCacheEnabled evaluationConfig
-    profile <- case baselineIdx of
-        1 ->
-            pure
-                ( "B1 (Sequential)"
-                , "b1-sequential"
-                , cacheEnabled
-                , statementOnlySettings dialect cacheEnabled "sequential-deletion"
-                , \_ oracle input -> runSequentialDrop dialect oracle input
+    let cacheEnabled = profileCacheEnabled profile
+        baseConfig = defaultReductionConfig {reductionDialect = dialect}
+        config = case profile of
+            NoSlicing -> baseConfig {reductionSlicing = False}
+            NoClosure -> baseConfig {reductionClosure = False}
+            GraphOff -> baseConfig {reductionSlicing = False, reductionClosure = False}
+            NoIntra -> baseConfig {reductionIntraStatement = False}
+            HardClosure -> baseConfig {reductionUnrestricted = False}
+            StatementFixedPoint ->
+                baseConfig
+                    { reductionSlicing = False
+                    , reductionClosure = False
+                    , reductionIntraStatement = False
+                    , reductionUnrestricted = False
+                    }
+            StatementWithSyntax ->
+                baseConfig
+                    { reductionSlicing = False
+                    , reductionClosure = False
+                    , reductionUnrestricted = False
+                    }
+            _ -> baseConfig
+        (settings, action) = case profile of
+            Sequential ->
+                ( statementOnlySettings dialect cacheEnabled "sequential-deletion"
+                , \_ oracle input -> statementAudit dialect oracle input
                 )
-        2 ->
-            pure
-                ( "B2 (Statement ddmin)"
-                , "b2-statement-ddmin"
-                , cacheEnabled
-                , statementSettings dialect cacheEnabled
-                , \_ oracle input -> runNaiveDdmin dialect oracle input
+            StatementDdmin ->
+                ( statementOnlySettings dialect cacheEnabled "statement-ddmin"
+                , \_ oracle input -> statementDdmin dialect oracle input
                 )
-        _ -> ioError (userError "baseline index must be 1 or 2")
-    runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir profile
+            _ -> (reductionSettings cacheEnabled config, reduceSQLWithConfig config)
+    runOne
+        dialect
+        evaluationConfig
+        oracleConfig
+        logger
+        sql
+        initialStmts
+        outDir
+        (profileName profile, cacheEnabled, settings, action)
 
 runOne ::
     SQLDialect ->
@@ -164,9 +163,9 @@ runOne ::
     FilePath ->
     BenchmarkProfile ->
     IO BenchmarkMetric
-runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (name, artifactName, cacheEnabled, settings, action) = do
-    let sqlPath = outDir </> (artifactName ++ ".sql")
-        metricsPath = outDir </> (artifactName ++ ".json")
+runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (name, cacheEnabled, settings, action) = do
+    let sqlPath = outDir </> "minimal.sql"
+        metricsPath = outDir </> "profile.json"
         runConfig = evaluationConfig {evaluationCacheEnabled = cacheEnabled}
         initialBytes = BS.length sql
     EvaluationResult {..} <-
@@ -185,6 +184,7 @@ runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (nam
         metric =
             BenchmarkMetric
                 { metricAlgorithm = name
+                , metricExperimentLine = "internal"
                 , metricInitialBytes = initialBytes
                 , metricReducedBytes = reducedBytes
                 , metricByteReduction = reductionPercent initialBytes reducedBytes
@@ -229,15 +229,6 @@ statementOnlySettings :: SQLDialect -> Bool -> Text -> Value
 statementOnlySettings dialect cacheEnabled strategy =
     object
         [ "kind" .= strategy
-        , "unit" .= ("top-level-statement" :: Text)
-        , "cache" .= cacheEnabled
-        , "dialect" .= sqlDialectName dialect
-        ]
-
-statementSettings :: SQLDialect -> Bool -> Value
-statementSettings dialect cacheEnabled =
-    object
-        [ "kind" .= ("statement-ddmin" :: Text)
         , "unit" .= ("top-level-statement" :: Text)
         , "cache" .= cacheEnabled
         , "dialect" .= sqlDialectName dialect

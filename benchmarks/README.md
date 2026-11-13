@@ -65,12 +65,38 @@ Comparison-runner `reset_calls` and `reset_time_sec` cover audited reducer callb
 `oracle_timeouts` counts reducer-scope observations only: native tools use a fresh `evaluationTimedOutObservations` profile count, callback tools use observed callback/reducer-audit outcomes, and validation-phase audit rows are excluded. If a native count is missing or invalid, it remains `null`.
 
 
-## Reproducible scale and ablation workloads
+## Internal profile worker
 
-`tools/p2_scale_study.py` derives SQL from the existing deep-expression golden fuzz fixture, executes it with SQLite to establish expected rowsets, and keeps each input beside its predicate metadata. It varies statement count (up to 4099 total), object count, expression depth and view fan-in separately. The corpus contains 128 related variants plus explicit reset-failure and real SQLite timeout cases; it is not 128 independent bugs or broad dialect coverage.
+`occam-eval` runs exactly one named internal control or ablation per process.
+It does not provide independent external baselines. `--profile` is required;
+the numeric `--baseline` selector and implicit all-profile run are removed.
 
 ```bash
-python3 benchmarks/tools/p2_scale_study.py prepare /tmp/occam-study --corpus-size 128
+cabal run occam-eval -- input.sql --profile full \
+  --oracle './interesting.sh' --dialect postgres \
+  --budget 30 --max-oracle-executions 100 --out /tmp/profile-full
+```
+
+Profiles: `full`, `no-slicing`, `no-closure`, `graph-off`, `no-intra`,
+`hard-closure`, `no-cache`, `sequential`, `statement-ddmin`,
+`statement-ddmin-fixed-point`, and `statement-ddmin-with-syntax`.
+The direct statement controls use the core audit/ddmin primitives; the latter
+two profiles use the graph-free fixed-point pipeline, without/with syntax edits.
+
+Each invocation performs its own preflight and owns its execution budget/cache.
+Use a distinct output directory per invocation: `minimal.sql` is the checkpoint,
+`profile.json` is its metric, and `benchmark.json` contains that single metric
+in an array. Metrics identify `metricExperimentLine=internal` and the selected
+profile in `metricAlgorithm`. Budget exhaustion remains a nonzero exit with a
+retained accepted checkpoint; it is not relabeled completed. Database state
+isolation still belongs to the supplied predicate/reset, not process isolation.
+
+## Reproducible scale and ablation workloads
+
+`tools/scale_study.py` derives SQL from the existing deep-expression golden fuzz fixture, executes it with SQLite to establish expected rowsets, and keeps each input beside its predicate metadata. It varies statement count (up to 4099 total), object count, expression depth and view fan-in separately. The corpus contains 128 related variants plus explicit reset-failure and real SQLite timeout cases; it is not 128 independent bugs or broad dialect coverage.
+
+```bash
+python3 benchmarks/tools/scale_study.py prepare /tmp/occam-study --corpus-size 128
 GHCRTS=-N1 python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
   --manifest /tmp/occam-study/scale.json --tools occam,ddmin --jobs 4 \
   --oracle-timeout 2 --budget 30 --max-oracle-executions 500 \
@@ -79,12 +105,13 @@ GHCRTS=-N1 python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
   --manifest /tmp/occam-study/corpus.json --tools occam,ddmin --jobs 4 \
   --oracle-timeout 1 --budget 12 --max-oracle-executions 100 \
   --out /tmp/occam-study/corpus-results.jsonl
-python3 benchmarks/tools/p2_scale_study.py profiles /tmp/occam-study/profiles.json \
+python3 benchmarks/tools/scale_study.py profiles /tmp/occam-study/profiles.json \
   --binary "$(env -u GHCRTS cabal list-bin exe:occam-eval)" \
+  --profile full --profile graph-off \
   --out /tmp/occam-study/profiles-run --timeout 2 --budget 30 --max-oracle-executions 500
 ```
 
-Prepare/build native executables first. Workload preparation and profile output refuse nonempty directories rather than overwriting evidence. Profiles run serially with `GHCRTS=-N1`; one physical preflight is shared per input and its budget debit is applied to each profile. Settings and raw stages distinguish statement-only B1/B2/byte-WeightedDD/CDD from shared-pass pipelines and the slicing/closure 2×2 ablation. Do not pool these as identical algorithms or compare their direct-predicate timings to wrapper-based batches.
+Prepare/build native executables first. Workload preparation and profile output refuse nonempty directories rather than overwriting evidence. Select profiles explicitly by repeating `--profile`; the study runner launches them serially in separate processes and output directories with `GHCRTS=-N1`. Each child performs and pays for its own physical preflight; checks are not shared across profiles. A failed child retains its own result and does not suppress later selected profiles. These remain internal controls/ablations, not independent external tools; do not pool direct-predicate timings with wrapper-based batches.
 
 `resets.json` compares fresh SQLite setup with copying a closed database template, on the same fixed-setup query. The predicate verifies schema, data, indexes, triggers, sequences and `user_version`, and applies `foreign_keys` per connection. This is a SQLite file-state comparison, not a server/container snapshot. No speculative parallel candidate search or incremental graph framework is enabled.
 
@@ -103,7 +130,7 @@ cabal install ghc-prof-flamegraph-0.2.0.1 --installdir="$TOOL_DIR" --overwrite-p
 cabal build exe:occam --builddir="$BUILD_DIR" --enable-profiling --enable-executable-profiling \
   --ghc-options='-O2 -fprof-late' --disable-executable-stripping
 BIN=$(cabal list-bin exe:occam --builddir="$BUILD_DIR")
-python3 benchmarks/tools/p2_scale_study.py prepare "$OUT_DIR/study" --corpus-size 1
+python3 benchmarks/tools/scale_study.py prepare "$OUT_DIR/study" --corpus-size 1
 ORACLE=$(jq -r '.cases[] | select(.id=="statements-4096") | .oracle_command' "$OUT_DIR/study/scale.json")
 set +e
 (cd "$OUT_DIR" && env -u GHCRTS "$BIN" +RTS -N1 -P -RTS "$OUT_DIR/study/statements-4096.sql" \

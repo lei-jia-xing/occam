@@ -261,7 +261,13 @@
 - Acceptance: preserve line-specific accounting and validation boundaries.
   Distinguish rejection, timeout/checkpoint, tool, infrastructure, and cleanup
   failures.
-** TODO [#A] Isolate each measured profile execution
+** IN_PROGRESS [#A] Isolate each measured profile execution
+- First slice verified: `occam-eval --profile NAME` runs one internal profile;
+  `scale_study.py profiles` launches selected profiles in separate processes.
+  Five CLI/control tests passed, including independent preflight/cap checks.
+  A small SQLite smoke retained one failed selection and three independently
+  validated profile results. DB fixture isolation, the contamination probe,
+  and the complete batch resource/evidence contract are not complete.
 - Use an immutable profile configuration and a fresh child per case × profile
   × repetition, including native/API variants. Each measured child runs exactly
   one explicitly named profile; never combine profiles in one measured worker.
@@ -310,9 +316,9 @@
   and limits; state GHC safe-FFI, Rust, and child-process blind spots. The
   generated GHC flamegraph smoke remains toolchain proof, not a baseline.
 ** TODO [#B] Run controlled internal controls and ablations
-- B1/B2 currently alias Occam's `statementAudit`/`statementDdmin`; retain them
-  only for a named internal question. Never brand them as external baselines;
-  B2 alone does not isolate AST gains.
+- Sequential audit and direct statement ddmin are named internal profiles;
+  the old `Baseline.hs` aliases and numeric B1/B2 selection are removed. Keep
+  controls only for a named question; direct ddmin does not isolate AST gains.
 - Before naming a profile, verify and record its effective ordered passes,
   fallback, audit/fixed-point behavior, and minimality claim. Do not presume
   an all-off Boolean config equals statement ddmin or count duplicate
@@ -362,8 +368,8 @@
 - Migrate single-input/generation (`benchmarks/live_fuzz_pipeline.sh`,
   `benchmarks/tools/fuzz_generator.py`); batch/study
   (`benchmarks/fuzz_corpus/run_docker_benchmark.py`,
-  `benchmarks/tools/p2_scale_study.py`); evaluation (`bench/Baseline.hs`,
-  `bench/Benchmark.hs`, `bench/Main.hs`, `occam.cabal`, `test/Spec.hs`);
+  `benchmarks/tools/scale_study.py`); evaluation (`bench/Benchmark.hs`,
+  `bench/Main.hs`, `occam.cabal`, `test/Spec.hs`);
   wrappers (`benchmarks/run_all.sh`, `benchmarks/report.sh`,
   `benchmarks/docker_run.sh`, root `Dockerfile.benchmark`,
   `harness/docker_entrypoint.sh`).
@@ -372,9 +378,10 @@
   `harness/sqlsmith_driver.sh`. Update `benchmarks/README.md`,
   `harness/README.md`, root `README.md`, and focused tests
   (`benchmarks/test_report_pairing.py`, `test_semantic_boundaries.py`,
-  `test_oracle_test.py`, `test_oracle_exec.py`, `test_p2_scale_study.py`).
-- Retire B1/B2 aliases/branding and mixed-profile orchestration; add no
-  compatibility shim. Preserve old artifacts only as labeled history, not
-  current baseline evidence. Keep safety-contract tests for the new boundaries.
+  `test_oracle_test.py`, `test_oracle_exec.py`, `test_scale_study.py`).
+- Baseline aliases and mixed in-process profile execution are retired. Finish
+  retiring redundant batch/report paths without compatibility shims. Preserve
+  old artifacts only as labeled history, not current baseline evidence. Keep
+  safety-contract tests for the new boundaries.
 - Acceptance: document one supported orchestration path and provision only
   selected-scope engines/tools. Old filenames and CLI are not commitments.

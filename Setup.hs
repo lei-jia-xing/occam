@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 
+import Control.Monad (when)
 import Distribution.Simple (defaultMainWithHooks, simpleUserHooks)
 import Distribution.Simple.LocalBuildInfo (
     ComponentLocalBuildInfo,
@@ -44,7 +45,6 @@ buildRust package localBuildInfo hooks flags = do
             archive = "rust/sqlparser-ffi/target/release/liboccam_sqlparser.a"
         createDirectoryIfMissing True dir
         copyFile archive (dir </> "libCoccam_sqlparser.a")
-        if withProfLib localBuildInfo
-            then copyFile archive (dir </> "libCoccam_sqlparser_p.a")
-            else pure ()
+        when (withProfLib localBuildInfo) $
+            copyFile archive (dir </> "libCoccam_sqlparser_p.a")
     buildHook simpleUserHooks package localBuildInfo hooks flags

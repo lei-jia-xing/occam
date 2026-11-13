@@ -1,8 +1,9 @@
 module Main (main) where
 
-import Baseline (runNaiveDdmin, runSequentialDrop)
+import Benchmark (BenchmarkMetric (..))
 import Control.Exception (bracket)
 import Control.Monad (when)
+import Data.Aeson (eitherDecodeStrict')
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Graph qualified as Graph
@@ -41,6 +42,7 @@ import Occam.Core (
     nameText,
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
+import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
 import Occam.Logger (nullLogger)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
 import Occam.Reducer
@@ -338,7 +340,7 @@ phase5Tests =
                         )
                         ["false", "exit 139", "kill -TERM $$"]
                 )
-                [(runOccamCLI, []), (runOccamEvalCLI, ["--baseline", "2"])]
+                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
         , testCase "CLI and evaluator shrink SQL while preserving the supplied predicate" $ do
             let initialSQL =
                     BSC.unlines
@@ -359,7 +361,51 @@ phase5Tests =
                     assertEqual "Reduced SQL lost the target property" ExitSuccess verified
                     assertBool "No SQL reduction occurred" (BS.length reduced < BS.length initialSQL)
                 )
-                [(runOccamCLI, []), (runOccamEvalCLI, ["--baseline", "2"])]
+                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
+        , testCase "selected internal profiles own their preflight and execution budget" $
+            withCLIInput "SELECT 1; SELECT 2;" $ \input outRoot ->
+                withCLIInput "" $ \calls _ -> do
+                    let predicate = "cat >/dev/null; printf x >> " ++ show calls
+                    mapM_
+                        ( \profile -> do
+                            let outDir = outRoot </> profile
+                            (code, _, _) <-
+                                runOccamEvalCLI
+                                    [ input
+                                    , "--profile"
+                                    , profile
+                                    , "--oracle"
+                                    , predicate
+                                    , "--max-oracle-executions"
+                                    , "1"
+                                    , "--out"
+                                    , outDir
+                                    , "--quiet"
+                                    ]
+                            assertBool "Execution-budget exhaustion must remain nonzero" (code /= ExitSuccess)
+                            encoded <- BS.readFile (outDir </> "benchmark.json")
+                            case eitherDecodeStrict' encoded :: Either String [BenchmarkMetric] of
+                                Right [metric] -> do
+                                    let evaluation = metricEvaluationMetrics metric
+                                    assertEqual "Wrong selected profile" (T.pack profile) (metricAlgorithm metric)
+                                    assertEqual "Not an external baseline" "internal" (metricExperimentLine metric)
+                                    assertEqual
+                                        "Own preflight consumes this run's cap"
+                                        1
+                                        (evaluationPreflightAttempts (evaluationBudget evaluation))
+                                    assertEqual "Budget result was lost" EvaluationExecutionBudget (evaluationStatus evaluation)
+                                    assertEqual
+                                        "No reduction call remains after preflight"
+                                        0
+                                        (evaluationDatabaseObservations evaluation)
+                                    assertBool "An unchecked checkpoint is not validated" (not (evaluationValidationPassed evaluation))
+                                other -> assertFailure ("Expected one profile result, got " ++ show other)
+                            checkpoint <- BS.readFile (outDir </> "minimal.sql")
+                            assertEqual "Accepted input checkpoint was lost" "SELECT 1; SELECT 2;" checkpoint
+                        )
+                        ["statement-ddmin", "graph-off"]
+                    observed <- BSC.readFile calls
+                    assertEqual "Each child must physically execute its own preflight" "xx" observed
         ]
 
 -- ----------------------------------------------------------------------------
@@ -687,14 +733,14 @@ withGraph dialect source action = do
         Right parsed -> action (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
 -- ----------------------------------------------------------------------------
--- Phase 8: Baselines & Benchmark Runner
+-- Phase 8: Internal statement controls
 -- ----------------------------------------------------------------------------
 
 phase8Tests :: TestTree
 phase8Tests =
     testGroup
-        "Phase 8: Baselines & Benchmark Runner"
-        [ testCase "B1 (Sequential Drop) removes dead statements and satisfies oracle" $ do
+        "Internal statement controls"
+        [ testCase "Sequential audit removes dead statements and satisfies oracle" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE t1 (a INT, b TEXT);"
@@ -708,15 +754,15 @@ phase8Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- runSequentialDrop GenericSQL oracle script
+            reduced <- statementAudit GenericSQL oracle script
             ok <- oracleAccepts oracle reduced
-            assertBool "B1 reduced SQL must satisfy oracle" ok
-            assertBool "Dead table t2 should be removed by B1" (not (BSC.isInfixOf "t2" reduced))
-            assertBool "Dead table t3 should be removed by B1" (not (BSC.isInfixOf "t3" reduced))
+            assertBool "Sequential audit must satisfy oracle" ok
+            assertBool "Dead table t2 should be removed" (not (BSC.isInfixOf "t2" reduced))
+            assertBool "Dead table t3 should be removed" (not (BSC.isInfixOf "t3" reduced))
             assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
             assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
             assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
-        , testCase "B2 (Naive ddmin) removes dead statements and satisfies oracle" $ do
+        , testCase "Statement ddmin removes dead statements and satisfies oracle" $ do
             let script =
                     BSC.unlines
                         [ "CREATE TABLE t1 (a INT, b TEXT);"
@@ -730,11 +776,11 @@ phase8Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- runNaiveDdmin GenericSQL oracle script
+            reduced <- statementDdmin GenericSQL oracle script
             ok <- oracleAccepts oracle reduced
-            assertBool "B2 reduced SQL must satisfy oracle" ok
-            assertBool "Dead table t2 should be removed by B2" (not (BSC.isInfixOf "t2" reduced))
-            assertBool "Dead table t3 should be removed by B2" (not (BSC.isInfixOf "t3" reduced))
+            assertBool "Statement ddmin must satisfy oracle" ok
+            assertBool "Dead table t2 should be removed" (not (BSC.isInfixOf "t2" reduced))
+            assertBool "Dead table t3 should be removed" (not (BSC.isInfixOf "t3" reduced))
             assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
             assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
             assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)

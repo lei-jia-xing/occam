@@ -586,7 +586,7 @@ def run_one(entry: dict[str, Any], root: Path, manifest_dir: Path, tool: str,
         if max_oracle_executions is not None:
             command += ["--max-oracle-executions", str(max_oracle_executions)]
         if tool == "ddmin":
-            command += ["--baseline", "2"]
+            command += ["--profile", "statement-ddmin"]
         outcome = command_result(command, root, deadline)
         reduction_elapsed = outcome["elapsed"]
         if tool == "occam":
