@@ -79,5 +79,5 @@ fi
 if [ $# -gt 0 ]; then
     exec "$@"
 else
-    exec ./benchmarks/run_all.sh
+    exec /bin/bash
 fi

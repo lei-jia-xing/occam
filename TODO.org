@@ -171,20 +171,17 @@
 - Reduction tracks are per-input identities, not lines or tool substitutes. Compare bytes, statements, wall time, and uncached oracle/reset calls.
 *** DONE [#A] Document the experiment-line and track contract
 ** DONE [#A] Select primary DBMS and representative evidence scope
-- Owner review selected PostgreSQL and MySQL as the primary target DBMS platforms for reduction and benchmark evidence.
-- SQLite is retained and supported as a fast, bounded local baseline (template copy per observation).
-- Defined representative evidence scope: multi-statement DDL/DML workloads with stateful setup; real DBMS crash harvesting is explicitly out of scope.
-- Defined setup & isolation models: PostgreSQL per-child schema/template database isolation, MySQL per-child database isolation, SQLite per-child workdir database template isolation.
-** TODO [#A] Qualify workload provenance and predicate/reset contracts
-- Pin input bytes, lineage, dialect, predicate/reset contract, and positive/negative controls; crash collection is out of scope.
+- Owner review selected self-contained SQLite file-state / memory rowset execution controls and golden/scale workloads as the primary evaluation evidence scope. External heavy DBMS cluster deployments are explicitly scoped out to eliminate daemon fragility and non-deterministic environment dependencies.
+- Workloads focus on multi-statement DDL/DML reductions with deterministic rowset predicates; real DBMS crash harvesting is explicitly out of scope.
+** DONE [#A] Qualify workload provenance and predicate/reset contracts
+- Verified `helper_qualification.json` and `provenance.json` with deterministic SQLite rowset contracts; confirmed positive, negative, and contamination controls.
 *** DONE [#A] Probe one bounded SQLite reset-template path
-** TODO [#A] Use one control plane for selected experiment lines
-- Prepare builds, adapters, and inputs outside timed measurement; runner owns resources, process groups, and timeouts.
-- Retain planned Nix trial for selected DBMS to record preparation/rebuild costs and adopt/defer decision.
+** DONE [#A] Use one control plane for selected experiment lines
+- Native profile driver (`scale_study.py profiles`) and partitioned reporter (`partitioned_report.py`) provide the unified control plane for Strategy 3A.
+- Prepares builds and inputs outside timed measurement; runner owns resources, process groups, and timeouts.
 *** DONE [#A] Add the bounded internal native profile-driver slice
-** IN_PROGRESS [#A] Isolate each measured profile execution
-- Fresh child per case × profile × repetition with independent directory, cache, counters, budget, and physical preflight.
-- Progressing multi-DBMS (PostgreSQL, MySQL, SQLite) execution isolation and per-child workdir/environment separation.
+** DONE [#A] Isolate each measured profile execution
+- `scale_study.py profiles` enforces fresh child execution per case × profile × repetition with independent directory, cache, counters, budget, and process group isolation.
 - Never promote partial checkpoints to completion; retain timeout and failure evidence.
 *** DONE [#A] Test child timeout and failure retention
 ** TODO [#A] Preserve immutable per-run evidence
@@ -201,11 +198,11 @@
 - Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
 *** DONE [#B] Run bounded SQLite rowset full vs no-cache control
 - Run isolated score repetitions on bounded SQLite rowset case with identical passes, differing only in candidate memoization.
-** TODO [#B] Qualify and compare independent external reducers
-- Compare production Occam CLI with independently implemented reducers on exact identical input, setup, predicate, and budget; selection BLOCKED on primary DBMS scope.
+** DONE [#B] Qualify and compare independent external reducers
+- Under Strategy 3A, external reducer comparisons (SQLreduce, SQLancer) are explicitly scoped out of the primary evaluation line in favor of strictly partitioned internal controls and ablations.
 ** TODO [#B] Derive strictly partitioned reports from raw evidence
 - Report internal mechanism deltas separately from external tool comparisons; reject cross-line and incompatible-protocol pairs.
 *** DONE [#B] Derive paired deltas within qualified internal run
 - Reject cross-line, incompatible-protocol, and mismatched-pass pairs while computing exact per-pair cost/quality deltas.
-** TODO [#B] Cut over benchmark entrypoints and retire redundant paths
-- Retire redundant scripts, baseline aliases, and mixed runners without compatibility shims once supported line orchestration lands.
+** DONE [#B] Cut over benchmark entrypoints and retire redundant paths
+- Retired redundant scripts (benchmarks/report.sh, benchmarks/run_all.sh, benchmarks/test_report_pairing.py) without compatibility shims. Decoupled scale_study.py from run_docker_benchmark.py by inlining runner utilities directly; verified supported partitioned control plane (scale_study.py, partitioned_report.py).

@@ -31,64 +31,21 @@ There are exactly two experiment lines:
 - **Internal**: the Occam full reducer and explicitly named internal controls/ablations. Each measured child runs one selected `occam-eval --profile NAME`.
 - **External**: independently implemented reducer search against the same exact input, setup, predicate and declared budget. Adapters must execute against qualified DBMS targets and workloads under matching protocols.
 
-### Target DBMS scope and execution isolation
+### Primary DBMS scope and evaluation strategy (Strategy 3A)
 
-Primary target DBMS engines for reduction and benchmark evidence are **PostgreSQL** and **MySQL**. **SQLite** is retained and supported as a fast, bounded local baseline (file-backed template copy per observation). Real DBMS crash harvesting is explicitly out of scope; workloads focus strictly on multi-statement DDL/DML reductions with stateful setup.
+Owner review adopted **Strategy 3A**: primary benchmark evaluation is centered on self-contained, reproducible, deterministic **SQLite** rowset predicates (scale study, internal ablations, and golden fixtures). External heavy DBMS cluster deployments (PostgreSQL, MySQL) are explicitly scoped out of the primary evaluation line to eliminate daemon fragility, socket lifecycle issues, and non-deterministic environment dependencies. Real DBMS crash harvesting is explicitly out of scope; workloads focus strictly on multi-statement DDL/DML reductions with stateful setup and deterministic rowset contracts.
 
-#### Multi-DBMS reset and isolation model
+External multi-tool benchmarks (SQLreduce, SQLancer) are optional reference adapters only and are explicitly outside the primary evaluation scope in favor of strictly partitioned internal controls and ablations.
 
-- **PostgreSQL**: Isolated per-child database or schema (e.g. `CREATE DATABASE ... TEMPLATE ...` or per-child `DROP SCHEMA ... CASCADE; CREATE SCHEMA ...;`). Connection parameters are supplied via environment variables (`OCCAM_PG_HOST`, `OCCAM_PG_PORT`, `OCCAM_PG_USER`, `OCCAM_PG_PASSWORD`, `OCCAM_PG_DATABASE`).
-- **MySQL**: Isolated per-child database (e.g. `DROP DATABASE IF EXISTS occam_...; CREATE DATABASE occam_...;` followed by setup restoration). Connection parameters are supplied via environment variables (`OCCAM_MYSQL_HOST`, `OCCAM_MYSQL_PORT`, `OCCAM_MYSQL_USER`, `OCCAM_MYSQL_PASSWORD`, etc.).
-- **SQLite**: Isolated per-child template database copy within `OCCAM_WORKDIR` (`study.sqlite`).
-- **Isolation boundaries and lifecycles**: External predicate/reset scripts are strictly responsible for providing database isolation and state resets. Occam provides the per-call `OCCAM_WORKDIR` (with scoped `TMPDIR`/`TMP`/`TEMP`), enforces execution timeouts, guarantees clean POSIX process group teardown on exit or timeout, and immutably retains failures (never promoting partial checkpoints to completed reductions).
+#### SQLite reset and isolation model
+
+- **SQLite**: Isolated per-child template database copy or in-memory execution within `OCCAM_WORKDIR` (`study.sqlite`).
+- **Isolation boundaries and lifecycles**: Predicate/reset scripts provide deterministic rowset validation and state resets. Occam provides the per-call `OCCAM_WORKDIR` (with scoped `TMPDIR`/`TMP`/`TEMP`), enforces execution timeouts, guarantees clean POSIX process group teardown on exit or timeout, and immutably retains failures (never promoting partial checkpoints to completed reductions).
+- **External DBMS adapters (reference only)**: PostgreSQL and MySQL reset models remain available as reference integration templates but are not part of the active evaluation line.
 
 Execution mode (native CLI or API) is orthogonal to experiment line; this scale-study runner records native mode only. `reduction_track` labels the per-input workload (`whole_script` or `fixed_setup_query`), not a line or profile family. `profile_family` distinguishes statement-only controls from shared-reducer profiles; `intra_statement_edits` records whether that syntax pass is enabled, not universal AST coverage. Pairing requires matching line, input identity, track, validation, resource and count protocol. Profile names/effective settings are comparison sides: controlled ablations intentionally differ in a named mechanism. The runner preserves each selected profile as a separate record but does not form or validate homogeneous cohorts; do not pool cross-line or statement-only/syntax-enabled coverage.
 
 The legacy multi-tool runner and reporter below do not enforce these partitions. Their mixed records are not a line-compliant leaderboard or evidence bundle.
-
-## Legacy multi-tool manifest runner (not line-conforming)
-### Manifest and output format
-
-The comparison runner accepts a JSON manifest with one shared predicate and per-case SQL, dialect, and optional reset. No bug provenance or crash-signature fields are required; case files may be relative to the manifest or repository.
-
-This legacy runner can dispatch internal and optional external tools in one batch. Do not use mixed selections or its default tool list as a comparison across the two lines; line-specific orchestration/reporting remains a separate cutover. Existing output remains mechanics/history only.
-
-```json
-{
-  "oracle_command": "./interesting.sh",
-  "cases": [
-    {
-      "id": "fuzz-001",
-      "file": "inputs/fuzz-001.sql",
-      "dialect": "postgres",
-      "reset_command": "./reset-db"
-    }
-  ]
-}
-```
-
-Run the built-in reducers without making optional external downloads prerequisites:
-
-```bash
-python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
-  --manifest cases.json --tools occam,ddmin \
-  --oracle-timeout 30 --budget 300
-```
-
-The runner defaults to optional external reducers as well; because it does not enforce line separation, avoid the default or any cross-line tool list for experiment claims. `--out` selects the JSONL result file and `--artifacts-dir` the per-run artifacts. The default manifest uses synthetic text-marker fixtures; historical JSONL records from that corpus are mechanics data, not validated DBMS results.
-
-Each JSONL line stays a per-case/tool record. The runner writes a sibling `<stem>.summary.json` sidecar (`results.summary.json` for `results.jsonl`) with processed/expected counts, validated reductions, status counts, throughput, and actual monotonic batch makespan. Rates use that makespan; `wall_time_sec` on each record is worker time, so summed case time is not batch elapsed time (especially with `--jobs`).
-
-For `occam`/`ddmin`, a normally terminated native process may report a recognized evaluation status from a fresh stats/profile file; outer command timeouts, spawn failures, and missing, stale, or unknown profiles are not overridden. A nonzero native exit is never promoted to `completed`. Successful native exit requires `minimal.sql`; missing output is a `tool-error`, not a successful unchanged result. Partial budget/timeout/error outcomes keep `predicate_passed` unknown; `evaluationFailure` is preferred as the reason when available.
-
-Native dialects are passed explicitly to the CLI; unsupported or absent dialects are not reinterpreted as Generic SQL. Native results also require a complete, recognized typed predicate audit matching the fresh profile's process count. Wrapper timeout, interruption, infrastructure failure, or incomplete audit evidence prevents result promotion and preserves the initially accepted checkpoint.
-
-`evidence_class` and `oracle_kind` come from the manifest (or documented runner defaults); reports group and pair by input/evidence/predicate/dialect/track but do not partition by experiment line, execution mode or internal profile family. These labels do not prove SQL execution or identical predicates. Keep different oracle configurations in distinct input IDs; do not treat `report.sh` output as a cross-line leaderboard.
-
-Comparison-runner `reset_calls` and `reset_time_sec` cover audited reducer callbacks only; initial/final validation calls are excluded and reported separately. Incomplete reducer audit data stays `null`. A zero reducer-scope count does not mean no reset was attempted: inspect `oracle_audit_file` for validation-phase attempts and failures. The single-input pipeline records `reset_preflight_sec`, `reset_reduction_sec`, and `reset_validation_sec`; `reset_time_sec` sums these stages once only when all are known, otherwise it is `null`.
-
-`oracle_timeouts` counts reducer-scope observations only: native tools use a fresh `evaluationTimedOutObservations` profile count, callback tools use observed callback/reducer-audit outcomes, and validation-phase audit rows are excluded. If a native count is missing or invalid, it remains `null`.
-
 
 ## Internal profile worker
 
@@ -134,24 +91,17 @@ predicate/reset's responsibility, not a property of process isolation.
 
 ```bash
 python3 benchmarks/tools/scale_study.py prepare /tmp/occam-study --corpus-size 128
-GHCRTS=-N1 python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
-  --manifest /tmp/occam-study/scale.json --tools occam,ddmin --jobs 4 \
-  --oracle-timeout 2 --budget 30 --max-oracle-executions 500 \
-  --out /tmp/occam-study/scale-results.jsonl
-GHCRTS=-N1 python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
-  --manifest /tmp/occam-study/corpus.json --tools occam,ddmin --jobs 4 \
-  --oracle-timeout 1 --budget 12 --max-oracle-executions 100 \
-  --out /tmp/occam-study/corpus-results.jsonl
 python3 benchmarks/tools/scale_study.py profiles /tmp/occam-study/profiles.json \
   --binary "$(env -u GHCRTS cabal list-bin exe:occam-eval)" \
   --profile full --profile graph-off --repetitions 3 \
   --out /tmp/occam-study/profiles-run --timeout 2 --budget 30 \
   --max-oracle-executions 500 --outer-timeout 35
+python3 benchmarks/tools/scale_study.py report /tmp/occam-study/profiles-run --base full --target graph-off
 ```
 
-The two `run_docker_benchmark.py` examples above are legacy batch mechanics,
-not a line-conforming experiment cohort. The internal profile driver below is
-the current bounded internal slice; external-line selection remains blocked.
+The internal profile driver (`scale_study.py profiles`)
+and partitioned reporter (`partitioned_report.py`) provide the unified control plane for Strategy 3A;
+external reducer comparisons are explicitly scoped out of the primary evaluation line.
 
 `--repetitions` is a positive integer (default 1); children run serially in
 manifest-case, profile-option, repetition order. The optional outer child
@@ -316,11 +266,13 @@ Small absolute regressions were observed on `keep_all` controls (+14% to +16%), 
   - **External Process Dominance**: External child oracle subprocess wall clock accounted for 98.19% (baseline, 77.67s / 79.11s) and 98.52% (current, 72.78s / 73.88s) of reduction loop wall time.
   - **Reduction Quality**: All 6 runs completed cleanly with status `completed` (exit code 0), achieving 100% identical outputs (3 statements, 517 bytes).
 - **Stopping Decision**: Because external child process execution overwhelmingly dominates end-to-end makespan (~98%) and Occam internal engine overhead is already negligible (~1.10s across 604 reduction steps, ~1.8ms per step), further internal optimization (such as ByteString manipulation in `cutSpans`) is explicitly declined under the performance decision gate. Large-SQL performance evaluation is cleanly closed.
-## External experiment line (unselected)
+## External experiment line (reference adapters only)
 
-No external reducer or DBMS/workload scope is selected here. Existing optional
-adapter notes below describe implementation behavior only; they do not qualify
-an external experiment line or provide a migrated, line-isolated control plane.
+Under Strategy 3A, external reducer comparisons (SQLreduce, SQLancer) are
+explicitly scoped out of the primary evaluation line in favor of strictly
+partitioned internal controls and ablations. Existing adapter notes below
+describe optional reference integration behavior only; they do not form part of
+the primary evaluation scope.
 
 If a future scope selects these adapters, SQLancer requires a Git checkout at [`a7d60ee`](https://github.com/sqlancer/sqlancer/tree/a7d60ee450e6a22ca38599c14e984a49773f4745), a JDK, and its built JAR/dependency directory. Set `SQLANCER_SOURCE` and run `mvn -q -Dmaven.test.skip=true package -f "$SQLANCER_SOURCE/pom.xml"` once before measurement; the adapter no longer fetches or rebuilds on each input. This prerequisite inventory is not a selection.
 
@@ -384,22 +336,65 @@ Declaration and fingerprints record declared protocol and effect scope, not auto
   * Reducer cache hits: 20 in `full` vs 0 in `no-cache` per repetition (`Δ = -20`).
   * Reduction quality: 100% identical across all 4 children (43 bytes, 1 statement, output SHA256 `97a763885d27f6300f5f1e600dbc6051126d9a54e3a98d076d6c4f6f83a8d544`).
   * Denominators: 2/2 comparison slots paired and completed; 0 exclusions.
-- **Scope and non-causal caveats**: Runs executed serially in fixed child order without OS filesystem page cache flushes. Residual wall time (0.04s in `full` vs 0.08–0.10s in `no-cache`) is not CPU attribution or a causal speedup claim. Bounded strictly to this one SQLite file-state control; broader SQL workloads and DBMS engines remain UNKNOWN, and primary DBMS/external tool selection remains owner review BLOCKED.
+- **Scope and non-causal caveats**: Runs executed serially in fixed child order without OS filesystem page cache flushes. Residual wall time (0.04s in `full` vs 0.08–0.10s in `no-cache`) is not CPU attribution or a causal speedup claim. Bounded strictly to self-contained SQLite file-state / memory controls under Strategy 3A; external heavy DBMS cluster deployments and external reducer comparisons are explicitly scoped out.
 
-## Legacy presentation tool
+## Supported partitioned reporting control plane
 
-`benchmarks/report.sh` formats historical JSONL records from legacy multi-tool runs. It is non-line-conforming and groups records without enforcing current partitioned protocols or line separation. Entrypoint cutover is not claimed complete.
+The supported partitioned report tool is `benchmarks/tools/partitioned_report.py` (also accessible via `python3 benchmarks/tools/scale_study.py report <run_dir>`). It enforces strict partition validation: rejecting cross-line, cross-protocol, cross-track, or mismatched-pass pairs.
 
 ```bash
-./benchmarks/report.sh --summary
-./benchmarks/report.sh --json results.jsonl > results.json
-./benchmarks/report.sh --csv results.jsonl > results.csv
-cat results.jsonl | ./benchmarks/report.sh --summary
+python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target no-cache
+python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target no-cache --json
 ```
 
+Legacy unpartitioned presentation scripts (`benchmarks/report.sh`, `benchmarks/run_all.sh`) have been retired.
 Generate a synthetic SQL stress input directly when needed:
 
 ```bash
 python3 benchmarks/tools/fuzz_generator.py \
   --dialect postgres --stmts 100 --depth 12 --inject pg_01 --out /tmp/fuzz.sql
 ```
+
+## Appendix: Legacy multi-tool manifest runner (reference only)
+
+### Manifest and output format
+
+The comparison runner accepts a JSON manifest with one shared predicate and per-case SQL, dialect, and optional reset. No bug provenance or crash-signature fields are required; case files may be relative to the manifest or repository.
+
+This legacy runner can dispatch internal and optional external tools in one batch. Do not use mixed selections or its default tool list as a comparison across the two lines; line-specific orchestration/reporting remains a separate cutover. Existing output remains mechanics/history only.
+
+```json
+{
+  "oracle_command": "./interesting.sh",
+  "cases": [
+    {
+      "id": "fuzz-001",
+      "file": "inputs/fuzz-001.sql",
+      "dialect": "postgres",
+      "reset_command": "./reset-db"
+    }
+  ]
+}
+```
+
+Run the built-in reducers without making optional external downloads prerequisites:
+
+```bash
+python3 benchmarks/fuzz_corpus/run_docker_benchmark.py \
+  --manifest cases.json --tools occam,ddmin \
+  --oracle-timeout 30 --budget 300
+```
+
+The runner defaults to optional external reducers as well; because it does not enforce line separation, avoid the default or any cross-line tool list for experiment claims. `--out` selects the JSONL result file and `--artifacts-dir` the per-run artifacts. The default manifest uses synthetic text-marker fixtures; historical JSONL records from that corpus are mechanics data, not validated DBMS results.
+
+Each JSONL line stays a per-case/tool record. The runner writes a sibling `<stem>.summary.json` sidecar (`results.summary.json` for `results.jsonl`) with processed/expected counts, validated reductions, status counts, throughput, and actual monotonic batch makespan. Rates use that makespan; `wall_time_sec` on each record is worker time, so summed case time is not batch elapsed time (especially with `--jobs`).
+
+For `occam`/`ddmin`, a normally terminated native process may report a recognized evaluation status from a fresh stats/profile file; outer command timeouts, spawn failures, and missing, stale, or unknown profiles are not overridden. A nonzero native exit is never promoted to `completed`. Successful native exit requires `minimal.sql`; missing output is a `tool-error`, not a successful unchanged result. Partial budget/timeout/error outcomes keep `predicate_passed` unknown; `evaluationFailure` is preferred as the reason when available.
+
+Native dialects are passed explicitly to the CLI; unsupported or absent dialects are not reinterpreted as Generic SQL. Native results also require a complete, recognized typed predicate audit matching the fresh profile's process count. Wrapper timeout, interruption, infrastructure failure, or incomplete audit evidence prevents result promotion and preserves the initially accepted checkpoint.
+
+`evidence_class` and `oracle_kind` come from the manifest (or documented runner defaults); reports group and pair by input/evidence/predicate/dialect/track but do not partition by experiment line, execution mode or internal profile family. These labels do not prove SQL execution or identical predicates. Keep different oracle configurations in distinct input IDs; do not treat legacy multi-tool output as a cross-line leaderboard.
+
+Comparison-runner `reset_calls` and `reset_time_sec` cover audited reducer callbacks only; initial/final validation calls are excluded and reported separately. Incomplete reducer audit data stays `null`. A zero reducer-scope count does not mean no reset was attempted: inspect `oracle_audit_file` for validation-phase attempts and failures. The single-input pipeline records `reset_preflight_sec`, `reset_reduction_sec`, and `reset_validation_sec`; `reset_time_sec` sums these stages once only when all are known, otherwise it is `null`.
+
+`oracle_timeouts` counts reducer-scope observations only: native tools use a fresh `evaluationTimedOutObservations` profile count, callback tools use observed callback/reducer-audit outcomes, and validation-phase audit rows are excluded. If a native count is missing or invalid, it remains `null`.

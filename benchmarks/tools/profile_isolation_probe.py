@@ -267,7 +267,7 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         "OCCAM_PROFILE_PROBE_REAL_BINARY": str(binary),
     })
     control_timeout = max(60, int(outer_timeout * 2 + 30))
-    result = study.runner_module().command_result(
+    result = study.command_result(
         runner_command,
         cwd=ROOT,
         deadline=time.monotonic() + control_timeout,

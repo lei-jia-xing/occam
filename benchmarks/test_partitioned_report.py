@@ -238,26 +238,61 @@ class PartitionedReportConsumerTests(unittest.TestCase):
     def test_reject_mismatched_sql_track_or_contract(self):
         meta = make_valid_metadata()
 
-        # Mismatched input_sha256 against declared case
-        row_full = make_valid_row(profile="full", child_id="c1", cache=True)
-        row_nocache = make_valid_row(profile="no-cache", child_id="c2", cache=False)
-        row_nocache["input_sha256"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        paired, summary = report.pair_internal_ablation(
-            run_metadata=meta,
-            records=[row_full, row_nocache],
-        )
-        self.assertEqual(len(paired), 0)
-        self.assertEqual(summary["incompatible_protocol_records"], 1)
-        self.assertEqual(summary["unpaired_base_count"], 1)
+        with self.subTest("mismatched input_sha256"):
+            row_full = make_valid_row(profile="full", child_id="c1", cache=True)
+            row_nocache = make_valid_row(profile="no-cache", child_id="c2", cache=False)
+            row_nocache["input_sha256"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            paired, summary = report.pair_internal_ablation(
+                run_metadata=meta,
+                records=[row_full, row_nocache],
+            )
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["incompatible_protocol_records"], 1)
+            self.assertEqual(summary["unpaired_base_count"], 1)
 
-        # Undeclared case_id
-        row_bad_cid = make_valid_row(profile="full", child_id="c3", cache=True)
-        row_bad_cid["case_id"] = "unknown-case"
-        paired, summary = report.pair_internal_ablation(
-            run_metadata=meta,
-            records=[row_bad_cid, row_nocache],
-        )
-        self.assertEqual(len(paired), 0)
+        with self.subTest("undeclared case_id"):
+            row_bad_cid = make_valid_row(profile="full", child_id="c3", cache=True)
+            row_bad_cid["case_id"] = "unknown-case"
+            row_nocache = make_valid_row(profile="no-cache", child_id="c4", cache=False)
+            paired, summary = report.pair_internal_ablation(
+                run_metadata=meta,
+                records=[row_bad_cid, row_nocache],
+            )
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["incompatible_protocol_records"], 1)
+
+        with self.subTest("mismatched reduction_track"):
+            row_full = make_valid_row(profile="full", child_id="c5", cache=True)
+            row_nocache = make_valid_row(profile="no-cache", child_id="c6", cache=False)
+            row_nocache["reduction_track"] = "whole_script"
+            paired, summary = report.pair_internal_ablation(
+                run_metadata=meta,
+                records=[row_full, row_nocache],
+            )
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["incompatible_protocol_records"], 1)
+
+        with self.subTest("mismatched predicate_command_sha256"):
+            row_full = make_valid_row(profile="full", child_id="c7", cache=True)
+            row_nocache = make_valid_row(profile="no-cache", child_id="c8", cache=False)
+            row_nocache["predicate_command_sha256"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            paired, summary = report.pair_internal_ablation(
+                run_metadata=meta,
+                records=[row_full, row_nocache],
+            )
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["incompatible_protocol_records"], 1)
+
+        with self.subTest("mismatched reset_command_sha256"):
+            row_full = make_valid_row(profile="full", child_id="c9", cache=True)
+            row_nocache = make_valid_row(profile="no-cache", child_id="c10", cache=False)
+            row_nocache["reset_command_sha256"] = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            paired, summary = report.pair_internal_ablation(
+                run_metadata=meta,
+                records=[row_full, row_nocache],
+            )
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["incompatible_protocol_records"], 1)
 
     def test_case_contract_validation_edges(self):
         with self.subTest("opaque string contract fails"):
@@ -322,6 +357,15 @@ class PartitionedReportConsumerTests(unittest.TestCase):
             self.assertEqual(len(paired), 0)
             self.assertEqual(summary["rejected_settings_slots_count"], 1)
 
+
+        with self.subTest("mismatched dialect in settings"):
+            row_full5 = make_valid_row(profile="full", child_id="c9_dial", cache=True)
+            row_nocache5 = make_valid_row(profile="no-cache", child_id="c10_dial", cache=False)
+            row_nocache5["settings"]["dialect"] = "postgres"
+            paired, summary = report.pair_internal_ablation(run_metadata=meta, records=[row_full5, row_nocache5])
+            self.assertEqual(len(paired), 0)
+            self.assertEqual(summary["rejected_settings_slots_count"], 1)
+            self.assertEqual(len(summary["exclusions"]["rejected_settings"]), 1)
     def test_reject_differing_side_scopes(self):
         meta = make_valid_metadata()
         row_full = make_valid_row(profile="full", child_id="c1", cache=True)

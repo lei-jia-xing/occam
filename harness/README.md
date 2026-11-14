@@ -1,6 +1,6 @@
 # Optional fuzz producer and container entrypoint
 
-The optional SQLsmith driver runs an upstream fuzzer; it does not collect crash reports, reproduce bugs, or reduce SQL. `docker_entrypoint.sh` starts its configured PostgreSQL and MySQL services and dispatches a supplied command (or the default benchmark runner). To reduce existing SQL, use `benchmarks/live_fuzz_pipeline.sh` with a predicate that accepts the target behavior (see `benchmarks/README.md`). Your predicate or reset command must handle real database reset and isolation.
+The optional SQLsmith driver runs an upstream fuzzer; it does not collect crash reports, reproduce bugs, or reduce SQL. `docker_entrypoint.sh` starts its configured PostgreSQL and MySQL services and dispatches a supplied command (or an interactive shell). To reduce existing SQL, use `benchmarks/live_fuzz_pipeline.sh` with a predicate that accepts the target behavior (see `benchmarks/README.md`). Your predicate or reset command must handle real database reset and isolation.
 
 ## SQLsmith
 
@@ -14,4 +14,4 @@ The optional SQLsmith driver runs an upstream fuzzer; it does not collect crash 
 
 The SQLancer reducer comparison lives in `benchmarks/upstream/sqlancer_adapter.sh`; it is separate from producing new fuzz input.
 
-`docker_entrypoint.sh` starts the configured PostgreSQL and MySQL services, then runs the supplied command (or `benchmarks/run_all.sh` when no command is supplied); it does not provide candidate-level database isolation.
+`docker_entrypoint.sh` starts the configured PostgreSQL and MySQL services, then runs the supplied command (or starts an interactive shell when no command is supplied); it does not provide candidate-level database isolation.

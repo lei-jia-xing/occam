@@ -7,10 +7,14 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import time
+from typing import Any
 import uuid
 from contextlib import closing
 from pathlib import Path
@@ -183,29 +187,355 @@ def oracle(path):
         connection.close()
 
 
-def runner_module():
-    from importlib.util import module_from_spec, spec_from_file_location
+# NOTE: coarse statement splitter used solely during test-set preparation (prepare()) to isolate the target query from setup statements; not used for candidate reduction or engine-level SQL parsing (which belongs to Occam's native parser).
+def split_sql_statements(sql: str, dialect: str = "") -> list[str]:
+    """Split on SQL terminators, not semicolons inside strings/comments/dollar quotes."""
+    dialect = dialect.lower()
+    statements: list[str] = []
+    start = 0
+    has_code = False
+    quote = ""
+    dollar_tag = ""
+    block_depth = 0
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        following = sql[i + 1] if i + 1 < len(sql) else ""
+        if block_depth:
+            if char == "/" and following == "*":
+                block_depth += 1
+                i += 2
+            elif char == "*" and following == "/":
+                block_depth -= 1
+                i += 2
+            else:
+                i += 1
+            continue
+        if dollar_tag:
+            if sql.startswith(dollar_tag, i):
+                i += len(dollar_tag)
+                dollar_tag = ""
+            else:
+                i += 1
+            continue
+        if quote:
+            if char == "\\" and i + 1 < len(sql):
+                i += 2
+            elif char == quote:
+                if following == quote:
+                    i += 2
+                else:
+                    quote = ""
+                    i += 1
+            else:
+                i += 1
+            continue
+        if char == "/" and following == "*":
+            block_depth = 1
+            i += 2
+        elif char == "-" and following == "-" and (
+            dialect not in {"mysql", "mariadb"}
+            or i + 2 == len(sql)
+            or sql[i + 2].isspace()
+            or ord(sql[i + 2]) < 32
+        ):
+            i += 2
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+        elif char == "#" and dialect in {"mysql", "mariadb"}:
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+        elif char in "'\"`":
+            quote = char
+            has_code = True
+            i += 1
+        elif char == "$" and dialect not in {"mysql", "mariadb"}:
+            match = re.match(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$", sql[i:])
+            if match:
+                dollar_tag = match.group(0)
+                has_code = True
+                i += len(dollar_tag)
+            else:
+                has_code = True
+                i += 1
+        elif char == ";":
+            if has_code:
+                statement = sql[start:i].strip()
+                if statement:
+                    statements.append(statement + ";")
+            start = i + 1
+            has_code = False
+            i += 1
+        else:
+            if not char.isspace():
+                has_code = True
+            i += 1
+    if has_code:
+        statement = sql[start:].strip()
+        if statement:
+            statements.append(statement + ("" if statement.endswith(";") else ";"))
+    return statements
 
-    spec = spec_from_file_location(
-        "occam_study_runner", ROOT / "benchmarks/fuzz_corpus/run_docker_benchmark.py"
+
+def case_file(root: Path, entry: dict[str, Any], manifest_dir: Path) -> Path:
+    candidate = Path(entry["file"])
+    if candidate.is_absolute():
+        return candidate
+    for base in (manifest_dir, root, root / "benchmarks" / "fuzz_corpus"):
+        path = base / candidate
+        if path.is_file():
+            return path
+    return manifest_dir / candidate
+
+
+def base_record(
+    entry: dict[str, Any],
+    tool: str,
+    oracle_timeout: float,
+    budget: float,
+    max_oracle_executions: int | None,
+) -> dict[str, Any]:
+    sid = entry["id"]
+    evidence = entry.get("evidence_class", "synthetic")
+    oracle_kind = entry.get(
+        "oracle_kind", "text_pattern" if evidence == "synthetic" else "unknown"
     )
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return {
+        "scenario": sid,
+        "evidence_class": evidence,
+        "oracle_kind": oracle_kind,
+        "dialect": entry.get("dialect", "unknown"),
+        "tool": tool,
+        "status": "tool-error",
+        "status_reason": None,
+        "scale": None,
+        "initial_stmts": None,
+        "reduced_stmts": None,
+        "stmt_red_pct": None,
+        "initial_bytes": None,
+        "reduced_bytes": None,
+        "byte_red_pct": None,
+        "oracle_timeout_sec": oracle_timeout,
+        "oracle_timeouts": None,
+        "budget_sec": budget,
+        "max_oracle_executions": max_oracle_executions,
+        "oracle_calls": None,
+        "oracle_calls_scope": "uncached reducer-side callbacks; runner initial/final checks excluded",
+        "candidate_checks": None,
+        "oracle_cache_hits": None,
+        "validation_calls": 0,
+        "validation_time_sec": 0.0,
+        "reset_calls": None,
+        "reset_calls_scope": "uncached reducer-side callbacks; runner initial/final checks excluded",
+        "reset_time_sec": None,
+        "reset_accounting": "not measured; predicate-internal reset unknown",
+        "reduction_time_sec": None,
+        "wall_time_sec": None,
+        "predicate_passed": None,
+        "tool_candidate_valid": None,
+        "checkpoint_used": None,
+        "reduction_track": entry.get("reduction_track", "whole_script"),
+    }
+
+
+def kill_process_tree(pid: int, failures: list[str] | None = None) -> list[str]:
+    if failures is None:
+        failures = []
+    if sys.platform == "linux":
+        try:
+            children = (
+                Path(f"/proc/{pid}/task/{pid}/children")
+                .read_text(encoding="ascii")
+                .split()
+            )
+        except FileNotFoundError:
+            children = []
+        except OSError as exc:
+            children = []
+            failures.append(f"could not enumerate descendants of {pid}: {exc}")
+        for child in children:
+            kill_process_tree(int(child), failures)
+    if os.name == "posix":
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            failures.append(f"could not signal process group {pid}: {exc}")
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            failures.append(f"could not signal process {pid}: {exc}")
+    return failures
+
+
+def command_result(
+    command: list[str],
+    cwd: Path,
+    deadline: float,
+    timeout_limit: float | None = None,
+    allow_nonzero: bool = False,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    timeout = (
+        min(deadline - started, timeout_limit)
+        if timeout_limit is not None
+        else deadline - started
+    )
+    cleanup_scope = (
+        "Linux /proc descendants plus owned POSIX process group; escaped/reparented descendants not guaranteed"
+        if os.name == "posix" and sys.platform == "linux"
+        else "owned POSIX process group; descendant enumeration unavailable"
+        if os.name == "posix"
+        else "direct process only; descendant cleanup unknown"
+    )
+    if timeout <= 0:
+        return {
+            "status": "timeout",
+            "elapsed": 0.0,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "budget exhausted",
+            "cleanup_status": "not-started",
+            "cleanup_error": None,
+            "cleanup_scope": "no child was started",
+        }
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            status = (
+                "completed"
+                if process.returncode == 0 or allow_nonzero
+                else "tool-error"
+            )
+            return {
+                "status": status,
+                "elapsed": time.monotonic() - started,
+                "returncode": process.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "cleanup_status": "unknown",
+                "cleanup_error": None,
+                "cleanup_scope": "normal exit; descendant cleanup not observed",
+            }
+        except subprocess.TimeoutExpired as exc:
+            try:
+                cleanup_failures = kill_process_tree(process.pid)
+            except Exception as cleanup_exc:
+                cleanup_failures = [f"process-tree cleanup raised: {cleanup_exc}"]
+            try:
+                stdout, stderr = process.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired as drain:
+                cleanup_failures.append(
+                    "captured output remained open after the termination request"
+                )
+                stdout = drain.stdout or exc.stdout or ""
+                stderr = drain.stderr or exc.stderr or ""
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                    except (OSError, subprocess.TimeoutExpired) as wait_exc:
+                        cleanup_failures.append(
+                            f"owned child did not exit after kill: {wait_exc}"
+                        )
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError as close_exc:
+                            cleanup_failures.append(
+                                f"could not close captured output pipe: {close_exc}"
+                            )
+            captured_stdout = (
+                stdout.decode(errors="replace")
+                if isinstance(stdout, bytes)
+                else (stdout or "")
+            )
+            captured_stderr = (
+                stderr.decode(errors="replace")
+                if isinstance(stderr, bytes)
+                else (stderr or "")
+            )
+            cleanup_status = (
+                "incomplete"
+                if any(
+                    failure.startswith(
+                        ("captured output", "owned child", "could not close")
+                    )
+                    for failure in cleanup_failures
+                )
+                else (
+                    "failed"
+                    if cleanup_failures
+                    else (
+                        "requested"
+                        if os.name == "posix" and sys.platform == "linux"
+                        else "unknown"
+                    )
+                )
+            )
+            return {
+                "status": "timeout",
+                "elapsed": time.monotonic() - started,
+                "returncode": None,
+                "stdout": captured_stdout,
+                "stderr": captured_stderr or "process timed out",
+                "cleanup_status": cleanup_status,
+                "cleanup_error": (
+                    "; ".join(cleanup_failures) if cleanup_failures else None
+                ),
+                "cleanup_scope": cleanup_scope,
+            }
+    except OSError as exc:
+        return {
+            "status": "tool-error",
+            "elapsed": time.monotonic() - started,
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "cleanup_status": "not-started",
+            "cleanup_error": None,
+            "cleanup_scope": "child did not start",
+        }
+
+
+def read_json(path: Path) -> dict[str, Any] | list[Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, (dict, list)) else None
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+
+
+def metric_count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
 
 
 def prepare(directory, corpus_size):
     import hashlib
     import shlex
 
-    runner = runner_module()
     directory.mkdir(parents=True, exist_ok=True)
     if any(directory.iterdir()):
         raise ValueError(
             "choose an empty study directory; existing evidence is preserved"
         )
     source = ROOT / "test/golden/fuzz_golden_03_deep_expressions.golden.sql"
-    statements = runner.split_sql_statements(source.read_text(), "sqlite")
+    statements = split_sql_statements(source.read_text(), "sqlite")
     setup = "\n".join(statements[:-1]) + "\n"
     groups = {"scale": [], "corpus": [], "profiles": [], "resets": []}
 
@@ -429,7 +759,6 @@ def profiles(
     )
     flamegraph_bin = find_flamegraph_tool(ghc_prof_flamegraph) if diagnostic else None
     perf_ver = get_perf_version(perf_bin) if perf_available else None
-    runner = runner_module()
     if not all(
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -508,7 +837,7 @@ def profiles(
             source["reset_command"], str
         ):
             raise ValueError(f"case {case_id} has an invalid reset_command")
-        case_path = runner.case_file(ROOT, source, manifest.parent).resolve()
+        case_path = case_file(ROOT, source, manifest.parent).resolve()
         if not case_path.is_file():
             raise ValueError(f"case {case_id} input file does not exist: {case_path}")
         original = case_path.read_bytes()
@@ -702,7 +1031,6 @@ def profiles(
         budget_metrics = evaluation.get("evaluationBudget")
         if not isinstance(budget_metrics, dict):
             budget_metrics = {}
-        metric_count = runner.metric_count
         row["oracle_calls"] = metric_count(
             evaluation.get("evaluationDatabaseObservations")
         )
@@ -980,7 +1308,7 @@ def profiles(
                     )
                     child_started = time.monotonic()
                     try:
-                        process = runner.command_result(
+                        process = command_result(
                             command,
                             ROOT,
                             child_started + outer_timeout,
@@ -1058,7 +1386,7 @@ def profiles(
                                 "-o",
                                 str(cpu_svg),
                             ]
-                            res_cpu = runner.command_result(
+                            res_cpu = command_result(
                                 cmd_cpu,
                                 ROOT,
                                 time.monotonic() + 30.0,
@@ -1096,7 +1424,7 @@ def profiles(
                                 "-o",
                                 str(alloc_svg),
                             ]
-                            res_alloc = runner.command_result(
+                            res_alloc = command_result(
                                 cmd_alloc,
                                 ROOT,
                                 time.monotonic() + 30.0,
@@ -1153,7 +1481,7 @@ def profiles(
                                 "--stdio",
                                 "--header",
                             ]
-                            res_rep = runner.command_result(
+                            res_rep = command_result(
                                 cmd_rep,
                                 ROOT,
                                 time.monotonic() + 60.0,
@@ -1278,7 +1606,7 @@ def profiles(
                         (case_dir / "diagnostic_manifest.json").write_text(
                             json.dumps(diag_manifest, indent=2) + "\n"
                         )
-                    row = runner.base_record(
+                    row = base_record(
                         entry, profile_name, timeout, budget, executions
                     )
                     artifact_dir = str(case_dir.resolve())
@@ -1407,7 +1735,7 @@ def profiles(
                             "parameters": entry.get("parameters"),
                         }
                     )
-                    native = runner.read_json(raw_metric_file)
+                    native = read_json(raw_metric_file)
                     metric = (
                         native[0]
                         if isinstance(native, list)
