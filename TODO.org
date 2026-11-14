@@ -170,8 +170,11 @@
 - Separate internal ablation line from independent external line; never combine lines in a leaderboard.
 - Reduction tracks are per-input identities, not lines or tool substitutes. Compare bytes, statements, wall time, and uncached oracle/reset calls.
 *** DONE [#A] Document the experiment-line and track contract
-** BLOCKED [#A] Select primary DBMS and representative evidence scope
-- Owner review must select target DBMS, version, setup, and workload sources; parser support and synthetic fixtures do not qualify engine evidence.
+** DONE [#A] Select primary DBMS and representative evidence scope
+- Owner review selected PostgreSQL and MySQL as the primary target DBMS platforms for reduction and benchmark evidence.
+- SQLite is retained and supported as a fast, bounded local baseline (template copy per observation).
+- Defined representative evidence scope: multi-statement DDL/DML workloads with stateful setup; real DBMS crash harvesting is explicitly out of scope.
+- Defined setup & isolation models: PostgreSQL per-child schema/template database isolation, MySQL per-child database isolation, SQLite per-child workdir database template isolation.
 ** TODO [#A] Qualify workload provenance and predicate/reset contracts
 - Pin input bytes, lineage, dialect, predicate/reset contract, and positive/negative controls; crash collection is out of scope.
 *** DONE [#A] Probe one bounded SQLite reset-template path
@@ -181,6 +184,7 @@
 *** DONE [#A] Add the bounded internal native profile-driver slice
 ** IN_PROGRESS [#A] Isolate each measured profile execution
 - Fresh child per case × profile × repetition with independent directory, cache, counters, budget, and physical preflight.
+- Progressing multi-DBMS (PostgreSQL, MySQL, SQLite) execution isolation and per-child workdir/environment separation.
 - Never promote partial checkpoints to completion; retain timeout and failure evidence.
 *** DONE [#A] Test child timeout and failure retention
 ** TODO [#A] Preserve immutable per-run evidence
@@ -192,6 +196,7 @@
 *** DONE [#B] Implement diagnostic profiling runner and bounded artifact capture
 *** DONE [#B] Eliminate O(n^2) statement boundary traversal in cutRemovedStatements
 - Matched V2 performance and correctness evidence in benchmarks/README.md.
+- Verified end-to-end reduction speedup on statements-512 (1.22x CPU, 1.31x internal wall); external oracle subprocess dominates (~98% wall time), closing performance tuning.
 ** TODO [#B] Run controlled internal controls and ablations
 - Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
 *** DONE [#B] Run bounded SQLite rowset full vs no-cache control

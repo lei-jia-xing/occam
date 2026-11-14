@@ -29,7 +29,18 @@ That built-in marker predicate checks SQL text only. It is a reducer-mechanics e
 There are exactly two experiment lines:
 
 - **Internal**: the Occam full reducer and explicitly named internal controls/ablations. Each measured child runs one selected `occam-eval --profile NAME`.
-- **External**: independently implemented reducer search against the same exact input, setup, predicate and declared budget. This line is unselected; the DBMS/workload scope is blocked, and existing optional adapters are not an admitted or verified experiment path.
+- **External**: independently implemented reducer search against the same exact input, setup, predicate and declared budget. Adapters must execute against qualified DBMS targets and workloads under matching protocols.
+
+### Target DBMS scope and execution isolation
+
+Primary target DBMS engines for reduction and benchmark evidence are **PostgreSQL** and **MySQL**. **SQLite** is retained and supported as a fast, bounded local baseline (file-backed template copy per observation). Real DBMS crash harvesting is explicitly out of scope; workloads focus strictly on multi-statement DDL/DML reductions with stateful setup.
+
+#### Multi-DBMS reset and isolation model
+
+- **PostgreSQL**: Isolated per-child database or schema (e.g. `CREATE DATABASE ... TEMPLATE ...` or per-child `DROP SCHEMA ... CASCADE; CREATE SCHEMA ...;`). Connection parameters are supplied via environment variables (`OCCAM_PG_HOST`, `OCCAM_PG_PORT`, `OCCAM_PG_USER`, `OCCAM_PG_PASSWORD`, `OCCAM_PG_DATABASE`).
+- **MySQL**: Isolated per-child database (e.g. `DROP DATABASE IF EXISTS occam_...; CREATE DATABASE occam_...;` followed by setup restoration). Connection parameters are supplied via environment variables (`OCCAM_MYSQL_HOST`, `OCCAM_MYSQL_PORT`, `OCCAM_MYSQL_USER`, `OCCAM_MYSQL_PASSWORD`, etc.).
+- **SQLite**: Isolated per-child template database copy within `OCCAM_WORKDIR` (`study.sqlite`).
+- **Isolation boundaries and lifecycles**: External predicate/reset scripts are strictly responsible for providing database isolation and state resets. Occam provides the per-call `OCCAM_WORKDIR` (with scoped `TMPDIR`/`TMP`/`TEMP`), enforces execution timeouts, guarantees clean POSIX process group teardown on exit or timeout, and immutably retains failures (never promoting partial checkpoints to completed reductions).
 
 Execution mode (native CLI or API) is orthogonal to experiment line; this scale-study runner records native mode only. `reduction_track` labels the per-input workload (`whole_script` or `fixed_setup_query`), not a line or profile family. `profile_family` distinguishes statement-only controls from shared-reducer profiles; `intra_statement_edits` records whether that syntax pass is enabled, not universal AST coverage. Pairing requires matching line, input identity, track, validation, resource and count protocol. Profile names/effective settings are comparison sides: controlled ablations intentionally differ in a named mechanism. The runner preserves each selected profile as a separate record but does not form or validate homogeneous cohorts; do not pool cross-line or statement-only/syntax-enabled coverage.
 
@@ -296,6 +307,15 @@ Verified diagnostic evidence on the bounded SQLite `reset-template` case is reta
 | 4096 | `keep_none` | 35.77 → 0.19 | 183.72x | 35.80 → 0.20 |
 
 Small absolute regressions were observed on `keep_all` controls (+14% to +16%), which perform no cuts; the optimization does not generalize to speeding up every pattern. The mechanics-only `keep_none` case performs zero retained output copying, isolating the boundary traversal elimination ceiling.
+
+### End-to-end large-SQL performance closure
+- **Workload & Protocol**: Full end-to-end reduction on `statements-512.sql` (515 statements, 20,922 bytes; dialect SQLite) reduced to 3 statements (517 bytes), evaluated against the deterministic SQLite rowset oracle via 3 matched interleaved runs (`B1, C1, B2, C2, B3, C3`). Binaries built in isolated trees under GHC 9.10.3 (`-O1 -threaded -rtsopts`) differing strictly in `cutRemovedStatements` (baseline drop-rescan vs current `collectSpans`), run with `+RTS -N1 -s -RTS`. Raw records in gitignored `benchmarks/benchmark_artifacts/large-sql-e2e-20261114/e2e_comparison.json`.
+- **Observed Metrics**:
+  - **Occam Process CPU**: Total user CPU improved from 3.182s to 2.614s (1.22x speedup; Mutator CPU 2.892s → 2.360s, 1.23x speedup).
+  - **Occam Internal Reduction Wall**: Reduction wall excluding child oracle duration improved from 1.432s to 1.096s (1.31x speedup).
+  - **External Process Dominance**: External child oracle subprocess wall clock accounted for 98.19% (baseline, 77.67s / 79.11s) and 98.52% (current, 72.78s / 73.88s) of reduction loop wall time.
+  - **Reduction Quality**: All 6 runs completed cleanly with status `completed` (exit code 0), achieving 100% identical outputs (3 statements, 517 bytes).
+- **Stopping Decision**: Because external child process execution overwhelmingly dominates end-to-end makespan (~98%) and Occam internal engine overhead is already negligible (~1.10s across 604 reduction steps, ~1.8ms per step), further internal optimization (such as ByteString manipulation in `cutSpans`) is explicitly declined under the performance decision gate. Large-SQL performance evaluation is cleanly closed.
 ## External experiment line (unselected)
 
 No external reducer or DBMS/workload scope is selected here. Existing optional
