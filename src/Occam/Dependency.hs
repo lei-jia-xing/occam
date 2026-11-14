@@ -2123,7 +2123,7 @@ processSequenceWrite sid eval write =
         evalWrites = mutateResolved stepKey eval keys
      in if not transactional && evalTransactionActive eval
             then
-                -- ponytail: durable sequence values across DDL rollback need
+                -- NOTE: durable sequence values across DDL rollback need
                 -- generation history; retain the script instead of restoring
                 -- their values as if they were ordinary transactional rows.
                 addBarrier

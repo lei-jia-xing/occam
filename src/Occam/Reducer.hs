@@ -159,23 +159,21 @@ partition is exact: it never inspects or rewrites the bytes it keeps.
 -}
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
-    cutSpans removedSpans baseSQL
+    cutSpans (collectSpans allStatements) baseSQL
     where
         keptIds = Set.fromList (map stmtId keptStatements)
         sourceLength = BS.length baseSQL
-        indexed = zip [0 :: Int ..] allStatements
-        nextStart index =
-            case drop (index + 1) allStatements of
-                next : _ -> spanStartByte (stmtSpan next)
-                [] -> sourceLength
-        deletionSpan (index, statement) =
+        -- NOTE: next-boundary lookup via adjacent walk; repeated ByteString surgery remains, address when copying dominates
+        collectSpans [] = []
+        collectSpans (statement : rest) =
             let Span start _ = stmtSpan statement
-             in Span start (nextStart index)
-        removedSpans =
-            [ deletionSpan entry
-            | entry@(_, statement) <- indexed
-            , Set.notMember (stmtId statement) keptIds
-            ]
+                nextStart = case rest of
+                    next : _ -> spanStartByte (stmtSpan next)
+                    [] -> sourceLength
+                removedSpan = Span start nextStart
+             in if Set.notMember (stmtId statement) keptIds
+                    then removedSpan : collectSpans rest
+                    else collectSpans rest
 
 cutSpans :: [Span] -> ByteString -> ByteString
 cutSpans spans source =

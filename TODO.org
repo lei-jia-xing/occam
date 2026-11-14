@@ -190,6 +190,8 @@
 - Keep diagnostic runs separate from normal score runs. Capture Haskell CPU/allocation and Linux perf; attribute child predicate/reset wall time separately.
 - Disclose GHC safe-FFI/Rust/child process blind spots; previous flamegraph smoke is toolchain proof, not a baseline. Details in `benchmarks/README.md`.
 *** DONE [#B] Implement diagnostic profiling runner and bounded artifact capture
+*** DONE [#B] Eliminate O(n^2) statement boundary traversal in cutRemovedStatements
+- Matched V2 performance and correctness evidence in benchmarks/README.md.
 ** TODO [#B] Run controlled internal controls and ablations
 - Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
 *** DONE [#B] Run bounded SQLite rowset full vs no-cache control

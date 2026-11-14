@@ -277,6 +277,25 @@ When `--diagnostic` is passed:
 
 ### Retained diagnostic evidence
 Verified diagnostic evidence on the bounded SQLite `reset-template` case is retained at gitignored `benchmarks/benchmark_artifacts/diagnostic-profile-20261114-final2/` (exact commands and verified artifacts in per-child `command.json` and `diagnostic_manifest.json`). Target binary preparation metadata and build logs are recorded in `benchmarks/benchmark_artifacts/profile-prep-20261114-eval/preparation.json` and `cabal-build-v2.log`.
+
+### Statement boundary traversal optimization
+- **Bottleneck**: Old GHC profiling (`ghc-profile-20261113-a`) revealed `$wunsafeDrop` in `Occam.Reducer` consuming 79.2% CPU ticks during multi-statement reduction. In `cutRemovedStatements`, boundary lookup used `drop (index + 1) allStatements` for each removed statement, leading to repeated $O(N^2)$ list suffix traversals.
+- **Optimization**: Replaced quadratic drop rescans with a single linear adjacent-statement walk (`collectSpans`) computing `nextStart` from the list tail in $O(1)$ per statement.
+- **Scope and Ceiling**: Boundary lookup alone improves from $O(N^2)$ suffix rescans to an $O(N)$ adjacent walk. Kept-ID `Set` operations ($O(N \log K)$), removed-span sorting ($O(M \log M)$), and repeated ByteString copying in `cutSpans` remain separate costs. No whole-function $O(N)$ or external DBMS speedup is inferred. Candidate order, reduction semantics, and byte preservation remain exact.
+- **Evidence**: Matched V2 before/after measurements across 1024, 4096, and 8192 statements (`benchmarks/benchmark_artifacts/statement-surgery-perf-20261114/final_v2_comparison.json`), using GHC 9.10.3 `-O1`, RTS `-N1 -T`, and 5 repeats per case. Reported values are 5-run arithmetic means of the helper microbenchmark timed region (timed statement surgery plus deep output forcing and FNV-1a64 checksumming, not isolated pure-function CPU). Across all 75 benchmark runs (15 size/pattern cases × 5 repeats), output lengths and FNV-1a64 checksums matched identically; this does not claim byte-for-byte equality across all 75 outputs. Separately, 14 exact ByteString semantics checks and all 184 `occam-test` suite tests passed.
+
+| Statements | Pattern | Process CPU Before → After (ms) | CPU Speedup | Wall Before → After (ms) |
+|---|---|---|---|---|
+| 8192 | `keep_one` | 274.30 → 92.28 | 2.97x | 275.96 → 93.18 |
+| 8192 | `keep_half` | 226.05 → 95.99 | 2.35x | 226.98 → 96.78 |
+| 4096 | `keep_one` | 58.06 → 25.27 | 2.30x | 58.21 → 25.53 |
+| 4096 | `keep_half` | 49.97 → 19.84 | 2.52x | 50.18 → 19.93 |
+| 8192 | `keep_all` | 1.28 → 1.49 | 0.86x | 1.28 → 1.49 |
+| 4096 | `keep_all` | 0.63 → 0.72 | 0.87x | 0.63 → 0.72 |
+| 8192 | `keep_none` | 153.23 → 0.42 | 364.55x | 153.56 → 0.43 |
+| 4096 | `keep_none` | 35.77 → 0.19 | 183.72x | 35.80 → 0.20 |
+
+Small absolute regressions were observed on `keep_all` controls (+14% to +16%), which perform no cuts; the optimization does not generalize to speeding up every pattern. The mechanics-only `keep_none` case performs zero retained output copying, isolating the boundary traversal elimination ceiling.
 ## External experiment line (unselected)
 
 No external reducer or DBMS/workload scope is selected here. Existing optional
