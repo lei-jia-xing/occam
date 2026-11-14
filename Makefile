@@ -1,4 +1,4 @@
-.PHONY: all build build-check test fmt fmt-check lint rust-check check hooks dev clean
+.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test check hooks dev clean
 
 all: build
 
@@ -11,6 +11,9 @@ build-check:
 test:
 	cabal test all --ghc-options=-Werror
 	cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
+
+benchmark-test:
+	python3 -m unittest discover -s benchmarks
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
@@ -43,7 +46,7 @@ rust-check:
 	cargo check --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets
 	cargo clippy --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets -- -D warnings
 
-check: fmt-check lint build-check test rust-check
+check: fmt-check lint build-check test rust-check benchmark-test
 
 
 hooks:

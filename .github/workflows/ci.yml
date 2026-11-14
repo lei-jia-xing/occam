@@ -57,3 +57,6 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
+
+      - name: Run Python benchmark tests
+        run: make benchmark-test

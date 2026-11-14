@@ -295,8 +295,11 @@ Occam instead tracks ordered SQL definitions, uses, writes, drops, renames and g
 ## Internal ablation reporting
 
 `benchmarks/tools/partitioned_report.py` (and `scale_study.py report`) derives paired deltas only within ONE qualified current run directory (`run.json` + `results.jsonl`). It enforces strict protocol compatibility:
-- Pairing requires exact match on `case_id`, `input_sha256`, `reduction_track`, `predicate_command_sha256`, `reset_command_sha256`, `case_contract_sha256`, `repetition`, limits (`oracle_timeout_sec`, `budget_sec`, `max_oracle_executions`, `outer_timeout_sec`), and resource/count scopes.
-- Native reduction settings must match across all reduction passes (`kind`, `slicing`, `closure`, `intra_statement`, `unrestricted`, `dialect`), differing ONLY in `cache` (`True` for base `full`, `False` for target `no-cache`). Asymmetric keys or any non-cache value/type difference refuses to pair.
+- Pairing requires exact match on `case_id`, `input_sha256`, `reduction_track`, `predicate_command_sha256`, `reset_command_sha256`, `case_contract_sha256`, `repetition`, limits (`oracle_timeout_sec`, `budget_sec`, `max_oracle_executions`, `outer_timeout_sec`), and resource/count scopes. Raw row records must explicitly contain each declared identity key (including explicit `null` for unconfigured reset commands; missing keys fail row validation).
+- Native reduction settings must match the declared internal contrast contract:
+  * `full` vs `no-cache` (memoization ablation): differs ONLY in candidate cache memoization (`True` for base `full`, `False` for target `no-cache`), with identical active reduction passes (`kind: "shared-reducer"`, `slicing: true`, `closure: true`, `intra_statement: true`, `unrestricted: true`, matching `dialect`).
+  * `full` vs `graph-off` (dependency graph ablation): differs ONLY in dependency graph passes (`slicing` and `closure` both `True` for base `full`, both `False` for target `graph-off`), with identical candidate cache (`cache: true`), active intra-statement pass (`intra_statement: true`), unrestricted 1-minimality audit (`unrestricted: true`), shared-reducer kind (`kind: "shared-reducer"`), and matching dialect. Weaker statement-only baselines (`statement-ddmin`, `sequential-deletion`) are strictly rejected.
+  * Unknown contrasts, missing/null/malformed settings, asymmetric keys, or non-target setting differences refuse to pair and fail qualification.
 - Profiles and child IDs are comparison sides, NOT equality keys.
 - Metrics: `oracle_calls` counts spawned predicate observations; `candidate_checks` counts attempted observations (debited before reset). Quality and cost metrics remain in their own units.
 - `unattributed_wall_time_sec` is residual wall-clock time minus predicate and reset duration; it reflects runtime overhead, scheduling, and parser latency, NOT CPU attribution.
@@ -308,7 +311,8 @@ For qualified case admission, `manifest.json` cases carry an explicit `case_cont
 - `comparison_policy`: string (e.g. `"exact ordered-row comparison against expected_rows"`)
 - `declared_scope`: string (e.g. `"one SQLite file-state control only; not primary DBMS/external tool selection"`)
 - `environment`: object with `python_executable`, `python_version`, and `sqlite_version`
-- `hashes`: object with 64-char hex strings for `sql_sha256` (must agree with `input_sha256`), `template_sha256`, `metadata_sha256`, and `helper_sha256`
+- `hashes`: object containing 64-char hex strings for `sql_sha256` (must agree with `input_sha256`), `metadata_sha256`, and `helper_sha256`, plus explicit `template_sha256` (64-char hex string for file-state fixtures requiring template DB restoration, or explicit `null` when no template DB is used, e.g. in-memory or fresh-seed cases)
+- Case configuration and raw row records must declare explicit `reset_command_sha256`: 64-char hex string when an external reset command is configured, or explicit `null` when no reset command is configured.
 
 Declaration and fingerprints record declared protocol and effect scope, not automatic oracle certification or DBMS bug reproduction. Running `prepare` alone does not qualify engine evidence.
 
@@ -338,13 +342,69 @@ Declaration and fingerprints record declared protocol and effect scope, not auto
   * Denominators: 2/2 comparison slots paired and completed; 0 exclusions.
 - **Scope and non-causal caveats**: Runs executed serially in fixed child order without OS filesystem page cache flushes. Residual wall time (0.04s in `full` vs 0.08–0.10s in `no-cache`) is not CPU attribution or a causal speedup claim. Bounded strictly to self-contained SQLite file-state / memory controls under Strategy 3A; external heavy DBMS cluster deployments and external reducer comparisons are explicitly scoped out.
 
+
+### Stratified 12-case SQLite pilot methodology and provenance
+
+To evaluate internal mechanism deltas beyond the 1-case micro-control, a stratified 12-case SQLite pilot is configured under Strategy 3A (`benchmarks/benchmark_artifacts/sqlite-pilot-20261114-b/`):
+- **Workload provenance and generation**: 12 related SQL cases derived from deep-expression fuzzing fixture `test/golden/fuzz_golden_03_deep_expressions.golden.sql` (source SHA256 `5667a182dfcb360bb8a824c0748b5858f36a149c93870517ea9281f97a87612a`) using Python 3.14 / SQLite 3.54.1; these are selected scale/reset suite variants with explicit controls, not independent bugs or representative of SQLite workloads generally:
+  * 10 `whole_script` cases using isolated in-memory execution (`:memory:`) without external reset command (`reset_command_sha256 = null`) or template database (`template_sha256 = null`):
+    - Statement count scaling: `statements-64` (64 noise inserts), `statements-512` (515 initial statements; declared budget-stress case).
+    - Object breadth: `objects-1` (1 table, 128 inserts), `objects-32` (32 tables, 128 inserts).
+    - AST expression depth: `depth-1` (shallow), `depth-8` (moderate), `depth-24` (deep).
+    - View dependency density: `density-1` (linear chain fan-in 1), `density-4` (diamond chain fan-in 4).
+    - Structural barrier control: `false-barrier` (`SELECT; BEGIN; SELECT; COMMIT;`).
+  * 2 `fixed_setup_query` file-state cases executing in candidate-local workdirs (`OCCAM_WORKDIR`):
+    - `reset-template`: file-state restored from SQLite template database (`reset_backend: "template"`).
+    - `reset-fresh`: file-state re-initialized from seed setup SQL (`reset_backend: "fresh"` with `template_sha256 = null`).
+- **Control plane and profile plan**: Evaluates three internal profiles—`full`, `no-cache`, and `graph-off`—across 3 serial repetitions (12 cases × 3 profiles × 3 reps = 108 total child runs).
+- **Uniform execution limits & resource protocol**:
+  * `--budget 35`: cumulative wall budget per child.
+  * `--timeout 2`: per-predicate execution deadline.
+  * `--max-oracle-executions 500`: shared cap on preflight, reduction, and validation oracle observations.
+  * `--outer-timeout 40`: outer child deadline followed by bounded process-group cleanup (not proof that all descendants or escaped processes exited).
+  * `GHCRTS="-N1"`, serial single-job execution (`jobs=1`), inherited CPU affinity.
+- **Oracle and helper qualification**: Standalone helper `sqlite_case_runner.py` (SHA256 `27bfbc67bfb3c8ca4bece4a822f7e9d77647065d627e783ef55bb8e7074880f6`) is pre-qualified across all 12 cases (`helper_qualification.json`):
+  * Positive identity control (`rc=0`),
+  * Negative controls: syntax error (`rc=1`), empty SQL (`rc=1`), wrong rowset values (`rc=1`),
+  * Contamination rejection: prior-session tables absent in fresh in-memory connections and corrupted user_version state rejected,
+  * Reset recovery: clean state restoration on template and fresh seed backends.
+- **Execution order and caveats**: Child processes execute serially in fixed `(case, profile, repetition)` order without flushing the OS page cache between runs. Raw artifacts and runs reside in gitignored local storage (`benchmarks/benchmark_artifacts/sqlite-pilot-20261114-b/`); these generated cases measure reduction and caching mechanics under Strategy 3A, not third-party DBMS bug reproduction, external cluster concurrency, or general SQLite behavior.
+- **Observed pilot outcomes and denominators** (`runs/results.summary.json`):
+  * Total child runs: 108 (71 completed, 36 timeout, 1 error; serial makespan 2091.58s).
+  * `whole_script` track (10 cases × 3 profiles × 3 reps = 90 runs): `full` 18 completed / 11 timeout / 1 error; `no-cache` 11 completed / 19 timeout; `graph-off` 24 completed / 6 timeout.
+  * `fixed_setup_query` track (2 cases × 3 profiles × 3 reps = 18 runs): `full` 6/6 completed; `no-cache` 6/6 completed; `graph-off` 6/6 completed.
+- **Candidate memoization evidence (`full` vs `no-cache`)**:
+  * 17 of 36 comparison slots completed jointly (11 `whole_script`, 6 `fixed_setup_query`; 19 censored due to target timeout).
+  * Output identity on completed pairs: 17/17 (100.0%) byte-for-byte identical outputs.
+  * Across all 6 completed cases, memoization observed fewer physical database oracle executions per case (median delta: `density-1` +127 calls, `depth-1` +68 calls, `statements-64` +66 calls, `reset-fresh` +20 calls, `reset-template` +20 calls, `false-barrier` +14 calls).
+  * In this bounded cohort under the 35s protocol, `full` had fewer noncompleted `whole_script` children than `no-cache` (refer to per-track denominator table above). Disclosing selection bias: evaluating completed-only pairs filters out harder uncached timeout workloads.
+- **Dependency graph ablation evidence (`full` vs `graph-off`)**:
+  * 24 of 36 comparison slots completed jointly (18 `whole_script`, 6 `fixed_setup_query`; 12 censored: at least one side reported timeout; density-4 rep2 additionally contains the raw infrastructure error).
+  * Output identity on completed pairs: 24/24 (100.0%) byte-for-byte identical outputs. Disabling dependency graph passes did not cause quality loss on any completed case.
+  * Case-dependent tradeoffs (reporting wins and regressions honestly without pre-framing):
+    - On `objects-1` (median delta -84 calls: 137 vs 221), `objects-32` (median delta -47 calls: 174 vs 221), `statements-64` (median delta -27 calls: 130 vs 157; rep 1: full 157 vs graph-off 130, same 517 B), and `density-1` (median delta -14 calls: 115 vs 129), `graph-off` completed with fewer oracle calls. On `statements-512` (declared budget stress) and `depth-8`, `graph-off` completed within budget (151 and 372 calls) while `full` reported timeout/budget exhaustion on all 3 repetitions.
+    - On shallow AST expression scaling (`depth-1`), `graph-off` incurred +7 more oracle calls (+5.0%, 148 vs 141 calls) and +2.120s median wall time.
+    - On single-statement fixed-setup inputs (`reset-fresh`, `reset-template`), graph passes had zero delta (identical 6 and 6 calls). On the 4-statement whole-script transaction control fixture `false-barrier` (`SELECT; BEGIN; SELECT; COMMIT;`), graph passes also showed zero delta (identical 9 calls).
+- **Censored cases and selection bias**:
+  * `statements-512` (whole_script, 515 initial stmts): Declared budget-stress case. `full` (3/3) and `no-cache` (3/3) reported timeout/budget exhaustion under the 35s protocol; `graph-off` completed (3/3, 151 calls, wall 18.04s–21.06s, median 18.88s). Both pairs censored due to base timeout.
+  * `depth-8` (whole_script, 19 initial stmts): Moderate AST expression depth. `full` (3/3) and `no-cache` (3/3) reported timeout/budget exhaustion under the 35s protocol; `graph-off` completed (3/3, 372 calls, wall 26.89s–27.46s, median 27.20s). Both pairs censored due to base timeout.
+  * `depth-24` (whole_script, 19 initial stmts): Deep AST expression depth. All three profiles reported timeout/budget exhaustion (3/3) under the 35s protocol.
+  * `density-4` (whole_script, 8 initial stmts): `no-cache` and `graph-off` reported timeout/budget exhaustion (3/3). `full` reported timeout/budget exhaustion on repetitions 1 and 3; repetition 2 exited with `status: "error"` due to a retained process-management/infrastructure error (`stderr.log:1`: `occam-eval: waitForProcess: does not exist (No child processes)`, classified as `OracleIOFailed`/`InfrastructureError` in `Occam.Oracle`, exit code 1, native validation passed true, predicate passed null; exact underlying process cause unestablished without claiming a proven race or reaping cause from a single log). In pair evaluation, the `density-4`/`full`/rep2 slot is labeled timeout in each contrast because its target timed out, while the raw full child is separately an infrastructure error.
+  * `objects-1` & `objects-32` (whole_script, 131 initial stmts): Object breadth scaling. `full` and `graph-off` completed 3/3; `no-cache` reported timeout/budget exhaustion (3/3; calls 244–267), censoring `full-vs-no-cache`.
+  * `density-1` (whole_script, 8 initial stmts): Linear view chain. `full` and `graph-off` completed 3/3; `no-cache` completed 2/3 and reported timeout/budget exhaustion on repetition 2 at 31.31s (243 calls).
+- Full track-separated denominators, case tables, and medians are retained in `benchmarks/benchmark_artifacts/sqlite-pilot-20261114-b/track_summary.{json,md}`.
 ## Supported partitioned reporting control plane
 
 The supported partitioned report tool is `benchmarks/tools/partitioned_report.py` (also accessible via `python3 benchmarks/tools/scale_study.py report <run_dir>`). It enforces strict partition validation: rejecting cross-line, cross-protocol, cross-track, or mismatched-pass pairs.
 
 ```bash
+# Memoization ablation: candidate cache enabled vs disabled
 python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target no-cache
 python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target no-cache --json
+
+# Dependency graph ablation: dependency graph passes enabled vs disabled
+python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target graph-off
+python3 benchmarks/tools/partitioned_report.py <run_dir> --base full --target graph-off --json
 ```
 
 Legacy unpartitioned presentation scripts (`benchmarks/report.sh`, `benchmarks/run_all.sh`) have been retired.

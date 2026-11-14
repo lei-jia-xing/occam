@@ -7,7 +7,11 @@ Derives paired deltas within ONE qualified current run directory where:
   resources, and validation scopes.
 - Planned comparison slots (cases × repetitions) track all outcomes: paired, missing,
   ambiguous, or rejected with full structured exclusions.
-- Native settings must match identically across all keys except cache (True base, False target).
+- Contrasts are narrowly declared:
+  * full vs no-cache: candidate memoization ablation (identical passes, cache True vs False).
+  * full vs graph-off: dependency graph ablation (slicing & closure True vs False, cache True,
+    intra-statement True, unrestricted True, shared-reducer kind, identical dialect).
+- Unknown contrasts, missing/null/malformed settings, and non-target setting differences are rejected.
 - Terminal observation, physical validation, and native exit code 0 dominate stale flags.
 - Residual wall time is explicitly noted as non-CPU attribution.
 """
@@ -19,13 +23,27 @@ import hashlib
 import json
 import math
 import sys
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 RESIDUAL_WALL_NOTE = (
     "Residual wall time is wall-clock duration minus (predicate + reset duration); "
     "it reflects runtime overhead, process scheduling, and parsing latency, NOT CPU attribution."
 )
+
+SUPPORTED_CONTRASTS: dict[str, dict[str, Any]] = {
+    "full-vs-no-cache": {
+        "base_profile": "full",
+        "target_profile": "no-cache",
+        "description": "Memoization ablation: candidate cache enabled (full) vs disabled (no-cache)",
+    },
+    "full-vs-graph-off": {
+        "base_profile": "full",
+        "target_profile": "graph-off",
+        "description": "Dependency graph ablation: graph slicing & closure enabled (full) vs disabled (graph-off)",
+    },
+}
 
 MANDATORY_SETTINGS_KEYS = (
     "kind",
@@ -72,7 +90,13 @@ def _metric_float(val: Any) -> float | None:
 
 
 def _is_sha256(val: Any) -> bool:
-    return isinstance(val, str) and len(val) == 64 and all(c in "0123456789abcdefABCDEF" for c in val)
+    return (
+        isinstance(val, str)
+        and len(val) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in val)
+    )
+
+
 def _canonical_contract_sha256(contract: Any) -> str | None:
     if not isinstance(contract, (dict, str)):
         return None
@@ -92,12 +116,24 @@ def qualify_run(
     if not isinstance(meta, dict):
         return False, "run_metadata is not a dictionary", {}
 
+    contrast = f"{base_profile}-vs-{target_profile}"
+    if contrast not in SUPPORTED_CONTRASTS:
+        return (
+            False,
+            f"unsupported internal contrast {contrast!r}; supported contrasts: {sorted(SUPPORTED_CONTRASTS.keys())}",
+            {},
+        )
+
     run_id = meta.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         return False, "missing or empty run_id", {}
 
     if meta.get("experiment_line") != "internal":
-        return False, f"experiment_line {meta.get('experiment_line')!r} != 'internal'", {}
+        return (
+            False,
+            f"experiment_line {meta.get('experiment_line')!r} != 'internal'",
+            {},
+        )
 
     if meta.get("execution_mode") != "native":
         return False, f"execution_mode {meta.get('execution_mode')!r} != 'native'", {}
@@ -106,7 +142,11 @@ def qualify_run(
         return False, f"run_type {meta.get('run_type')!r} != 'score'", {}
 
     binary = meta.get("native_binary")
-    if not isinstance(binary, dict) or not binary.get("path") or not binary.get("sha256"):
+    if (
+        not isinstance(binary, dict)
+        or not binary.get("path")
+        or not binary.get("sha256")
+    ):
         return False, "missing native_binary path or sha256", {}
 
     cfg = meta.get("configuration")
@@ -114,34 +154,66 @@ def qualify_run(
         return False, "missing configuration dictionary", {}
 
     profiles = cfg.get("profiles")
-    if not isinstance(profiles, list) or base_profile not in profiles or target_profile not in profiles:
-        return False, f"configuration profiles do not include {base_profile!r} and {target_profile!r}", {}
+    if (
+        not isinstance(profiles, list)
+        or base_profile not in profiles
+        or target_profile not in profiles
+    ):
+        return (
+            False,
+            f"configuration profiles do not include {base_profile!r} and {target_profile!r}",
+            {},
+        )
 
     repetitions = _exact_int(cfg.get("repetitions"), min_val=1)
     if repetitions is None:
-        return False, "invalid repetitions in configuration (must be exact integer >= 1)", {}
+        return (
+            False,
+            "invalid repetitions in configuration (must be exact integer >= 1)",
+            {},
+        )
 
     p_timeout = _finite_pos_float(cfg.get("predicate_timeout_sec"))
     budget = _finite_pos_float(cfg.get("budget_sec"))
     max_execs = _exact_int(cfg.get("max_oracle_executions"), min_val=1)
     outer_timeout = _finite_pos_float(cfg.get("outer_timeout_sec"))
-    if p_timeout is None or budget is None or max_execs is None or outer_timeout is None:
-        return False, "invalid limits in configuration (must be finite positive numbers)", {}
+    if (
+        p_timeout is None
+        or budget is None
+        or max_execs is None
+        or outer_timeout is None
+    ):
+        return (
+            False,
+            "invalid limits in configuration (must be finite positive numbers)",
+            {},
+        )
 
     resources = cfg.get("resources")
     if not isinstance(resources, dict) or not resources:
         return False, "missing or empty resources in configuration", {}
     if resources.get("serial") is not True or resources.get("jobs") != 1:
         return False, "resources must declare serial execution with jobs=1", {}
-    if not isinstance(resources.get("cpu_affinity"), str) or not resources["cpu_affinity"]:
+    if (
+        not isinstance(resources.get("cpu_affinity"), str)
+        or not resources["cpu_affinity"]
+    ):
         return False, "resources must specify cpu_affinity", {}
 
     v_phases = cfg.get("validation_phases")
-    if not isinstance(v_phases, dict) or not v_phases.get("preflight") or not v_phases.get("final"):
+    if (
+        not isinstance(v_phases, dict)
+        or not v_phases.get("preflight")
+        or not v_phases.get("final")
+    ):
         return False, "missing validation_phases specification in configuration", {}
 
     c_scope = cfg.get("count_scope")
-    if not isinstance(c_scope, dict) or not c_scope.get("oracle_calls") or not c_scope.get("validation_calls"):
+    if (
+        not isinstance(c_scope, dict)
+        or not c_scope.get("oracle_calls")
+        or not c_scope.get("validation_calls")
+    ):
         return False, "missing count_scope specification in configuration", {}
 
     raw_cases = cfg.get("cases")
@@ -161,15 +233,27 @@ def qualify_run(
         input_sha = entry.get("input_sha256")
         track = entry.get("reduction_track")
         pred_sha = entry.get("predicate_command_sha256")
-        reset_sha = entry.get("reset_command_sha256")
         contract = entry.get("case_contract")
         contract_sha = entry.get("case_contract_sha256")
 
-        if not all(_is_sha256(x) for x in (input_sha, pred_sha, reset_sha, contract_sha)):
+        if (
+            not _is_sha256(input_sha)
+            or not _is_sha256(pred_sha)
+            or not _is_sha256(contract_sha)
+        ):
             return False, f"case {cid} missing required 64-char hex identity hashes", {}
         if not isinstance(track, str) or not track:
             return False, f"case {cid} missing reduction_track", {}
 
+        if "reset_command_sha256" not in entry:
+            return False, f"case {cid} missing explicit reset_command_sha256 key", {}
+        reset_sha = entry["reset_command_sha256"]
+        if reset_sha is not None and not _is_sha256(reset_sha):
+            return (
+                False,
+                f"case {cid} reset_command_sha256 must be null or 64-char hex string, got {reset_sha!r}",
+                {},
+            )
         # Validate explicit structured case_contract
         if not isinstance(contract, dict):
             return False, f"case {cid} case_contract must be an explicit dictionary", {}
@@ -187,27 +271,63 @@ def qualify_run(
         if not isinstance(declared_scope, str) or not declared_scope:
             return False, f"case {cid} case_contract missing declared_scope", {}
 
-        if not isinstance(environment, dict) or not environment.get("python_executable") \
-                or not environment.get("python_version") or not environment.get("sqlite_version"):
-            return False, f"case {cid} case_contract missing valid environment specification", {}
+        if (
+            not isinstance(environment, dict)
+            or not environment.get("python_executable")
+            or not environment.get("python_version")
+            or not environment.get("sqlite_version")
+        ):
+            return (
+                False,
+                f"case {cid} case_contract missing valid environment specification",
+                {},
+            )
 
         if not isinstance(hashes, dict):
             return False, f"case {cid} case_contract missing hashes dictionary", {}
 
         sql_sha = hashes.get("sql_sha256")
-        template_sha = hashes.get("template_sha256")
         metadata_sha = hashes.get("metadata_sha256")
         helper_sha = hashes.get("helper_sha256")
 
-        if not all(_is_sha256(h) for h in (sql_sha, template_sha, metadata_sha, helper_sha)):
-            return False, f"case {cid} case_contract hashes must contain 64-char hex strings", {}
+        if (
+            not _is_sha256(sql_sha)
+            or not _is_sha256(metadata_sha)
+            or not _is_sha256(helper_sha)
+        ):
+            return (
+                False,
+                f"case {cid} case_contract hashes must contain 64-char hex strings",
+                {},
+            )
 
+        if "template_sha256" not in hashes:
+            return (
+                False,
+                f"case {cid} case_contract.hashes missing explicit template_sha256 key",
+                {},
+            )
+        template_sha = hashes["template_sha256"]
+        if template_sha is not None and not _is_sha256(template_sha):
+            return (
+                False,
+                f"case {cid} case_contract.hashes template_sha256 must be null or 64-char hex string, got {template_sha!r}",
+                {},
+            )
         if sql_sha != input_sha:
-            return False, f"case {cid} case_contract sql_sha256 does not match case input_sha256", {}
+            return (
+                False,
+                f"case {cid} case_contract sql_sha256 does not match case input_sha256",
+                {},
+            )
 
         computed_sha = _canonical_contract_sha256(contract)
         if computed_sha != contract_sha:
-            return False, f"case {cid} case_contract_sha256 does not match canonical hash of case_contract", {}
+            return (
+                False,
+                f"case {cid} case_contract_sha256 does not match canonical hash of case_contract",
+                {},
+            )
 
         declared_cases[cid] = {
             "case_id": cid,
@@ -223,6 +343,7 @@ def qualify_run(
         "run_type": "score",
         "experiment_line": "internal",
         "execution_mode": "native",
+        "contrast": contrast,
         "binary_sha256": str(binary["sha256"]),
         "predicate_timeout_sec": p_timeout,
         "budget_sec": budget,
@@ -245,11 +366,17 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any]) -> tuple[bool, str |
     if row.get("run_type") != plan["run_type"]:
         return False, f"mismatched run_type: {row.get('run_type')!r}"
 
-    if _finite_pos_float(row.get("oracle_timeout_sec")) != plan["predicate_timeout_sec"]:
+    if (
+        _finite_pos_float(row.get("oracle_timeout_sec"))
+        != plan["predicate_timeout_sec"]
+    ):
         return False, "oracle_timeout_sec does not match root configuration"
     if _finite_pos_float(row.get("budget_sec")) != plan["budget_sec"]:
         return False, "budget_sec does not match root configuration"
-    if _exact_int(row.get("max_oracle_executions"), min_val=1) != plan["max_oracle_executions"]:
+    if (
+        _exact_int(row.get("max_oracle_executions"), min_val=1)
+        != plan["max_oracle_executions"]
+    ):
         return False, "max_oracle_executions does not match root configuration"
     if _finite_pos_float(row.get("outer_timeout_sec")) != plan["outer_timeout_sec"]:
         return False, "outer_timeout_sec does not match root configuration"
@@ -267,10 +394,20 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any]) -> tuple[bool, str |
         return False, f"case_id {cid!r} not declared in root configuration"
 
     decl = plan["declared_cases"][cid]
-    for key in ("input_sha256", "reduction_track", "predicate_command_sha256",
-                "reset_command_sha256", "case_contract_sha256"):
-        if row.get(key) != decl[key]:
-            return False, f"case {cid} mismatched {key}: {row.get(key)!r} != {decl[key]!r}"
+    for key in (
+        "input_sha256",
+        "reduction_track",
+        "predicate_command_sha256",
+        "reset_command_sha256",
+        "case_contract_sha256",
+    ):
+        if key not in row:
+            return False, f"case {cid} missing explicit {key} field"
+        if row[key] != decl[key]:
+            return (
+                False,
+                f"case {cid} mismatched {key}: {row[key]!r} != {decl[key]!r}",
+            )
 
     for scope_key in REQUIRED_SCOPE_KEYS:
         if not isinstance(row.get(scope_key), str) or not row[scope_key]:
@@ -279,8 +416,20 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any]) -> tuple[bool, str |
     return True, None
 
 
-def validate_settings(base: dict[str, Any], target: dict[str, Any]) -> tuple[bool, str | None]:
-    """Ensure base and target native settings differ ONLY in candidate memoization."""
+def validate_settings(
+    base: dict[str, Any],
+    target: dict[str, Any],
+    base_profile: str,
+    target_profile: str,
+) -> tuple[bool, str | None]:
+    """Ensure base and target native settings strictly match the declared contrast contract."""
+    contrast = f"{base_profile}-vs-{target_profile}"
+    if contrast not in SUPPORTED_CONTRASTS:
+        return (
+            False,
+            f"unsupported internal contrast {contrast!r}; supported contrasts: {sorted(SUPPORTED_CONTRASTS.keys())}",
+        )
+
     b_set = base.get("settings")
     t_set = target.get("settings")
     if not isinstance(b_set, dict) or not isinstance(t_set, dict):
@@ -290,16 +439,23 @@ def validate_settings(base: dict[str, Any], target: dict[str, Any]) -> tuple[boo
         diff = set(b_set.keys()) ^ set(t_set.keys())
         return False, f"settings keys mismatch: {sorted(diff)}"
 
-    for req in MANDATORY_SETTINGS_KEYS:
-        if req not in b_set:
-            return False, f"missing mandatory settings key: {req}"
+    if set(b_set.keys()) != set(MANDATORY_SETTINGS_KEYS):
+        missing = set(MANDATORY_SETTINGS_KEYS) - set(b_set.keys())
+        if missing:
+            return False, f"missing mandatory settings key: {min(missing)}"
+        unexpected = set(b_set.keys()) - set(MANDATORY_SETTINGS_KEYS)
+        if unexpected:
+            return False, f"unexpected settings key: {min(unexpected)}"
 
     # Mandatory pass flags must be real bools
     for flag in ("slicing", "closure", "intra_statement", "unrestricted", "cache"):
         if type(b_set.get(flag)) is not bool:
             return False, f"base settings {flag} is {b_set.get(flag)!r}, expected bool"
         if type(t_set.get(flag)) is not bool:
-            return False, f"target settings {flag} is {t_set.get(flag)!r}, expected bool"
+            return (
+                False,
+                f"target settings {flag} is {t_set.get(flag)!r}, expected bool",
+            )
 
     # Mandatory strings must be non-empty strings
     for s_key in ("kind", "dialect"):
@@ -308,18 +464,142 @@ def validate_settings(base: dict[str, Any], target: dict[str, Any]) -> tuple[boo
         if not isinstance(t_set.get(s_key), str) or not t_set[s_key]:
             return False, f"target settings {s_key} must be non-empty string"
 
-    if b_set.get("cache") is not True:
-        return False, f"base profile settings cache is {b_set.get('cache')!r}, expected True"
-    if t_set.get("cache") is not False:
-        return False, f"target profile settings cache is {t_set.get('cache')!r}, expected False"
+    # Both base and target must be shared-reducer (reject weaker statement-only baselines)
+    if b_set.get("kind") != "shared-reducer":
+        return (
+            False,
+            f"base settings kind is {b_set.get('kind')!r}, expected 'shared-reducer'",
+        )
+    if t_set.get("kind") != "shared-reducer":
+        return (
+            False,
+            f"target settings kind is {t_set.get('kind')!r}, expected 'shared-reducer'",
+        )
+
+    # Profile family validation if present on rows
+    if (
+        base.get("profile_family") is not None
+        and base.get("profile_family") != "shared-reducer-profile"
+    ):
+        return (
+            False,
+            f"base profile_family is {base.get('profile_family')!r}, expected 'shared-reducer-profile'",
+        )
+    if (
+        target.get("profile_family") is not None
+        and target.get("profile_family") != "shared-reducer-profile"
+    ):
+        return (
+            False,
+            f"target profile_family is {target.get('profile_family')!r}, expected 'shared-reducer-profile'",
+        )
+
+    # Dialect must match identically
+    if b_set.get("dialect") != t_set.get("dialect"):
+        return (
+            False,
+            f"reduction pass mismatch on dialect: base={b_set.get('dialect')!r}(str) vs target={t_set.get('dialect')!r}(str)",
+        )
+
+    # Effective intra-statement and unrestricted audit passes must be active on both sides
+    if b_set.get("intra_statement") is not True:
+        return (
+            False,
+            f"base settings intra_statement is {b_set.get('intra_statement')!r}, expected True",
+        )
+    if t_set.get("intra_statement") is not True:
+        return (
+            False,
+            f"target settings intra_statement is {t_set.get('intra_statement')!r}, expected True",
+        )
+
+    if b_set.get("unrestricted") is not True:
+        return (
+            False,
+            f"base settings unrestricted is {b_set.get('unrestricted')!r}, expected True",
+        )
+    if t_set.get("unrestricted") is not True:
+        return (
+            False,
+            f"target settings unrestricted is {t_set.get('unrestricted')!r}, expected True",
+        )
+
+    # Contrast-specific target pass validation
+    if contrast == "full-vs-no-cache":
+        if b_set.get("cache") is not True:
+            return (
+                False,
+                f"base profile settings cache is {b_set.get('cache')!r}, expected True",
+            )
+        if t_set.get("cache") is not False:
+            return (
+                False,
+                f"target profile settings cache is {t_set.get('cache')!r}, expected False",
+            )
+        if b_set.get("slicing") is not True:
+            return (
+                False,
+                f"base profile settings slicing is {b_set.get('slicing')!r}, expected True",
+            )
+        if t_set.get("slicing") is not True:
+            return (
+                False,
+                f"reduction pass mismatch on slicing: base={b_set.get('slicing')!r}(bool) vs target={t_set.get('slicing')!r}(bool)",
+            )
+        if b_set.get("closure") is not True:
+            return (
+                False,
+                f"base profile settings closure is {b_set.get('closure')!r}, expected True",
+            )
+        if t_set.get("closure") is not True:
+            return (
+                False,
+                f"reduction pass mismatch on closure: base={b_set.get('closure')!r}(bool) vs target={t_set.get('closure')!r}(bool)",
+            )
+    elif contrast == "full-vs-graph-off":
+        if b_set.get("cache") is not True:
+            return (
+                False,
+                f"base profile settings cache is {b_set.get('cache')!r}, expected True",
+            )
+        if t_set.get("cache") is not True:
+            return (
+                False,
+                f"target profile settings cache is {t_set.get('cache')!r}, expected True",
+            )
+        if b_set.get("slicing") is not True:
+            return (
+                False,
+                f"base profile settings slicing is {b_set.get('slicing')!r}, expected True",
+            )
+        if t_set.get("slicing") is not False:
+            return (
+                False,
+                f"target profile settings slicing is {t_set.get('slicing')!r}, expected False",
+            )
+        if b_set.get("closure") is not True:
+            return (
+                False,
+                f"base profile settings closure is {b_set.get('closure')!r}, expected True",
+            )
+        if t_set.get("closure") is not False:
+            return (
+                False,
+                f"target profile settings closure is {t_set.get('closure')!r}, expected False",
+            )
 
     for k in b_set:
-        if k == "cache":
+        if contrast == "full-vs-no-cache" and k == "cache":
+            continue
+        if contrast == "full-vs-graph-off" and k in ("slicing", "closure"):
             continue
         b_val = b_set[k]
         t_val = t_set[k]
         if type(b_val) is not type(t_val) or b_val != t_val or b_val is None:
-            return False, f"reduction pass mismatch on {k}: base={b_val!r}({type(b_val).__name__}) vs target={t_val!r}({type(t_val).__name__})"
+            return (
+                False,
+                f"reduction pass mismatch on {k}: base={b_val!r}({type(b_val).__name__}) vs target={t_val!r}({type(t_val).__name__})",
+            )
     return True, None
 
 
@@ -335,12 +615,21 @@ def is_validated_complete(row: dict[str, Any]) -> tuple[bool, str]:
     # Strict score native returncode check
     native_rc = row.get("native_process_returncode")
     if type(native_rc) is not int or native_rc != 0:
-        return False, f"native_process_returncode is {native_rc!r}, expected exact int 0"
+        return (
+            False,
+            f"native_process_returncode is {native_rc!r}, expected exact int 0",
+        )
     wrapper_rc = row.get("wrapper_process_returncode")
     if wrapper_rc is not None and (type(wrapper_rc) is not int or wrapper_rc != 0):
-        return False, f"wrapper_process_returncode is {wrapper_rc!r}, expected exact int 0 or None"
+        return (
+            False,
+            f"wrapper_process_returncode is {wrapper_rc!r}, expected exact int 0 or None",
+        )
     if row.get("result_artifact_present") is not True:
-        return False, f"result_artifact_present is {row.get('result_artifact_present')!r}, expected True"
+        return (
+            False,
+            f"result_artifact_present is {row.get('result_artifact_present')!r}, expected True",
+        )
     term = row.get("terminal_observation")
     if not isinstance(term, dict) or term.get("status") != "completed":
         return False, f"terminal observation not completed: {term}"
@@ -352,9 +641,15 @@ def is_validated_complete(row: dict[str, Any]) -> tuple[bool, str]:
     v_calls = _exact_int(row.get("validation_calls"))
     v_obs = _exact_int(row.get("validation_observations"))
     if v_calls is None or v_calls < 2 or v_obs is None or v_obs < 2:
-        return False, f"insufficient final validation checks: calls={v_calls}, obs={v_obs}"
+        return (
+            False,
+            f"insufficient final validation checks: calls={v_calls}, obs={v_obs}",
+        )
 
-    if not row.get("result_artifact_present") or _metric_int(row.get("reduced_bytes")) is None:
+    if (
+        not row.get("result_artifact_present")
+        or _metric_int(row.get("reduced_bytes")) is None
+    ):
         return False, "minimal.sql artifact missing or unmeasured"
 
     return True, "completed"
@@ -375,10 +670,18 @@ def build_pair_record(
         reason = None
     elif base.get("status") == "timeout" or target.get("status") == "timeout":
         status = "timeout"
-        reason = target.get("status_reason") if target.get("status") == "timeout" else base.get("status_reason")
+        reason = (
+            target.get("status_reason")
+            if target.get("status") == "timeout"
+            else base.get("status_reason")
+        )
     elif base.get("status") == "tool-error" or target.get("status") == "tool-error":
         status = "tool-error"
-        reason = target.get("status_reason") if target.get("status") == "tool-error" else base.get("status_reason")
+        reason = (
+            target.get("status_reason")
+            if target.get("status") == "tool-error"
+            else base.get("status_reason")
+        )
     else:
         status = "validation_incomplete"
         reason = f"base: {b_msg}; target: {t_msg}"
@@ -386,12 +689,13 @@ def build_pair_record(
     b_out = base.get("output_sha256")
     t_out = target.get("output_sha256")
     if _is_sha256(b_out) and _is_sha256(t_out):
-        identical = (b_out.lower() == t_out.lower())
+        identical = b_out.lower() == t_out.lower()
     else:
         identical = None
     pair: dict[str, Any] = {
         "case_id": base["case_id"],
         "repetition": base["repetition"],
+        "contrast": f"{base_name}-vs-{target_name}",
         "base_profile": base_name,
         "target_profile": target_name,
         "base_child_id": base["child_id"],
@@ -410,7 +714,9 @@ def build_pair_record(
             "candidate_checks": _metric_int(base.get("candidate_checks")),
             "oracle_cache_hits": _metric_int(base.get("oracle_cache_hits")),
             "wall_time_sec": _metric_float(base.get("wall_time_sec")),
-            "unattributed_wall_time_sec": _metric_float(base.get("unattributed_wall_time_sec")),
+            "unattributed_wall_time_sec": _metric_float(
+                base.get("unattributed_wall_time_sec")
+            ),
             "output_sha256": b_out,
         },
         "target": {
@@ -420,13 +726,16 @@ def build_pair_record(
             "candidate_checks": _metric_int(target.get("candidate_checks")),
             "oracle_cache_hits": _metric_int(target.get("oracle_cache_hits")),
             "wall_time_sec": _metric_float(target.get("wall_time_sec")),
-            "unattributed_wall_time_sec": _metric_float(target.get("unattributed_wall_time_sec")),
+            "unattributed_wall_time_sec": _metric_float(
+                target.get("unattributed_wall_time_sec")
+            ),
             "output_sha256": t_out,
         },
         "delta": None,
     }
 
     if status == "completed":
+
         def _diff(key: str) -> Any:
             bv = pair["base"].get(key)
             tv = pair["target"].get(key)
@@ -467,20 +776,26 @@ def pair_internal_ablation(
             raise FileNotFoundError(f"results.jsonl not found in {p}")
         run_metadata = json.loads(run_file.read_text(encoding="utf-8"))
         records = [
-            json.loads(line) for line in results_file.read_text(encoding="utf-8").splitlines()
+            json.loads(line)
+            for line in results_file.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
 
     if run_metadata is None or records is None:
-        raise ValueError("pair_internal_ablation requires either run_dir or both run_metadata and records")
+        raise ValueError(
+            "pair_internal_ablation requires either run_dir or both run_metadata and records"
+        )
 
     records_list = list(records)
 
-    qualified, disqualification_reason, plan = qualify_run(run_metadata, base_profile, target_profile)
+    qualified, disqualification_reason, plan = qualify_run(
+        run_metadata, base_profile, target_profile
+    )
     if not qualified:
         summary = {
             "qualified": False,
             "disqualification_reason": disqualification_reason,
+            "contrast": f"{base_profile}-vs-{target_profile}",
             "base_profile": base_profile,
             "target_profile": target_profile,
             "total_records_read": len(records_list),
@@ -504,7 +819,10 @@ def pair_internal_ablation(
                 "rejected_settings": [],
                 "rejected_child_id": [],
                 "rejected_scopes": [],
-                "incompatible_protocol": [{"record_index": i, "reason": "unqualified run"} for i in range(len(records_list))],
+                "incompatible_protocol": [
+                    {"record_index": i, "reason": "unqualified run"}
+                    for i in range(len(records_list))
+                ],
             },
             "residual_wall_scope": RESIDUAL_WALL_NOTE,
         }
@@ -530,7 +848,9 @@ def pair_internal_ablation(
 
         valid, err = validate_row(row, plan)
         if not valid:
-            incompatible_records.append({"child_id": row.get("child_id"), "reason": err})
+            incompatible_records.append(
+                {"child_id": row.get("child_id"), "reason": err}
+            )
             continue
 
         cid = row["case_id"]
@@ -568,25 +888,37 @@ def pair_internal_ablation(
         elif len(bases) == 0 and len(targets) == 1:
             unpaired_target.append(targets[0])
         elif len(bases) > 1 or len(targets) > 1:
-            ambiguous_slots.append({"slot": slot_key, "base_count": len(bases), "target_count": len(targets)})
+            ambiguous_slots.append(
+                {
+                    "slot": slot_key,
+                    "base_count": len(bases),
+                    "target_count": len(targets),
+                }
+            )
         else:
             b = bases[0]
             t = targets[0]
             if b.get("child_id") == t.get("child_id"):
-                rejected_child_slots.append({"slot": slot_key, "child_id": b.get("child_id")})
+                rejected_child_slots.append(
+                    {"slot": slot_key, "child_id": b.get("child_id")}
+                )
                 continue
 
             # Scope equality check between sides
             scope_diff = None
             for sk in REQUIRED_SCOPE_KEYS + ("reset_calls_scope",):
                 if b.get(sk) != t.get(sk):
-                    scope_diff = f"scope mismatch on {sk}: {b.get(sk)!r} != {t.get(sk)!r}"
+                    scope_diff = (
+                        f"scope mismatch on {sk}: {b.get(sk)!r} != {t.get(sk)!r}"
+                    )
                     break
             if scope_diff is not None:
                 rejected_scopes_slots.append({"slot": slot_key, "reason": scope_diff})
                 continue
 
-            settings_ok, s_err = validate_settings(b, t)
+            settings_ok, s_err = validate_settings(
+                b, t, base_profile=base_profile, target_profile=target_profile
+            )
             if not settings_ok:
                 rejected_settings_slots.append({"slot": slot_key, "reason": s_err})
                 continue
@@ -602,6 +934,7 @@ def pair_internal_ablation(
         "qualified": True,
         "run_id": plan["run_id"],
         "binary_sha256": plan["binary_sha256"],
+        "contrast": plan.get("contrast", f"{base_profile}-vs-{target_profile}"),
         "base_profile": base_profile,
         "target_profile": target_profile,
         "total_records_read": total_records,
@@ -620,9 +953,25 @@ def pair_internal_ablation(
         "other_profile_records": other_profile_records,
         "output_identical_count": identical_outputs,
         "exclusions": {
-            "missing_both": [{"case_id": cid, "repetition": rep} for (cid, rep) in missing_both],
-            "unpaired_base": [{"case_id": b["case_id"], "repetition": b["repetition"], "child_id": b.get("child_id")} for b in unpaired_base],
-            "unpaired_target": [{"case_id": t["case_id"], "repetition": t["repetition"], "child_id": t.get("child_id")} for t in unpaired_target],
+            "missing_both": [
+                {"case_id": cid, "repetition": rep} for (cid, rep) in missing_both
+            ],
+            "unpaired_base": [
+                {
+                    "case_id": b["case_id"],
+                    "repetition": b["repetition"],
+                    "child_id": b.get("child_id"),
+                }
+                for b in unpaired_base
+            ],
+            "unpaired_target": [
+                {
+                    "case_id": t["case_id"],
+                    "repetition": t["repetition"],
+                    "child_id": t.get("child_id"),
+                }
+                for t in unpaired_target
+            ],
             "ambiguous": ambiguous_slots,
             "rejected_settings": rejected_settings_slots,
             "rejected_child_id": rejected_child_slots,
@@ -637,17 +986,21 @@ def pair_internal_ablation(
 
 def render_markdown(paired: list[dict[str, Any]], summary: dict[str, Any]) -> str:
     """Format report as concise readable Markdown."""
+    b_prof = summary.get("base_profile")
+    t_prof = summary.get("target_profile")
+    contrast_id = summary.get("contrast") or f"{b_prof}-vs-{t_prof}"
     if not summary.get("qualified", True):
         return (
             f"## Internal Ablation Report (DISQUALIFIED)\n\n"
             f"**Disqualification Reason**: `{summary.get('disqualification_reason')}`\n"
+            f"- Contrast: {contrast_id}\n"
             f"- Total records read: {summary.get('total_records_read')}\n"
             f"- Incompatible records: {summary.get('incompatible_protocol_records')}\n"
         )
 
     lines = [
-        f"## Internal Ablation Report: `{summary['base_profile']}` vs `{summary['target_profile']}`",
-        f"**Run ID**: `{summary.get('run_id')}` | **Binary SHA**: `{summary.get('binary_sha256', '')[:12]}...`",
+        f"## Internal Ablation Report: `{b_prof}` vs `{t_prof}`",
+        f"**Run ID**: `{summary.get('run_id')}` | **Contrast**: `{contrast_id}` | **Binary SHA**: `{summary.get('binary_sha256', '')[:12]}...`",
         "",
         "| Case | Rep | Status | Base Bytes | Target Bytes | Δ Bytes | Base Calls | Target Calls | Δ Calls | Base Hits | Target Hits | Base Wall(s) | Target Wall(s) | Δ Wall(s) | Output Identical |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
@@ -662,10 +1015,26 @@ def render_markdown(paired: list[dict[str, Any]], summary: dict[str, Any]) -> st
         b = p["base"]
         t = p["target"]
         d = p["delta"] or {}
-        d_b = f"{d.get('delta_reduced_bytes'):+d}" if d.get("delta_reduced_bytes") is not None else "N/A"
-        d_c = f"{d.get('delta_oracle_calls'):+d}" if d.get("delta_oracle_calls") is not None else "N/A"
-        d_w = f"{d.get('delta_wall_time_sec'):+.3f}" if d.get("delta_wall_time_sec") is not None else "N/A"
-        ident = "YES" if p["output_identical"] is True else ("NO" if p["output_identical"] is False else "N/A")
+        d_b = (
+            f"{d.get('delta_reduced_bytes'):+d}"
+            if d.get("delta_reduced_bytes") is not None
+            else "N/A"
+        )
+        d_c = (
+            f"{d.get('delta_oracle_calls'):+d}"
+            if d.get("delta_oracle_calls") is not None
+            else "N/A"
+        )
+        d_w = (
+            f"{d.get('delta_wall_time_sec'):+.3f}"
+            if d.get("delta_wall_time_sec") is not None
+            else "N/A"
+        )
+        ident = (
+            "YES"
+            if p["output_identical"] is True
+            else ("NO" if p["output_identical"] is False else "N/A")
+        )
 
         lines.append(
             f"| {p['case_id']} | {p['repetition']} | {p['status']} | "
@@ -675,18 +1044,20 @@ def render_markdown(paired: list[dict[str, Any]], summary: dict[str, Any]) -> st
             f"{_val(b.get('wall_time_sec'), '.3f')} | {_val(t.get('wall_time_sec'), '.3f')} | {d_w} | {ident} |"
         )
 
-    lines.extend([
-        "",
-        "### Planned Slot Denominators",
-        f"- Expected Comparison Slots: {summary['expected_slots_count']}",
-        f"- Paired Slots: {summary['paired_instances_count']} (Completed: {summary['completed_pairs_count']}, Noncompleted: {summary['noncompleted_pairs_count']})",
-        f"- Missing Slots: Both={summary['missing_both_slots_count']}, BaseOnly={summary['unpaired_base_count']}, TargetOnly={summary['unpaired_target_count']}",
-        f"- Rejected Slots: Settings={summary['rejected_settings_slots_count']}, IdenticalChild={summary['rejected_child_id_slots_count']}, Scopes={summary['rejected_scopes_slots_count']}, Ambiguous={summary['ambiguous_slots_count']}",
-        f"- Incompatible Protocol Records: {summary['incompatible_protocol_records']}",
-        f"- Output Equivalence: {summary['output_identical_count']}/{summary['completed_pairs_count']}",
-        "",
-        f"**Scope Note**: {summary['residual_wall_scope']}",
-    ])
+    lines.extend(
+        [
+            "",
+            "### Planned Slot Denominators",
+            f"- Expected Comparison Slots: {summary['expected_slots_count']}",
+            f"- Paired Slots: {summary['paired_instances_count']} (Completed: {summary['completed_pairs_count']}, Noncompleted: {summary['noncompleted_pairs_count']})",
+            f"- Missing Slots: Both={summary['missing_both_slots_count']}, BaseOnly={summary['unpaired_base_count']}, TargetOnly={summary['unpaired_target_count']}",
+            f"- Rejected Slots: Settings={summary['rejected_settings_slots_count']}, IdenticalChild={summary['rejected_child_id_slots_count']}, Scopes={summary['rejected_scopes_slots_count']}, Ambiguous={summary['ambiguous_slots_count']}",
+            f"- Incompatible Protocol Records: {summary['incompatible_protocol_records']}",
+            f"- Output Equivalence: {summary['output_identical_count']}/{summary['completed_pairs_count']}",
+            "",
+            f"**Scope Note**: {summary['residual_wall_scope']}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -702,12 +1073,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--base",
         default="full",
-        help="Base profile name (default: full)",
+        help="Base profile name (default: full; supported: full)",
     )
     parser.add_argument(
         "--target",
         default="no-cache",
-        help="Target ablation profile name (default: no-cache)",
+        help="Target ablation profile name (default: no-cache; supported: no-cache, graph-off)",
     )
     parser.add_argument(
         "--json",

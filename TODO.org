@@ -198,11 +198,26 @@
 - Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
 *** DONE [#B] Run bounded SQLite rowset full vs no-cache control
 - Run isolated score repetitions on bounded SQLite rowset case with identical passes, differing only in candidate memoization.
+*** DONE [#B] Run stratified 12-case SQLite pilot across full, no-cache, and graph-off
+- Executed 108 serial child runs (12 cases × 3 profiles × 3 repetitions) under Strategy 3A (uniform limits 35s budget, 2s timeout, 500 cap, 40s outer deadline).
+- Evaluated both full vs no-cache (17/36 completed pairs) and full vs graph-off (24/36 completed pairs) with 100% output identity on completed pairs (17/17 and 24/24).
+- Observed case-dependent graph-off tradeoffs (call savings on objects/statements scaling, small regression on shallow expressions); caching observed lower noncompletion under 35s protocol.
 ** DONE [#B] Qualify and compare independent external reducers
 - Under Strategy 3A, external reducer comparisons (SQLreduce, SQLancer) are explicitly scoped out of the primary evaluation line in favor of strictly partitioned internal controls and ablations.
 ** TODO [#B] Derive strictly partitioned reports from raw evidence
 - Report internal mechanism deltas separately from external tool comparisons; reject cross-line and incompatible-protocol pairs.
 *** DONE [#B] Derive paired deltas within qualified internal run
 - Reject cross-line, incompatible-protocol, and mismatched-pass pairs while computing exact per-pair cost/quality deltas.
+*** DONE [#B] Implement narrowly declared contrasts and optional-resource contracts
+- Implement full vs graph-off internal contrast alongside full vs no-cache in partitioned_report.py; reject unknown contrasts and unintended pass differences.
+- Support optional-resource identity semantics in qualify_run: require explicit reset_command_sha256 (null or 64-char hex) and explicit template_sha256 (null or 64-char hex) independent of reduction track.
+- Tested via 22 deterministic consumer-visible regression cases covering in-memory whole_script, file-state, fresh-seed, malformed/missing identities, and pairing rejection on null/hash mismatch.
+*** DONE [#B] Verify aggregate benchmark-test gate
+- Verified aggregate `make benchmark-test`: 40 tests in 17.520s, OK (skipped=1; 39 passed, 1 skipped optional SQLreduce test lacking pinned source/pglast).
+- Gate executes existing benchmark test suites across partitioned reporting contracts, scale study orchestration, profile isolation, and syntax reduction.
+*** DONE [#B] Derive track-separated reports and denominator accounting for SQLite pilot
+- Derived per-track (whole_script vs fixed_setup_query) and per-profile completion, timeout, and error denominators (71 completed, 36 timeout, 1 error).
+- Evaluated case-level paired deltas and medians on jointly completed pairs; no cross-track pooling; remaining selection bias disclosed.
+- Documented censored cases (statements-512, depth-8, depth-24, density-4, objects-1, objects-32) and density-4 full rep 2 native error in benchmarks/README.md and track_summary.{json,md}.
 ** DONE [#B] Cut over benchmark entrypoints and retire redundant paths
 - Retired redundant scripts (benchmarks/report.sh, benchmarks/run_all.sh, benchmarks/test_report_pairing.py) without compatibility shims. Decoupled scale_study.py from run_docker_benchmark.py by inlining runner utilities directly; verified supported partitioned control plane (scale_study.py, partitioned_report.py).
