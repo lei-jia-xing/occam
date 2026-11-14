@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Probe repeated native profiles against the bounded SQLite reset case."""
+
 from __future__ import annotations
 
 import argparse
-from contextlib import closing, redirect_stdout
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import shutil
 import sqlite3
@@ -15,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing, redirect_stdout
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -98,17 +99,22 @@ def _oracle(args: list[str]) -> int:
     }
     try:
         before = database_observation(database)
-        record.update({
-            "before_state_signature": before["state_signature"],
-            "before_marker": before["marker"],
-            "before_user_version": before["user_version"],
-        })
+        record.update(
+            {
+                "before_state_signature": before["state_signature"],
+                "before_marker": before["marker"],
+                "before_user_version": before["user_version"],
+            }
+        )
         if sentinel_seen:
             returncode = 1
         else:
             result = subprocess.run(
                 [sys.executable, str(study.SCRIPT), "oracle", str(metadata)],
-                input=sql, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
+                check=False,
+                input=sql,
+                capture_output=True,
+                cwd=ROOT,
             )
             sys.stdout.buffer.write(result.stdout)
             sys.stdout.buffer.flush()
@@ -119,12 +125,14 @@ def _oracle(args: list[str]) -> int:
         record["accepted"] = returncode == 0
         if run_index == 1:
             dirty = dirty_database(database)
-            record.update({
-                "after_state_signature": dirty["state_signature"],
-                "after_marker": dirty["marker"],
-                "after_user_version": dirty["user_version"],
-                "deliberately_contaminated": dirty["state_signature"] != expected,
-            })
+            record.update(
+                {
+                    "after_state_signature": dirty["state_signature"],
+                    "after_marker": dirty["marker"],
+                    "after_user_version": dirty["user_version"],
+                    "deliberately_contaminated": dirty["state_signature"] != expected,
+                }
+            )
         else:
             record["deliberately_contaminated"] = False
     except Exception as exc:
@@ -158,18 +166,25 @@ def _binary_shim(args: list[str]) -> int:
     child_env["OCCAM_PROFILE_PROBE_ARTIFACT_DIR"] = str(out_dir)
     # Oracle.hs owns OCCAM_WORKDIR/TMPDIR for each predicate observation.
     result = subprocess.run(
-        [os.environ["OCCAM_PROFILE_PROBE_REAL_BINARY"], *args], env=child_env,
+        [os.environ["OCCAM_PROFILE_PROBE_REAL_BINARY"], *args],
+        check=False,
+        env=child_env,
     )
     sentinel_written = False
     if run_index == 1 and result.returncode == 0:
-        (out_dir / SENTINEL).write_text("run-one artifact contamination sentinel\n", encoding="utf-8")
+        (out_dir / SENTINEL).write_text(
+            "run-one artifact contamination sentinel\n", encoding="utf-8"
+        )
         sentinel_written = True
-    append_jsonl(root / "children.jsonl", {
-        "repetition": run_index,
-        "out_dir": str(out_dir),
-        "native_returncode": result.returncode,
-        "sentinel_written": sentinel_written,
-    })
+    append_jsonl(
+        root / "children.jsonl",
+        {
+            "repetition": run_index,
+            "out_dir": str(out_dir),
+            "native_returncode": result.returncode,
+            "sentinel_written": sentinel_written,
+        },
+    )
     return result.returncode
 
 
@@ -180,8 +195,12 @@ def _copy_case(output: Path) -> tuple[Path, Path, dict, dict]:
         staging = Path(staging_name)
         with open(os.devnull, "w") as null, redirect_stdout(null):
             study.prepare(staging, 1)
-        source_manifest = json.loads((staging / "resets.json").read_text(encoding="utf-8"))
-        entry = next(case for case in source_manifest["cases"] if case["id"] == "reset-template")
+        source_manifest = json.loads(
+            (staging / "resets.json").read_text(encoding="utf-8")
+        )
+        entry = next(
+            case for case in source_manifest["cases"] if case["id"] == "reset-template"
+        )
         metadata = json.loads(Path(entry["case_metadata"]).read_text(encoding="utf-8"))
         sql_path = fixture / "reset-template.sql"
         metadata_path = fixture / "reset-template.case.json"
@@ -190,36 +209,80 @@ def _copy_case(output: Path) -> tuple[Path, Path, dict, dict]:
         shutil.copyfile(metadata["template"], template_path)
         metadata["template"] = str(template_path.resolve())
         metadata["file"] = str(sql_path.resolve())
-        metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+        metadata_path.write_text(
+            json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"
+        )
         shutil.copyfile(staging / "provenance.json", fixture / "provenance.json")
-    entry.update({
-        "file": str(sql_path.resolve()),
-        "case_metadata": str(metadata_path.resolve()),
-        "reset_command": shlex.join([sys.executable, str(study.SCRIPT), "reset", str(metadata_path.resolve())]),
-        "oracle_command": shlex.join([sys.executable, str(Path(__file__).resolve()), "--oracle", str(metadata_path.resolve())]),
-    })
+    entry.update(
+        {
+            "file": str(sql_path.resolve()),
+            "case_metadata": str(metadata_path.resolve()),
+            "reset_command": shlex.join(
+                [
+                    sys.executable,
+                    str(study.SCRIPT),
+                    "reset",
+                    str(metadata_path.resolve()),
+                ]
+            ),
+            "oracle_command": shlex.join(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--oracle",
+                    str(metadata_path.resolve()),
+                ]
+            ),
+        }
+    )
     manifest = fixture / "reset-template.json"
-    manifest.write_text(json.dumps({"cases": [entry]}, indent=2) + "\n", encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"cases": [entry]}, indent=2) + "\n", encoding="utf-8"
+    )
     return manifest, sql_path, metadata, entry
 
 
-def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float = 2,
-              budget: float = 10, executions: int = 100, outer_timeout: float = 30) -> dict:
+def run_probe(
+    binary: Path,
+    output: Path,
+    profile: str = "full",
+    timeout: float = 2,
+    budget: float = 10,
+    executions: int = 100,
+    outer_timeout: float = 30,
+) -> dict:
     binary = binary.resolve()
     output = output.resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"--binary is not an executable file: {binary}")
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
-        raise ValueError("choose an empty probe output directory; existing evidence is preserved")
+        raise ValueError(
+            "choose an empty probe output directory; existing evidence is preserved"
+        )
     manifest, sql_path, case, entry = _copy_case(output)
     runner_output = output / "runs"
     runner_command = [
-        sys.executable, str(study.SCRIPT), "profiles", str(manifest),
-        "--binary", str(output / "occam-eval-probe"), "--out", str(runner_output),
-        "--profile", profile, "--repetitions", "2", "--timeout", str(timeout),
-        "--budget", str(budget), "--max-oracle-executions", str(executions),
-        "--outer-timeout", str(outer_timeout),
+        sys.executable,
+        str(study.SCRIPT),
+        "profiles",
+        str(manifest),
+        "--binary",
+        str(output / "occam-eval-probe"),
+        "--out",
+        str(runner_output),
+        "--profile",
+        profile,
+        "--repetitions",
+        "2",
+        "--timeout",
+        str(timeout),
+        "--budget",
+        str(budget),
+        "--max-oracle-executions",
+        str(executions),
+        "--outer-timeout",
+        str(outer_timeout),
     ]
     shim = output / "occam-eval-probe"
     shim.write_text(
@@ -229,11 +292,17 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    version = subprocess.run([str(binary), "--version"], cwd=ROOT, capture_output=True, text=True, timeout=5)
+    version = subprocess.run(
+        [str(binary), "--version"], check=False, cwd=ROOT, capture_output=True, text=True, timeout=5
+    )
     probe = {
         "schema_version": 1,
         "scope": "one existing reset-template SQLite rowset case; two native profile children; per-observation SQLite candidate-workdir plus external reset only; not shared-server restoration or representative workload evidence",
-        "predicate_contract": {"accept": "exit 0", "reject": "any nonzero or signal", "stdout_stderr": "opaque"},
+        "predicate_contract": {
+            "accept": "exit 0",
+            "reject": "any nonzero or signal",
+            "stdout_stderr": "opaque",
+        },
         "case_id": entry["id"],
         "profile": profile,
         "repetitions": 2,
@@ -244,7 +313,9 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         "binary_version": version.stdout.strip(),
         "sql_sha256": sha256(sql_path),
         "case_metadata_sha256": sha256(manifest.parent / "reset-template.case.json"),
-        "reset_template_sha256": sha256(manifest.parent / "reset-template.template.sqlite"),
+        "reset_template_sha256": sha256(
+            manifest.parent / "reset-template.template.sqlite"
+        ),
         "probe_helper": str(Path(__file__).resolve()),
         "probe_helper_sha256": sha256(Path(__file__).resolve()),
         "scale_study_sha256": sha256(study.SCRIPT),
@@ -253,19 +324,31 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         "command": runner_command,
         "runner_returncode": None,
     }
-    (output / "probe.json").write_text(json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (output / "probe-command.json").write_text(json.dumps({
-        "command": runner_command,
-        "real_binary": str(binary),
-        "real_binary_sha256": probe["binary_sha256"],
-        "binary_shim": str(shim),
-        "binary_shim_sha256": probe["binary_shim_sha256"],
-    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (output / "probe.json").write_text(
+        json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (output / "probe-command.json").write_text(
+        json.dumps(
+            {
+                "command": runner_command,
+                "real_binary": str(binary),
+                "real_binary_sha256": probe["binary_sha256"],
+                "binary_shim": str(shim),
+                "binary_shim_sha256": probe["binary_shim_sha256"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     env = os.environ.copy()
-    env.update({
-        "OCCAM_PROFILE_PROBE_DIR": str(output),
-        "OCCAM_PROFILE_PROBE_REAL_BINARY": str(binary),
-    })
+    env.update(
+        {
+            "OCCAM_PROFILE_PROBE_DIR": str(output),
+            "OCCAM_PROFILE_PROBE_REAL_BINARY": str(binary),
+        }
+    )
     control_timeout = max(60, int(outer_timeout * 2 + 30))
     result = study.command_result(
         runner_command,
@@ -295,7 +378,10 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         failures.append("real reducer shim did not observe two serial children")
     if probe["runner_returncode"] != 0:
         failures.append("profile runner process did not exit successfully")
-    records_by_rep = {rep: [record for record in observations if record.get("repetition") == rep] for rep in (1, 2)}
+    records_by_rep = {
+        rep: [record for record in observations if record.get("repetition") == rep]
+        for rep in (1, 2)
+    }
     for repetition in (1, 2):
         row = row_by_rep.get(repetition)
         child = child_by_rep.get(repetition)
@@ -303,16 +389,34 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
         if row is None or child is None:
             continue
         if row.get("case_id") != entry["id"] or row.get("repetition") != repetition:
-            failures.append(f"repetition {repetition} result identity does not match its case")
+            failures.append(
+                f"repetition {repetition} result identity does not match its case"
+            )
         if row.get("execution_mode") != "native":
-            failures.append(f"repetition {repetition} is not recorded as native execution")
+            failures.append(
+                f"repetition {repetition} is not recorded as native execution"
+            )
         terminal = row.get("terminal_observation")
-        if row.get("status") != "completed" or not isinstance(terminal, dict) or terminal.get("status") != "completed":
-            failures.append(f"repetition {repetition} did not retain completed terminal observation")
+        if (
+            row.get("status") != "completed"
+            or not isinstance(terminal, dict)
+            or terminal.get("status") != "completed"
+        ):
+            failures.append(
+                f"repetition {repetition} did not retain completed terminal observation"
+            )
         if child.get("native_returncode") != 0:
-            failures.append(f"repetition {repetition} native CLI did not exit successfully")
-        if not records or records[0].get("call_index") != 1 or not records[0].get("physical_preflight"):
-            failures.append(f"repetition {repetition} has no independently observed physical preflight")
+            failures.append(
+                f"repetition {repetition} native CLI did not exit successfully"
+            )
+        if (
+            not records
+            or records[0].get("call_index") != 1
+            or not records[0].get("physical_preflight")
+        ):
+            failures.append(
+                f"repetition {repetition} has no independently observed physical preflight"
+            )
             continue
         native_path = Path(child["out_dir"]) / "benchmark.json"
         try:
@@ -321,26 +425,59 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
             metrics = metric["metricEvaluationMetrics"]
             budget_metrics = metrics["evaluationBudget"]
         except (OSError, ValueError, KeyError, IndexError, TypeError):
-            failures.append(f"repetition {repetition} lacks a readable native profile artifact")
+            failures.append(
+                f"repetition {repetition} lacks a readable native profile artifact"
+            )
             continue
-        if metric.get("metricAlgorithm") != profile or metric.get("metricExperimentLine") != "internal":
-            failures.append(f"repetition {repetition} native artifact is not the selected internal profile")
+        if (
+            metric.get("metricAlgorithm") != profile
+            or metric.get("metricExperimentLine") != "internal"
+        ):
+            failures.append(
+                f"repetition {repetition} native artifact is not the selected internal profile"
+            )
         if budget_metrics.get("evaluationPreflightAttempts") != 1:
-            failures.append(f"repetition {repetition} did not debit its own physical preflight")
-        if metrics.get("evaluationValidationPassed") is not True or metrics.get("evaluationValidationDatabaseObservations", 0) < 1:
-            failures.append(f"repetition {repetition} did not complete fresh final validation")
+            failures.append(
+                f"repetition {repetition} did not debit its own physical preflight"
+            )
+        if (
+            metrics.get("evaluationValidationPassed") is not True
+            or metrics.get("evaluationValidationDatabaseObservations", 0) < 1
+        ):
+            failures.append(
+                f"repetition {repetition} did not complete fresh final validation"
+            )
         if metrics.get("evaluationCacheMisses", 0) < 1:
-            failures.append(f"repetition {repetition} did not populate its own candidate cache counters")
+            failures.append(
+                f"repetition {repetition} did not populate its own candidate cache counters"
+            )
         audited_count = len(records)
-        expected_count = 1 + metrics.get("evaluationDatabaseObservations", 0) + metrics.get("evaluationValidationDatabaseObservations", 0)
+        expected_count = (
+            1
+            + metrics.get("evaluationDatabaseObservations", 0)
+            + metrics.get("evaluationValidationDatabaseObservations", 0)
+        )
         if audited_count != expected_count:
-            failures.append(f"repetition {repetition} observation audit does not reconcile to native per-run counters")
+            failures.append(
+                f"repetition {repetition} observation audit does not reconcile to native per-run counters"
+            )
         if records[0].get("predicate_returncode") != 0:
-            failures.append(f"repetition {repetition} physical preflight did not accept")
+            failures.append(
+                f"repetition {repetition} physical preflight did not accept"
+            )
         validation_count = metrics.get("evaluationValidationDatabaseObservations", 0)
-        if type(validation_count) is not int or validation_count < 1 or len(records) < validation_count + 1:
-            failures.append(f"repetition {repetition} lacks its independently audited final checks")
-        elif any(record.get("predicate_returncode") != 0 for record in records[-validation_count:]):
+        if (
+            type(validation_count) is not int
+            or validation_count < 1
+            or len(records) < validation_count + 1
+        ):
+            failures.append(
+                f"repetition {repetition} lacks its independently audited final checks"
+            )
+        elif any(
+            record.get("predicate_returncode") != 0
+            for record in records[-validation_count:]
+        ):
             failures.append(f"repetition {repetition} final validation did not accept")
         for record in records:
             before_ok = (
@@ -349,27 +486,50 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
                 and record.get("before_user_version") == 42
             )
             if not before_ok:
-                failures.append(f"repetition {repetition} observation did not see restored SQLite state")
+                failures.append(
+                    f"repetition {repetition} observation did not see restored SQLite state"
+                )
             if record.get("artifact_sentinel_seen"):
-                failures.append(f"repetition {repetition} observed run-one artifact sentinel")
+                failures.append(
+                    f"repetition {repetition} observed run-one artifact sentinel"
+                )
             workdir = Path(record["candidate_workdir"])
-            record["cleanup_observed"] = "removed" if not workdir.exists() else "still_exists"
+            record["cleanup_observed"] = (
+                "removed" if not workdir.exists() else "still_exists"
+            )
             if workdir.exists():
-                failures.append(f"repetition {repetition} candidate workdir was not cleaned")
+                failures.append(
+                    f"repetition {repetition} candidate workdir was not cleaned"
+                )
             if repetition == 1 and not record.get("deliberately_contaminated"):
-                failures.append("run-one predicate did not leave deliberate dirty fixture state")
+                failures.append(
+                    "run-one predicate did not leave deliberate dirty fixture state"
+                )
         expected_input_hash = sha256(sql_path)
         if records[0].get("sql_sha256") != expected_input_hash:
-            failures.append(f"repetition {repetition} preflight did not check the exact initial SQL")
-        if repetition == 2 and (records[0].get("predicate_returncode") != 0 or records[0].get("before_state_signature") != case["state_signature"]):
-            failures.append("run-two physical preflight did not accept the restored fixture")
+            failures.append(
+                f"repetition {repetition} preflight did not check the exact initial SQL"
+            )
+        if repetition == 2 and (
+            records[0].get("predicate_returncode") != 0
+            or records[0].get("before_state_signature") != case["state_signature"]
+        ):
+            failures.append(
+                "run-two physical preflight did not accept the restored fixture"
+            )
     if all(len(records_by_rep[repetition]) > 1 for repetition in (1, 2)):
-        first_candidates = [records_by_rep[repetition][1]["sql_sha256"] for repetition in (1, 2)]
+        first_candidates = [
+            records_by_rep[repetition][1]["sql_sha256"] for repetition in (1, 2)
+        ]
         probe["first_reducer_candidate_sha256"] = first_candidates
         if first_candidates[0] != first_candidates[1]:
-            failures.append("run two did not independently observe run one's first cache-miss candidate")
+            failures.append(
+                "run two did not independently observe run one's first cache-miss candidate"
+            )
     else:
-        failures.append("missing reducer callback needed to prove per-child cache state")
+        failures.append(
+            "missing reducer callback needed to prove per-child cache state"
+        )
     all_workdirs = [record.get("candidate_workdir") for record in observations]
     if len(all_workdirs) != len(set(all_workdirs)):
         failures.append("candidate workdir was reused across observations")
@@ -399,11 +559,37 @@ def run_probe(binary: Path, output: Path, profile: str = "full", timeout: float 
     probe["children"] = children
     probe["failures"] = failures
     probe["qualified"] = not failures
-    (output / "probe.json").write_text(json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (output / "observations.jsonl").write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in observations), encoding="utf-8")
-    (output / "cleanup.jsonl").write_text("".join(json.dumps({key: record.get(key) for key in ("repetition", "runner_run_id", "runner_child_id", "candidate_workdir", "cleanup_observed")}, sort_keys=True) + "\n" for record in observations), encoding="utf-8")
+    (output / "probe.json").write_text(
+        json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (output / "observations.jsonl").write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in observations),
+        encoding="utf-8",
+    )
+    (output / "cleanup.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    key: record.get(key)
+                    for key in (
+                        "repetition",
+                        "runner_run_id",
+                        "runner_child_id",
+                        "candidate_workdir",
+                        "cleanup_observed",
+                    )
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for record in observations
+        ),
+        encoding="utf-8",
+    )
     if failures:
-        raise RuntimeError("SQLite profile isolation probe failed: " + "; ".join(failures))
+        raise RuntimeError(
+            "SQLite profile isolation probe failed: " + "; ".join(failures)
+        )
     return probe
 
 
@@ -414,8 +600,12 @@ def main() -> int:
     if args[:1] == ["--oracle"]:
         return _oracle(args[1:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True, help="built executable occam-eval")
-    parser.add_argument("--out", type=Path, required=True, help="new empty evidence directory")
+    parser.add_argument(
+        "--binary", type=Path, required=True, help="built executable occam-eval"
+    )
+    parser.add_argument(
+        "--out", type=Path, required=True, help="new empty evidence directory"
+    )
     parser.add_argument("--profile", default="full")
     parser.add_argument("--timeout", type=float, default=2)
     parser.add_argument("--budget", type=float, default=10)
@@ -423,12 +613,28 @@ def main() -> int:
     parser.add_argument("--outer-timeout", type=float, default=30)
     options = parser.parse_args(args)
     try:
-        report = run_probe(options.binary, options.out, options.profile, options.timeout,
-                           options.budget, options.max_oracle_executions, options.outer_timeout)
+        report = run_probe(
+            options.binary,
+            options.out,
+            options.profile,
+            options.timeout,
+            options.budget,
+            options.max_oracle_executions,
+            options.outer_timeout,
+        )
     except Exception as exc:
         print(f"profile isolation probe: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"out": str(options.out.resolve()), "qualified": report["qualified"], "repetitions": 2}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "out": str(options.out.resolve()),
+                "qualified": report["qualified"],
+                "repetitions": 2,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 

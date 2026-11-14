@@ -14,10 +14,10 @@ import sqlite3
 import subprocess
 import sys
 import time
-from typing import Any
 import uuid
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 DIAGNOSTIC_BLIND_SPOTS = [
     "GHC cost centres do not resolve internal Rust CPU; safe foreign calls can run outside sampled Haskell capabilities; use native perf with declared coverage",
@@ -63,7 +63,7 @@ def check_perf_support(perf_bin: Path | None) -> tuple[bool, str | None]:
         probe = subprocess.run(
             [str(perf_bin), "record", "-o", "/dev/null", "--", "true"],
             capture_output=True,
-            check = False,
+            check=False,
             timeout=5,
         )
         if probe.returncode == 0:
@@ -79,7 +79,11 @@ def get_perf_version(perf_bin: Path | None) -> str | None:
         return None
     try:
         res = subprocess.run(
-            [str(perf_bin), "--version"], check=False, stdout=subprocess.PIPE, text=True, timeout=5
+            [str(perf_bin), "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=5,
         )
         if res.returncode == 0:
             return res.stdout.strip()
@@ -233,11 +237,15 @@ def split_sql_statements(sql: str, dialect: str = "") -> list[str]:
         if char == "/" and following == "*":
             block_depth = 1
             i += 2
-        elif char == "-" and following == "-" and (
-            dialect not in {"mysql", "mariadb"}
-            or i + 2 == len(sql)
-            or sql[i + 2].isspace()
-            or ord(sql[i + 2]) < 32
+        elif (
+            char == "-"
+            and following == "-"
+            and (
+                dialect not in {"mysql", "mariadb"}
+                or i + 2 == len(sql)
+                or sql[i + 2].isspace()
+                or ord(sql[i + 2]) < 32
+            )
         ):
             i += 2
             while i < len(sql) and sql[i] not in "\r\n":
@@ -1606,9 +1614,7 @@ def profiles(
                         (case_dir / "diagnostic_manifest.json").write_text(
                             json.dumps(diag_manifest, indent=2) + "\n"
                         )
-                    row = base_record(
-                        entry, profile_name, timeout, budget, executions
-                    )
+                    row = base_record(entry, profile_name, timeout, budget, executions)
                     artifact_dir = str(case_dir.resolve())
                     raw_metric_file = case_dir / "benchmark.json"
                     result_file = case_dir / "minimal.sql"
