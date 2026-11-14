@@ -153,276 +153,52 @@
 - Ensured monotonic byte reduction and verified termination at the true fixed point.
 
 * 23. DBMS Semantic Alignment
-- Principle: the Rust frontend owns dialect/server semantics and emits typed
-  facts for modeled effects; the Haskell graph builder stays dialect-agnostic.
-  Distinguish parser acceptance, modeled effects and opaque effects. Scoped
-  barriers apply only where their scope is proven; unknown global effects
-  establish a persistent fence through later statements.
-- Coverage and proof boundaries for all 16 selected dialects are in README.md,
-  "Dialect semantic coverage"; parser support is not engine-validity evidence.
+- Principle: Rust frontend emits typed facts for modeled effects; Haskell graph builder stays dialect-agnostic. Unknown global effects establish a persistent fence; coverage details are in README.md.
 ** TODO Extend the typed fact IR only for additionally proven effects
-- Already represented: session values, DML/write kinds, drop/truncate modes,
-  transaction effects, schema ownership and refresh source mode. TABLE sources,
-  whole-row projections (including qualified temporary aliases), direct
-  table-target SELECT INTO, CTAS WITH NO DATA,
-  snapshot/live source lifetimes and ALTER VIEW schema moves now have consumer
-  regressions. Unknown effects are preserved, not silently discarded.
-- Remaining opaque: external/bulk I/O, partition/overwrite/multi-table INSERT,
-  OUTPUT INTO sinks, table inheritance/partition relationships, persistent view
-  routing and computed row expansion without proven lineage.
+- Model remaining opaque effects: external/bulk I/O, partition/multi-table INSERT, OUTPUT INTO sinks, table inheritance, persistent view routing, and unproved row expansions.
 ** TODO Extend identifier and namespace rules only where context is proven
-- Already modeled: object-class/configuration-aware folding, MySQL
-  lower_case_table_names (namespace parts included), BigQuery table/column case,
-  and case-insensitive quoted matching for SQLite/DuckDB/MsSql.
-- Simple MySQL database creation/USE and complete supported namespace paths
-  retain schema generations. Partial multi-level USE/default-schema transitions
-  remain opaque; ambiguous destructive targets fence rather than mutate all
-  possible matches. Option-bearing database creation remains opaque.
+- Resolve multi-level USE/default-schema transitions and ambiguous destructive targets; unproved targets fence rather than mutate.
 ** TODO Extend session state beyond the dedicated modeled settings
-- Already modeled: search paths including symbolic current-user entries,
-  namespace changes with proven context, role/session-user identity and
-  dedicated autocommit/foreign-key settings.
-- Generic variable SET/RESET, unknown settings and unproved session effects
-  remain globally fenced; a recorded value alone is not semantic support.
+- Generic variable SET/RESET and unproved session effects remain globally fenced.
 ** TODO Resolve durable sequence values without weakening rollback safety
-- Already modeled: MySQL/Oracle implicit DDL commits, nested-BEGIN policies,
-  savepoint/catalog snapshots and ON COMMIT registrations.
-- PostgreSQL sequence DDL stays transactional, but value advances do not.
-  Qualified provable sequence advances inside transactions/autocommit-off now
-  establish explicit uncertainty, including drop/recreate/rollback cases;
-  durable generation history is not claimed.
+- Sequence advances inside transactions/autocommit-off remain uncertain; durable generation history is not claimed.
 ** TODO Extend stored-expression, constraint and trigger effects
-- Already modeled: foreign-key identity/cascades, constraint changes, recognized
-  inline trigger effects and data-modifying CTEs.
-- Unproved routines, deferred defaults/expressions, opaque trigger bodies and
-  privilege effects remain fenced. Do not treat accepted syntax or stored
-  definitions as proof that their later effects are modeled.
+- Unproved routines, deferred defaults/expressions, opaque trigger bodies and privileges remain fenced.
 
 * 24. Benchmark & Performance Engineering
 ** TODO [#A] Define experiment lines and reduction tracks
-- Define exactly two experiment lines: internal Occam experiments (full reducer
-  and controlled ablations) and external reducer comparisons. Keep separate
-  experiment definitions and result/report identities.
-- An experiment selects one line and homogeneous profiles; never combine both
-  lines in a leaderboard. CLI/native/API execution mode is orthogonal to line.
-  Shared runner, qualified cases, predicate, resource, and evidence contracts
-  are allowed; external candidate construction/search must remain independent.
-- Within each declared cohort/budget, compare validated output quality against
-  end-to-end cost and completion: bytes and reliable statement/token counts
-  where supported, wall time, and actual uncached predicate executions/reset
-  scope. State phases, validation, count/debit scope, and statement-only versus
-  full-AST coverage.
-- Do not invent universal parse-success or scalar scores, or claim byte-only
-  formatter advantage. A reduction is not a global minimum, SQL-semantic
-  validity, or bug reproduction.
+- Separate internal ablation line from independent external line; never combine lines in a leaderboard.
+- Reduction tracks are per-input identities, not lines or tool substitutes. Compare bytes, statements, wall time, and uncached oracle/reset calls.
 *** DONE [#A] Document the experiment-line and track contract
-- `benchmarks/README.md` defines exactly the internal and external lines,
-  separates line from execution mode, and treats reduction tracks as per-input
-  identities. Profile/effective settings are comparison sides; unlike
-  statement-only and full-AST coverage are not pooled.
-- Documentation only: cohort/profile compatibility is not enforced by every
-  entrypoint, and the external line remains unselected.
 ** BLOCKED [#A] Select primary DBMS and representative evidence scope
-- Owner review must select engine/version, setup, and workload sources.
-  PostgreSQL with SQLite execution controls is only a bounded proposal; parser
-  support and synthetic fixtures do not establish evidence.
-- Acceptance: record the selected scope and rationale, or explicitly limit
-  claims until representative evidence exists. Do not require crash cases or
-  an arbitrary corpus-size target.
+- Owner review must select target DBMS, version, setup, and workload sources; parser support and synthetic fixtures do not qualify engine evidence.
 ** TODO [#A] Qualify workload provenance and predicate/reset contracts
-- For each selected case, preserve exact SQL bytes/checksum, origin and lineage,
-  property to preserve, workload-family rationale, dialect, DBMS/version/setup,
-  and predicate/reset fingerprints and isolation contract. Pin deterministic
-  source, parameters, and seed where generated.
-- Include positive and negative predicate controls and case-specific
-  contamination/reset/restoration checks. These qualify the selected
-  predicate/reset path, not universal oracle correctness; crash harvesting is
-  out of scope.
-- The reducer/runner must not infer diagnostic categories from raw predicate
-  stdout/stderr or exit status; a case predicate may inspect target DB output
-  per its declared contract. The generic predicate-exit rule remains: status
-  0 accepts, any nonzero/signal rejects; no exit codes are reserved globally.
-- For an already-selected relational/metamorphic case, document the proven
-  relation and comparison semantics (bag/order, duplicates, NULL as relevant);
-  require both branches to succeed from equivalent DB state. This conditional
-  paired-success requirement does not apply to diagnostic-only cases.
-- Acceptance: record initial acceptance and fresh-state final validation.
-  External predicate/reset owns DB isolation. Keep text-marker mechanics
-  distinct from execution evidence.
+- Pin input bytes, lineage, dialect, predicate/reset contract, and positive/negative controls; crash collection is out of scope.
 *** DONE [#A] Probe one bounded SQLite reset-template path
-- `python3 benchmarks/tools/profile_isolation_probe.py --binary
-  dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/build/occam-eval/occam-eval
-  --out benchmarks/benchmark_artifacts/profile-isolation-20261114-b` returned
-  `qualified=true` for two native `full` repetitions; both rows completed and
-  validated. The gitignored local evidence records per-observation
-  candidate-workdir signatures, contamination and cleanup checks, and child
-  metrics. Probe helper SHA256:
-  `8b8a37fe066f1932f8a3be2bd2fd9196739382af027a881c78ae67f6d79ab4f3`.
-- Scope is one existing `reset-template` SQLite rowset with per-observation
-  candidate workdirs and configured reset only. It does not qualify arbitrary
-  database isolation, a representative workload, or external DBMS selection.
 ** TODO [#A] Use one control plane for selected experiment lines
-- Use one runner/control plane for either selected line; prepare upstream
-  checkouts, builds, adapters, and workloads outside timed measurement. The
-  runner owns resources and outer outcomes; each reducer owns its search and
-  candidate semantics; the external predicate/reset owns DB execution/reset.
-- Trial Nix using the existing lock for one selected DBMS and one qualified
-  case; do not require full-project packaging or historical-version builds.
-  Whether Nix becomes a benchmark prerequisite remains an explicit decision.
-- Trial acceptance: run from a clean environment without undeclared host tools,
-  identify resolved binaries and dependency/build inputs outside the lock, and
-  record preparation/rebuild cost separately from measured runs. Materialize
-  dependencies before timing and invoke resolved binaries directly. Record an
-  adopt/defer decision and maintenance cost; Nix is not DB/profile isolation.
-- Clean up owned process groups, containers, and resources on the declared
-  platform; record cleanup failures. Do not promise to kill escaped or
-  reparented descendants, or identical cleanup behavior on every OS.
-- Acceptance: preserve line-specific accounting and validation boundaries.
-  Distinguish rejection, timeout/checkpoint, tool, infrastructure, and cleanup
-  failures.
+- Prepare builds, adapters, and inputs outside timed measurement; runner owns resources, process groups, and timeouts.
+- Retain planned Nix trial for selected DBMS to record preparation/rebuild costs and adopt/defer decision.
 *** DONE [#A] Add the bounded internal native profile-driver slice
-- `scale_study.py profiles` runs case × profile × repetition serially with a
-  fresh native child, budget, counters, preflight, output directory, and
-  per-child `GHCRTS=-N1`; the shared command helper retains timeout/cleanup
-  observations and bounds post-timeout output draining.
-- This is not a two-line control-plane migration: legacy entrypoints and
-  external reducer integration remain outside this slice.
 ** IN_PROGRESS [#A] Isolate each measured profile execution
-- First slice verified: `occam-eval --profile NAME` selects one internal
-  profile; `scale_study.py profiles` records separate native child processes.
-- Focused `python3 -m unittest -v benchmarks.test_scale_study` passed 5 tests
-  in 11.971s, covering timeout cleanup/continuation, malformed non-UTF8 and
-  missing metrics, nonzero child, and spawn-failure retention.
-- The retained two-repetition SQLite probe is qualified only for its bounded
-  reset-template fixture path (evidence and limits are recorded above).
-- Use an immutable profile configuration and a fresh child per case × profile
-  × repetition, including native/API variants. Each measured child runs exactly
-  one explicitly named profile; never combine profiles in one measured worker.
-  Each child gets fresh runtime, cache, counters, budget, and physical preflight.
-  Run final checks only when status/budget permit; never reuse another run's
-  preflight/final check. Give each child its own output directory and artifacts.
-- Record a structured terminal observation (including budget/timeout) separately
-  from process exit status; a failed child must not erase other batch results.
-  Preserve production CLI nonzero-on-exhaustion/checkpoint and generic predicate
-  contract: 0 accepts; any nonzero/signal rejects; output is opaque.
-- Prove DB fixture/reset isolation at case effect scope; a new process or
-  directory alone is insufficient. Read-only inputs and binaries may be shared.
-- Serialize measurements by default. Record CPU/thread settings, repetitions,
-  order, warm-up and cache policy; a fresh process is not a cold OS page cache.
-  Run instrumented diagnostics separately from normal score runs.
-- Acceptance: a two-run probe dirties fixture, cache/counters, and artifact
-  state in run one and proves run two starts clean. Retain isolation/reset
-  evidence and cleanup outcomes. Preserve timeout versus validated-partial
-  status; never promote a checkpoint to completed.
+- Fresh child per case × profile × repetition with independent directory, cache, counters, budget, and physical preflight.
+- Never promote partial checkpoints to completion; retain timeout and failure evidence.
 *** DONE [#A] Test child timeout and failure retention
-- The focused suite covers a timed-out child with ordinary descendant cleanup,
-  bounded output capture and later-child continuation; it also verifies that
-  timeout/nonzero/missing-metric outcomes are not promoted from stale
-  completed/checkpoint data.
-- Cleanup evidence is scoped to the Linux `/proc`/owned-process-group helper;
-  escaped or reparented descendants are not promised.
 ** TODO [#A] Preserve immutable per-run evidence
-- Store versioned raw records/artifacts with case, line, profile, repetition,
-  child and isolation/reset identities; input/output checksums; execution mode;
-  score-versus-diagnostic mode; tool/toolchain/environment; exact command,
-  options, resources, validation phases, and count/debit scope. Unknown metrics
-  remain null, not zero.
-- Internal ablations record the base config and one mechanism difference.
-  External runs record upstream checkout, local patch, executable, options,
-  and adapter fingerprints.
-- Resolve the already-selected source/patch, toolchain/build flags, and
-  executable before timing; record resolved path and identity/hash where
-  available, and invoke that binary directly (no per-candidate builds).
-- Preserve all actual parsing, normalization, search, and preflight costs;
-  do not silently subtract them.
-- `validated-complete` requires completed reduction and fresh successful final
-  checks. Timeout/budget checkpoints retain timeout/incomplete status. Never
-  override outer timeout or infrastructure failure with a stale profile.
-- Acceptance: every result traces to raw records/artifacts; partial accepted
-  checkpoints retain validation state and are never promoted to completion.
+- Store versioned raw records with unique run/child IDs, checksums, commands, flags, and count/debit provenance; unknown metrics stay null.
 *** DONE [#A] Capture raw artifacts for internal native children
-- Per-run metadata and JSONL rows carry unique run/child identities, serial
-  order, profile/track, configured command fingerprints, actual input/output
-  byte hashes, native typed statement-count provenance, separate outer/native
-  timing, and raw metric/checkpoint/log paths. Unknown metrics stay null.
-- This does not capture all source/patch/toolchain/effective-pass evidence or
-  external-line raw records required by the parent task.
 ** TODO [#B] Add evidence-led profiling early
-- Start when the foundation contract, first qualified case, and raw-run capture
-  exist; do not wait for full rewrite or external-tool selection. Keep
-  instrumented profiles separate from normal score runs. Capture Haskell
-  CPU/allocation and, where supported, Linux `perf` for CLI/Rust FFI; attribute
-  child predicate/reset costs separately.
-- Acceptance: retain symbolized profiles with exact cases, binaries, flags,
-  and limits; state GHC safe-FFI, Rust, and child-process blind spots. The
-  generated GHC flamegraph smoke remains toolchain proof, not a baseline.
+- Keep diagnostic runs separate from normal score runs. Capture Haskell CPU/allocation and Linux perf; attribute child predicate/reset wall time separately.
+- Disclose GHC safe-FFI/Rust/child process blind spots; previous flamegraph smoke is toolchain proof, not a baseline. Details in `benchmarks/README.md`.
+*** DONE [#B] Implement diagnostic profiling runner and bounded artifact capture
 ** TODO [#B] Run controlled internal controls and ablations
-- Sequential audit and direct statement ddmin are named internal profiles;
-  the old `Baseline.hs` aliases and numeric B1/B2 selection are removed. Keep
-  controls only for a named question; direct ddmin does not isolate AST gains.
-- Before naming a profile, verify and record its effective ordered passes,
-  fallback, audit/fixed-point behavior, and minimality claim. Do not presume
-  an all-off Boolean config equals statement ddmin or count duplicate
-  effective configurations as separate controls without a named reason;
-  merge only after verified equivalence.
-- Compare full Occam with one feature-off profile at a time, holding other
-  passes and cache policy fixed except the named mechanism. Do not create a
-  full cross-product or pool statement-only and full-AST results.
-- Acceptance: report paired mechanism deltas only within matched internal
-  profiles, cases, repetitions, and resource/validation protocol.
+- Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
+*** DONE [#B] Run bounded SQLite rowset full vs no-cache control
+- Run isolated score repetitions on bounded SQLite rowset case with identical passes, differing only in candidate memoization.
 ** TODO [#B] Qualify and compare independent external reducers
-- Compare the production Occam CLI with separately implemented upstream
-  parser/candidate/search algorithms. Verify independent search before
-  admission; record commit, dirty/local patch, executable, options, adapter,
-  and configuration fingerprints. SQLreduce/SQLancer remain conditional
-  candidates; choose no tool before the blocked DBMS/workload scope is resolved.
-- Use the exact same full input, setup, predicate, and declared budget. If a
-  reducer cannot handle a full script, record unsupported or define a
-  query-only cohort used identically for every tool; never substitute a
-  tool-specific input. External tools may use declared native capabilities and
-  cache policies; do not force Occam passes onto them.
-- Record observed token/statement/AST granularity, syntax/dependency awareness
-  where verified, dialect/full-script coverage, and formatting behavior as
-  capabilities, not mandatory tiers or presumed winners.
-- Prepare checkout/build/adapter compilation before timing. Do not silently
-  exclude actual input parsing, normalization, search, or per-run preflight.
-  Verify fresh predicate results. Report byte and structural quality for
-  formatters; do not claim byte-only superiority.
-- Acceptance: share count protocol only where comparable and state differences.
-  Admit no arbitrary tool zoo; preserve unsupported outcomes in the denominator.
+- Compare production Occam CLI with independently implemented reducers on exact identical input, setup, predicate, and budget; selection BLOCKED on primary DBMS scope.
 ** TODO [#B] Derive strictly partitioned reports from raw evidence
-- Trace records by unique run/profile/repetition/child IDs. Pair only by
-  matched case/input checksum, experiment line, predicate/reset identity,
-  scope, repetition/block, and compatible budget/resource/count protocol.
-  Profile/tool/child IDs are comparison sides, not equality keys.
-- Report internal mechanism deltas separately from external tool comparisons;
-  keep score and diagnostic runs separate. Never aggregate or rank across
-  experiment lines.
-- Preserve matched cases, cohorts, related lineages, failures, unsupported and
-  missing cases. Distinguish batch makespan from summed worker time; never run
-  predicates in the reporter or silently normalize unlike protocols.
-- Acceptance: allow distinct profiles/tools/children to be compared when
-  protocol-compatible; reject cross-line and incompatible-protocol pairs.
-  Reports derive reproducibly from immutable raw records and retain incomplete
-  outcomes and denominators.
+- Report internal mechanism deltas separately from external tool comparisons; reject cross-line and incompatible-protocol pairs.
+*** DONE [#B] Derive paired deltas within qualified internal run
+- Reject cross-line, incompatible-protocol, and mismatched-pass pairs while computing exact per-pair cost/quality deltas.
 ** TODO [#B] Cut over benchmark entrypoints and retire redundant paths
-- Migrate single-input/generation (`benchmarks/live_fuzz_pipeline.sh`,
-  `benchmarks/tools/fuzz_generator.py`); batch/study
-  (`benchmarks/fuzz_corpus/run_docker_benchmark.py`,
-  `benchmarks/tools/scale_study.py`); evaluation (`bench/Benchmark.hs`,
-  `bench/Main.hs`, `occam.cabal`, `test/Spec.hs`);
-  wrappers (`benchmarks/run_all.sh`, `benchmarks/report.sh`,
-  `benchmarks/docker_run.sh`, root `Dockerfile.benchmark`,
-  `harness/docker_entrypoint.sh`).
-- Migrate selected optional paths only: `benchmarks/upstream/oracle_exec.py`,
-  `oracle_test.py`, `sqlancer_adapter.sh`, `sqlreduce_adapter.py`, and
-  `harness/sqlsmith_driver.sh`. Update `benchmarks/README.md`,
-  `harness/README.md`, root `README.md`, and focused tests
-  (`benchmarks/test_report_pairing.py`, `test_semantic_boundaries.py`,
-  `test_oracle_test.py`, `test_oracle_exec.py`, `test_scale_study.py`).
-- Baseline aliases and mixed in-process profile execution are retired. Finish
-  retiring redundant batch/report paths without compatibility shims. Preserve
-  old artifacts only as labeled history, not current baseline evidence. Keep
-  safety-contract tests for the new boundaries.
-- Acceptance: document one supported orchestration path and provision only
-  selected-scope engines/tools. Old filenames and CLI are not commitments.
+- Retire redundant scripts, baseline aliases, and mixed runners without compatibility shims once supported line orchestration lands.

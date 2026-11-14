@@ -362,6 +362,291 @@ PRAGMA user_version=7;
             self.assertEqual(2, len({row["child_id"] for row in rows}))
             self.assertTrue((output / "run.json").is_file())
 
+    def test_diagnostic_mode_partitions_run_and_records_phase_attribution(self):
+        with tempfile.TemporaryDirectory(prefix="occam-diagnostic-test-") as directory:
+            root = Path(directory)
+            sql = root / "case.sql"
+            sql.write_text("SELECT 1;\n", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"cases": [{
+                "id": "diag-case", "file": str(sql), "dialect": "sqlite",
+                "evidence_class": "generated_db_execution", "oracle_kind": "sqlite_rowset",
+                "oracle_command": "exit 0", "reset_command": "exit 0", "parameters": {},
+            }]}), encoding="utf-8")
+            worker = root / "worker"
+            worker.write_text(textwrap.dedent(r'''
+                #!/usr/bin/env python3
+                import json
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                out = Path(args[args.index("--out") + 1])
+                out.mkdir(parents=True, exist_ok=True)
+                profile = args[args.index("--profile") + 1]
+                sql_arg = args[args.index("-RTS") + 1] if "-RTS" in args else args[0]
+                sql = Path(sql_arg).read_bytes()
+                minimal = out / "minimal.sql"
+                minimal.write_bytes(sql)
+                if "-P" in args:
+                    (out / "occam.prof").write_text("mock GHC profile\n", encoding="utf-8")
+                metrics_path = out / "profile.json"
+                metric = {
+                    "metricAlgorithm": profile,
+                    "metricExperimentLine": "internal",
+                    "metricInitialBytes": len(sql),
+                    "metricReducedBytes": len(sql),
+                    "metricByteReduction": 0.0,
+                    "metricInitialStmts": 1,
+                    "metricReducedStmts": 1,
+                    "metricStmtReduction": 0.0,
+                    "metricOracleCalls": 1,
+                    "metricTimeSeconds": 0.008,
+                    "metricEvaluationMetrics": {
+                        "evaluationStatus": "completed",
+                        "evaluationFailure": None,
+                        "evaluationCacheUsed": True,
+                        "evaluationCacheHits": 0,
+                        "evaluationCacheMisses": 1,
+                        "evaluationOracleAttempts": 1,
+                        "evaluationDatabaseObservations": 1,
+                        "evaluationTimedOutObservations": 0,
+                        "evaluationValidationObservations": 2,
+                        "evaluationValidationDatabaseObservations": 2,
+                        "evaluationValidationPassed": True,
+                        "evaluationValidationSeconds": 0.001,
+                        "evaluationPreflightOracleSeconds": 0.001,
+                        "evaluationOracleSeconds": 0.002,
+                        "evaluationValidationOracleSeconds": 0.001,
+                        "evaluationPreflightResetSeconds": 0.001,
+                        "evaluationResetSeconds": 0.001,
+                        "evaluationValidationResetSeconds": 0.001,
+                        "evaluationReductionSeconds": 0.002,
+                        "evaluationTotalSeconds": 0.008,
+                        "evaluationBudget": {
+                            "evaluationPreflightAttempts": 1,
+                            "evaluationPreflightMicros": 1000,
+                        },
+                    },
+                    "metricReductionSettings": {},
+                    "metricSQLArtifact": str(minimal),
+                    "metricMetricsArtifact": str(metrics_path),
+                }
+                metrics_path.write_text(json.dumps(metric))
+                (out / "benchmark.json").write_text(json.dumps([metric]))
+            ''').lstrip(), encoding="utf-8")
+            worker.chmod(0o755)
+            fake_bin = root / "fake_bin"
+            fake_bin.mkdir()
+            fake_perf = fake_bin / "perf"
+            fake_perf.write_text(
+                "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('fake perf: permission denied\\n')\nsys.exit(126)\n",
+                encoding="utf-8",
+            )
+            fake_perf.chmod(0o755)
+
+            fake_flamegraph = root / "fake-flamegraph"
+            fake_flamegraph.write_text(
+                "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('fake flamegraph: mock parsing failed\\n')\nsys.exit(2)\n",
+                encoding="utf-8",
+            )
+            fake_flamegraph.chmod(0o755)
+
+            test_env = {"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            with patch.dict(os.environ, test_env):
+                score_out = root / "score_out"
+                study.profiles(manifest, worker, score_out, 1, 10, 10, ["full"], diagnostic=False)
+                score_run = json.loads((score_out / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual("score", score_run["run_type"])
+                self.assertNotIn("diagnostic_config", score_run)
+                score_rows = [json.loads(line) for line in (score_out / "results.jsonl").read_text().splitlines()]
+                self.assertEqual(1, len(score_rows))
+                self.assertEqual("score", score_rows[0]["run_type"])
+                self.assertIsNone(score_rows[0].get("diagnostic_artifacts"))
+                self.assertIsNone(score_rows[0].get("diagnostic_manifest"))
+                self.assertIsNone(score_rows[0].get("diagnostic_status"))
+
+                diag_out = root / "diag_out"
+                study.profiles(
+                    manifest, worker, diag_out, 1, 10, 10, ["full"],
+                    diagnostic=True, ghc_prof_flamegraph=fake_flamegraph,
+                )
+                diag_run = json.loads((diag_out / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual("diagnostic", diag_run["run_type"])
+                self.assertIn("diagnostic_config", diag_run)
+                self.assertFalse(diag_run["diagnostic_config"]["perf_available"])
+                self.assertIn("fake perf: permission denied", diag_run["diagnostic_config"]["perf_unavailable_reason"])
+                self.assertTrue(diag_run["diagnostic_config"]["flamegraph_available"])
+
+                diag_rows = [json.loads(line) for line in (diag_out / "results.jsonl").read_text().splitlines()]
+                self.assertEqual(1, len(diag_rows))
+                row = diag_rows[0]
+                self.assertEqual("completed", row["status"])
+                self.assertEqual("diagnostic", row["run_type"])
+                self.assertEqual("partial", row["diagnostic_status"])
+                self.assertEqual(0.001, row["predicate_preflight_sec"])
+                self.assertEqual(0.002, row["predicate_reduction_sec"])
+                self.assertEqual(0.001, row["predicate_validation_sec"])
+                self.assertEqual(0.004, row["predicate_time_sec"])
+                self.assertEqual(0.001, row["reset_preflight_sec"])
+                self.assertEqual(0.001, row["reset_reduction_sec"])
+                self.assertEqual(0.001, row["reset_validation_sec"])
+                self.assertEqual(0.003, row["reset_time_sec"])
+                self.assertEqual(0.001, row["unattributed_wall_time_sec"])
+                self.assertIsNone(row["unattributed_wall_time_reason"])
+                self.assertTrue(row.get("unattributed_wall_time_scope"))
+                self.assertIsInstance(row.get("diagnostic_artifacts"), dict)
+                self.assertIn("ghc_profile", row["diagnostic_artifacts"])
+                self.assertTrue(row.get("diagnostic_manifest"))
+                manifest_path = Path(row["diagnostic_manifest"])
+                self.assertTrue(manifest_path.is_file())
+                manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual("diagnostic", manifest_doc["run_type"])
+                self.assertEqual("partial", manifest_doc["diagnostic_status"])
+                self.assertIn("toolchain", manifest_doc)
+                self.assertIn("blind_spots", manifest_doc)
+                self.assertIn("artifacts", manifest_doc)
+                self.assertIn("postprocessing", manifest_doc)
+                self.assertFalse(manifest_doc["postprocessing"]["cpu_flamegraph"]["artifact_present"])
+                self.assertEqual(2, manifest_doc["postprocessing"]["cpu_flamegraph"]["returncode"])
+                self.assertIn("fake flamegraph: mock parsing failed", manifest_doc["postprocessing"]["cpu_flamegraph"]["stderr"])
+
+    def test_diagnostic_mode_inconsistent_timing_and_failure_reporting(self):
+        with tempfile.TemporaryDirectory(prefix="occam-diagnostic-inconsistent-") as directory:
+            root = Path(directory)
+            sql = root / "case.sql"
+            sql.write_text("SELECT 1;\n", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"cases": [
+                {
+                    "id": "inconsistent-timing", "file": str(sql), "dialect": "sqlite",
+                    "oracle_command": "exit 0", "parameters": {},
+                },
+                {
+                    "id": "missing-prof", "file": str(sql), "dialect": "sqlite",
+                    "oracle_command": "exit 0", "parameters": {},
+                },
+            ]}), encoding="utf-8")
+            worker = root / "worker"
+            worker.write_text(textwrap.dedent(r'''
+                #!/usr/bin/env python3
+                import json
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                out = Path(args[args.index("--out") + 1])
+                out.mkdir(parents=True, exist_ok=True)
+                profile = args[args.index("--profile") + 1]
+                sql_arg = args[args.index("-RTS") + 1] if "-RTS" in args else args[0]
+                sql = Path(sql_arg).read_bytes()
+                minimal = out / "minimal.sql"
+                minimal.write_bytes(sql)
+                case_id = "inconsistent-timing" if "inconsistent-timing" in str(out) else "missing-prof"
+                if case_id == "inconsistent-timing":
+                    (out / "occam.prof").write_text("mock GHC profile\n", encoding="utf-8")
+                    total_seconds = 0.002
+                else:
+                    total_seconds = 0.010
+                metrics_path = out / "profile.json"
+                metric = {
+                    "metricAlgorithm": profile,
+                    "metricExperimentLine": "internal",
+                    "metricInitialBytes": len(sql),
+                    "metricReducedBytes": len(sql),
+                    "metricByteReduction": 0.0,
+                    "metricInitialStmts": 1,
+                    "metricReducedStmts": 1,
+                    "metricStmtReduction": 0.0,
+                    "metricOracleCalls": 1,
+                    "metricTimeSeconds": total_seconds,
+                    "metricEvaluationMetrics": {
+                        "evaluationStatus": "completed",
+                        "evaluationFailure": None,
+                        "evaluationCacheUsed": True,
+                        "evaluationCacheHits": 0,
+                        "evaluationCacheMisses": 1,
+                        "evaluationOracleAttempts": 1,
+                        "evaluationDatabaseObservations": 1,
+                        "evaluationTimedOutObservations": 0,
+                        "evaluationValidationObservations": 2,
+                        "evaluationValidationDatabaseObservations": 2,
+                        "evaluationValidationPassed": True,
+                        "evaluationValidationSeconds": 0.001,
+                        "evaluationPreflightOracleSeconds": 0.002,
+                        "evaluationOracleSeconds": 0.003,
+                        "evaluationValidationOracleSeconds": 0.001,
+                        "evaluationReductionSeconds": 0.001,
+                        "evaluationTotalSeconds": total_seconds,
+                        "evaluationBudget": {
+                            "evaluationPreflightAttempts": 1,
+                            "evaluationPreflightMicros": 1000,
+                        },
+                    },
+                    "metricReductionSettings": {},
+                    "metricSQLArtifact": str(minimal),
+                    "metricMetricsArtifact": str(metrics_path),
+                }
+                metrics_path.write_text(json.dumps(metric))
+                (out / "benchmark.json").write_text(json.dumps([metric]))
+            ''').lstrip(), encoding="utf-8")
+            worker.chmod(0o755)
+
+            fake_bin = root / "fake_bin"
+            fake_bin.mkdir()
+            fake_perf = fake_bin / "perf"
+            fake_perf.write_text(
+                "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('fake perf: permission denied\\n')\nsys.exit(126)\n",
+                encoding="utf-8",
+            )
+            fake_perf.chmod(0o755)
+
+            fake_flamegraph = root / "fake-flamegraph"
+            fake_flamegraph.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "if '-o' in sys.argv:\n"
+                "    Path(sys.argv[sys.argv.index('-o') + 1]).write_text('<svg>partial corrupted data</svg>', encoding='utf-8')\n"
+                "sys.stderr.write('fake flamegraph: mock parsing failed after writing partial output\\n')\n"
+                "sys.exit(2)\n",
+                encoding="utf-8",
+            )
+            fake_flamegraph.chmod(0o755)
+
+            test_env = {"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            with patch.dict(os.environ, test_env):
+                diag_out = root / "diag_out"
+                study.profiles(
+                    manifest, worker, diag_out, 1, 10, 10, ["full"],
+                    diagnostic=True, ghc_prof_flamegraph=fake_flamegraph,
+                )
+                rows = {row["case_id"]: row for row in [json.loads(line) for line in (diag_out / "results.jsonl").read_text().splitlines()]}
+
+                inconsistent = rows["inconsistent-timing"]
+                self.assertEqual("diagnostic", inconsistent["run_type"])
+                self.assertEqual("completed", inconsistent["status"])
+                self.assertEqual("partial", inconsistent["diagnostic_status"])
+                self.assertIsNone(inconsistent["diagnostic_artifacts"]["cpu_flamegraph"])
+                inconsistent_dir = Path(inconsistent["artifact_directory"])
+                raw_cpu_svg = inconsistent_dir / "cpu-time.svg"
+                self.assertTrue(raw_cpu_svg.is_file())
+                self.assertEqual("<svg>partial corrupted data</svg>", raw_cpu_svg.read_text(encoding="utf-8"))
+                manifest_doc = json.loads(Path(inconsistent["diagnostic_manifest"]).read_text(encoding="utf-8"))
+                cpu_post = manifest_doc["postprocessing"]["cpu_flamegraph"]
+                self.assertEqual(2, cpu_post["returncode"])
+                self.assertIn("mock parsing failed", cpu_post["stderr"])
+                self.assertTrue(cpu_post["artifact_present"])
+                self.assertEqual(0.006, inconsistent["predicate_time_sec"])
+                self.assertEqual(0.002, inconsistent["wall_time_sec"])
+                self.assertIsNone(inconsistent["unattributed_wall_time_sec"])
+                self.assertIn("inconsistent timing", inconsistent["unattributed_wall_time_reason"])
+                missing_prof = rows["missing-prof"]
+                self.assertEqual("diagnostic", missing_prof["run_type"])
+                self.assertEqual("completed", missing_prof["status"])
+                self.assertEqual("failed", missing_prof["diagnostic_status"])
+                self.assertIsNone(missing_prof["diagnostic_artifacts"]["ghc_profile"])
+
 
 if __name__ == "__main__":
     unittest.main()

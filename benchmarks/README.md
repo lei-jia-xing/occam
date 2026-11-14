@@ -241,6 +241,42 @@ printf 'bounded smoke exit=%s (inspect run/stats.json; timeout is not completion
 
 The setup links the same, uninstrumented Rust release archive under Cabal's `_p` library name; this does not profile Rust. GHC time profiles exclude safe foreign-call CPU (`c_parseSQL`), child-oracle time and Rust allocations; allocation is cumulative Haskell heap, not live heap. Treat these graphs as Haskell diagnostics, not whole-process timing.
 
+## Evidence-led diagnostic profiling
+
+To capture symbolized runtime profiles and separately attribute child phase costs without contaminating score runs:
+
+```bash
+python3 benchmarks/tools/scale_study.py profiles manifest.json \
+  --binary /path/to/profiled/occam-eval \
+  --out /path/to/diagnostic-output \
+  --profile full --repetitions 2 \
+  --diagnostic
+```
+
+When `--diagnostic` is passed:
+- `run.json` and every record in `results.jsonl` record `run_type: "diagnostic"` (normal runs record `run_type: "score"`) to support line-compliant partitioning; do not mix score and diagnostic runs or rely on the legacy reporter to enforce this boundary.
+- The instrumented binary is invoked with `+RTS -N1 -P -po{case_dir}/occam -RTS`, writing symbolized cost-centre profile `{case_dir}/occam.prof`.
+- If `ghc-prof-flamegraph` is available, SVG flamegraphs `{case_dir}/cpu-time.svg` and `{case_dir}/haskell-allocation.svg` are generated.
+- If Linux `perf` is supported, the run is wrapped with resolved absolute `perf record -o {case_dir}/perf.data -g -- ...` and `{case_dir}/perf-report.txt` is generated with symbol tables.
+- Postprocessing renderers and reporters reuse bounded runner process management, capturing structured execution records and raw stderrs into `diagnostic_manifest.json` under `postprocessing`.
+- A top-level `diagnostic_status` (`"completed"`, `"partial"`, or `"failed"`) is recorded separately from native SQL reduction completion.
+- Child predicate and reset costs are typed and attributed by phase in each record:
+  `predicate_preflight_sec`, `predicate_reduction_sec`, `predicate_validation_sec`, `predicate_time_sec`,
+  `reset_preflight_sec`, `reset_reduction_sec`, `reset_validation_sec`, `reset_time_sec`, and
+  `unattributed_wall_time_sec` (residual wall-clock duration: `wall_time_sec - (predicate_time_sec + reset_time_sec)`; reflects scheduling, RTS runtime overhead, parser execution, and measurement latency, not CPU attribution; set to null with reason on inconsistent timing).
+- A per-child `diagnostic_manifest.json` records toolchain versions, binary fingerprints, exact CLI and RTS flags, artifact paths, postprocessor command outcomes, and explicit blind spots disclosure (input checksums and reduction track provenance remain in `run.json` and per-child `results.jsonl` rows).
+
+### Known blind spots and constraints
+- **Internal Rust CPU**: GHC cost centres do not resolve internal Rust CPU; safe foreign calls can run outside sampled Haskell capabilities; use native perf with declared coverage.
+- **Rust Allocations**: Rust allocations occur via the system/Rust allocator and are completely invisible to the GHC heap profiler.
+- **Child Process Isolation**: External predicate (`--oracle`) and reset (`--reset`) commands execute in independent child processes. GHC profilers cover Haskell-side execution, not child process CPU or memory; predicate and reset phase durations are wall-clock times.
+- **Linux perf Scope**: Linux `perf` default `-g` inherits the entire native process tree (including child oracle/reset processes and kernel fork/clone routines; symbolized aggregate in `perf-report.txt` is not target-only or Rust-only CPU, and presence of `perf.data` does not prove isolated Rust profiling). Linux `perf` does not observe Haskell heap allocations or green-thread scheduling.
+- **Phase Duration Nature**: Typed predicate and reset phase costs (`predicate_*_sec`, `reset_*_sec`) are wall-clock durations measured from the runner/engine perspective, not isolated CPU time.
+- **Bounded Case Sample Count**: Low CPU sample counts on small bounded inputs (such as the 47-byte SQLite `reset-template` case) reflect fast execution where startup, reset, and predicate phases dominate, rather than an absence of hotspots.
+- **Toolchain Smoke Proof**: Prior flamegraph artifacts (e.g. `ghc-profile-20261113-a` on `statements-4096.sql`) remain toolchain proofs, not a performance baseline.
+
+### Retained diagnostic evidence
+Verified diagnostic evidence on the bounded SQLite `reset-template` case is retained at gitignored `benchmarks/benchmark_artifacts/diagnostic-profile-20261114-final2/` (exact commands and verified artifacts in per-child `command.json` and `diagnostic_manifest.json`). Target binary preparation metadata and build logs are recorded in `benchmarks/benchmark_artifacts/profile-prep-20261114-eval/preparation.json` and `cabal-build-v2.log`.
 ## External experiment line (unselected)
 
 No external reducer or DBMS/workload scope is selected here. Existing optional
@@ -265,9 +301,55 @@ Outer initial/final checks are reported separately. Native execution caps includ
 
 Occam instead tracks ordered SQL definitions, uses, writes, drops, renames and generations, plus recognized transaction/savepoint catalog snapshots. Conservative barriers retain uncertain state; unrestricted deletion lets the supplied predicate remove false dependencies. Unchanged source bytes are retained, without DRReduce-style typed identifier repair. These are scoped engineering differences, not proof of a novel or universally superior method. DRReduce excludes some C expression reductions and leaves Java inheritance propagation incomplete; neither its compiler timings nor its other-language limitations establish SQL performance. Use the controlled SQL profiles above for SQL-specific evidence.
 
-## Reports and synthetic inputs
+## Internal ablation reporting
 
-`benchmarks/report.sh` formats JSONL records and cannot establish SQL validity or bug reproduction. `--table` is the default; `--summary` groups by evidence class, predicate kind, dialect, reduction track and tool; `--md` emits Markdown. `--json` emits case/tool records as a JSON array; `--csv` emits one case/tool record per CSV row and preserves false separately from unknown. These two data modes do not merge the separate batch-summary sidecar.
+`benchmarks/tools/partitioned_report.py` (and `scale_study.py report`) derives paired deltas only within ONE qualified current run directory (`run.json` + `results.jsonl`). It enforces strict protocol compatibility:
+- Pairing requires exact match on `case_id`, `input_sha256`, `reduction_track`, `predicate_command_sha256`, `reset_command_sha256`, `case_contract_sha256`, `repetition`, limits (`oracle_timeout_sec`, `budget_sec`, `max_oracle_executions`, `outer_timeout_sec`), and resource/count scopes.
+- Native reduction settings must match across all reduction passes (`kind`, `slicing`, `closure`, `intra_statement`, `unrestricted`, `dialect`), differing ONLY in `cache` (`True` for base `full`, `False` for target `no-cache`). Asymmetric keys or any non-cache value/type difference refuses to pair.
+- Profiles and child IDs are comparison sides, NOT equality keys.
+- Metrics: `oracle_calls` counts spawned predicate observations; `candidate_checks` counts attempted observations (debited before reset). Quality and cost metrics remain in their own units.
+- `unattributed_wall_time_sec` is residual wall-clock time minus predicate and reset duration; it reflects runtime overhead, scheduling, and parser latency, NOT CPU attribution.
+
+### Required `case_contract` schema
+
+For qualified case admission, `manifest.json` cases carry an explicit `case_contract` dictionary (with canonical `case_contract_sha256 = hashlib.sha256(json.dumps(case_contract, sort_keys=True).encode("utf-8")).hexdigest()`):
+- `effect_scope`: string (e.g. `"candidate-local SQLite file-state control via OCCAM_WORKDIR"`)
+- `comparison_policy`: string (e.g. `"exact ordered-row comparison against expected_rows"`)
+- `declared_scope`: string (e.g. `"one SQLite file-state control only; not primary DBMS/external tool selection"`)
+- `environment`: object with `python_executable`, `python_version`, and `sqlite_version`
+- `hashes`: object with 64-char hex strings for `sql_sha256` (must agree with `input_sha256`), `template_sha256`, `metadata_sha256`, and `helper_sha256`
+
+Declaration and fingerprints record declared protocol and effect scope, not automatic oracle certification or DBMS bug reproduction. Running `prepare` alone does not qualify engine evidence.
+
+### Verified full vs no-cache control slice
+
+- **Pass and reduction contract**: Traced and verified from `bench/Benchmark.hs`, `src/Occam/Reducer.hs`, and `src/Occam/Evaluation.hs`. Both profiles execute identical ordered mechanisms: after preflight, an outer shrinking loop runs backward dependency slicing (`reductionSlicing: true`), DAG closure delta debugging (`reductionClosure: true`), unrestricted statement deletion fallback (`reductionUnrestricted: true`), and an inner fixed-point loop (`interleaveFixedPoint`) alternating single-statement audit (`statementAuditWithLogger`) THEN intra-statement syntax rewrites (`reduceSyntaxWithDialect`). `src/Occam/Evaluation.hs` then applies a separate final shared statement audit (`statementAuditWithLogger`), achieving statement deletion 1-minimality only when audit is confirmed (not a global SQL minimum), followed by 2 uncached physical validation checks (`validateTwice`). The named difference is strictly candidate memoization during reduction (`evaluationCacheEnabled: true` in `full` vs `false` in `no-cache`).
+- **Case provenance & helper qualification**: Input derived from `test/golden/fuzz_golden_03_deep_expressions.golden.sql` (47 bytes, input SHA256 `12f182722a25864cfc7a0deeca2c8d3ff692a90c35b89d0d200a597fdbe4b3cc`). Comparison semantics enforce exact ordered-row equality against expected rows `[[1, 100.5], [2, 250.75]]`. Standalone helper `sqlite_case_runner.py` is qualified with clean reset, positive control, wrong-row negative control (`rc=1`), syntax-error negative control (`rc=1`), contamination detection (`rc=125`), and clean restoration (`helper_qualification.json`).
+- **Execution and reporting commands**:
+  The command below records local historical evidence; for new runs, choose a NEW, empty `--out` directory (existing directories are preserved). Local gitignored evidence is not fresh-checkout-ready packaging.
+  ```bash
+  python3 benchmarks/tools/scale_study.py profiles \
+    benchmarks/benchmark_artifacts/internal-ablation-20261114-a/fixture/manifest.json \
+    --binary dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/build/occam-eval/occam-eval \
+    --out benchmarks/benchmark_artifacts/internal-ablation-20261114-a/runs \
+    --profile full --profile no-cache --repetitions 2 \
+    --timeout 2 --budget 30 --max-oracle-executions 100
+
+  python3 benchmarks/tools/scale_study.py report \
+    benchmarks/benchmark_artifacts/internal-ablation-20261114-a/runs
+  python3 benchmarks/tools/scale_study.py report \
+    benchmarks/benchmark_artifacts/internal-ablation-20261114-a/runs --json
+  ```
+- **Evidence and observations**: Retained evidence lives in `benchmarks/benchmark_artifacts/internal-ablation-20261114-a` (local gitignored).
+  * Reducer-scope physical predicate observations: 6 in `full` vs 26 in `no-cache` **per repetition**, eliminating exactly 20 uncached physical predicate observations in each repetition (`Δ = +20`).
+  * Reducer cache hits: 20 in `full` vs 0 in `no-cache` per repetition (`Δ = -20`).
+  * Reduction quality: 100% identical across all 4 children (43 bytes, 1 statement, output SHA256 `97a763885d27f6300f5f1e600dbc6051126d9a54e3a98d076d6c4f6f83a8d544`).
+  * Denominators: 2/2 comparison slots paired and completed; 0 exclusions.
+- **Scope and non-causal caveats**: Runs executed serially in fixed child order without OS filesystem page cache flushes. Residual wall time (0.04s in `full` vs 0.08–0.10s in `no-cache`) is not CPU attribution or a causal speedup claim. Bounded strictly to this one SQLite file-state control; broader SQL workloads and DBMS engines remain UNKNOWN, and primary DBMS/external tool selection remains owner review BLOCKED.
+
+## Legacy presentation tool
+
+`benchmarks/report.sh` formats historical JSONL records from legacy multi-tool runs. It is non-line-conforming and groups records without enforcing current partitioned protocols or line separation. Entrypoint cutover is not claimed complete.
 
 ```bash
 ./benchmarks/report.sh --summary
