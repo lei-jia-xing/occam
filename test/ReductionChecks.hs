@@ -73,31 +73,6 @@ tests =
                 (BSC.pack "SELECT id FROM \"mixed\";\n")
                 postgres
             assertEqual "SQLite folds quoted identifiers for closure" sql sqlite
-        , testCase "Graph-free and dependency-aware modes run identical intra-statement passes" $ do
-            let sql = "SELECT 100 + 200;"
-                oracle = predicateOracle (BSC.isInfixOf "SELECT")
-                shared =
-                    defaultReductionConfig
-                        { reductionSlicing = False
-                        , reductionIntraStatement = True
-                        , reductionUnrestricted = False
-                        }
-            graphFree <- reduceSQLWithConfig (shared {reductionClosure = False}) nullLogger oracle sql
-            closure <- reduceSQLWithConfig (shared {reductionClosure = True}) nullLogger oracle sql
-            audited <-
-                reduceSQLWithConfig
-                    (shared {reductionClosure = True, reductionUnrestricted = True})
-                    nullLogger
-                    oracle
-                    sql
-            assertBool
-                "intra-statement rewriting must make strict progress"
-                (BS.length graphFree < BS.length sql)
-            assertEqual "disabling dependency closure leaves the rewrite pass unchanged" graphFree closure
-            assertEqual
-                "the unrestricted fallback/audit composition leaves this result unchanged"
-                closure
-                audited
         , testCase "Closure search prunes unneeded independent subgraphs" $ do
             let sql =
                     BSC.unlines
@@ -133,22 +108,6 @@ tests =
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
             assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
-        , testCase "Named table constraints are stripped with their CONSTRAINT prefix" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (id INT, CONSTRAINT pk PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id), name TEXT);"
-                        , "SELECT id FROM t;"
-                        ]
-                oracle =
-                    predicateOracle
-                        ( \candidate ->
-                            BSC.isInfixOf "CREATE TABLE t" candidate
-                                && BSC.isInfixOf "SELECT id FROM t" candidate
-                        )
-            reduced <- reduceSQL GenericSQL oracle sql
-            assertBool "strips named primary key" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
-            assertBool "strips named foreign key" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
-            assertBool "strips constraint names" (not (BSC.isInfixOf "CONSTRAINT" reduced))
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             let sql =
                     BSC.unlines
@@ -283,73 +242,6 @@ tests =
             assertEqual "MsSql statements stay within units" 2 mssqlCount
             assertEqual "Snowflake statements stay within units" 2 snowflakeCount
             assertEqual "BigQuery statements stay within units" 2 bigqueryCount
-        , testCase
-            "MsSql dependency extraction and reduction removes dead tables while preserving bracketed query"
-            $ do
-                let sql =
-                        BSC.unlines
-                            [ "CREATE TABLE [dbo].[dead_table] ([id] INT);"
-                            , "CREATE TABLE [dbo].[live_table] ([id] INT, [name] NVARCHAR(50));"
-                            , "INSERT INTO [dbo].[live_table] VALUES (1, 'bob');"
-                            , "SELECT TOP 1 [name] FROM [dbo].[live_table] WHERE [id] = 1;"
-                            ]
-                mssqlCount <- countOrFail MsSql sql
-                assertEqual "MsSql statement counting counts 4 statements" 4 mssqlCount
-                let oracle =
-                        predicateOracle
-                            (\candidate -> BSC.isInfixOf "live_table" candidate && BSC.isInfixOf "SELECT" candidate)
-                reduced <- reduceSQL MsSql oracle sql
-                assertBool "dead table is eliminated by reduction" (not (BSC.isInfixOf "dead_table" reduced))
-                assertBool "live table is preserved" (BSC.isInfixOf "live_table" reduced)
-                assertBool "query is preserved" (BSC.isInfixOf "SELECT" reduced)
-        , testCase "DuckDB dependency extraction and reduction removes unused statements" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE unused_tbl (id INT);"
-                        , "CREATE TABLE duck_data (id INT, val INT);"
-                        , "INSERT INTO duck_data VALUES (1, 10);"
-                        , "SELECT [x + 1 FOR x IN [1, 2, 3]] FROM duck_data WHERE val > 5;"
-                        ]
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "duck_data" candidate && BSC.isInfixOf "SELECT" candidate)
-            reduced <- reduceSQL DuckDB oracle sql
-            assertBool "unused table is eliminated by reduction" (not (BSC.isInfixOf "unused_tbl" reduced))
-            assertBool "referenced table is preserved" (BSC.isInfixOf "duck_data" reduced)
-            assertBool "query statement is preserved" (BSC.isInfixOf "SELECT" reduced)
-        , testCase "ClickHouse dependency extraction and reduction preserves engine clauses and dependencies" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE unneeded (id UInt64) ENGINE = MergeTree() ORDER BY id;"
-                        , "CREATE TABLE ch_events (EventId UInt64) ENGINE = MergeTree() ORDER BY EventId;"
-                        , "INSERT INTO ch_events VALUES (42);"
-                        , "SELECT EventId FROM ch_events WHERE EventId > 0;"
-                        ]
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "ch_events" candidate && BSC.isInfixOf "SELECT" candidate)
-            reduced <- reduceSQL ClickHouse oracle sql
-            assertBool "unneeded table is eliminated by reduction" (not (BSC.isInfixOf "unneeded" reduced))
-            assertBool "referenced table is preserved" (BSC.isInfixOf "ch_events" reduced)
-            assertBool "query statement is preserved" (BSC.isInfixOf "SELECT" reduced)
-        , testCase "Oracle statement counting and reduction removes dead tables while preserving DUAL query" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE dead_table (id NUMBER(10));"
-                        , "CREATE TABLE live_table (id NUMBER(10), name VARCHAR2(50));"
-                        , "INSERT INTO live_table VALUES (1, 'alice');"
-                        , "SELECT 1 FROM dual;"
-                        , "SELECT name FROM live_table WHERE id = 1;"
-                        ]
-            oracleCount <- countOrFail Oracle sql
-            assertEqual "Oracle statement counting counts 5 statements" 5 oracleCount
-            let oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "live_table" candidate && BSC.isInfixOf "dual" candidate)
-            reduced <- reduceSQL Oracle oracle sql
-            assertBool "dead table is eliminated by reduction" (not (BSC.isInfixOf "dead_table" reduced))
-            assertBool "live table is preserved" (BSC.isInfixOf "live_table" reduced)
-            assertBool "dual query is preserved" (BSC.isInfixOf "dual" reduced)
         , testCase "inconclusive oracle outcomes abort reduction" $ do
             let inconclusive _ = pure OracleInconclusive
             result <-

@@ -516,78 +516,11 @@ checkParserValidity dialect sql = do
                 Nothing -> True
                 Just _ -> False
 
--- | The selected dialect accepts reduced SQL without syntax-error units.
-prop_parserValidity :: FuzzScript -> Property
-prop_parserValidity script = monadicIO $ do
-    let initialSQL = renderScriptSQL script
-        oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
-    valid <- run (checkParserValidity SQLite reducedSQL)
-    monitor
-        ( counterexample
-            ( "SQL parser rejected reduced output:\n"
-                ++ BSC.unpack reducedSQL
-                ++ "\nOracle desc: "
-                ++ T.unpack (targetDesc (scriptTarget script))
-            )
-        )
-    assert valid
-
--- | Synthetic invariant: reduced output must satisfy the generated text predicate.
-prop_oracleSoundness :: FuzzScript -> Property
-prop_oracleSoundness script = monadicIO $ do
-    let initialSQL = renderScriptSQL script
-        oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
-    sound <- run (oracleAccepts oracle reducedSQL)
-    monitor
-        ( counterexample
-            ( "Oracle returned False on reduced SQL:\n"
-                ++ BSC.unpack reducedSQL
-                ++ "\nOracle desc: "
-                ++ T.unpack (targetDesc (scriptTarget script))
-            )
-        )
-    assert sound
-
--- | Invariant 3: Reduction monotonicity (reduced byte length <= initial byte length)
-prop_reductionMonotonicity :: FuzzScript -> Property
-prop_reductionMonotonicity script = monadicIO $ do
-    let initialSQL = renderScriptSQL script
-        oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
-    let initLen = BSC.length initialSQL
-        redLen = BSC.length reducedSQL
-    monitor
-        ( counterexample
-            ( "Monotonicity violated: reduced length "
-                ++ show redLen
-                ++ " > initial length "
-                ++ show initLen
-            )
-        )
-    assert (redLen <= initLen)
-
--- | Invariant 4: Reducer idempotency reaches the same fixed point.
-prop_reductionIdempotency :: FuzzScript -> Property
-prop_reductionIdempotency script = monadicIO $ do
-    let initialSQL = renderScriptSQL script
-        oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
-    secondReducedSQL <- run (reduceSQL SQLite oracle reducedSQL)
-    monitor
-        ( counterexample
-            ( "Idempotency violated: fixed-point not reached.\nFirst:\n"
-                ++ BSC.unpack reducedSQL
-                ++ "\nSecond:\n"
-                ++ BSC.unpack secondReducedSQL
-            )
-        )
-    assert (secondReducedSQL == reducedSQL)
-
--- | Comprehensive Heavy Fuzzing Property (syntax validity, oracle, monotonicity, and idempotency).
-prop_heavyFuzzAllInvariants :: FuzzScript -> Property
-prop_heavyFuzzAllInvariants script = monadicIO $ do
+{- | Core reduction invariant: the reduced script is valid, still satisfies the
+predicate, never grows, and is already a fixed point.
+-}
+prop_reductionInvariants :: FuzzScript -> Property
+prop_reductionInvariants script = monadicIO $ do
     let initialSQL = renderScriptSQL script
         oracle = makeScriptOracle script
     reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
@@ -628,22 +561,10 @@ generativeFuzzTests :: TestTree
 generativeFuzzTests =
     testGroup
         "Generative Fuzzing (Tasty / QuickCheck)"
-        [ testProperty
-            "Fuzz 1: SQL parser accepts reduced output"
-            prop_parserValidity
-        , testProperty
-            "Fuzz 2: Synthetic Predicate Preservation"
-            prop_oracleSoundness
-        , testProperty
-            "Fuzz 3: Reduction Monotonicity (Len Reduced <= Initial)"
-            prop_reductionMonotonicity
-        , testProperty
-            "Fuzz 4: Reducer Idempotency (Fixed-Point Reached)"
-            prop_reductionIdempotency
-        , localOption (QuickCheckTests 200) $
+        [ localOption (QuickCheckTests 200) $
             testProperty
-                "Fuzz 5: Deep Stress Invariants (syntax, oracle, monotonicity, idempotency)"
-                prop_heavyFuzzAllInvariants
+                "Reduced output preserves syntax, predicate, monotonicity, and fixed point"
+                prop_reductionInvariants
         ]
 
 fuzzTests :: TestTree

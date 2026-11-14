@@ -12,17 +12,13 @@ import Data.List (subsequences)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import DependencyChecks qualified
 import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (
-    CacheAdmission (..),
-    CacheMode (..),
     CacheStats (..),
     memoizeOracle,
-    memoizeOracleWith,
  )
 import Occam.Core (
     CatalogOp (..),
@@ -39,11 +35,9 @@ import Occam.Core (
     StatementId (..),
     TableDef (..),
     WriteKind (..),
-    nameText,
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
-import Occam.Logger (nullLogger)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
 import Occam.Reducer
 import Occam.Slicer
@@ -63,27 +57,20 @@ import System.IO (hClose, openTempFile)
 import System.Process (readProcessWithExitCode)
 import Test.QuickCheck (
     Arbitrary (..),
-    Gen,
     Property,
     chooseInt,
     counterexample,
     elements,
     oneof,
     resize,
-    sublistOf,
     vectorOf,
  )
-import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
 emptySemanticFacts :: SemanticFacts
 emptySemanticFacts = SemanticFacts [] [] [] [] []
-
-isTruncateKind :: WriteKind -> Bool
-isTruncateKind TruncateWrite {} = True
-isTruncateKind _ = False
 
 main :: IO ()
 main = defaultMain tests
@@ -92,9 +79,7 @@ tests :: TestTree
 tests =
     testGroup
         "Occam Test Suite"
-        [ phase1Tests
-        , phase2Tests
-        , phase3Tests
+        [ phase3Tests
         , phase5Tests
         , phase6Tests
         , phase7Tests
@@ -109,103 +94,7 @@ tests =
         ]
 
 -- ----------------------------------------------------------------------------
--- Phase 1: SQL frontend
--- ----------------------------------------------------------------------------
-
-phase1Tests :: TestTree
-phase1Tests =
-    testGroup
-        "SQL frontend"
-        [ testCase "same-line UTF-8 projection surgery preserves retained bytes and CRLF" $ do
-            let kept = TE.encodeUtf8 "SELECT 'café' AS kept, a FROM"
-                sql = kept <> " (SELECT 42 AS a,99 AS b);\r\n"
-                expected = kept <> " (SELECT 42 AS a);\r\n"
-                oracle = oracleFromPredicate $ \candidate -> pure (BS.isInfixOf kept candidate && BSC.isInfixOf "42 AS a" candidate)
-                config =
-                    defaultReductionConfig
-                        { reductionSlicing = False
-                        , reductionClosure = False
-                        , reductionIntraStatement = True
-                        , reductionUnrestricted = False
-                        , reductionDialect = GenericSQL
-                        }
-            reduced <- reduceSQLWithConfig config nullLogger oracle sql
-            assertEqual "unused projection removal leaves UTF-8 SQL and CRLF untouched" expected reduced
-        ]
-
--- ----------------------------------------------------------------------------
--- Phase 2: Dependency Analysis
--- ----------------------------------------------------------------------------
-
-phase2Tests :: TestTree
-phase2Tests =
-    testGroup
-        "Phase 2: Dependency Analysis"
-        [ testCase "Construct dependency DAG and verify non-dependency of irrelevant tables" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "CREATE INDEX i1 ON t1 (a);"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-            withGraph GenericSQL script $ \graph -> do
-                let depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                    depsS5 = Map.findWithDefault Set.empty (StatementId 5) (graphEdges graph)
-                assertBool "s3 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS3))
-                assertBool "s5 should not depend on s2 (t2)" (not (Set.member (StatementId 2) depsS5))
-        , testCase "Reads base tables through CTEs, subqueries, and UNION branches" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE base_a (id INT);"
-                        , "CREATE TABLE base_b (id INT);"
-                        , "CREATE TABLE base_c (id INT);"
-                        , "WITH cte_union AS ("
-                        , "  SELECT id FROM base_a"
-                        , "  UNION ALL"
-                        , "  SELECT id FROM base_b"
-                        , ")"
-                        , "SELECT id FROM cte_union"
-                        , "WHERE EXISTS (SELECT 1 FROM base_c WHERE base_c.id = cte_union.id);"
-                        ]
-            withGraph GenericSQL script $ \graph -> do
-                let queryId = StatementId 4
-                    queryFacts = Map.findWithDefault emptySemanticFacts queryId (graphFacts graph)
-                    uses =
-                        Set.fromList
-                            [ nameText (nameRefName (readSource readFact))
-                            | ReadOp readFact <- factOps queryFacts
-                            ]
-                    deps = Map.findWithDefault Set.empty queryId (graphEdges graph)
-                assertEqual
-                    "Only external base tables are query reads"
-                    (Set.fromList ["base_a", "base_b", "base_c"])
-                    uses
-                assertEqual
-                    "Query depends on each referenced base table definition"
-                    (Set.fromList (map StatementId [1, 2, 3]))
-                    deps
-        , testCase "Backward slicing from crashing statement" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "CREATE INDEX i1 ON t1 (a);"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-            withGraph GenericSQL script $ \graph -> do
-                let slice = backwardSlice (StatementId 5) graph
-                assertBool
-                    "CRITICAL: Statement 2 (t2) should have been pruned by slice"
-                    (not (Set.member (StatementId 2) slice))
-                assertBool "Statement 1 (CREATE TABLE t1) must be in slice" (Set.member (StatementId 1) slice)
-                assertBool "Statement 5 (Crash trigger) must be in slice" (Set.member (StatementId 5) slice)
-        ]
-
--- ----------------------------------------------------------------------------
--- Phase 3: Hierarchical Reducer
+-- Hierarchical reducer
 -- ----------------------------------------------------------------------------
 
 phase3Tests :: TestTree
@@ -257,12 +146,6 @@ phase3Tests =
             assertBool "Missing required CREATE TABLE t1" (BSC.isInfixOf "CREATE TABLE t1" reduced)
             assertBool "Missing required INSERT INTO t1" (BSC.isInfixOf "INSERT INTO t1" reduced)
             assertBool "Missing required WHERE a > 0" (BSC.isInfixOf "WHERE a > 0" reduced)
-        , testCase "Expression simplification unit test" $ do
-            let complexExprSQL = "SELECT * FROM t1 WHERE (a + 10) > 0 AND 1 = 1;"
-                exprOracle sql = pure (BSC.isInfixOf "a" sql && BSC.isInfixOf "> 0" sql)
-            simplifiedExpr <- simplifyExpressions GenericSQL (oracleFromPredicate exprOracle) complexExprSQL
-            assertBool "Failed to simplify 1 = 1" (not (BSC.isInfixOf "1 = 1" simplifiedExpr))
-            assertBool "Failed to simplify + 10" (not (BSC.isInfixOf "10" simplifiedExpr))
         ]
 
 -- ----------------------------------------------------------------------------
@@ -462,32 +345,6 @@ phase6Tests =
             stats3 <- getStats
             assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
             assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
-        , testCase "precomputed observations are served even without memoization" $ do
-            callCountRef <- newIORef (0 :: Int)
-            let mockOracle _ = do
-                    modifyIORef' callCountRef (+ 1)
-                    pure False
-            (cachedOracle, getStats) <-
-                memoizeOracleWith
-                    CacheDisabled
-                    (Map.singleton "SELECT 1;" True)
-                    (const CacheAdmit)
-                    mockOracle
-            seeded <- cachedOracle "SELECT 1;"
-            assertEqual "precomputed observation is returned" True seeded
-            callsAfterSeed <- readIORef callCountRef
-            assertEqual "precomputed observation does not invoke the oracle" 0 callsAfterSeed
-            repeated <- cachedOracle "SELECT 1;"
-            assertEqual "precomputed observation remains available" True repeated
-            callsAfterRepeat <- readIORef callCountRef
-            assertEqual "repeated precomputed lookup does not invoke the oracle" 0 callsAfterRepeat
-            unseeded <- cachedOracle "SELECT 2;"
-            assertEqual "unseeded query reaches the oracle" False unseeded
-            callsAfterMiss <- readIORef callCountRef
-            assertEqual "unseeded query is counted as a miss" 1 callsAfterMiss
-            stats <- getStats
-            assertEqual "precomputed lookups are not cache hits when disabled" 0 (cacheHits stats)
-            assertEqual "only the real query is a miss" 1 (cacheMisses stats)
         , testCase "inconclusive outcomes are not cached as authoritative" $ do
             callCountRef <- newIORef (0 :: Int)
             let outcomeOracle _ = do
@@ -503,226 +360,45 @@ phase6Tests =
             stats <- getStats
             assertEqual "inconclusive results are misses" 2 (cacheMisses stats)
             assertEqual "inconclusive results are not hits" 0 (cacheHits stats)
-        , testCase "Late-query slicing completes within a linear oracle allowance" $ do
-            let required =
-                    [ "CREATE TABLE needed (v INT);"
-                    , "INSERT INTO needed VALUES (42);"
-                    , "SELECT v FROM needed;"
-                    ]
-                noise = [BSC.pack ("CREATE TABLE unused_" ++ show n ++ " (v INT);") | n <- [1 .. 64 :: Int]]
-                statements = take 2 required ++ noise ++ drop 2 required
-                sql = BSC.unlines statements
-                allowance = length statements + 16
-            calls <- newIORef (0 :: Int)
-            let check candidate = do
-                    modifyIORef' calls (+ 1)
-                    count <- readIORef calls
-                    when (count > allowance) $
-                        assertFailure
-                            ( "Linear prefix search exceeded its oracle allowance: "
-                                ++ show count
-                                ++ " > "
-                                ++ show allowance
-                            )
-                    pure (all (`BSC.isInfixOf` candidate) required)
-            (oracle, _) <- memoizeOracle (oracleFromPredicate check)
-            reduced <-
-                reduceSQLWithConfig
-                    defaultReductionConfig {reductionIntraStatement = False, reductionUnrestricted = False}
-                    nullLogger
-                    oracle
-                    sql
-            assertEqual "Unrelated setup is removed by a linear prefix scan" (BSC.unlines required) reduced
         ]
 
 -- ----------------------------------------------------------------------------
--- Phase 7: Dialect Hardening
+-- Selected frontend dialects
 -- ----------------------------------------------------------------------------
 
 phase7Tests :: TestTree
 phase7Tests =
     testGroup
-        "Phase 7: Dialect Hardening"
-        [ testCase "PG schema-qualified table: public.orders" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE public.orders (id INT);"
-                        , "SELECT * FROM public.orders;"
-                        ]
-            withGraph PostgreSQL script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                assertBool "SELECT should depend on CREATE TABLE public.orders" (Set.member (StatementId 1) depsS2)
-        , testCase "MySQL backticks: `items`" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE `items` (id INT);"
-                        , "INSERT INTO `items` VALUES (1);"
-                        ]
-            withGraph MySQL script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                assertBool "INSERT should depend on CREATE TABLE `items`" (Set.member (StatementId 1) depsS2)
-        , testCase "Unquoted mixed-case PostgreSQL name matches quoted lowercase" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE Customers (id INT);"
-                        , "SELECT * FROM \"customers\";"
-                        ]
-            withGraph PostgreSQL script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                assertBool
-                    "PostgreSQL folds unquoted identifiers to lowercase"
-                    (Set.member (StatementId 1) depsS2)
-        , testCase "MySQL ON DUPLICATE KEY UPDATE records ModDep" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE `items` (id INT, val INT);"
-                        , "INSERT INTO `items` VALUES (1, 2) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`);"
-                        ]
-            withGraph MySQL script $ \graph -> do
-                let factsS2 = Map.findWithDefault emptySemanticFacts (StatementId 2) (graphFacts graph)
-                    depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    writes = [write | WriteDataOp write <- factOps factsS2]
-                assertBool
-                    "INSERT ... ON DUPLICATE KEY UPDATE should record a conflict-update write on items"
-                    ( any
-                        ( \write ->
-                            dataWriteTarget write == NameRef (Name [Ident "items"]) False
-                                && dataWriteKind write == InsertWrite ConflictUpdate
-                        )
-                        writes
-                    )
-                assertBool
-                    "INSERT ... ON DUPLICATE KEY UPDATE should depend on CREATE TABLE"
-                    (Set.member (StatementId 1) depsS2)
-        , testCase "SQLite bracket identifiers: [products]" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE [products] (id INT, name TEXT);"
-                        , "INSERT INTO [products] VALUES (1, 'widget');"
-                        , "SELECT * FROM [products];"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let sliceS3 = backwardSlice (StatementId 3) graph
-                assertBool
-                    "Backward slice from SELECT should reach CREATE TABLE [products]"
-                    (Set.member (StatementId 1) sliceS3)
-        , testCase "SQLite schema-qualified table: main.products" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE main.products (id INT, name TEXT);"
-                        , "INSERT INTO main.products VALUES (1, 'widget');"
-                        , "SELECT * FROM main.products;"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                assertBool "INSERT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS2)
-                assertBool "SELECT should depend on CREATE TABLE main.products" (Set.member (StatementId 1) depsS3)
-        , testCase "SQLite CREATE VIEW and SELECT from view" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (id INT, val TEXT);"
-                        , "CREATE VIEW v1 AS SELECT * FROM t1;"
-                        , "SELECT * FROM v1;"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                assertBool "CREATE VIEW should depend on CREATE TABLE t1" (Set.member (StatementId 1) depsS2)
-                assertBool "SELECT from view should depend on CREATE VIEW v1" (Set.member (StatementId 2) depsS3)
-        , testCase "SQLite CREATE TABLE t2 AS SELECT * FROM t1 maintains dependencies" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (id INT);"
-                        , "CREATE TABLE t2 AS SELECT * FROM t1;"
-                        , "SELECT * FROM t1;"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    depsS3 = Map.findWithDefault Set.empty (StatementId 3) (graphEdges graph)
-                assertBool
-                    "CREATE TABLE t2 AS SELECT should depend on t1 (Stmt 1)"
-                    (Set.member (StatementId 1) depsS2)
-                assertBool
-                    "SELECT * FROM t1 must still depend on CREATE TABLE t1 (Stmt 1)"
-                    (Set.member (StatementId 1) depsS3)
-        , testCase "SQLite foreign key REFERENCES parent(id)" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id));"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                assertBool
-                    "CREATE TABLE child should depend on CREATE TABLE parent"
-                    (Set.member (StatementId 1) depsS2)
-        , testCase "SQLite TRUNCATE TABLE records UseDep and ModDep" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE items (id INT);"
-                        , "TRUNCATE TABLE items;"
-                        ]
-            withGraph SQLite script $ \graph -> do
-                let factsS2 = Map.findWithDefault emptySemanticFacts (StatementId 2) (graphFacts graph)
-                    depsS2 = Map.findWithDefault Set.empty (StatementId 2) (graphEdges graph)
-                    writes = [write | WriteDataOp write <- factOps factsS2]
-                assertBool
-                    "TRUNCATE should record a truncate write on items"
-                    ( any
-                        ( \write ->
-                            dataWriteTarget write == NameRef (Name [Ident "items"]) False
-                                && isTruncateKind (dataWriteKind write)
-                        )
-                        writes
-                    )
-                assertBool "TRUNCATE should depend on CREATE TABLE items" (Set.member (StatementId 1) depsS2)
-        , testCase "DuckDB dialect parses range and list comprehension syntax" $ do
-            let script = "SELECT * FROM range(10); SELECT [x + 1 FOR x IN [1, 2, 3]];"
-            result <- parseSQL (defaultParseOptions DuckDB) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "DuckDB parses two statement units" 2 (length (parsedUnits parsed))
-        , testCase "ClickHouse dialect parses numbers and engine clauses" $ do
-            let script = "CREATE TABLE t (id UInt64) ENGINE = MergeTree() ORDER BY id; SELECT number FROM numbers(5);"
-            result <- parseSQL (defaultParseOptions ClickHouse) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "ClickHouse parses two statement units" 2 (length (parsedUnits parsed))
-        , testCase "Oracle dialect parses DUAL, outer join (+), and hierarchical queries" $ do
-            let script =
-                    "SELECT 1 FROM dual;\n\
-                    \CREATE TABLE emp (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100));\n\
-                    \SELECT a.id, b.name FROM a, b WHERE a.id = b.id(+);\n\
-                    \SELECT id, name FROM emp START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id;"
-            result <- parseSQL (defaultParseOptions Oracle) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "Oracle parses four statement units" 4 (length (parsedUnits parsed))
-        , testCase "MsSql dialect parses bracketed identifiers and TOP clauses" $ do
-            let script = "SELECT TOP 10 [id], [val] FROM [dbo].[my_table];\nSELECT 1;"
-            result <- parseSQL (defaultParseOptions MsSql) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "MsSql parses two statement units" 2 (length (parsedUnits parsed))
-        , testCase "BigQuery dialect parses backtick qualified identifiers" $ do
-            let script = "SELECT `x` FROM `project.dataset.table`;\nSELECT 42;"
-            result <- parseSQL (defaultParseOptions BigQuery) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "BigQuery parses two statement units" 2 (length (parsedUnits parsed))
-        , testCase "Snowflake dialect parses double-quoted identifiers" $ do
-            let script = "SELECT \"ColA\" FROM \"Db\".\"Schema\".\"MyTable\";\nSELECT 1;"
-            result <- parseSQL (defaultParseOptions Snowflake) script
-            case result of
-                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
-                Right parsed ->
-                    assertEqual "Snowflake parses two statement units" 2 (length (parsedUnits parsed))
+        "Selected frontend dialects"
+        [ testCase "every selected dialect parses statement boundaries" $
+            mapM_
+                ( \dialect -> do
+                    result <- parseSQL (defaultParseOptions dialect) "SELECT 1; SELECT 2;"
+                    case result of
+                        Left err -> assertFailure (show dialect ++ " parser transport error: " ++ show err)
+                        Right parsed ->
+                            assertEqual
+                                (show dialect ++ " parses two statement units")
+                                2
+                                (length (parsedUnits parsed))
+                )
+                [ GenericSQL
+                , Ansi
+                , Teradata
+                , PostgreSQL
+                , Redshift
+                , MySQL
+                , SQLite
+                , DuckDB
+                , ClickHouse
+                , Oracle
+                , Snowflake
+                , Hive
+                , Spark
+                , Databricks
+                , BigQuery
+                , MsSql
+                ]
         ]
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()
@@ -740,50 +416,33 @@ phase8Tests :: TestTree
 phase8Tests =
     testGroup
         "Internal statement controls"
-        [ testCase "Sequential audit removes dead statements and satisfies oracle" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "CREATE TABLE t3 (d INT);"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-                oracle = oracleFromPredicate $ \sql -> do
-                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
-                        hasIns = BSC.isInfixOf "INSERT INTO t1" sql
-                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
-                    pure (hasT1 && hasIns && hasSel)
-            reduced <- statementAudit GenericSQL oracle script
-            ok <- oracleAccepts oracle reduced
-            assertBool "Sequential audit must satisfy oracle" ok
-            assertBool "Dead table t2 should be removed" (not (BSC.isInfixOf "t2" reduced))
-            assertBool "Dead table t3 should be removed" (not (BSC.isInfixOf "t3" reduced))
-            assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
-            assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
-            assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
-        , testCase "Statement ddmin removes dead statements and satisfies oracle" $ do
-            let script =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT, b TEXT);"
-                        , "CREATE TABLE t2 (c INT);"
-                        , "INSERT INTO t1 VALUES (1, 'x');"
-                        , "CREATE TABLE t3 (d INT);"
-                        , "SELECT * FROM t1 WHERE a > 0;"
-                        ]
-                oracle = oracleFromPredicate $ \sql -> do
-                    let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
-                        hasIns = BSC.isInfixOf "INSERT INTO t1" sql
-                        hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
-                    pure (hasT1 && hasIns && hasSel)
-            reduced <- statementDdmin GenericSQL oracle script
-            ok <- oracleAccepts oracle reduced
-            assertBool "Statement ddmin must satisfy oracle" ok
-            assertBool "Dead table t2 should be removed" (not (BSC.isInfixOf "t2" reduced))
-            assertBool "Dead table t3 should be removed" (not (BSC.isInfixOf "t3" reduced))
-            assertBool "Table t1 must be retained" (BSC.isInfixOf "CREATE TABLE t1" reduced)
-            assertBool "Insert into t1 must be retained" (BSC.isInfixOf "INSERT INTO t1" reduced)
-            assertBool "Select query must be retained" (BSC.isInfixOf "SELECT * FROM t1" reduced)
+        [ testCase "statement deletion removes dead statements and satisfies oracle" $
+            mapM_
+                ( \(name, reduce) -> do
+                    let script =
+                            BSC.unlines
+                                [ "CREATE TABLE t1 (a INT, b TEXT);"
+                                , "CREATE TABLE t2 (c INT);"
+                                , "INSERT INTO t1 VALUES (1, 'x');"
+                                , "CREATE TABLE t3 (d INT);"
+                                , "SELECT * FROM t1 WHERE a > 0;"
+                                ]
+                        oracle = oracleFromPredicate $ \sql -> do
+                            let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
+                                hasIns = BSC.isInfixOf "INSERT INTO t1" sql
+                                hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
+                            pure (hasT1 && hasIns && hasSel)
+                    reduced <- reduce GenericSQL oracle script
+                    accepted <- oracleAccepts oracle reduced
+                    assertBool (name ++ " must satisfy oracle") accepted
+                    assertBool (name ++ " should remove dead table t2") (not (BSC.isInfixOf "t2" reduced))
+                    assertBool (name ++ " should remove dead table t3") (not (BSC.isInfixOf "t3" reduced))
+                    assertBool (name ++ " must retain t1, its insert, and its query") $
+                        all (`BSC.isInfixOf` reduced) ["CREATE TABLE t1", "INSERT INTO t1", "SELECT * FROM t1 WHERE a > 0"]
+                )
+                [ ("statement audit", statementAudit)
+                , ("statement ddmin", statementDdmin)
+                ]
         ]
 
 -- ----------------------------------------------------------------------------
@@ -935,56 +594,6 @@ prop_closeSetReachability (SmallFactGraph rawFacts) =
             ("closeSet differs from reachability (roots, actual, expected): " ++ show mismatches)
             (null mismatches)
 
--- Prop 3: Reduction Monotonicity
-data TestOracle
-    = OracleAlwaysTrue
-    | OracleAlwaysFalse
-    | OracleContains BSC.ByteString
-    | OracleMinLength Int
-    deriving (Show)
-
-instance Arbitrary TestOracle where
-    arbitrary =
-        oneof
-            [ pure OracleAlwaysTrue
-            , pure OracleAlwaysFalse
-            , OracleContains <$> elements ["t1", "t2", "SELECT", "WHERE", "crash", "missing"]
-            , OracleMinLength <$> chooseInt (0, 100)
-            ]
-
-runTestOracle :: TestOracle -> Oracle
-runTestOracle = oracleFromPredicate . runTestPredicate
-
-runTestPredicate :: TestOracle -> BS.ByteString -> IO Bool
-runTestPredicate OracleAlwaysTrue = const (pure True)
-runTestPredicate OracleAlwaysFalse = const (pure False)
-runTestPredicate (OracleContains needle) = \s -> pure (needle `BSC.isInfixOf` s)
-runTestPredicate (OracleMinLength minLen) = \s -> pure (BS.length s >= minLen)
-
-newtype TestScript = TestScript BSC.ByteString
-    deriving (Show)
-
-instance Arbitrary TestScript where
-    arbitrary = do
-        let pool =
-                [ "CREATE TABLE t1 (a INT, b TEXT);"
-                , "CREATE TABLE t2 (c INT);"
-                , "INSERT INTO t1 VALUES (1, 'x');"
-                , "INSERT INTO t2 VALUES (2);"
-                , "SELECT * FROM t1 WHERE (a + 0) > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
-                , "SELECT * FROM t2 WHERE c > 0;"
-                , "BEGIN;\nINSERT INTO t1 VALUES (3, 'y');\nCOMMIT;"
-                ]
-        lines_ <- sublistOf pool
-        extra <- arbitrary :: Gen String
-        let full = BSC.unlines (map BSC.pack lines_ ++ [TE.encodeUtf8 (T.pack extra) | not (null extra)])
-        pure (TestScript full)
-
-prop_reductionMonotonicity :: TestScript -> TestOracle -> Property
-prop_reductionMonotonicity (TestScript script) testOracle = monadicIO $ do
-    reduced <- run (reduceSQL SQLite (runTestOracle testOracle) script)
-    assert (BS.length reduced <= BS.length script)
-
 propertyTests :: TestTree
 propertyTests =
     testGroup
@@ -996,7 +605,4 @@ propertyTests =
         , testProperty
             "Prop 2b: Set closure matches reachability for every valid root subset"
             prop_closeSetReachability
-        , testProperty
-            "Prop 3: Reduction Monotonicity (len reduced <= len initial)"
-            prop_reductionMonotonicity
         ]

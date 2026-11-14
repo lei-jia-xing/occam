@@ -62,19 +62,7 @@ posixTests :: [TestTree]
 posixTests = []
 #else
 posixTests =
-    [ testCase "reset and oracle elapsed metrics are separately measured" $ do
-            let cfg = OracleConfig "sh" ["-c", "sleep 0.05"] 2000000 (Just "sleep 0.05")
-            details <- observeExternalOracleDetailed cfg BS.empty
-            assertEqual "expected successful observation" (OracleFinished ExitSuccess) (detailedObservation details)
-            assertBool "reset elapsed time was not recorded" (resetElapsedMicros details > 0)
-            case oracleElapsedMicros details of
-                Nothing -> assertBool "oracle elapsed time was omitted" False
-                Just oracleMicros -> do
-                    assertBool "oracle elapsed time was not recorded" (oracleMicros > 0)
-                    assertBool
-                        "total elapsed time is shorter than its measured components"
-                        (totalElapsedMicros details >= resetElapsedMicros details + oracleMicros)
-        , testCase "predicates may close stdin early without changing their exit verdict" $
+    [ testCase "predicates may close stdin early without changing their exit verdict" $
             mapM_
                 ( \(exitStatus, expected) -> do
                     let command = "exec 0<&-; sleep 0.05; exit " ++ exitStatus

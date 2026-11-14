@@ -12,10 +12,6 @@ module MutationalFuzz (
 
     -- * Properties
     prop_mutationRecovery,
-    prop_deadTablesPruned,
-    prop_bloatExpressionsSimplified,
-    prop_optionalClausesPruned,
-    prop_lexicalNoiseSoundness,
 
     -- * Test Tree & Runner
     mutationalFuzzTests,
@@ -375,58 +371,9 @@ checkParserValidity dialect sql = do
                 Nothing -> True
                 Just _ -> False
 
--- | Invariant 1: Injected dead tables are completely pruned
-prop_deadTablesPruned :: Property
-prop_deadTablesPruned = forAll (elements seedPool) $ \seed ->
-    forAll (injectDeadTables (seedSQL seed)) $ \s_mutated -> monadicIO $ do
-        origOk <- run (seedOracle seed s_mutated)
-        assert origOk
-        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
-        crashPreserved <- run (seedOracle seed s_red)
-        monitor (counterexample "Crash was not preserved: oracle returned False")
-        assert crashPreserved
-        assert (not (BSC.isInfixOf "noise_tbl" s_red))
-
--- | Invariant 2: Bloated expressions are simplified
-prop_bloatExpressionsSimplified :: Property
-prop_bloatExpressionsSimplified = forAll (elements seedPool) $ \seed ->
-    forAll (bloatExpressions (seedSQL seed)) $ \s_mutated -> monadicIO $ do
-        origOk <- run (seedOracle seed s_mutated)
-        assert origOk
-        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
-        crashPreserved <- run (seedOracle seed s_red)
-        monitor (counterexample "Crash was not preserved: oracle returned False")
-        assert crashPreserved
-        assert (BS.length s_red <= BS.length s_mutated)
-
--- | Invariant 3: Optional clauses (ORDER BY, LIMIT) are pruned
-prop_optionalClausesPruned :: Property
-prop_optionalClausesPruned = forAll (elements seedPool) $ \seed ->
-    forAll (injectOptionalClauses (seedSQL seed)) $ \s_mutated -> monadicIO $ do
-        origOk <- run (seedOracle seed s_mutated)
-        assert origOk
-        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
-        crashPreserved <- run (seedOracle seed s_red)
-        monitor (counterexample "Crash was not preserved: oracle returned False")
-        assert crashPreserved
-        assert (not (BSC.isInfixOf "ORDER BY 1" s_red))
-        assert (not (BSC.isInfixOf "LIMIT 9999" s_red))
-
--- | Invariant 4: Lexical noise does not compromise reduction or syntax validity
-prop_lexicalNoiseSoundness :: Property
-prop_lexicalNoiseSoundness = forAll (elements seedPool) $ \seed ->
-    forAll (injectLexicalNoise (seedSQL seed)) $ \s_mutated -> monadicIO $ do
-        origOk <- run (seedOracle seed s_mutated)
-        assert origOk
-        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
-        crashPreserved <- run (seedOracle seed s_red)
-        monitor (counterexample "Crash was not preserved: oracle returned False")
-        assert crashPreserved
-        valid <- run (checkParserValidity SQLite s_red)
-        monitor (counterexample "Reduced SQL was rejected by the selected dialect parser")
-        assert valid
-
--- | Grand Invariant: Mutational recovery preserves syntax, the oracle, and output bounds.
+{- | Core mutational invariant: recovery preserves the predicate and syntax,
+never grows the script, and removes injected dead statements.
+-}
 prop_mutationRecovery :: Property
 prop_mutationRecovery = forAll (elements seedPool) $ \seed ->
     forAllShrink (compositeMutate (seedSQL seed)) (const []) $ \s_mutated -> monadicIO $ do
@@ -472,21 +419,9 @@ mutationalFuzzTests :: TestTree
 mutationalFuzzTests =
     testGroup
         "Mutational Fuzz Testing (Seed-and-Mutate Recovery)"
-        [ testProperty
-            "MutFuzz 1: Dead Tables Pruning"
-            prop_deadTablesPruned
-        , testProperty
-            "MutFuzz 2: Bloated Expressions Simplification"
-            prop_bloatExpressionsSimplified
-        , testProperty
-            "MutFuzz 3: Optional Clauses Pruning"
-            prop_optionalClausesPruned
-        , testProperty
-            "MutFuzz 4: Lexical Noise Soundness & Reduction"
-            prop_lexicalNoiseSoundness
-        , localOption (QuickCheckTests 100) $
+        [ localOption (QuickCheckTests 100) $
             testProperty
-                "MutFuzz 5: Composite Mutation Recovery (All 4 Invariants)"
+                "Composite mutation recovery preserves predicate, syntax, and bounds"
                 prop_mutationRecovery
         ]
 

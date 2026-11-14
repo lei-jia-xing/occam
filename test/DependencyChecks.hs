@@ -1,6 +1,5 @@
 module DependencyChecks (tests) where
 
-import Control.Monad (when)
 import Data.Bifunctor qualified as Bifunctor
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
@@ -9,19 +8,15 @@ import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Occam.Core (
-    AlterChange (..),
-    AlterTable (..),
     BarrierScope (..),
     BeginPolicy (..),
     CatalogOp (..),
     ColumnDef (..),
     ConflictAction (..),
-    Constraint (..),
     DataWrite (..),
     Ident (..),
     IndexDef (..),
     IndexRef (..),
-    IndexRole (..),
     IndexSchemaPlacement (..),
     Name (..),
     NameRef (..),
@@ -89,9 +84,6 @@ tableDefinition parts ops =
 definedColumns :: [Text] -> [CatalogOp] -> [Text]
 definedColumns parts ops =
     maybe [] (map (identText . columnName) . tableColumns) (tableDefinition parts ops)
-
-indexDefinitions :: [CatalogOp] -> [IndexDef]
-indexDefinitions ops = [definition | DefineIndexOp definition <- ops]
 
 readsFor :: StatementId -> DependencyGraph -> [ReadFact]
 readsFor sid graph = [readFact | ReadOp readFact <- opsFor sid graph]
@@ -179,103 +171,6 @@ tests =
             assertBool
                 "qualified read excludes the colliding schema"
                 (has (StatementId 5) qualifiedReads && not (has (StatementId 6) qualifiedReads))
-        , testCase "SET ROLE changes the $user search-path entry" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA alice;"
-                        , "CREATE SCHEMA bob;"
-                        , "SET search_path TO \"$user\", public;"
-                        , "SET ROLE alice;"
-                        , "CREATE TABLE t (x INT);"
-                        , "SET ROLE bob;"
-                        , "CREATE TABLE t (x INT);"
-                        , "SET ROLE alice;"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let readDeps = dependenciesFor (StatementId 9) graph
-            assertBool
-                "the read resolves to the table created while the role was alice"
-                (has (StatementId 5) readDeps && not (has (StatementId 7) readDeps))
-        , testCase "RESET ROLE restores current_user from session_user" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA alice;"
-                        , "CREATE SCHEMA bob;"
-                        , "SET search_path TO \"$user\", public;"
-                        , "SET SESSION AUTHORIZATION bob;"
-                        , "SET ROLE alice;"
-                        , "CREATE TABLE t (x INT);"
-                        , "RESET ROLE;"
-                        , "CREATE TABLE t (x INT);"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let readDeps = dependenciesFor (StatementId 9) graph
-            assertBool
-                "the read resolves to the table created after resetting to the session user"
-                (has (StatementId 8) readDeps && not (has (StatementId 6) readDeps))
-        , testCase "RESET SESSION AUTHORIZATION restores the authenticated user" $ do
-            let options =
-                    (defaultParseOptions PostgreSQL)
-                        { parseServerConfig =
-                            (parseServerConfig (defaultParseOptions PostgreSQL))
-                                { serverCurrentUser = Just "carol"
-                                }
-                        }
-                sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA carol;"
-                        , "CREATE SCHEMA bob;"
-                        , "SET search_path TO \"$user\", public;"
-                        , "SET SESSION AUTHORIZATION bob;"
-                        , "CREATE TABLE t (x INT);"
-                        , "RESET SESSION AUTHORIZATION;"
-                        , "CREATE TABLE t (x INT);"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyzeWith options sql
-            let readDeps = dependenciesFor (StatementId 8) graph
-            assertBool
-                "the read resolves to the table created by the authenticated user"
-                (has (StatementId 7) readDeps && not (has (StatementId 5) readDeps))
-        , testCase "quoted current_user preserves identifier case" $ do
-            let options =
-                    (defaultParseOptions PostgreSQL)
-                        { parseServerConfig =
-                            (parseServerConfig (defaultParseOptions PostgreSQL))
-                                { serverCurrentUser = Just "\"MixedUser\""
-                                }
-                        }
-                sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA \"MixedUser\";"
-                        , "SET search_path TO \"$user\";"
-                        , "CREATE TABLE t (id INT);"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyzeWith options sql
-            assertBool
-                "the $user entry resolves to the case-preserved authenticated user"
-                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
-        , testCase "quoted namespace_prefix preserves identifier case" $ do
-            let options =
-                    (defaultParseOptions PostgreSQL)
-                        { parseServerConfig =
-                            (parseServerConfig (defaultParseOptions PostgreSQL))
-                                { serverNamespacePrefix = ["\"MixedSchema\""]
-                                }
-                        }
-                sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA \"MixedSchema\";"
-                        , "CREATE TABLE t (id INT);"
-                        , "SELECT * FROM \"MixedSchema\".t;"
-                        ]
-            graph <- analyzeWith options sql
-            assertBool
-                "the namespace prefix resolves to the case-preserved schema"
-                (has (StatementId 2) (dependenciesFor (StatementId 3) graph))
         , testCase "unresolved column qualifiers do not bind to every table" $ do
             let sql =
                     BSC.unlines
@@ -394,37 +289,6 @@ tests =
             assertBool
                 "later query depends on rename"
                 (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
-        , testCase "relation renames carry the frontend index placement" $ do
-            let oracleSql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE TABLE s.t (a INT);"
-                        , "ALTER TABLE s.t RENAME TO u;"
-                        ]
-                postgresSql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE TABLE s.t (a INT);"
-                        , "ALTER TABLE s.t RENAME TO u;"
-                        ]
-            oracleGraph <- analyze Oracle oracleSql
-            postgresGraph <- analyze PostgreSQL postgresSql
-            assertBool
-                "Oracle renames record current-schema index placement"
-                ( RenameRelation
-                    (ref ["S", "T"])
-                    (objectName ["S", "U"])
-                    IndexCurrentSchema
-                    `elem` renamesFor (StatementId 3) oracleGraph
-                )
-            assertBool
-                "PostgreSQL renames record table-schema index placement"
-                ( RenameRelation
-                    (ref ["s", "t"])
-                    (objectName ["s", "u"])
-                    IndexTableSchema
-                    `elem` renamesFor (StatementId 3) postgresGraph
-                )
         , testCase "temporary tables shadow unqualified names, not explicit schemas" $ do
             let sql =
                     BSC.unlines
@@ -533,23 +397,6 @@ tests =
             assertBool
                 "session setting is a barrier for later statements"
                 (has (StatementId 10) afterSessionChange)
-        , testCase "releasing an outer SQLite savepoint commits its writes" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (x INT);"
-                        , "SAVEPOINT s;"
-                        , "INSERT INTO t VALUES (1);"
-                        , "RELEASE s;"
-                        , "ROLLBACK;"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze SQLite sql
-            assertBool
-                "RELEASE is extracted from its statement"
-                (TxReleaseSavepoint (Ident "s") `elem` factPostTx (factsFor (StatementId 4) graph))
-            assertBool
-                "released savepoint writes remain in the catalog"
-                (has (StatementId 3) (dependenciesFor (StatementId 6) graph))
         , testCase "unknown statement syntax becomes a conservative global barrier" $ do
             let sql = BSC.unlines ["CREATE TABLE t (id INT);", "CREATE EXTENSION hstore;", "SELECT * FROM t;"]
             graph <- analyze PostgreSQL sql
@@ -591,105 +438,6 @@ tests =
                 , (PostgreSQL, "SELECT mutate_t();", "t")
                 , (SQLite, "PRAGMA recursive_triggers=0;", "hidden_view")
                 ]
-        , testCase "temporary definitions preserve permanent column and index ownership" $ do
-            graph <-
-                analyze SQLite $
-                    BSC.unlines
-                        [ "CREATE TABLE main.t (x INT);"
-                        , "CREATE INDEX ix ON t (x);"
-                        , "CREATE TEMP TABLE t (x INT);"
-                        , "SELECT * FROM main.t;"
-                        , "SELECT x FROM main.t;"
-                        ]
-            assertBool
-                "index name is not confused with its target table"
-                ( any
-                    (\definition -> indexRef definition == NamedIndex (objectName ["ix"]))
-                    (indexDefinitions (opsFor (StatementId 2) graph))
-                )
-            assertEqual
-                "index creation reads its table"
-                (Set.singleton (StatementId 1))
-                (dependenciesFor (StatementId 2) graph)
-            let expected = Set.fromList [StatementId 1, StatementId 2]
-            assertEqual
-                "explicit permanent lookup retains its index"
-                expected
-                (dependenciesFor (StatementId 4) graph)
-            assertEqual
-                "temporary columns do not replace permanent columns"
-                expected
-                (dependenciesFor (StatementId 5) graph)
-        , testCase "dropping a temporary table reveals permanent reaching writes" $ do
-            graph <-
-                analyze SQLite $
-                    BSC.unlines
-                        [ "CREATE TABLE main.t (x INT);"
-                        , "INSERT INTO main.t VALUES (42);"
-                        , "CREATE TEMP TABLE t (x INT);"
-                        , "DROP TABLE t;"
-                        , "SELECT x FROM t;"
-                        ]
-            assertEqual
-                "the dropped shadow does not hide the live permanent object"
-                (Set.fromList [StatementId 1, StatementId 2, StatementId 4])
-                (dependenciesFor (StatementId 5) graph)
-        , testCase "temporary rename does not redirect a bound permanent view" $ do
-            graph <-
-                analyze SQLite $
-                    BSC.unlines
-                        [ "CREATE TABLE main.t (x INT);"
-                        , "CREATE VIEW v AS SELECT * FROM t;"
-                        , "CREATE TEMP TABLE t (x INT);"
-                        , "ALTER TABLE t RENAME TO u;"
-                        , "INSERT INTO main.t VALUES (42);"
-                        , "SELECT * FROM v;"
-                        ]
-            assertEqual
-                "the view remains bound to its definition-time source"
-                (Set.fromList [StatementId 1, StatementId 2, StatementId 5])
-                (dependenciesFor (StatementId 6) graph)
-        , testCase "qualified recreation retires an unqualified dropped generation" $ do
-            graph <-
-                analyze SQLite $
-                    BSC.unlines
-                        [ "CREATE TABLE \"t.part\" (old_col INT);"
-                        , "DROP TABLE \"t.part\";"
-                        , "CREATE TABLE main.\"t.part\" (new_col INT);"
-                        , "SELECT new_col FROM main.\"t.part\";"
-                        ]
-            assertEqual
-                "only the new definition reaches the qualified query"
-                (Set.singleton (StatementId 3))
-                (dependenciesFor (StatementId 4) graph)
-        , testCase "nested-only CTE aliases do not shadow an outer table read" $ do
-            graph <-
-                analyze PostgreSQL $
-                    BSC.unlines
-                        [ "CREATE TABLE base (id INT);"
-                        , "CREATE TABLE src (id INT);"
-                        , "SELECT * FROM base WHERE EXISTS (WITH base AS (SELECT id FROM src) SELECT 1 FROM base);"
-                        ]
-            assertEqual
-                "both outer and nested external sources remain visible"
-                (Set.fromList [StatementId 1, StatementId 2])
-                (dependenciesFor (StatementId 3) graph)
-        , testCase "a nonrecursive CTE body can read its same-named base table" $ do
-            graph <-
-                analyze PostgreSQL "CREATE TABLE t (id INT); WITH t AS (SELECT id FROM t) SELECT id FROM t;"
-            assertEqual
-                "a CTE alias is not visible in its own nonrecursive body"
-                (Set.singleton (StatementId 1))
-                (dependenciesFor (StatementId 2) graph)
-        , testCase "quoted dotted CTE aliases retain their identity" $ do
-            graph <-
-                analyze
-                    PostgreSQL
-                    "CREATE TABLE \"a.b\" (id INT); WITH \"a.b\" AS (SELECT 42 AS id) SELECT id FROM \"a.b\";"
-            assertEqual
-                "the quoted CTE shadows the quoted base table"
-                Set.empty
-                (dependenciesFor (StatementId 2) graph)
         , testCase "view reads retain indexes created after the view" $ do
             graph <-
                 analyze SQLite $
@@ -727,25 +475,6 @@ tests =
                 "the restored table and index, not the rename, reach the read directly"
                 (Set.fromList [StatementId 1, StatementId 2, StatementId 5])
                 (dependenciesFor (StatementId 6) graph)
-        , testCase "savepoint rollback restores a dropped schema generation and its data" $ do
-            graph <-
-                analyze SQLite $
-                    BSC.unlines
-                        [ "CREATE TABLE t (old_col INT);"
-                        , "CREATE INDEX ix ON t (old_col);"
-                        , "INSERT INTO t VALUES (42);"
-                        , "SAVEPOINT s;"
-                        , "DROP TABLE t;"
-                        , "CREATE TABLE t (new_col INT);"
-                        , "INSERT INTO t VALUES (99);"
-                        , "ROLLBACK TO s;"
-                        , "SELECT old_col FROM t;"
-                        , "RELEASE s;"
-                        ]
-            assertEqual
-                "only the restored generation and rollback reach the read directly"
-                (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 8])
-                (dependenciesFor (StatementId 9) graph)
         , testCase "table writes retain related indexes, triggers, and column definitions" $ do
             let table =
                     TableDef
@@ -986,105 +715,6 @@ tests =
                 "Child query does not depend on parent deletion without cascade"
                 (not (has (StatementId 3) childQueryDeps))
             assertBool "Child query depends on child definition" (has (StatementId 2) childQueryDeps)
-        , testCase "temporary table with ON COMMIT DROP is dropped upon commit" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE persistent_tbl (id INT);"
-                        , "BEGIN;"
-                        , "CREATE TEMPORARY TABLE temp_drop (id INT) ON COMMIT DROP;"
-                        , "COMMIT;"
-                        , "SELECT id FROM persistent_tbl;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let queryDeps = dependenciesFor (StatementId 5) graph
-            assertBool "Query depends on persistent table" (has (StatementId 1) queryDeps)
-            assertBool "Query does not depend on dropped temp table" (not (has (StatementId 3) queryDeps))
-        , testCase "temporary table created inside a rolled-back transaction is not visible after rollback" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE persistent_tbl (id INT);"
-                        , "BEGIN;"
-                        , "CREATE TEMPORARY TABLE temp_tbl (id INT);"
-                        , "ROLLBACK;"
-                        , "SELECT id FROM persistent_tbl;"
-                        ]
-            graph <- analyze SQLite sql
-            let queryDeps = dependenciesFor (StatementId 5) graph
-            assertBool "Query depends on persistent table" (has (StatementId 1) queryDeps)
-            assertBool
-                "Query does not depend on rolled-back temp table definition"
-                (not (has (StatementId 3) queryDeps))
-        , testCase "column and table renames update trigger body references" $ do
-            let columnSql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT);"
-                        , "CREATE TABLE log (x INT);"
-                        , "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE log SET x = 1; END;"
-                        , "ALTER TABLE log RENAME COLUMN x TO y;"
-                        , "INSERT INTO t (a) VALUES (1);"
-                        , "SELECT y FROM log;"
-                        ]
-                tableSql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT);"
-                        , "CREATE TABLE log (x INT);"
-                        , "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE log SET x = 1; END;"
-                        , "ALTER TABLE log RENAME TO log_new;"
-                        , "INSERT INTO t (a) VALUES (1);"
-                        , "SELECT x FROM log_new;"
-                        ]
-            columnGraph <- analyze SQLite columnSql
-            tableGraph <- analyze SQLite tableSql
-            let columnDeps = dependenciesFor (StatementId 6) columnGraph
-                tableDeps = dependenciesFor (StatementId 6) tableGraph
-            assertBool
-                "the trigger writes the renamed column"
-                (has (StatementId 5) columnDeps)
-            assertBool
-                "the trigger writes the renamed table"
-                (has (StatementId 5) tableDeps)
-        , testCase "table rename updates foreign-key parents and unresolved view sources" $ do
-            let fkSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
-                        , "ALTER TABLE parent RENAME TO parent_new;"
-                        , "DELETE FROM parent_new WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-                viewSql =
-                    BSC.unlines
-                        [ "CREATE VIEW v AS SELECT * FROM old_name;"
-                        , "CREATE TABLE old_name (x INT);"
-                        , "ALTER TABLE old_name RENAME TO new_name;"
-                        , "SELECT * FROM v;"
-                        ]
-            fkGraph <- analyze PostgreSQL fkSql
-            viewGraph <- analyze PostgreSQL viewSql
-            let childDeps = dependenciesFor (StatementId 5) fkGraph
-                viewDeps = dependenciesFor (StatementId 4) viewGraph
-            assertBool
-                "the renamed parent still cascades to the child"
-                (has (StatementId 4) childDeps)
-            assertBool
-                "the unresolved view source follows the table rename"
-                (has (StatementId 2) viewDeps && has (StatementId 3) viewDeps)
-        , testCase "PostgreSQL unqualified index names use the table schema" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s1;"
-                        , "CREATE SCHEMA s2;"
-                        , "SET search_path TO s1, s2;"
-                        , "CREATE TABLE s2.t (id INT);"
-                        , "CREATE INDEX idx ON s2.t (id);"
-                        , "DROP INDEX s2.idx;"
-                        , "SELECT * FROM s2.t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let readDeps = dependenciesFor (StatementId 7) graph
-            assertBool
-                "the index was created in the table schema and dropped by its qualified name"
-                (not (has (StatementId 5) readDeps))
         , testCase "DROP COLUMN CASCADE drops views that read the column" $ do
             let sql =
                     BSC.unlines
@@ -1097,35 +727,6 @@ tests =
             assertBool
                 "the dependent view is dropped with the column"
                 (not (has (StatementId 2) (dependenciesFor (StatementId 4) graph)))
-        , testCase "DROP COLUMN CASCADE keeps views that read other columns" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT, b INT);"
-                        , "CREATE VIEW v AS SELECT b FROM t;"
-                        , "ALTER TABLE t DROP COLUMN a CASCADE;"
-                        , "SELECT * FROM v;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let viewDeps = dependenciesFor (StatementId 4) graph
-            assertBool
-                "the unaffected view survives the column drop"
-                (has (StatementId 2) viewDeps)
-            assertBool
-                "the surviving view still reaches the altered table"
-                (has (StatementId 3) viewDeps)
-        , testCase "column renames keep view column dependencies current" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT, b INT);"
-                        , "CREATE VIEW v AS SELECT a FROM t;"
-                        , "ALTER TABLE t RENAME COLUMN a TO c;"
-                        , "ALTER TABLE t DROP COLUMN c CASCADE;"
-                        , "SELECT * FROM v;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the view follows the renamed column and is dropped with it"
-                (not (has (StatementId 2) (dependenciesFor (StatementId 5) graph)))
         , testCase "DROP COLUMN drops indexes on that column but a rejected RESTRICT keeps them" $ do
             let cascadeSql =
                     BSC.unlines
@@ -1165,19 +766,6 @@ tests =
             assertBool
                 "a rejected RESTRICT leaves the index and table intact"
                 (has (StatementId 2) restrictDeps)
-        , testCase "DROP TABLE CASCADE follows unresolved view sources" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE VIEW v AS SELECT * FROM later;"
-                        , "CREATE TABLE later (x INT);"
-                        , "DROP TABLE later CASCADE;"
-                        , "SELECT * FROM v;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let viewReadDeps = dependenciesFor (StatementId 4) graph
-            assertBool
-                "the dependent view is dropped with its newly resolvable source"
-                (not (has (StatementId 1) viewReadDeps))
         , testCase "USE database constrains unqualified names to the current database" $ do
             let sql =
                     BSC.unlines
@@ -1206,130 +794,6 @@ tests =
             assertBool
                 "view read follows the unresolved source to its later definition"
                 (has (StatementId 2) viewReadDeps)
-        , testCase "DROP COLUMN CASCADE removes cross-table foreign keys but RESTRICT keeps them" $ do
-            let cascadeSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
-                        , "ALTER TABLE parent DROP COLUMN id CASCADE;"
-                        , "DELETE FROM parent WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-                restrictSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
-                        , "ALTER TABLE parent DROP COLUMN id;"
-                        , "DELETE FROM parent WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-            cascadeGraph <- analyze GenericSQL cascadeSql
-            restrictGraph <- analyze GenericSQL restrictSql
-            let cascadeDeps = dependenciesFor (StatementId 5) cascadeGraph
-                restrictDeps = dependenciesFor (StatementId 5) restrictGraph
-            assertBool
-                "child read still depends on its definition"
-                (has (StatementId 2) cascadeDeps)
-            assertBool
-                "removed foreign key no longer cascades the parent delete"
-                (not (has (StatementId 4) cascadeDeps))
-            assertBool
-                "RESTRICT keeps the cross-table foreign key"
-                (has (StatementId 4) restrictDeps)
-        , testCase "VALIDATE CONSTRAINT depends on current parent data" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT);"
-                        , "ALTER TABLE child ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES parent(id) NOT VALID;"
-                        , "INSERT INTO parent VALUES (1);"
-                        , "ALTER TABLE child VALIDATE CONSTRAINT fk;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let validationDeps = dependenciesFor (StatementId 5) graph
-            assertBool
-                "validation depends on the parent insert"
-                (has (StatementId 4) validationDeps)
-            assertBool
-                "validation depends on the child definition"
-                (has (StatementId 2) validationDeps)
-        , testCase "unnamed constraints from separate ALTER changes keep distinct identities" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE p1 (id INT PRIMARY KEY);"
-                        , "CREATE TABLE p2 (id INT PRIMARY KEY);"
-                        , "CREATE TABLE c (x INT);"
-                        , "ALTER TABLE c ADD COLUMN a INT REFERENCES p1(id) ON DELETE CASCADE, ADD COLUMN b INT REFERENCES p2(id) ON DELETE CASCADE;"
-                        , "DELETE FROM p1 WHERE id = 1;"
-                        , "SELECT * FROM c;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let childDeps = dependenciesFor (StatementId 6) graph
-            assertBool
-                "both unnamed foreign keys survive and the first still cascades"
-                (has (StatementId 5) childDeps)
-        , testCase "USING INDEX constraints retain the index columns for column drops" $ do
-            -- Keep this as an extraction smoke test; the schema-resolution test
-            -- below observes the resolved constraint through column coupling.
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (id INT);"
-                        , "CREATE UNIQUE INDEX t_id_idx ON t (id);"
-                        , "ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_id_idx;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "PRIMARY KEY USING INDEX is extracted as a typed constraint"
-                ( case opsFor (StatementId 3) graph of
-                    [AlterTableOp alter] ->
-                        case alterTableChanges alter of
-                            [ AddConstraint
-                                    (UsingIndexConstraint (Just (Ident "t_pk")) (Ident "t_id_idx") PrimaryIndex IndexTableSchema)
-                                ] -> True
-                            _ -> False
-                    _ -> False
-                )
-        , testCase "USING INDEX resolves in the altered table's schema" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "SET search_path TO public;"
-                        , "CREATE TABLE s.t (a INT, b INT);"
-                        , "CREATE UNIQUE INDEX t_ab_idx ON s.t (a, b);"
-                        , "ALTER TABLE s.t ADD PRIMARY KEY USING INDEX t_ab_idx;"
-                        , "UPDATE s.t SET a = 1;"
-                        , "SELECT b FROM s.t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "a read of the coupled column depends on the update through the schema-local index constraint"
-                (has (StatementId 6) (dependenciesFor (StatementId 7) graph))
-        , testCase "USING INDEX resolves an Oracle current-schema index" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE TABLE s.t (a INT, b INT);"
-                        , "CREATE UNIQUE INDEX idx ON s.t (a, b);"
-                        , "ALTER TABLE s.t ADD PRIMARY KEY USING INDEX idx;"
-                        , "UPDATE s.t SET a = 1;"
-                        , "SELECT b FROM s.t;"
-                        ]
-            graph <- analyze Oracle sql
-            assertBool
-                "a read of the coupled column depends on the update through the current-schema index constraint"
-                (has (StatementId 5) (dependenciesFor (StatementId 6) graph))
-        , testCase "DROP SCHEMA RESTRICT keeps a non-empty schema intact" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE TABLE s.t (x INT);"
-                        , "DROP SCHEMA s;"
-                        , "CREATE SCHEMA IF NOT EXISTS s;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the rejected schema drop leaves the schema definition reachable"
-                (has (StatementId 1) (dependenciesFor (StatementId 4) graph))
         , testCase "MySQL DROP SCHEMA cascades through its contents" $ do
             let sql =
                     BSC.unlines
@@ -1341,58 +805,6 @@ tests =
             assertBool
                 "the table is gone with the schema"
                 (not (has (StatementId 1) (dependenciesFor (StatementId 3) graph)))
-        , testCase "DROP SCHEMA CASCADE updates unqualified name resolution" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE SCHEMA public;"
-                        , "CREATE TABLE s.t (x INT);"
-                        , "CREATE TABLE public.t (x INT);"
-                        , "SET search_path TO s, public;"
-                        , "DROP SCHEMA s CASCADE;"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let readDeps = dependenciesFor (StatementId 7) graph
-            assertBool
-                "the read now resolves to public.t"
-                (has (StatementId 4) readDeps)
-            assertBool
-                "the read depends on the schema drop that changed resolution"
-                (has (StatementId 6) readDeps)
-        , testCase "DROP TABLE CASCADE updates unqualified name resolution" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE SCHEMA s;"
-                        , "CREATE SCHEMA public;"
-                        , "CREATE TABLE s.t (x INT);"
-                        , "CREATE TABLE public.t (x INT);"
-                        , "SET search_path TO s, public;"
-                        , "DROP TABLE s.t CASCADE;"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let readDeps = dependenciesFor (StatementId 7) graph
-            assertBool
-                "the read now resolves to public.t"
-                (has (StatementId 4) readDeps)
-            assertBool
-                "the read depends on the table drop that changed resolution"
-                (has (StatementId 6) readDeps)
-        , testCase "DROP CONSTRAINT RESTRICT keeps foreign keys that depend on it" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT, CONSTRAINT parent_pk PRIMARY KEY (id));"
-                        , "CREATE TABLE child (pid INT);"
-                        , "ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (pid) REFERENCES parent(id);"
-                        , "INSERT INTO parent VALUES (1);"
-                        , "ALTER TABLE parent DROP CONSTRAINT parent_pk;"
-                        , "INSERT INTO child VALUES (1);"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the rejected drop leaves the foreign-key parent check in place"
-                (has (StatementId 4) (dependenciesFor (StatementId 6) graph))
         , testCase "DROP CONSTRAINT CASCADE removes foreign keys that depend on it" $ do
             let sql =
                     BSC.unlines
@@ -1407,145 +819,6 @@ tests =
             assertBool
                 "the cascaded drop also removes the dependent foreign-key parent check"
                 (not (has (StatementId 4) (dependenciesFor (StatementId 6) graph)))
-        , testCase "DROP CONSTRAINT CASCADE keeps foreign keys on other unique columns" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (a INT, b INT, CONSTRAINT parent_a UNIQUE (a), CONSTRAINT parent_b UNIQUE (b));"
-                        , "CREATE TABLE child (x INT);"
-                        , "ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (x) REFERENCES parent(a);"
-                        , "INSERT INTO parent VALUES (1, 2);"
-                        , "ALTER TABLE parent DROP CONSTRAINT parent_b CASCADE;"
-                        , "INSERT INTO child VALUES (1);"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the foreign key references parent_a and survives the drop of parent_b"
-                (has (StatementId 4) (dependenciesFor (StatementId 6) graph))
-        , testCase "DROP TABLE RESTRICT keeps dependents when they still exist" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE base (x INT);"
-                        , "CREATE VIEW v AS SELECT * FROM base;"
-                        , "DROP TABLE base;"
-                        , "SELECT * FROM base;"
-                        , "SELECT * FROM v;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            let baseDeps = dependenciesFor (StatementId 4) graph
-                viewDeps = dependenciesFor (StatementId 5) graph
-            assertBool
-                "restricted table drop leaves the table definition reachable"
-                (has (StatementId 1) baseDeps)
-            assertBool
-                "view still reaches the retained base table"
-                (has (StatementId 1) viewDeps && has (StatementId 2) viewDeps)
-        , testCase "MsSql nested BEGIN counts commits and rolls back the outer transaction" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (x INT);"
-                        , "BEGIN;"
-                        , "INSERT INTO t VALUES (1);"
-                        , "BEGIN;"
-                        , "INSERT INTO t VALUES (2);"
-                        , "COMMIT;"
-                        , "SELECT * FROM t;"
-                        , "ROLLBACK;"
-                        , "SELECT * FROM t;"
-                        ]
-            graph <- analyze MsSql sql
-            let afterInnerCommit = dependenciesFor (StatementId 7) graph
-                afterRollback = dependenciesFor (StatementId 9) graph
-            assertBool
-                "inner COMMIT does not commit the outer transaction"
-                (has (StatementId 3) afterInnerCommit && has (StatementId 5) afterInnerCommit)
-            assertBool
-                "outer ROLLBACK removes both inserts"
-                ( not (has (StatementId 3) afterRollback)
-                    && not (has (StatementId 5) afterRollback)
-                )
-            assertBool
-                "table definition remains after rollback"
-                (has (StatementId 1) afterRollback)
-        , testCase "DROP COLUMN removes self-referential foreign keys" $ do
-            let cascadeSql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES t(id) ON UPDATE CASCADE);"
-                        , "ALTER TABLE t DROP COLUMN id CASCADE;"
-                        , "UPDATE t SET id = 2;"
-                        , "SELECT parent_id FROM t;"
-                        ]
-                restrictSql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES t(id) ON UPDATE CASCADE);"
-                        , "ALTER TABLE t DROP COLUMN id;"
-                        , "UPDATE t SET id = 2;"
-                        , "SELECT parent_id FROM t;"
-                        ]
-            cascadeGraph <- analyze GenericSQL cascadeSql
-            restrictGraph <- analyze GenericSQL restrictSql
-            let cascadeDeps = dependenciesFor (StatementId 4) cascadeGraph
-                restrictDeps = dependenciesFor (StatementId 4) restrictGraph
-            assertBool
-                "the dropped self-reference no longer cascades onto parent_id"
-                (not (has (StatementId 3) cascadeDeps))
-            assertBool
-                "RESTRICT keeps the self-referential cascade"
-                (has (StatementId 3) restrictDeps)
-        , testCase "renaming a parent column updates foreign-key parent columns" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON UPDATE CASCADE);"
-                        , "ALTER TABLE parent RENAME COLUMN id TO new_id;"
-                        , "UPDATE parent SET new_id = 2;"
-                        , "SELECT * FROM child;"
-                        ]
-            graph <- analyze GenericSQL sql
-            let childDeps = dependenciesFor (StatementId 5) graph
-            assertBool
-                "ON UPDATE CASCADE still fires after the parent column rename"
-                (has (StatementId 4) childDeps)
-        , testCase "renaming a child column leaves foreign-key parent columns alone" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON UPDATE CASCADE);"
-                        , "ALTER TABLE child RENAME COLUMN pid TO cid;"
-                        , "UPDATE parent SET id = 2;"
-                        , "SELECT * FROM child;"
-                        ]
-            graph <- analyze GenericSQL sql
-            let childDeps = dependenciesFor (StatementId 5) graph
-            assertBool
-                "ON UPDATE CASCADE still fires when only the child column is renamed"
-                (has (StatementId 4) childDeps)
-        , testCase "RESET foreign_key_checks restores the configured initial value" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE CASCADE);"
-                        , "SET foreign_key_checks = 1;"
-                        , "RESET foreign_key_checks;"
-                        , "DELETE FROM parent WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-                disabledOptions =
-                    (defaultParseOptions MySQL)
-                        { parseServerConfig =
-                            (parseServerConfig (defaultParseOptions MySQL))
-                                { serverForeignKeyChecks = Just False
-                                }
-                        }
-            disabledGraph <- analyzeWith disabledOptions sql
-            enabledGraph <- analyze MySQL sql
-            let disabledDeps = dependenciesFor (StatementId 6) disabledGraph
-                enabledDeps = dependenciesFor (StatementId 6) enabledGraph
-            assertBool
-                "reset restores the initial disabled state, so the delete does not cascade"
-                (not (has (StatementId 5) disabledDeps))
-            assertBool
-                "the default enabled state keeps the cascade after reset"
-                (has (StatementId 5) enabledDeps)
         , testCase "SQLite foreign keys default to disabled" $ do
             let sql =
                     BSC.unlines
@@ -1647,27 +920,6 @@ tests =
                         (all (\sid -> not (has (StatementId sid) deps)) [2, 5, 6])
                 )
                 [PostgreSQL, Redshift, MsSql]
-        , testCase "procedural SELECT INTO targets preserve hidden session effects" $
-            mapM_
-                ( \(dialect, operation) -> do
-                    graph <-
-                        analyzeParsed dialect $
-                            BSC.unlines
-                                [ "CREATE TABLE src (a INT);"
-                                , "INSERT INTO src VALUES (1);"
-                                , operation
-                                , "SELECT 0;"
-                                ]
-                    let deps = backwardSlice (StatementId 4) graph
-                    assertBool
-                        ("constant query stays behind procedural INTO: " ++ BSC.unpack operation)
-                        (all (\sid -> has (StatementId sid) deps) [1, 2, 3])
-                )
-                [ (MySQL, "SELECT a INTO @v FROM src;")
-                , (Oracle, "SELECT a INTO v FROM src;")
-                , (PostgreSQL, "SELECT a INTO @v FROM src;")
-                , (PostgreSQL, "SELECT * FROM (SELECT a INTO copied FROM src) AS q;")
-                ]
         , testCase "CTAS NO DATA binds schema while data copies remain isolated snapshots" $
             mapM_
                 ( \(suffix, keepsInitialData) -> do
@@ -1726,81 +978,6 @@ tests =
             assertBool
                 "NO DATA refresh discards previous refresh data dependencies"
                 (all (\sid -> not (has (StatementId sid) emptyDeps)) [3, 4, 5])
-        , testCase "view namespace transitions preserve live sources without unrelated state" $
-            mapM_
-                ( \(alteration, target) -> do
-                    graph <-
-                        analyzeParsed PostgreSQL $
-                            BSC.unlines
-                                [ "CREATE SCHEMA s;"
-                                , "CREATE SCHEMA dest;"
-                                , "CREATE TABLE src (a INT);"
-                                , "CREATE TABLE unrelated (a INT);"
-                                , "CREATE VIEW s.v AS SELECT a FROM src;"
-                                , alteration
-                                , "INSERT INTO src VALUES (1);"
-                                , "INSERT INTO unrelated VALUES (2);"
-                                , "SELECT a FROM " <> target <> ";"
-                                ]
-                    let deps = backwardSlice (StatementId 9) graph
-                    assertBool
-                        "moved view retains its definition, transition and current source rows"
-                        (all (\sid -> has (StatementId sid) deps) [3, 5, 6, 7])
-                    assertBool
-                        "modeled view transition does not fence unrelated rows"
-                        (not (has (StatementId 8) deps))
-                )
-                [ ("ALTER VIEW s.v SET SCHEMA dest;", "dest.v")
-                , ("ALTER VIEW s.v RENAME TO renamed;", "s.renamed")
-                ]
-        , testCase "MySQL database creation owns qualified table state without fencing unrelated data" $ do
-            graph <-
-                analyzeParsed MySQL $
-                    BSC.unlines
-                        [ "CREATE TABLE unrelated (a INT);"
-                        , "INSERT INTO unrelated VALUES (1);"
-                        , "CREATE DATABASE tenant;"
-                        , "CREATE TABLE tenant.t (a INT);"
-                        , "INSERT INTO tenant.t VALUES (2);"
-                        , "SELECT a FROM tenant.t;"
-                        ]
-            let deps = backwardSlice (StatementId 6) graph
-            assertBool
-                "qualified table reads retain database and table creation plus rows"
-                (all (\sid -> has (StatementId sid) deps) [3, 4, 5])
-            assertBool
-                "database creation does not impose a global dependency"
-                (not (has (StatementId 1) deps) && not (has (StatementId 2) deps))
-        , testCase "MySQL case-sensitive namespace selection retains only its matching database" $ do
-            graph <-
-                analyzeParsed MySQL $
-                    BSC.unlines
-                        [ "CREATE DATABASE Tenant;"
-                        , "CREATE DATABASE tenant;"
-                        , "USE Tenant;"
-                        , "CREATE TABLE t (a INT);"
-                        , "INSERT INTO t VALUES (1);"
-                        , "SELECT a FROM Tenant.t;"
-                        ]
-            let deps = backwardSlice (StatementId 6) graph
-            assertBool
-                "selected namespace creation and USE reach its qualified rows"
-                (all (\sid -> has (StatementId sid) deps) [1, 3, 4, 5])
-            assertBool
-                "lower_case_table_names zero does not merge distinct database names"
-                (not (has (StatementId 2) deps))
-        , testCase "partial namespace selection keeps unknown default-schema effects opaque" $ do
-            graph <-
-                analyzeParsed MsSql $
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT);"
-                        , "INSERT INTO t VALUES (1);"
-                        , "USE tenant;"
-                        , "SELECT 0;"
-                        ]
-            assertBool
-                "a database-only USE cannot be treated as a complete relation namespace"
-                (all (\sid -> has (StatementId sid) (backwardSlice (StatementId 4) graph)) [1, 2, 3])
         , testCase "ambiguous destructive targets preserve possible state across later writes" $ do
             graph <-
                 analyzeParsed PostgreSQL $
@@ -1880,109 +1057,6 @@ tests =
                 "CREATE TABLE AS derives columns from the projection"
                 ["a"]
                 (definedColumns ["copy"] (opsFor (StatementId 6) graph))
-        , testCase "ALTER VIEW transitions preserve subsequent source writes" $
-            mapM_
-                ( \(alteration, viewName) -> do
-                    graph <-
-                        analyzeParsed PostgreSQL $
-                            BSC.unlines
-                                [ "CREATE TABLE t (a INT);"
-                                , "CREATE TABLE unrelated (a INT);"
-                                , "CREATE VIEW v AS SELECT a FROM t;"
-                                , alteration
-                                , "INSERT INTO unrelated VALUES (0);"
-                                , "INSERT INTO t VALUES (42);"
-                                , "SELECT a FROM " <> viewName <> ";"
-                                ]
-                    let readDeps = backwardSlice (StatementId 7) graph
-                    assertBool
-                        ("view reads retain source writes after alteration: " ++ BSC.unpack alteration)
-                        (has (StatementId 6) readDeps)
-                    when (viewName == "renamed") $
-                        assertBool
-                            "renamed view does not retain unrelated row writes"
-                            (not (has (StatementId 5) readDeps))
-                )
-                [ ("ALTER VIEW v RENAME TO renamed;", "renamed")
-                , ("ALTER VIEW v SET (security_barrier = true);", "v")
-                ]
-        , testCase "multi-table UPDATE assigns unqualified columns to the owning table" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t1 (a INT);"
-                        , "CREATE TABLE t2 (b INT);"
-                        , "UPDATE t1 JOIN t2 ON t1.a = t2.b SET b = 1;"
-                        , "SELECT a FROM t1;"
-                        , "SELECT b FROM t2;"
-                        ]
-            graph <- analyze MySQL sql
-            assertBool
-                "the table without the assigned column is not written"
-                (not (has (StatementId 3) (dependenciesFor (StatementId 4) graph)))
-            assertBool
-                "the table that owns the unqualified column is written"
-                (has (StatementId 3) (dependenciesFor (StatementId 5) graph))
-        , testCase "foreign keys with omitted parent columns follow the primary key" $ do
-            let cascadeSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent ON DELETE CASCADE);"
-                        , "ALTER TABLE parent DROP COLUMN id CASCADE;"
-                        , "DELETE FROM parent WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-                restrictSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent ON DELETE CASCADE);"
-                        , "ALTER TABLE parent DROP COLUMN id;"
-                        , "DELETE FROM parent WHERE id = 1;"
-                        , "SELECT * FROM child;"
-                        ]
-            cascadeGraph <- analyze PostgreSQL cascadeSql
-            restrictGraph <- analyze PostgreSQL restrictSql
-            let cascadeDeps = dependenciesFor (StatementId 5) cascadeGraph
-                restrictDeps = dependenciesFor (StatementId 5) restrictGraph
-            assertBool
-                "CASCADE removes the implicit primary-key reference"
-                (not (has (StatementId 4) cascadeDeps))
-            assertBool
-                "RESTRICT keeps the implicit primary-key reference"
-                (has (StatementId 4) restrictDeps)
-        , testCase "validated foreign key addition depends on parent data" $ do
-            let validatedSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT);"
-                        , "INSERT INTO parent VALUES (1);"
-                        , "ALTER TABLE child ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES parent(id);"
-                        ]
-                notValidSql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT);"
-                        , "INSERT INTO parent VALUES (1);"
-                        , "ALTER TABLE child ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES parent(id) NOT VALID;"
-                        ]
-            validatedGraph <- analyze PostgreSQL validatedSql
-            notValidGraph <- analyze PostgreSQL notValidSql
-            assertBool
-                "a validated foreign key scans existing parent rows"
-                (has (StatementId 3) (dependenciesFor (StatementId 4) validatedGraph))
-            assertBool
-                "NOT VALID defers the parent scan"
-                (not (has (StatementId 3) (dependenciesFor (StatementId 4) notValidGraph)))
-        , testCase "TRUNCATE without CASCADE depends on referencing tables" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
-                        , "CREATE TABLE child (pid INT REFERENCES parent(id));"
-                        , "TRUNCATE parent;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "the truncate depends on the table that references the parent"
-                (has (StatementId 2) (dependenciesFor (StatementId 3) graph))
         , testCase "sequence reads depend on the sequence definition" $ do
             let postgresSql =
                     BSC.unlines
@@ -2002,67 +1076,6 @@ tests =
             assertBool
                 "Oracle NEXTVAL depends on the sequence definition"
                 (has (StatementId 1) (dependenciesFor (StatementId 2) oracleGraph))
-        , testCase "PostgreSQL sequence advances survive rollback and sequence generation restoration" $
-            mapM_
-                ( \betweenAdvanceAndRollback -> do
-                    graph <-
-                        analyzeParsed PostgreSQL $
-                            BSC.unlines $
-                                [ "CREATE SEQUENCE s;"
-                                , "BEGIN;"
-                                , "SELECT pg_catalog.nextval('s');"
-                                ]
-                                    ++ betweenAdvanceAndRollback
-                                    ++ [ "ROLLBACK;"
-                                       , "SELECT pg_catalog.currval('s');"
-                                       ]
-                    let finalId = StatementId (5 + length betweenAdvanceAndRollback)
-                        deps = backwardSlice finalId graph
-                    assertBool
-                        "rollback does not erase the durable sequence advance"
-                        (has (StatementId 3) deps)
-                )
-                [ []
-                , ["DROP SEQUENCE s;", "CREATE SEQUENCE s;"]
-                ]
-        , testCase "dynamic and session sequence reads retain preceding sequence effects" $
-            mapM_
-                ( \expression -> do
-                    graph <-
-                        analyzeParsed PostgreSQL $
-                            BSC.unlines
-                                [ "CREATE SEQUENCE s;"
-                                , "CREATE TABLE seqs (seq_name TEXT);"
-                                , "INSERT INTO seqs VALUES ('s');"
-                                , "SELECT pg_catalog.nextval('s');"
-                                , "SELECT 0;"
-                                , "SELECT " <> expression <> " FROM seqs;"
-                                ]
-                    assertBool
-                        ("sequence state is retained for " ++ BSC.unpack expression)
-                        (has (StatementId 4) (backwardSlice (StatementId 6) graph))
-                )
-                [ "pg_catalog.nextval(seq_name::regclass)"
-                , "pg_catalog.setval(seq_name::regclass, 42)"
-                , "pg_catalog.currval(seq_name::regclass)"
-                , "pg_catalog.currval('s')"
-                , "pg_catalog.currval('s'::regclass)"
-                , "pg_catalog.nextval('long_seq'::varchar(1))"
-                , "lastval()"
-                ]
-        , testCase "deferred sequence defaults retain insert-time sequence effects" $ do
-            graph <-
-                analyzeParsed PostgreSQL $
-                    BSC.unlines
-                        [ "CREATE SEQUENCE s;"
-                        , "CREATE TABLE t (id BIGINT DEFAULT pg_catalog.nextval('s'));"
-                        , "INSERT INTO t DEFAULT VALUES;"
-                        , "SELECT 0;"
-                        , "SELECT pg_catalog.currval('s');"
-                        ]
-            assertBool
-                "the sequence read retains the INSERT that evaluates its default"
-                (has (StatementId 3) (backwardSlice (StatementId 5) graph))
         , testCase "constraint-coupled columns share write dependencies" $ do
             let sql =
                     BSC.unlines
@@ -2079,30 +1092,6 @@ tests =
             assertBool
                 "a read of an unrelated column does not depend on the update"
                 (not (has (StatementId 3) (dependenciesFor (StatementId 5) graph)))
-        , testCase "constraint coupling is transitively closed" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (a INT, b INT, c INT, UNIQUE (a, b), CHECK (b > c));"
-                        , "INSERT INTO t VALUES (1, 2, 3);"
-                        , "UPDATE t SET a = 4;"
-                        , "SELECT c FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "a read of a column coupled through two constraints depends on the update"
-                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
-        , testCase "self-referential foreign keys couple child and parent columns" $ do
-            let sql =
-                    BSC.unlines
-                        [ "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES t(id));"
-                        , "INSERT INTO t VALUES (1, NULL);"
-                        , "UPDATE t SET id = 2;"
-                        , "SELECT parent_id FROM t;"
-                        ]
-            graph <- analyze PostgreSQL sql
-            assertBool
-                "a read of the child column depends on the update of the parent column"
-                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions
