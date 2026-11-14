@@ -265,7 +265,52 @@ Small absolute regressions were observed on `keep_all` controls (+14% to +16%), 
   - **Occam Internal Reduction Wall**: Reduction wall excluding child oracle duration improved from 1.432s to 1.096s (1.31x speedup).
   - **External Process Dominance**: External child oracle subprocess wall clock accounted for 98.19% (baseline, 77.67s / 79.11s) and 98.52% (current, 72.78s / 73.88s) of reduction loop wall time.
   - **Reduction Quality**: All 6 runs completed cleanly with status `completed` (exit code 0), achieving 100% identical outputs (3 statements, 517 bytes).
-- **Stopping Decision**: Because external child process execution overwhelmingly dominates end-to-end makespan (~98%) and Occam internal engine overhead is already negligible (~1.10s across 604 reduction steps, ~1.8ms per step), further internal optimization (such as ByteString manipulation in `cutSpans`) is explicitly declined under the performance decision gate. Large-SQL performance evaluation is cleanly closed.
+- **Historical Stopping Decision (Superseded)**: Earlier iterations closed large-SQL performance tuning on the basis that external child process execution dominated end-to-end makespan (~98%). On 2026-11-14, owner instructions reopened internal performance and source quality engineering, requiring general algorithmic and allocation improvements without heuristics, preserving exact candidate order, reduction semantics, and byte preservation contracts.
+
+### Single-pass retained-span assembly and candidate hoisting (2026-11-14)
+- **Mechanics & Invariants**:
+  - `cutRemovedStatements`: Replaced descending span sort and repeated `foldl'` concatenation (worst-case $O(\text{removed} \times \text{input bytes})$ copying across up to removed-count intermediate ByteString allocations) with linear cursor assembly (`chunks !cursor (stmt : rest)`). Kept statements advance down the list without moving the cursor, automatically coalescing adjacent kept spans. A removed statement emits preceding non-empty retained slice `[cursor, start)` (covering kept statements and leading prefix bytes $[0, start_0)$) and advances cursor to `nextStart`. Returns `baseSQL` directly on zero removals (`[single] -> single`), emitting at most one output-buffer allocation via `BS.concat` when multiple slices exist.
+  - Complexity: $O(K \log K + S \log K)$ Set construction and lookup ($K = \text{kept}$, $S = \text{total}$ statements), plus $O(\text{output bytes})$ copying; at most one output-buffer allocation for $>1$ slice, 0 output-buffer allocations for $\le 1$ slice (Set and list cell allocations remain separate).
+  - `searchDDMin`: Hoisted `currentIds`, `currentSQL`, and `currentLen` to the outer `go granularity current` step loop, computing them once per granularity step rather than per candidate trial (recomputed if delta debugging increases granularity on an unchanged `current`).
+  - Candidate trials, oracle sequence, feedback caching, and reduction semantics remain identical.
+- **Evaluation & Commands**:
+  - Build command: `cabal exec -- ghc -O1 -threaded -rtsopts -package occam /tmp/helper.hs -o helper` using GHC 9.10.3 and identical pinned Rust static library `libCoccam_sqlparser.a` (SHA-256 `abf74a41f32f9d566536764a8c9e4e9b0a34a666b51577c7478d3aa54f5be348`).
+  - Workload: `benchmarks/benchmark_artifacts/haskell-perf-20261114/statements-512.sql` (515 statements, 20,922 B), deterministically generated via `scale_study.py`.
+  - Microbenchmark: `./helper micro +RTS -N1 -s -RTS` across 4 sizes × 6 patterns (100 iterations/case). Note: initial micro run (`baseline_micro.txt`) was invalidated and excluded because GHC let-floating floated the pure surgery outside `replicateM_`; the valid protocol (`baseline_micro_corrected.txt` vs `after_micro_corrected.txt`) enforced runtime IO input dependencies via `readIORef` inside `{-# NOINLINE runOneSurgery #-}`.
+  - Trace benchmark: `perf stat -e instructions,cycles,branch-misses,page-faults ./helper trace statements-512.sql trace.bin min.sql +RTS -N1 -s -RTS` (deterministic in-process oracle, 19 trials). Valid trace is independent of the flawed micro loop.
+  - Linux `perf record`: `perf record -F 999 -g -o perf.data -- sh -c 'for i in $(seq 1 30); do ./helper trace statements-512.sql /tmp/trace_trash.bin /tmp/min_trash.sql > /dev/null; done'`, analyzed with `perf report -i perf.data --stdio --no-children -n --percent-limit 1.0`.
+
+| Benchmark Workload / Metric | Baseline (`collectSpans`) | After Optimization | Delta / Speedup | Evidence File |
+|---|---|---|---|---|
+| Micro Total RTS Heap Allocation (24 cases × 100 iters) | 132,823,984,792 B (132.8 GB) | 1,107,905,104 B (1.11 GB) | 120x reduction (-99.17%) | `baseline_micro_corrected.txt` vs `after_micro_corrected.txt` |
+| Micro 4096 Dense90 CPU (90% removed) | 27.787 ms/call | 0.154 ms/call | 180.9x speedup | `after_micro_corrected.txt` |
+| Micro 4096 Interleaved50 CPU (50% removed) | 18.069 ms/call | 0.368 ms/call | 49.1x speedup | `after_micro_corrected.txt` |
+| Micro 4096 Sparse10 CPU (10% removed) | 6.159 ms/call | 0.484 ms/call | 12.7x speedup | `after_micro_corrected.txt` |
+| Micro 2048 Dense90 CPU | 7.511 ms/call | 0.072 ms/call | 105.0x speedup | `after_micro_corrected.txt` |
+| Micro 2048 Interleaved50 CPU | 5.052 ms/call | 0.162 ms/call | 31.3x speedup | `after_micro_corrected.txt` |
+| Micro 512 KeepAll CPU (0 removed) | 0.100 ms/call | 0.156 ms/call | +0.056 ms/call | `after_micro_corrected.txt` |
+| Micro 512 SingleRemoval CPU (1 removed) | 0.121 ms/call | 0.156 ms/call | +0.035 ms/call | `after_micro_corrected.txt` |
+| Reducer Trace Heap Allocation (19 trials on 512 stmts) | 202,126,512 B (202.1 MB) | 21,837,848 B (21.8 MB) | 9.26x reduction (-89.2%) | `baseline_trace.txt` vs `after_trace.txt` |
+| Reducer Trace Wall Time | 121.912 ms | 76.676 ms | 1.59x speedup (Mutator 1.69x) | `baseline_trace.txt` vs `after_trace.txt` |
+| Reducer Trace CPU Cycles | 145,491,031 | 93,926,452 | -35.4% cycles | `baseline_trace.txt` vs `after_trace.txt` |
+| Reducer Trace Instructions | 150,088,873 | 119,755,264 | -20.2% instructions | `baseline_trace.txt` vs `after_trace.txt` |
+| Reducer Trace Branch Misses | 521,767 | 312,181 | -40.2% branch misses | `baseline_trace.txt` vs `after_trace.txt` |
+| Reducer Trace Page Faults | 3,937 | 3,312 | -15.9% page faults | `baseline_trace.txt` vs `after_trace.txt` |
+| Linux `perf` `__memmove_avx_unaligned_erms` share | 17.33% sampled share | 2.31% sampled share | -15.02 pp share | `perf_report_baseline.txt` vs `perf_report_after.txt` |
+
+- **Verification & Limitations**:
+  - Candidate equivalence: Length-framed traces (`trace_baseline.bin` and `trace_after.bin`, 66,768 B; SHA-256 `59f00b64b5970a201f8d4c741754c7faf945f5bf215da704ca41f8a60f0215ed`) and minimal outputs (`minimal_baseline.sql` and `minimal_after.sql`, 290 B; SHA-256 `598f8f2b3f77bdc84b8c89157feb36246a4003d254513919313391168a232f43`) are 100% byte-for-byte identical via `cmp`.
+  - Microbenchmark numbers reflect one aggregate run of 100 iterations per case; no statistical significance estimate is claimed for small differences on 512 KeepAll/SingleRemoval.
+  - Linux `perf` samples native threads across the process tree (including startup, parser, libc, and RTS), but does not observe GHC heap allocations or green-thread scheduling; Rust allocations use the system allocator outside GHC RTS.
+  - The in-process deterministic oracle isolates Occam reduction from child process startup and external SQLite costs; no external DBMS makespan speedup is claimed or inferred.
+- **CLI Final Integration Smoke**:
+  - Rebuilt `exe:occam` linking final Haskell and static Rust library `libCoccam_sqlparser.a`.
+  - Workload & Artifacts: `benchmarks/benchmark_artifacts/general-perf-final-smoke-20261114/` containing input SQL (485 B, 9 statements; multi-statement SQLite DDL/DML with UTF-8 comments and Chinese string literal), exact executed CLI command and Python sqlite3 predicate source snapshotted in `README.md` (fresh `:memory:` database per call requiring `SELECT a FROM t WHERE a = 7` to return row `(7,)`), minimal SQL (`out/minimal.sql`, 125 B, 2 statements, preserving UTF-8 comment and required table), stats (`out/stats.json`), and complete log (`smoke.log`).
+  - Observed CLI Outcome: Status `completed` (exit code 0), 485 B → 125 B (-74.2%), 17 database observations, 19 cache hits, 14 cache misses, exactly two uncached final validation observations (`validation_observations: 2`, `validation_passed: true`), total elapsed time 0.890s under 2s timeout / 30s budget / 200 cap protocol with `+RTS -N1 -RTS`.
+- **Native Rust SourceMap Flattening Experiment (Declined)**:
+  - An exploratory Rust worker evaluated flattening line index lookups in `rust/sqlparser-ffi/src/source.rs` (detailed in `benchmarks/benchmark_artifacts/rust-sourcemap-perf-20261114/SUMMARY.md`).
+  - Microbenchmark and interleaved FFI timings showed mixed results (+2.9% CPU latency on ASCII inputs, other signals mixed) without reliable latency wins.
+  - The production Rust code remains the original `Vec<Vec<usize>>` implementation with one Unicode/bounds regression test added. No Rust performance win or allocation reduction is claimed; only Haskell general performance improvements are retained in shipped code.
 ## External experiment line (reference adapters only)
 
 Under Strategy 3A, external reducer comparisons (SQLreduce, SQLancer) are
@@ -458,3 +503,15 @@ Native dialects are passed explicitly to the CLI; unsupported or absent dialects
 Comparison-runner `reset_calls` and `reset_time_sec` cover audited reducer callbacks only; initial/final validation calls are excluded and reported separately. Incomplete reducer audit data stays `null`. A zero reducer-scope count does not mean no reset was attempted: inspect `oracle_audit_file` for validation-phase attempts and failures. The single-input pipeline records `reset_preflight_sec`, `reset_reduction_sec`, and `reset_validation_sec`; `reset_time_sec` sums these stages once only when all are known, otherwise it is `null`.
 
 `oracle_timeouts` counts reducer-scope observations only: native tools use a fresh `evaluationTimedOutObservations` profile count, callback tools use observed callback/reducer-audit outcomes, and validation-phase audit rows are excluded. If a native count is missing or invalid, it remains `null`.
+
+## Parser & JSON Cost Share Investigation (2026-11-14)
+
+An immutable measurement suite in `benchmarks/benchmark_artifacts/json-cost-20261114/` evaluates the exact matching-call cost share of the current JSON transport pipeline between Haskell and the Rust native sqlparser FFI across four canonical workloads (`smoke_9`, `scale_512`, `ascii_1000`, `cjk_500`):
+
+1. **Haskell JSON Deserialization Dominates (Aeson Value AST: ~50% – 62% at Scale)**: Supplementary two-step diagnostic split runs demonstrate that Aeson JSON text parsing, `Text`/`KeyMap` allocations, and `Value` syntax tree construction account for **49.8% – 62.5%** of split time at scale (**28.9%** on tiny `smoke_9`). Combined with typed domain construction (`FromJSON` conversions, `makeUnits` UTF-8 slicing, and ADT materialization: **16.1% – 22.1%**), the Haskell decode and materialization upper envelope reaches **71.0% – 82.3%** of full parse time at scale.
+2. **Partial Codec Cost Excluding Haskell Decoder Is Minor (2.4% – 2.8% at Scale)**: The isolated partial codec cost—Haskell config encode + Rust config decode (`serde_json::from_slice`) + Rust response JSON encode (`serde_json::to_vec`)—accounts for only **2.38% – 2.84%** of full parse time at scale (**7.86%** on `smoke_9`). Rust response encoding alone is **2.35% – 2.70%** at scale.
+3. **Buffer Transport Overhead Is Minimal (<0.4%)**: Pointer export, copying into a managed ByteString (`BS.packCStringLen`), and buffer freeing (`c_freeSQL`) together account for **0.17% – 0.38%** of full parse time.
+4. **Rust Core Parsing**: AST parsing, tokenization, semantic facts, and edit calculations consume **80% to 87%** of native FFI time (**14.3% to 45.3%** of full parse time).
+5. **Reducer Invariants & Limits**: A single-run trace of `statementDdmin` on `workload_scale_512.sql` confirms that initial input ingestion accounts for 95.15% of that run's 66.8 ms runtime (partial codec cost 2.82%), with all subsequent 19 candidates evaluated via pure statement surgery (`cutRemovedStatements`). Candidate traces and minimal outputs match **100% byte-for-byte via `cmp`** across baseline, same-forcing, and profiled modes, and match golden reference `benchmarks/benchmark_artifacts/haskell-perf-20261114/trace_after.bin`.
+
+Full immutable tables, weighted-sum aggregations, paired observer overhead accounting, raw logs, and source snapshots are documented in [`benchmarks/benchmark_artifacts/json-cost-20261114/README.md`](benchmark_artifacts/json-cost-20261114/README.md).

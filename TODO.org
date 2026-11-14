@@ -194,6 +194,14 @@
 *** DONE [#B] Eliminate O(n^2) statement boundary traversal in cutRemovedStatements
 - Matched V2 performance and correctness evidence in benchmarks/README.md.
 - Verified end-to-end reduction speedup on statements-512 (1.22x CPU, 1.31x internal wall); external oracle subprocess dominates (~98% wall time), closing performance tuning.
+*** DONE [#B] Eliminate quadratic copying in cutRemovedStatements and hoist candidate rendering in searchDDMin
+- Reopened general/non-heuristic Haskell performance optimization under owner request; historical stopping decision superseded.
+- Replaced quadratic ByteString concatenation in cutRemovedStatements with a linear single-pass cursor assembly that coalesces adjacent kept statements and executes in at most one output buffer allocation.
+- Hoisted candidate rendering (currentSQL, currentIds, currentLen) in searchDDMin to compute once per go granularity step rather than on every candidate attempt.
+- Observed 120x heap allocation reduction in surgery microbenchmark (132.8 GB -> 1.11 GB) with up to 180.9x CPU speedup on dense removals (4096 statements: 27.79 ms -> 0.154 ms/call).
+- Verified on 512-statement reduction workload with 100% byte-for-byte binary trace and output equivalence across 19 candidate trials (10 accepted, 9 rejected); reduced trace heap allocations from 202.1 MB to 21.8 MB (9.26x reduction) and elapsed wall time from 121.9 ms to 76.7 ms (1.59x speedup).
+- Reduced __memmove_avx_unaligned_erms sampled share from 17.33% to 2.31% in Linux perf. Details and commands in benchmarks/README.md.
+- Native Rust SourceMap flattening experiment evaluated and declined (mixed observed latency, +2.9% on ASCII FFI); original Vec<Vec<usize>> retained.
 ** TODO [#B] Run controlled internal controls and ablations
 - Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
 *** DONE [#B] Run bounded SQLite rowset full vs no-cache control

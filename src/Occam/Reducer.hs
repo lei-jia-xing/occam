@@ -27,9 +27,7 @@ import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -159,27 +157,29 @@ partition is exact: it never inspects or rewrites the bytes it keeps.
 -}
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
-    cutSpans (collectSpans allStatements) baseSQL
+    case chunks 0 allStatements of
+        [] -> BS.empty
+        [single] -> single
+        slices -> BS.concat slices
     where
         keptIds = Set.fromList (map stmtId keptStatements)
         sourceLength = BS.length baseSQL
-        -- NOTE: next-boundary lookup via adjacent walk; repeated ByteString surgery remains, address when copying dominates
-        collectSpans [] = []
-        collectSpans (statement : rest) =
-            let Span start _ = stmtSpan statement
-                nextStart = case rest of
-                    next : _ -> spanStartByte (stmtSpan next)
-                    [] -> sourceLength
-                removedSpan = Span start nextStart
-             in if Set.notMember (stmtId statement) keptIds
-                    then removedSpan : collectSpans rest
-                    else collectSpans rest
 
-cutSpans :: [Span] -> ByteString -> ByteString
-cutSpans spans source =
-    foldl' (\acc (Span start end) -> cutSpan start end acc) source (sortOn (Down . spanStartByte) spans)
-cutSpan :: Int -> Int -> ByteString -> ByteString
-cutSpan start end source = BS.take start source <> BS.drop end source
+        chunks !cursor []
+            | cursor < sourceLength = [BS.drop cursor baseSQL]
+            | otherwise = []
+        chunks !cursor (stmt : rest)
+            | Set.member (stmtId stmt) keptIds = chunks cursor rest
+            | otherwise =
+                let Span start _ = stmtSpan stmt
+                    nextStart = case rest of
+                        next : _ -> spanStartByte (stmtSpan next)
+                        [] -> sourceLength
+                    prefix =
+                        if start > cursor
+                            then (BS.take (start - cursor) (BS.drop cursor baseSQL) :)
+                            else id
+                 in prefix (chunks nextStart rest)
 
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]
@@ -319,37 +319,40 @@ searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
         go granularity current = do
             let n = min (length current) (max 1 granularity)
                 chunks = partitionChunks n current
-            subset <- trySubsets current chunks
+                currentIds = statementIds current
+                currentSQL = statementSQL baseSQL allStatements current
+                currentLen = BS.length currentSQL
+            subset <- trySubsets current currentIds currentLen chunks
             case subset of
                 Just reduced -> go 2 reduced
                 Nothing -> do
-                    complement <- tryComplements current chunks
+                    complement <- tryComplements current currentIds currentLen chunks
                     case complement of
                         Just reduced -> go (max 2 (n - 1)) reduced
                         Nothing
                             | n < length current -> go (min (length current) (2 * n)) current
                             | otherwise -> pure current
 
-        trySubsets _ [] = pure Nothing
-        trySubsets current (chunk : rest) = do
+        trySubsets _ _ _ [] = pure Nothing
+        trySubsets current currentIds currentLen (chunk : rest) = do
             let seedIds = statementIds chunk
-            candidate <- testCandidate current seedIds
+            candidate <- testCandidate current currentIds currentLen seedIds
             case candidate of
                 Just reduced -> pure (Just reduced)
-                Nothing -> trySubsets current rest
+                Nothing -> trySubsets current currentIds currentLen rest
 
-        tryComplements _ [] = pure Nothing
-        tryComplements current (chunk : rest) = do
-            let seedIds = statementIds current `Set.difference` statementIds chunk
-            candidate <- testCandidate current seedIds
+        tryComplements _ _ _ [] = pure Nothing
+        tryComplements current currentIds currentLen (chunk : rest) = do
+            let seedIds = currentIds `Set.difference` statementIds chunk
+            candidate <- testCandidate current currentIds currentLen seedIds
             case candidate of
                 Just reduced -> pure (Just reduced)
-                Nothing -> tryComplements current rest
+                Nothing -> tryComplements current currentIds currentLen rest
 
-        testCandidate current seedIds
-            | seedIds == statementIds current = pure Nothing
+        testCandidate current currentIds currentLen seedIds
+            | seedIds == currentIds = pure Nothing
             | otherwise = do
-                let removedIds = statementIds current `Set.difference` seedIds
+                let removedIds = currentIds `Set.difference` seedIds
                 essential <- readIORef (fbEssentialStatements feedback)
                 failed <- readIORef (fbFailedRemovals feedback)
                 if (Set.size removedIds == 1 && any (`Set.member` essential) (Set.toList removedIds))
@@ -360,9 +363,8 @@ searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
                         case maybeKept of
                             Nothing -> pure Nothing
                             Just kept -> do
-                                let currentSQL = statementSQL baseSQL allStatements current
-                                    candidateSQL = statementSQL baseSQL allStatements kept
-                                if BS.length candidateSQL >= BS.length currentSQL
+                                let candidateSQL = statementSQL baseSQL allStatements kept
+                                if BS.length candidateSQL >= currentLen
                                     then pure Nothing
                                     else do
                                         evaluated <- readIORef (fbEvaluated feedback)
