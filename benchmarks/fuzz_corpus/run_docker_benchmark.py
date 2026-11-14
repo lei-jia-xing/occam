@@ -274,57 +274,109 @@ def set_size_metrics(record: dict[str, Any], original: bytes, reduced: bytes, di
         "byte_red_pct": round((1 - reduced_bytes / initial_bytes) * 100, 2) if initial_bytes else None,
     })
 
-def kill_process_tree(pid: int) -> None:
-    try:
-        children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii").split()
-    except OSError:
-        children = []
-    for child in children:
-        kill_process_tree(int(child))
+def kill_process_tree(pid: int, failures: list[str] | None = None) -> list[str]:
+    if failures is None:
+        failures = []
+    if sys.platform == "linux":
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            children = []
+        except OSError as exc:
+            children = []
+            failures.append(f"could not enumerate descendants of {pid}: {exc}")
+        for child in children:
+            kill_process_tree(int(child), failures)
     if os.name == "posix":
         try:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except OSError as exc:
+            failures.append(f"could not signal process group {pid}: {exc}")
     else:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-
+        except OSError as exc:
+            failures.append(f"could not signal process {pid}: {exc}")
+    return failures
 def command_result(command: list[str], cwd: Path, deadline: float, timeout_limit: float | None = None,
-                   allow_nonzero: bool = False) -> dict[str, Any]:
+                   allow_nonzero: bool = False, env: dict[str, str] | None = None) -> dict[str, Any]:
     started = time.monotonic()
     timeout = min(deadline - started, timeout_limit) if timeout_limit is not None else deadline - started
+    cleanup_scope = (
+        "Linux /proc descendants plus owned POSIX process group; escaped/reparented descendants not guaranteed"
+        if os.name == "posix" and sys.platform == "linux"
+        else "owned POSIX process group; descendant enumeration unavailable"
+        if os.name == "posix"
+        else "direct process only; descendant cleanup unknown"
+    )
     if timeout <= 0:
-        return {"status": "timeout", "elapsed": 0.0, "returncode": None, "stdout": "", "stderr": "budget exhausted"}
+        return {"status": "timeout", "elapsed": 0.0, "returncode": None, "stdout": "", "stderr": "budget exhausted",
+                "cleanup_status": "not-started", "cleanup_error": None, "cleanup_scope": "no child was started"}
     try:
         process = subprocess.Popen(
-            command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=(os.name == "posix"),
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout)
             status = "completed" if process.returncode == 0 or allow_nonzero else "tool-error"
             return {"status": status, "elapsed": time.monotonic() - started, "returncode": process.returncode,
-                    "stdout": stdout, "stderr": stderr}
+                    "stdout": stdout, "stderr": stderr, "cleanup_status": "unknown",
+                    "cleanup_error": None, "cleanup_scope": "normal exit; descendant cleanup not observed"}
         except subprocess.TimeoutExpired as exc:
-            kill_process_tree(process.pid)
-            stdout, stderr = process.communicate()
-            captured_stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            captured_stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            try:
+                cleanup_failures = kill_process_tree(process.pid)
+            except Exception as cleanup_exc:
+                cleanup_failures = [f"process-tree cleanup raised: {cleanup_exc}"]
+            try:
+                stdout, stderr = process.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired as drain:
+                cleanup_failures.append("captured output remained open after the termination request")
+                stdout = drain.stdout or exc.stdout or ""
+                stderr = drain.stderr or exc.stderr or ""
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                    except (OSError, subprocess.TimeoutExpired) as wait_exc:
+                        cleanup_failures.append(f"owned child did not exit after kill: {wait_exc}")
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError as close_exc:
+                            cleanup_failures.append(f"could not close captured output pipe: {close_exc}")
+            captured_stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else (stdout or "")
+            captured_stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else (stderr or "")
+            cleanup_status = (
+                "incomplete" if any(
+                    failure.startswith(("captured output", "owned child", "could not close"))
+                    for failure in cleanup_failures
+                )
+                else "failed" if cleanup_failures
+                else "requested" if os.name == "posix" and sys.platform == "linux"
+                else "unknown"
+            )
             return {"status": "timeout", "elapsed": time.monotonic() - started, "returncode": None,
-                    "stdout": stdout or captured_stdout, "stderr": stderr or captured_stderr or "process timed out"}
+                    "stdout": captured_stdout, "stderr": captured_stderr or "process timed out",
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": "; ".join(cleanup_failures) if cleanup_failures else None,
+                    "cleanup_scope": cleanup_scope}
     except OSError as exc:
         return {"status": "tool-error", "elapsed": time.monotonic() - started, "returncode": None,
-                "stdout": "", "stderr": str(exc)}
+                "stdout": "", "stderr": str(exc), "cleanup_status": "not-started",
+                "cleanup_error": None, "cleanup_scope": "child did not start"}
 
 
 def read_json(path: Path) -> dict[str, Any] | list[Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, (dict, list)) else None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None
 
 

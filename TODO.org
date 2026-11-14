@@ -215,6 +215,13 @@
 - Do not invent universal parse-success or scalar scores, or claim byte-only
   formatter advantage. A reduction is not a global minimum, SQL-semantic
   validity, or bug reproduction.
+*** DONE [#A] Document the experiment-line and track contract
+- `benchmarks/README.md` defines exactly the internal and external lines,
+  separates line from execution mode, and treats reduction tracks as per-input
+  identities. Profile/effective settings are comparison sides; unlike
+  statement-only and full-AST coverage are not pooled.
+- Documentation only: cohort/profile compatibility is not enforced by every
+  entrypoint, and the external line remains unselected.
 ** BLOCKED [#A] Select primary DBMS and representative evidence scope
 - Owner review must select engine/version, setup, and workload sources.
   PostgreSQL with SQLite execution controls is only a bounded proposal; parser
@@ -242,6 +249,18 @@
 - Acceptance: record initial acceptance and fresh-state final validation.
   External predicate/reset owns DB isolation. Keep text-marker mechanics
   distinct from execution evidence.
+*** DONE [#A] Probe one bounded SQLite reset-template path
+- `python3 benchmarks/tools/profile_isolation_probe.py --binary
+  dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/build/occam-eval/occam-eval
+  --out benchmarks/benchmark_artifacts/profile-isolation-20261114-b` returned
+  `qualified=true` for two native `full` repetitions; both rows completed and
+  validated. The gitignored local evidence records per-observation
+  candidate-workdir signatures, contamination and cleanup checks, and child
+  metrics. Probe helper SHA256:
+  `8b8a37fe066f1932f8a3be2bd2fd9196739382af027a881c78ae67f6d79ab4f3`.
+- Scope is one existing `reset-template` SQLite rowset with per-observation
+  candidate workdirs and configured reset only. It does not qualify arbitrary
+  database isolation, a representative workload, or external DBMS selection.
 ** TODO [#A] Use one control plane for selected experiment lines
 - Use one runner/control plane for either selected line; prepare upstream
   checkouts, builds, adapters, and workloads outside timed measurement. The
@@ -261,13 +280,21 @@
 - Acceptance: preserve line-specific accounting and validation boundaries.
   Distinguish rejection, timeout/checkpoint, tool, infrastructure, and cleanup
   failures.
+*** DONE [#A] Add the bounded internal native profile-driver slice
+- `scale_study.py profiles` runs case × profile × repetition serially with a
+  fresh native child, budget, counters, preflight, output directory, and
+  per-child `GHCRTS=-N1`; the shared command helper retains timeout/cleanup
+  observations and bounds post-timeout output draining.
+- This is not a two-line control-plane migration: legacy entrypoints and
+  external reducer integration remain outside this slice.
 ** IN_PROGRESS [#A] Isolate each measured profile execution
-- First slice verified: `occam-eval --profile NAME` runs one internal profile;
-  `scale_study.py profiles` launches selected profiles in separate processes.
-  Five CLI/control tests passed, including independent preflight/cap checks.
-  A small SQLite smoke retained one failed selection and three independently
-  validated profile results. DB fixture isolation, the contamination probe,
-  and the complete batch resource/evidence contract are not complete.
+- First slice verified: `occam-eval --profile NAME` selects one internal
+  profile; `scale_study.py profiles` records separate native child processes.
+- Focused `python3 -m unittest -v benchmarks.test_scale_study` passed 5 tests
+  in 11.971s, covering timeout cleanup/continuation, malformed non-UTF8 and
+  missing metrics, nonzero child, and spawn-failure retention.
+- The retained two-repetition SQLite probe is qualified only for its bounded
+  reset-template fixture path (evidence and limits are recorded above).
 - Use an immutable profile configuration and a fresh child per case × profile
   × repetition, including native/API variants. Each measured child runs exactly
   one explicitly named profile; never combine profiles in one measured worker.
@@ -287,6 +314,13 @@
   state in run one and proves run two starts clean. Retain isolation/reset
   evidence and cleanup outcomes. Preserve timeout versus validated-partial
   status; never promote a checkpoint to completed.
+*** DONE [#A] Test child timeout and failure retention
+- The focused suite covers a timed-out child with ordinary descendant cleanup,
+  bounded output capture and later-child continuation; it also verifies that
+  timeout/nonzero/missing-metric outcomes are not promoted from stale
+  completed/checkpoint data.
+- Cleanup evidence is scoped to the Linux `/proc`/owned-process-group helper;
+  escaped or reparented descendants are not promised.
 ** TODO [#A] Preserve immutable per-run evidence
 - Store versioned raw records/artifacts with case, line, profile, repetition,
   child and isolation/reset identities; input/output checksums; execution mode;
@@ -306,6 +340,13 @@
   override outer timeout or infrastructure failure with a stale profile.
 - Acceptance: every result traces to raw records/artifacts; partial accepted
   checkpoints retain validation state and are never promoted to completion.
+*** DONE [#A] Capture raw artifacts for internal native children
+- Per-run metadata and JSONL rows carry unique run/child identities, serial
+  order, profile/track, configured command fingerprints, actual input/output
+  byte hashes, native typed statement-count provenance, separate outer/native
+  timing, and raw metric/checkpoint/log paths. Unknown metrics stay null.
+- This does not capture all source/patch/toolchain/effective-pass evidence or
+  external-line raw records required by the parent task.
 ** TODO [#B] Add evidence-led profiling early
 - Start when the foundation contract, first qualified case, and raw-run capture
   exist; do not wait for full rewrite or external-tool selection. Keep
