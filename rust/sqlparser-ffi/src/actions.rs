@@ -1935,7 +1935,8 @@ fn set_effects(
         .last()
         .map(|ident| ident.0.to_ascii_lowercase())
         .unwrap_or_default();
-    match last.as_str() {
+    let variable_name = last.trim_start_matches('@');
+    match variable_name {
         "search_path" => match search_path_value(values, rules) {
             Some(path) => (
                 vec![ir::SessionEffect::SetSearchPath { scope, path }],
@@ -2219,6 +2220,7 @@ fn reset_effects(
                         .last()
                         .map(|ident| ident.0.to_ascii_lowercase())
                         .as_deref()
+                        .map(|s| s.trim_start_matches('@'))
                     {
                         Some("search_path") => (
                             vec![ir::SessionEffect::SetSearchPath {
@@ -2661,7 +2663,8 @@ fn sequence_effects_for_statement<'a>(
         | Statement::Update(_)
         | Statement::Delete(_)
         | Statement::Merge(_)
-        | Statement::Call(_) => {
+        | Statement::Call(_)
+        | Statement::Copy { .. } => {
             let _ = statement.visit(&mut visitor);
         }
         Statement::CreateTable(create)
@@ -2749,6 +2752,7 @@ pub(super) fn analyze_statement(
                 | Statement::Delete(_)
                 | Statement::Merge(_)
                 | Statement::Call(_)
+                | Statement::Copy { .. }
                 | Statement::Explain { .. }
         );
     if sequences.unknown || deferred_function {
@@ -3437,6 +3441,76 @@ pub(super) fn analyze_statement(
                 }
             }
         }
+        Statement::Copy { source, to, .. } => {
+            if *to {
+                match source {
+                    CopySource::Table {
+                        table_name,
+                        columns,
+                    } => {
+                        let col_idents = columns
+                            .iter()
+                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                            .collect();
+                        match relation_ref(table_name, dialect, rules) {
+                            Some(target) => facts.ops.push(ir::CatalogOp::Read(read_fact(
+                                target,
+                                ir::ReadMode::Data,
+                                col_idents,
+                            ))),
+                            None => facts.barriers.push(global_barrier(
+                                ir::BarrierReason::UnknownDml,
+                                Some(table_name.to_string()),
+                            )),
+                        }
+                    }
+                    CopySource::Query(query) => {
+                        let nested = collect_dml_in_query(query);
+                        let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
+                        for read in reads {
+                            facts.ops.push(ir::CatalogOp::Read(read));
+                        }
+                        add_unmodeled_barriers(&mut facts, &visitor, &[]);
+                        merge_nested(&mut facts, nested, context);
+                    }
+                }
+            } else {
+                match source {
+                    CopySource::Table {
+                        table_name,
+                        columns,
+                    } => {
+                        let col_idents = columns
+                            .iter()
+                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                            .collect();
+                        match relation_ref(table_name, dialect, rules) {
+                            Some(target) => {
+                                facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
+                                    target,
+                                    kind: ir::WriteKind::Insert {
+                                        conflict: ir::ConflictAction::Error,
+                                    },
+                                    columns: col_idents,
+                                    unqualified_columns: Vec::new(),
+                                    reads: Vec::new(),
+                                }))
+                            }
+                            None => facts.barriers.push(global_barrier(
+                                ir::BarrierReason::UnknownDml,
+                                Some(table_name.to_string()),
+                            )),
+                        }
+                    }
+                    CopySource::Query(query) => {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownDml,
+                            Some(query.to_string()),
+                        ));
+                    }
+                }
+            }
+        }
         Statement::Set(set) => {
             let (effects, barriers, transactions) = set_statement_effects(set, rules);
             facts.session.extend(effects);
@@ -3746,8 +3820,6 @@ pub(super) fn analyze_statement(
             Some(statement.to_string()),
         )),
     }
-    // TODO(dialect-alignment): MySQL `SET foreign_key_checks = 0/1` should be explicitly mapped
-    // to `ir::SessionEffect::SetForeignKeyChecks` similar to SQLite's `PRAGMA foreign_keys`.
     // Generic variables are recorded, but their effects on parsing, writes,
     // triggers, and transaction behavior are not represented by the catalog.
     if facts.session.iter().any(|effect| {

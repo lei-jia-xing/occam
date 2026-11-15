@@ -845,6 +845,56 @@ tests =
             assertBool
                 "an explicit PRAGMA foreign_keys = 1 restores cascading"
                 (has (StatementId 4) enabledDeps')
+        , testCase "MySQL SET foreign_key_checks dynamically controls foreign key cascading" $ do
+            let baseSql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT, FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "SET foreign_key_checks = 0;"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+                enabledSql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT, FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "SET @@foreign_key_checks = 1;"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+            disabledGraph <- analyze MySQL baseSql
+            enabledGraph <- analyze MySQL enabledSql
+            let disabledDeps = dependenciesFor (StatementId 5) disabledGraph
+                enabledDeps = dependenciesFor (StatementId 5) enabledGraph
+            assertBool
+                "SET foreign_key_checks = 0 disables cascade dependency"
+                (not (has (StatementId 4) disabledDeps))
+            assertBool
+                "SET @@foreign_key_checks = 1 enables cascade dependency"
+                (has (StatementId 4) enabledDeps)
+        , testCase "PostgreSQL COPY FROM writes to relation and COPY TO reads from relation" $ do
+            let copyFromSql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT PRIMARY KEY);"
+                        , "COPY t FROM '/tmp/data.csv';"
+                        , "SELECT * FROM t;"
+                        ]
+                copyToSql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT PRIMARY KEY);"
+                        , "INSERT INTO t VALUES (1);"
+                        , "COPY t TO '/tmp/data.csv';"
+                        ]
+            fromGraph <- analyzeParsed PostgreSQL copyFromSql
+            toGraph <- analyzeParsed PostgreSQL copyToSql
+            let fromDeps = dependenciesFor (StatementId 3) fromGraph
+                toDeps = dependenciesFor (StatementId 3) toGraph
+            assertBool
+                "SELECT reads from COPY FROM"
+                (has (StatementId 2) fromDeps)
+            assertBool
+                "COPY TO reads from INSERT"
+                (has (StatementId 2) toDeps)
         , testCase "TABLE query bodies retain external sources without capturing CTE shadows" $
             mapM_
                 ( \(query, expectedWrites) -> do

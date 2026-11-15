@@ -1496,7 +1496,7 @@ mod tests {
     #[test]
     fn reset_foreign_keys_restores_the_initial_setting() {
         let units = parse(
-            "SET foreign_key_checks = 0; RESET foreign_key_checks;",
+            "SET foreign_key_checks = 0; RESET foreign_key_checks; SET @@foreign_key_checks = 1; SET @@SESSION.foreign_key_checks = 0;",
             DialectKind::MySql,
         )
         .unwrap();
@@ -1509,6 +1509,47 @@ mod tests {
             [SessionEffect::ResetForeignKeyChecks {
                 scope: SessionScope::Session
             }]
+        ));
+        assert!(matches!(
+            facts(&units[2]).session.as_slice(),
+            [SessionEffect::SetForeignKeyChecks { value: true, .. }]
+        ));
+        assert!(matches!(
+            facts(&units[3]).session.as_slice(),
+            [SessionEffect::SetForeignKeyChecks { value: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn copy_statement_records_read_and_write_facts() {
+        let units = parse(
+            "COPY t (a, b) FROM '/path/to/data.csv'; COPY t (a, b) TO '/path/to/out.csv'; COPY (SELECT a FROM t) TO STDOUT;",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        // COPY FROM t is a WriteData op
+        let f0 = facts(&units[0]);
+        assert_eq!(f0.barriers.len(), 0);
+        assert!(matches!(
+            f0.ops.as_slice(),
+            [CatalogOp::WriteData(DataWrite { target, kind: WriteKind::Insert { .. }, .. })]
+                if name_text(&target.name) == "t"
+        ));
+        // COPY t TO is a Read op
+        let f1 = facts(&units[1]);
+        assert_eq!(f1.barriers.len(), 0);
+        assert!(matches!(
+            f1.ops.as_slice(),
+            [CatalogOp::Read(ReadFact { source, .. })]
+                if name_text(&source.name) == "t"
+        ));
+        // COPY (SELECT ..) TO is a Read op from query visitor
+        let f2 = facts(&units[2]);
+        assert_eq!(f2.barriers.len(), 0);
+        assert!(matches!(
+            f2.ops.as_slice(),
+            [CatalogOp::Read(ReadFact { source, .. })]
+                if name_text(&source.name) == "t"
         ));
     }
 
