@@ -71,16 +71,20 @@ def read_new_log(log_file, offset):
                 f.seek(offset)
                 return f.read()
         except OSError as e:
-            sys.stderr.write(f"[crash_oracle] Warning: failed to read {log_file}: {e}\n")
+            sys.stderr.write(
+                f"[crash_oracle] Warning: failed to read {log_file}: {e}\n"
+            )
     return ""
 
 
-def get_container_log_offset(container_name, internal_log="/var/log/postgresql/postgresql.log"):
+def get_container_log_offset(
+    container_name, internal_log="/var/log/postgresql/postgresql.log"
+):
     try:
         res = subprocess.run(
             ["docker", "exec", container_name, "stat", "-c", "%s", internal_log],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            check=False,
+            capture_output=True,
             text=True,
             timeout=3,
         )
@@ -91,15 +95,28 @@ def get_container_log_offset(container_name, internal_log="/var/log/postgresql/p
     return 0
 
 
-def read_container_logs(container_name, since_iso, log_offset=0, internal_log="/var/log/postgresql/postgresql.log"):
+def read_container_logs(
+    container_name,
+    since_iso,
+    log_offset=0,
+    internal_log="/var/log/postgresql/postgresql.log",
+):
     file_log = ""
     if log_offset >= 0:
         try:
-            cmd = ["docker", "exec", container_name, "tail", "-c", f"+{log_offset + 1}", internal_log]
+            cmd = [
+                "docker",
+                "exec",
+                container_name,
+                "tail",
+                "-c",
+                f"+{log_offset + 1}",
+                internal_log,
+            ]
             res = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                check=False,
+                capture_output=True,
                 text=True,
                 timeout=5,
             )
@@ -112,8 +129,8 @@ def read_container_logs(container_name, since_iso, log_offset=0, internal_log="/
     try:
         res = subprocess.run(
             ["docker", "logs", "--since", since_iso, container_name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            check=False,
+            capture_output=True,
             text=True,
             timeout=5,
         )
@@ -192,15 +209,35 @@ def main():
 
     # Resolve dbms-aware connection defaults
     if args.host is None:
-        args.host = os.environ.get("MYSQL_HOST", "127.0.0.1") if args.dbms == "mysql" else os.environ.get("PGHOST", "127.0.0.1")
+        args.host = (
+            os.environ.get("MYSQL_HOST", "127.0.0.1")
+            if args.dbms == "mysql"
+            else os.environ.get("PGHOST", "127.0.0.1")
+        )
     if args.port is None:
-        args.port = int(os.environ.get("MYSQL_TCP_PORT", 3306)) if args.dbms == "mysql" else int(os.environ.get("PGPORT", 5432))
+        args.port = (
+            int(os.environ.get("MYSQL_TCP_PORT", 3306))
+            if args.dbms == "mysql"
+            else int(os.environ.get("PGPORT", 5432))
+        )
     if args.user is None:
-        args.user = os.environ.get("MYSQL_USER", "root") if args.dbms == "mysql" else os.environ.get("PGUSER", "postgres")
+        args.user = (
+            os.environ.get("MYSQL_USER", "root")
+            if args.dbms == "mysql"
+            else os.environ.get("PGUSER", "postgres")
+        )
     if args.password is None:
-        args.password = os.environ.get("MYSQL_PWD", "") if args.dbms == "mysql" else os.environ.get("PGPASSWORD", "")
+        args.password = (
+            os.environ.get("MYSQL_PWD", "")
+            if args.dbms == "mysql"
+            else os.environ.get("PGPASSWORD", "")
+        )
     if args.dbname is None:
-        args.dbname = os.environ.get("MYSQL_DATABASE", "occam_test") if args.dbms == "mysql" else os.environ.get("PGDATABASE", "occam_test")
+        args.dbname = (
+            os.environ.get("MYSQL_DATABASE", "occam_test")
+            if args.dbms == "mysql"
+            else os.environ.get("PGDATABASE", "occam_test")
+        )
     if args.log_file is None:
         args.log_file = os.environ.get("DBMS_LOG_FILE", "")
 
@@ -216,13 +253,19 @@ def main():
     container_offset = 0
     since_iso = ""
     local_log_usable = False
-    internal_log = args.log_file if args.log_file else (
-        "/var/log/postgresql/postgresql.log" if args.dbms == "postgres" else "/var/log/mysql/error.log"
+    internal_log = (
+        args.log_file
+        if args.log_file
+        else (
+            "/var/log/postgresql/postgresql.log"
+            if args.dbms == "postgres"
+            else "/var/log/mysql/error.log"
+        )
     )
 
     if args.log_file and os.path.isfile(args.log_file):
         try:
-            with open(args.log_file, "r", errors="replace") as f:
+            with open(args.log_file, "r", errors="replace"):
                 pass
             log_offset = get_log_offset(args.log_file)
             local_log_usable = True
@@ -230,9 +273,11 @@ def main():
             local_log_usable = False
 
     if args.container_name:
-        since_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        since_iso = datetime.datetime.now(datetime.UTC).isoformat()
         if not local_log_usable:
-            container_offset = get_container_log_offset(args.container_name, internal_log)
+            container_offset = get_container_log_offset(
+                args.container_name, internal_log
+            )
     # Build client command
     env = os.environ.copy()
     if args.dbms == "postgres":
@@ -250,11 +295,16 @@ def main():
         binary = resolve_binary("psql", psql_candidates)
         cmd = [
             binary,
-            "-h", args.host,
-            "-p", str(args.port),
-            "-U", args.user,
-            "-d", args.dbname,
-            "-v", "ON_ERROR_STOP=0",
+            "-h",
+            args.host,
+            "-p",
+            str(args.port),
+            "-U",
+            args.user,
+            "-d",
+            args.dbname,
+            "-v",
+            "ON_ERROR_STOP=0",
             "-X",
             "-q",
         ]
@@ -268,10 +318,14 @@ def main():
         binary = resolve_binary("mysql", mysql_candidates)
         cmd = [
             binary,
-            "-h", args.host,
-            "-P", str(args.port),
-            "-u", args.user,
-            "-D", args.dbname,
+            "-h",
+            args.host,
+            "-P",
+            str(args.port),
+            "-u",
+            args.user,
+            "-D",
+            args.dbname,
             "--force",
             "-s",
         ]
@@ -292,7 +346,9 @@ def main():
             env=env,
             start_new_session=True,
         )
-        client_stdout, client_stderr = proc.communicate(input=candidate_sql, timeout=args.timeout)
+        _, client_stderr = proc.communicate(
+            input=candidate_sql, timeout=args.timeout
+        )
         retcode = proc.returncode
     except subprocess.TimeoutExpired:
         try:
@@ -304,10 +360,14 @@ def main():
         except Exception:
             pass
         if args.verbose:
-            sys.stderr.write(f"[crash_oracle] TIMEOUT: Query exceeded {args.timeout}s\n")
+            sys.stderr.write(
+                f"[crash_oracle] TIMEOUT: Query exceeded {args.timeout}s\n"
+            )
         sys.exit(124)
     except FileNotFoundError:
-        sys.stderr.write(f"[crash_oracle] Error: DBMS client binary '{cmd[0]}' not found\n")
+        sys.stderr.write(
+            f"[crash_oracle] Error: DBMS client binary '{cmd[0]}' not found\n"
+        )
         sys.exit(1)
     except Exception as e:
         sys.stderr.write(f"[crash_oracle] Unexpected execution error: {e}\n")
@@ -332,7 +392,9 @@ def main():
     if local_log_usable:
         new_log = read_new_log(args.log_file, log_offset)
     elif args.container_name:
-        new_log = read_container_logs(args.container_name, since_iso, container_offset, internal_log)
+        new_log = read_container_logs(
+            args.container_name, since_iso, container_offset, internal_log
+        )
 
     combined_text = f"{new_log}\n{client_stderr}"
 
@@ -372,7 +434,9 @@ def main():
 
         if matched:
             if args.verbose:
-                sys.stderr.write(f"[crash_oracle] ACCEPT: Crash signature matched '{sig}'\n")
+                sys.stderr.write(
+                    f"[crash_oracle] ACCEPT: Crash signature matched '{sig}'\n"
+                )
             sys.exit(0)
         else:
             if args.verbose:

@@ -14,11 +14,11 @@
 - Generate publication-ready figures for oracle call counts, wall-clock speedup, and cache hit ratios.
 
 * Completed Milestones
-** DONE Shell auto-completion and manpage via `usage` CLI specification [2026-11]
-- Authored `occam.usage.kdl` CLI specification compliant with jdx's `usage` standard.
-- Added `--usage-spec` introspection flag to `occam` CLI (`app/Main.hs`).
-- Generated multi-shell completions (`completions/occam.fish`, `_occam`, `occam.bash`) and roff manpage (`man/occam.1`).
-- Installed Fish completion into `~/.config/fish/completions/occam.fish`.
+** DONE Comprehensive multi-shell completions for `occam` via `usage` [2026-11]
+- Authored `occam.usage.kdl` with context-aware file filtering (`file:sql`), directory completion, and full dialect descriptions.
+- Added `--usage-spec` introspection flag to `occam` CLI.
+- Generated and verified completions across 5 shells (Fish, Zsh, Bash, PowerShell, Nushell).
+- Configured automated installation into Fish, Bash, and Zsh completion directories.
 
 ** DONE Modernize CLI with Unix-native I/O and dynamic progress bar [2026-11]
 - Adopted Hackage libraries `terminal-progress-bar` and `ansi-terminal`; eliminated all hand-rolled ANSI escape codes.

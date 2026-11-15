@@ -1,4 +1,4 @@
-.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test check hooks dev clean completions install-completions man
+.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test check hooks dev clean completions install-completions
 
 all: build
 
@@ -63,12 +63,10 @@ completions:
 	usage generate completion bash occam -f occam.usage.kdl > completions/occam.bash
 	usage generate completion zsh occam -f occam.usage.kdl > completions/_occam
 	usage generate completion fish occam -f occam.usage.kdl > completions/occam.fish
+	usage generate completion powershell occam -f occam.usage.kdl > completions/occam.ps1
+	usage generate completion nu occam -f occam.usage.kdl > completions/occam.nu
 
 install-completions:
 	usage generate completion bash occam -f occam.usage.kdl --install
 	usage generate completion zsh occam -f occam.usage.kdl --install
 	usage generate completion fish occam -f occam.usage.kdl --install
-
-man:
-	@mkdir -p man
-	usage generate manpage -f occam.usage.kdl > man/occam.1
