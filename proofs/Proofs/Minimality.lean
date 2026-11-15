@@ -1,26 +1,6 @@
 import Proofs.DAG
 import Proofs.Reduction
 
-/-!
-This module provides the formal mathematical model and verified properties
-of Occam's sequential single-statement deletion audit algorithm and the concept
-of 1-minimality (local minimality with respect to single-statement removals).
-
-Haskell reference:
-- `src/Occam/Reducer.hs`: `statementAudit`, `statementAuditWithLogger`, `auditPass`,
-  and `statement_1_minimal = true`.
-
-Key theorems proved:
-1. **Length Reduction Lemma**: Removing any present statement strictly decreases candidate length.
-2. **Theorem 1 (Termination & Complexity Bound)**: `auditLoop` is well-founded and terminates
-   in at most `stmts.length` removal passes.
-3. **Theorem 2 (Length Monotonicity)**: `(auditLoop O stmts).length ≤ stmts.length`.
-4. **Theorem 3 (Oracle Preservation / Soundness)**: If `O stmts = true`, then `O (auditLoop O stmts) = true`.
-5. **Theorem 4 (Audit Fixed Point is 1-Minimal)**: If `O stmts = true`, then `IsOneMinimal O (auditLoop O stmts)`.
-6. **Connection with DAG Closure**: `IsClosureOneMinimal` ensures that all closure-preserving single-statement
-   removals either fail the oracle or fail to reduce the statement set.
--/
-
 /-- Statement removal: filters out all occurrences of statement `s` from `stmts`.
     Matches Occam's `filter ((/= stmtId statement) . stmtId) current` in `src/Occam/Reducer.hs`. -/
 def removeStmt (s : StmtId) (stmts : List StmtId) : List StmtId :=
@@ -297,11 +277,11 @@ In Occam, SQL statement reduction operates over dependencies modeled as a DAG.
 When removing a statement `s`, transitive dependencies must be retained by computing
 the closure `closeSet G (removeStmt s stmts)`.
 
-We define **Closure 1-Minimality** (闭包局部极小性) and prove that candidates
+We define **Closure 1-Minimality** and prove that candidates
 whose closure removals fail the oracle (or preserve the entire set) are closure-1-minimal.
 -/
 
-/-- Definition: **Closure 1-Minimality** (闭包 1-极小性):
+/-- Definition: **Closure 1-Minimality**:
     A candidate `stmts` is closure-1-minimal with respect to DAG `G` and oracle `O` iff:
     1. It satisfies the oracle (`O stmts = true`),
     2. It is a valid DAG closure (`isValidClosure G stmts`), and

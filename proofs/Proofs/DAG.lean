@@ -1,14 +1,3 @@
-/-!
-This module provides the formal mathematical model and verified properties
-of Occam's temporal dependency DAG, backward slicing, and set closure algorithms.
-
-Haskell reference:
-- `src/Occam/Core.hs`: StatementId (Nat), DependencyGraph
-- `src/Occam/Slicer.hs`: `backwardSlice target graph`
-- `src/Occam/Reducer.hs`: `isValidClosure graph kept`, `closeSet graph roots`
-- `test/Spec.hs`: Prop 1 (Acyclicity), Prop 2 (Backward Slice Soundness), Prop 2b (Closure Reachability)
--/
-
 abbrev StmtId := Nat
 
 /-- A temporal dependency DAG of SQL statements.

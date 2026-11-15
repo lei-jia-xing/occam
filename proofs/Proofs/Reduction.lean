@@ -1,16 +1,5 @@
 import Proofs.DAG
 
-/-!
-This module provides the formal mathematical model and verified properties
-of Occam's hierarchical reduction engine, reduction measure, termination,
-oracle preservation, fixed-point convergence, and connection to DAG closure validity.
-
-Haskell reference:
-- `src/Occam/Reducer.hs`: `reduceSQLWithConfig`, `loop iteration currentSQL`,
-  `reduceIterationWithConfig`, measure by statements & bytes (`cutRemovedStatements`, `sliceSQL`).
-- `src/Occam/Core.hs`: `StatementId`, `Span`, `Statement`.
--/
-
 /-- A candidate program representation consisting of an ordered list of statement IDs
     and its total byte length (or measure weight). -/
 structure Program where
