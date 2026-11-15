@@ -256,6 +256,13 @@
 - Aligned strictly with Unix I/O conventions: diagnostics and dynamic progress bar to stderr, pure reduced SQL to stdout when redirected or with `-o -`, stdin support (`-`).
 - Removed all ASCII banner clutter (`======` / `------`).
 
+** DONE [#A] Shell auto-completion and manpage via `usage` CLI specification
+- Authored `occam.usage.kdl` CLI specification compliant with jdx's `usage` standard (covering all flags, arguments, choices, and defaults).
+- Added `--usage-spec` flag to `occam` CLI (`app/Main.hs`) for zero-overhead dynamic spec introspection.
+- Generated full multi-shell tab completion scripts for Fish, Zsh, and Bash in `completions/` (`occam.fish`, `_occam`, `occam.bash`).
+- Installed Fish completion into `~/.config/fish/completions/occam.fish` with full dialect and flag option completions.
+- Generated standard Unix roff manual page `man/occam.1` and added `Makefile` targets (`completions`, `install-completions`, `man`).
+
 * 26. Thesis Evaluation & Figure Synthesis
 ** TODO [#A] Compile comparative benchmark results and thesis evaluation figures
 - Aggregate dual-engine real crash reduction benchmark results (Ours vs B1 vs B2 vs NoDep).

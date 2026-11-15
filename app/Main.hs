@@ -255,10 +255,60 @@ versionOption =
             <> help "Show version information"
         )
 
+usageSpecOption :: Parser (a -> a)
+usageSpecOption =
+    infoOption
+        usageSpecText
+        ( long "usage-spec"
+            <> help "Print CLI usage specification (KDL format for 'usage' shell completion generator)"
+        )
+
+usageSpecText :: String
+usageSpecText =
+    unlines
+        [ "name \"Occam\""
+        , "bin \"occam\""
+        , "version \"" ++ Occam.version ++ "\""
+        , "about \"Occam: Dependency-Aware SQL Test Case Minimizer\""
+        , ""
+        , "arg \"<INPUT.sql>\" help=\"Path to fuzz SQL input, or '-' for stdin\""
+        , ""
+        , "flag \"--oracle <COMMAND>\" help=\"Interestingness predicate command (SQL on stdin; exit 0 accepts)\" required=#true"
+        , "flag \"-o --out <DIR>\" default=\"occam-out\" help=\"Directory where reduced artifacts will be written, or '-' for stdout\""
+        , "flag \"--reset <COMMAND>\" help=\"Lightweight state reset command (e.g. dropdb/createdb)\""
+        , "flag \"--timeout <SECONDS>\" default=\"10.0\" help=\"Per-execution timeout in seconds\""
+        , ""
+        , "flag \"--log-level <LEVEL>\" default=\"info\" help=\"Log severity level\" {"
+        , "    choices \"debug\" \"info\" \"warn\" \"error\""
+        , "}"
+        , "flag \"--log-format <FORMAT>\" default=\"text\" help=\"Log output format\" {"
+        , "    choices \"text\" \"json\""
+        , "}"
+        , "flag \"-v --verbose\" help=\"Enable verbose debug output (equivalent to --log-level debug)\""
+        , "flag \"-q --quiet\" help=\"Suppress info logs and banners (equivalent to --log-level error)\""
+        , "flag \"--budget <SECONDS>\" help=\"Shared wall-clock cap including initial check, reduction, and audit\""
+        , "flag \"--max-oracle-executions <N>\" help=\"Maximum uncached oracle attempts including initial check and validation\""
+        , ""
+        , "flag \"--slicing\" help=\"Enable dependency slicing\""
+        , "flag \"--no-slicing\" help=\"Disable dependency slicing\""
+        , "flag \"--closure\" help=\"Enable dependency closure\""
+        , "flag \"--no-closure\" help=\"Disable dependency closure\""
+        , "flag \"--intra-statement\" help=\"Enable intra-statement reductions\""
+        , "flag \"--no-intra-statement\" help=\"Disable intra-statement reductions\""
+        , "flag \"--unrestricted\" help=\"Enable unrestricted reductions\""
+        , "flag \"--no-unrestricted\" help=\"Disable unrestricted reductions\""
+        , "flag \"--cache\" help=\"Enable candidate caching\""
+        , "flag \"--no-cache\" help=\"Disable candidate caching\""
+        , ""
+        , "flag \"--dialect <DIALECT>\" default=\"generic\" help=\"SQL dependency dialect\" {"
+        , "    choices \"generic\" \"postgresql\" \"mysql\" \"sqlite\" \"duckdb\" \"clickhouse\" \"oracle\" \"ansi\" \"bigquery\" \"databricks\" \"hive\" \"mssql\" \"redshift\" \"snowflake\" \"spark\" \"teradata\""
+        , "}"
+        ]
+
 optsInfo :: ParserInfo Options
 optsInfo =
     info
-        (optionsParser <**> versionOption <**> helper)
+        (optionsParser <**> versionOption <**> usageSpecOption <**> helper)
         ( fullDesc
             <> progDesc "Occam: Dependency-Aware SQL Test Case Minimizer"
             <> header ("Occam v" ++ Occam.version ++ " - Multi-statement SQL reducer")
