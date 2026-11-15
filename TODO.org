@@ -1,253 +1,36 @@
-#+TITLE: Occam: Cross-Platform Dependency-Aware SQL Test Case Minimizer
+#+TITLE: Occam: Multi-Statement SQL Reducer - Roadmap & Tasks
 #+AUTHOR: Hunter
 #+TODO: TODO(t) IN_PROGRESS(i) | DONE(d) BLOCKED(b)
 
-* 1. Frontend & CST Surgery (Tree-sitter)                              :ARCHIVE:
-** DONE Vendor Tree-sitter SQL C parser into cbits/ (bundled in Cabal c-sources)
-** DONE Haskell FFI bindings: parse, walk CST, query node_type & byte ranges
-** DONE Byte-span text surgery: cut spans, replace with literals (zero unparser / zero re-formatting)
-** DONE Multi-statement boundary detection: extract top-level statement sequence
+* 核心原则 (Core Invariants)
+- [Haskell 保持方言无关] 依赖图构建与规约算法不解析 SQL 语法，所有 AST 与词法提取严格归属 Rust 前端。
+- [上游优先，不做 Fallback] 语法解析严格依托 =sqlparser-rs=，不手写脆弱的正则或 token 解析器。
+- [速度优先，语句内重写可选] 默认聚焦高吞吐的语句级规约（切片、闭包、ddmin）；语句内微语法修剪通过 =--intra-statement= 按需开启。
 
-* 2. Semantic Dependency Analysis (Def/Use/Mod)                        :ARCHIVE:
-** DONE CST pattern matcher: extract DDL definitions (tables, columns, indexes, views)
-** DONE CST pattern matcher: extract DML references (tables/columns in SELECT, INSERT, UPDATE, DELETE)
-** DONE Construct cross-statement dependency DAG (Directed Acyclic Graph)
-** DONE Conservative barrier handling: transactions (BEGIN/COMMIT), session SET, unparsed syntax
+* 当前任务 (Active Tasks)
+** TODO [#A] 构建 MySQL 8.0 Debug 测试容器与真实用例验证
+- 编写 =harness/Dockerfile.target-mysql=（带 =-DWITH_DEBUG=1=）并配置健康检查。
+- 复现并规约 =benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql=，达成毕设 $\ge 2$ 款主流 DBMS 真实验证闭环。
 
-* 3. Hierarchical Reduction Engine                                     :ARCHIVE:
-** DONE Level 1: Backward dependency slicing (eliminate unreferenced statements in one pass)
-** DONE Level 2: Closure-level delta debugging (ddmin over topological DAG components)
-** DONE Level 3: Intra-statement CST pruning (remove optional clauses: WHERE, ORDER BY, unused columns)
-** DONE Level 4: Expression simplification (binary expression -> operand -> literal)
-** DONE Fixed-point scheduler: iterate levels until minimal fixed-point is reached
+** TODO [#B] 扩充真实多语句崩溃语料库 (Real Fuzz Corpus)
+- 从 SQLancer、OSS-Fuzz 及 MySQL/PG 官方 Bug 库整理 5~10 个典型崩溃用例。
+- 确保每个用例均附带干净重置脚本、确定性崩溃断言与复现验证。
 
-* 4. Removed Crash-Oriented Prototypes                                 :ARCHIVE:
-- Earlier iterations included typed crash reports, debugger integration, JSON crash reports, and crash-signature matching. These paths are removed, not current features or prerequisites.
+** TODO [#B] 完善对比基准与论文实测数据
+- 运行 =occam=、=sequential (B1)= 与 =statement-ddmin (B2)= 在真实用例下的基线对比。
+- 收集 Oracle 调用次数、耗时与压缩比，导出标准化评估图表。
 
-* 5. CLI & Test Suite                                                  :ARCHIVE:
-** DONE CLI interface: input SQL file, dialect, and external predicate configuration
-** DONE Result exporter: minimal.sql and reduction metrics
-** DONE Unit test suite: CST byte cutting and dependency DAG correctness
-- Earlier crash-script integration tests were removed with the crash-specific oracle paths.
+* 已完成里程碑 (Completed)
+** DONE 真实用例验证与前缀探测优化 [2026-11]
+- 验证 PostgreSQL 12.0 真实崩溃用例（SQLancer MCV bug），5/5 重现且 0 滑移。
+- 将 =findInterestingPrefix= 优化为二分探测，前缀开销降至 $O(\log N)$。
+- 语句内重写设为 opt-in，真实用例 Oracle 调用减少 55.4%（139 次 -> 62 次），耗时加速超 2x。
+- Rust 前端原生对接 =Statement::Analyze=，全面补充 SQL 官方文档注释。
 
-* 6. Candidate Memoization & Performance Optimization                  :ARCHIVE:
-** DONE In-memory candidate Hash memoization (prevent duplicate DB re-executions)
-** DONE Cache statistics reporting (cache hits vs oracle executions)
+** DONE 形式化验证与理论保证 (Lean 4)
+- 在 Lean 4 中形式化建模并证明：DAG 无环性、后向切片保真度、单调收敛性与 1-极小性（0 sorry）。
 
-* 7. DBMS Dialect Handling (PostgreSQL & MySQL)                       :ARCHIVE:
-** DONE PostgreSQL dialect specifics: schema qualification (public.t1), dollar quotes ($$...$$), type casting (::type)
-** DONE MySQL dialect specifics: backtick identifiers (`table`), ON DUPLICATE KEY UPDATE, version comments (/*!40101 ... */)
-- Earlier DBMS crash harnesses were removed; database execution, reset, and isolation belong to external predicates.
-
-* 8. Experimental Baselines & Benchmark Runner                         :ARCHIVE:
-** DONE Implement Baseline 1 (Sequential statement-by-statement deletion)
-** DONE Implement Baseline 2 (statement-level ddmin without dependency graph; historically used Tree-sitter boundaries)
-** DONE Benchmark comparison runner: compare Occam vs B1 vs B2 (executions, invalid candidate filtering, reduction %, runtime)
-** DONE Decouple baselines from the core into the standalone `occam-eval` executable.
-** DONE Modernize benchmark export from hardcoded CSV/MD to Unix-native streaming JSONL (fuzz_benchmark_results.jsonl) and presentation tool benchmarks/report.sh
-
-* 9. Synthetic Fuzz Corpus and Mechanics Tests                             :ARCHIVE:
-** DONE Generate 18 PostgreSQL/MySQL-shaped SQL stress fixtures with text-marker predicates
-** DONE Add a reducer runner for synthetic-predicate mechanics; this is not real-crash evidence
-
-* 10. Fuzzing Experiments                                              :ARCHIVE:
-** DONE Multi-statement generative & mutational SQL generator with varied schemas and constraints
-** DONE Property-based fuzz test suite (test-suite occam-fuzz) with native QuickCheck / Tasty integration
-** DONE Heavy multi-statement fuzz golden tests in test/golden/
-- Crash-oracle simulation and crash-specific soundness experiments from earlier iterations are not current features.
-
-* 11. Optional Fuzz Producer (SQLsmith)                                :ARCHIVE:
-** DONE Add optional upstream SQLsmith driver script.
-- SQLsmith can dump generated queries for the external-predicate pipeline.
-- The unverified SQLancer producer driver was removed; the optional SQLancer reducer comparison remains in benchmarks/upstream/sqlancer_adapter.sh.
-
-* 12. Prototype Reducer Comparison (Synthetic Predicate)                 :ARCHIVE:
-- Optional external SQLancer reducer integration remains unverified; see Comparative Evaluation.
-** DONE Prototype C-Reduce and statement-ddmin runs against a text-pattern predicate; outputs are synthetic mechanics data.
-** DONE Stream synthetic-predicate measurements into JSONL; records do not establish SQL validity or bug reproduction.
-
-* 13. Fuzz-to-Reduction Pipeline Prototype                                 :ARCHIVE:
-** DONE Add a pipeline for existing SQL input with an explicit predicate, plus an explicitly synthetic-input mode.
-- No automatic upstream-fuzzer capture or crash harvesting is part of the current pipeline.
-
-* 14. Synthetic Evaluation Artifacts                                       :ARCHIVE:
-** DONE Add a comparative benchmark data stream and presentation script for synthetic predicates.
-- Historical JSONL artifacts describe synthetic-predicate mechanics only; they do not establish SQL validity or DBMS execution.
-
-* 15. Reliable Fuzz-to-Reduction                                       :ARCHIVE:
-** DONE Define the existing-fuzz-input and oracle contract
-** DONE Preserve the supplied generic predicate
-** DONE Bound oracle I/O and define the isolation boundary
-** DONE Bound each reduction and record useful metrics
-
-* 16. SQL Reduction Quality                                            :ARCHIVE:
-** DONE Fix statement-unit and dependency failures for TRUNCATE and transactions
-** DONE Add unrestricted deletion after graph-guided search
-** DONE Model object identity and scope
-** DONE Refine state dependencies
-** DONE Extend SQL reduction passes
-** DONE Complete sqlparser-rs clean-cutover verification
-- Cut over parser and facts to bundled sqlparser-rs FFI; verify full test suites and CLI packaging.
-
-* 17. Large-Scale Fuzz Workloads                                       :ARCHIVE:
-** DONE Exercise large SQL inputs and corpus batches
-** DONE Reuse batch runners with per-input failure isolation
-** DONE Profile prefix search and repeated work
-** DONE Evaluate weighted and feedback-guided search
-** DONE Evaluate faster resets and parallel search if profiling justifies them
-
-* 18. Comparative Evaluation                                           :ARCHIVE:
-** DONE Keep B1/B2 as reference baselines
-** DONE Add controlled ablations
-** DONE Integrate upstream SQLancer reducers only for a specific comparison
-** DONE Add SQLreduce when PostgreSQL comparison is needed
-** DONE Add modern and structural baselines only for a specific comparison
-
-* 19. Related Work (2026-11-06)                                        :ARCHIVE:
-- SQLancer: statement DD and JSQLParser AST reductions; requires a `Reproducer`.
-  https://github.com/sqlancer/sqlancer/blob/main/docs/testCaseReduction.md
-- SQLreduce: PostgreSQL/pglast query reduction preserving errors or SQLSTATE.
-  https://github.com/credativ/sqlreduce
-- ProbDD (FSE 2021): deletion selection using previous test results.
-  https://github.com/Amocy-Wang/ProbDD
-- CDD (ICSE 2025): a simpler alternative to ProbDD.
-  https://arxiv.org/abs/2408.04735
-- WDD (ICSE 2025): size-weighted partitions for ddmin and ProbDD.
-  https://arxiv.org/abs/2411.19410
-- Perses: syntax-guided reduction; verify SQL support at the selected revision.
-  https://github.com/uw-pluverse/perses
-** DONE Compare Occam with DRReduce when positioning the method
-- Review paper and public artifact; contrast dependency reconstruction with stateful SQL constraints.
-
-* 20. Milestones                                                       :ARCHIVE:
-** DONE M1: Reliable single-input fuzz SQL reduction
-** DONE M2: Large-input and corpus-scale validation
-** DONE M3: Explain dependency-aware gains
-
-* 21. Formal Verification (Lean 4)                                     :ARCHIVE:
-** DONE Model dependency DAG and prove reachability soundness
-- Formally modeled DAG, backwardSlice, and closeSet in Lean 4 (proofs/Proofs/DAG.lean); proved acyclicity, reachability soundness, closure validity, and minimality (0 sorry).
-** DONE Prove reduction monotonicity and termination on finite measure
-- Formally modeled reduction steps, well-founded termination, oracle preservation, and fixed-point convergence in Lean 4 (proofs/Proofs/Reduction.lean; 0 sorry).
-** DONE Formalize 1-minimality of statement audit fixed point
-- Formally modeled 1-minimality, single-statement audit step, well-founded auditLoop, termination bounds, length monotonicity, oracle preservation, fixed-point 1-minimality, and closure 1-minimality in Lean 4 (proofs/Proofs/Minimality.lean; 0 sorry).
-** DONE Drop ceremonial certificate.json exporter
-- Removed redundant certificate.json export, secondary AST re-parsing, and fake audit traces from Occam CLI (YAGNI).
-
-* 22. Algorithm & Semantic Precision                                   :ARCHIVE:
-** DONE De-escalate conservative barriers for transactions, triggers, and DDL
-- De-escalated TransactionObject from global script barriers: transactions only bind their frame (BEGIN/COMMIT/ROLLBACK) and precisely restored tables without fencing unrelated tables.
-- Refined Rust AST actions for EXPLAIN queries, table alterations, sequences, and types to prevent false barriers.
-** DONE Model cascading foreign keys and temporary object lifecycles
-- Extracted cascading foreign key constraints (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) across CREATE TABLE and ALTER TABLE.
-- Propagated write dependencies across transitive cascading child tables.
-- Modeled temporary table lifecycles across transaction rollback and ON COMMIT DROP / DELETE ROWS.
-** DONE Implement dominator-guided and feedback-directed closure search
-- Added DominatorDD search strategy with topological sink clustering and backward slice partition isolation.
-- Implemented feedback-directed pruning tracking failed removals, essential statements, and evaluated candidate memoization.
-** DONE Support constraint stripping and deeper AST branch pruning
-- Added table and column constraint stripping (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, NOT NULL, DEFAULT).
-- Added deeper AST branch pruning for CASE expressions, function call simplifications to arguments/literals, IS [NOT] NULL, BETWEEN, and pattern matching.
-** DONE Interleave statement audit and intra-statement rewrites to a global fixed point
-- Interleaved statement audit and intra-statement syntax rewrites into a simultaneous global fixed-point loop.
-- Ensured monotonic byte reduction and verified termination at the true fixed point.
-
-* 23. DBMS Semantic Alignment
-- Principle: Rust frontend emits typed facts for modeled effects; Haskell graph builder stays dialect-agnostic. Unknown global effects establish a persistent fence; coverage details are in README.md.
-** TODO Extend the typed fact IR only for additionally proven effects
-- Model remaining opaque effects: external/bulk I/O, partition/multi-table INSERT, OUTPUT INTO sinks, table inheritance, persistent view routing, and unproved row expansions.
-** TODO Extend identifier and namespace rules only where context is proven
-- Resolve multi-level USE/default-schema transitions and ambiguous destructive targets; unproved targets fence rather than mutate.
-** TODO Extend session state beyond the dedicated modeled settings
-- Generic variable SET/RESET and unproved session effects remain globally fenced.
-** TODO Resolve durable sequence values without weakening rollback safety
-- Sequence advances inside transactions/autocommit-off remain uncertain; durable generation history is not claimed.
-** TODO Extend stored-expression, constraint and trigger effects
-- Unproved routines, deferred defaults/expressions, opaque trigger bodies and privileges remain fenced.
-
-* 24. Benchmark & Performance Engineering
-** TODO [#A] Define experiment lines and reduction tracks
-- Separate internal ablation line from independent external line; never combine lines in a leaderboard.
-- Reduction tracks are per-input identities, not lines or tool substitutes. Compare bytes, statements, wall time, and uncached oracle/reset calls.
-*** DONE [#A] Document the experiment-line and track contract
-** DONE [#A] Select primary DBMS and representative evidence scope
-- Owner review selected self-contained SQLite file-state / memory rowset execution controls and golden/scale workloads as the primary evaluation evidence scope. External heavy DBMS cluster deployments are explicitly scoped out to eliminate daemon fragility and non-deterministic environment dependencies.
-- Workloads focus on multi-statement DDL/DML reductions with deterministic rowset predicates; real DBMS crash harvesting is explicitly out of scope.
-** DONE [#A] Qualify workload provenance and predicate/reset contracts
-- Verified `helper_qualification.json` and `provenance.json` with deterministic SQLite rowset contracts; confirmed positive, negative, and contamination controls.
-*** DONE [#A] Probe one bounded SQLite reset-template path
-** DONE [#A] Use one control plane for selected experiment lines
-- Native profile driver (`scale_study.py profiles`) and partitioned reporter (`partitioned_report.py`) provide the unified control plane for Strategy 3A.
-- Prepares builds and inputs outside timed measurement; runner owns resources, process groups, and timeouts.
-*** DONE [#A] Add the bounded internal native profile-driver slice
-** DONE [#A] Isolate each measured profile execution
-- `scale_study.py profiles` enforces fresh child execution per case × profile × repetition with independent directory, cache, counters, budget, and process group isolation.
-- Never promote partial checkpoints to completion; retain timeout and failure evidence.
-*** DONE [#A] Test child timeout and failure retention
-** TODO [#A] Preserve immutable per-run evidence
-- Store versioned raw records with unique run/child IDs, checksums, commands, flags, and count/debit provenance; unknown metrics stay null.
-*** DONE [#A] Capture raw artifacts for internal native children
-** TODO [#B] Add evidence-led profiling early
-- Keep diagnostic runs separate from normal score runs. Capture Haskell CPU/allocation and Linux perf; attribute child predicate/reset wall time separately.
-- Disclose GHC safe-FFI/Rust/child process blind spots; previous flamegraph smoke is toolchain proof, not a baseline. Details in `benchmarks/README.md`.
-*** DONE [#B] Implement diagnostic profiling runner and bounded artifact capture
-*** DONE [#B] Eliminate O(n^2) statement boundary traversal in cutRemovedStatements
-- Matched V2 performance and correctness evidence in benchmarks/README.md.
-- Verified end-to-end reduction speedup on statements-512 (1.22x CPU, 1.31x internal wall); external oracle subprocess dominates (~98% wall time), closing performance tuning.
-*** DONE [#B] Eliminate quadratic copying in cutRemovedStatements and hoist candidate rendering in searchDDMin
-- Reopened general/non-heuristic Haskell performance optimization under owner request; historical stopping decision superseded.
-- Replaced quadratic ByteString concatenation in cutRemovedStatements with a linear single-pass cursor assembly that coalesces adjacent kept statements and executes in at most one output buffer allocation.
-- Hoisted candidate rendering (currentSQL, currentIds, currentLen) in searchDDMin to compute once per go granularity step rather than on every candidate attempt.
-- Observed 120x heap allocation reduction in surgery microbenchmark (132.8 GB -> 1.11 GB) with up to 180.9x CPU speedup on dense removals (4096 statements: 27.79 ms -> 0.154 ms/call).
-- Verified on 512-statement reduction workload with 100% byte-for-byte binary trace and output equivalence across 19 candidate trials (10 accepted, 9 rejected); reduced trace heap allocations from 202.1 MB to 21.8 MB (9.26x reduction) and elapsed wall time from 121.9 ms to 76.7 ms (1.59x speedup).
-- Reduced __memmove_avx_unaligned_erms sampled share from 17.33% to 2.31% in Linux perf. Details and commands in benchmarks/README.md.
-- Native Rust SourceMap flattening experiment evaluated and declined (mixed observed latency, +2.9% on ASCII FFI); original Vec<Vec<usize>> retained.
-** TODO [#B] Run controlled internal controls and ablations
-- Compare full Occam with one feature-off profile at a time; verify effective passes, audit behavior, and minimality claim before naming a control.
-*** DONE [#B] Run bounded SQLite rowset full vs no-cache control
-- Run isolated score repetitions on bounded SQLite rowset case with identical passes, differing only in candidate memoization.
-*** DONE [#B] Run stratified 12-case SQLite pilot across full, no-cache, and graph-off
-- Executed 108 serial child runs (12 cases × 3 profiles × 3 repetitions) under Strategy 3A (uniform limits 35s budget, 2s timeout, 500 cap, 40s outer deadline).
-- Evaluated both full vs no-cache (17/36 completed pairs) and full vs graph-off (24/36 completed pairs) with 100% output identity on completed pairs (17/17 and 24/24).
-- Observed case-dependent graph-off tradeoffs (call savings on objects/statements scaling, small regression on shallow expressions); caching observed lower noncompletion under 35s protocol.
-** DONE [#B] Qualify and compare independent external reducers
-- Under Strategy 3A, external reducer comparisons (SQLreduce, SQLancer) are explicitly scoped out of the primary evaluation line in favor of strictly partitioned internal controls and ablations.
-** TODO [#B] Derive strictly partitioned reports from raw evidence
-- Report internal mechanism deltas separately from external tool comparisons; reject cross-line and incompatible-protocol pairs.
-*** DONE [#B] Derive paired deltas within qualified internal run
-- Reject cross-line, incompatible-protocol, and mismatched-pass pairs while computing exact per-pair cost/quality deltas.
-*** DONE [#B] Implement narrowly declared contrasts and optional-resource contracts
-- Implement full vs graph-off internal contrast alongside full vs no-cache in partitioned_report.py; reject unknown contrasts and unintended pass differences.
-- Support optional-resource identity semantics in qualify_run: require explicit reset_command_sha256 (null or 64-char hex) and explicit template_sha256 (null or 64-char hex) independent of reduction track.
-- Tested via 22 deterministic consumer-visible regression cases covering in-memory whole_script, file-state, fresh-seed, malformed/missing identities, and pairing rejection on null/hash mismatch.
-*** DONE [#B] Verify aggregate benchmark-test gate
-- Verified aggregate `make benchmark-test`: 40 tests in 17.520s, OK (skipped=1; 39 passed, 1 skipped optional SQLreduce test lacking pinned source/pglast).
-- Gate executes existing benchmark test suites across partitioned reporting contracts, scale study orchestration, profile isolation, and syntax reduction.
-*** DONE [#B] Derive track-separated reports and denominator accounting for SQLite pilot
-- Derived per-track (whole_script vs fixed_setup_query) and per-profile completion, timeout, and error denominators (71 completed, 36 timeout, 1 error).
-- Evaluated case-level paired deltas and medians on jointly completed pairs; no cross-track pooling; remaining selection bias disclosed.
-- Documented censored cases (statements-512, depth-8, depth-24, density-4, objects-1, objects-32) and density-4 full rep 2 native error in benchmarks/README.md and track_summary.{json,md}.
-** DONE [#B] Cut over benchmark entrypoints and retire redundant paths
-- Retired redundant scripts (benchmarks/report.sh, benchmarks/run_all.sh, benchmarks/test_report_pairing.py) without compatibility shims. Decoupled scale_study.py from run_docker_benchmark.py by inlining runner utilities directly; verified supported partitioned control plane (scale_study.py, partitioned_report.py).
-
-* 25. Real Bug Evaluation, Corpus Sourcing & Reducer Competitiveness
-- Empirical finding from real PostgreSQL crash case (`pg_fuzzer_mcv_enhanced.sql`): Ours-Full took 139 oracle calls (129.07s) vs B1's 26 calls (35.54s) and B2's 36 calls (32.68s) for a modest byte advantage (606B vs 620B).
-- Competitiveness gap: In small/medium real crash scripts, lack of high-level dependency pruning coupled with conservative barrier cascading and linear scans causes Occam to lose heavily on latency while demonstrating only marginal byte-level gains.
-
-** DONE [#A] Replace linear prefix scan in `findInterestingPrefix` with binary search / reverse probe
-- In `src/Occam/Reducer.hs:487-502`, replaced $O(N)$ linear scan with $O(\log N)$ binary search probing over statement lists (pure statement-level operation, zero SQL parsing in Haskell). Proved on 21-statement crash sequences that probe overhead drops from 21 calls down to <= 5 calls. Handled edge cases soundly (empty list, 1 statement, arbitrary crash indices, no match). Added unit tests in `test/ReductionChecks.hs`.
-
-** DONE [#A] Defer and gate intra-statement AST rewrites as developer opt-in (AST 退化之后再考虑)
-- As directed by user (\"AST重写是否有必要, 目前看起来没有什么收益, 让开发者自己选择开启是否会更合适一点\"), configured `reductionIntraStatement = False` by default in `src/Occam/Reducer.hs` and `app/Main.hs`.
-- Intra-statement AST surgery (clause deletion, expression simplification) is now opt-in via `--intra-statement`. Default Occam runs and primary benchmarks focus on fast, high-impact statement-level minimization (backward slicing, closure search, ddmin, and statement audit).
-- Avoids 70+ oracle invocations and ~60s of DB restarts on micro-syntax edits that only yield trivial byte differences (e.g. 14 bytes on pg_fuzzer_mcv).
-
-** DONE [#A] Upstream Parser Alignment & Clean Out-of-the-Box Statement Handling (NO fallbacks)
-- Architectural rule strictly enforced: Zero SQL parsing in Haskell; Haskell graph engine remains dialect-agnostic.
-- User directive: \"我们尽量不要做fallback, 留给sqlparser-rs吧, 等上游parser提供足够强的解析\".
-- Reverted all ad-hoc fallback parsers. Unsupported syntax like `CREATE STATISTICS` is handled as an unparsed barrier until upstream `sqlparser-rs` provides native support.
-- Supported statements in `sqlparser-rs` out-of-the-box (e.g., `Statement::Analyze`) are cleanly wired in `rust/sqlparser-ffi/src/actions.rs` to emit relation-level read facts and relation-scoped barriers instead of opaque global barriers. Documented with `// NOTE:` linking to official PostgreSQL documentation.
-
-** TODO [#B] Implement `Dockerfile.target-mysql` for MySQL 8.0 Debug verification
-- Provide `harness/Dockerfile.target-mysql` with `-DWITH_DEBUG=1` to reproduce and reduce `benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql`.
-- Complete the thesis mandate of supporting and empirically validating on >= 2 target DBMS engines (PostgreSQL and MySQL).
+** DONE 语义依赖分析与层级规约引擎
+- 基于 Rust =sqlparser-rs= 提取类型化事实并构建跨语句依赖 DAG。
+- 实现四级分层规约：后向切片 -> 闭包级 ddmin -> 语句审计 -> 无约束兜底。
+- 实现候选查询哈希记忆化（Memoization）与状态重置解耦。
