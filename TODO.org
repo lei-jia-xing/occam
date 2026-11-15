@@ -13,6 +13,12 @@
 - 绘制 Oracle 调用次数、耗时加速比及缓存命中率柱状对比图。
 
 * 已完成里程碑 (Completed)
+** DONE 开发者友好现代 CLI 与 Unix-Native 进度呈现 [2026-11]
+- 引入 Hackage 标准库 =terminal-progress-bar= 与 =ansi-terminal=，坚决杜绝手写 ANSI 终端转义序列。
+- 全面遵循 Unix I/O 规范：诊断日志、动态进度条与总结严格走 stderr，管道重定向或 -o - 时 stdout 输出纯净规约 SQL。
+- 移除所有 ====== 与 ------ 冗余字符 banner，交互式 TTY 下呈现单行动态进度条，非 TTY 下输出清晰离散里程碑。
+- 支持从标准输入（-）读取 SQL，格式化及所有前置检查全部通过。
+
 ** DONE 构建 MySQL 8.0 Debug 测试容器与真实用例验证 [2026-11]
 - 编写 =harness/Dockerfile.target-mysql=（基于原生 Ubuntu 18.04 编译环境，带 =-DWITH_DEBUG=1=）并配置健康检查与自动拉起 Supervisor。
 - 编写 =scripts/run_real_benchmarks.py= 运行 =occam-eval= 全自动对比基准评测。

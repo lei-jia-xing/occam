@@ -10,16 +10,14 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
-import Numeric (showFFloat)
 import Occam qualified
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationResult (..),
     EvaluationStatus (..),
-    evaluationStatusName,
     parseSQLDialect,
-    runEvaluatedReduction,
+    runEvaluatedReductionWithProgress,
     sqlDialectName,
  )
 import Occam.Logger (
@@ -42,6 +40,11 @@ import Occam.Reducer (
     ReductionConfig (..),
     defaultReductionConfig,
     reduceSQLWithConfig,
+ )
+import Occam.UI (
+    UI (..),
+    UIConfig (..),
+    newUI,
  )
 import Options.Applicative (
     Parser,
@@ -75,7 +78,7 @@ import System.Directory (
  )
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
+import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
 data Options = Options
@@ -132,7 +135,7 @@ optionsParser =
     Options
         <$> strArgument
             ( metavar "INPUT.sql"
-                <> help "Path to fuzz SQL input, including schema and setup statements"
+                <> help "Path to fuzz SQL input, or '-' for stdin"
             )
         <*> strOption
             ( long "oracle"
@@ -141,10 +144,11 @@ optionsParser =
             )
         <*> strOption
             ( long "out"
+                <> short 'o'
                 <> metavar "DIR"
                 <> value "occam-out"
                 <> showDefault
-                <> help "Directory where reduced artifacts will be written"
+                <> help "Directory where reduced artifacts will be written, or '-' for stdout"
             )
         <*> optional
             ( strOption
@@ -268,7 +272,8 @@ runOccam opts@Options {..} = do
     let effectiveLevel
             | optQuiet = LevelError
             | optVerbose = LevelDebug
-            | otherwise = optLogLevel
+            | optLogFormat == FormatJSON = optLogLevel
+            | otherwise = LevelWarn
         effectiveFormat = optLogFormat
         logCfg =
             LogConfig
@@ -294,31 +299,32 @@ runOccamWithLogger logger Options {..} = do
         hPutStrLn stderr "Error: timeout, budget, and execution limits must be positive"
         exitFailure
 
-    fileExists <- doesFileExist optInputFile
-    unless fileExists do
-        logError logger "occam::cli" ("Error: Input file not found: " <> T.pack optInputFile)
-        hPutStrLn stderr ("Error: Input file not found: " ++ optInputFile)
-        exitFailure
+    initialSQL <-
+        if optInputFile == "-"
+            then BS.getContents
+            else do
+                fileExists <- doesFileExist optInputFile
+                unless fileExists do
+                    let msg = "cannot open '" ++ optInputFile ++ "': No such file or directory"
+                    logError logger "occam::cli" (T.pack msg)
+                    hPutStrLn stderr ("occam: error: " ++ msg)
+                    exitFailure
+                BS.readFile optInputFile
 
-    initialSQL <- BS.readFile optInputFile
     initialStmts <- countStatementsForCLI logger dialect initialSQL
     let initialBytes = BS.length initialSQL
 
-    when (not optQuiet && optLogFormat == FormatText) do
-        putStrLn "======================================================================"
-        putStrLn $ "Occam v" ++ Occam.version ++ " starting reduction"
-        putStrLn "======================================================================"
-        putStrLn $
-            "  Target SQL:   "
-                ++ optInputFile
-                ++ " ("
-                ++ show initialBytes
-                ++ " bytes, "
-                ++ show initialStmts
-                ++ " statements)"
-        putStrLn $ "  Oracle Cmd:   " ++ optOracleCmd
-        putStrLn $ "  Artifact Dir: " ++ optOutDir
-        putStrLn "----------------------------------------------------------------------"
+    ui <-
+        newUI
+            UIConfig
+                { uiTargetFile = optInputFile
+                , uiInitialBytes = initialBytes
+                , uiInitialStmts = initialStmts
+                , uiDialect = sqlDialectName dialect
+                , uiQuiet = optQuiet
+                , uiVerbose = optVerbose || optLogLevel == LevelDebug
+                , uiUseColor = True
+                }
 
     let baseOracleConfig =
             OracleConfig
@@ -360,10 +366,11 @@ runOccamWithLogger logger Options {..} = do
             (prepareOracle baseOracleConfig initialSQL)
     preflightDetails <- case prepared of
         Nothing -> do
-            hPutStrLn stderr "Error: Initial predicate check exceeded the total budget"
+            hPutStrLn stderr "occam: error: initial predicate check exceeded the total budget"
             exitFailure
         Just (Left err) -> do
-            hPutStrLn stderr ("Error: " ++ T.unpack err)
+            hPutStrLn stderr ("occam: error: initial predicate check failed: " ++ T.unpack err)
+            hPutStrLn stderr "occam: note: oracle command rejected the original unreduced SQL input"
             exitFailure
         Just (Right details) -> pure details
     preflightEnd <- toInteger <$> getMonotonicTimeNSec
@@ -381,20 +388,24 @@ runOccamWithLogger logger Options {..} = do
                 }
     logInfo logger "occam::oracle" "Initial predicate check passed"
 
-    createDirectoryIfMissing True optOutDir
+    let writeToStdout = optOutDir == "-"
+        minimalPath = if writeToStdout then "" else optOutDir </> "minimal.sql"
+        statsPath = if writeToStdout then "" else optOutDir </> "stats.json"
+        checkpointPath = if writeToStdout then "/tmp/occam-checkpoint.sql" else minimalPath
 
-    let minimalPath = optOutDir </> "minimal.sql"
+    unless writeToStdout (createDirectoryIfMissing True optOutDir)
     logInfo logger "occam::reducer" "Running hierarchical reduction engine..."
 
     result <-
-        runEvaluatedReduction
+        runEvaluatedReductionWithProgress
+            (uiOnProgress ui)
             budgetConfig
             dialect
             oracleCfg
             (Just (detailedObservation preflightDetails))
             logger
             initialSQL
-            minimalPath
+            checkpointPath
             (\reducerLogger oracle -> reduceSQLWithConfig reductionConfig reducerLogger oracle initialSQL)
     let reducedSQL = evaluatedSQL result
         evaluation = evaluationMetrics result
@@ -412,7 +423,6 @@ runOccamWithLogger logger Options {..} = do
                 then (1.0 - (fromIntegral reducedBytes / fromIntegral initialBytes :: Double)) * 100.0
                 else 0.0
         initialOracleSeconds = realToFrac (diffUTCTime initialEnd initialStart)
-        statsPath = optOutDir </> "stats.json"
         totalOracleExecutions =
             evaluationPreflightAttempts budgetConfig
                 + evaluationDatabaseObservations evaluation
@@ -443,8 +453,14 @@ runOccamWithLogger logger Options {..} = do
                 , initial_oracle_seconds = initialOracleSeconds
                 , elapsed_seconds = evaluationTotalSeconds evaluation
                 }
-    BS.writeFile minimalPath reducedSQL
-    BSL.writeFile statsPath (encode stats)
+    unless writeToStdout do
+        BS.writeFile minimalPath reducedSQL
+        BSL.writeFile statsPath (encode stats)
+
+    isStdoutTTY <- hIsTerminalDevice stdout
+    when (writeToStdout || not isStdoutTTY) do
+        BS.putStr reducedSQL
+        hFlush stdout
 
     logInfo'
         logger
@@ -461,30 +477,7 @@ runOccamWithLogger logger Options {..} = do
         , ("elapsed_seconds", toJSON (evaluationTotalSeconds evaluation))
         ]
 
-    when (not optQuiet && optLogFormat == FormatText) do
-        putStrLn "----------------------------------------------------------------------"
-        putStrLn "Reduction Finished"
-        putStrLn "======================================================================"
-        putStrLn "Occam Reduction Summary"
-        putStrLn "======================================================================"
-        putStrLn $ "  Status:       " ++ T.unpack (evaluationStatusName (evaluationStatus evaluation))
-        putStrLn $ "  Statements:   " ++ show initialStmts ++ " -> " ++ show reducedStmts
-        putStrLn $
-            "  Bytes:        "
-                ++ show initialBytes
-                ++ " B -> "
-                ++ show reducedBytes
-                ++ " B (-"
-                ++ showFFloat (Just 1) ratio "%"
-                ++ ")"
-        putStrLn $ "  DB Observes:  " ++ show totalOracleExecutions
-        putStrLn $ "  Cache Hits:   " ++ show totalHits
-        putStrLn $ "  Cache Misses: " ++ show totalMisses
-        putStrLn $ "  Hit Ratio:    " ++ showFFloat (Just 1) (hitRatio * 100.0) "%"
-        putStrLn $ "  Elapsed Time: " ++ showFFloat (Just 3) (evaluationTotalSeconds evaluation) "s"
-        putStrLn $ "  Artifacts:    " ++ minimalPath
-        putStrLn $ "                " ++ statsPath
-        putStrLn "======================================================================"
+    uiFinish ui evaluation initialBytes reducedBytes initialStmts reducedStmts minimalPath statsPath
     unless
         (evaluationStatus evaluation == EvaluationCompleted && evaluationValidationPassed evaluation)
         exitFailure
@@ -504,7 +497,7 @@ countStatementsForCLI logger dialect sql = do
         Left err -> do
             let message = "SQL parser failed while counting statements: " <> T.pack (show err)
             logError logger "occam::parser" message
-            hPutStrLn stderr ("Error: " ++ T.unpack message)
+            hPutStrLn stderr ("occam: error: " ++ T.unpack message)
             exitFailure
         Right count -> pure count
 

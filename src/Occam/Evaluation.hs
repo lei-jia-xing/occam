@@ -2,6 +2,7 @@ module Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationPoint (..),
+    EvaluationProgress (..),
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
@@ -10,6 +11,7 @@ module Occam.Evaluation (
     parseSQLDialect,
     sqlDialectName,
     runEvaluatedReduction,
+    runEvaluatedReductionWithProgress,
 ) where
 
 import Control.Exception (
@@ -104,6 +106,12 @@ instance ToJSON EvaluationStatus where
 instance FromJSON EvaluationStatus where
     parseJSON = withText "EvaluationStatus" \name ->
         maybe (fail ("unknown evaluation status: " <> T.unpack name)) pure (parseEvaluationStatusName name)
+
+data EvaluationProgress
+    = ProgressStage !Text
+    | ProgressCandidateTested !Int !Bool !Bool
+    | ProgressCandidateAccepted !Int !(Maybe Int)
+    deriving (Eq, Show)
 
 data MinimalityClaim
     = StatementDeletionOneMinimal
@@ -260,7 +268,20 @@ runEvaluatedReduction ::
     FilePath ->
     ReductionAction ->
     IO EvaluationResult
-runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
+runEvaluatedReduction = runEvaluatedReductionWithProgress (\_ -> pure ())
+
+runEvaluatedReductionWithProgress ::
+    (EvaluationProgress -> IO ()) ->
+    EvaluationConfig ->
+    SQLDialect ->
+    OracleConfig ->
+    Maybe OracleObservation ->
+    Logger ->
+    ByteString ->
+    FilePath ->
+    ReductionAction ->
+    IO EvaluationResult
+runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
     startedAt <- ticks
     let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
         totalStart = startedAt - preflightMicros * 1000
@@ -393,7 +414,11 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
                             Left _ -> Nothing
                             Right count -> Just count
                     else pure Nothing
-            when (persistCheckpoint && accepted) $ checkpointIfSmaller acceptedRef checkpoint candidate
+            onProgress (ProgressCandidateTested (callIndex + 1) hit accepted)
+            when (persistCheckpoint && accepted) $ do
+                smaller <- checkpointIfSmaller acceptedRef checkpoint candidate
+                when smaller $
+                    onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
             now <- ticks
             modifyIORef' curveRef \points ->
                 EvaluationPoint
@@ -411,6 +436,13 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
             parentLogger
                 { loggerAction = \level component message metadata -> do
                     modifyIORef' stagesRef (event level component message metadata :)
+                    case message of
+                        "Starting reduction iteration" -> onProgress (ProgressStage "slicing")
+                        "Finished backward-slicing" -> onProgress (ProgressStage "closure")
+                        "Finished closure-search" -> onProgress (ProgressStage "ddmin")
+                        "Finished unrestricted-fallback" -> onProgress (ProgressStage "audit")
+                        "Statement deletion audit reached a fixed point" -> onProgress (ProgressStage "audit")
+                        _ -> pure ()
                     loggerAction parentLogger level component message metadata
                 }
         runAction = do
@@ -626,11 +658,14 @@ runEvaluatedReduction config dialect oracleCfg preflightObservation parentLogger
 
         checkpointIfSmaller acceptedRef path candidate = do
             current <- readIORef acceptedRef
-            when (BS.length candidate < BS.length current) do
-                let temporary = path ++ ".tmp"
-                BS.writeFile temporary candidate
-                renameFile temporary path
-                writeIORef acceptedRef candidate
+            if BS.length candidate < BS.length current
+                then do
+                    let temporary = path ++ ".tmp"
+                    BS.writeFile temporary candidate
+                    renameFile temporary path
+                    writeIORef acceptedRef candidate
+                    pure True
+                else pure False
 
 event :: (Show a) => a -> Text -> Text -> [(Text, Value)] -> Value
 event level component message metadata =

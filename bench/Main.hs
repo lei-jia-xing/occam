@@ -243,19 +243,7 @@ runEvalWithLogger logger Options {..} = do
         failWith $ "Error: Input file does not exist: " ++ optInputFile
     initialSQL <- BS.readFile optInputFile
     when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
-        putStrLn "======================================================================"
-        putStrLn ("Occam-Eval v" ++ Occam.version ++ " - Internal Profile Worker")
-        putStrLn $ "  Input SQL:      " ++ optInputFile
-        putStrLn $ "  Output Dir:     " ++ optOutDir
-        putStrLn $ "  Oracle Command: " ++ optOracleCmd
-        case optResetCmd of
-            Just reset -> putStrLn $ "  Reset Command:  " ++ reset
-            Nothing -> pure ()
-        putStrLn $ "  Timeout:        " ++ show optTimeoutSecs ++ "s per oracle call"
-        case optBudgetSecs of
-            Just budget -> putStrLn $ "  Total Budget:   " ++ show budget ++ "s per profile"
-            Nothing -> pure ()
-        putStrLn "======================================================================"
+        putStrLn ("occam-eval: profiling " ++ optInputFile ++ " -> " ++ optOutDir)
 
     let baseOracleConfig =
             OracleConfig
@@ -323,18 +311,8 @@ runEvalWithLogger logger Options {..} = do
         "Internal profile result written"
         [("out_file", toJSON (optOutDir </> "benchmark.json"))]
 
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
-        putStrLn "----------------------------------------------------------------------"
-        putStrLn "Internal Profile Result"
-        putStrLn "======================================================================"
-        putStrLn "Internal Profile Metrics (JSON)"
-        putStrLn "======================================================================"
     BSL.putStr jsonData
     putStrLn ""
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
-        putStrLn "======================================================================"
-        putStrLn $ "  Artifact: " ++ (optOutDir </> "benchmark.json")
-        putStrLn "======================================================================"
     unless (completedAndValidated metric) $
         failWith "Error: selected profile did not complete repeated target validation"
 
