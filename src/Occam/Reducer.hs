@@ -102,7 +102,7 @@ defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
         , reductionClosure = True
-        , reductionIntraStatement = True
+        , reductionIntraStatement = False
         , reductionUnrestricted = True
         , reductionDialect = defaultSQLDialect
         }

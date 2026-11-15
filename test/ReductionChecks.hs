@@ -106,7 +106,8 @@ tests =
                 oracle =
                     predicateOracle
                         (\candidate -> BSC.isInfixOf "42" candidate && BSC.isInfixOf "CREATE TABLE t" candidate)
-            reduced <- reduceSQL GenericSQL oracle sql
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger oracle sql
             assertBool "strips table constraint" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
@@ -122,7 +123,8 @@ tests =
                         ]
                 oracle =
                     predicateOracle (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)
-            reduced <- reduceSQL GenericSQL oracle sql
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger oracle sql
             assertBool "keeps main table" (BSC.isInfixOf "main_tbl" reduced)
             assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
             assertBool "eliminates helper table via interleaved audit" (not (BSC.isInfixOf "helper" reduced))

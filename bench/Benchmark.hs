@@ -112,7 +112,7 @@ runProfileBenchmark ::
 runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql outDir = do
     initialStmts <- countStatementsOrFail dialect sql
     let cacheEnabled = profileCacheEnabled profile
-        baseConfig = defaultReductionConfig {reductionDialect = dialect}
+        baseConfig = defaultReductionConfig {reductionDialect = dialect, reductionIntraStatement = True}
         config = case profile of
             NoSlicing -> baseConfig {reductionSlicing = False}
             NoClosure -> baseConfig {reductionClosure = False}
@@ -130,6 +130,7 @@ runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql out
                 baseConfig
                     { reductionSlicing = False
                     , reductionClosure = False
+                    , reductionIntraStatement = True
                     , reductionUnrestricted = False
                     }
             _ -> baseConfig

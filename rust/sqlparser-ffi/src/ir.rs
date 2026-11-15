@@ -629,14 +629,14 @@ pub enum TxEffect {
     SetReadOnly { value: bool },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ScopedBarrier {
     pub scope: BarrierScope,
     pub reason: BarrierReason,
     pub detail: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum BarrierScope {
     Global,
@@ -647,7 +647,7 @@ pub enum BarrierScope {
     TransactionState,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "object", rename_all = "snake_case")]
 pub enum ObjectRef {
     Relation { relation: NameRef },

@@ -237,23 +237,16 @@
 ** DONE [#A] Replace linear prefix scan in `findInterestingPrefix` with binary search / reverse probe
 - In `src/Occam/Reducer.hs:487-502`, replaced $O(N)$ linear scan with $O(\log N)$ binary search probing over statement lists (pure statement-level operation, zero SQL parsing in Haskell). Proved on 21-statement crash sequences that probe overhead drops from 21 calls down to <= 5 calls. Handled edge cases soundly (empty list, 1 statement, arbitrary crash indices, no match). Added unit tests in `test/ReductionChecks.hs`.
 
-** TODO [#A] De-escalate unsupported DDL in frontend (DO NOT parse SQL in Haskell)
-- Architectural rule: Haskell graph engine must remain dialect-agnostic; absolutely DO NOT perform ad-hoc SQL parsing or token extraction in Haskell.
-- Any syntax extensions (e.g. `CREATE STATISTICS` in PostgreSQL) belong strictly in `rust/sqlparser-ffi` or Tree-sitter C bindings.
-- In `src/Occam/Dependency.hs`, ensure unparsed statements maintain sound barrier semantics without contaminating Haskell with SQL dialect lexers.
+** DONE [#A] Defer and gate intra-statement AST rewrites as developer opt-in (AST 退化之后再考虑)
+- As directed by user (\"AST重写是否有必要, 目前看起来没有什么收益, 让开发者自己选择开启是否会更合适一点\"), configured `reductionIntraStatement = False` by default in `src/Occam/Reducer.hs` and `app/Main.hs`.
+- Intra-statement AST surgery (clause deletion, expression simplification) is now opt-in via `--intra-statement`. Default Occam runs and primary benchmarks focus on fast, high-impact statement-level minimization (backward slicing, closure search, ddmin, and statement audit).
+- Avoids 70+ oracle invocations and ~60s of DB restarts on micro-syntax edits that only yield trivial byte differences (e.g. 14 bytes on pg_fuzzer_mcv).
 
-** TODO [#B] Establish public DBMS fuzz bug collection pipeline
-- Sources identified for authentic multi-statement crash cases:
-  1. `sqlancer/sqlancer` official `BUGS.md` and issue tracker (>500 real bugs with reproducers across PG, MySQL, SQLite, DuckDB).
-  2. Google `OSS-Fuzz` issue tracker (thousands of fuzz-discovered ASan crash testcases for SQLite3, PostgreSQL, DuckDB, ClickHouse).
-  3. `bugs.mysql.com` (filtered by Crash / Assertion failure / Fuzzer tags; e.g., Roel Van de Paar reports).
-  4. PostgreSQL `pgsql-bugs` and `pgsql-hackers` archive threads (filtered by `FailedAssertion`).
-  5. Beihang WingTecher lab internal SQUIRREL / Griffin raw crash directory (`output/crashes/`).
-- Build an automated scraper/converter to generate standardized `.sql` and `.meta.json` bundles with 5-replay verification.
-
-** TODO [#B] Defer intra-statement AST rewrites until statement-level degeneration (AST 退化之后再考虑)
-- Focus primary reduction budget and competitive speed comparisons strictly on statement-level minimization (backward slicing, closure search, ddmin, and statement audit).
-- Intra-statement AST surgery (clause deletion, expression simplification) is deferred until after statement-level reduction reaches a fixed-point / degenerates, avoiding premature micro-edits that waste dozens of oracle calls.
+** DONE [#A] Upstream Parser Alignment & Clean Out-of-the-Box Statement Handling (NO fallbacks)
+- Architectural rule strictly enforced: Zero SQL parsing in Haskell; Haskell graph engine remains dialect-agnostic.
+- User directive: \"我们尽量不要做fallback, 留给sqlparser-rs吧, 等上游parser提供足够强的解析\".
+- Reverted all ad-hoc fallback parsers. Unsupported syntax like `CREATE STATISTICS` is handled as an unparsed barrier until upstream `sqlparser-rs` provides native support.
+- Supported statements in `sqlparser-rs` out-of-the-box (e.g., `Statement::Analyze`) are cleanly wired in `rust/sqlparser-ffi/src/actions.rs` to emit relation-level read facts and relation-scoped barriers instead of opaque global barriers. Documented with `// NOTE:` linking to official PostgreSQL documentation.
 
 ** TODO [#B] Implement `Dockerfile.target-mysql` for MySQL 8.0 Debug verification
 - Provide `harness/Dockerfile.target-mysql` with `-DWITH_DEBUG=1` to reproduce and reduce `benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql`.

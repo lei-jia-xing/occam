@@ -38,6 +38,7 @@ import Occam.Core (
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
+import Occam.Logger (nullLogger)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
 import Occam.Reducer
 import Occam.Slicer
@@ -134,7 +135,8 @@ phase3Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT" sql && BSC.isInfixOf "WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-            reduced <- reduceSQL GenericSQL oracle script
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger oracle script
             ok <- oracleAccepts oracle reduced
             assertBool "Reduced SQL failed to satisfy the crash oracle" ok
             assertBool "Table t2 was not pruned" (not (BSC.isInfixOf "t2" reduced))

@@ -2818,6 +2818,8 @@ pub(super) fn analyze_statement(
             merge_nested(&mut facts, nested, context);
         }
         Statement::CreateTable(create) => {
+            // NOTE: PostgreSQL `CREATE TABLE` manual: https://www.postgresql.org/docs/current/sql-createtable.html
+            // MySQL `CREATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/create-table.html
             if create
                 .inherits
                 .as_ref()
@@ -2904,6 +2906,8 @@ pub(super) fn analyze_statement(
             merge_nested(&mut facts, nested, context);
         }
         Statement::CreateView(create) => {
+            // NOTE: PostgreSQL `CREATE VIEW` manual: https://www.postgresql.org/docs/current/sql-createview.html
+            // MySQL `CREATE VIEW` manual: https://dev.mysql.com/doc/refman/8.0/en/create-view.html
             let excluded = [create.name.span()];
             // Defining a plain view only binds its source columns; it does not
             // read source rows. Materialized views execute the query eagerly,
@@ -2962,6 +2966,8 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::CreateIndex(create) => {
+            // NOTE: PostgreSQL `CREATE INDEX` manual: https://www.postgresql.org/docs/current/sql-createindex.html
+            // MySQL `CREATE INDEX` manual: https://dev.mysql.com/doc/refman/8.0/en/create-index.html
             let table = relation_ref(&create.table_name, dialect, rules);
             let index_name = create
                 .name
@@ -2996,6 +3002,8 @@ pub(super) fn analyze_statement(
             add_unmodeled_barriers(&mut facts, &visitor, &[create.table_name.span()]);
         }
         Statement::CreateTrigger(create) => {
+            // NOTE: PostgreSQL `CREATE TRIGGER` manual: https://www.postgresql.org/docs/current/sql-createtrigger.html
+            // MySQL `CREATE TRIGGER` manual: https://dev.mysql.com/doc/refman/8.0/en/create-trigger.html
             let table = relation_ref(&create.table_name, dialect, rules);
             let trigger_name = name_from_object(&create.name, rules, ir::IdentifierClass::Other);
             match (trigger_name, table) {
@@ -3056,6 +3064,8 @@ pub(super) fn analyze_statement(
             table,
             ..
         } => {
+            // NOTE: PostgreSQL `DROP` manual: https://www.postgresql.org/docs/current/sql-droptable.html
+            // MySQL `DROP TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/drop-table.html
             let mut objects = Vec::new();
             let mut failed = false;
             for name in names {
@@ -3084,6 +3094,8 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::AlterTable(alter) => {
+            // NOTE: PostgreSQL `ALTER TABLE` manual: https://www.postgresql.org/docs/current/sql-altertable.html
+            // MySQL `ALTER TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/alter-table.html
             if let Some(table) = relation_ref(&alter.name, dialect, rules) {
                 let mut changes = Vec::new();
                 let mut ops = Vec::new();
@@ -3388,6 +3400,8 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::Truncate(truncate) => {
+            // NOTE: PostgreSQL `TRUNCATE` manual: https://www.postgresql.org/docs/current/sql-truncate.html
+            // MySQL `TRUNCATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/truncate-table.html
             if truncate.table_names.is_empty() {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownTruncate,
@@ -3470,6 +3484,8 @@ pub(super) fn analyze_statement(
         Statement::StartTransaction {
             statements, modes, ..
         } => {
+            // NOTE: PostgreSQL `BEGIN` manual: https://www.postgresql.org/docs/current/sql-begin.html
+            // MySQL `START TRANSACTION` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
             if statements.is_empty() {
                 if !modes.is_empty() {
                     for mode in modes {
@@ -3511,6 +3527,8 @@ pub(super) fn analyze_statement(
             end,
             modifier,
         } => {
+            // NOTE: PostgreSQL `COMMIT` manual: https://www.postgresql.org/docs/current/sql-commit.html
+            // MySQL `COMMIT` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
             // `END` is a synonym for `COMMIT` in PostgreSQL and SQLite. It is
             // only a block terminator for the T-SQL `END TRY`/`END CATCH`
             // forms, which the parser marks with a modifier.
@@ -3523,19 +3541,23 @@ pub(super) fn analyze_statement(
                 facts.post_tx.push(ir::TxEffect::Commit { chain: *chain });
             }
         }
-        Statement::Rollback { chain, savepoint } => match savepoint {
-            Some(savepoint) => facts.post_tx.push(ir::TxEffect::RollbackTo {
-                savepoint: canonical_ident(savepoint, rules, ir::IdentifierClass::Other),
-            }),
-            None => {
-                facts.post_tx.push(ir::TxEffect::RollbackAll);
-                if *chain {
-                    facts.post_tx.push(ir::TxEffect::Begin {
-                        if_active: ir::BeginPolicy::Ignore,
-                    });
+        Statement::Rollback { chain, savepoint } => {
+            // NOTE: PostgreSQL `ROLLBACK` manual: https://www.postgresql.org/docs/current/sql-rollback.html
+            // MySQL `ROLLBACK` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
+            match savepoint {
+                Some(savepoint) => facts.post_tx.push(ir::TxEffect::RollbackTo {
+                    savepoint: canonical_ident(savepoint, rules, ir::IdentifierClass::Other),
+                }),
+                None => {
+                    facts.post_tx.push(ir::TxEffect::RollbackAll);
+                    if *chain {
+                        facts.post_tx.push(ir::TxEffect::Begin {
+                            if_active: ir::BeginPolicy::Ignore,
+                        });
+                    }
                 }
             }
-        },
+        }
         Statement::Savepoint { name } => {
             facts.post_tx.push(ir::TxEffect::Savepoint {
                 name: canonical_ident(name, rules, ir::IdentifierClass::Other),
@@ -3602,6 +3624,7 @@ pub(super) fn analyze_statement(
             }
         }
         Statement::RefreshMaterializedView(refresh) => {
+            // NOTE: PostgreSQL `REFRESH MATERIALIZED VIEW` manual: https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html
             if let Some(target) = relation_ref(&refresh.name, dialect, rules) {
                 facts.ops.push(ir::CatalogOp::Refresh(ir::RefreshOp {
                     target,
@@ -3616,6 +3639,35 @@ pub(super) fn analyze_statement(
                     ir::BarrierReason::UnknownView,
                     Some(refresh.name.to_string()),
                 ));
+            }
+        }
+        Statement::Analyze(analyze) => {
+            // NOTE: PostgreSQL `ANALYZE` manual: https://www.postgresql.org/docs/current/sql-analyze.html
+            // `ANALYZE [ ( option [, ...] ) ] [ table_and_columns [, ...] ]`
+            // Collects statistics for the database or the specified table.
+            if let Some(name) = &analyze.table_name {
+                if let Some(target) = relation_ref(name, dialect, rules) {
+                    let cols = analyze
+                        .columns
+                        .iter()
+                        .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                        .collect();
+                    facts.ops.push(ir::CatalogOp::Read(read_fact(
+                        target.clone(),
+                        ir::ReadMode::Data,
+                        cols,
+                    )));
+                    facts.barriers.push(barrier(
+                        ir::BarrierScope::Relation { relation: target },
+                        ir::BarrierReason::UnknownDdl,
+                        Some(format!("ANALYZE on relation {}", name)),
+                    ));
+                } else {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownRelation,
+                        Some(name.to_string()),
+                    ));
+                }
             }
         }
         Statement::CreateDatabase {

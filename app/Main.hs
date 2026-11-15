@@ -208,7 +208,7 @@ reductionOptionsParser =
     ReductionOptions
         <$> toggle True "slicing" "no-slicing" "dependency slicing"
         <*> toggle True "closure" "no-closure" "dependency closure"
-        <*> toggle True "intra-statement" "no-intra-statement" "intra-statement reductions"
+        <*> toggle False "intra-statement" "no-intra-statement" "intra-statement reductions"
         <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
         <*> toggle True "cache" "no-cache" "candidate caching"
         <*> option

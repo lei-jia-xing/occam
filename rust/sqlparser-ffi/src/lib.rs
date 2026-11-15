@@ -2297,4 +2297,37 @@ mod tests {
             vec!["t".to_string(), "t".to_string(), "t".to_string()]
         );
     }
+
+    #[test]
+    fn postgres_analyze_table_extracts_relation_and_columns() {
+        // NOTE: PostgreSQL `ANALYZE` manual: https://www.postgresql.org/docs/current/sql-analyze.html
+        let sql = "ANALYZE t0 (c0, c2);";
+        let units = parse(sql, DialectKind::PostgreSql).unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].parse_error.is_none());
+        let facts = units[0].facts.as_ref().expect("expected facts for ANALYZE");
+        assert_eq!(facts.barriers.len(), 1);
+        assert_eq!(
+            facts.barriers[0].scope,
+            ir::BarrierScope::Relation {
+                relation: ir::NameRef {
+                    name: ir::Name(vec![ir::Ident("t0".to_string())]),
+                    temp: false,
+                }
+            }
+        );
+        if let ir::CatalogOp::Read(read) = &facts.ops[0] {
+            assert_eq!(name_text(&read.source.name), "t0");
+            let cols: Vec<String> = read.columns.iter().map(|c| c.0.clone()).collect();
+            assert_eq!(cols, vec!["c0".to_string(), "c2".to_string()]);
+        } else {
+            panic!("expected CatalogOp::Read");
+        }
+
+        // Bare ANALYZE; has no parse error
+        let sql_bare = "ANALYZE;";
+        let units_bare = parse(sql_bare, DialectKind::PostgreSql).unwrap();
+        assert_eq!(units_bare.len(), 1);
+        assert!(units_bare[0].parse_error.is_none());
+    }
 }
