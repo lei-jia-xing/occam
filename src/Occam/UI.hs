@@ -1,14 +1,3 @@
-{- |
-Module      : Occam.UI
-Description : Pragmatic, Unix-native terminal progress and summary rendering
-License     : MIT
-Maintainer  : leij49456@gmail.com
-
-Provides single-line dynamic progress rendering on interactive terminals (TTY)
-using standard 'terminal-progress-bar' and 'ansi-terminal' libraries, and discrete
-milestone reporting when redirected or in non-TTY environments.
-All diagnostics strictly write to stderr, keeping stdout clean for pipeline composability.
--}
 module Occam.UI (
     UIConfig (..),
     UI (..),
