@@ -34,7 +34,7 @@
 - Formatted structured metadata (`.meta.json`), deterministic crash assertions, and noise-enhanced multi-table stress variants.
 
 ** DONE Algorithmic complexity reduction & binary prefix search [2026-11]
-- Replaced linear prefix scan in `findInterestingPrefix` with $O(\log N)$ binary search, reducing probe calls from $N$ to $\le 5$.
+- `findInterestingPrefix` uses $O(\log N)$ binary prefix probes (at most 5 for the tested 21-statement scripts). Finding the earliest accepted prefix requires a monotone predicate; arbitrary predicates receive a heuristic search with oracle-gated candidates.
 - Gated intra-statement AST rewrites as opt-in, reducing oracle calls on real crash scripts by 55.4% (139 -> 62) and achieving >2x wall-clock speedup.
 
 ** DONE Formal verification and theoretical guarantees (Lean 4)

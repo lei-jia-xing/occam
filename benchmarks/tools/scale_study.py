@@ -542,7 +542,7 @@ def prepare(directory, corpus_size):
         raise ValueError(
             "choose an empty study directory; existing evidence is preserved"
         )
-    source = ROOT / "test/golden/fuzz_golden_03_deep_expressions.golden.sql"
+    source = ROOT / "benchmarks/seeds/deep_expression_seed.sql"
     statements = split_sql_statements(source.read_text(), "sqlite")
     setup = "\n".join(statements[:-1]) + "\n"
     groups = {"scale": [], "corpus": [], "profiles": [], "resets": []}

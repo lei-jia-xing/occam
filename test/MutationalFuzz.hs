@@ -159,6 +159,101 @@ seedPool =
                     && BSC.isInfixOf "tag = 'segv_window'" bs
                 )
         }
+    , SeedScenario
+        { seedName = "cte_hierarchical"
+        , seedSQL =
+            BSC.unlines
+                [ "CREATE TABLE employees (emp_id INT PRIMARY KEY, mgr_id INT REFERENCES employees(emp_id), salary NUMERIC);"
+                , "INSERT INTO employees VALUES (1, NULL, 100000), (2, 1, 80000);"
+                , "WITH RECURSIVE org AS ("
+                , "    SELECT emp_id, salary FROM employees WHERE mgr_id IS NULL"
+                , "    UNION ALL"
+                , "    SELECT e.emp_id, e.salary FROM employees e JOIN org o ON e.mgr_id = o.emp_id"
+                , ") SELECT emp_id, salary FROM org WHERE salary >= 80000;"
+                ]
+        , seedOracle = \bs ->
+            pure
+                ( BSC.isInfixOf "CREATE TABLE employees" bs
+                    && BSC.isInfixOf "WITH RECURSIVE org AS" bs
+                    && BSC.isInfixOf "salary >= 80000" bs
+                )
+        }
+    , SeedScenario
+        { seedName = "tx_savepoint_churn"
+        , seedSQL =
+            BSC.unlines
+                [ "CREATE TABLE ledger (acc_id INT PRIMARY KEY, balance NUMERIC);"
+                , "INSERT INTO ledger VALUES (101, 5000);"
+                , "BEGIN;"
+                , "UPDATE ledger SET balance = 4500 WHERE acc_id = 101;"
+                , "SAVEPOINT sp1;"
+                , "UPDATE ledger SET balance = 9999 WHERE acc_id = 101;"
+                , "ROLLBACK TO SAVEPOINT sp1;"
+                , "COMMIT;"
+                , "SELECT acc_id, balance FROM ledger WHERE balance = 4500;"
+                ]
+        , seedOracle = \bs ->
+            pure
+                ( BSC.isInfixOf "CREATE TABLE ledger" bs
+                    && BSC.isInfixOf "SAVEPOINT sp1" bs
+                    && BSC.isInfixOf "ROLLBACK TO SAVEPOINT sp1" bs
+                    && BSC.isInfixOf "balance = 4500" bs
+                )
+        }
+    , SeedScenario
+        { seedName = "deep_expr_polymorphic"
+        , seedSQL =
+            BSC.unlines
+                [ "CREATE TABLE calc_data (id INT PRIMARY KEY, v NUMERIC, flag BOOLEAN);"
+                , "INSERT INTO calc_data VALUES (1, 100.5, TRUE);"
+                , "SELECT id, CASE WHEN flag THEN COALESCE(NULLIF(v * 2, 0), v) ELSE 0 END AS res FROM calc_data WHERE flag = TRUE;"
+                ]
+        , seedOracle = \bs ->
+            pure
+                ( BSC.isInfixOf "CREATE TABLE calc_data" bs
+                    && BSC.isInfixOf "CASE WHEN flag THEN" bs
+                    && BSC.isInfixOf "COALESCE" bs
+                    && BSC.isInfixOf "flag = TRUE" bs
+                )
+        }
+    , SeedScenario
+        { seedName = "diamond_dag"
+        , seedSQL =
+            BSC.unlines
+                [ "CREATE TABLE d_root (rid INT PRIMARY KEY);"
+                , "CREATE TABLE d_left (lid INT PRIMARY KEY, rid INT REFERENCES d_root(rid));"
+                , "CREATE TABLE d_right (jid INT PRIMARY KEY, rid INT REFERENCES d_root(rid));"
+                , "CREATE TABLE d_sink (sid INT PRIMARY KEY, lid INT REFERENCES d_left(lid), jid INT REFERENCES d_right(jid));"
+                , "INSERT INTO d_root VALUES (1);"
+                , "INSERT INTO d_left VALUES (10, 1);"
+                , "INSERT INTO d_right VALUES (100, 1);"
+                , "INSERT INTO d_sink VALUES (1000, 10, 100);"
+                , "SELECT s.sid FROM d_sink s JOIN d_left l ON s.lid = l.lid JOIN d_right r ON s.jid = r.jid WHERE s.sid = 1000;"
+                ]
+        , seedOracle = \bs ->
+            pure
+                ( BSC.isInfixOf "CREATE TABLE d_root" bs
+                    && BSC.isInfixOf "CREATE TABLE d_sink" bs
+                    && BSC.isInfixOf "JOIN d_left" bs
+                    && BSC.isInfixOf "s.sid = 1000" bs
+                )
+        }
+    , SeedScenario
+        { seedName = "upsert_conflict"
+        , seedSQL =
+            BSC.unlines
+                [ "CREATE TABLE stock (item_id INT PRIMARY KEY, qty INT);"
+                , "INSERT INTO stock VALUES (1, 10);"
+                , "INSERT INTO stock VALUES (1, 5) ON CONFLICT (item_id) DO UPDATE SET qty = stock.qty + EXCLUDED.qty;"
+                , "SELECT item_id, qty FROM stock WHERE qty = 15;"
+                ]
+        , seedOracle = \bs ->
+            pure
+                ( BSC.isInfixOf "CREATE TABLE stock" bs
+                    && BSC.isInfixOf "ON CONFLICT (item_id) DO UPDATE" bs
+                    && BSC.isInfixOf "qty = 15" bs
+                )
+        }
     ]
 
 -- ----------------------------------------------------------------------------
@@ -238,7 +333,10 @@ findConditionEnd bs = go 0 False 0
                                         then go (idx + 1) inQuote (parenDepth + 1)
                                         else
                                             if b == 41 -- )
-                                                then go (idx + 1) inQuote (max 0 (parenDepth - 1))
+                                                then
+                                                    if parenDepth == 0
+                                                        then idx
+                                                        else go (idx + 1) inQuote (parenDepth - 1)
                                                 else
                                                     if parenDepth == 0 && (b == 59 || matchesClause idx) -- ;
                                                         then idx
@@ -253,6 +351,9 @@ findConditionEnd bs = go 0 False 0
                     , "HAVING"
                     , "LIMIT"
                     , "WINDOW"
+                    , "UNION"
+                    , "EXCEPT"
+                    , "INTERSECT"
                     ]
 
 -- | Mutator b: Wraps existing WHERE conditions with redundant expressions.

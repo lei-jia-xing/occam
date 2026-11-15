@@ -486,7 +486,9 @@ logAuditStats logger stats =
         , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
         ]
 
--- | Binary search for the first predicate-preserving statement prefix.
+{- | Binary prefix probes. Only monotone predicates guarantee the first accepted
+prefix; arbitrary predicates may have earlier accepted prefixes we never visit.
+-}
 findInterestingPrefix ::
     Oracle -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
 findInterestingPrefix oracle baseSQL statements
