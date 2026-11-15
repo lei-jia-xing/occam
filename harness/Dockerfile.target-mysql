@@ -1,0 +1,76 @@
+# Reproducible target MySQL 8.0 image built with assertion checking (-DWITH_DEBUG=1)
+# and debug symbols on Ubuntu 18.04 for validating Occam reduction on authentic DBMS fuzz crashes.
+FROM ubuntu:18.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MYSQL_DATADIR="/var/lib/mysql"
+ENV MYSQL_LOGDIR="/var/log/mysql"
+
+# Install native system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    libaio1 \
+    libmecab2 \
+    debconf-utils \
+    psmisc \
+    libnuma1 \
+    perl \
+    gosu \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-seed debconf selections for unattended noninteractive package installation
+RUN echo "mysql-community-server mysql-community-server/root-pass password root" | debconf-set-selections && \
+    echo "mysql-community-server mysql-community-server/re-root-pass password root" | debconf-set-selections && \
+    echo "mysql-community-server mysql-community-server/root-pass seen true" | debconf-set-selections && \
+    echo "mysql-community-server mysql-community-server/re-root-pass seen true" | debconf-set-selections
+
+# Download and install official MySQL Community Server 8.0.20 deb bundle with debug binaries
+ARG MYSQL_BUNDLE_URL=https://cdn.mysql.com/archives/mysql-8.0/mysql-server_8.0.20-1ubuntu18.04_amd64.deb-bundle.tar
+
+RUN mkdir -p /tmp/mysql-debs && \
+    cd /tmp/mysql-debs && \
+    curl -sSL "${MYSQL_BUNDLE_URL}" | tar -xf - && \
+    dpkg -i mysql-common_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i libmysqlclient21_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-community-client-core_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-community-client_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-client_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-community-server-core_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-community-server_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-server_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-community-server-debug_8.0.20-1ubuntu18.04_amd64.deb && \
+    cd / && \
+    rm -rf /tmp/mysql-debs
+
+# Set up runtime directories
+RUN mkdir -p "${MYSQL_DATADIR}" "${MYSQL_LOGDIR}" /var/run/mysqld && \
+    chown -R mysql:mysql "${MYSQL_DATADIR}" "${MYSQL_LOGDIR}" /var/run/mysqld && \
+    chmod 777 /var/run/mysqld
+
+# Initialize database cluster and bootstrap occam_test & template_occam databases
+RUN rm -rf "${MYSQL_DATADIR:?}"/* && \
+    mysqld-debug --initialize-insecure --user=mysql --datadir="${MYSQL_DATADIR}" && \
+    mysqld-debug --user=mysql --datadir="${MYSQL_DATADIR}" --log-error="${MYSQL_LOGDIR}/bootstrap.log" --daemonize && \
+    for i in $(seq 1 30); do \
+        if mysqladmin ping -u root --silent 2>/dev/null; then break; fi; \
+        sleep 0.5; \
+    done && \
+    mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '';" && \
+    mysql -u root -e "CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '';" && \
+    mysql -u root -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;" && \
+    mysql -u root -e "CREATE DATABASE IF NOT EXISTS template_occam;" && \
+    mysql -u root -e "CREATE DATABASE IF NOT EXISTS occam_test;" && \
+    mysql -u root -e "FLUSH PRIVILEGES;" && \
+    mysqladmin -u root shutdown && \
+    rm -f "${MYSQL_LOGDIR}/bootstrap.log" && \
+    cp -a "${MYSQL_DATADIR}" /var/lib/mysql_template
+
+EXPOSE 3306
+
+COPY harness/entrypoint_target_mysql.sh /usr/local/bin/entrypoint_target_mysql.sh
+RUN chmod +x /usr/local/bin/entrypoint_target_mysql.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_target_mysql.sh"]
+CMD ["mysqld-debug"]

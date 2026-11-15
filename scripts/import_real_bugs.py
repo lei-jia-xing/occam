@@ -15,8 +15,6 @@ Outputs standardized pairs into benchmarks/real_fuzz_corpus/:
 
 import argparse
 import json
-import os
-import sys
 from pathlib import Path
 
 CURATED_CORPUS = [

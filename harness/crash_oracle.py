@@ -92,6 +92,7 @@ def get_container_log_offset(container_name, internal_log="/var/log/postgresql/p
 
 
 def read_container_logs(container_name, since_iso, log_offset=0, internal_log="/var/log/postgresql/postgresql.log"):
+    file_log = ""
     if log_offset >= 0:
         try:
             cmd = ["docker", "exec", container_name, "tail", "-c", f"+{log_offset + 1}", internal_log]
@@ -103,10 +104,11 @@ def read_container_logs(container_name, since_iso, log_offset=0, internal_log="/
                 timeout=5,
             )
             if res.returncode == 0:
-                return res.stdout or ""
+                file_log = res.stdout or ""
         except Exception:
             pass
 
+    docker_log = ""
     try:
         res = subprocess.run(
             ["docker", "logs", "--since", since_iso, container_name],
@@ -115,10 +117,11 @@ def read_container_logs(container_name, since_iso, log_offset=0, internal_log="/
             text=True,
             timeout=5,
         )
-        return (res.stdout or "") + "\n" + (res.stderr or "")
+        docker_log = (res.stdout or "") + "\n" + (res.stderr or "")
     except Exception as e:
         sys.stderr.write(f"[crash_oracle] Warning: docker logs failed: {e}\n")
-        return ""
+
+    return f"{file_log}\n{docker_log}"
 
 
 def main():
@@ -133,28 +136,28 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("PGHOST" if os.environ.get("DBMS") != "mysql" else "MYSQL_HOST", "127.0.0.1"),
+        default=None,
         help="Database host or unix socket directory (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PGPORT", 5432) if os.environ.get("DBMS") != "mysql" else os.environ.get("MYSQL_TCP_PORT", 3306)),
+        default=None,
         help="Database port (default: 5432 for postgres, 3306 for mysql)",
     )
     parser.add_argument(
         "--user",
-        default=os.environ.get("PGUSER", "postgres") if os.environ.get("DBMS") != "mysql" else os.environ.get("MYSQL_USER", "root"),
+        default=None,
         help="Database user (default: postgres / root)",
     )
     parser.add_argument(
         "--password",
-        default=os.environ.get("PGPASSWORD", "") if os.environ.get("DBMS") != "mysql" else os.environ.get("MYSQL_PWD", ""),
+        default=None,
         help="Database password",
     )
     parser.add_argument(
         "--dbname",
-        default=os.environ.get("PGDATABASE", "occam_test") if os.environ.get("DBMS") != "mysql" else os.environ.get("MYSQL_DATABASE", "occam_test"),
+        default=None,
         help="Target database name (default: occam_test)",
     )
     parser.add_argument(
@@ -164,7 +167,7 @@ def main():
     )
     parser.add_argument(
         "--log-file",
-        default=os.environ.get("DBMS_LOG_FILE", "/var/log/postgresql/postgresql.log" if os.environ.get("DBMS") != "mysql" else ""),
+        default=None,
         help="Path to database server log file",
     )
     parser.add_argument(
@@ -187,6 +190,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve dbms-aware connection defaults
+    if args.host is None:
+        args.host = os.environ.get("MYSQL_HOST", "127.0.0.1") if args.dbms == "mysql" else os.environ.get("PGHOST", "127.0.0.1")
+    if args.port is None:
+        args.port = int(os.environ.get("MYSQL_TCP_PORT", 3306)) if args.dbms == "mysql" else int(os.environ.get("PGPORT", 5432))
+    if args.user is None:
+        args.user = os.environ.get("MYSQL_USER", "root") if args.dbms == "mysql" else os.environ.get("PGUSER", "postgres")
+    if args.password is None:
+        args.password = os.environ.get("MYSQL_PWD", "") if args.dbms == "mysql" else os.environ.get("PGPASSWORD", "")
+    if args.dbname is None:
+        args.dbname = os.environ.get("MYSQL_DATABASE", "occam_test") if args.dbms == "mysql" else os.environ.get("PGDATABASE", "occam_test")
+    if args.log_file is None:
+        args.log_file = os.environ.get("DBMS_LOG_FILE", "")
+
     # Read candidate SQL from stdin
     candidate_sql = sys.stdin.read()
     if not candidate_sql.strip():
@@ -199,6 +216,10 @@ def main():
     container_offset = 0
     since_iso = ""
     local_log_usable = False
+    internal_log = args.log_file if args.log_file else (
+        "/var/log/postgresql/postgresql.log" if args.dbms == "postgres" else "/var/log/mysql/error.log"
+    )
+
     if args.log_file and os.path.isfile(args.log_file):
         try:
             with open(args.log_file, "r", errors="replace") as f:
@@ -211,7 +232,7 @@ def main():
     if args.container_name:
         since_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         if not local_log_usable:
-            container_offset = get_container_log_offset(args.container_name)
+            container_offset = get_container_log_offset(args.container_name, internal_log)
     # Build client command
     env = os.environ.copy()
     if args.dbms == "postgres":
@@ -311,7 +332,7 @@ def main():
     if local_log_usable:
         new_log = read_new_log(args.log_file, log_offset)
     elif args.container_name:
-        new_log = read_container_logs(args.container_name, since_iso, container_offset)
+        new_log = read_container_logs(args.container_name, since_iso, container_offset, internal_log)
 
     combined_text = f"{new_log}\n{client_stderr}"
 

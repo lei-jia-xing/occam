@@ -10,11 +10,12 @@
 set -eo pipefail
 
 DBMS="${DBMS:-postgres}"
-HOST="${PGHOST:-127.0.0.1}"
-PORT="${PGPORT:-5432}"
-USER="${PGUSER:-postgres}"
-DBNAME="${PGDATABASE:-occam_test}"
+HOST="${PGHOST:-${MYSQL_HOST:-127.0.0.1}}"
+PORT="${PORT:-}"
+DB_USER=""
+DBNAME="${PGDATABASE:-${MYSQL_DATABASE:-occam_test}}"
 TEMPLATE="${TEMPLATE_DB:-template_occam}"
+PASSWORD="${PGPASSWORD:-${MYSQL_PWD:-}}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 MAX_WAIT_SECS=20
 
@@ -27,7 +28,9 @@ while [[ $# -gt 0 ]]; do
         --port)
             PORT="$2"; shift 2 ;;
         --user)
-            USER="$2"; shift 2 ;;
+            DB_USER="$2"; shift 2 ;;
+        --password)
+            PASSWORD="$2"; shift 2 ;;
         --dbname)
             DBNAME="$2"; shift 2 ;;
         --template)
@@ -35,13 +38,29 @@ while [[ $# -gt 0 ]]; do
         --container-name)
             CONTAINER_NAME="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: $0 [--dbms postgres|mysql] [--host HOST] [--port PORT] [--user USER] [--dbname DBNAME] [--template TEMPLATE] [--container-name NAME]"
+            echo "Usage: $0 [--dbms postgres|mysql] [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--dbname DBNAME] [--template TEMPLATE] [--container-name NAME]"
             exit 0 ;;
         *)
             echo "Unknown argument: $1" >&2
             exit 1 ;;
     esac
 done
+
+if [[ -z "$PORT" ]]; then
+    if [[ "$DBMS" == "mysql" ]]; then
+        PORT="${MYSQL_TCP_PORT:-3306}"
+    else
+        PORT="${PGPORT:-5432}"
+    fi
+fi
+
+if [[ -z "$DB_USER" ]]; then
+    if [[ "$DBMS" == "mysql" ]]; then
+        DB_USER="${MYSQL_USER:-root}"
+    else
+        DB_USER="${PGUSER:-postgres}"
+    fi
+fi
 
 resolve_tool() {
     local tool="$1"
@@ -61,11 +80,13 @@ resolve_tool() {
 
 PSQL_BIN=$(resolve_tool psql "$HOME/.cache/occam/postgresql-17.0-debug/install/bin/psql" /usr/local/pgsql/bin/psql /usr/lib/postgresql/13/bin/psql /usr/lib/postgresql/12/bin/psql /usr/lib/postgresql/14/bin/psql /usr/lib/postgresql/17/bin/psql /usr/bin/psql)
 PG_ISREADY_BIN=$(resolve_tool pg_isready "$HOME/.cache/occam/postgresql-17.0-debug/install/bin/pg_isready" /usr/local/pgsql/bin/pg_isready /usr/lib/postgresql/13/bin/pg_isready /usr/lib/postgresql/12/bin/pg_isready /usr/lib/postgresql/14/bin/pg_isready /usr/lib/postgresql/17/bin/pg_isready /usr/bin/pg_isready)
+MYSQL_BIN=$(resolve_tool mysql /usr/local/mysql/bin/mysql /usr/bin/mysql)
+MYSQLADMIN_BIN=$(resolve_tool mysqladmin /usr/local/mysql/bin/mysqladmin /usr/bin/mysqladmin)
 
 reset_postgres() {
     local is_ready=0
     for ((i=1; i<=MAX_WAIT_SECS*5; i++)); do
-        if "$PG_ISREADY_BIN" -h "$HOST" -p "$PORT" -U "$USER" >/dev/null 2>&1; then
+        if "$PG_ISREADY_BIN" -h "$HOST" -p "$PORT" -U "$DB_USER" >/dev/null 2>&1; then
             is_ready=1
             break
         fi
@@ -92,7 +113,7 @@ reset_postgres() {
     fi
 
     # Terminate active backend connections to target database and reset from template
-    "$PSQL_BIN" -h "$HOST" -p "$PORT" -U "$USER" -d template1 -v ON_ERROR_STOP=1 -X -q <<EOF
+    "$PSQL_BIN" -h "$HOST" -p "$PORT" -U "$DB_USER" -d template1 -v ON_ERROR_STOP=1 -X -q <<EOF
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
 WHERE datname = '${DBNAME}' AND pid <> pg_backend_pid();
@@ -105,8 +126,13 @@ EOF
 
 reset_mysql() {
     local is_ready=0
+    local pass_args=()
+    if [[ -n "${PASSWORD:-}" ]]; then
+        pass_args=("-p${PASSWORD}")
+    fi
+
     for ((i=1; i<=MAX_WAIT_SECS*5; i++)); do
-        if mysqladmin ping -h "$HOST" -P "$PORT" -u "$USER" --silent 2>/dev/null; then
+        if "$MYSQLADMIN_BIN" ping -h "$HOST" -P "$PORT" -u "$DB_USER" "${pass_args[@]}" --silent 2>/dev/null; then
             is_ready=1
             break
         fi
@@ -126,7 +152,7 @@ reset_mysql() {
         return 1
     fi
 
-    mysql -h "$HOST" -P "$PORT" -u "$USER" <<EOF
+    "$MYSQL_BIN" -h "$HOST" -P "$PORT" -u "$DB_USER" "${pass_args[@]}" <<EOF
 DROP DATABASE IF EXISTS ${DBNAME};
 CREATE DATABASE ${DBNAME};
 EOF

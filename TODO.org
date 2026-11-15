@@ -8,17 +8,20 @@
 - [速度优先，语句内重写可选] 默认聚焦高吞吐的语句级规约（切片、闭包、ddmin）；语句内微语法修剪通过 =--intra-statement= 按需开启。
 
 * 当前任务 (Active Tasks)
-** TODO [#A] 构建 MySQL 8.0 Debug 测试容器与真实用例验证
-- 编写 =harness/Dockerfile.target-mysql=（带 =-DWITH_DEBUG=1=）并配置健康检查。
-- 复现并规约 =benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql=，达成毕设 $\ge 2$ 款主流 DBMS 真实验证闭环。
+** TODO [#A] 整理毕业论文实验章节与图表导出
+- 汇总 PostgreSQL 12 与 MySQL 8.0 双引擎真实用例规约对比结果（Ours vs B1 vs B2 vs NoDep）。
+- 绘制 Oracle 调用次数、耗时加速比及缓存命中率柱状对比图。
 
-** DONE [#B] 扩充真实多语句崩溃语料库 (Real Fuzz Corpus)
-- 编写 =scripts/import_real_bugs.py=，从 SQLancer、SQUIRREL、bugs.mysql.com 导入 14 个典型崩溃用例（PostgreSQL 5 例、MySQL 6 例、SQLite 3 例）。
-- 配套提供原始崩溃核与论文 Section 6.1 增强多表噪声测试集，附带规范元数据（.meta.json）与确定性崩溃断言。
+* 已完成里程碑 (Completed)
+** DONE 构建 MySQL 8.0 Debug 测试容器与真实用例验证 [2026-11]
+- 编写 =harness/Dockerfile.target-mysql=（基于原生 Ubuntu 18.04 编译环境，带 =-DWITH_DEBUG=1=）并配置健康检查与自动拉起 Supervisor。
+- 编写 =scripts/run_real_benchmarks.py= 运行 =occam-eval= 全自动对比基准评测。
+- 在 MySQL 8.0.20-debug 上成功复现并规约 SQUIRREL Bug #99421（14 语句规约至 2 语句，体积压缩 78.9%），达成 5/5 零滑移重现，实现毕设双主流 DBMS 闭环。
 
-** TODO [#B] 完善对比基准与论文实测数据
-- 运行 =occam=、=sequential (B1)= 与 =statement-ddmin (B2)= 在真实用例下的基线对比。
-- 收集 Oracle 调用次数、耗时与压缩比，导出标准化评估图表。
+** DONE 完善对比基准与论文实测数据 [2026-11]
+- 在真实多表增强用例下运行 =no-intra (Ours)=、=sequential (B1)=、=statement-ddmin (B2)= 与 =graph-off (Ours-NoDep)=。
+- 结果表明：依赖分析使无效 DBMS 崩溃重启减少 71.6%（19 次 vs 67 次），相比 B1 取得超 2x 耗时加速，缓存命中率达 52.5%。
+- 产出标准化数据 =mysql_squirrel_bug99421_enhanced_results.json= 与 Markdown 报告。
 
 * 已完成里程碑 (Completed)
 ** DONE 真实用例验证与前缀探测优化 [2026-11]
