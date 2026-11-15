@@ -30,8 +30,17 @@ import Data.Text.Encoding qualified as TE
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import GHC.Generics (Generic)
+import System.Console.ANSI (
+    Color (..),
+    ColorIntensity (..),
+    ConsoleIntensity (..),
+    ConsoleLayer (..),
+    SGR (..),
+    hSupportsANSI,
+    setSGRCode,
+ )
 import System.Environment (lookupEnv)
-import System.IO (hIsTerminalDevice, stdout)
+import System.IO (stdout)
 import System.Log.FastLogger (
     LoggerSet,
     defaultBufSize,
@@ -127,9 +136,9 @@ logError' Logger {..} comp msg meta =
 -- | Bracket-managed high-performance logger using fast-logger.
 withLogger :: LogConfig -> (Logger -> IO a) -> IO a
 withLogger cfg action = do
-    isTTY <- hIsTerminalDevice stdout
+    supportsANSI <- hSupportsANSI stdout
     noColor <- lookupEnv "NO_COLOR"
-    let colorSupported = isTTY && isNothing noColor && logUseColor cfg
+    let colorSupported = supportsANSI && isNothing noColor && logUseColor cfg
         resolvedCfg = cfg {logUseColor = colorSupported}
     bracket (newStdoutLoggerSet defaultBufSize) rmLoggerSet \lset -> do
         logger <- newFastLogger resolvedCfg lset
@@ -191,11 +200,18 @@ renderValue Null = "null"
 renderValue other = TE.decodeUtf8Lenient (BSL.toStrict (encode other))
 
 formatBadge :: Bool -> LogLevel -> BSC.ByteString
-formatBadge True LevelDebug = "\ESC[36m[DEBUG]\ESC[0m"
-formatBadge True LevelInfo = "\ESC[32m[INFO ]\ESC[0m"
-formatBadge True LevelWarn = "\ESC[33m[WARN ]\ESC[0m"
-formatBadge True LevelError = "\ESC[1;31m[ERROR]\ESC[0m"
-formatBadge False LevelDebug = "[DEBUG]"
-formatBadge False LevelInfo = "[INFO ]"
-formatBadge False LevelWarn = "[WARN ]"
-formatBadge False LevelError = "[ERROR]"
+formatBadge False lvl = plainBadge lvl
+formatBadge True lvl =
+    BSC.pack (setSGRCode (levelSGR lvl)) <> plainBadge lvl <> BSC.pack (setSGRCode [Reset])
+
+plainBadge :: LogLevel -> BSC.ByteString
+plainBadge LevelDebug = "[DEBUG]"
+plainBadge LevelInfo = "[INFO ]"
+plainBadge LevelWarn = "[WARN ]"
+plainBadge LevelError = "[ERROR]"
+
+levelSGR :: LogLevel -> [SGR]
+levelSGR LevelDebug = [SetColor Foreground Vivid Cyan]
+levelSGR LevelInfo = [SetColor Foreground Vivid Green]
+levelSGR LevelWarn = [SetColor Foreground Vivid Yellow]
+levelSGR LevelError = [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Red]
