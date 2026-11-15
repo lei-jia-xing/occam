@@ -2765,6 +2765,8 @@ pub(super) fn analyze_statement(
             Some("SELECT INTO outside a standalone query".to_string()),
         ));
     }
+    // TODO(dialect-alignment): MSSQL `OUTPUT ... INTO table` clause currently triggers an
+    // UnknownDml barrier. Support writing to temporary/table variables when parsed.
     let output = match statement {
         Statement::Insert(insert) => insert.output.as_ref(),
         Statement::Update(update) => update.output.as_ref(),
@@ -2820,6 +2822,9 @@ pub(super) fn analyze_statement(
         Statement::CreateTable(create) => {
             // NOTE: PostgreSQL `CREATE TABLE` manual: https://www.postgresql.org/docs/current/sql-createtable.html
             // MySQL `CREATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/create-table.html
+            // TODO(dialect-alignment): PostgreSQL table inheritance (`INHERITS`) and table partitioning
+            // (`PARTITION OF`) currently emit an UnknownDdl barrier. To align: track child-to-parent routing
+            // and partition attachment in Occam's catalog.
             if create
                 .inherits
                 .as_ref()
@@ -3475,6 +3480,8 @@ pub(super) fn analyze_statement(
                     }
                 }
             } else {
+                // TODO(dialect-alignment): SQLite pragmas beyond foreign_keys (e.g. recursive_triggers,
+                // journal_mode, temp_store) currently emit UnknownSessionEffect barriers.
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,
                     Some(statement.to_string()),
@@ -3725,11 +3732,22 @@ pub(super) fn analyze_statement(
                 )),
             }
         }
+        // TODO(upstream-sqlparser): Procedural statements, client commands, and dialect extensions
+        // currently hit this fallback barrier:
+        // 1. PL/pgSQL & PL/SQL: `CREATE FUNCTION/PROCEDURE ... AS $$ ... $$` procedural blocks
+        //    (sqlparser stores function bodies as unparsed strings; inner DML dependencies are opaque).
+        // 2. MySQL: `DELIMITER //` client command is outside ANSI/ISO SQL lexical grammar.
+        // 3. MySQL: User session variables (`@var := expr`) and dynamic `PREPARE .. FROM @var`.
+        // 4. SQLite: `CREATE VIRTUAL TABLE ... USING module(...)` and hidden shadow tables (t_data, t_idx).
+        // 5. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`) and `CREATE MACRO`.
+        // 6. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`, `OUTPUT INTO @var`).
         _ => facts.barriers.push(global_barrier(
             ir::BarrierReason::UnknownStatement,
             Some(statement.to_string()),
         )),
     }
+    // TODO(dialect-alignment): MySQL `SET foreign_key_checks = 0/1` should be explicitly mapped
+    // to `ir::SessionEffect::SetForeignKeyChecks` similar to SQLite's `PRAGMA foreign_keys`.
     // Generic variables are recorded, but their effects on parsing, writes,
     // triggers, and transaction behavior are not represented by the catalog.
     if facts.session.iter().any(|effect| {
