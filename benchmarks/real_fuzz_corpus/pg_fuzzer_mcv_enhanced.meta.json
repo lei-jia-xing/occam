@@ -1,0 +1,92 @@
+{
+  "id": "pg_fuzzer_mcv_enhanced",
+  "file": "pg_fuzzer_mcv_enhanced.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer / PQS DBMS fuzzer (OSDI 2020) + Redundancy Augmentation (Thesis Section 6.1)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/20191119125051.GA2021%40gmail.com",
+    "mirror_url": "https://postgrespro.ru/list/thread-id/2467133",
+    "reporter": "Manuel Rigger (author of SQLancer / PQS)",
+    "report_date": "2019-11-19",
+    "issue_id": "Failed assertion clauses != NIL",
+    "fixed_by": "Tomas Vondra (2ndQuadrant / PostgreSQL Global Development Group)",
+    "fix_commit_message": "Fix choose_best_statistics to check clauses individually"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12.0",
+    "git_tag": "REL_12_0",
+    "compilation_flags": "./configure --prefix=/usr/local/pgsql --enable-cassert --enable-debug CFLAGS=\"-O1 -g -fno-omit-frame-pointer\""
+  },
+  "crash_signature": {
+    "expected_signature": "FailedAssertion.*mcv\\.c",
+    "raw_assertion_message": "!(clauses != ((List *) ((void *)0)))",
+    "source_file": "src/backend/statistics/mcv.c",
+    "source_line": 1553,
+    "signal": "SIGABRT (signal 6)",
+    "top_stack_frames": [
+      "ExceptionalCondition(conditionName='!(clauses != ((List *) ((void *)0)))', errorType='FailedAssertion', fileName='mcv.c', lineNumber=1553)",
+      "mcv_clauselist_selectivity",
+      "statext_clauselist_selectivity",
+      "clauselist_selectivity",
+      "set_baserel_size_estimates",
+      "make_one_rel",
+      "query_planner",
+      "standard_planner",
+      "pg_plan_query",
+      "PostgresMain"
+    ]
+  },
+  "authentic_crash_core": {
+    "core_statements": [
+      "CREATE TABLE t0 (c0 boolean, c1 boolean, c2 boolean, ...);",
+      "INSERT INTO t0 VALUES (FALSE, FALSE, FALSE, ...);",
+      "CREATE STATISTICS s0 ON c0, c2 FROM t0;",
+      "ANALYZE;",
+      "SELECT * FROM t0 WHERE t0.c2 OR t0.c1 OR t0.c0;"
+    ],
+    "core_statement_indices": [16, 17, 19, 21, 22]
+  },
+  "injected_redundancies": {
+    "redundancy_groups": [
+      {
+        "name": "Users & Orders Subsystem",
+        "statement_indices": [1, 2, 3, 4, 5, 6, 7, 8],
+        "types": ["CREATE TABLE", "INSERT", "CREATE VIEW", "ALTER TABLE", "UPDATE", "SELECT"]
+      },
+      {
+        "name": "Sensor Telemetry & Indexing",
+        "statement_indices": [9, 10, 11, 12],
+        "types": ["CREATE TABLE", "INSERT", "CREATE INDEX", "SELECT"]
+      },
+      {
+        "name": "Inventory Subsystem & Mutation",
+        "statement_indices": [13, 14, 15],
+        "types": ["CREATE TABLE", "INSERT", "DELETE"]
+      },
+      {
+        "name": "Intra-Core Redundancies",
+        "statement_indices": [16, 18, 20],
+        "types": [
+          "Extra column 'c_extra' in t0",
+          "Redundant tuple insertion into t0",
+          "Unrelated cross-table SELECT query before ANALYZE"
+        ]
+      }
+    ]
+  },
+  "trigger": {
+    "statement": "SELECT * FROM t0 WHERE t0.c2 OR t0.c1 OR t0.c0;",
+    "statement_index": 22
+  },
+  "metrics": {
+    "statement_count": 22,
+    "byte_count": 2277
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "expected_outcome": "CRASH",
+    "isolation": "clean per-candidate database reset before each replay"
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "pg_sqlsmith_partprune",
+  "file": "pg_sqlsmith_partprune.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLsmith (automated random query generator for PostgreSQL)",
+    "origin_url": "https://www.postgresql.org/message-id/CAJGNTeOkdk%3DUVuMugmKL7M%3Dowgt4nNr1wjxMg1F%2BmHsXyLCzFA%40mail.gmail.com",
+    "mirror_url": "https://postgrespro.ru/list/thread-id/2397418",
+    "attachment_url": "https://postgrespro.ru/media/maillist_attaches/pgsql-hackers/2018/07/23/CAJGNTeOkdk=UVuMugmKL7M=owgt4nNr1wjxMg1F+mHsXyLCzFA@mail.gmail.com/crash.sql",
+    "reporter": "Jaime Casanova (2ndQuadrant)",
+    "report_date": "2018-07-24",
+    "issue_id": "FailedAssertion on partprune",
+    "fixed_by": "Tom Lane in commit 59ef49d26d2"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "11-devel / REL_11_STABLE",
+    "git_commit": "1b957e59b92dc44c14708762f882d7910463a9ac",
+    "compilation_flags": "./configure --prefix=/usr/local/pgsql --enable-debug --enable-depend --enable-cassert CFLAGS=\"-O1 -g -fno-omit-frame-pointer\""
+  },
+  "crash_signature": {
+    "expected_signature": "TRAP:\\s+FailedAssertion\\(\"!\\(relid_subplan_map\\[rti\\] == 0\\)\",\\s+File:\\s+\"partprune\\.c\",\\s+Line:\\s+244\\)",
+    "assertion_message": "!(relid_subplan_map[rti] == 0)",
+    "source_file": "src/backend/optimizer/util/partprune.c",
+    "source_line": 244,
+    "signal": "SIGABRT (signal 6)",
+    "top_stack_frames": [
+      "ExceptionalCondition(conditionName='!(relid_subplan_map[rti] == 0)', errorType='FailedAssertion', fileName='partprune.c', lineNumber=244)",
+      "make_partition_pruneinfo",
+      "create_append_plan",
+      "create_plan_recurse",
+      "create_limit_plan",
+      "create_plan",
+      "standard_planner",
+      "pg_plan_query",
+      "exec_simple_query",
+      "PostgresMain"
+    ]
+  },
+  "trigger": {
+    "statement": "select (select pg_catalog.avg(actu_codi) from public.actualizar_sistema) as c0, sample_0.radi_nume_temp as c1, sample_0.radi_usua_ante as c2, (select anex_borrado from public.anexos limit 1 offset 4) as c3, pg_catalog.pg_stat_get_buf_alloc() as c4 from public.radicado as sample_0 tablesample bernoulli (9.7) where (sample_0.radi_texto = cast(nullif(sample_0.radi_inst_actu, sample_0.radi_usua_radi) as int4)) or (cast(null as jsonb) ?& case when sample_0.radi_imagen is not NULL then cast(null as _text) else cast(null as _text) end) limit 33;",
+    "statement_index": 22
+  },
+  "metrics": {
+    "statement_count": 22,
+    "byte_count": 4225
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "expected_outcome": "CRASH",
+    "isolation": "clean per-candidate database reset before each replay"
+  }
+}

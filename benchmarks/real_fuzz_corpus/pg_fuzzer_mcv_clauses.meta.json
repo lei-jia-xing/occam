@@ -1,0 +1,54 @@
+{
+  "id": "pg_fuzzer_mcv_clauses",
+  "file": "pg_fuzzer_mcv_clauses.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer / PQS DBMS fuzzer (OSDI 2020)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/20191119125051.GA2021%40gmail.com",
+    "mirror_url": "https://postgrespro.ru/list/thread-id/2467133",
+    "reporter": "Manuel Rigger (author of SQLancer / PQS)",
+    "report_date": "2019-11-19",
+    "issue_id": "Failed assertion clauses != NIL",
+    "fixed_by": "Tomas Vondra (2ndQuadrant / PostgreSQL Global Development Group)",
+    "fix_commit_message": "Fix choose_best_statistics to check clauses individually"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12.0",
+    "git_tag": "REL_12_0",
+    "compilation_flags": "./configure --prefix=/usr/local/pgsql --enable-cassert --enable-debug CFLAGS=\"-O1 -g -fno-omit-frame-pointer\""
+  },
+  "crash_signature": {
+    "expected_signature": "TRAP:\\s+FailedAssertion\\(.*File:\\s+\"mcv\\.c\"",
+    "assertion_message": "clauses != NIL",
+    "source_file": "src/backend/statistics/mcv.c",
+    "source_line": 1551,
+    "signal": "SIGABRT (signal 6)",
+    "top_stack_frames": [
+      "ExceptionalCondition(conditionName='clauses != NIL', errorType='FailedAssertion', fileName='mcv.c', lineNumber=1551)",
+      "mcv_clauselist_selectivity",
+      "statext_clauselist_selectivity",
+      "clauselist_selectivity",
+      "set_baserel_size_estimates",
+      "make_one_rel",
+      "query_planner",
+      "standard_planner",
+      "pg_plan_query",
+      "PostgresMain"
+    ]
+  },
+  "trigger": {
+    "statement": "SELECT * FROM t0 WHERE t0.c2 OR t0.c1 OR t0.c0;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 194
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "expected_outcome": "CRASH",
+    "isolation": "clean per-candidate database reset before each replay"
+  }
+}

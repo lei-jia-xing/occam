@@ -1,0 +1,55 @@
+{
+  "id": "mysql_squirrel_bug99421",
+  "file": "mysql_squirrel_bug99421.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "SQUIRREL (CCS 2020 DBMS fuzzer)",
+    "fuzzer_wiki_url": "https://github.com/s3team/Squirrel/wiki/Bug-List",
+    "origin_url": "https://bugs.mysql.com/bug.php?id=99421",
+    "reporter": "Yongheng Chen (SQUIRREL co-author / S3 team)",
+    "report_date": "2020-05-03",
+    "issue_id": "Bug #99421",
+    "fixed_in_version": "MySQL 8.0.24",
+    "changelog_entry": "Creating an index on virtual columns raised an invalid debug assertion failure."
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20",
+    "verified_versions": [
+      "8.0.19-debug",
+      "8.0.20-debug"
+    ],
+    "git_tag": "mysql-8.0.20",
+    "compilation_flags": "cmake ../mysql/ -DDOWNLOAD_BOOST=1 -DWITH_BOOST=../boost -DWITH_DEBUG=1 -DCPACK_MONOLITHIC_INSTALL=1 -DWITH_UNIT_TESTS=OFF"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion failure: dict0dict\\.cc:657:col_nr < static_cast<ulint>\\(table->n_t_def\\)",
+    "assertion_message": "col_nr < static_cast<ulint>(table->n_t_def)",
+    "source_file": "storage/innobase/dict/dict0dict.cc",
+    "source_line": 657,
+    "signal": "SIGABRT (signal 6)",
+    "top_stack_frames": [
+      "ut_dbg_assertion_failed(char const*, char const*, unsigned long)",
+      "dict_table_get_v_col_name_mysql(dict_table_t const*, unsigned long)",
+      "dict_index_add_col(dict_index_t*, dict_table_t const*, dict_col_t*, unsigned long, bool)",
+      "dict_index_add_to_cache_w_vcol(dict_table_t*, dict_index_t*, dict_add_v_col_t const*, unsigned int, unsigned long)",
+      "row_merge_create_index(trx_t*, dict_table_t*, index_def_t const*, dict_add_v_col_t const*)",
+      "ha_innobase::prepare_inplace_alter_table_impl(TABLE*, Alter_inplace_info*, dd::Table const*, dd::Table*)",
+      "mysql_alter_table(THD*, char const*, char const*, HA_CREATE_INFO*, TABLE_LIST*, Alter_info*)"
+    ]
+  },
+  "trigger": {
+    "statement": "CREATE INDEX v2 ON v0 ( ( v1 = 127 ) , ( v1 + v1 ) , v1 , ( v1 + - -1 ) , ( v1 > 26 ) ) ;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 268
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "expected_outcome": "CRASH",
+    "isolation": "clean per-candidate database reset before each replay"
+  }
+}

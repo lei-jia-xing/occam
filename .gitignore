@@ -36,6 +36,7 @@ crashes/
 tmp/
 __pycache__/
 *.pyc
+occam-out/
 # Benchmark & Fuzz runtime results
 benchmarks/**/results/
 benchmarks/*.jsonl

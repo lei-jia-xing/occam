@@ -20,6 +20,7 @@ module Occam.Reducer (
     statementAudit,
     statementAuditWithLogger,
     AuditStats (..),
+    findInterestingPrefix,
 ) where
 
 import Control.Exception (Exception, throwIO)
@@ -483,22 +484,28 @@ logAuditStats logger stats =
         , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
         ]
 
--- | Linear search for the first predicate-preserving statement prefix.
+-- | Binary search for the first predicate-preserving statement prefix.
 findInterestingPrefix ::
     Oracle -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
-findInterestingPrefix oracle baseSQL statements = go 1
+findInterestingPrefix oracle baseSQL statements
+    | null statements = pure (Nothing, 0)
+    | otherwise = go 1 (length statements) Nothing 0
     where
-        go prefixLength
-            | prefixLength > length statements = pure (Nothing, prefixLength - 1)
+        go !low !high best !tests
+            | low > high = pure (best, tests)
             | otherwise = do
-                let prefix = take prefixLength statements
+                let mid = low + (high - low) `div` 2
+                    prefix = take mid statements
                     candidate = statementSQL baseSQL statements prefix
                 ok <- oracleAccepts oracle candidate
+                let tests' = tests + 1
                 if ok
                     then case reverse prefix of
-                        statement : _ -> pure (Just (statement, candidate, prefixLength), prefixLength)
-                        [] -> pure (Nothing, prefixLength)
-                    else go (prefixLength + 1)
+                        statement : _ ->
+                            go low (mid - 1) (Just (statement, candidate, mid)) tests'
+                        [] ->
+                            go low (mid - 1) best tests'
+                    else go (mid + 1) high best tests'
 
 -- | Parsed statements plus their dependency graph for one exact candidate byte string.
 data SQLAnalysis = SQLAnalysis
@@ -751,63 +758,118 @@ simplifyExpressions :: SQLDialect -> Oracle -> ByteString -> IO ByteString
 simplifyExpressions dialect oracle =
     reduceSyntaxWithDialect nullLogger dialect oracle ((== EditExpression) . parserEditCategory)
 
+data SyntaxStats = SyntaxStats
+    { syntaxAttempts :: !Int
+    , syntaxAccepted :: !Int
+    , syntaxElapsed :: !Word64
+    , syntaxConsecutiveRejections :: !Int
+    }
+
 reduceSyntaxWithDialect ::
     Logger -> SQLDialect -> Oracle -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
 reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
-    stats <- newIORef (0 :: Int, 0 :: Int, 0 :: Word64)
+    stats <- newIORef (SyntaxStats 0 0 0 0)
     result <- go stats initialSQL
-    (attempts, accepted, oracleElapsed) <- readIORef stats
+    finalStats <- readIORef stats
     logInfo'
         logger
         "occam::reducer"
         "Syntax replacement summary"
-        [ ("replacement_attempts", toJSON attempts)
-        , ("replacement_accepted", toJSON accepted)
-        , ("replacement_oracle_seconds", toJSON (seconds oracleElapsed))
+        [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
+        , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
+        , ("replacement_oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
         ]
     pure result
     where
+        maxConsecutiveRejections = 12 :: Int
+        maxStageAttempts = 40 :: Int
+
         go stats currentSQL = do
-            (_, units) <- parseUnitsOrThrow dialect currentSQL
-            let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
-            reduced <- tryEdits stats currentSQL edits
-            maybe (pure currentSQL) (go stats) reduced
+            st <- readIORef stats
+            if syntaxConsecutiveRejections st >= maxConsecutiveRejections
+                then do
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        "Intra-statement rewrites early exit: consecutive rejection threshold reached"
+                        [ ("consecutive_rejections", toJSON (syntaxConsecutiveRejections st))
+                        , ("total_attempts", toJSON (syntaxAttempts st))
+                        , ("total_accepted", toJSON (syntaxAccepted st))
+                        ]
+                    pure currentSQL
+                else
+                    if syntaxAttempts st >= maxStageAttempts
+                        then do
+                            logInfo'
+                                logger
+                                "occam::reducer"
+                                "Intra-statement rewrites early exit: stage attempt budget exhausted"
+                                [ ("stage_budget", toJSON maxStageAttempts)
+                                , ("total_attempts", toJSON (syntaxAttempts st))
+                                , ("total_accepted", toJSON (syntaxAccepted st))
+                                ]
+                            pure currentSQL
+                        else do
+                            (_, units) <- parseUnitsOrThrow dialect currentSQL
+                            let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
+                            reduced <- tryEdits stats currentSQL edits
+                            maybe (pure currentSQL) (go stats) reduced
 
         tryEdits _ _ [] = pure Nothing
-        tryEdits stats currentSQL (edit : rest) =
-            let candidate =
-                    replaceSpan
-                        (parserEditStart edit)
-                        (parserEditEnd edit)
-                        (parserEditReplacement edit)
-                        currentSQL
-             in if BS.length candidate >= BS.length currentSQL
-                    then tryEdits stats currentSQL rest
-                    else do
-                        started <- getMonotonicTimeNSec
-                        ok <- oracleAccepts oracle candidate
-                        finished <- getMonotonicTimeNSec
-                        modifyIORef'
-                            stats
-                            ( \(attempts, accepted, elapsed) ->
-                                (attempts + 1, accepted + fromEnum ok, elapsed + (finished - started))
-                            )
-                        if ok
-                            then do
-                                logInfo'
-                                    logger
-                                    "occam::reducer"
-                                    "Accepted byte-preserving syntax rewrite"
-                                    [ ("rewrite_kind", toJSON (parserEditLabel edit))
-                                    , ("rewrite_category", toJSON (parserEditCategory edit))
-                                    , ("span_start", toJSON (parserEditStart edit))
-                                    , ("span_end", toJSON (parserEditEnd edit))
-                                    , ("replacement", toJSON (TE.decodeUtf8Lenient (parserEditReplacement edit)))
-                                    , ("bytes_before", toJSON (BS.length currentSQL))
-                                    , ("bytes_after", toJSON (BS.length candidate))
-                                    ]
-                                pure (Just candidate)
-                            else tryEdits stats currentSQL rest
+        tryEdits stats currentSQL (edit : rest) = do
+            st <- readIORef stats
+            if syntaxConsecutiveRejections st >= maxConsecutiveRejections || syntaxAttempts st >= maxStageAttempts
+                then pure Nothing
+                else do
+                    let candidate =
+                            replaceSpan
+                                (parserEditStart edit)
+                                (parserEditEnd edit)
+                                (parserEditReplacement edit)
+                                currentSQL
+                    if BS.length candidate >= BS.length currentSQL
+                        then tryEdits stats currentSQL rest
+                        else do
+                            started <- getMonotonicTimeNSec
+                            ok <- oracleAccepts oracle candidate
+                            finished <- getMonotonicTimeNSec
+                            let elapsed = finished - started
+                            if ok
+                                then do
+                                    modifyIORef'
+                                        stats
+                                        ( \s ->
+                                            s
+                                                { syntaxAttempts = syntaxAttempts s + 1
+                                                , syntaxAccepted = syntaxAccepted s + 1
+                                                , syntaxElapsed = syntaxElapsed s + elapsed
+                                                , syntaxConsecutiveRejections = 0
+                                                }
+                                        )
+                                    logInfo'
+                                        logger
+                                        "occam::reducer"
+                                        "Accepted byte-preserving syntax rewrite"
+                                        [ ("rewrite_kind", toJSON (parserEditLabel edit))
+                                        , ("rewrite_category", toJSON (parserEditCategory edit))
+                                        , ("span_start", toJSON (parserEditStart edit))
+                                        , ("span_end", toJSON (parserEditEnd edit))
+                                        , ("replacement", toJSON (TE.decodeUtf8Lenient (parserEditReplacement edit)))
+                                        , ("bytes_before", toJSON (BS.length currentSQL))
+                                        , ("bytes_after", toJSON (BS.length candidate))
+                                        ]
+                                    pure (Just candidate)
+                                else do
+                                    modifyIORef'
+                                        stats
+                                        ( \s ->
+                                            s
+                                                { syntaxAttempts = syntaxAttempts s + 1
+                                                , syntaxElapsed = syntaxElapsed s + elapsed
+                                                , syntaxConsecutiveRejections = syntaxConsecutiveRejections s + 1
+                                                }
+                                        )
+                                    tryEdits stats currentSQL rest
 
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
 replaceSpan start end replacement source =

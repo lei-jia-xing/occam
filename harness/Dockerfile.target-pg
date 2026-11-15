@@ -1,0 +1,90 @@
+# Reproducible target PostgreSQL image built with assertion checking and debug symbols
+# for validating Occam reduction on authentic DBMS fuzz crashes.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/usr/local/pgsql/bin:${PATH}"
+ENV PGDATA="/usr/local/pgsql/data"
+ENV PGLOG_DIR="/var/log/postgresql"
+ENV PGLOG="/var/log/postgresql/postgresql.log"
+
+# Install build dependencies, gosu, and system utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libreadline-dev \
+    zlib1g-dev \
+    bison \
+    flex \
+    git \
+    curl \
+    ca-certificates \
+    gosu \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configurable PostgreSQL version or commit (default: REL_13_0)
+ARG PG_VERSION=REL_13_0
+ARG PG_REPO=https://github.com/postgres/postgres.git
+
+# Clone and compile PostgreSQL with --enable-cassert and --enable-debug
+RUN git clone --depth 1 --branch ${PG_VERSION} ${PG_REPO} /tmp/postgres && \
+    cd /tmp/postgres && \
+    ./configure --prefix=/usr/local/pgsql \
+                --enable-cassert \
+                --enable-debug \
+                CFLAGS="-O1 -g -fno-omit-frame-pointer" && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/postgres
+
+# Create dedicated postgres system user and required runtime directories
+RUN useradd -ms /bin/bash postgres && \
+    mkdir -p "${PGDATA}" /var/run/postgresql "${PGLOG_DIR}" /tmp && \
+    chown -R postgres:postgres /usr/local/pgsql "${PGDATA}" /var/run/postgresql "${PGLOG_DIR}" /tmp && \
+    chmod 1777 /tmp /var/run/postgresql
+
+# Initialize database cluster with trust authentication for local tests
+USER postgres
+RUN initdb -D "${PGDATA}" --auth=trust --auth-local=trust && \
+    echo "host all all all trust" >> "${PGDATA}/pg_hba.conf"
+
+# Configure PostgreSQL server for maximum crash observability:
+# - log_statement = 'all': logs every candidate statement
+# - log_min_messages = 'warning': captures warnings, errors, and assertions
+# - logging_collector = on: directs logs to /var/log/postgresql/postgresql.log
+# - unix_socket_directories and listen_addresses: accessible via socket or port 5432
+RUN { \
+        echo "listen_addresses = '*'"; \
+        echo "port = 5432"; \
+        echo "unix_socket_directories = '/var/run/postgresql, /tmp'"; \
+        echo "logging_collector = on"; \
+        echo "log_destination = 'stderr'"; \
+        echo "log_directory = '${PGLOG_DIR}'"; \
+        echo "log_filename = 'postgresql.log'"; \
+        echo "log_truncate_on_rotation = off"; \
+        echo "log_statement = 'all'"; \
+        echo "log_min_messages = 'warning'"; \
+        echo "log_min_error_statement = 'error'"; \
+        echo "log_line_prefix = '%m [%p] %q%u@%d '"; \
+    } >> "${PGDATA}/postgresql.conf"
+
+# Bootstrap template_occam and occam_test during build, then archive clean template_data
+RUN pg_ctl -D "${PGDATA}" -l /tmp/pg_bootstrap.log -w start && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE root WITH SUPERUSER LOGIN;" && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE template_occam;" && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE template_occam WITH is_template = true;" && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE occam_test TEMPLATE template_occam;" && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE template_occam TO PUBLIC;" && \
+    psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE occam_test TO PUBLIC;" && \
+    pg_ctl -D "${PGDATA}" -w stop && \
+    rm -f /tmp/pg_bootstrap.log && \
+    cp -a "${PGDATA}" /usr/local/pgsql/template_data
+
+USER root
+EXPOSE 5432
+
+COPY harness/entrypoint_target_pg.sh /usr/local/bin/entrypoint_target_pg.sh
+RUN chmod +x /usr/local/bin/entrypoint_target_pg.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_target_pg.sh"]
+CMD ["postgres"]

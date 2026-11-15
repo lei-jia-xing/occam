@@ -5,10 +5,12 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text.Encoding qualified as TE
 import Occam.Core (StatementId (..))
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
+import Occam.Facts (StatementUnit (..))
 import Occam.Logger (nullLogger)
 import Occam.Parser (
     ParsedSQL (..),
@@ -25,6 +27,7 @@ import Occam.Reducer (
     OracleOutcome (..),
     ReductionConfig (..),
     defaultReductionConfig,
+    findInterestingPrefix,
     oracleFromPredicate,
     reduceSQL,
     reduceSQLWithConfig,
@@ -266,6 +269,65 @@ tests =
             case result of
                 Left _ -> pure ()
                 Right _ -> assertFailure "invalid UTF-8 returned as a successful reduction"
+        , testCase "findInterestingPrefix binary search handles empty, 1-stmt, tail, middle, and no-match" $ do
+            let mkSQL n = BSC.unlines [BSC.pack ("SELECT " ++ show i ++ ";") | i <- [1 .. n]]
+            -- Case 1: Empty list
+            (resEmpty, testsEmpty) <- findInterestingPrefix (predicateOracle (const True)) BS.empty []
+            assertEqual "empty statements returns Nothing" Nothing resEmpty
+            assertEqual "empty statements does 0 tests" 0 testsEmpty
+
+            -- Case 2: 1-statement matching
+            parsed1 <- parseSQL (defaultParseOptions SQLite) "SELECT 1;"
+            case parsed1 of
+                Left err -> assertFailure (show err)
+                Right p1 -> do
+                    let stmts1 = map unitStatement (parsedUnits p1)
+                    (res1, tests1) <- findInterestingPrefix (predicateOracle (const True)) "SELECT 1;" stmts1
+                    assertBool "1-stmt matches" (isJust res1)
+                    assertEqual "1-stmt does 1 test" 1 tests1
+
+            -- Case 3: 21 statements with tail crash (prefix >= 21)
+            let sql21 = mkSQL (21 :: Int)
+            parsed21 <- parseSQL (defaultParseOptions SQLite) sql21
+            case parsed21 of
+                Left err -> assertFailure (show err)
+                Right p21 -> do
+                    let stmts21 = map unitStatement (parsedUnits p21)
+                        tailOracle = predicateOracle (BSC.isInfixOf "SELECT 21;")
+                    (resTail, testsTail) <- findInterestingPrefix tailOracle sql21 stmts21
+                    case resTail of
+                        Nothing -> assertFailure "failed to find tail crash prefix"
+                        Just (_, _, prefixLen) -> do
+                            assertEqual "tail crash is at prefix 21" 21 prefixLen
+                            assertBool ("binary search takes <= 5 tests (took " ++ show testsTail ++ ")") (testsTail <= 5)
+
+            -- Case 4: 21 statements with middle crash (prefix >= 7)
+            case parsed21 of
+                Left err -> assertFailure (show err)
+                Right p21 -> do
+                    let stmts21 = map unitStatement (parsedUnits p21)
+                        midOracle = predicateOracle (BSC.isInfixOf "SELECT 7;")
+                    (resMid, testsMid) <- findInterestingPrefix midOracle sql21 stmts21
+                    case resMid of
+                        Nothing -> assertFailure "failed to find middle crash prefix"
+                        Just (_, _, prefixLen) -> do
+                            assertEqual "middle crash is at prefix 7" 7 prefixLen
+                            assertBool ("binary search takes <= 5 tests (took " ++ show testsMid ++ ")") (testsMid <= 5)
+
+            -- Case 5: 21 statements with no match
+            case parsed21 of
+                Left err -> assertFailure (show err)
+                Right p21 -> do
+                    let stmts21 = map unitStatement (parsedUnits p21)
+                        noOracle = predicateOracle (const False)
+                    (resNo, testsNo) <- findInterestingPrefix noOracle sql21 stmts21
+                    assertEqual "no match returns Nothing" Nothing resNo
+                    assertBool ("binary search takes <= 5 tests (took " ++ show testsNo ++ ")") (testsNo <= 5)
+        , testCase "intra-statement rewrites terminates early when AST mutations plateau" $ do
+            let sql = "SELECT * FROM t WHERE 1 = 1 AND 2 = 2;"
+                failingOracle = predicateOracle (== sql)
+            reduced <- syntaxOnly GenericSQL failingOracle sql
+            assertEqual "no rewrite accepted returns unchanged SQL without infinite loop" sql reduced
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int

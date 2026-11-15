@@ -229,3 +229,32 @@
 - Documented censored cases (statements-512, depth-8, depth-24, density-4, objects-1, objects-32) and density-4 full rep 2 native error in benchmarks/README.md and track_summary.{json,md}.
 ** DONE [#B] Cut over benchmark entrypoints and retire redundant paths
 - Retired redundant scripts (benchmarks/report.sh, benchmarks/run_all.sh, benchmarks/test_report_pairing.py) without compatibility shims. Decoupled scale_study.py from run_docker_benchmark.py by inlining runner utilities directly; verified supported partitioned control plane (scale_study.py, partitioned_report.py).
+
+* 25. Real Bug Evaluation, Corpus Sourcing & Reducer Competitiveness
+- Empirical finding from real PostgreSQL crash case (`pg_fuzzer_mcv_enhanced.sql`): Ours-Full took 139 oracle calls (129.07s) vs B1's 26 calls (35.54s) and B2's 36 calls (32.68s) for a modest byte advantage (606B vs 620B).
+- Competitiveness gap: In small/medium real crash scripts, lack of high-level dependency pruning coupled with conservative barrier cascading and linear scans causes Occam to lose heavily on latency while demonstrating only marginal byte-level gains.
+
+** DONE [#A] Replace linear prefix scan in `findInterestingPrefix` with binary search / reverse probe
+- In `src/Occam/Reducer.hs:487-502`, replaced $O(N)$ linear scan with $O(\log N)$ binary search probing over statement lists (pure statement-level operation, zero SQL parsing in Haskell). Proved on 21-statement crash sequences that probe overhead drops from 21 calls down to <= 5 calls. Handled edge cases soundly (empty list, 1 statement, arbitrary crash indices, no match). Added unit tests in `test/ReductionChecks.hs`.
+
+** TODO [#A] De-escalate unsupported DDL in frontend (DO NOT parse SQL in Haskell)
+- Architectural rule: Haskell graph engine must remain dialect-agnostic; absolutely DO NOT perform ad-hoc SQL parsing or token extraction in Haskell.
+- Any syntax extensions (e.g. `CREATE STATISTICS` in PostgreSQL) belong strictly in `rust/sqlparser-ffi` or Tree-sitter C bindings.
+- In `src/Occam/Dependency.hs`, ensure unparsed statements maintain sound barrier semantics without contaminating Haskell with SQL dialect lexers.
+
+** TODO [#B] Establish public DBMS fuzz bug collection pipeline
+- Sources identified for authentic multi-statement crash cases:
+  1. `sqlancer/sqlancer` official `BUGS.md` and issue tracker (>500 real bugs with reproducers across PG, MySQL, SQLite, DuckDB).
+  2. Google `OSS-Fuzz` issue tracker (thousands of fuzz-discovered ASan crash testcases for SQLite3, PostgreSQL, DuckDB, ClickHouse).
+  3. `bugs.mysql.com` (filtered by Crash / Assertion failure / Fuzzer tags; e.g., Roel Van de Paar reports).
+  4. PostgreSQL `pgsql-bugs` and `pgsql-hackers` archive threads (filtered by `FailedAssertion`).
+  5. Beihang WingTecher lab internal SQUIRREL / Griffin raw crash directory (`output/crashes/`).
+- Build an automated scraper/converter to generate standardized `.sql` and `.meta.json` bundles with 5-replay verification.
+
+** TODO [#B] Defer intra-statement AST rewrites until statement-level degeneration (AST 退化之后再考虑)
+- Focus primary reduction budget and competitive speed comparisons strictly on statement-level minimization (backward slicing, closure search, ddmin, and statement audit).
+- Intra-statement AST surgery (clause deletion, expression simplification) is deferred until after statement-level reduction reaches a fixed-point / degenerates, avoiding premature micro-edits that waste dozens of oracle calls.
+
+** TODO [#B] Implement `Dockerfile.target-mysql` for MySQL 8.0 Debug verification
+- Provide `harness/Dockerfile.target-mysql` with `-DWITH_DEBUG=1` to reproduce and reduce `benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql`.
+- Complete the thesis mandate of supporting and empirically validating on >= 2 target DBMS engines (PostgreSQL and MySQL).
