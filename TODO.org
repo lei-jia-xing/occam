@@ -238,13 +238,11 @@
 - In `src/Occam/Reducer.hs:487-502`, replaced $O(N)$ linear scan with $O(\log N)$ binary search probing over statement lists (pure statement-level operation, zero SQL parsing in Haskell). Proved on 21-statement crash sequences that probe overhead drops from 21 calls down to <= 5 calls. Handled edge cases soundly (empty list, 1 statement, arbitrary crash indices, no match). Added unit tests in `test/ReductionChecks.hs`.
 
 ** DONE [#A] Defer and gate intra-statement AST rewrites as developer opt-in (AST 退化之后再考虑)
-- As directed by user (\"AST重写是否有必要, 目前看起来没有什么收益, 让开发者自己选择开启是否会更合适一点\"), configured `reductionIntraStatement = False` by default in `src/Occam/Reducer.hs` and `app/Main.hs`.
 - Intra-statement AST surgery (clause deletion, expression simplification) is now opt-in via `--intra-statement`. Default Occam runs and primary benchmarks focus on fast, high-impact statement-level minimization (backward slicing, closure search, ddmin, and statement audit).
 - Avoids 70+ oracle invocations and ~60s of DB restarts on micro-syntax edits that only yield trivial byte differences (e.g. 14 bytes on pg_fuzzer_mcv).
 
 ** DONE [#A] Upstream Parser Alignment & Clean Out-of-the-Box Statement Handling (NO fallbacks)
 - Architectural rule strictly enforced: Zero SQL parsing in Haskell; Haskell graph engine remains dialect-agnostic.
-- User directive: \"我们尽量不要做fallback, 留给sqlparser-rs吧, 等上游parser提供足够强的解析\".
 - Reverted all ad-hoc fallback parsers. Unsupported syntax like `CREATE STATISTICS` is handled as an unparsed barrier until upstream `sqlparser-rs` provides native support.
 - Supported statements in `sqlparser-rs` out-of-the-box (e.g., `Statement::Analyze`) are cleanly wired in `rust/sqlparser-ffi/src/actions.rs` to emit relation-level read facts and relation-scoped barriers instead of opaque global barriers. Documented with `// NOTE:` linking to official PostgreSQL documentation.
 
