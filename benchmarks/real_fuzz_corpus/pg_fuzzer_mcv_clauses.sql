@@ -1,5 +1,5 @@
-CREATE TABLE t0(c0 boolean, c1 boolean, c2 boolean);
-INSERT INTO t0 VALUES(FALSE, FALSE, FALSE);
+CREATE TABLE t0 (c0 boolean, c1 boolean, c2 boolean);
+INSERT INTO t0 VALUES (TRUE, FALSE, TRUE);
 CREATE STATISTICS s0 ON c0, c2 FROM t0;
 ANALYZE;
 SELECT * FROM t0 WHERE t0.c2 OR t0.c1 OR t0.c0;

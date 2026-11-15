@@ -1,0 +1,36 @@
+{
+  "id": "sqlite_fuzz_vdbe_pin1",
+  "file": "sqlite_fuzz_vdbe_pin1.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "SQLancer",
+    "origin_url": "https://github.com/sqlancer/bugs",
+    "reporter": "Manuel Rigger",
+    "report_date": "2020-02-10",
+    "issue_id": "sqlite3VdbeExec assertion failure"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "sqlite3VdbeExec: Assertion `pIn1!=pIn3' failed",
+    "assertion_message": "pIn1!=pIn3",
+    "source_file": "sqlite3.c",
+    "source_line": 86402,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "UPDATE t0 SET c0 = 0;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 104
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

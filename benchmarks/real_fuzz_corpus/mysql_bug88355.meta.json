@@ -1,0 +1,36 @@
+{
+  "id": "mysql_bug88355",
+  "file": "mysql_bug88355.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "pquery (Percona QA DBMS fuzzer)",
+    "origin_url": "https://bugs.mysql.com/bug.php?id=88355",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2017-10-31",
+    "issue_id": "Bug #88355"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.3-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion failure: api0api\\.cc:3330:err == DB_SUCCESS \\|\\| err == DB_DUPLICATE_KEY",
+    "assertion_message": "err == DB_SUCCESS || err == DB_DUPLICATE_KEY",
+    "source_file": "storage/innobase/api/api0api.cc",
+    "source_line": 3330,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "ALTER TABLE t2 ADD INDEX(c2);",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 260
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

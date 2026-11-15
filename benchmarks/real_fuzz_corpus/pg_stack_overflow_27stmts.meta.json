@@ -1,0 +1,34 @@
+{
+  "id": "pg_stack_overflow_27stmts",
+  "file": "pg_stack_overflow_27stmts.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer (OSDI 2020)",
+    "origin_url": "https://github.com/sqlancer/bugs",
+    "reporter": "Manuel Rigger",
+    "report_date": "2019-07-28",
+    "issue_id": "Stack buffer overflow in 12beta2 release"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12 Beta 2",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Stack buffer overflow|server closed the connection unexpectedly|terminated by signal 11|PANIC)",
+    "assertion_message": "Stack buffer overflow",
+    "signal": "SIGSEGV / Stack Overflow"
+  },
+  "trigger": {
+    "statement": "ANALYZE;",
+    "statement_index": 27
+  },
+  "metrics": {
+    "statement_count": 27,
+    "byte_count": 1317
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

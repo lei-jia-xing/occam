@@ -16,13 +16,22 @@ In accordance with the thesis specification and DBMS fuzzing research standards:
 
 ## 2. Benchmark Case Catalog
 
-| Case ID | Dialect | Origin & Tool | Target Version & Flags | Trigger Statement | Expected Crash Signature |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `mysql_squirrel_bug99421` | MySQL | [MySQL Bug #99421](https://bugs.mysql.com/bug.php?id=99421)<br>**SQUIRREL** (CCS '20) | MySQL 8.0.20-debug<br>`-DWITH_DEBUG=1` | `CREATE INDEX v2 ON v0 (...)` | `Assertion failure: dict0dict.cc:657:col_nr < static_cast<ulint>(table->n_t_def)` |
-| `pg_fuzzer_mcv_clauses` | PostgreSQL | [pgsql-bugs Thread 2467133](https://postgrespro.ru/list/thread-id/2467133)<br>**SQLancer** (OSDI '20) | PostgreSQL 12.0<br>`--enable-cassert --enable-debug` | `SELECT * FROM t0 WHERE t0.c2 OR ...` | `TRAP: FailedAssertion("clauses != NIL", File: "mcv.c", Line: 1551)` |
-| `pg_fuzzer_mcv_enhanced` | PostgreSQL | SQLancer bug core + Thesis Sec 6.1 redundancy augmentation | PostgreSQL 12.0<br>`--enable-cassert --enable-debug` | `SELECT * FROM t0 WHERE t0.c2 OR ...` | `TRAP: FailedAssertion.*mcv\.c` |
-| `pg_sqlsmith_partprune` | PostgreSQL | [pgsql-hackers Thread 2397418](https://postgrespro.ru/list/thread-id/2397418)<br>**SQLsmith** | PostgreSQL 11-devel (1b957e5)<br>`--enable-cassert --enable-debug` | `SELECT (select ...) FROM radicado ...` | `TRAP: FailedAssertion("!(relid_subplan_map[rti] == 0)", File: "partprune.c", Line: 244)` |
-| `mysql_bug_91975` | MySQL | [MySQL Bug #91975](https://bugs.mysql.com/bug.php?id=91975)<br>**QA Fuzzer** | MySQL 8.0.12-debug<br>`-DWITH_DEBUG=1` | `RENAME TABLE t1 TO t3;` | `Assertion failure: dict0dd.cc:1071:!fail` |
+| Case ID | Dialect | Origin & Tool | Stmts / Bytes | Target Version & Flags | Trigger Statement | Expected Crash Signature |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `mysql_squirrel_bug99421` | MySQL | [MySQL Bug #99421](https://bugs.mysql.com/bug.php?id=99421)<br>**SQUIRREL** (CCS '20) | 5 / 268B | MySQL 8.0.20-debug<br>`-DWITH_DEBUG=1` | `CREATE INDEX v2 ON v0 (...)` | `Assertion failure: dict0dict.cc:657:col_nr < static_cast<ulint>(table->n_t_def)` |
+| `mysql_squirrel_bug99421_enhanced` | MySQL | SQUIRREL + Thesis Sec 6.1 Noise Injection | 14 / 1,282B | MySQL 8.0.20-debug<br>`-DWITH_DEBUG=1` | `CREATE INDEX v2 ON v0 (...)` | `Assertion failure: dict0dict.cc:657` |
+| `mysql_bug_91975` | MySQL | [MySQL Bug #91975](https://bugs.mysql.com/bug.php?id=91975)<br>**pquery/randgen** | 5 / 301B | MySQL 8.0.12-debug<br>`-DWITH_DEBUG=1` | `RENAME TABLE t1 TO t3;` | `Assertion failure: sql_executor.cc:2956:!join->plan_is_const()` |
+| `mysql_bug_91975_enhanced` | MySQL | Bug #91975 + Thesis Sec 6.1 Noise Injection | 12 / 1,029B | MySQL 8.0.12-debug<br>`-DWITH_DEBUG=1` | `RENAME TABLE t1 TO t3;` | `Assertion failure: sql_executor.cc:2956` |
+| `mysql_bug88355` | MySQL | [MySQL Bug #88355](https://bugs.mysql.com/bug.php?id=88355)<br>**pquery** | 4 / 260B | MySQL 8.0.3-debug<br>`-DWITH_DEBUG=1` | `ALTER TABLE t2 ADD INDEX(c2);` | `Assertion failure: api0api.cc:3330:err == DB_SUCCESS \|\| err == DB_DUPLICATE_KEY` |
+| `mysql_bug86293` | MySQL | [MySQL Bug #86293](https://bugs.mysql.com/bug.php?id=86293)<br>**randgen** | 5 / 270B | MySQL 8.0.1-debug<br>`-DWITH_DEBUG=1` | `ALTER TABLE t2 ADD CONSTRAINT...` | `Assertion failure: pars0pars.cc:778:sym_node->table != NULL` |
+| `pg_fuzzer_mcv_clauses` | PostgreSQL | [pgsql-bugs Thread 2467133](https://postgrespro.ru/list/thread-id/2467133)<br>**SQLancer** (OSDI '20) | 5 / 194B | PostgreSQL 12.0<br>`--enable-cassert --enable-debug` | `SELECT * FROM t0 WHERE t0.c2 OR ...` | `TRAP: FailedAssertion("!(clauses != NIL)", File: "mcv.c", Line: 1553)` |
+| `pg_fuzzer_mcv_enhanced` | PostgreSQL | SQLancer bug core + Thesis Sec 6.1 E-Commerce Subsystem | 22 / 2,277B | PostgreSQL 12.0<br>`--enable-cassert --enable-debug` | `SELECT * FROM t0 WHERE t0.c2 OR ...` | `TRAP: FailedAssertion.*mcv\.c` |
+| `pg_sqlsmith_partprune` | PostgreSQL | [pgsql-hackers Thread 2397418](https://postgrespro.ru/list/thread-id/2397418)<br>**SQLsmith** | 22 / 4,616B | PostgreSQL 11-devel<br>`--enable-cassert --enable-debug` | `SELECT (select ...) FROM radicado ...` | `TRAP: FailedAssertion("!(relid_subplan_map[rti] == 0)", File: "partprune.c", Line: 244)` |
+| `pg_stack_overflow_27stmts` | PostgreSQL | [sqlancer/bugs Bug #13](https://github.com/sqlancer/bugs)<br>**SQLancer** | 27 / 1,317B | PostgreSQL 12 Beta 2<br>`--enable-cassert --enable-debug` | `ANALYZE;` | `Stack buffer overflow / SIGSEGV` |
+| `pg_view_coll_oid` | PostgreSQL | [sqlancer/bugs Bug #31](https://github.com/sqlancer/bugs)<br>**SQLancer** | 2 / 103B | PostgreSQL 12.0<br>`--enable-cassert --enable-debug` | `CREATE VIEW v0 AS SELECT ...` | `FailedAssertion("!OidIsValid(def->collOid)", File: "view.c", Line: 89)` |
+| `sqlite_fuzz_fts5_savepoint` | SQLite | [sqlancer/bugs SQLite](https://github.com/sqlancer/bugs)<br>**SQLancer** | 12 / 341B | SQLite 3.31.0-debug<br>`-DSQLITE_DEBUG=1` | `DROP TABLE vt1;` | `fts5CheckTransactionState: Assertion !iSavepoint<=p->ts.iSavepoint failed` |
+| `sqlite_fuzz_recursive_trigger` | SQLite | [SQLite Ticket 50c09fc2cf](https://www.sqlite.org/src/tktview?name=50c09fc2cf)<br>**SQLancer** | 7 / 308B | SQLite 3.30.0<br>`-O2` | `REPLACE INTO t0...` | `Segmentation fault (signal 11)` |
+| `sqlite_fuzz_vdbe_pin1` | SQLite | [sqlancer/bugs SQLite](https://github.com/sqlancer/bugs)<br>**SQLancer** | 3 / 104B | SQLite 3.31.0-debug<br>`-DSQLITE_DEBUG=1` | `UPDATE t0 SET c0 = 0;` | `sqlite3VdbeExec: Assertion !pIn1!=pIn3 failed` |
 
 ---
 

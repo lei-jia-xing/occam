@@ -1,0 +1,36 @@
+{
+  "id": "sqlite_fuzz_fts5_savepoint",
+  "file": "sqlite_fuzz_fts5_savepoint.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "SQLancer (OSDI 2020)",
+    "origin_url": "https://github.com/sqlancer/bugs",
+    "reporter": "Manuel Rigger",
+    "report_date": "2020-03-15",
+    "issue_id": "fts5CheckTransactionState assertion failure"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "fts5CheckTransactionState: Assertion `iSavepoint<=p->ts\\.iSavepoint' failed",
+    "assertion_message": "iSavepoint<=p->ts.iSavepoint",
+    "source_file": "sqlite3.c",
+    "source_line": 219981,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "DROP TABLE vt1;",
+    "statement_index": 12
+  },
+  "metrics": {
+    "statement_count": 12,
+    "byte_count": 341
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

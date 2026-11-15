@@ -1,0 +1,38 @@
+{
+  "id": "mysql_bug_91975_enhanced",
+  "file": "mysql_bug_91975_enhanced.sql",
+  "dialect": "mysql",
+  "description": "Thesis Section 6.1 enhancement: embeds Bug #91975 crash core in 18-stmt multi-table schema with global state fences",
+  "provenance": {
+    "tool": "randgen / pquery (Percona QA DBMS fuzzer)",
+    "origin_url": "https://bugs.mysql.com/bug.php?id=91975",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2018-08-08",
+    "issue_id": "Bug #91975",
+    "fixed_in_version": "MySQL 8.0.14"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.12-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion failure: sql_executor\\.cc:2956:!join->plan_is_const\\(\\)",
+    "assertion_message": "!join->plan_is_const()",
+    "source_file": "sql/sql_executor.cc",
+    "source_line": 2956,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "RENAME TABLE t1 TO t3;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 12,
+    "byte_count": 1029
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

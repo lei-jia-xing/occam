@@ -1,0 +1,38 @@
+{
+  "id": "mysql_squirrel_bug99421_enhanced",
+  "file": "mysql_squirrel_bug99421_enhanced.sql",
+  "dialect": "mysql",
+  "description": "Thesis Section 6.1 enhancement: embeds Bug #99421 crash core in 20-stmt multi-table schema with users, orders, and redundant expressions",
+  "provenance": {
+    "tool": "SQUIRREL (CCS 2020 DBMS fuzzer)",
+    "origin_url": "https://bugs.mysql.com/bug.php?id=99421",
+    "reporter": "Yongheng Chen (SQUIRREL co-author / S3 team)",
+    "report_date": "2020-05-03",
+    "issue_id": "Bug #99421",
+    "fixed_in_version": "MySQL 8.0.24"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion failure: dict0dict\\.cc:657:col_nr < static_cast<ulint>\\(table->n_t_def\\)",
+    "assertion_message": "col_nr < static_cast<ulint>(table->n_t_def)",
+    "source_file": "storage/innobase/dict/dict0dict.cc",
+    "source_line": 657,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "CREATE INDEX v2 ON v0 ( ( v1 = 127 ) , ( v1 + v1 ) , v1 , ( v1 + - -1 ) , ( v1 > 26 ) ) ;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 14,
+    "byte_count": 1282
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

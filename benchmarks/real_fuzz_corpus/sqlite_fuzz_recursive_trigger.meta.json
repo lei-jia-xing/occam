@@ -1,0 +1,34 @@
+{
+  "id": "sqlite_fuzz_recursive_trigger",
+  "file": "sqlite_fuzz_recursive_trigger.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "SQLancer",
+    "origin_url": "https://www.sqlite.org/src/tktview?name=50c09fc2cf",
+    "reporter": "Manuel Rigger",
+    "report_date": "2019-10-21",
+    "issue_id": "Crash on REPLACE INTO of a table with an AFTER DELETE trigger"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.30.0",
+    "compilation_flags": "-O2"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Segmentation fault|SIGSEGV|signal 11)",
+    "assertion_message": "Segmentation fault",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "REPLACE INTO t0(c0, c1, c2) VALUES(2, 0, -1572226132);",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 308
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

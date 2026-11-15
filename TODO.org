@@ -12,9 +12,9 @@
 - 编写 =harness/Dockerfile.target-mysql=（带 =-DWITH_DEBUG=1=）并配置健康检查。
 - 复现并规约 =benchmarks/real_fuzz_corpus/mysql_squirrel_bug99421.sql=，达成毕设 $\ge 2$ 款主流 DBMS 真实验证闭环。
 
-** TODO [#B] 扩充真实多语句崩溃语料库 (Real Fuzz Corpus)
-- 从 SQLancer、OSS-Fuzz 及 MySQL/PG 官方 Bug 库整理 5~10 个典型崩溃用例。
-- 确保每个用例均附带干净重置脚本、确定性崩溃断言与复现验证。
+** DONE [#B] 扩充真实多语句崩溃语料库 (Real Fuzz Corpus)
+- 编写 =scripts/import_real_bugs.py=，从 SQLancer、SQUIRREL、bugs.mysql.com 导入 14 个典型崩溃用例（PostgreSQL 5 例、MySQL 6 例、SQLite 3 例）。
+- 配套提供原始崩溃核与论文 Section 6.1 增强多表噪声测试集，附带规范元数据（.meta.json）与确定性崩溃断言。
 
 ** TODO [#B] 完善对比基准与论文实测数据
 - 运行 =occam=、=sequential (B1)= 与 =statement-ddmin (B2)= 在真实用例下的基线对比。

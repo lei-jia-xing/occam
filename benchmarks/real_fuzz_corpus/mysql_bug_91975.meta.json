@@ -3,36 +3,24 @@
   "file": "mysql_bug_91975.sql",
   "dialect": "mysql",
   "provenance": {
-    "tool": "MySQL/MariaDB QA fuzzer",
+    "tool": "randgen / pquery (Percona QA DBMS fuzzer)",
     "origin_url": "https://bugs.mysql.com/bug.php?id=91975",
-    "reporter": "Roel Van de Paar (MariaDB/MySQL QA engineer, acknowledged in SQUIRREL README)",
-    "report_date": "2018-08-11",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2018-08-08",
     "issue_id": "Bug #91975",
-    "status": "Closed / Fixed"
+    "fixed_in_version": "MySQL 8.0.14"
   },
   "target": {
     "dbms": "mysql",
-    "version": "8.0.12",
-    "verified_versions": [
-      "8.0.12-debug",
-      "8.0.13-debug"
-    ],
-    "git_tag": "mysql-8.0.12",
-    "compilation_flags": "cmake ../mysql/ -DDOWNLOAD_BOOST=1 -DWITH_BOOST=../boost -DWITH_DEBUG=1 -DCPACK_MONOLITHIC_INSTALL=1 -DWITH_UNIT_TESTS=OFF"
+    "version": "8.0.12-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
   },
   "crash_signature": {
-    "expected_signature": "Assertion failure: dict0dd\\.cc:1071:!fail",
-    "assertion_message": "!fail",
-    "source_file": "storage/innobase/dict/dict0dd.cc",
-    "source_line": 1071,
-    "signal": "SIGABRT (signal 6)",
-    "top_stack_frames": [
-      "__pthread_kill",
-      "my_print_stacktrace",
-      "handle_fatal_signal",
-      "ut_dbg_assertion_failed",
-      "dict_table_rename_in_cache"
-    ]
+    "expected_signature": "Assertion failure: sql_executor\\.cc:2956:!join->plan_is_const\\(\\)",
+    "assertion_message": "!join->plan_is_const()",
+    "source_file": "sql/sql_executor.cc",
+    "source_line": 2956,
+    "signal": "SIGABRT (signal 6)"
   },
   "trigger": {
     "statement": "RENAME TABLE t1 TO t3;",
@@ -44,8 +32,6 @@
   },
   "replay_verification": {
     "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
-    "runs_required": 5,
-    "expected_outcome": "CRASH",
-    "isolation": "clean per-candidate database reset before each replay"
+    "runs_required": 5
   }
 }
