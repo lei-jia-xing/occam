@@ -10,6 +10,7 @@ module Occam.Reducer (
     closeSet,
     closureDdmin,
     cutRemovedStatements,
+    cutRemovedStatementIds,
     partitionChunks,
     pruneClauses,
     simplifyExpressions,
@@ -156,14 +157,13 @@ partition includes the statement's own terminator and separator, so removing
 a statement cannot leave an orphaned delimiter or blank line behind. The
 partition is exact: it never inspects or rewrites the bytes it keeps.
 -}
-cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
-cutRemovedStatements baseSQL allStatements keptStatements =
+cutRemovedStatementIds :: ByteString -> [Statement] -> Set StatementId -> ByteString
+cutRemovedStatementIds baseSQL allStatements keptIds =
     case chunks 0 allStatements of
         [] -> BS.empty
         [single] -> single
         slices -> BS.concat slices
     where
-        keptIds = Set.fromList (map stmtId keptStatements)
         sourceLength = BS.length baseSQL
 
         chunks !cursor []
@@ -181,6 +181,10 @@ cutRemovedStatements baseSQL allStatements keptStatements =
                             then (BS.take (start - cursor) (BS.drop cursor baseSQL) :)
                             else id
                  in prefix (chunks nextStart rest)
+
+cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
+cutRemovedStatements baseSQL allStatements keptStatements =
+    cutRemovedStatementIds baseSQL allStatements (statementIds keptStatements)
 
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]
@@ -321,7 +325,7 @@ searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
             let n = min (length current) (max 1 granularity)
                 chunks = partitionChunks n current
                 currentIds = statementIds current
-                currentSQL = statementSQL baseSQL allStatements current
+                currentSQL = cutRemovedStatementIds baseSQL allStatements currentIds
                 currentLen = BS.length currentSQL
             subset <- trySubsets current currentIds currentLen chunks
             case subset of
@@ -356,8 +360,10 @@ searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
                 let removedIds = currentIds `Set.difference` seedIds
                 essential <- readIORef (fbEssentialStatements feedback)
                 failed <- readIORef (fbFailedRemovals feedback)
-                if (Set.size removedIds == 1 && any (`Set.member` essential) (Set.toList removedIds))
-                    || Set.member removedIds failed
+                let isEssentialSingle = case Set.toList removedIds of
+                        [single] -> Set.member single essential
+                        _ -> False
+                if isEssentialSingle || Set.member removedIds failed
                     then pure Nothing
                     else do
                         maybeKept <- buildCandidate current seedIds
@@ -459,11 +465,7 @@ statementAuditWithLogger logger dialect oracle initialSQL = do
                                     then go candidateSQL kept' rest (attempts + 1) (removals + 1)
                                     else go currentSQL currentKept rest (attempts + 1) removals
 
-        renderKept baseSQL allStatements kept =
-            statementSQL
-                baseSQL
-                allStatements
-                (filter (\statement -> Set.member (stmtId statement) kept) allStatements)
+        renderKept = cutRemovedStatementIds
 
 data AuditStats = AuditStats
     { auditPasses :: !Int
@@ -558,7 +560,7 @@ sliceWithAnalysis logger oracle analysis sql = do
             let sliceFor target =
                     let slice = backwardSlice (stmtId target) graph
                         retained = filter (\s -> Set.member (stmtId s) slice) statements
-                     in (retained, statementSQL sql statements retained)
+                     in (retained, cutRemovedStatementIds sql statements slice)
                 acceptSlice strategy target retained candidate = do
                     let StatementId targetId = stmtId target
                     logInfo'

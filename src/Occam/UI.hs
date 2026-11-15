@@ -1,7 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 {- |
 Module      : Occam.UI
 Description : Pragmatic, Unix-native terminal progress and summary rendering

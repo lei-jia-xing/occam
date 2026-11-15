@@ -39,6 +39,7 @@
 
 ** DONE Formal verification and theoretical guarantees (Lean 4)
 - Formally modeled and proved in Lean 4: DAG acyclicity, backward slice reachability soundness, reduction monotonic convergence, and 1-minimality (0 sorry).
+- Integrated `proof-check` into `make check` for automated continuous verification.
 
 ** DONE Hierarchical reduction engine & semantic dependency analysis
 - Implemented 4-level reduction pipeline: backward slicing -> closure ddmin -> statement audit -> unrestricted fallback.

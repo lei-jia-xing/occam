@@ -4,8 +4,6 @@ module Occam.Slicer (
 ) where
 
 import Data.Map.Strict qualified as Map
-import Data.Sequence (ViewL (..), (|>))
-import Data.Sequence qualified as Seq
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Occam.Core (StatementId)
@@ -19,13 +17,12 @@ backwardSlice target = backwardSliceMany (Set.singleton target)
 traversal, visiting each statement at most once.
 -}
 backwardSliceMany :: Set StatementId -> DependencyGraph -> Set StatementId
-backwardSliceMany roots DependencyGraph {..} =
-    go roots (Seq.fromList (Set.toList roots))
+backwardSliceMany roots DependencyGraph {..} = go roots (Set.toList roots)
     where
-        go visited queue = case Seq.viewl queue of
-            EmptyL -> visited
-            curr :< rest ->
-                let deps = Map.findWithDefault Set.empty curr graphEdges
-                    newNodes = deps `Set.difference` visited
-                    queue' = foldl' (|>) rest (Set.toList newNodes)
-                 in go (visited `Set.union` newNodes) queue'
+        go !visited [] = visited
+        go !visited (curr : rest) =
+            let deps = Map.findWithDefault Set.empty curr graphEdges
+                newNodes = deps `Set.difference` visited
+             in if Set.null newNodes
+                    then go visited rest
+                    else go (visited `Set.union` newNodes) (Set.foldl' (flip (:)) rest newNodes)

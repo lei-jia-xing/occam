@@ -1,4 +1,4 @@
-.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test check hooks dev clean completions install-completions
+.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -46,7 +46,14 @@ rust-check:
 	cargo check --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets
 	cargo clippy --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets -- -D warnings
 
-check: fmt-check lint build-check test rust-check benchmark-test
+proof-check:
+	@if command -v lake >/dev/null 2>&1; then \
+		(cd proofs && lake build); \
+	else \
+		nix develop --command bash -c "cd proofs && lake build"; \
+	fi
+
+check: fmt-check lint build-check test rust-check benchmark-test proof-check
 
 
 hooks:
