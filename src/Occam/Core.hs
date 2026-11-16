@@ -62,8 +62,14 @@ module Occam.Core (
     SemanticFacts (..),
     DmlEvent (..),
     DropOp (..),
+    OracleOutcome (..),
+    OracleInconclusiveError (..),
+    Oracle,
+    oracleAccepts,
+    oracleFromPredicate,
 ) where
 
+import Control.Exception (Exception, throwIO)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
@@ -503,3 +509,38 @@ data SemanticFacts = SemanticFacts
     , factBarriers :: ![ScopedBarrier]
     }
     deriving (Eq, Show)
+
+{- | The oracle classifies a complete candidate. Inconclusive results must not
+be silently treated as rejections because that would make reductions depend
+on timeouts or infrastructure failures.
+-}
+data OracleOutcome
+    = OracleAccepted
+    | OracleRejected
+    | OracleInconclusive
+    deriving (Eq, Ord, Show)
+
+-- | Primitive per-candidate oracle callback. Batching lives in 'Occam.Pool'.
+type Oracle = ByteString -> IO OracleOutcome
+
+data OracleInconclusiveError = OracleInconclusiveError
+    deriving (Show)
+
+instance Exception OracleInconclusiveError
+
+-- | Require a definite oracle decision, aborting the reduction otherwise.
+oracleAccepts :: Oracle -> ByteString -> IO Bool
+oracleAccepts oracle candidate = do
+    outcome <- oracle candidate
+    case outcome of
+        OracleAccepted -> pure True
+        OracleRejected -> pure False
+        OracleInconclusive -> throwIO OracleInconclusiveError
+
+{- | Lift a total Boolean predicate into an oracle. Use this only at
+integration boundaries that cannot report timeouts or infrastructure errors.
+-}
+oracleFromPredicate :: (ByteString -> IO Bool) -> Oracle
+oracleFromPredicate predicate candidate = do
+    accepted <- predicate candidate
+    pure (if accepted then OracleAccepted else OracleRejected)

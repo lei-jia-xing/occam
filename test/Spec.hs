@@ -1,7 +1,7 @@
 module Main (main) where
 
 import Benchmark (BenchmarkMetric (..))
-import Control.Exception (bracket)
+import Control.Exception (bracket, try)
 import Control.Monad (when)
 import Data.Aeson (eitherDecodeStrict')
 import Data.ByteString qualified as BS
@@ -18,7 +18,6 @@ import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (
     CacheStats (..),
-    memoizeOracle,
  )
 import Occam.Core (
     CatalogOp (..),
@@ -28,6 +27,8 @@ import Occam.Core (
     Ident (..),
     Name (..),
     NameRef (..),
+    OracleInconclusiveError,
+    OracleOutcome (..),
     ReadFact (..),
     ReadMode (..),
     SemanticFacts (..),
@@ -35,14 +36,27 @@ import Occam.Core (
     StatementId (..),
     TableDef (..),
     WriteKind (..),
+    oracleAccepts,
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
 import Occam.Logger (nullLogger)
+import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
+import Occam.Pool (
+    OraclePool,
+    PoolConfig (..),
+    newOraclePool,
+    observationDetails,
+    poolCacheStats,
+    poolOracle,
+    predicateDetails,
+    testOrdered,
+ )
 import Occam.Reducer
 import Occam.Slicer
 import OracleChecks qualified
+import PoolChecks qualified
 import ReductionChecks qualified
 import System.Directory (
     doesDirectoryExist,
@@ -88,6 +102,7 @@ tests =
         , DependencyChecks.tests
         , EvaluationChecks.tests
         , OracleChecks.tests
+        , PoolChecks.tests
         , ReductionChecks.tests
         , propertyTests
         , generativeFuzzTests
@@ -130,14 +145,15 @@ phase3Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
                         ]
-                oracle = oracleFromPredicate $ \sql -> do
+                predicate sql = do
                     let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT" sql && BSC.isInfixOf "WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
                 config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
-            reduced <- reduceSQLWithConfig config nullLogger oracle script
-            ok <- oracleAccepts oracle reduced
+            pool <- testPredicatePool predicate
+            reduced <- reduceSQLWithConfig config nullLogger pool script
+            ok <- oracleAccepts (poolOracle pool) reduced
             assertBool "Reduced SQL failed to satisfy the crash oracle" ok
             assertBool "Table t2 was not pruned" (not (BSC.isInfixOf "t2" reduced))
             assertBool "Index i1 was not pruned" (not (BSC.isInfixOf "i1" reduced))
@@ -291,6 +307,23 @@ phase5Tests =
                         ["statement-ddmin", "graph-off"]
                     observed <- BSC.readFile calls
                     assertEqual "Each child must physically execute its own preflight" "xx" observed
+        , testCase "CLI and evaluator surface --jobs help and reject invalid counts" $ do
+            mapM_
+                ( \(runner, extra) -> do
+                    (helpCode, helpOut, _) <- runner ("--help" : extra)
+                    assertEqual "help must exit zero" ExitSuccess helpCode
+                    assertBool "help hides --jobs" ("--jobs" `elem` words helpOut)
+                    mapM_
+                        ( \jobs -> withCLIInput "SELECT 1;" $ \input outDir -> do
+                            (code, _, _) <-
+                                runner ([input, "--oracle", "exit 0", "--out", outDir, "--jobs", jobs, "--quiet"] ++ extra)
+                            assertBool ("invalid --jobs was accepted: " ++ jobs) (code /= ExitSuccess)
+                            exists <- doesDirectoryExist outDir
+                            assertBool "reduction started with invalid --jobs" (not exists)
+                        )
+                        ["0", "-1", "abc"]
+                )
+                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
         ]
 
 -- ----------------------------------------------------------------------------
@@ -301,67 +334,91 @@ phase6Tests :: TestTree
 phase6Tests =
     testGroup
         "Phase 6: Candidate Memoization"
-        [ testCase "memoizeOracle caches repeated queries and tracks hits/misses" $ do
+        [ testCase "ordered pool caches repeated queries and tracks hits/misses" $ do
             callCountRef <- newIORef (0 :: Int)
             let mockOracle sql = do
                     modifyIORef' callCountRef (+ 1)
-                    pure (BSC.isInfixOf "CRASH" sql)
-
-            (cachedOracle, getStats) <- memoizeOracle (oracleFromPredicate mockOracle)
+                    pure (observationDetails (boolObservation (BSC.isInfixOf "CRASH" sql)))
+            pool <- testCountingPool 1 mockOracle
+            let oracle = poolOracle pool
 
             -- 1. Initial queries (all misses)
-            r1 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r1 <- oracleAccepts oracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "First query should return True" True r1
-            r2 <- oracleAccepts cachedOracle "SELECT 1;"
+            r2 <- oracleAccepts oracle "SELECT 1;"
             assertEqual "Second query should return False" False r2
 
             calls1 <- readIORef callCountRef
             assertEqual "Underlying oracle should be called 2 times" 2 calls1
 
-            stats1 <- getStats
+            stats1 <- poolCacheStats pool
             assertEqual "cacheHits should be 0" 0 (cacheHits stats1)
             assertEqual "cacheMisses should be 2" 2 (cacheMisses stats1)
 
             -- 2. Repeated queries (all hits)
-            r3 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r3 <- oracleAccepts oracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "Cached query 1 should return True" True r3
-            r4 <- oracleAccepts cachedOracle "SELECT 1;"
+            r4 <- oracleAccepts oracle "SELECT 1;"
             assertEqual "Cached query 2 should return False" False r4
-            r5 <- oracleAccepts cachedOracle "SELECT * FROM t1 WHERE CRASH;"
+            r5 <- oracleAccepts oracle "SELECT * FROM t1 WHERE CRASH;"
             assertEqual "Cached query 1 (second time) should return True" True r5
 
             calls2 <- readIORef callCountRef
             assertEqual "Underlying oracle should NOT be re-invoked on cache hits" 2 calls2
 
-            stats2 <- getStats
+            stats2 <- poolCacheStats pool
             assertEqual "cacheHits should be 3" 3 (cacheHits stats2)
             assertEqual "cacheMisses should remain 2" 2 (cacheMisses stats2)
 
             -- 3. Another new query (miss)
-            r6 <- oracleAccepts cachedOracle "SELECT 2;"
+            r6 <- oracleAccepts oracle "SELECT 2;"
             assertEqual "New query should return False" False r6
 
             calls3 <- readIORef callCountRef
             assertEqual "Underlying oracle should be called for new query" 3 calls3
 
-            stats3 <- getStats
+            stats3 <- poolCacheStats pool
             assertEqual "cacheHits should be 3" 3 (cacheHits stats3)
             assertEqual "cacheMisses should be 3" 3 (cacheMisses stats3)
         , testCase "inconclusive outcomes are not cached as authoritative" $ do
             callCountRef <- newIORef (0 :: Int)
             let outcomeOracle _ = do
                     modifyIORef' callCountRef (+ 1)
-                    pure OracleInconclusive
-            (cachedOracle, getStats) <- memoizeOracle outcomeOracle
-            first <- cachedOracle "SELECT 1;"
-            assertEqual "first call stays inconclusive" OracleInconclusive first
-            second <- cachedOracle "SELECT 1;"
-            assertEqual "second call stays inconclusive" OracleInconclusive second
+                    pure (observationDetails OracleTimedOut)
+            pool <- testCountingPool 1 outcomeOracle
+            let oracle = poolOracle pool
+                expectInconclusive label = do
+                    result <- try (oracle "SELECT 1;") :: IO (Either OracleInconclusiveError OracleOutcome)
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> assertFailure ("inconclusive outcome was returned as definite: " ++ label)
+            expectInconclusive "first"
+            expectInconclusive "second"
             calls <- readIORef callCountRef
             assertEqual "inconclusive result is re-observed" 2 calls
-            stats <- getStats
+            stats <- poolCacheStats pool
             assertEqual "inconclusive results are misses" 2 (cacheMisses stats)
             assertEqual "inconclusive results are not hits" 0 (cacheHits stats)
+        , testCase "concurrent duplicate candidates single-flight one physical execution" $ do
+            callCountRef <- newIORef (0 :: Int)
+            let mockOracle _ = do
+                    modifyIORef' callCountRef (+ 1)
+                    pure (observationDetails (OracleFinished (ExitFailure 1)))
+            pool <- testCountingPool 4 mockOracle
+            outcomes <- testOrdered pool (replicate 4 "SELECT 1;")
+            assertEqual "every duplicate retires" 4 (length outcomes)
+            assertBool "shared verdict rejects" (all ((== OracleRejected) . fst) outcomes)
+            calls <- readIORef callCountRef
+            assertEqual "duplicates share one physical execution" 1 calls
+            stats <- poolCacheStats pool
+            assertEqual "one miss" 1 (cacheMisses stats)
+            -- Whether a later duplicate joins the in-flight owner or hits its
+            -- completed entry depends on scheduling; either way it never
+            -- re-executes physically.
+            assertEqual
+                "every duplicate shared without re-executing"
+                3
+                (cacheHits stats + cacheJoins stats)
         ]
 
 -- ----------------------------------------------------------------------------
@@ -410,6 +467,39 @@ withGraph dialect source action = do
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
         Right parsed -> action (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
+{- | Throwaway pools for unit tests. Workers always join before 'testOrdered'
+returns, so tests never need to close these.
+-}
+testPredicatePool :: (BS.ByteString -> IO Bool) -> IO OraclePool
+testPredicatePool predicate =
+    newOraclePool
+        PoolConfig
+            { poolJobs = 1
+            , poolCacheEnabled = False
+            , poolPermits = Nothing
+            , poolPrecomputed = Map.empty
+            , poolExecute = predicateDetails predicate
+            , poolBill = const (pure ())
+            , poolRetire = \_ _ _ _ -> pure ()
+            }
+
+testCountingPool :: Int -> (BS.ByteString -> IO OracleObservationDetails) -> IO OraclePool
+testCountingPool jobs execute =
+    newOraclePool
+        PoolConfig
+            { poolJobs = jobs
+            , poolCacheEnabled = True
+            , poolPermits = Nothing
+            , poolPrecomputed = Map.empty
+            , poolExecute = execute
+            , poolBill = const (pure ())
+            , poolRetire = \_ _ _ _ -> pure ()
+            }
+
+boolObservation :: Bool -> OracleObservation
+boolObservation accepted =
+    if accepted then OracleFinished ExitSuccess else OracleFinished (ExitFailure 1)
+
 -- ----------------------------------------------------------------------------
 -- Phase 8: Internal statement controls
 -- ----------------------------------------------------------------------------
@@ -429,13 +519,14 @@ phase8Tests =
                                 , "CREATE TABLE t3 (d INT);"
                                 , "SELECT * FROM t1 WHERE a > 0;"
                                 ]
-                        oracle = oracleFromPredicate $ \sql -> do
+                        predicate sql = do
                             let hasT1 = BSC.isInfixOf "CREATE TABLE t1" sql
                                 hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                                 hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                             pure (hasT1 && hasIns && hasSel)
-                    reduced <- reduce GenericSQL oracle script
-                    accepted <- oracleAccepts oracle reduced
+                    pool <- testPredicatePool predicate
+                    reduced <- reduce GenericSQL pool script
+                    accepted <- oracleAccepts (poolOracle pool) reduced
                     assertBool (name ++ " must satisfy oracle") accepted
                     assertBool (name ++ " should remove dead table t2") (not (BSC.isInfixOf "t2" reduced))
                     assertBool (name ++ " should remove dead table t3") (not (BSC.isInfixOf "t3" reduced))

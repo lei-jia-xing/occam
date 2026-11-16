@@ -98,6 +98,18 @@ mod tests {
             &ParseConfig {
                 dialect,
                 server: ServerConfig::default(),
+                chunk_edits: false,
+            },
+        )
+    }
+
+    fn parse_chunks(sql: &str, dialect: DialectKind) -> Result<Vec<NativeUnit>, String> {
+        parse_units(
+            sql,
+            &ParseConfig {
+                dialect,
+                server: ServerConfig::default(),
+                chunk_edits: true,
             },
         )
     }
@@ -311,6 +323,90 @@ mod tests {
     }
 
     #[test]
+    fn list_chunks_delete_contiguous_values_rows_before_singles() {
+        let sql = "INSERT INTO t(a,b) VALUES (1,2),(3,4),(5,6),(42,43);";
+        let units = parse_chunks(sql, DialectKind::SQLite).unwrap();
+        let edits = &facts(&units[0]).edits;
+        let applied: Vec<String> = edits
+            .iter()
+            .filter(|edit| edit.label == "remove-values_row-chunk")
+            .map(|edit| {
+                assert!(edit.replacement.is_empty());
+                assert!(sql.is_char_boundary(edit.start));
+                assert!(sql.is_char_boundary(edit.end));
+                format!(
+                    "{}{}{}",
+                    &sql[..edit.start],
+                    edit.replacement,
+                    &sql[edit.end..]
+                )
+            })
+            .collect();
+        assert_eq!(
+            applied,
+            vec![
+                "INSERT INTO t(a,b) VALUES (5,6),(42,43);",
+                "INSERT INTO t(a,b) VALUES (1,2),(3,4);",
+            ]
+        );
+        for candidate in &applied {
+            let reparsed = parse_chunks(candidate, DialectKind::SQLite).unwrap();
+            assert!(reparsed[0].facts.is_some());
+        }
+        let first_single = edits
+            .iter()
+            .position(|edit| edit.label == "remove-values_row")
+            .unwrap();
+        let last_chunk = edits
+            .iter()
+            .rposition(|edit| edit.label == "remove-values_row-chunk")
+            .unwrap();
+        assert!(last_chunk < first_single);
+        let single = edits
+            .iter()
+            .find(|edit| edit.label == "remove-values_row")
+            .unwrap();
+        let reduced = format!(
+            "{}{}{}",
+            &sql[..single.start],
+            single.replacement,
+            &sql[single.end..]
+        );
+        assert_eq!(reduced, "INSERT INTO t(a,b) VALUES (3,4),(5,6),(42,43);");
+    }
+
+    #[test]
+    fn list_chunks_carry_comments_and_preserve_unicode_crlf() {
+        let sql = "-- caf\u{e9}\nSELECT * FROM t WHERE x IN (1, /* drop */ 2, 3);\r\n";
+        let units = parse_chunks(sql, DialectKind::SQLite).unwrap();
+        let edits = &facts(&units[0]).edits;
+        let applied: Vec<String> = edits
+            .iter()
+            .filter(|edit| edit.label == "remove-in_list-chunk")
+            .map(|edit| {
+                assert!(sql.is_char_boundary(edit.start));
+                assert!(sql.is_char_boundary(edit.end));
+                format!(
+                    "{}{}{}",
+                    &sql[..edit.start],
+                    edit.replacement,
+                    &sql[edit.end..]
+                )
+            })
+            .collect();
+        assert_eq!(
+            applied,
+            vec!["-- caf\u{e9}\nSELECT * FROM t WHERE x IN (3);\r\n"]
+        );
+        for candidate in &applied {
+            assert!(candidate.starts_with("-- caf\u{e9}\n"));
+            assert!(candidate.ends_with(";\r\n"));
+            let reparsed = parse_chunks(candidate, DialectKind::SQLite).unwrap();
+            assert!(reparsed[0].facts.is_some());
+        }
+    }
+
+    #[test]
     fn quoted_dots_and_trigger_drop_keep_canonical_actions() {
         let sql = "CREATE TABLE t (\"a.b\" INT); INSERT INTO t (\"a.b\") VALUES (1); ALTER TABLE \"old.schema\".t RENAME TO \"new.name\"; DROP TRIGGER tr ON t;";
         let units = parse(sql, DialectKind::PostgreSql).unwrap();
@@ -403,6 +499,7 @@ mod tests {
         let config = serde_json::to_vec(&ParseConfig {
             dialect: DialectKind::SQLite,
             server: ServerConfig::default(),
+            chunk_edits: false,
         })
         .unwrap();
         let mut output: *mut u8 = std::ptr::null_mut();
@@ -1409,6 +1506,7 @@ mod tests {
                 foreign_key_checks,
                 ..ServerConfig::default()
             },
+            chunk_edits: false,
         };
         assert!(
             !crate::ffi::session_init(&config(DialectKind::SQLite, None)).foreign_key_checks,

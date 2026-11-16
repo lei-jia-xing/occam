@@ -10,10 +10,11 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text.Encoding qualified as TE
-import Occam.Core (StatementId (..))
+import Occam.Core (OracleInconclusiveError, OracleOutcome (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (StatementUnit (..))
 import Occam.Logger (nullLogger)
+import Occam.Oracle (OracleObservation (..))
 import Occam.Parser (
     ParsedSQL (..),
     ParserError (..),
@@ -23,19 +24,22 @@ import Occam.Parser (
     defaultParseOptions,
     parseSQL,
  )
+import Occam.Pool (
+    OraclePool,
+    PoolConfig (..),
+    newOraclePool,
+    observationDetails,
+ )
 import Occam.Reducer (
-    Oracle,
-    OracleInconclusiveError,
-    OracleOutcome (..),
     ReductionConfig (..),
     defaultReductionConfig,
     findInterestingPrefix,
-    oracleFromPredicate,
     reduceSQL,
     reduceSQLWithConfig,
     statementAudit,
     statementDdmin,
  )
+import System.Exit (ExitCode (..))
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
@@ -61,8 +65,8 @@ tests =
                         "query must not depend on an unrelated table with the same column name"
                         (Set.notMember (StatementId 2) dependencies)
         , testCase "Configured SQL dialect changes dependency closure" $ do
+            pool <- predicatePool (BSC.isInfixOf "SELECT id")
             let sql = BSC.pack "CREATE TABLE \"MiXeD\" (id INT);\nSELECT id FROM \"mixed\";\n"
-                oracle = predicateOracle (BSC.isInfixOf "SELECT id")
                 config dialect =
                     defaultReductionConfig
                         { reductionSlicing = False
@@ -71,14 +75,16 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = dialect
                         }
-            postgres <- reduceSQLWithConfig (config PostgreSQL) nullLogger oracle sql
-            sqlite <- reduceSQLWithConfig (config SQLite) nullLogger oracle sql
+            postgres <- reduceSQLWithConfig (config PostgreSQL) nullLogger pool sql
+            sqlite <- reduceSQLWithConfig (config SQLite) nullLogger pool sql
             assertEqual
                 "PostgreSQL quoted identifiers retain case"
                 (BSC.pack "SELECT id FROM \"mixed\";\n")
                 postgres
             assertEqual "SQLite folds quoted identifiers for closure" sql sqlite
         , testCase "Closure search prunes unneeded independent subgraphs" $ do
+            pool <-
+                predicatePool (\candidate -> BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE unneeded_tbl (id INT);"
@@ -88,33 +94,33 @@ tests =
                         , "INSERT INTO crash_tbl VALUES (42);"
                         , "SELECT * FROM crash_tbl WHERE id = 42;"
                         ]
-                oracle =
-                    predicateOracle (\candidate -> BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)
                 config =
                     defaultReductionConfig
                         { reductionIntraStatement = False
                         , reductionUnrestricted = False
                         }
-            reduced <- reduceSQLWithConfig config nullLogger oracle sql
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
             assertBool "keeps crash table" (BSC.isInfixOf "crash_tbl" reduced)
             assertBool "keeps crash value" (BSC.isInfixOf "42" reduced)
             assertBool "eliminates unneeded subgraph" (not (BSC.isInfixOf "unneeded_tbl" reduced))
         , testCase "Constraint stripping and deeper branch pruning simplify table definitions and expressions" $ do
+            pool <-
+                predicatePool
+                    (\candidate -> BSC.isInfixOf "42" candidate && BSC.isInfixOf "CREATE TABLE t" candidate)
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'abc', PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p(id));"
                         , "SELECT CASE WHEN id = 1 THEN 42 ELSE 0 END, COALESCE(id, 0), id IS NOT NULL FROM t;"
                         ]
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "42" candidate && BSC.isInfixOf "CREATE TABLE t" candidate)
                 config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
-            reduced <- reduceSQLWithConfig config nullLogger oracle sql
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
             assertBool "strips table constraint" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
             assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
+            pool <-
+                predicatePool (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE helper (hid INT);"
@@ -123,10 +129,8 @@ tests =
                         , "INSERT INTO main_tbl VALUES (42);"
                         , "SELECT id FROM main_tbl WHERE id = 42 AND (SELECT COUNT(*) FROM helper) > 0;"
                         ]
-                oracle =
-                    predicateOracle (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)
                 config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
-            reduced <- reduceSQLWithConfig config nullLogger oracle sql
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
             assertBool "keeps main table" (BSC.isInfixOf "main_tbl" reduced)
             assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
             assertBool "eliminates helper table via interleaved audit" (not (BSC.isInfixOf "helper" reduced))
@@ -135,22 +139,24 @@ tests =
             let sql = BSC.unlines ["SELECT 101;", "SELECT 202;", "SELECT 303;"]
                 accepted = BSC.pack "SELECT 101;\nSELECT 303;\n"
                 final = BSC.pack "SELECT 303;\n"
-                oracle = predicateOracle (\candidate -> candidate == sql || candidate == accepted || candidate == final)
-            fixedPoint <- statementAudit GenericSQL oracle sql
+            pool <-
+                predicatePool (\candidate -> candidate == sql || candidate == accepted || candidate == final)
+            fixedPoint <- statementAudit GenericSQL pool sql
             assertEqual "a statement becomes removable only after an earlier deletion" final fixedPoint
-            empty <- statementAudit GenericSQL (predicateOracle (const True)) "SELECT 7;"
+            emptyPool <- predicatePool (const True)
+            empty <- statementAudit GenericSQL emptyPool "SELECT 7;"
             assertEqual "the empty candidate is not prohibited" BS.empty empty
+            keepPool <- predicatePool (BSC.isInfixOf "SELECT 11")
             let bytes = BSC.pack "SELECT 11;\r\nSELECT 22;\n"
                 firstStatement = BSC.pack "SELECT 11;\r\n"
-                keepFirst = predicateOracle (BSC.isInfixOf "SELECT 11")
-            byteResult <- statementDdmin GenericSQL keepFirst bytes
+            byteResult <- statementDdmin GenericSQL keepPool bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
         , testCase "statement deletion removes exactly its own terminator and separator" $ do
+            pool <-
+                predicatePool
+                    (\candidate -> BSC.isInfixOf "SELECT 2" candidate && BSC.isInfixOf "SELECT 3" candidate)
             let sql = BSC.pack "SELECT 1;\r\n\r\nSELECT 2;\r\nSELECT 3;\r\n"
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "SELECT 2" candidate && BSC.isInfixOf "SELECT 3" candidate)
-            reduced <- statementDdmin GenericSQL oracle sql
+            reduced <- statementDdmin GenericSQL pool sql
             assertEqual
                 "the removed statement takes its CRLF and blank separator with it"
                 (BSC.pack "SELECT 2;\r\nSELECT 3;\r\n")
@@ -160,56 +166,68 @@ tests =
                 kept = "kept AS (SELECT 42 AS value)"
                 query = "SELECT value FROM kept;\r\n"
                 sql = prefix <> "WITH unused AS (SELECT 1), " <> kept <> " " <> query
-                oracle = predicateOracle (\candidate -> BS.isInfixOf kept candidate && BS.isInfixOf query candidate)
-            reduced <- syntaxOnly SQLite oracle sql
+            pool <- predicatePool (\candidate -> BS.isInfixOf kept candidate && BS.isInfixOf query candidate)
+            reduced <- syntaxOnly SQLite pool sql
             assertBool "the unnecessary CTE is removed" (not (BSC.isInfixOf "unused" reduced))
             assertBool "the required CTE is unchanged" (BS.isInfixOf kept reduced)
             assertBool "the Unicode prefix is untouched" (BS.isPrefixOf prefix reduced)
             assertBool "the query and CRLF ending are untouched" (BS.isSuffixOf query reduced)
+            secondPool <- predicatePool (BSC.isInfixOf "SELECT 42;")
             withoutCTEs <-
                 syntaxOnly
                     SQLite
-                    (predicateOracle (BSC.isInfixOf "SELECT 42;"))
+                    secondPool
                     "WITH unused AS (SELECT 1) SELECT 42;"
             assertBool
                 "the final unnecessary CTE and WITH keyword can disappear"
                 (not (BSC.isInfixOf "WITH" withoutCTEs))
         , testCase "VALUES row reduction excludes the INSERT target column list" $ do
+            pool <-
+                predicatePool
+                    (\candidate -> BSC.isInfixOf "t(a,b)" candidate && BSC.isInfixOf "(42,43)" candidate)
             let sql = "INSERT INTO t(a,b) VALUES (1,2),(42,43);"
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "t(a,b)" candidate && BSC.isInfixOf "(42,43)" candidate)
-            reduced <- syntaxOnly SQLite oracle sql
+            reduced <- syntaxOnly SQLite pool sql
             assertEqual
                 "only the irrelevant VALUES row and its comma are removed"
                 "INSERT INTO t(a,b) VALUES (42,43);"
                 reduced
+        , testCase "VALUES chunk deletion removes contiguous rows with exact separators" $ do
+            pool <- predicatePool (BSC.isInfixOf "(42)")
+            let prefix = TE.encodeUtf8 "-- café\n"
+                sql = prefix <> "INSERT INTO t VALUES (1),(2),(3),(42);\r\n"
+                expected = prefix <> "INSERT INTO t VALUES (42);\r\n"
+            reduced <- syntaxOnly SQLite pool sql
+            assertEqual
+                "contiguous chunk deletions and singles leave exact separators and untouched bytes"
+                expected
+                reduced
         , testCase "unused projection terms are removed inside a subquery" $ do
+            pool <-
+                predicatePool
+                    (\candidate -> BSC.isInfixOf "SELECT a FROM" candidate && BSC.isInfixOf "42 AS a" candidate)
             let sql = "SELECT a FROM (SELECT 42 AS a,99 AS b);\r\n"
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "SELECT a FROM" candidate && BSC.isInfixOf "42 AS a" candidate)
-            reduced <- syntaxOnly SQLite oracle sql
+            reduced <- syntaxOnly SQLite pool sql
             assertEqual
                 "the unused projection and comma disappear without reformatting"
                 "SELECT a FROM (SELECT 42 AS a);\r\n"
                 reduced
         , testCase "OFFSET can disappear while a required LIMIT remains" $ do
+            pool <-
+                predicatePool
+                    (\candidate -> BSC.isInfixOf "SELECT a FROM t" candidate && BSC.isInfixOf "LIMIT 1" candidate)
             let sql = "SELECT a FROM t LIMIT 1 OFFSET 0;\r\n"
-                oracle =
-                    predicateOracle
-                        (\candidate -> BSC.isInfixOf "SELECT a FROM t" candidate && BSC.isInfixOf "LIMIT 1" candidate)
-            reduced <- syntaxOnly SQLite oracle sql
+            reduced <- syntaxOnly SQLite pool sql
             assertEqual
                 "LIMIT and the original ending survive OFFSET removal"
                 "SELECT a FROM t LIMIT 1;\r\n"
                 reduced
         , testCase "literal scalar subqueries collapse using their exact source span" $ do
+            pool <- predicatePool (BSC.isInfixOf "42")
             let prefix = TE.encodeUtf8 "-- café\n"
                 sql = prefix <> "SELECT (SELECT 42);\r\n"
-            reduced <- syntaxOnly SQLite (predicateOracle (BSC.isInfixOf "42")) sql
+            reduced <- syntaxOnly SQLite pool sql
             assertEqual "outer Unicode and CRLF bytes remain untouched" (prefix <> "SELECT 42;\r\n") reduced
-            tableQuery <- syntaxOnly SQLite (predicateOracle (BSC.isInfixOf "42")) "SELECT * FROM (SELECT 42);"
+            tableQuery <- syntaxOnly SQLite pool "SELECT * FROM (SELECT 42);"
             assertBool
                 "table subqueries are not replaced by scalar literals"
                 (not (BSC.isInfixOf "FROM 42" tableQuery))
@@ -236,11 +254,11 @@ tests =
                 -- A deterministic external predicate accepts these three complete valid scripts.
                 accepted = Set.fromList [initial, afterChild, expected]
             observations <- newIORef ([] :: [(ByteString, Bool)])
-            let oracle candidate = do
-                    let wasAccepted = Set.member candidate accepted
-                    modifyIORef' observations ((candidate, wasAccepted) :)
-                    pure (if wasAccepted then OracleAccepted else OracleRejected)
-            reduced <- syntaxOnly SQLite oracle initial
+            pool <- outcomePool $ \candidate -> do
+                let wasAccepted = Set.member candidate accepted
+                modifyIORef' observations ((candidate, wasAccepted) :)
+                pure (if wasAccepted then OracleAccepted else OracleRejected)
+            reduced <- syntaxOnly SQLite pool initial
             seen <- reverse <$> readIORef observations
             let observedSQL = map fst seen
             assertEqual "the later parent deletion is accepted after its child" expected reduced
@@ -266,10 +284,11 @@ tests =
                 target = TE.encodeUtf8 "SELECT 'semi;colon';\r\n"
                 sql = prefix <> unused <> trigger <> "\r\n" <> target <> BSC.pack "SELECT 9;\n"
                 expected = prefix <> trigger <> "\r\n" <> target
-                oracle = predicateOracle (\candidate -> BS.isInfixOf trigger candidate && BS.isInfixOf target candidate)
+            pool <-
+                predicatePool (\candidate -> BS.isInfixOf trigger candidate && BS.isInfixOf target candidate)
             statementCount <- countOrFail SQLite sql
             assertEqual "table, trigger, target, and following SELECT are four source units" 4 statementCount
-            reduced <- statementDdmin SQLite oracle sql
+            reduced <- statementDdmin SQLite pool sql
             assertEqual "the trigger is one source statement and retained bytes are untouched" expected reduced
         , testCase "Statement counting follows each selected SQL dialect" $ do
             sqliteCount <- countOrFail SQLite "SELECT /*; block */ 'a;b'; -- line; comment\nSELECT [g;h];"
@@ -294,9 +313,9 @@ tests =
             assertEqual "Snowflake statements stay within units" 2 snowflakeCount
             assertEqual "BigQuery statements stay within units" 2 bigqueryCount
         , testCase "inconclusive oracle outcomes abort reduction" $ do
-            let inconclusive _ = pure OracleInconclusive
+            pool <- outcomePool (\_ -> pure OracleInconclusive)
             result <-
-                try (reduceSQL GenericSQL inconclusive "SELECT 1;") ::
+                try (reduceSQL GenericSQL pool "SELECT 1;") ::
                     IO (Either OracleInconclusiveError ByteString)
             case result of
                 Left _ -> pure ()
@@ -309,10 +328,10 @@ tests =
                 Left err -> assertEqual "invalid UTF-8 has a typed parser error" ParserInvalidUtf8 (parserErrorKind err)
                 Right count -> assertFailure ("invalid UTF-8 unexpectedly counted as " ++ show count)
         , testCase "reducer propagates parser transport failures" $ do
+            pool <- predicatePool (== BS.pack [255])
             let invalidUtf8 = BS.pack [255]
-                acceptingOracle = predicateOracle (== invalidUtf8)
             result <-
-                try (reduceSQL SQLite acceptingOracle invalidUtf8) ::
+                try (reduceSQL SQLite pool invalidUtf8) ::
                     IO (Either IOException ByteString)
             case result of
                 Left _ -> pure ()
@@ -320,29 +339,31 @@ tests =
         , testCase "findInterestingPrefix binary search handles empty, 1-stmt, tail, middle, and no-match" $ do
             let mkSQL n = BSC.unlines [BSC.pack ("SELECT " ++ show i ++ ";") | i <- [1 .. n]]
             -- Case 1: Empty list
-            (resEmpty, testsEmpty) <- findInterestingPrefix (predicateOracle (const True)) BS.empty []
+            emptyPool <- predicatePool (const True)
+            (resEmpty, testsEmpty) <- findInterestingPrefix emptyPool BS.empty []
             assertEqual "empty statements returns Nothing" Nothing resEmpty
             assertEqual "empty statements does 0 tests" 0 testsEmpty
 
             -- Case 2: 1-statement matching
+            onePool <- predicatePool (const True)
             parsed1 <- parseSQL (defaultParseOptions SQLite) "SELECT 1;"
             case parsed1 of
                 Left err -> assertFailure (show err)
                 Right p1 -> do
                     let stmts1 = map unitStatement (parsedUnits p1)
-                    (res1, tests1) <- findInterestingPrefix (predicateOracle (const True)) "SELECT 1;" stmts1
+                    (res1, tests1) <- findInterestingPrefix onePool "SELECT 1;" stmts1
                     assertBool "1-stmt matches" (isJust res1)
                     assertEqual "1-stmt does 1 test" 1 tests1
 
             -- Case 3: 21 statements with tail crash (prefix >= 21)
+            tailPool <- predicatePool (BSC.isInfixOf "SELECT 21;")
             let sql21 = mkSQL (21 :: Int)
             parsed21 <- parseSQL (defaultParseOptions SQLite) sql21
             case parsed21 of
                 Left err -> assertFailure (show err)
                 Right p21 -> do
                     let stmts21 = map unitStatement (parsedUnits p21)
-                        tailOracle = predicateOracle (BSC.isInfixOf "SELECT 21;")
-                    (resTail, testsTail) <- findInterestingPrefix tailOracle sql21 stmts21
+                    (resTail, testsTail) <- findInterestingPrefix tailPool sql21 stmts21
                     case resTail of
                         Nothing -> assertFailure "failed to find tail crash prefix"
                         Just (_, _, prefixLen) -> do
@@ -350,12 +371,12 @@ tests =
                             assertBool ("binary search takes <= 5 tests (took " ++ show testsTail ++ ")") (testsTail <= 5)
 
             -- Case 4: 21 statements with middle crash (prefix >= 7)
+            midPool <- predicatePool (BSC.isInfixOf "SELECT 7;")
             case parsed21 of
                 Left err -> assertFailure (show err)
                 Right p21 -> do
                     let stmts21 = map unitStatement (parsedUnits p21)
-                        midOracle = predicateOracle (BSC.isInfixOf "SELECT 7;")
-                    (resMid, testsMid) <- findInterestingPrefix midOracle sql21 stmts21
+                    (resMid, testsMid) <- findInterestingPrefix midPool sql21 stmts21
                     case resMid of
                         Nothing -> assertFailure "failed to find middle crash prefix"
                         Just (_, _, prefixLen) -> do
@@ -363,12 +384,12 @@ tests =
                             assertBool ("binary search takes <= 5 tests (took " ++ show testsMid ++ ")") (testsMid <= 5)
 
             -- Case 5: 21 statements with no match
+            noPool <- predicatePool (const False)
             case parsed21 of
                 Left err -> assertFailure (show err)
                 Right p21 -> do
                     let stmts21 = map unitStatement (parsedUnits p21)
-                        noOracle = predicateOracle (const False)
-                    (resNo, testsNo) <- findInterestingPrefix noOracle sql21 stmts21
+                    (resNo, testsNo) <- findInterestingPrefix noPool sql21 stmts21
                     assertEqual "no match returns Nothing" Nothing resNo
                     assertBool ("binary search takes <= 5 tests (took " ++ show testsNo ++ ")") (testsNo <= 5)
         , testCase "syntax search reaches a late clause after earlier same-category rejections" $ do
@@ -386,18 +407,62 @@ tests =
                                 && BSC.isInfixOf "SELECT 42;" candidate
                            )
             rejected <- newIORef (0 :: Int)
-            let oracle candidate =
-                    if accepts candidate
-                        then pure OracleAccepted
-                        else do
-                            modifyIORef' rejected (+ 1)
-                            pure OracleRejected
-            reduced <- syntaxOnly SQLite oracle sql
+            pool <- outcomePool $ \candidate ->
+                if accepts candidate
+                    then pure OracleAccepted
+                    else do
+                        modifyIORef' rejected (+ 1)
+                        pure OracleRejected
+            reduced <- syntaxOnly SQLite pool sql
             rejectionCount <- readIORef rejected
             assertEqual "the final clause is removed after earlier clauses remain" expected reduced
             assertBool
                 "the earlier same-category candidates were rejected"
                 (rejectionCount >= length earlier)
+        , testCase "statement ddmin re-tests a removal enabled by a later shrink (jobs 1 and 4)" $ do
+            -- Statement-ID-keyed rejection memo is unsound: dropping the
+            -- second A is rejected while B is present, then becomes valid
+            -- once B is gone. Only exact candidate bytes memoize verdicts.
+            let sql = BSC.unlines ["SELECT 0;", "SELECT 1;", "SELECT 0;", "SELECT 2;", "SELECT 42;"]
+                expected = BSC.pack "SELECT 1;\nSELECT 42;\n"
+                interesting candidate =
+                    BSC.isInfixOf "SELECT 1;" candidate
+                        && BSC.isInfixOf "SELECT 42;" candidate
+                        && ( not (BSC.isInfixOf "SELECT 2;" candidate)
+                                || length (filter (== "SELECT 0;") (BSC.lines candidate)) >= 2
+                           )
+            mapM_
+                ( \jobs -> do
+                    pool <- jobsPool jobs interesting
+                    reduced <- statementDdmin GenericSQL pool sql
+                    assertEqual ("ddmin reaches C,M with jobs=" ++ show jobs) expected reduced
+                )
+                [1, 4]
+        , testCase "jobs 1 and 4 agree on audit, ddmin, and syntax fixed points" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a INT, b TEXT);"
+                        , "CREATE TABLE t2 (c INT);"
+                        , "INSERT INTO t1 VALUES (1, 'x');"
+                        , "CREATE INDEX i1 ON t1 (a);"
+                        , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
+                        ]
+                interesting candidate =
+                    BSC.isInfixOf "CREATE TABLE t1" candidate
+                        && BSC.isInfixOf "INSERT INTO t1" candidate
+                        && BSC.isInfixOf "WHERE a > 0" candidate
+            mapM_
+                ( \(name, reduce) -> do
+                    serialPool <- jobsPool 1 interesting
+                    serial <- reduce serialPool sql
+                    widePool <- jobsPool 4 interesting
+                    wide <- reduce widePool sql
+                    assertEqual (name ++ " agrees across job counts") serial wide
+                )
+                [ ("statement audit", statementAudit GenericSQL)
+                , ("statement ddmin", statementDdmin GenericSQL)
+                , ("syntax only", syntaxOnly GenericSQL)
+                ]
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int
@@ -407,10 +472,41 @@ countOrFail dialect sql = do
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
         Right count -> pure count
 
-predicateOracle :: (ByteString -> Bool) -> Oracle
-predicateOracle predicate = oracleFromPredicate (pure . predicate)
+{- | Throwaway in-process pools for search-logic tests (serial, no cache, no
+budget). Window workers always join before 'testOrdered' returns, so tests
+never need to close these pools.
+-}
+predicatePool :: (ByteString -> Bool) -> IO OraclePool
+predicatePool predicate = testPoolWith 1 (pure . decide)
+    where
+        decide candidate = if predicate candidate then OracleAccepted else OracleRejected
 
-syntaxOnly :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+outcomePool :: (ByteString -> IO OracleOutcome) -> IO OraclePool
+outcomePool = testPoolWith 1
+
+jobsPool :: Int -> (ByteString -> Bool) -> IO OraclePool
+jobsPool jobs predicate = testPoolWith jobs (pure . decide)
+    where
+        decide candidate = if predicate candidate then OracleAccepted else OracleRejected
+
+testPoolWith :: Int -> (ByteString -> IO OracleOutcome) -> IO OraclePool
+testPoolWith jobs decide =
+    newOraclePool
+        PoolConfig
+            { poolJobs = jobs
+            , poolCacheEnabled = False
+            , poolPermits = Nothing
+            , poolPrecomputed = Map.empty
+            , poolExecute = fmap (observationDetails . toObservation) . decide
+            , poolBill = const (pure ())
+            , poolRetire = \_ _ _ _ -> pure ()
+            }
+    where
+        toObservation OracleAccepted = OracleFinished ExitSuccess
+        toObservation OracleRejected = OracleFinished (ExitFailure 1)
+        toObservation OracleInconclusive = OracleTimedOut
+
+syntaxOnly :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 syntaxOnly dialect =
     reduceSQLWithConfig
         defaultReductionConfig

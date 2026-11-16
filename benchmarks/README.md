@@ -314,9 +314,39 @@ checkpoints passed native and common final validation. See the report for
 native/common cost scopes, pglast 8.8 syntax diagnostics, and timeout
 limitations.
 
+#### Bounded --jobs paired measurement (2026-11-16)
 
+The immutable same-binary jobs1-vs-jobs4 paired run is
+[`benchmark_artifacts/concurrency-jobs1-vs-jobs4-20261116-a/`](benchmark_artifacts/concurrency-jobs1-vs-jobs4-20261116-a/);
+per-pair verdicts and the aggregate are
+[`pairs.json`](benchmark_artifacts/concurrency-jobs1-vs-jobs4-20261116-a/pairs.json)
+and
+[`summary.json`](benchmark_artifacts/concurrency-jobs1-vs-jobs4-20261116-a/summary.json).
+The prepared runner and fixed protocol are
+[`run_paired.py`](benchmark_artifacts/concurrency-paired-jobs-20261116-a/run_paired.py)
+and
+[`PROTOCOL.json`](benchmark_artifacts/concurrency-paired-jobs-20261116-a/PROTOCOL.json).
 
+Both arms ran the same snapshotted new binary (`98d276d9...`) under the same
+inherited CPUs {0,1,2,3} with `GHCRTS=-N1`, on the 64-row SUM workload only:
+4 AB/BA pairs (8 arms), 90 s outer / 1 s per call / no execution cap, helpers
+`5b36f6` + `713cd458` verified against the frozen ledger (drift refuses the run).
+Strict completion (rc 0, native completed, native final 2/pass, output present,
+common double validation) held for all 8 arms with zero blockers; missing
+metrics would classify `INCOMPLETE-PROFILE` and excluded pairs never enter
+ratios. All 4 pairs jointly completed with identical `67B` endpoints matching
+the recorded frozen endpoint, each validated twice.
 
+Reducer-wall jobs4/jobs1 ratios were 0.531/0.600/0.550/0.573 (AB-1/AB-2/BA-1/BA-2),
+median 0.561, on jointly-completed identical-bytes pairs only. Physical oracle
+attempts were 46 vs 31 every rep; jobs4 recorded cancels 9/11/14/11, joins 11,
+and cache hits 34 per arm, with reducer-phase unknowns kept as cost-only (never
+downgrades). The pre-scenario CLI phase captured `--help` and rejected invalid
+`--jobs` values (0/-1/abc/huge) with zero oracle side effects.
+
+This is narrow same-resource paired evidence for one workload only: not a
+primary-protocol score, not an eight-input run, not an SQLancer comparison, and
+not a general speedup claim.
 
 ## Internal profile worker
 
@@ -600,6 +630,8 @@ Scoped adapter checks have exercised SQLite and PostgreSQL multi-statement predi
 
 Predicate stdout/stderr are opaque, and every raw nonzero predicate exit (including 124/125/126) rejects SQL. Wrapper-owned failures are carried by fresh typed JSONL audit records, not log text. The internal checker translates those records into its explicit 0/1/124/125/126 protocol; both upstream adapters stop on an inconclusive timeout instead of treating it as rejection.
 
+`oracle_exec.py` waits on each leader with a dedicated blocking-wait reaper thread under the same absolute deadline, verdict taxonomy, and JSONL audit contract; waiter errors propagate through the existing cancel path and verdicts follow leader exit rather than stream EOF. This is a generic external-oracle adapter latency change only (native search untouched): the paired same-protocol probe (`benchmark_artifacts/oracle-latency-paired-20261116-a/paired.json`, frozen 9ba1c269 consumer, AB/BA rotation) measured median -28.2ms per oracle observation over 10 kept pairs (10/10 negative, all accepted; sleep-0.07 control -48.8ms, 3/3), under recorded host startup-timing drift. The fresh 32-child score (`benchmark_artifacts/external-comparison-eventwait-20261116-a/`, analysis in `external-comparison-eventwait-analysis-20261116-a/report.md`) is an observed fresh cohort, not a same-binary RCT: before ran f9b9e0ce/Reducer-177cfd87, after runs 57de9a75/Reducer-32a483df (drift is the committed fmt/fromMaybe mechanical fix; same phase-forward-sweep policy), and all other scripts/predicate/interpreter are identical except oracle_exec 9068a812->5b36f6b2. After-occam completed 6/16 (8 timeouts, 2 CTE-error validated checkpoints) and after-sqlancer 10/16 (6 timeouts), every output twice-validated; cross-tool joint completion is 4 slots (upsert x2, statements-64 x2) at wall 1.07/obs 0.66. SQLancer before/after has no native drift (same pin and predicate), but its old/new full scores are not interleaved: 6 jointly completed pairs at median before/after wall 1.25 with identical observation counts is an observed joint-completion ratio, not exclusive causal proof or a guaranteed gain. Selected SQLite seed/scale inputs from local checkouts only (not fresh-checkout packaging); scale_study lazy-import scope intentionally deferred (guard-bound SHA); no censored speedups or global claims.
+
 Outer initial/final checks are reported separately. Native execution caps include native preflight/final checks; callback caps cover shared-checker observations, including adapter format probes. Adapter overhead counts toward the wall deadline. Do not present differing internal validation protocols as identical callback counts; compare their scope and final fresh-state checks explicitly.
 
 ## Dependency reconstruction versus SQL state slicing
@@ -786,3 +818,21 @@ An immutable measurement suite in `benchmarks/benchmark_artifacts/json-cost-2026
 5. **Reducer Invariants & Limits**: A single-run trace of `statementDdmin` on `workload_scale_512.sql` confirms that initial input ingestion accounts for 95.15% of that run's 66.8 ms runtime (partial codec cost 2.82%), with all subsequent 19 candidates evaluated via pure statement surgery (`cutRemovedStatements`). Candidate traces and minimal outputs match **100% byte-for-byte via `cmp`** across baseline, same-forcing, and profiled modes, and match golden reference `benchmarks/benchmark_artifacts/haskell-perf-20261114/trace_after.bin`.
 
 Full immutable tables, weighted-sum aggregations, paired observer overhead accounting, raw logs, and source snapshots are documented in [`benchmarks/benchmark_artifacts/json-cost-20261114/README.md`](benchmark_artifacts/json-cost-20261114/README.md).
+
+## List batching: measured gain and limitation (2026-11-16)
+
+The intra-statement List phase under `phase-forward-sweep-list-chunks` offers coarse-to-fine contiguous chunk deletions before the original single-item deletions in each comma-separated list. Arbitrary oracles (no monotonicity assumption), exact source spans, and strict byte shrink are unchanged; only the syntax pass requests chunks per parse.
+
+| | before (`57de9a75`) | new (`0c0febfe`) |
+|---|---|---|
+| 64-row proof reduction db observations | 78 | 31 |
+| 64-row proof reducer wall (s) | 12.978 | 5.428 |
+| 64-row proof final bytes | 67 | 67 |
+| primary completed/timeout/error | 6/8/2 | 6/8/2 |
+| primary recorded attempts at cutoff | 1214 | 1273 |
+
+The 64-row SUM feature proof is a single paired trial (same adapter/predicate, both completed, identical final SQL, twice-validated) and is not pooled with the primary. The primary is 8 SQLite cases × 2 reps × 2 tools = 32 children (16 per tool) under a 20s budget, 1s per-call timeout, and one CPU. Primary raw-result-byte medians and per-slot statuses/bytes are identical before/after for Occam (6/8/2 both); the +59 attempts are observed at cutoff (mixed complete+censored), and jointly completed old/new pairs show median wall 1.05 old-over-new with observation ratio 1.00 (cohorts noninterleaved; wall ratio not isolated causal proof) — no primary completion/quality gain, no pooled or censored speedup claim, no global-superiority claim.
+
+Canonical evidence: [`list-chunk-proof-20261116-a/proof_result.json`](benchmark_artifacts/list-chunk-proof-20261116-a/proof_result.json), [`external-comparison-list-chunks-20261116-a/`](benchmark_artifacts/external-comparison-list-chunks-20261116-a/), and [`external-comparison-list-chunks-analysis-20261116-a/report.md`](benchmark_artifacts/external-comparison-list-chunks-analysis-20261116-a/report.md).
+
+Concurrency was assessed but not implemented: external predicate state, budgets, cache, and checkpoints are not thread-safe by default, so no parallel oracle flag is offered.

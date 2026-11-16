@@ -6,6 +6,10 @@ pub struct ParseConfig {
     pub dialect: crate::DialectKind,
     #[serde(default)]
     pub server: ServerConfig,
+    /// Emit coarse-to-fine list-chunk deletions alongside single-item edits.
+    /// Off by default so statement-only parses keep the legacy payload.
+    #[serde(default)]
+    pub chunk_edits: bool,
 }
 
 /// Server/session configuration that is independent of a particular SQL text.

@@ -7,6 +7,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import MutationalFuzz (mutationalFuzzTests)
+import Occam.Core (oracleAccepts)
 import Occam.Parser (
     ParsedSQL (..),
     SQLDialect (..),
@@ -14,7 +15,8 @@ import Occam.Parser (
     defaultParseOptions,
     parseSQL,
  )
-import Occam.Reducer (Oracle, oracleAccepts, oracleFromPredicate, reduceSQL)
+import Occam.Pool (OraclePool, poolOracle, withPredicatePool)
+import Occam.Reducer (reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -495,10 +497,12 @@ evalTargetCondition (TargetExpr tbl exprSnippet) bs =
      in tblBS `BSC.isInfixOf` bs
             && exprSnippet `BSC.isInfixOf` bs
 
-makeScriptOracle :: FuzzScript -> Oracle
-makeScriptOracle FuzzScript {..} =
-    oracleFromPredicate $ \bs ->
-        pure (evalTargetCondition (targetKind scriptTarget) bs)
+makeScriptPredicate :: FuzzScript -> ByteString -> IO Bool
+makeScriptPredicate FuzzScript {..} bs =
+    pure (evalTargetCondition (targetKind scriptTarget) bs)
+
+withScriptPool :: FuzzScript -> (OraclePool -> IO a) -> IO a
+withScriptPool script = withPredicatePool 1 False (makeScriptPredicate script)
 
 -- ----------------------------------------------------------------------------
 -- QuickCheck Properties
@@ -522,12 +526,11 @@ predicate, never grows, and is already a fixed point.
 prop_reductionInvariants :: FuzzScript -> Property
 prop_reductionInvariants script = monadicIO $ do
     let initialSQL = renderScriptSQL script
-        oracle = makeScriptOracle script
-    reducedSQL <- run (reduceSQL SQLite oracle initialSQL)
+    reducedSQL <- run (withScriptPool script (\pool -> reduceSQL SQLite pool initialSQL))
     valid <- run (checkParserValidity SQLite reducedSQL)
-    sound <- run (oracleAccepts oracle reducedSQL)
+    sound <- run (withScriptPool script (\pool -> oracleAccepts (poolOracle pool) reducedSQL))
     let mono = BSC.length reducedSQL <= BSC.length initialSQL
-    secondReducedSQL <- run (reduceSQL SQLite oracle reducedSQL)
+    secondReducedSQL <- run (withScriptPool script (\pool -> reduceSQL SQLite pool reducedSQL))
     let idem = secondReducedSQL == reducedSQL
     monitor
         ( counterexample

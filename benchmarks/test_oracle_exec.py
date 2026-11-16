@@ -87,6 +87,40 @@ class OracleExecTests(unittest.TestCase):
             self.assertLessEqual(len(record["stdout"]), 8192)
             self.assertLessEqual(len(record["stderr"]), 8192)
 
+    def test_oracle_timeout_is_typed_with_audit(self):
+        wrapper = Path(__file__).with_name("upstream") / "oracle_exec.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audit = root / "oracle.jsonl"
+            result = subprocess.run(
+                [
+                    sys.executable, str(wrapper), "--command", "sleep 5",
+                    "--audit", str(audit), "--timeout", "0.5", "--cwd", str(root),
+                ],
+                input=b"SELECT 1;\n", capture_output=True, timeout=10,
+            )
+            self.assertEqual(124, result.returncode)
+            record = json.loads(audit.read_text(encoding="utf-8"))
+            self.assertEqual("timeout", record["status"])
+            self.assertEqual(124, record["returncode"])
+
+    def test_leader_exit_with_live_descendant_holding_pipes_is_accepted(self):
+        wrapper = Path(__file__).with_name("upstream") / "oracle_exec.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audit = root / "oracle.jsonl"
+            result = subprocess.run(
+                [
+                    sys.executable, str(wrapper), "--command", "(sleep 5) & exit 0",
+                    "--audit", str(audit), "--timeout", "2", "--cwd", str(root),
+                ],
+                input=b"SELECT 1;\n", capture_output=True, timeout=10,
+            )
+            self.assertEqual(0, result.returncode)
+            record = json.loads(audit.read_text(encoding="utf-8"))
+            self.assertEqual("accepted", record["status"])
+            self.assertEqual(0, record["returncode"])
+
 
 if __name__ == "__main__":
     unittest.main()

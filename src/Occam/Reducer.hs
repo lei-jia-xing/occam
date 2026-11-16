@@ -1,9 +1,4 @@
 module Occam.Reducer (
-    Oracle,
-    OracleOutcome (..),
-    OracleInconclusiveError (..),
-    oracleAccepts,
-    oracleFromPredicate,
     ReductionConfig (..),
     defaultReductionConfig,
     isValidClosure,
@@ -24,26 +19,33 @@ module Occam.Reducer (
     findInterestingPrefix,
 ) where
 
-import Control.Exception (Exception, throwIO)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam.Core (SessionInit (..), Span (..), Statement (..), StatementId (..))
+import Occam.Core (
+    OracleOutcome (..),
+    SessionInit (..),
+    Span (..),
+    Statement (..),
+    StatementId (..),
+    oracleAccepts,
+ )
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
  )
 import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
 import Occam.Parser (
+    ParseOptions (..),
     ParsedSQL (..),
     ParserEdit (..),
     ParserEditCategory (..),
@@ -54,41 +56,8 @@ import Occam.Parser (
     defaultSQLDialect,
     parseSQL,
  )
+import Occam.Pool (OraclePool, poolJobCount, poolOracle, testOrdered)
 import Occam.Slicer (backwardSlice, backwardSliceMany)
-
-{- | The oracle classifies a complete candidate. Inconclusive results must not
-be silently treated as rejections because that would make reductions depend
-on timeouts or infrastructure failures.
--}
-data OracleOutcome
-    = OracleAccepted
-    | OracleRejected
-    | OracleInconclusive
-    deriving (Eq, Ord, Show)
-
-type Oracle = ByteString -> IO OracleOutcome
-
-data OracleInconclusiveError = OracleInconclusiveError
-    deriving (Show)
-
-instance Exception OracleInconclusiveError
-
--- | Require a definite oracle decision, aborting the reduction otherwise.
-oracleAccepts :: Oracle -> ByteString -> IO Bool
-oracleAccepts oracle candidate = do
-    outcome <- oracle candidate
-    case outcome of
-        OracleAccepted -> pure True
-        OracleRejected -> pure False
-        OracleInconclusive -> throwIO OracleInconclusiveError
-
-{- | Lift a total Boolean predicate into an oracle. Use this only at
-integration boundaries that cannot report timeouts or infrastructure errors.
--}
-oracleFromPredicate :: (ByteString -> IO Bool) -> Oracle
-oracleFromPredicate predicate candidate = do
-    accepted <- predicate candidate
-    pure (if accepted then OracleAccepted else OracleRejected)
 
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
@@ -128,12 +97,18 @@ timedStage logger stage action = do
     logStage logger stage (finished - started)
     pure result
 
-parseUnitsOrThrow :: SQLDialect -> ByteString -> IO (SessionInit, [StatementUnit])
-parseUnitsOrThrow dialect sql = do
-    parsed <- parseSQL (defaultParseOptions dialect) sql
+parseUnitsOrThrow :: ParseOptions -> ByteString -> IO (SessionInit, [StatementUnit])
+parseUnitsOrThrow options sql = do
+    parsed <- parseSQL options sql
     case parsed of
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
         Right result -> pure (parsedInitialSession result, parsedUnits result)
+
+{- | The syntax pass alone opts into list-chunk deletions; statement-only
+parses keep the legacy payload without chunk materialization.
+-}
+syntaxParseOptions :: SQLDialect -> ParseOptions
+syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True}
 
 {- | A retained candidate set K is closed iff every kept statement's direct
 predecessors are also retained.
@@ -212,12 +187,12 @@ statementSQL :: ByteString -> [Statement] -> [Statement] -> ByteString
 statementSQL = cutRemovedStatements
 
 -- | Closure-constrained delta debugging.
-closureDdmin :: Oracle -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
+closureDdmin :: OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
 closureDdmin = closureDdminWithLogger nullLogger
 
 closureDdminWithLogger ::
-    Logger -> Oracle -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
-closureDdminWithLogger logger oracle baseSQL initialStatements graph = do
+    Logger -> OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
+closureDdminWithLogger logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef Map.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = Map.fromList [(stmtId s, statementSpanBytes s) | s <- initialStatements]
@@ -251,7 +226,7 @@ closureDdminWithLogger logger oracle baseSQL initialStatements graph = do
     result <-
         searchStatements
             buildCandidate
-            oracle
+            pool
             baseSQL
             initialStatements
             initialStatements
@@ -279,28 +254,30 @@ data CandidateVerdict
     | CandidateRejected
     deriving (Eq, Show)
 
-data Feedback = Feedback
-    { fbFailedRemovals :: !(IORef (Set (Set StatementId)))
-    , fbEssentialStatements :: !(IORef (Set StatementId))
-    , fbEvaluated :: !(IORef (Map.Map ByteString CandidateVerdict))
+{- | Verdict memo keyed ONLY by exact candidate bytes. Statement-ID-keyed
+rejection reuse is unsafe for arbitrary oracles: a removal rejected under
+one snapshot can become valid after the current SQL shrinks, so IDs must
+never skip re-testing a changed candidate. Same exact bytes stay valid.
+-}
+newtype Feedback = Feedback
+    { fbEvaluated :: IORef (Map.Map ByteString CandidateVerdict)
     }
 
 newFeedback :: IO Feedback
-newFeedback = Feedback <$> newIORef Set.empty <*> newIORef Set.empty <*> newIORef Map.empty
-
+newFeedback = Feedback <$> newIORef Map.empty
 searchStatements ::
     CandidateBuilder ->
-    Oracle ->
+    OraclePool ->
     ByteString ->
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements buildCandidate oracle baseSQL allStatements initialStatements = do
+searchStatements buildCandidate pool baseSQL allStatements initialStatements = do
     feedback <- newFeedback
     searchDDMin
         feedback
         buildCandidate
-        oracle
+        pool
         baseSQL
         allStatements
         initialStatements
@@ -311,16 +288,22 @@ plainCandidate :: CandidateBuilder
 plainCandidate current keptIds =
     pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
 
+-- | Classified seeds: previously accepted seeds commit; fresh seeds test in order.
+data SeedToken
+    = SeedAccepted ![Statement]
+    | SeedFresh ![Statement] !ByteString
+
 searchDDMin ::
     Feedback ->
     CandidateBuilder ->
-    Oracle ->
+    OraclePool ->
     ByteString ->
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
+searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
     where
+        jobs = poolJobCount pool
         go _ [] = pure []
         go granularity current = do
             let n = min (length current) (max 1 granularity)
@@ -339,90 +322,108 @@ searchDDMin feedback buildCandidate oracle baseSQL allStatements = go 2
                             | n < length current -> go (min (length current) (2 * n)) current
                             | otherwise -> pure current
 
-        trySubsets _ _ _ [] = pure Nothing
-        trySubsets current currentIds currentLen (chunk : rest) = do
-            let seedIds = statementIds chunk
-            candidate <- testCandidate current currentIds currentLen seedIds
-            case candidate of
-                Just reduced -> pure (Just reduced)
-                Nothing -> trySubsets current currentIds currentLen rest
+        trySubsets current currentIds currentLen chunks =
+            trySeeds current currentIds currentLen (map statementIds chunks)
+        tryComplements current currentIds currentLen chunks =
+            trySeeds
+                current
+                currentIds
+                currentLen
+                [currentIds `Set.difference` statementIds chunk | chunk <- chunks]
 
-        tryComplements _ _ _ [] = pure Nothing
-        tryComplements current currentIds currentLen (chunk : rest) = do
-            let seedIds = currentIds `Set.difference` statementIds chunk
-            candidate <- testCandidate current currentIds currentLen seedIds
-            case candidate of
-                Just reduced -> pure (Just reduced)
-                Nothing -> tryComplements current currentIds currentLen rest
+        trySeeds current currentIds currentLen = pull
+            where
+                -- Pull only the next window of eligible candidates, test and
+                -- record them, then classify further seeds with updated
+                -- feedback. Never materializes SQL for the whole granularity.
+                -- Duplicate candidate bytes within one pull are probed once:
+                -- the byte memo would skip the twin right after the first
+                -- rejects, and any other outcome stops before it. The scan is
+                -- bounded too: at most one window of classify work is pulled
+                -- before testing, never a full duplicate-list scan.
+                pull [] = pure Nothing
+                pull seeds = collect jobs [] Set.empty seeds
+                collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
+                collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
+                collect n acc seen (seedIds : rest) = do
+                    token <- classifySeed current currentIds currentLen seedIds
+                    case token of
+                        Nothing -> collect (n - 1) acc seen rest
+                        Just (SeedAccepted kept) -> testAndContinue (reverse acc) rest (Just kept)
+                        Just (SeedFresh kept sql)
+                            | Set.member sql seen -> collect (n - 1) acc seen rest
+                            | otherwise -> collect (n - 1) ((kept, sql) : acc) (Set.insert sql seen) rest
+                testAndContinue batch rest barrier = do
+                    accepted <- testBatch batch
+                    case accepted of
+                        Just kept -> pure (Just kept)
+                        Nothing -> case barrier of
+                            Just kept -> pure (Just kept)
+                            Nothing -> pull rest
 
-        testCandidate current currentIds currentLen seedIds
+        testBatch [] = pure Nothing
+        testBatch batch = do
+            outcomes <- testOrdered pool [sql | (_, sql) <- batch]
+            let retired = zip batch outcomes
+            mapM_ recordRetired retired
+            pure $ listToMaybe [kept | ((kept, _), (outcome, _)) <- retired, outcome == OracleAccepted]
+
+        recordRetired ((_, sql), (outcome, _)) =
+            let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
+             in modifyIORef' (fbEvaluated feedback) (Map.insert sql verdict)
+
+        classifySeed current currentIds currentLen seedIds
             | seedIds == currentIds = pure Nothing
             | otherwise = do
-                let removedIds = currentIds `Set.difference` seedIds
-                essential <- readIORef (fbEssentialStatements feedback)
-                failed <- readIORef (fbFailedRemovals feedback)
-                let isEssentialSingle = case Set.toList removedIds of
-                        [single] -> Set.member single essential
-                        _ -> False
-                if isEssentialSingle || Set.member removedIds failed
-                    then pure Nothing
-                    else do
-                        maybeKept <- buildCandidate current seedIds
-                        case maybeKept of
-                            Nothing -> pure Nothing
-                            Just kept -> do
-                                let candidateSQL = statementSQL baseSQL allStatements kept
-                                if BS.length candidateSQL >= currentLen
-                                    then pure Nothing
-                                    else do
-                                        evaluated <- readIORef (fbEvaluated feedback)
-                                        case Map.lookup candidateSQL evaluated of
-                                            Just CandidateAccepted -> pure (Just kept)
-                                            Just CandidateRejected -> pure Nothing
-                                            Nothing -> do
-                                                ok <- oracleAccepts oracle candidateSQL
-                                                let verdict = if ok then CandidateAccepted else CandidateRejected
-                                                modifyIORef' (fbEvaluated feedback) (Map.insert candidateSQL verdict)
-                                                case verdict of
-                                                    CandidateAccepted -> pure (Just kept)
-                                                    CandidateRejected -> do
-                                                        modifyIORef' (fbFailedRemovals feedback) (Set.insert removedIds)
-                                                        case Set.toList removedIds of
-                                                            [single] -> modifyIORef' (fbEssentialStatements feedback) (Set.insert single)
-                                                            _ -> pure ()
-                                                        pure Nothing
+                maybeKept <- buildCandidate current seedIds
+                case maybeKept of
+                    Nothing -> pure Nothing
+                    Just kept -> do
+                        let candidateSQL = statementSQL baseSQL allStatements kept
+                        if BS.length candidateSQL >= currentLen
+                            then pure Nothing
+                            else do
+                                evaluated <- readIORef (fbEvaluated feedback)
+                                case Map.lookup candidateSQL evaluated of
+                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept))
+                                    Just CandidateRejected -> pure Nothing
+                                    Nothing -> pure (Just (SeedFresh kept candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
-statementDdmin :: SQLDialect -> Oracle -> ByteString -> IO ByteString
-statementDdmin dialect oracle initialSQL = do
-    initialOK <- oracleAccepts oracle initialSQL
+statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
+statementDdmin dialect pool initialSQL = do
+    initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then pure initialSQL
         else do
-            (_, units) <- parseUnitsOrThrow dialect initialSQL
+            (_, units) <- parseUnitsOrThrow (defaultParseOptions dialect) initialSQL
             let allStatements = map unitStatement units
             reduced <-
-                searchStatements plainCandidate oracle initialSQL allStatements allStatements
+                searchStatements plainCandidate pool initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
--- | Sequential one-statement deletion to a fixed point; the empty candidate is allowed.
-statementAudit :: SQLDialect -> Oracle -> ByteString -> IO ByteString
-statementAudit dialect oracle initialSQL = fst <$> statementAuditWithLogger nullLogger dialect oracle initialSQL
+{- | One-statement deletion to a fixed point; the empty candidate is allowed.
+Successive rejected deletions share the snapshot, so each window pulls the
+next retained statements and retires them in order.
+-}
+statementAudit :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
+statementAudit dialect pool initialSQL = fst <$> statementAuditWithLogger nullLogger dialect pool initialSQL
 
 statementAuditWithLogger ::
-    Logger -> SQLDialect -> Oracle -> ByteString -> IO (ByteString, AuditStats)
-statementAuditWithLogger logger dialect oracle initialSQL = do
-    initialOK <- oracleAccepts oracle initialSQL
+    Logger -> SQLDialect -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
+statementAuditWithLogger logger dialect pool initialSQL = do
+    initialOK <- oracleAccepts (poolOracle pool) initialSQL
     outcome <-
         if initialOK
             then do
-                (_, units) <- parseUnitsOrThrow dialect initialSQL
+                (_, units) <- parseUnitsOrThrow (defaultParseOptions dialect) initialSQL
                 let statements = map unitStatement units
                 loop initialSQL statements (statementIds statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
     logAuditStats logger (snd outcome)
     pure outcome
     where
+        jobs = poolJobCount pool
         -- The audit only removes whole statements, and those statements keep
         -- their original byte spans. Parse once, then track the retained set.
         loop baseSQL allStatements kept passCount attemptCount removalCount
@@ -452,19 +453,46 @@ statementAuditWithLogger logger dialect oracle initialSQL = do
         auditPass baseSQL allStatements kept = go (renderKept baseSQL allStatements kept) kept allStatements 0 0
             where
                 go _ currentKept [] attempts removals = pure (currentKept, attempts, removals)
-                go currentSQL currentKept (statement : rest) attempts removals
-                    | Set.notMember (stmtId statement) currentKept =
-                        go currentSQL currentKept rest attempts removals
-                    | otherwise = do
-                        let kept' = Set.delete (stmtId statement) currentKept
-                            candidateSQL = renderKept baseSQL allStatements kept'
-                        if BS.length candidateSQL >= BS.length currentSQL
-                            then go currentSQL currentKept rest attempts removals
-                            else do
-                                ok <- oracleAccepts oracle candidateSQL
-                                if ok
-                                    then go candidateSQL kept' rest (attempts + 1) (removals + 1)
-                                    else go currentSQL currentKept rest (attempts + 1) removals
+                go currentSQL currentKept statements attempts removals = do
+                    let batch = take jobs [s | s <- statements, Set.member (stmtId s) currentKept]
+                    case batch of
+                        [] -> pure (currentKept, attempts, removals)
+                        _ -> do
+                            let currentLen = BS.length currentSQL
+                                candidates =
+                                    [ (statement, renderKept baseSQL allStatements (Set.delete (stmtId statement) currentKept))
+                                    | statement <- batch
+                                    ]
+                                testables =
+                                    [(statement, sql) | (statement, sql) <- candidates, BS.length sql < currentLen]
+                            if null testables
+                                then go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
+                                else do
+                                    outcomes <- testOrdered pool [sql | (_, sql) <- testables]
+                                    let retired = zip testables outcomes
+                                        tested = length outcomes
+                                    case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
+                                        Just (acceptedStatement, acceptedSQL) ->
+                                            go
+                                                acceptedSQL
+                                                (Set.delete (stmtId acceptedStatement) currentKept)
+                                                (afterStatement acceptedStatement statements)
+                                                (attempts + tested)
+                                                (removals + 1)
+                                        Nothing ->
+                                            go
+                                                currentSQL
+                                                currentKept
+                                                (afterStatement (last batch) statements)
+                                                (attempts + tested)
+                                                removals
+
+                afterStatement target = goAfter
+                    where
+                        goAfter [] = []
+                        goAfter (s : ss)
+                            | stmtId s == stmtId target = ss
+                            | otherwise = goAfter ss
 
         renderKept = cutRemovedStatementIds
 
@@ -491,8 +519,8 @@ logAuditStats logger stats =
 prefix; arbitrary predicates may have earlier accepted prefixes we never visit.
 -}
 findInterestingPrefix ::
-    Oracle -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
-findInterestingPrefix oracle baseSQL statements
+    OraclePool -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
+findInterestingPrefix pool baseSQL statements
     | null statements = pure (Nothing, 0)
     | otherwise = go 1 (length statements) Nothing 0
     where
@@ -502,7 +530,7 @@ findInterestingPrefix oracle baseSQL statements
                 let mid = low + (high - low) `div` 2
                     prefix = take mid statements
                     candidate = statementSQL baseSQL statements prefix
-                ok <- oracleAccepts oracle candidate
+                ok <- oracleAccepts (poolOracle pool) candidate
                 let tests' = tests + 1
                 if ok
                     then case reverse prefix of
@@ -521,7 +549,7 @@ data SQLAnalysis = SQLAnalysis
 analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
 analyzeSQL logger dialect sql = do
     started <- getMonotonicTimeNSec
-    (initialSession, units) <- parseUnitsOrThrow dialect sql
+    (initialSession, units) <- parseUnitsOrThrow (defaultParseOptions dialect) sql
     let statements = map unitStatement units
         graph = analyzeStatements initialSession units
     graph `seq` pure ()
@@ -551,8 +579,8 @@ only when the result is byte-identical to @sql@, so the caller can safely reuse
 it for the next stage without re-parsing.
 -}
 sliceWithAnalysis ::
-    Logger -> Oracle -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
-sliceWithAnalysis logger oracle analysis sql = do
+    Logger -> OraclePool -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
+sliceWithAnalysis logger pool analysis sql = do
     let statements = analyzedStatements analysis
         graph = analyzedGraph analysis
         keep result =
@@ -582,10 +610,10 @@ sliceWithAnalysis logger oracle analysis sql = do
                 (lastRetained, lastCandidate) = sliceFor lastStatement
             lastAccepted <-
                 if BS.length lastCandidate < BS.length sql
-                    then oracleAccepts oracle lastCandidate
+                    then oracleAccepts (poolOracle pool) lastCandidate
                     else pure False
             let tryPrefix bestCandidate = do
-                    (maybeTarget, prefixTests) <- findInterestingPrefix oracle sql statements
+                    (maybeTarget, prefixTests) <- findInterestingPrefix pool sql statements
                     case maybeTarget of
                         Nothing -> pure bestCandidate
                         Just (targetStatement, prefixSQL, prefixLength) -> do
@@ -594,7 +622,7 @@ sliceWithAnalysis logger oracle analysis sql = do
                                 then pure bestCandidate
                                 else do
                                     let reusedPrefixResult = candidate == prefixSQL
-                                    ok <- if reusedPrefixResult then pure True else oracleAccepts oracle candidate
+                                    ok <- if reusedPrefixResult then pure True else oracleAccepts (poolOracle pool) candidate
                                     logInfo'
                                         logger
                                         "occam::reducer"
@@ -618,8 +646,8 @@ sliceWithAnalysis logger oracle analysis sql = do
                         else keep sql
 
 closureSearchWithAnalysis ::
-    Logger -> Oracle -> ByteString -> SQLAnalysis -> IO ByteString
-closureSearchWithAnalysis logger oracle sql analysis =
+    Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
+closureSearchWithAnalysis logger pool sql analysis =
     let statements = analyzedStatements analysis
      in if null statements
             then pure sql
@@ -627,22 +655,22 @@ closureSearchWithAnalysis logger oracle sql analysis =
                 retained <-
                     closureDdminWithLogger
                         logger
-                        oracle
+                        pool
                         sql
                         statements
                         (analyzedGraph analysis)
                 pure (statementSQL sql statements retained)
 
-reduceSQL :: SQLDialect -> Oracle -> ByteString -> IO ByteString
+reduceSQL :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 reduceSQL dialect = reduceSQLWithLogger dialect nullLogger
 
-reduceSQLWithLogger :: SQLDialect -> Logger -> Oracle -> ByteString -> IO ByteString
+reduceSQLWithLogger :: SQLDialect -> Logger -> OraclePool -> ByteString -> IO ByteString
 reduceSQLWithLogger dialect =
     reduceSQLWithConfig (defaultReductionConfig {reductionDialect = dialect})
 
-reduceSQLWithConfig :: ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
-reduceSQLWithConfig config logger oracle initialSQL = do
-    initialOK <- oracleAccepts oracle initialSQL
+reduceSQLWithConfig :: ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
+reduceSQLWithConfig config logger pool initialSQL = do
+    initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then do
             logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
@@ -662,7 +690,7 @@ reduceSQLWithConfig config logger oracle initialSQL = do
                 , ("intra_statement", toJSON (reductionIntraStatement config))
                 , ("dialect", toJSON (T.pack (show (reductionDialect config))))
                 ]
-            nextSQL <- reduceIterationWithConfig config logger oracle currentSQL
+            nextSQL <- reduceIterationWithConfig config logger pool currentSQL
             if BS.length nextSQL < BS.length currentSQL
                 then loop (iteration + 1) nextSQL
                 else do
@@ -676,13 +704,13 @@ reduceSQLWithConfig config logger oracle initialSQL = do
                     pure currentSQL
 
 reduceIterationWithConfig ::
-    ReductionConfig -> Logger -> Oracle -> ByteString -> IO ByteString
-reduceIterationWithConfig config logger oracle initialSQL = do
+    ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
+reduceIterationWithConfig config logger pool initialSQL = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedStage logger "backward-slicing" do
                 analysis <- analyzeSQL logger (reductionDialect config) initialSQL
-                sliceWithAnalysis logger oracle analysis initialSQL
+                sliceWithAnalysis logger pool analysis initialSQL
             else pure (initialSQL, Nothing)
     searched <-
         if reductionClosure config
@@ -691,19 +719,19 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                     case reusableAnalysis of
                         Just cached -> pure cached
                         Nothing -> analyzeSQL logger (reductionDialect config) sliced
-                closureSearchWithAnalysis logger oracle sliced analysis
+                closureSearchWithAnalysis logger pool sliced analysis
             else
                 timedStage
                     logger
                     "graph-free-statement-search"
-                    (statementDdmin (reductionDialect config) oracle sliced)
+                    (statementDdmin (reductionDialect config) pool sliced)
     fallback <-
         if reductionClosure config && reductionUnrestricted config
             then
                 timedStage
                     logger
                     "unrestricted-fallback"
-                    (statementDdmin (reductionDialect config) oracle searched)
+                    (statementDdmin (reductionDialect config) pool searched)
             else pure searched
     interleaveStages fallback
     where
@@ -712,7 +740,7 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                 (True, True) -> interleaveFixedPoint (1 :: Int) base
                 (True, False) -> do
                     started <- getMonotonicTimeNSec
-                    (result, _) <- statementAuditWithLogger logger (reductionDialect config) oracle base
+                    (result, _) <- statementAuditWithLogger logger (reductionDialect config) pool base
                     finished <- getMonotonicTimeNSec
                     logStage logger "statement-audit" (finished - started)
                     pure result
@@ -720,19 +748,31 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                     timedStage
                         logger
                         "intra-statement-rewrites"
-                        (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) base)
+                        ( reduceSyntaxWithDialect
+                            logger
+                            (syntaxParseOptions (reductionDialect config))
+                            pool
+                            (const True)
+                            base
+                        )
                 (False, False) -> pure base
 
         interleaveFixedPoint iter current = do
             started <- getMonotonicTimeNSec
-            (afterAudit, _) <- statementAuditWithLogger logger (reductionDialect config) oracle current
+            (afterAudit, _) <- statementAuditWithLogger logger (reductionDialect config) pool current
             finished <- getMonotonicTimeNSec
             logStage logger "statement-audit" (finished - started)
             afterSyntax <-
                 timedStage
                     logger
                     "intra-statement-rewrites"
-                    (reduceSyntaxWithDialect logger (reductionDialect config) oracle (const True) afterAudit)
+                    ( reduceSyntaxWithDialect
+                        logger
+                        (syntaxParseOptions (reductionDialect config))
+                        pool
+                        (const True)
+                        afterAudit
+                    )
             if BS.length afterSyntax < BS.length current
                 then do
                     logInfo'
@@ -754,14 +794,22 @@ reduceIterationWithConfig config logger oracle initialSQL = do
                         ]
                     pure afterSyntax
 
-pruneClauses :: SQLDialect -> Oracle -> ByteString -> IO ByteString
-pruneClauses dialect oracle =
-    reduceSyntaxWithDialect nullLogger dialect oracle ((== EditClause) . parserEditCategory)
+pruneClauses :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
+pruneClauses dialect pool =
+    reduceSyntaxWithDialect
+        nullLogger
+        (defaultParseOptions dialect)
+        pool
+        ((== EditClause) . parserEditCategory)
 
 -- Expression-only public pass.
-simplifyExpressions :: SQLDialect -> Oracle -> ByteString -> IO ByteString
-simplifyExpressions dialect oracle =
-    reduceSyntaxWithDialect nullLogger dialect oracle ((== EditExpression) . parserEditCategory)
+simplifyExpressions :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
+simplifyExpressions dialect pool =
+    reduceSyntaxWithDialect
+        nullLogger
+        (defaultParseOptions dialect)
+        pool
+        ((== EditExpression) . parserEditCategory)
 
 data SyntaxStats = SyntaxStats
     { syntaxAttempts :: !Int
@@ -770,13 +818,13 @@ data SyntaxStats = SyntaxStats
     }
 
 reduceSyntaxWithDialect ::
-    Logger -> SQLDialect -> Oracle -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
-reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
+    Logger -> ParseOptions -> OraclePool -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
+reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
     logInfo'
         logger
         "occam::reducer"
         "Using ordinal-forward syntax candidate schedule"
-        [ ("search_policy", toJSON ("phase-forward-sweep" :: T.Text))
+        [ ("search_policy", toJSON ("phase-forward-sweep-list-chunks" :: T.Text))
         , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
         ]
     stats <- newIORef (SyntaxStats 0 0 0)
@@ -789,7 +837,7 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
         [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
         , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
         , ("replacement_oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
-        , ("search_policy", toJSON ("phase-forward-sweep" :: T.Text))
+        , ("search_policy", toJSON ("phase-forward-sweep-list-chunks" :: T.Text))
         , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
         ]
     pure result
@@ -803,7 +851,7 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
             , EditLiteral
             ]
         parseEdits currentSQL = do
-            (_, units) <- parseUnitsOrThrow dialect currentSQL
+            (_, units) <- parseUnitsOrThrow options currentSQL
             let edits =
                     concatMap
                         (filter shouldRun . maybe [] factEdits . unitFacts)
@@ -849,30 +897,35 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                 (shrunk || categoryShrunk)
         -- After a strict shrink, reparse and resume at the accepted ordinal.
         -- Any candidates before that cursor are revisited in the next full cycle.
+        -- Each window pulls testable edits from the unchanged snapshot and
+        -- retires them in parser-emitted order.
+        jobs = poolJobCount pool
         exhaustCategory stats sourceSQL phases category =
             sweep False 0 sourceSQL phases (phaseCandidates category phases)
             where
                 sweep changed _ currentSQL currentPhases [] =
                     pure (currentSQL, currentPhases, changed)
-                sweep changed !ordinal currentSQL currentPhases (edit : rest) = do
-                    let editStart = parserEditStart edit
-                        editEnd = parserEditEnd edit
-                        replacement = parserEditReplacement edit
-                    if BS.length replacement >= editEnd - editStart
-                        then sweep changed (ordinal + 1) currentSQL currentPhases rest
+                sweep changed ordinal currentSQL currentPhases edits = do
+                    let (windowTasks, nextOrdinal, rest) = fillWindow currentSQL ordinal edits
+                    if null windowTasks
+                        then sweep changed nextOrdinal currentSQL currentPhases rest
                         else do
-                            let candidate = replaceSpan editStart editEnd replacement currentSQL
                             started <- getMonotonicTimeNSec
-                            ok <- oracleAccepts oracle candidate
+                            outcomes <- testOrdered pool [candidate | (_, _, candidate) <- windowTasks]
                             finished <- getMonotonicTimeNSec
                             let elapsed = finished - started
-                            if ok
-                                then do
+                                retired = zip windowTasks outcomes
+                                tested = length outcomes
+                            case listToMaybe [(o, e, c) | ((o, e, c), (outcome, _)) <- retired, outcome == OracleAccepted] of
+                                Just (acceptedOrdinal, edit, candidate) -> do
+                                    let editStart = parserEditStart edit
+                                        editEnd = parserEditEnd edit
+                                        replacement = parserEditReplacement edit
                                     modifyIORef'
                                         stats
                                         ( \s ->
                                             s
-                                                { syntaxAttempts = syntaxAttempts s + 1
+                                                { syntaxAttempts = syntaxAttempts s + tested
                                                 , syntaxAccepted = syntaxAccepted s + 1
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
                                                 }
@@ -891,23 +944,42 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                                         ]
                                     freshPhases <- parseEdits candidate
                                     let freshCandidates =
-                                            drop ordinal (phaseCandidates category freshPhases)
+                                            drop acceptedOrdinal (phaseCandidates category freshPhases)
                                     sweep
                                         True
-                                        ordinal
+                                        acceptedOrdinal
                                         candidate
                                         freshPhases
                                         freshCandidates
-                                else do
+                                Nothing -> do
                                     modifyIORef'
                                         stats
                                         ( \s ->
                                             s
-                                                { syntaxAttempts = syntaxAttempts s + 1
+                                                { syntaxAttempts = syntaxAttempts s + tested
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
                                                 }
                                         )
-                                    sweep changed (ordinal + 1) currentSQL currentPhases rest
+                                    sweep changed nextOrdinal currentSQL currentPhases rest
+
+                fillWindow currentSQL ordinal = fill jobs ordinal []
+                    where
+                        fill _ o acc [] = (reverse acc, o, [])
+                        fill 0 o acc rest = (reverse acc, o, rest)
+                        fill n o acc (edit : rest)
+                            | BS.length (parserEditReplacement edit) >= parserEditEnd edit - parserEditStart edit =
+                                fill n (o + 1) acc rest
+                            | otherwise =
+                                fill
+                                    (n - 1)
+                                    (o + 1)
+                                    ( ( o
+                                      , edit
+                                      , replaceSpan (parserEditStart edit) (parserEditEnd edit) (parserEditReplacement edit) currentSQL
+                                      )
+                                        : acc
+                                    )
+                                    rest
 
         phaseCandidates category phases =
             fromMaybe [] (lookup category phases)

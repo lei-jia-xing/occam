@@ -57,6 +57,9 @@ flag --budget help="Shared wall-clock cap including initial check, reduction, an
 flag --max-oracle-executions help="Maximum uncached oracle attempts including initial check and validation" {
     arg <N>
 }
+flag --jobs help="Maximum concurrent oracle/reset interactions; values above 1 require independent external state (no DB isolation is promised)" default="1" {
+    arg <N>
+}
 flag --slicing help="Enable backward dependency slicing pass (default: on)"
 flag --no-slicing help="Disable backward dependency slicing pass"
 flag --closure help="Enable dependency closure minimization pass (default: on)"

@@ -6,7 +6,7 @@ import Data.ByteString qualified as BS
 import Occam.Oracle
 import System.Exit (ExitCode (..))
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
+import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 #ifndef mingw32_HOST_OS
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
@@ -14,6 +14,7 @@ import Control.Monad (when)
 import Data.Maybe (isJust)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
+import System.Timeout (timeout)
 #endif
 
 tests :: TestTree
@@ -99,6 +100,26 @@ posixTests =
                 assertEqual "expected timeout" OracleTimedOut (detailedObservation details)
                 assertBool "timed-out oracle duration was omitted" (isJust (oracleElapsedMicros details))
                 threadDelay 1200000
+                leaked <- doesFileExist sentinel
+                assertBool "a timed-out descendant survived the process-group cleanup" (not leaked)
+        , testCase "unread stdin with a full pipe and flooded output still times out cleanly" $
+            withSentinelPath $ \sentinel -> do
+                let input = BS.replicate (2 * 1024 * 1024) 65
+                    command =
+                        "(sleep 2; printf leaked > "
+                            ++ shellQuote sentinel
+                            ++ ") & yes flooding-output | head -c 20000000 >&2; wait"
+                    cfg = OracleConfig "sh" ["-c", command] 500000 Nothing
+                -- The oracle never reads stdin while its 2MiB payload fills
+                -- the pipe and stderr floods; the group must die before the
+                -- blocked writer is joined. Generous outer guard proves
+                -- liveness only, not a wall threshold.
+                result <- timeout 20000000 (observeExternalOracleDetailed cfg input)
+                case result of
+                    Nothing -> assertFailure "oracle observation hung on unread stdin"
+                    Just details ->
+                        assertEqual "expected oracle timeout" OracleTimedOut (detailedObservation details)
+                threadDelay 2500000
                 leaked <- doesFileExist sentinel
                 assertBool "a timed-out descendant survived the process-group cleanup" (not leaked)
         ]

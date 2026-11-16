@@ -81,6 +81,7 @@ data Options = Options
     , optQuiet :: !Bool
     , optBudgetSecs :: !(Maybe Double)
     , optMaxOracleExecutions :: !(Maybe Int)
+    , optJobs :: !Int
     , optDialect :: !SQLDialect
     }
     deriving (Eq, Show)
@@ -165,6 +166,15 @@ optionsParser =
                 )
             )
         <*> option
+            (eitherReader parseJobs)
+            ( long "jobs"
+                <> metavar "N"
+                <> value 1
+                <> showDefault
+                <> help
+                    "Maximum concurrent oracle/reset executions (default 1). Declares the predicate AND reset support N concurrent independent calls with independent database state; Occam enforces at most N in flight but provides no database isolation"
+            )
+        <*> option
             (eitherReader parseSQLDialect)
             ( long "dialect"
                 <> metavar "DIALECT"
@@ -186,6 +196,18 @@ parseLogFormat :: String -> LogFormat
 parseLogFormat s = case map toLower s of
     "json" -> FormatJSON
     _ -> FormatText
+
+{- | Positive job count parsed as 'Integer' first so huge inputs range-fail
+instead of overflowing 'Int'.
+-}
+parseJobs :: String -> Either String Int
+parseJobs s = case reads s of
+    [(n, "")]
+        | n >= (1 :: Integer)
+        , n <= toInteger (maxBound :: Int) ->
+            Right (fromInteger n)
+    _ -> Left "Expected a positive --jobs value"
+
 versionOption :: Parser (a -> a)
 versionOption =
     infoOption
@@ -234,8 +256,9 @@ runEvalWithLogger logger Options {..} = do
             finiteTimeout optTimeoutSecs
                 && maybe True finiteTimeout optBudgetSecs
                 && maybe True (> 0) optMaxOracleExecutions
+                && optJobs > 0
     unless validLimits $
-        failWith "Error: timeout, budget, and execution limits must be positive"
+        failWith "Error: timeout, budget, execution, and job limits must be positive"
 
     exists <- doesFileExist optInputFile
     unless exists do
@@ -270,6 +293,7 @@ runEvalWithLogger logger Options {..} = do
         evaluationConfig =
             EvaluationConfig
                 { evaluationCacheEnabled = profileCacheEnabled optProfile
+                , evaluationJobs = optJobs
                 , evaluationTotalTimeoutMicros = round . (* 1000000) <$> optBudgetSecs
                 , evaluationMaxOracleExecutions = optMaxOracleExecutions
                 , evaluationPreflightMicros = preflightMicros

@@ -12,17 +12,27 @@ module Occam.Oracle (
     observeExternalOracleDetailedWith,
     oracleObservationMatches,
     classifyOracleObservation,
+    observationOutcome,
+    OracleReapFailed (..),
     prepareOracle,
 ) where
 
-import Control.Concurrent (forkFinally, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
+import Control.Concurrent (
+    forkIOWithUnmask,
+    killThread,
+    newEmptyMVar,
+    putMVar,
+    readMVar,
+    threadDelay,
+ )
 import Control.Exception (
+    Exception,
     IOException,
+    SomeException,
     bracket,
     finally,
     handle,
     mask,
-    mask_,
     onException,
     throwIO,
     try,
@@ -43,6 +53,7 @@ import Data.Aeson.Encoding qualified as Encoding
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -62,6 +73,7 @@ import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (ProcessID)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, getProcessExitCode, proc, shell, waitForProcess, withCreateProcess)
 #endif
+import Occam.Core (OracleOutcome (..))
 import System.IO.Error (isResourceVanishedError)
 import System.Timeout (timeout)
 
@@ -94,8 +106,16 @@ defaultResetTimeoutMicros = 30000000
 
 {- | Oracle and reset children get a fresh process group. Ordinary descendants
 inherit ownership and are terminated on completion/timeout; children that call
-setsid escape it and are outside the supported Linux/POSIX contract.
+setsid escape it and are outside the supported Linux/POSIX contract. Process
+groups are job control, not a security sandbox or a hard real-time guarantee:
+kernel-wedged (SIGKILL-immune, D-state) leaders cannot be reaped, and that
+failure aborts loudly via 'OracleReapFailed' instead of claiming cleanup.
 -}
+data OracleReapFailed = OracleReapFailed
+    deriving (Show)
+
+instance Exception OracleReapFailed
+
 runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe ExitCode)
 runProcessGroup timeoutMicros command input =
     snd <$> runProcessGroupWithStart (pure ()) timeoutMicros command input
@@ -126,16 +146,28 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                         timeoutMicros
                                         ( withWorker (drainOutput hOut) \readOut ->
                                             withWorker (drainOutput hErr) \readErr ->
-                                                withWorker (writePipe hIn input) \writeInput -> do
-                                                    exitCode <- waitForProcess ph
-                                                    writeInput
-                                                    readOut
-                                                    readErr
-                                                    pure exitCode
+                                                withWorker (writePipe hIn input) \writeInput ->
+                                                    ( do
+                                                        exitCode <- waitForProcess ph
+                                                        -- The leader is gone but group members may still hold
+                                                        -- pipes open; kill the owned group before joining the
+                                                        -- drains so a lingering grandchild cannot stall them.
+                                                        _ <- cleanup
+                                                        writeInput
+                                                        readOut
+                                                        readErr
+                                                        pure exitCode
+                                                    )
+                                                        -- On timeout the group must die BEFORE the helper
+                                                        -- joins unwind: a writer blocked on a full pipe
+                                                        -- that nobody reads cannot close until its readers
+                                                        -- are gone. This innermost handler runs first.
+                                                        `onException` cleanup
                                         )
                             )
                                 `onException` cleanup
-                        cleanup
+                        reaped <- cleanup
+                        unless reaped $ throwIO OracleReapFailed
                         pure (True, result)
                     _ -> ioError (userError "Missing oracle process pipes")
     where
@@ -153,11 +185,11 @@ createProcessGroup = False
 getOwnedGroup :: ProcessHandle -> IO ()
 getOwnedGroup _ = pure ()
 
-cleanupOwnedGroup :: () -> ProcessHandle -> IO ()
+cleanupOwnedGroup :: () -> ProcessHandle -> IO Bool
 cleanupOwnedGroup _ ph = do
     ignoreIOException (terminateProcess ph)
-    _ <- timeout 1000000 (waitForProcess ph)
-    pure ()
+    reaped <- timeout 1000000 (waitForProcess ph)
+    pure (isJust reaped)
 #else
 createProcessGroup :: Bool
 createProcessGroup = True
@@ -165,8 +197,11 @@ createProcessGroup = True
 getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
 getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
 
-cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO ()
-cleanupOwnedGroup mPid ph = mask_ do
+-- | Terminate the owned group and report whether the leader was reaped.
+-- Signals stay masked; only the bounded reap wait is interruptible, so the
+-- one-second bound is real even for wedged leaders.
+cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO Bool
+cleanupOwnedGroup mPid ph = mask $ \restore -> do
     case mPid of
         Nothing -> pure ()
         Just pid -> do
@@ -175,8 +210,8 @@ cleanupOwnedGroup mPid ph = mask_ do
                 Right () -> uninterruptibleMask_ (waitForGroupTermination pid ph 50)
                 Left _ -> pure ()
             ignoreIOException (signalProcessGroup sigKILL pid)
-    _ <- timeout 1000000 (waitForProcess ph)
-    pure ()
+    reaped <- restore (timeout 1000000 (waitForProcess ph))
+    pure (isJust reaped)
 
 {- | Give a cooperative process group a short grace period after SIGTERM.
 Poll instead of sleeping for the full delay so fast oracles do not pay it on
@@ -197,16 +232,31 @@ waitForGroupTermination pid ph remaining
                         threadDelay 1000 >> waitForGroupTermination pid ph (remaining - 1)
 #endif
 
+{- | Fork a pipe helper that is always killable and always joined. The helper
+runs unmasked ('forkFinally' under 'mask' would inherit 'MaskedInterruptible'
+and hostile always-ready I/O could starve its kill); completion is published
+masked. Both the user and the release join via persistent 'readMVar'.
+-}
 withWorker :: IO a -> (IO a -> IO b) -> IO b
 withWorker action use =
     bracket
         ( do
             result <- newEmptyMVar
-            tid <- forkFinally action (putMVar result)
+            tid <-
+                forkIOWithUnmask $ \unmask -> do
+                    completed <- tryWorker (unmask action)
+                    putMVar result completed
             pure (tid, result)
         )
-        (killThread . fst)
+        ( \(tid, result) -> do
+            killThread tid
+            _ <- readMVar result
+            pure ()
+        )
         (\(_, result) -> use (readMVar result >>= either throwIO pure))
+
+tryWorker :: IO a -> IO (Either SomeException a)
+tryWorker = try
 
 drainOutput :: Handle -> IO ()
 drainOutput h = do
@@ -409,6 +459,15 @@ classifyOracleObservation observation = case observation of
     OracleIOFailed _ -> InfrastructureError
     OracleFinished ExitSuccess -> Accepted
     OracleFinished _ -> Rejected
+
+-- | Definite process outcomes decide; timeouts and failures stay inconclusive.
+observationOutcome :: OracleObservation -> OracleOutcome
+observationOutcome observation = case classifyOracleObservation observation of
+    Accepted -> OracleAccepted
+    Rejected -> OracleRejected
+    TimedOut -> OracleInconclusive
+    InfrastructureError -> OracleInconclusive
+    Interrupted -> OracleInconclusive
 
 -- ----------------------------------------------------------------------------
 -- External interestingness predicate

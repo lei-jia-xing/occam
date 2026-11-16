@@ -16,10 +16,12 @@ module Occam.Evaluation (
 
 import Control.Exception (
     AsyncException,
-    Exception,
+    IOException,
     displayException,
     finally,
     fromException,
+    handle,
+    mask_,
     onException,
     throwIO,
     try,
@@ -30,7 +32,7 @@ import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Char (toLower)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -38,29 +40,42 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
-import Occam.Cache (CacheAdmission (..), CacheMode (..), CacheStats (..), memoizeOracleWith)
+import Occam.Cache (CacheStats (..))
+import Occam.Core (OracleOutcome (..))
 import Occam.Logger (Logger (..), logInfo')
 import Occam.Oracle (
     OracleConfig (..),
     OracleObservation (..),
     OracleObservationDetails (..),
+    OracleReapFailed (..),
     OracleStatus (..),
     classifyOracleObservation,
+    observationOutcome,
     observeExternalOracleDetailedWith,
     oracleObservationMatches,
  )
 import Occam.Parser (SQLDialect (..), countStatements)
+import Occam.Pool (
+    ExecutionBudgetReached (..),
+    OraclePool,
+    PoolConfig (..),
+    closeOraclePool,
+    mapPoolRetire,
+    newOraclePool,
+    poolAttempts,
+    poolCacheStats,
+    poolCancelled,
+ )
 import Occam.Reducer (
     AuditStats (..),
-    Oracle,
-    OracleOutcome (..),
     statementAuditWithLogger,
  )
-import System.Directory (renameFile)
+import System.Directory (removeFile, renameFile)
 import System.Timeout (timeout)
 
 data EvaluationConfig = EvaluationConfig
     { evaluationCacheEnabled :: !Bool
+    , evaluationJobs :: !Int
     , evaluationTotalTimeoutMicros :: !(Maybe Int)
     , evaluationMaxOracleExecutions :: !(Maybe Int)
     , evaluationPreflightMicros :: !Int
@@ -211,9 +226,11 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationTimedOutObservations :: !Int
     , evaluationResetFailures :: !Int
     , evaluationOracleErrors :: !Int
+    , evaluationCancelledObservations :: !Int
     , evaluationOracleOutcomes :: !(Map OracleStatus Int)
     , evaluationCacheHits :: !Int
     , evaluationCacheMisses :: !Int
+    , evaluationCacheJoins :: !Int
     , evaluationValidationRepeats :: !Int
     , evaluationValidationSeconds :: !Double
     , evaluationValidationOracleSeconds :: !Double
@@ -240,12 +257,7 @@ data EvaluationResult = EvaluationResult
     , evaluationMetrics :: !EvaluationMetrics
     }
 
-newtype ExecutionBudgetReached = ExecutionBudgetReached ()
-    deriving (Show)
-
-instance Exception ExecutionBudgetReached
-
-type ReductionAction = Logger -> Oracle -> IO ByteString
+type ReductionAction = Logger -> OraclePool -> IO ByteString
 
 type Ticks = Integer
 
@@ -282,11 +294,12 @@ runEvaluatedReductionWithProgress ::
     ReductionAction ->
     IO EvaluationResult
 runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
+    when (evaluationJobs config <= 0) $
+        ioError (userError ("Evaluation jobs must be positive, got " ++ show (evaluationJobs config)))
     startedAt <- ticks
     let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
         totalStart = startedAt - preflightMicros * 1000
     acceptedRef <- newIORef initialSQL
-    attemptsRef <- newIORef (0 :: Int)
     databaseRef <- newIORef (0 :: Int)
     completedRef <- newIORef (0 :: Int)
     acceptedCountRef <- newIORef (0 :: Int)
@@ -307,7 +320,6 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
     validationSecondsRef <- newIORef (0.0 :: Double)
     curveRef <- newIORef ([] :: [EvaluationPoint])
     stagesRef <- newIORef ([] :: [Value])
-    callIndexRef <- newIORef (0 :: Int)
     auditSecondsRef <- newIORef (0.0 :: Double)
     auditChecksRef <- newIORef (0 :: Int)
     auditInitialAcceptedRef <- newIORef False
@@ -346,63 +358,40 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
         recordOutcome outcomes observation =
             modifyIORef' outcomes $
                 Map.insertWith (+) (classifyOracleObservation observation) 1
-        recordInterrupted = do
-            modifyIORef' timedOutRef (+ 1)
-            modifyIORef' errorsRef (+ 1)
-            modifyIORef' outcomesRef (Map.insertWith (+) Interrupted 1)
+        -- Worker-side billing: every update is atomic. Cancelled speculative
+        -- work never reaches this path; it counts as cancelled, not here.
         recordReductionObservation profile = do
             let observation = detailedObservation profile
                 micros = fromIntegral
-            modifyIORef' resetSecondsRef (+ micros (resetElapsedMicros profile) / 1000000)
+            atomicModifyIORef'
+                resetSecondsRef
+                (\total -> (total + micros (resetElapsedMicros profile) / 1000000, ()))
             case oracleElapsedMicros profile of
-                Just oracleMicros -> modifyIORef' oracleSecondsRef (+ micros oracleMicros / 1000000)
+                Just oracleMicros -> atomicModifyIORef' oracleSecondsRef (\total -> (total + micros oracleMicros / 1000000, ()))
                 Nothing -> pure ()
-            recordOutcome outcomesRef observation
+            atomicModifyIORef'
+                outcomesRef
+                (\counts -> (Map.insertWith (+) (classifyOracleObservation observation) 1 counts, ()))
             case observation of
                 OracleFinished _ -> do
-                    modifyIORef' completedRef (+ 1)
+                    atomicModifyIORef' completedRef (\n -> (n + 1, ()))
                     if oracleObservationMatches observation
-                        then modifyIORef' acceptedCountRef (+ 1)
-                        else modifyIORef' rejectedCountRef (+ 1)
+                        then atomicModifyIORef' acceptedCountRef (\n -> (n + 1, ()))
+                        else atomicModifyIORef' rejectedCountRef (\n -> (n + 1, ()))
                 OracleTimedOut -> do
-                    modifyIORef' timedOutRef (+ 1)
-                    modifyIORef' errorsRef (+ 1)
+                    atomicModifyIORef' timedOutRef (\n -> (n + 1, ()))
+                    atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
                 OracleResetFailed -> do
-                    modifyIORef' resetFailureRef (+ 1)
-                    modifyIORef' errorsRef (+ 1)
-                OracleIOFailed _ -> modifyIORef' errorsRef (+ 1)
-    let runObservation candidate = do
-            attempts <- readIORef attemptsRef
-            case reductionCallLimit of
-                Just limit | attempts >= limit -> throwIO (ExecutionBudgetReached ())
-                _ -> pure ()
-            modifyIORef' attemptsRef (+ 1)
-            profile <-
-                observeExternalOracleDetailedWith
-                    (modifyIORef' databaseRef (+ 1))
-                    oracleCfg
-                    candidate
-                    `onException` recordInterrupted
-            recordReductionObservation profile
-            pure (detailedObservation profile)
+                    atomicModifyIORef' resetFailureRef (\n -> (n + 1, ()))
+                    atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
+                OracleIOFailed _ -> atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
+    reductionStart <- ticks
     let precomputedObservations =
             maybe Map.empty (Map.singleton initialSQL) preflightObservation
-    (cachedObservation, getCacheStats) <-
-        memoizeOracleWith
-            (if evaluationCacheEnabled config then CacheEnabled else CacheDisabled)
-            precomputedObservations
-            cacheCompletedObservation
-            runObservation
-    reductionStart <- ticks
-    let measuredOracle persistCheckpoint candidate = do
-            before <- getCacheStats
-            callIndex <- readIORef callIndexRef
-            modifyIORef' callIndexRef (+ 1)
-            result <- cachedObservation candidate
-            after <- getCacheStats
-            let hit = cacheHits after > cacheHits before
-                outcome = oracleOutcome result
-                accepted = outcome == OracleAccepted
+    -- Scheduler-side retirement: curve, progress, and checkpoint updates run
+    -- in decision order on the single reduction thread.
+    let retireCandidate callIndex candidate outcome hit = do
+            let accepted = outcome == OracleAccepted
             -- Statement counts are diagnostic only. Parsing every candidate just
             -- to fill the curve can cost more than the reduction search itself,
             -- so only pay for the count on candidates that were accepted.
@@ -415,7 +404,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                             Right count -> Just count
                     else pure Nothing
             onProgress (ProgressCandidateTested (callIndex + 1) hit accepted)
-            when (persistCheckpoint && accepted) $ do
+            when accepted $ do
                 smaller <- checkpointIfSmaller acceptedRef checkpoint candidate
                 when smaller $
                     onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
@@ -431,8 +420,21 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                     , pointAccepted = accepted
                     }
                     : points
-            pure outcome
-        captureLogger =
+    pool <-
+        newOraclePool
+            PoolConfig
+                { poolJobs = evaluationJobs config
+                , poolCacheEnabled = evaluationCacheEnabled config
+                , poolPermits = reductionCallLimit
+                , poolPrecomputed = precomputedObservations
+                , poolExecute =
+                    observeExternalOracleDetailedWith
+                        (atomicModifyIORef' databaseRef (\n -> (n + 1, ())))
+                        oracleCfg
+                , poolBill = recordReductionObservation
+                , poolRetire = retireCandidate
+                }
+    let captureLogger =
             parentLogger
                 { loggerAction = \level component message metadata -> do
                     modifyIORef' stagesRef (event level component message metadata :)
@@ -446,15 +448,18 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                     loggerAction parentLogger level component message metadata
                 }
         runAction = do
-            reduced <- action captureLogger (measuredOracle True)
+            reduced <- action captureLogger pool
             auditInput <- readIORef acceptedRef
             auditStart <- ticks
-            let auditOracle candidate = do
-                    priorChecks <- readIORef auditChecksRef
-                    modifyIORef' auditChecksRef (+ 1)
-                    outcome <- measuredOracle True candidate
-                    when (priorChecks == 0) (writeIORef auditInitialAcceptedRef (outcome == OracleAccepted))
-                    pure outcome
+            let auditPool =
+                    mapPoolRetire
+                        ( \retire index candidate outcome hit -> do
+                            priorChecks <- readIORef auditChecksRef
+                            modifyIORef' auditChecksRef (+ 1)
+                            when (priorChecks == 0) (writeIORef auditInitialAcceptedRef (outcome == OracleAccepted))
+                            retire index candidate outcome hit
+                        )
+                        pool
                 finishAudit = do
                     auditEnd <- ticks
                     let elapsed = seconds auditStart auditEnd
@@ -475,7 +480,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
             _ <-
                 ( do
                     (result, stats) <-
-                        statementAuditWithLogger captureLogger dialect auditOracle auditInput
+                        statementAuditWithLogger captureLogger dialect auditPool auditInput
                     initialAccepted <- readIORef auditInitialAcceptedRef
                     writeIORef auditCompletedRef (auditMinimalityConfirmed stats)
                     writeIORef auditUnchangedRef (initialAccepted && result == auditInput)
@@ -494,17 +499,24 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
             pure (Just available)
     reductionOutcome <-
         try $ case reductionBudget of
-            Nothing -> Just <$> runAction
-            Just micros -> timeout (boundedTimeout micros) runAction
+            Nothing -> Just <$> (runAction `finally` closeOraclePool pool)
+            Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
     reductionEnd <- ticks
     let reductionSeconds = seconds reductionStart reductionEnd
-    (status, failure) <- case reductionOutcome of
-        Right (Just _) -> pure (EvaluationCompleted, Nothing)
-        Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction")
+    (status, failure, skipValidation) <- case reductionOutcome of
+        Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
+        Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
         Left err
-            | Just (ExecutionBudgetReached _) <- fromException err -> pure (EvaluationExecutionBudget, Nothing)
+            | Just (ExecutionBudgetReached _) <- fromException err ->
+                pure (EvaluationExecutionBudget, Nothing, False)
+            | Just OracleReapFailed <- fromException err ->
+                pure
+                    ( EvaluationError
+                    , Just "Oracle process group could not be reaped; refusing further oracle executions"
+                    , True
+                    )
             | Just asyncErr <- fromException err -> throwIO (asyncErr :: AsyncException)
-            | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)))
+            | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)), False)
 
     acceptedFinal <- readIORef acceptedRef
     auditResult <- readIORef auditResultRef
@@ -547,7 +559,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                                     modifyIORef' validationResetSecondsRef (+ micros (resetElapsedMicros profile) / 1000000)
                                     modifyIORef' validationOracleSecondsRef (+ maybe 0 micros (oracleElapsedMicros profile) / 1000000)
                                     recordOutcome validationOutcomesRef observation
-                                    case oracleOutcome observation of
+                                    case observationOutcome observation of
                                         OracleAccepted -> pure (Just OracleAccepted)
                                         OracleRejected -> do
                                             writeIORef validationRejectedRef True
@@ -559,11 +571,12 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
             first <- validateOnce candidate
             second <- validateOnce candidate
             pure (first == Just OracleAccepted && second == Just OracleAccepted)
-    validationPassed <- validateTwice finalSQL
-    cacheStats <- getCacheStats
+    validationPassed <- if skipValidation then pure False else validateTwice finalSQL
+    cacheStats <- poolCacheStats pool
     curve <- reverse <$> readIORef curveRef
     stages <- reverse <$> readIORef stagesRef
-    attempts <- readIORef attemptsRef
+    attempts <- poolAttempts pool
+    cancelled <- poolCancelled pool
     database <- readIORef databaseRef
     completed <- readIORef completedRef
     acceptedCount <- readIORef acceptedCountRef
@@ -627,9 +640,11 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                 , evaluationTimedOutObservations = timedOut
                 , evaluationResetFailures = resetFailures
                 , evaluationOracleErrors = errors
+                , evaluationCancelledObservations = cancelled
                 , evaluationOracleOutcomes = outcomes
                 , evaluationCacheHits = cacheHits cacheStats
                 , evaluationCacheMisses = cacheMisses cacheStats
+                , evaluationCacheJoins = cacheJoins cacheStats
                 , evaluationValidationRepeats = validationObservations
                 , evaluationValidationSeconds = validationSeconds
                 , evaluationValidationOracleSeconds = validationOracleSeconds
@@ -651,21 +666,26 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                 }
     pure EvaluationResult {evaluatedSQL = finalSQL, evaluationMetrics = metrics}
     where
-        writeCheckpoint sql = do
-            let temporary = checkpoint ++ ".tmp"
-            BS.writeFile temporary sql
-            renameFile temporary checkpoint
+        -- Single-committer critical section: tmp write, rename, and the
+        -- accepted-pointer transition happen masked, and any failure removes
+        -- the tmp file. Local file operations only; no unbounded waits.
+        writeAtomicFile path sql = mask_ $ do
+            let temporary = path ++ ".tmp"
+            (BS.writeFile temporary sql >> renameFile temporary path)
+                `onException` ignoreIOException (removeFile temporary)
+
+        writeCheckpoint = writeAtomicFile checkpoint
 
         checkpointIfSmaller acceptedRef path candidate = do
             current <- readIORef acceptedRef
             if BS.length candidate < BS.length current
-                then do
-                    let temporary = path ++ ".tmp"
-                    BS.writeFile temporary candidate
-                    renameFile temporary path
+                then mask_ $ do
+                    writeAtomicFile path candidate
                     writeIORef acceptedRef candidate
                     pure True
                 else pure False
+
+        ignoreIOException = handle (\(_ :: IOException) -> pure ())
 
 event :: (Show a) => a -> Text -> Text -> [(Text, Value)] -> Value
 event level component message metadata =
@@ -675,15 +695,3 @@ event level component message metadata =
         , "message" .= message
         , "metadata" .= object [(Key.fromText key, value) | (key, value) <- metadata]
         ]
-
-cacheCompletedObservation :: OracleObservation -> CacheAdmission
-cacheCompletedObservation OracleFinished {} = CacheAdmit
-cacheCompletedObservation _ = CacheReject
-
-oracleOutcome :: OracleObservation -> OracleOutcome
-oracleOutcome observation = case classifyOracleObservation observation of
-    Accepted -> OracleAccepted
-    Rejected -> OracleRejected
-    TimedOut -> OracleInconclusive
-    InfrastructureError -> OracleInconclusive
-    Interrupted -> OracleInconclusive

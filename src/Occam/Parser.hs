@@ -187,6 +187,7 @@ defaultServerConfig =
 data ParseOptions = ParseOptions
     { parseDialect :: !SQLDialect
     , parseServerConfig :: !ServerConfig
+    , parseChunkEdits :: !Bool
     }
     deriving (Eq, Show)
 
@@ -195,6 +196,7 @@ defaultParseOptions dialect =
     ParseOptions
         { parseDialect = dialect
         , parseServerConfig = defaultServerConfig
+        , parseChunkEdits = False
         }
 
 instance ToJSON ServerConfig where
@@ -219,6 +221,7 @@ instance ToJSON ParseOptions where
         object
             [ "dialect" .= dialectName (parseDialect options)
             , "server" .= parseServerConfig options
+            , "chunk_edits" .= parseChunkEdits options
             ]
 
 data ParserErrorKind

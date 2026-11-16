@@ -93,6 +93,7 @@ data Options = Options
     , optQuiet :: !Bool
     , optBudgetSecs :: !(Maybe Double)
     , optMaxOracleExecutions :: !(Maybe Int)
+    , optJobs :: !Int
     , optReductionOptions :: !ReductionOptions
     }
     deriving (Eq, Show)
@@ -120,7 +121,9 @@ data Stats = Stats
     , initial_oracle_observations :: !Int
     , cache_hits :: !Int
     , cache_misses :: !Int
+    , cache_joins :: !Int
     , cache_hit_ratio :: !Double
+    , cancelled_observations :: !Int
     , status :: !EvaluationStatus
     , reduction_settings :: !Value
     , evaluation_budget :: !EvaluationConfig
@@ -205,6 +208,15 @@ optionsParser =
                     <> help "Maximum uncached oracle attempts including the initial check and final validation"
                 )
             )
+        <*> option
+            (eitherReader parseJobs)
+            ( long "jobs"
+                <> metavar "N"
+                <> value 1
+                <> showDefault
+                <> help
+                    "Maximum concurrent oracle/reset executions (default 1). Declares the predicate AND reset support N concurrent independent calls with independent database state; Occam enforces at most N in flight but provides no database isolation"
+            )
         <*> reductionOptionsParser
 
 reductionOptionsParser :: Parser ReductionOptions
@@ -245,6 +257,17 @@ parseLogFormat s = case map toLower s of
     "text" -> Right FormatText
     "json" -> Right FormatJSON
     _ -> Left "Expected text or json"
+
+{- | Positive job count parsed as 'Integer' first so huge inputs range-fail
+instead of overflowing 'Int'.
+-}
+parseJobs :: String -> Either String Int
+parseJobs s = case reads s of
+    [(n, "")]
+        | n >= (1 :: Integer)
+        , n <= toInteger (maxBound :: Int) ->
+            Right (fromInteger n)
+    _ -> Left "Expected a positive --jobs value"
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -324,6 +347,9 @@ usageSpecText =
         , "flag \"--max-oracle-executions <N>\" help=\"Maximum uncached oracle attempts including initial check and validation\" {"
         , "    arg <N>"
         , "}"
+        , "flag \"--jobs <N>\" default=\"1\" help=\"Maximum concurrent oracle/reset executions; declares N concurrent independent calls with independent database state\" {"
+        , "    arg <N>"
+        , "}"
         , ""
         , "flag \"--slicing\" help=\"Enable backward dependency slicing pass (default: on)\""
         , "flag \"--no-slicing\" help=\"Disable backward dependency slicing pass\""
@@ -400,8 +426,9 @@ runOccamWithLogger logger Options {..} = do
             finiteTimeout optTimeoutSecs
                 && maybe True finiteTimeout optBudgetSecs
                 && maybe True (> 0) optMaxOracleExecutions
+                && optJobs > 0
     unless validBudget do
-        hPutStrLn stderr "Error: timeout, budget, and execution limits must be positive"
+        hPutStrLn stderr "Error: timeout, budget, execution, and job limits must be positive"
         exitFailure
 
     initialSQL <-
@@ -442,6 +469,7 @@ runOccamWithLogger logger Options {..} = do
         configuredBudget =
             EvaluationConfig
                 { evaluationCacheEnabled = optCache optReductionOptions
+                , evaluationJobs = optJobs
                 , evaluationTotalTimeoutMicros = round . (* 1000000) <$> optBudgetSecs
                 , evaluationMaxOracleExecutions = optMaxOracleExecutions
                 , evaluationPreflightMicros = 0
@@ -550,7 +578,9 @@ runOccamWithLogger logger Options {..} = do
                 , initial_oracle_observations = evaluationPreflightAttempts budgetConfig
                 , cache_hits = totalHits
                 , cache_misses = totalMisses
+                , cache_joins = evaluationCacheJoins evaluation
                 , cache_hit_ratio = hitRatio
+                , cancelled_observations = evaluationCancelledObservations evaluation
                 , status = evaluationStatus evaluation
                 , reduction_settings = reductionSettings (optCache optReductionOptions) reductionConfig
                 , evaluation_budget = budgetConfig

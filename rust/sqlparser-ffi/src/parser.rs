@@ -17,6 +17,7 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
         &ParseConfig {
             dialect: kind,
             server: Default::default(),
+            chunk_edits: false,
         },
         false,
         |_| {},
@@ -180,6 +181,7 @@ fn walk_units(
                         source_map,
                         tokens: &positions[token_start..token_end],
                         unit: ByteSpan { start, end },
+                        chunk_edits: config.chunk_edits,
                     },
                 );
                 for edit in &facts.edits {

@@ -135,19 +135,43 @@ def run_command(
         writer_thread = threading.Thread(target=write_input, daemon=True)
         workers.append(writer_thread)
 
+    # A dedicated reaper waits on the leader with a blocking wait so the timed
+    # wait below avoids the backoff polling inside wait(timeout). It stays
+    # separate from the stream drainers on purpose: the leader may exit while
+    # background descendants keep the pipes open, and the verdict must follow
+    # leader termination, not stream EOF.
+    reaped = threading.Event()
+    reaper_error: list[BaseException] = []
+
+    def reap_leader() -> None:
+        try:
+            process.wait()
+        except BaseException as exc:
+            reaper_error.append(exc)
+        finally:
+            reaped.set()
+
+    reaper = threading.Thread(target=reap_leader, daemon=True)
+
     timed_out = False
     cancelled = False
     try:
         for worker in workers:
             worker.start()
+        reaper.start()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
+        elif reaped.wait(timeout=remaining):
+            # A clean wait assigned returncode before signalling the event. A
+            # waiter failure is re-raised here so it travels the same cancel
+            # path as a direct wait() error instead of becoming a timeout.
+            # (^C still flows through that same path; only Popen's internal
+            # first-interrupt grace on the main wait no longer applies.)
+            if reaper_error:
+                raise reaper_error[0]
         else:
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            timed_out = True
     except BaseException:
         cancelled = True
         raise
@@ -160,10 +184,10 @@ def run_command(
             except subprocess.TimeoutExpired:
                 timed_out = True
         join_deadline = time.monotonic() if cancelled else deadline
-        for worker in workers:
+        for worker in (*workers, reaper):
             if worker.ident is not None:
                 worker.join(timeout=max(0.0, join_deadline - time.monotonic()))
-        if not cancelled and any(worker.is_alive() for worker in workers):
+        if not cancelled and any(worker.is_alive() for worker in (*workers, reaper)):
             timed_out = True
 
     with stdout_capture["lock"]:

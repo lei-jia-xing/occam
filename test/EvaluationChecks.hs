@@ -5,7 +5,9 @@ import Control.Exception (finally)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
+import Occam.Core (OracleOutcome (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -23,17 +25,17 @@ import Occam.Oracle (
     prepareOracle,
  )
 import Occam.Parser (SQLDialect (..))
+import Occam.Pool (poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
     defaultReductionConfig,
-    oracleFromPredicate,
     reduceSQL,
     reduceSQLWithConfig,
  )
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
+import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
 tests :: TestTree
 tests =
@@ -44,9 +46,9 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = (predicateOracle 500000 "exit 0") {oracleResetCommand = Just "sleep 0.01"}
                 config = evaluationConfig False Nothing (Just 3)
-                action _ oracle = do
-                    _ <- oracle candidate
-                    _ <- oracle candidate
+                action _ pool = do
+                    _ <- poolOracle pool candidate
+                    _ <- poolOracle pool candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
@@ -85,7 +87,7 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -119,7 +121,7 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -163,7 +165,7 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -193,7 +195,7 @@ tests =
                                 , evaluationPreflightResetMicros = Just (resetElapsedMicros details)
                                 , evaluationPreflightOracleMicros = oracleElapsedMicros details
                                 }
-                        action _ oracle = oracle candidate >> pure candidate
+                        action _ pool = poolOracle pool candidate >> pure candidate
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
                             runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
@@ -218,8 +220,8 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 100000 "exit 0"
                 config = evaluationConfig True (Just 300000) Nothing
-                action _ oracle = do
-                    _ <- oracle candidate
+                action _ pool = do
+                    _ <- poolOracle pool candidate
                     threadDelay 2000000
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
@@ -237,8 +239,8 @@ tests =
             let initial = "SELECT 1;\n"
                 oracleCfg = predicateOracle 100000 "sleep 2"
                 config = evaluationConfig False (Just 300000) Nothing
-                action _ oracle = do
-                    _ <- oracle initial
+                action _ pool = do
+                    _ <- poolOracle pool initial
                     pure initial
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
@@ -254,8 +256,8 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig True Nothing Nothing
-                action _ oracle = do
-                    _ <- oracle candidate
+                action _ pool = do
+                    _ <- poolOracle pool candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
@@ -277,9 +279,9 @@ tests =
                 invalidUtf8 = BS.pack [255]
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig False Nothing Nothing
-                action _ oracle = do
-                    _ <- oracle candidate
-                    reduceSQL SQLite (oracleFromPredicate (const (pure True))) invalidUtf8
+                action _ pool = do
+                    _ <- poolOracle pool candidate
+                    withPredicatePool 1 False (const (pure True)) (\inner -> reduceSQL SQLite inner invalidUtf8)
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -325,12 +327,70 @@ tests =
             assertEqual "Snowflake serialized using CLI spelling" "snowflake" (sqlDialectName Snowflake)
             assertEqual "Spark serialized using CLI spelling" "spark" (sqlDialectName Spark)
             assertEqual "Teradata serialized using CLI spelling" "teradata" (sqlDialectName Teradata)
+        , testCase "speculative losers are cancelled without timeout or error inflation" $
+            withSentinelPath $ \sentinel -> do
+                let acceptSQL = "SELECT 1;\n"
+                    sleepSQL = "SELECT SLEEP;\n"
+                    oracleCfg =
+                        predicateOracle
+                            30000000
+                            ( "sql=$(cat); case \"$sql\" in *SLEEP*) (sleep 2; printf leaked > "
+                                ++ shellQuotePath sentinel
+                                ++ ") & wait;; *) exit 0;; esac"
+                            )
+                    config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+                    action _ pool = do
+                        outcomes <- testOrdered pool [acceptSQL, sleepSQL]
+                        case outcomes of
+                            [(OracleAccepted, _)] -> pure acceptSQL
+                            _ -> assertFailure "ordered head accept was lost to speculation"
+                result <- withCheckpoint $ \checkpoint ->
+                    runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger acceptSQL checkpoint action
+                let metrics = evaluationMetrics result
+                assertEqual "slow loser must not time out" 0 (evaluationTimedOutObservations metrics)
+                assertEqual "cancelled work is not an error" 0 (evaluationOracleErrors metrics)
+                assertBool "loser cancellation was not accounted" (evaluationCancelledObservations metrics >= 1)
+                threadDelay 2500000
+                leaked <- doesFileExist sentinel
+                assertBool "a cancelled loser descendant survived the process-group cleanup" (not leaked)
+        , testCase "reduction drains all workers before final validation" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+            liveAtEndRef <- newIORef (1 :: Int)
+            let action _ pool = do
+                    _ <- testOrdered pool [candidate, initial]
+                    live <- poolLiveWorkers pool
+                    writeIORef liveAtEndRef live
+                    pure candidate
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+            let metrics = evaluationMetrics result
+            liveAtEnd <- readIORef liveAtEndRef
+            assertEqual "workers outlived the reduction action" 0 liveAtEnd
+            assertEqual "drained run did not complete" EvaluationCompleted (evaluationStatus metrics)
+            assertEqual "final validation did not run twice" 2 (evaluationValidationRepeats metrics)
+            assertBool "final validation failed" (evaluationValidationPassed metrics)
+        , testCase "parallel jobs complete a small end-to-end reduction" $ do
+            let initial = "SELECT 1;\nSELECT 2;\nSELECT 3;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+            let metrics = evaluationMetrics result
+            assertEqual "parallel reduction lost the empty fixed point" "" (evaluatedSQL result)
+            assertEqual "parallel run did not complete" EvaluationCompleted (evaluationStatus metrics)
+            assertBool "parallel result failed final validation" (evaluationValidationPassed metrics)
         ]
 
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig
 evaluationConfig cacheEnabled wallBudget callBudget =
     EvaluationConfig
         { evaluationCacheEnabled = cacheEnabled
+        , evaluationJobs = 1
         , evaluationTotalTimeoutMicros = wallBudget
         , evaluationMaxOracleExecutions = callBudget
         , evaluationPreflightMicros = 0
@@ -359,3 +419,21 @@ withCheckpoint action = do
         removeIfExists path = do
             exists <- doesFileExist path
             when exists (removeFile path)
+
+withSentinelPath :: (FilePath -> IO a) -> IO a
+withSentinelPath action = do
+    directory <- getTemporaryDirectory
+    (path, handle) <- openTempFile directory "occam-cancel-sentinel"
+    hClose handle
+    removeFile path
+    action path `finally` mapM_ removeIfExists [path]
+    where
+        removeIfExists sentinel = do
+            exists <- doesFileExist sentinel
+            when exists (removeFile sentinel)
+
+shellQuotePath :: String -> String
+shellQuotePath value = "'" ++ concatMap quote value ++ "'"
+    where
+        quote '\'' = "'\\''"
+        quote character = [character]

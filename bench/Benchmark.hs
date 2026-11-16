@@ -24,8 +24,8 @@ import Occam.Evaluation (
 import Occam.Logger (Logger)
 import Occam.Oracle (OracleConfig)
 import Occam.Parser (SQLDialect (..), countStatements)
+import Occam.Pool (OraclePool)
 import Occam.Reducer (
-    Oracle,
     ReductionConfig (..),
     defaultReductionConfig,
     reduceSQLWithConfig,
@@ -55,7 +55,7 @@ data BenchmarkMetric = BenchmarkMetric
 instance ToJSON BenchmarkMetric
 instance FromJSON BenchmarkMetric
 
-type BenchmarkAction = Logger -> Oracle -> ByteString -> IO ByteString
+type BenchmarkAction = Logger -> OraclePool -> ByteString -> IO ByteString
 
 type BenchmarkProfile = (Text, Bool, Value, BenchmarkAction)
 
@@ -137,11 +137,11 @@ runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql out
         (settings, action) = case profile of
             Sequential ->
                 ( statementOnlySettings dialect cacheEnabled "sequential-deletion"
-                , \_ oracle input -> statementAudit dialect oracle input
+                , \_ pool input -> statementAudit dialect pool input
                 )
             StatementDdmin ->
                 ( statementOnlySettings dialect cacheEnabled "statement-ddmin"
-                , \_ oracle input -> statementDdmin dialect oracle input
+                , \_ pool input -> statementDdmin dialect pool input
                 )
             _ -> (reductionSettings cacheEnabled config, reduceSQLWithConfig config)
     runOne
@@ -178,7 +178,7 @@ runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (nam
             logger
             sql
             sqlPath
-            (\reducerLogger oracle -> action reducerLogger oracle sql)
+            (\reducerLogger pool -> action reducerLogger pool sql)
     reducedStmts <- countStatementsOrFail dialect evaluatedSQL
     let metrics = evaluationMetrics
         reducedBytes = BS.length evaluatedSQL

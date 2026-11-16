@@ -73,6 +73,7 @@ pub(super) struct AnalysisContext<'a> {
     pub(super) source_map: &'a SourceMap,
     pub(super) tokens: &'a [TokenPosition],
     pub(super) unit: ByteSpan,
+    pub(super) chunk_edits: bool,
 }
 
 pub(super) struct SequenceVisitor<'a> {
@@ -146,6 +147,7 @@ pub(super) struct AnalysisVisitor<'a> {
     pub(super) edits: Vec<NativeEdit>,
     tokens: &'a [TokenPosition],
     unit: ByteSpan,
+    chunk_edits: bool,
 }
 impl<'a> AnalysisVisitor<'a> {
     pub(super) fn new(context: AnalysisContext<'a>) -> Self {
@@ -179,6 +181,7 @@ impl<'a> AnalysisVisitor<'a> {
             edits: Vec::new(),
             tokens: context.tokens,
             unit: context.unit,
+            chunk_edits: context.chunk_edits,
         }
     }
 
@@ -1430,6 +1433,7 @@ impl<'a> AnalysisVisitor<'a> {
         if spans.len() < 2 {
             return;
         }
+        self.list_chunk_ranges(label, spans);
         for index in 0..spans.len() {
             let range = if index == 0 {
                 (spans[index].0, spans[index + 1].0)
@@ -1439,6 +1443,94 @@ impl<'a> AnalysisVisitor<'a> {
             if self.find_comma(range.0, range.1).is_some() {
                 self.add_edit_bytes(range.0, range.1, "", NativeEditCategory::List, label);
             }
+        }
+    }
+
+    /// Coarse-to-fine contiguous chunk deletions for one comma-separated list.
+    ///
+    /// Granularities double (2, 4, 8, ...) up to the list length; each level
+    /// partitions the items into contiguous groups and emits one deletion per
+    /// group of two or more. Every level has at least two groups, so a chunk
+    /// always leaves a survivor. Spans reuse the single-item first-vs-nonfirst
+    /// separator convention (a head chunk runs through the first survivor's
+    /// start, otherwise from the previous survivor's end), and only the
+    /// boundary gap holding the actual separator is comma-gated before the
+    /// full composite span is emitted. Item spans are validated once per
+    /// list; groups within a level are disjoint and balanced halving never
+    /// repeats a range across levels, so no candidate is generated twice.
+    /// Chunks precede (never replace) the single-item deletions, which keep
+    /// their exact legacy spans, gating, labels, and order.
+    fn list_chunk_ranges(&mut self, label: &'static str, spans: &[(usize, usize)]) {
+        if !self.chunk_edits {
+            return;
+        }
+        let total = spans.len();
+        // A chunk needs at least two removed items plus a survivor.
+        if total < 3 {
+            return;
+        }
+        if !Self::spans_ordered(spans) {
+            return;
+        }
+        let mut level = 1u32;
+        while let Some(groups) = 1usize.checked_shl(level) {
+            if groups > total {
+                break;
+            }
+            let base = total / groups;
+            let extra = total % groups;
+            let mut start = 0;
+            for group in 0..groups {
+                let size = base + usize::from(group < extra);
+                if size < 2 {
+                    // Group sizes are nonincreasing within a level, so no
+                    // later group can emit; skip the remaining size-1 groups.
+                    break;
+                }
+                let end = start + size;
+                let (gap, range) = if start == 0 {
+                    ((spans[end - 1].1, spans[end].0), (spans[0].0, spans[end].0))
+                } else {
+                    (
+                        (spans[start - 1].1, spans[start].0),
+                        (spans[start - 1].1, spans[end - 1].1),
+                    )
+                };
+                if gap.0 < gap.1 && self.find_comma(gap.0, gap.1).is_some() {
+                    self.add_edit_bytes(
+                        range.0,
+                        range.1,
+                        "",
+                        NativeEditCategory::List,
+                        Self::chunk_label(label),
+                    );
+                }
+                start = end;
+            }
+            level += 1;
+        }
+    }
+
+    /// One O(n) check per list: every item span is non-empty and the spans
+    /// are ordered without overlap. Only gates chunk emission; the
+    /// single-item loop runs unchanged regardless.
+    fn spans_ordered(spans: &[(usize, usize)]) -> bool {
+        spans
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[0].1 && pair[0].1 <= pair[1].0 && pair[1].0 < pair[1].1)
+    }
+
+    /// Static chunk label per list kind; no per-chunk allocation.
+    fn chunk_label(label: &'static str) -> &'static str {
+        match label {
+            "remove-cte" => "remove-cte-chunk",
+            "remove-values_row" => "remove-values_row-chunk",
+            "remove-select_expression" => "remove-select_expression-chunk",
+            "remove-from-relation" => "remove-from-relation-chunk",
+            "remove-in_list" => "remove-in_list-chunk",
+            "remove-tuple_item" => "remove-tuple_item-chunk",
+            "remove-function_argument" => "remove-function_argument-chunk",
+            _ => "remove-list-chunk",
         }
     }
 

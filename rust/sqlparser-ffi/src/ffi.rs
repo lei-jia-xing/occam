@@ -290,6 +290,7 @@ mod tests {
                 current_user: Some("\"MixedUser\"".to_string()),
                 ..Default::default()
             },
+            chunk_edits: false,
         };
         let init = session_init(&config);
         assert_eq!(init.namespace_prefix[0].0, "Tenant");

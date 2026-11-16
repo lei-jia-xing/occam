@@ -32,7 +32,8 @@ import Occam.Parser (
     defaultParseOptions,
     parseSQL,
  )
-import Occam.Reducer (oracleFromPredicate, reduceSQL)
+import Occam.Pool (withPredicatePool)
+import Occam.Reducer (reduceSQL)
 import Test.QuickCheck (
     Arbitrary (..),
     Gen,
@@ -482,7 +483,8 @@ prop_mutationRecovery = forAll (elements seedPool) $ \seed ->
         unless origOk $
             monitor (counterexample "Mutated SQL failed initial crash oracle check")
         assert origOk
-        s_red <- run (reduceSQL SQLite (oracleFromPredicate (seedOracle seed)) s_mutated)
+        s_red <-
+            run (withPredicatePool 1 False (seedOracle seed) (\pool -> reduceSQL SQLite pool s_mutated))
         -- 1. Crash is strictly preserved
         crashPreserved <- run (seedOracle seed s_red)
         unless crashPreserved $
