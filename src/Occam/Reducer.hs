@@ -30,6 +30,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -766,13 +767,19 @@ data SyntaxStats = SyntaxStats
     { syntaxAttempts :: !Int
     , syntaxAccepted :: !Int
     , syntaxElapsed :: !Word64
-    , syntaxConsecutiveRejections :: !Int
     }
 
 reduceSyntaxWithDialect ::
     Logger -> SQLDialect -> Oracle -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
 reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
-    stats <- newIORef (SyntaxStats 0 0 0 0)
+    logInfo'
+        logger
+        "occam::reducer"
+        "Using ordinal-forward syntax candidate schedule"
+        [ ("search_policy", toJSON ("phase-forward-sweep" :: T.Text))
+        , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
+        ]
+    stats <- newIORef (SyntaxStats 0 0 0)
     result <- go stats initialSQL
     finalStats <- readIORef stats
     logInfo'
@@ -782,58 +789,79 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
         [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
         , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
         , ("replacement_oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+        , ("search_policy", toJSON ("phase-forward-sweep" :: T.Text))
+        , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
         ]
     pure result
     where
-        maxConsecutiveRejections = 12 :: Int
-        maxStageAttempts = 40 :: Int
+        categoryOrder =
+            [ EditClause
+            , EditList
+            , EditConstraint
+            , EditType
+            , EditExpression
+            , EditLiteral
+            ]
+        parseEdits currentSQL = do
+            (_, units) <- parseUnitsOrThrow dialect currentSQL
+            let edits =
+                    concatMap
+                        (filter shouldRun . maybe [] factEdits . unitFacts)
+                        units
+            -- Fold into ordered buckets once; category transitions reuse this snapshot.
+            pure (groupEdits edits)
+
+        groupEdits edits =
+            let (clauses, lists, constraints, types, expressions, literals) =
+                    foldr distribute ([], [], [], [], [], []) edits
+             in [ (EditClause, clauses)
+                , (EditList, lists)
+                , (EditConstraint, constraints)
+                , (EditType, types)
+                , (EditExpression, expressions)
+                , (EditLiteral, literals)
+                ]
+
+        distribute edit (clauses, lists, constraints, types, expressions, literals) =
+            case parserEditCategory edit of
+                EditClause -> (edit : clauses, lists, constraints, types, expressions, literals)
+                EditList -> (clauses, edit : lists, constraints, types, expressions, literals)
+                EditConstraint -> (clauses, lists, edit : constraints, types, expressions, literals)
+                EditType -> (clauses, lists, constraints, edit : types, expressions, literals)
+                EditExpression -> (clauses, lists, constraints, types, edit : expressions, literals)
+                EditLiteral -> (clauses, lists, constraints, types, expressions, edit : literals)
 
         go stats currentSQL = do
-            st <- readIORef stats
-            if syntaxConsecutiveRejections st >= maxConsecutiveRejections
-                then do
-                    logInfo'
-                        logger
-                        "occam::reducer"
-                        "Intra-statement rewrites early exit: consecutive rejection threshold reached"
-                        [ ("consecutive_rejections", toJSON (syntaxConsecutiveRejections st))
-                        , ("total_attempts", toJSON (syntaxAttempts st))
-                        , ("total_accepted", toJSON (syntaxAccepted st))
-                        ]
-                    pure currentSQL
-                else
-                    if syntaxAttempts st >= maxStageAttempts
-                        then do
-                            logInfo'
-                                logger
-                                "occam::reducer"
-                                "Intra-statement rewrites early exit: stage attempt budget exhausted"
-                                [ ("stage_budget", toJSON maxStageAttempts)
-                                , ("total_attempts", toJSON (syntaxAttempts st))
-                                , ("total_accepted", toJSON (syntaxAccepted st))
-                                ]
-                            pure currentSQL
-                        else do
-                            (_, units) <- parseUnitsOrThrow dialect currentSQL
-                            let edits = concatMap (filter shouldRun . maybe [] factEdits . unitFacts) units
-                            reduced <- tryEdits stats currentSQL edits
-                            maybe (pure currentSQL) (go stats) reduced
+            phases <- parseEdits currentSQL
+            visitPhases stats currentSQL phases categoryOrder False
 
-        tryEdits _ _ [] = pure Nothing
-        tryEdits stats currentSQL (edit : rest) = do
-            st <- readIORef stats
-            if syntaxConsecutiveRejections st >= maxConsecutiveRejections || syntaxAttempts st >= maxStageAttempts
-                then pure Nothing
-                else do
-                    let candidate =
-                            replaceSpan
-                                (parserEditStart edit)
-                                (parserEditEnd edit)
-                                (parserEditReplacement edit)
-                                currentSQL
-                    if BS.length candidate >= BS.length currentSQL
-                        then tryEdits stats currentSQL rest
+        visitPhases stats currentSQL phases [] shrunk
+            | shrunk = visitPhases stats currentSQL phases categoryOrder False
+            | otherwise = pure currentSQL
+        visitPhases stats currentSQL phases (category : rest) shrunk = do
+            (nextSQL, nextPhases, categoryShrunk) <-
+                exhaustCategory stats currentSQL phases category
+            visitPhases
+                stats
+                nextSQL
+                nextPhases
+                rest
+                (shrunk || categoryShrunk)
+        -- After a strict shrink, reparse and resume at the accepted ordinal.
+        -- Any candidates before that cursor are revisited in the next full cycle.
+        exhaustCategory stats sourceSQL phases category =
+            sweep False 0 sourceSQL phases (phaseCandidates category phases)
+            where
+                sweep changed _ currentSQL currentPhases [] =
+                    pure (currentSQL, currentPhases, changed)
+                sweep changed !ordinal currentSQL currentPhases (edit : rest) = do
+                    let editStart = parserEditStart edit
+                        editEnd = parserEditEnd edit
+                        replacement = parserEditReplacement edit
+                    if BS.length replacement >= editEnd - editStart
+                        then sweep changed (ordinal + 1) currentSQL currentPhases rest
                         else do
+                            let candidate = replaceSpan editStart editEnd replacement currentSQL
                             started <- getMonotonicTimeNSec
                             ok <- oracleAccepts oracle candidate
                             finished <- getMonotonicTimeNSec
@@ -847,7 +875,6 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                                                 { syntaxAttempts = syntaxAttempts s + 1
                                                 , syntaxAccepted = syntaxAccepted s + 1
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
-                                                , syntaxConsecutiveRejections = 0
                                                 }
                                         )
                                     logInfo'
@@ -856,13 +883,21 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                                         "Accepted byte-preserving syntax rewrite"
                                         [ ("rewrite_kind", toJSON (parserEditLabel edit))
                                         , ("rewrite_category", toJSON (parserEditCategory edit))
-                                        , ("span_start", toJSON (parserEditStart edit))
-                                        , ("span_end", toJSON (parserEditEnd edit))
-                                        , ("replacement", toJSON (TE.decodeUtf8Lenient (parserEditReplacement edit)))
+                                        , ("span_start", toJSON editStart)
+                                        , ("span_end", toJSON editEnd)
+                                        , ("replacement", toJSON (TE.decodeUtf8Lenient replacement))
                                         , ("bytes_before", toJSON (BS.length currentSQL))
                                         , ("bytes_after", toJSON (BS.length candidate))
                                         ]
-                                    pure (Just candidate)
+                                    freshPhases <- parseEdits candidate
+                                    let freshCandidates =
+                                            drop ordinal (phaseCandidates category freshPhases)
+                                    sweep
+                                        True
+                                        ordinal
+                                        candidate
+                                        freshPhases
+                                        freshCandidates
                                 else do
                                     modifyIORef'
                                         stats
@@ -870,11 +905,13 @@ reduceSyntaxWithDialect logger dialect oracle shouldRun initialSQL = do
                                             s
                                                 { syntaxAttempts = syntaxAttempts s + 1
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
-                                                , syntaxConsecutiveRejections = syntaxConsecutiveRejections s + 1
                                                 }
                                         )
-                                    tryEdits stats currentSQL rest
+                                    sweep changed (ordinal + 1) currentSQL currentPhases rest
+
+        phaseCandidates category phases =
+            fromMaybe [] (lookup category phases)
 
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
 replaceSpan start end replacement source =
-    BS.take start source <> replacement <> BS.drop end source
+    BS.concat [BS.take start source, replacement, BS.drop end source]

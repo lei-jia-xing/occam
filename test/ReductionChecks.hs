@@ -4,6 +4,8 @@ import Control.Exception (IOException, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (elemIndex)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
@@ -211,6 +213,50 @@ tests =
             assertBool
                 "table subqueries are not replaced by scalar literals"
                 (not (BSC.isInfixOf "FROM 42" tableQuery))
+        , testCase "SQL search retries an FK-blocked parent row after child reduction" $ do
+            let prefix = TE.encodeUtf8 "-- café\n"
+                script parentValues childValues =
+                    prefix
+                        <> BSC.pack
+                            ( "PRAGMA foreign_keys = ON;\r\n"
+                                ++ "CREATE TABLE parent (id INTEGER PRIMARY KEY);\r\n"
+                                ++ "CREATE TABLE child (pid INTEGER REFERENCES parent(id));\r\n"
+                                ++ "INSERT INTO parent VALUES "
+                                ++ parentValues
+                                ++ ";\r\n"
+                                ++ "INSERT INTO child VALUES "
+                                ++ childValues
+                                ++ ";\r\n"
+                                ++ "SELECT p.id FROM parent p JOIN child c ON c.pid = p.id WHERE p.id = 1;\r\n"
+                            )
+                initial = script "(1), (2)" "(1), (2)"
+                blockedParent = script "(1)" "(1), (2)"
+                afterChild = script "(1), (2)" "(1)"
+                expected = script "(1)" "(1)"
+                -- A deterministic external predicate accepts these three complete valid scripts.
+                accepted = Set.fromList [initial, afterChild, expected]
+            observations <- newIORef ([] :: [(ByteString, Bool)])
+            let oracle candidate = do
+                    let wasAccepted = Set.member candidate accepted
+                    modifyIORef' observations ((candidate, wasAccepted) :)
+                    pure (if wasAccepted then OracleAccepted else OracleRejected)
+            reduced <- syntaxOnly SQLite oracle initial
+            seen <- reverse <$> readIORef observations
+            let observedSQL = map fst seen
+            assertEqual "the later parent deletion is accepted after its child" expected reduced
+            assertEqual "the parent deletion is initially rejected" (Just False) (lookup blockedParent seen)
+            assertEqual "the child deletion is accepted" (Just True) (lookup afterChild seen)
+            assertEqual "the enabled parent deletion is accepted" (Just True) (lookup expected seen)
+            let positions =
+                    ( elemIndex blockedParent observedSQL
+                    , elemIndex afterChild observedSQL
+                    , elemIndex expected observedSQL
+                    )
+            case positions of
+                (Just blockedAt, Just childAt, Just parentAt) -> do
+                    assertBool "the blocked parent candidate comes before child removal" (blockedAt < childAt)
+                    assertBool "child removal precedes the newly enabled parent removal" (childAt < parentAt)
+                _ -> assertFailure "the oracle did not observe the three complete-script states"
         , testCase "Statement surgery preserves compound SQLite triggers and UTF-8 offsets" $ do
             let prefix = TE.encodeUtf8 "-- café\n"
                 unused = BSC.pack "CREATE TABLE unused (id INT);\n"
@@ -325,11 +371,33 @@ tests =
                     (resNo, testsNo) <- findInterestingPrefix noOracle sql21 stmts21
                     assertEqual "no match returns Nothing" Nothing resNo
                     assertBool ("binary search takes <= 5 tests (took " ++ show testsNo ++ ")") (testsNo <= 5)
-        , testCase "intra-statement rewrites terminates early when AST mutations plateau" $ do
-            let sql = "SELECT * FROM t WHERE 1 = 1 AND 2 = 2;"
-                failingOracle = predicateOracle (== sql)
-            reduced <- syntaxOnly GenericSQL failingOracle sql
-            assertEqual "no rewrite accepted returns unchanged SQL without infinite loop" sql reduced
+        , testCase "syntax search reaches a late clause after earlier same-category rejections" $ do
+            let statements =
+                    [ let value = BSC.pack (show index)
+                       in "SELECT " <> value <> " WHERE " <> value <> " = " <> value <> ";"
+                    | index <- [1 :: Int .. 42]
+                    ]
+                earlier = init statements
+                sql = BSC.unlines statements
+                expected = BSC.unlines (earlier ++ ["SELECT 42;"])
+                accepts candidate =
+                    candidate == sql
+                        || ( all (`BSC.isInfixOf` candidate) earlier
+                                && BSC.isInfixOf "SELECT 42;" candidate
+                           )
+            rejected <- newIORef (0 :: Int)
+            let oracle candidate =
+                    if accepts candidate
+                        then pure OracleAccepted
+                        else do
+                            modifyIORef' rejected (+ 1)
+                            pure OracleRejected
+            reduced <- syntaxOnly SQLite oracle sql
+            rejectionCount <- readIORef rejected
+            assertEqual "the final clause is removed after earlier clauses remain" expected reduced
+            assertBool
+                "the earlier same-category candidates were rejected"
+                (rejectionCount >= length earlier)
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int

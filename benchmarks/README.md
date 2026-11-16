@@ -47,6 +47,277 @@ Execution mode (native CLI or API) is orthogonal to experiment line; this scale-
 
 The legacy multi-tool runner and reporter below do not enforce these partitions. Their mixed records are not a line-compliant leaderboard or evidence bundle.
 
+## Optional external reducer pilot
+
+`tools/compare_reducers.py` is a separate, bounded external comparison, not an
+internal profile cohort or the legacy mixed-tool leaderboard. The primary
+SQLite/internal evaluation scope above is unchanged.
+
+It compares the native Occam CLI with `--intra-statement`, C-Reduce's `--not-c`
+mode, SQLancer's upstream statement + AST reducers, and SQLreduce's upstream
+search/rules. SQLancer and SQLreduce use the existing external-predicate
+adapters, not their native DBMS orchestration. In particular, SQLreduce uses a
+PostgreSQL parser against a shared SQLite predicate on these inputs; this is
+not a PostgreSQL engine result or a general SQLite-support claim.
+
+The default cohort is the six numbered SQL seeds in `seeds/` plus the existing
+`statements-64` and `statements-512` scale fixtures. These are selected workloads,
+not eight independent bugs or a representative SQL corpus. Each predicate
+executes the complete candidate in a fresh in-memory SQLite connection, rejects
+SQL errors, and compares the last rowset in exact order. Preparation checks
+each original twice and rejects empty, malformed, and wrong-row controls.
+
+Prepare the pinned upstream checkouts outside the repository:
+
+```bash
+export SQLANCER_SOURCE="$HOME/.cache/occam/sqlancer-a7d60ee450e6a22ca38599c14e984a49773f4745"
+export SQLREDUCE_SOURCE="$HOME/.cache/occam/sqlreduce-568c8a9a31601ead7128d0b067658b4d5a26821d"
+# For new checkouts; retain existing prepared checkouts instead of overwriting them.
+git clone https://github.com/sqlancer/sqlancer.git "$SQLANCER_SOURCE"
+git -C "$SQLANCER_SOURCE" checkout --detach a7d60ee450e6a22ca38599c14e984a49773f4745
+mvn -q -Dmaven.test.skip=true package -f "$SQLANCER_SOURCE/pom.xml"
+git clone https://github.com/df7cb/sqlreduce.git "$SQLREDUCE_SOURCE"
+git -C "$SQLREDUCE_SOURCE" checkout --detach 568c8a9a31601ead7128d0b067658b4d5a26821d
+uv venv --python python3 /tmp/occam-external-compare-venv
+uv pip install --python /tmp/occam-external-compare-venv/bin/python \
+  pglast==8.8 psycopg2-binary==2.9.13 PyYAML==6.0.3
+CREDUCE="$(nix build --no-link --print-out-paths \
+  github:nixos/nixpkgs/1d060086d60cb76a40cf37109f979d88a5bd6396#creduce)/bin/creduce"
+env -u GHCRTS cabal build exe:occam
+OUT="$(mktemp -d /tmp/occam-external-comparison.XXXXXX)"
+/tmp/occam-external-compare-venv/bin/python benchmarks/tools/compare_reducers.py \
+  --out "$OUT" --occam "$(env -u GHCRTS cabal list-bin exe:occam)" \
+  --creduce "$CREDUCE" --sqlancer-source "$SQLANCER_SOURCE" \
+  --sqlreduce-source "$SQLREDUCE_SOURCE" \
+  --budget 20 --timeout 1 --repetitions 2
+python3 benchmarks/tools/compare_reducers.py report "$OUT"
+```
+
+`--tools` selects a declared cohort (for example, `--tools occam sqlancer`);
+the default remains all four tools. Only selected tools require binaries or
+source checkouts. The selected list is recorded in `run.json`, and the reporter
+requires exactly that tool/case/repetition cohort. Legacy v1 bundles without a
+selection declaration retain their original four-tool cohort and are not
+rewritten by the reporter.
+
+For a matched rerun, use the original Python/SQLite environment and
+`--reuse-cases-from benchmarks/benchmark_artifacts/external-comparison-20261115-a`
+to copy the original SQL bytes and predicate metadata. The reuse path checks
+the input, metadata, helper, interpreter, and SQLite contract before controls.
+The source snapshot policy always records and hashes `src/Occam/Reducer.hs`
+under `sources/production/`; pass additional changed production dependencies
+with repeatable `--production-source PATH` arguments. Raw output bytes remain
+the primary size metric; any structural count is diagnostic and must name its
+parser and version.
+
+Example Occam/SQLancer selection (no C-Reduce or SQLreduce arguments or
+dependencies):
+
+```bash
+OCCAM="$(env -u GHCRTS cabal list-bin exe:occam)"
+OUT="$(mktemp -d /tmp/occam-external-comparison.XXXXXX)"
+/tmp/occam-external-compare-venv/bin/python benchmarks/tools/compare_reducers.py \
+  --out "$OUT" --tools occam sqlancer \
+  --occam "$OCCAM" --sqlancer-source "$SQLANCER_SOURCE" \
+  --reuse-cases-from benchmarks/benchmark_artifacts/external-comparison-20261115-a \
+  --budget 20 --timeout 1 --repetitions 2
+```
+
+
+The driver compiles the SQLancer bridge once before timing. Children run
+serially with rotating tool order, inherit one CPU affinity where supported,
+and use `GHCRTS=-N1`, C-Reduce `--n 1`, and JVM `ActiveProcessorCount=1`.
+The common wall cap includes an input check, the tool process, and two final
+checks; all tools reserve the same final-check window. There is no execution
+count cap, page-cache flush, or separate warmup. External callbacks receive a
+per-child exact-byte verdict cache in addition to upstream caches; Occam keeps
+its native cache and its additional native preflight/final checks. Consequently
+the comparison measures these declared execution adapters, not search-only CPU.
+
+`run.json`, `manifest.json`, `qualification.json`, input/metadata files, source
+snapshots, per-child commands/logs/audits, and reduced SQL retain the evidence.
+`report.md` and `summary.json` show completion denominators and budget-limited
+output sizes separately. Cost ratios use jointly completed pairs only;
+noncompleted oracle audit counts can be incomplete and are not treated as
+exact costs. Bytes include whitespace/comments, which AST printers can remove:
+byte improvement is not a pure structural-complexity metric.
+
+The reporter rejects missing/duplicate slots and mismatched input, predicate,
+budget, experiment-line, or run-type identities. This pilot does not replace
+the stricter internal partitioned reporting protocol or establish crash
+identity. Any future crash/stack predicate must be shared unchanged by every
+tool in its cohort; stack collection is optional and database-specific.
+
+### Retained pilot observations
+
+The local gitignored evidence bundle is
+[`benchmark_artifacts/external-comparison-20261115-a/report.md`](benchmark_artifacts/external-comparison-20261115-a/report.md);
+`run.json` records the actual Python/SQLite versions, native binary identity,
+upstream pins, affinity, commands, and timing/cache scopes.
+`evidence_validation.json` records the retained-output/hash, validation-audit,
+and completed-call-count checks. The maintained driver above regenerates the
+cohort in a new directory; the local bundle is not fresh-checkout packaging.
+
+Across eight inputs and two repetitions, the bounded protocol completed
+12/16 Occam runs, 5/16 SQLancer runs, and 0/16 C-Reduce or SQLreduce runs.
+All 64 completed outputs/checkpoints passed the two common final checks;
+40 predicate qualification controls passed. Completion means a tool finished
+its own declared pass sequence, not equal search coverage or global minimality.
+The report-contract regression command
+`python3 -m unittest -v benchmarks.test_compare_reducers` passed four tests.
+
+The clearest positive result is statement-noise scaling: Occam reduced both
+the 67-statement and 515-statement inputs to the same 3-statement, 283-byte
+output, with respectively 55 and 58 total audited predicate observations per
+repetition. The larger input started at 20,679 bytes; its median outer time
+was 15.88 seconds. This supports a bounded large-script reduction use case,
+not a causal claim that dependency graphs alone produced the advantage.
+
+The counterevidence matters: SQLancer produced a smaller completed output on
+the deep-expression case, and C-Reduce/SQLreduce often retained smaller
+validated checkpoints on short inputs despite not finishing. On the five
+jointly completed Occam/SQLancer pairs, Occam's median wall advantage includes
+adapter/runtime overhead; SQLancer used fewer predicate observations in four
+of those pairs. This run does not establish uniformly better reduction quality,
+lower oracle cost, crash preservation, or superiority across DBMSs.
+
+#### Post-cap-fix Occam/SQLancer score (2026-11-16)
+
+The fresh 8-input × 2-repetition score bundle is
+[`benchmark_artifacts/external-comparison-post-capfix-20261116-a/`](benchmark_artifacts/external-comparison-post-capfix-20261116-a/);
+per-case raw-byte, validation, scoped-cost, and parser-qualified diagnostics
+are in
+[`external-comparison-post-capfix-analysis-20261116-a/report.md`](benchmark_artifacts/external-comparison-post-capfix-analysis-20261116-a/report.md)
+and `diagnostics.json` in the same directory. It uses the exact reused SQL
+bytes and predicate, 20 s cap, 1 s oracle timeout, CPU 0, Python 3.14.8 /
+SQLite 3.53.3, and declared cache/final-check protocol. The old
+`external-comparison-20261115-a` bundle was not rerun or changed.
+
+All 32 new outputs/checkpoints passed the two common final validations, but
+new Occam completed 0/16 runs while fresh SQLancer completed 4/16 (deep
+expressions and upsert, both repetitions). Thus there are no jointly completed
+new Occam/SQLancer pairs and no completed-pair speed or cost ratio. Relative
+to old Occam's raw output medians, the new validated timeout checkpoints are
+smaller on five cases and larger on three; these are not completed reduction
+quality wins. SQLancer's completed deep output is 955 B versus Occam's 1106 B
+timeout checkpoint. The pglast 8.8 PostgreSQL-grammar diagnostic shows why
+raw bytes need qualification: SQLancer has 30 more non-comment token bytes
+but 181 fewer whitespace/comment bytes there. Parser counts are diagnostic,
+not the SQLite oracle.
+
+The old 12/16 Occam completion result was not uncapped syntax saturation:
+the retained native stats show cap-boundary signatures in its completed
+children, with no explicit termination reason. In the new run all 16 Occam
+children log coarse-to-fine order but time out before terminal syntax summaries.
+Each native timeout records one preflight and completed final-validation fields
+(`evaluationValidationDatabaseObservations=2`, `evaluationValidationRepeats=2`,
+`evaluationValidationPassed=true`); these are separate from the three common
+checks. Reduction observations and cache requests are exact through cutoff,
+not total cost to saturation, and the native audit remains incomplete.
+SQLancer's four completed rows have exact reduction-only scopes in the
+diagnostic report, separated from the three common checks and its adapter
+preflight. The report also records 76 accepted syntax edits and repeated
+queue regeneration; rejected edit kinds are not logged, so repeated expensive
+coarse-probe counts remain unknown. Neither result establishes general
+superiority or a graph contribution.
+
+The score snapshots the production `src/Occam/Reducer.hs` used for the run
+(SHA-256 recorded in `run.json`); that is the only production source file
+included in this bundle. Pass every other changed production dependency
+explicitly with repeatable `--production-source PATH` when making a new
+comparison.
+
+#### Final phased-scheduler Occam/SQLancer score (2026-11-16)
+
+The final immutable 8-input × 2-repetition score is
+[`benchmark_artifacts/external-comparison-phased-20261116-a/`](benchmark_artifacts/external-comparison-phased-20261116-a/).
+The regenerated machine diagnostics and case-by-case report are
+[`diagnostics.json`](benchmark_artifacts/external-comparison-phased-analysis-20261116-a/diagnostics.json)
+and
+[`report.md`](benchmark_artifacts/external-comparison-phased-analysis-20261116-a/report.md).
+The comparison reuses the exact inputs and full-script SQLite ordered-last-rowset
+predicate, with a 20 s child cap, 1 s oracle-call timeout, CPU 0, and
+`GHCRTS=-N1`; SQLancer is pinned to
+`a7d60ee450e6a22ca38599c14e984a49773f4745`. The Occam binary SHA-256 is
+`7ef5ce46f44faa1ab663557bf3e381c53d97db498d524e6fb71f20509954b9a6`,
+and the recorded `src/Occam/Reducer.hs` SHA-256 is
+`4665c455c3efa2df703208b57fa3a0911b57a767cfbca0897216ad43b6d8b4b1`.
+The old baseline and intervening score bundles were not changed.
+
+Phased Occam completed 0/16 children; fresh SQLancer completed 4/16. All
+16 Occam timeout checkpoints and all 16 SQLancer outputs passed both common
+final validations; all 32 selected outputs were validated twice. There are no
+jointly completed pairs. These matched-budget endpoints permit a quality
+comparison despite timeouts, but establish no completion-time or saturated-
+quality result.
+
+Median raw output bytes, phased Occam / SQLancer: CTE 1495/1353; transaction
+942.5/970.5; deep expressions 685/955; multitable diamond 1581.5/1525;
+upsert 632/674; views 735/837; `statements-64` fixture (67 total statements)
+278/313; `statements-512` fixture (515 total statements) 278/507.
+Occam is smaller in six cases and larger in CTE and diamond. The report
+separately lists pglast 8.8 PostgreSQL-grammar AST/token/whitespace diagnostics;
+these are not the SQLite oracle or a minimality score. In the CTE case, for
+example, the 142-byte raw gap includes 21 more Occam token bytes and 121 more
+whitespace/comment bytes.
+
+Phased logs contain 111 accepted syntax rewrites versus 76 in the
+post-cap-fix global-restart run, including accepted CASE, function, and type
+simplifications in the deep case. However, none of the 16 phased children
+emitted a terminal syntax summary before timeout, so syntax-pass saturation
+is unproven. CTE and multitable diamond remain larger than SQLancer's
+checkpoints; equal-length scalar canonicalization remains unsupported by the
+strict byte-shrink gate, and this iteration added no AST rewrite families.
+This evidence does not establish full AST/global minimality or general
+superiority over SQLancer. Scoped counters and remaining limitations are in
+the linked diagnostics/report; timeout counters are observed through cutoff,
+not total cost to saturation.
+
+#### Offline syntax/List prefix diagnostic (2026-11-16)
+
+The bounded offline audit reuses the immutable phased-score artifacts; it ran
+no reducer, predicate, Oracle, or score. Its exact-digest joins show two
+rejected CTE List candidates replayed as cache hits after an acceptance, while
+the MAX-removal candidate from the actual retained checkpoint is distinct
+from the original-input candidate and absent from all saved requests. The
+diamond case has three accepted List row removals but only one request after
+the final acceptance before timeout. Findings, counter-scope limits,
+provenance, and the offline-only reproduction command are in
+[`benchmark_artifacts/syntax-trace-20261116-a/report.md`](benchmark_artifacts/syntax-trace-20261116-a/report.md);
+machine-generated joins and source are in the same directory. Diagnostic
+observer work is not pooled with score timing.
+
+#### Forward-sweep Occam/SQLancer score (2026-11-16)
+
+The immutable 8-input × 2-repetition comparison is
+[`benchmark_artifacts/external-comparison-forward-20261116-a/`](benchmark_artifacts/external-comparison-forward-20261116-a/).
+Its generated diagnostics and full report are
+[`diagnostics.json`](benchmark_artifacts/external-comparison-forward-analysis-20261116-a/diagnostics.json)
+and
+[`report.md`](benchmark_artifacts/external-comparison-forward-analysis-20261116-a/report.md).
+The run records the exact reused SQLite inputs, 20 s child cap, 1 s oracle
+timeout, CPU 0, `GHCRTS=-N1`, Python 3.14.8 / SQLite 3.53.3, Occam binary and
+`Reducer.hs` SHA-256 identities, and SQLancer's upstream pin.
+
+Forward-sweep Occam completed 4/16 children, timed out on 10, and returned
+error on both CTE children; fresh SQLancer completed 6/16 and timed out on 10.
+All 32 new outputs/checkpoints passed both common final checks, but there are
+zero jointly completed pairs. Forward-sweep median raw bytes were 1379/879/
+670/1399/616/729/274/274 for CTE/transaction/deep/diamond/upsert/views/
+67-statement/515-statement inputs; they are smaller than the historical
+phase-fixed-point medians on all eight inputs. Against SQLancer, 14/16
+per-repetition slots are smaller and both larger slots are CTE; this is a
+matched-budget checkpoint comparison, not a speedup, completed-quality,
+saturation, or global-minimality result. The two CTE errors are retained
+`OracleInconclusiveError` failures after per-call timeouts; their 1379-byte
+checkpoints passed native and common final validation. See the report for
+native/common cost scopes, pglast 8.8 syntax diagnostics, and timeout
+limitations.
+
+
+
+
+
 ## Internal profile worker
 
 `occam-eval` runs exactly one named internal control or ablation per process.

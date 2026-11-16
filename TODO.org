@@ -5,13 +5,15 @@
 * Core Invariants
 - [Dialect-Agnostic Engine] Haskell reducer and dependency DAG builder remain dialect-agnostic; all AST parsing and lexical extraction belong exclusively to the Rust frontend (`sqlparser-rs`).
 - [No Fragile Fallbacks] Defer unparsed SQL constructs to upstream `sqlparser-rs` as barriers rather than writing fragile ad-hoc regex or token heuristics.
-- [Speed-First Default] Focus on high-throughput statement-level reductions (backward slicing, closure search, ddmin, audit); intra-statement AST rewrites are opt-in via `--intra-statement`.
+- [Speed-First Default] Focus on high-throughput statement-level reductions (backward slicing, closure search, ddmin, audit); intra-statement AST rewrites remain opt-in. When enabled, generated edits use ordinal-forward category sweeps until a complete unchanged cycle or explicit Evaluation-budget interruption (details below).
 - [Unix-Native Ergonomics] Pure reduced SQL on `stdout` when piped, diagnostics and dynamic progress on `stderr`, and native shell auto-completions via `usage`.
 
 * Active Tasks
-** TODO [#A] Compile comparative benchmark results and thesis evaluation figures
-- Aggregate dual-engine real crash reduction benchmark results (Ours vs B1 vs B2 vs NoDep across PostgreSQL and MySQL).
-- Generate publication-ready figures for oracle call counts, wall-clock speedup, and cache hit ratios.
+** IN_PROGRESS [#A] Compile reproducible reducer comparisons and evaluation evidence
+- Keep the primary evaluation on deterministic, self-contained SQLite predicates; no new crash harvesting or heavyweight DBMS deployment.
+- Compare Occam against independently implemented C-Reduce, SQLancer, and SQLreduce search using identical inputs, predicates, resource limits, and declared adapter modes.
+- Separate completed reductions from validated budget checkpoints; report output size, wall time, oracle observations, failures, and regressions without pooling internal controls with external tools.
+- Real-crash stack fingerprints, if needed later, belong in optional database-specific predicates rather than the reducer core.
 
 * Completed Milestones
 ** DONE Comprehensive multi-shell completions for `occam` via `usage` [2026-11]
@@ -36,6 +38,11 @@
 ** DONE Algorithmic complexity reduction & binary prefix search [2026-11]
 - `findInterestingPrefix` uses $O(\log N)$ binary prefix probes (at most 5 for the tested 21-statement scripts). Finding the earliest accepted prefix requires a monotone predicate; arbitrary predicates receive a heuristic search with oracle-gated candidates.
 - Gated intra-statement AST rewrites as opt-in, reducing oracle calls on real crash scripts by 55.4% (139 -> 62) and achieving >2x wall-clock speedup.
+
+** DONE Ordinal-forward sweep traversal of generated syntax edits [2026-11]
+- Removed hidden consecutive-rejection and total-attempt cutoffs. Generated eligible edits remain oracle-gated until the existing Evaluation budget interrupts or a complete unchanged cycle establishes exhaustion.
+- Stable category order is Clause, List, Constraint, Type, Expression, then Literal; each fresh category snapshot retains parser-emitted order. Rejection/nonshrinking advances the ordinal; acceptance triggers a fresh parse and resumes at the accepted ordinal. All categories finish before a new full cycle; candidates before the cursor, including newly inserted or shifted edits, are revisited from ordinal zero on that cycle, and the pass repeats iff the prior cycle shrank SQL. This forward priority may change finite-budget checkpoints relative to restart-from-zero scheduling.
+- Every accepted candidate strictly shrinks bytes and triggers one parse before traversal resumes; exact spans are never reused across changed SQL. Equal-length canonicalization such as `1` to `0` remains unsupported. Only an unchanged full cycle establishes generated-edit exhaustion; this is not full AST coverage or a global-minimality guarantee.
 
 ** DONE Formal verification and theoretical guarantees (Lean 4)
 - Formally modeled and proved in Lean 4: DAG acyclicity, backward slice reachability soundness, reduction monotonic convergence, and 1-minimality (0 sorry).

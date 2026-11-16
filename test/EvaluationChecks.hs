@@ -4,6 +4,7 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
 import Occam.Evaluation (
     EvaluationConfig (..),
@@ -22,7 +23,13 @@ import Occam.Oracle (
     prepareOracle,
  )
 import Occam.Parser (SQLDialect (..))
-import Occam.Reducer (oracleFromPredicate, reduceSQL)
+import Occam.Reducer (
+    ReductionConfig (..),
+    defaultReductionConfig,
+    oracleFromPredicate,
+    reduceSQL,
+    reduceSQLWithConfig,
+ )
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
@@ -60,6 +67,116 @@ tests =
                 (sum (Map.elems (evaluationValidationOutcomes metrics)))
             assertBool "reset process time is reported separately" (evaluationResetSeconds metrics > 0)
             assertBool "validation reset time is separate" (evaluationValidationResetSeconds metrics > 0)
+        , testCase "coarse-to-fine search checkpoints a structural edit within finite budget" $ do
+            let initial = "INSERT INTO t VALUES (123456);\nSELECT x FROM t WHERE x = 42;\n"
+                candidate = "INSERT INTO t VALUES (123456);\nSELECT x FROM t;\n"
+                predicate =
+                    "sql=$(cat); case \"$sql\" in "
+                        ++ "'INSERT INTO t VALUES (123456);\nSELECT x FROM t WHERE x = 42;'|"
+                        ++ "'INSERT INTO t VALUES (123456);\nSELECT x FROM t;') exit 0 ;; "
+                        ++ "*) exit 1 ;; esac"
+                oracleCfg = predicateOracle 500000 predicate
+                config = evaluationConfig False Nothing (Just 8)
+                reducerConfig =
+                    defaultReductionConfig
+                        { reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionIntraStatement = True
+                        , reductionUnrestricted = False
+                        , reductionDialect = SQLite
+                        }
+                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+            result <- withCheckpoint $ \checkpoint -> do
+                value <-
+                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                saved <- BS.readFile checkpoint
+                assertEqual "the structural candidate is persisted" candidate saved
+                pure value
+            let metrics = evaluationMetrics result
+            assertEqual "the accepted structural SQL is returned" candidate (evaluatedSQL result)
+            assertEqual
+                "further search stops only at the explicit budget"
+                EvaluationExecutionBudget
+                (evaluationStatus metrics)
+            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+        , testCase "syntax reduction checkpoints both fine edits before budget exhaustion" $ do
+            let initial = "INSERT INTO t VALUES (123456, 654321);\nSELECT x FROM t WHERE flag;\n"
+                candidate = "INSERT INTO t VALUES (0, 0);\nSELECT x FROM t WHERE flag;\n"
+                predicate =
+                    "sql=$(cat); case \"$sql\" in "
+                        ++ "'INSERT INTO t VALUES (123456, 654321);\nSELECT x FROM t WHERE flag;'|"
+                        ++ "'INSERT INTO t VALUES (0, 654321);\nSELECT x FROM t WHERE flag;'|"
+                        ++ "'INSERT INTO t VALUES (123456, 0);\nSELECT x FROM t WHERE flag;'|"
+                        ++ "'INSERT INTO t VALUES (0, 0);\nSELECT x FROM t WHERE flag;') exit 0 ;; "
+                        ++ "*) exit 1 ;; esac"
+                oracleCfg = predicateOracle 500000 predicate
+                config = evaluationConfig False Nothing (Just 9)
+                reducerConfig =
+                    defaultReductionConfig
+                        { reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionIntraStatement = True
+                        , reductionUnrestricted = False
+                        , reductionDialect = SQLite
+                        }
+                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+            result <- withCheckpoint $ \checkpoint -> do
+                value <-
+                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                saved <- BS.readFile checkpoint
+                assertEqual "both fine edits are checkpointed before coarse replay" candidate saved
+                pure value
+            let metrics = evaluationMetrics result
+            assertEqual "both fine edits are returned" candidate (evaluatedSQL result)
+            assertEqual
+                "the next search attempt exhausts the explicit budget"
+                EvaluationExecutionBudget
+                (evaluationStatus metrics)
+            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+        , testCase "finite oracle budget reaches both later same-category literal reductions" $ do
+            let initial = "INSERT INTO t VALUES (42, 123456, 654321);\nSELECT x FROM t WHERE flag;"
+                afterFirst = "INSERT INTO t VALUES (42, 0, 654321);\nSELECT x FROM t WHERE flag;"
+                afterSecond = "INSERT INTO t VALUES (42, 123456, 0);\nSELECT x FROM t WHERE flag;"
+                afterBoth = "INSERT INTO t VALUES (42, 0, 0);\nSELECT x FROM t WHERE flag;"
+                shellQuote sql =
+                    "'" ++ concatMap escape (BSC.unpack sql) ++ "'"
+                escape character
+                    | character == '\'' = "'\\''"
+                    | otherwise = [character]
+                predicate =
+                    "sql=$(cat); case \"$sql\" in "
+                        ++ shellQuote initial
+                        ++ "|"
+                        ++ shellQuote afterFirst
+                        ++ "|"
+                        ++ shellQuote afterSecond
+                        ++ "|"
+                        ++ shellQuote afterBoth
+                        ++ ") exit 0 ;; *) exit 1 ;; esac"
+                oracleCfg = predicateOracle 500000 predicate
+                config = evaluationConfig False Nothing (Just 11)
+                reducerConfig =
+                    defaultReductionConfig
+                        { reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionIntraStatement = True
+                        , reductionUnrestricted = False
+                        , reductionDialect = SQLite
+                        }
+                action _ oracle = reduceSQLWithConfig reducerConfig nullLogger oracle initial
+            result <- withCheckpoint $ \checkpoint -> do
+                value <-
+                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                saved <- BS.readFile checkpoint
+                assertEqual "both later literal reductions are checkpointed" afterBoth saved
+                pure value
+            let metrics = evaluationMetrics result
+            assertEqual "both later values are zeroed before the cap" afterBoth (evaluatedSQL result)
+            assertEqual
+                "the explicit oracle cap interrupts only further search"
+                EvaluationExecutionBudget
+                (evaluationStatus metrics)
+            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
         , testCase "preflight exhaustion reports execution budget and keeps the accepted checkpoint" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
