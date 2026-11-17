@@ -76,7 +76,7 @@ Other explicit opaque boundaries include privileges/routine statements, unsuppor
 
 Parser limits remain independent: the selected frontend rejects standalone `TABLE t`, although `(TABLE t)` and the nested forms above parse; the probed CTAS `WITH NO DATA` form is rejected under Snowflake. Conversely, cross-dialect parser acceptance of REFRESH/ALTER VIEW does not establish DBMS validity.
 
-Proof boundaries: the batch passed 99 dependency tests, a 16-dialect graph smoke, and 640 selected-frontend syntax/fact probes before the whole-row correction. That correction passed six targeted consumer scope/TABLE checks and five native alias/LATERAL checks. The final temporary-schema alias normalization then passed a rebuilt, row-seeded whole-row regression covering five queries; the earlier checks were not rerun. Real SQLite and DuckDB CLI reductions preserved populated CTAS snapshots and passed final validation twice each before these whole-row corrections; these are not execution proofs for the other selected dialects.
+Proof boundaries: real SQLite and DuckDB CLI reductions passed final validation twice each; these are not execution proofs for the other selected dialects.
 
 ## Building
 
