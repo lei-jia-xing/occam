@@ -95,6 +95,27 @@
 //! length-prefix production — functional key parts require double parens and
 //! lower as `Nested` — so the shape is positional, never a name-table lookup.
 //! Adding `b` to a name table would be unsound and is never done.
+//!
+//! Multi-dialect strategy (decided; no redesign planned):
+//!
+//! Upstream sqlparser-rs is syntax-only BY DESIGN and will not distinguish
+//! functions by semantics (README "Syntax vs Semantics": "only a syntax
+//! parser ... tries to avoid applying any SQL semantics"; semantic analysis
+//! is left to downstream projects). Function semantics is therefore
+//! permanently occam-owned; do not wait on or propose upstream changes.
+//!
+//! The current shape stays: per-dialect allowlists plus shared shape gates
+//! plus the script-wide routine-DDL shadowing rule. Every entry keeps its
+//! per-entry justification comment and covering tests; removals need the
+//! same evidence bar as additions.
+//!
+//! Growth policy: census-driven selection only, with additions batched per
+//! dialect documentation rather than one-off names. Generic stays
+//! reserved-keyword-only: a lift there must hold on ANY engine.
+//!
+//! Explicitly deferred — do not build without revisiting this decision:
+//! a DBMS execution matrix for function verification (heavy asset), and
+//! data-file/catalog-driven tables (code tables suffice at current scale).
 
 use crate::DialectKind;
 use crate::ir;
@@ -108,14 +129,30 @@ use sqlparser::ast::{Function, ObjectNamePart, Statement};
 /// `ceil`/`floor` → `Expr::Ceil`/`Expr::Floor`, `case` → `Expr::Case`) never
 /// fenced and are deliberately absent: there is no fence to lift.
 const PURE_BUILTINS: &[&str] = &[
-    "abs",      // Absolute value; closed arithmetic over its argument.
+    "abs", // Absolute value; closed arithmetic over its argument.
+    // sqlite: https://sqlite.org/lang_corefunc.html#abs | pg: https://www.postgresql.org/docs/current/functions-math.html#FUNCTIONS-MATH-FUNC-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/mathematical-functions.html#function_abs
     "coalesce", // First-non-NULL value selection over its arguments.
-    "concat",   // Variadic string concatenation; deterministic over arguments.
+    // sqlite: https://sqlite.org/lang_corefunc.html#coalesce | pg: https://www.postgresql.org/docs/current/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/comparison-operators.html#function_coalesce
+    "concat", // Variadic string concatenation; deterministic over arguments.
+    // sqlite: https://sqlite.org/lang_corefunc.html#concat | pg: https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-OTHER
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/string-functions.html#function_concat
     "length", // String length measure (bytes vs. characters differs by dialect; every spelling is pure).
-    "lower",  // Case mapping; deterministic over the argument.
+    // sqlite: https://sqlite.org/lang_corefunc.html#length | pg: https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-OTHER
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/string-functions.html#function_length
+    "lower", // Case mapping; deterministic over the argument.
+    // sqlite: https://sqlite.org/lang_corefunc.html#lower | pg: https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-SQL
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/string-functions.html#function_lower
     "nullif", // Equality-conditional NULL; a failed comparison errors rather than writes.
-    "round",  // Numeric rounding; deterministic arithmetic.
-    "upper",  // Case mapping; deterministic over the argument.
+    // sqlite: https://sqlite.org/lang_corefunc.html#nullif | pg: https://www.postgresql.org/docs/current/functions-conditional.html#FUNCTIONS-NULLIF
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/flow-control-functions.html#function_nullif
+    "round", // Numeric rounding; deterministic arithmetic.
+    // sqlite: https://sqlite.org/lang_corefunc.html#round | pg: https://www.postgresql.org/docs/current/functions-math.html#FUNCTIONS-MATH-FUNC-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/mathematical-functions.html#function_round
+    "upper", // Case mapping; deterministic over the argument.
+             // sqlite: https://sqlite.org/lang_corefunc.html#upper | pg: https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-SQL
+             // mysql: https://dev.mysql.com/doc/refman/8.0/en/string-functions.html#function_upper
 ];
 
 /// Allowlisted pure aggregates (lowercase canonical spelling), gated by the
@@ -124,11 +161,21 @@ const PURE_BUILTINS: &[&str] = &[
 /// its input rows. Statistical siblings, ordered-set functions, and
 /// string-building aggregates are deliberately absent (see the module docs).
 const AGGREGATE_BUILTINS: &[&str] = &[
-    "avg",   // Closed arithmetic mean over the input values.
+    "avg", // Closed arithmetic mean over the input values.
+    // sqlite: https://sqlite.org/lang_aggfunc.html#avg | pg: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html#function_avg
     "count", // Input-row counting, including `COUNT(*)`.
-    "max",   // Order extremum over the input values.
-    "min",   // Order extremum over the input values.
-    "sum",   // Closed addition over the input values.
+    // sqlite: https://sqlite.org/lang_aggfunc.html#count | pg: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html#function_count
+    "max", // Order extremum over the input values.
+    // sqlite: https://sqlite.org/lang_aggfunc.html#max_agg | pg: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html#function_max
+    "min", // Order extremum over the input values.
+    // sqlite: https://sqlite.org/lang_aggfunc.html#min_agg | pg: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+    // mysql: https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html#function_min
+    "sum", // Closed addition over the input values.
+           // sqlite: https://sqlite.org/lang_aggfunc.html#sumunc | pg: https://www.postgresql.org/docs/current/functions-aggregate.html#FUNCTIONS-AGGREGATE-TABLE
+           // mysql: https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html#function_sum
 ];
 
 /// Pure builtins on unknown engines (`GenericSQL`). Only SQL-standard
@@ -137,7 +184,11 @@ const AGGREGATE_BUILTINS: &[&str] = &[
 /// stay fenced on Generic (see the module docs).
 const GENERIC_PURE_BUILTINS: &[&str] = &[
     "coalesce", // Keyword first-non-NULL selection; unquoted spellings only.
-    "nullif",   // Keyword equality-conditional NULL; unquoted spellings only.
+    // SQL:2023/2016/92 reserved; PG bars it as a function/type name (COALESCE row):
+    // https://www.postgresql.org/docs/current/sql-keywords-appendix.html
+    "nullif", // Keyword equality-conditional NULL; unquoted spellings only.
+             // SQL:2023/2016/92 reserved; PG bars it as a function/type name (NULLIF row):
+             // https://www.postgresql.org/docs/current/sql-keywords-appendix.html
 ];
 /// Whether `statement` defines, drops, or alters a callable routine. Any such
 /// statement anywhere in the script disables the pure-builtin tables for every
