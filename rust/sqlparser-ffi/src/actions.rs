@@ -1889,6 +1889,25 @@ fn pragma_bool(value: &ValueWithSpan) -> Option<bool> {
     }
 }
 
+/// Session value of an inert-pragma assignment. Only concrete literals are
+/// representable; placeholders and exotic values stay fenced.
+fn pragma_session_value(value: &ValueWithSpan) -> Option<ir::SessionValue> {
+    match &value.value {
+        Value::Boolean(value) => Some(ir::SessionValue::Bool { value: *value }),
+        Value::Number(text, _) => text
+            .parse::<i64>()
+            .ok()
+            .map(|value| ir::SessionValue::Integer { value }),
+        Value::SingleQuotedString(text)
+        | Value::DoubleQuotedString(text)
+        | Value::TripleSingleQuotedString(text)
+        | Value::TripleDoubleQuotedString(text) => Some(ir::SessionValue::Text {
+            value: text.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn expr_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -2061,12 +2080,56 @@ fn search_path_value(values: &[Expr], rules: &ir::IdentifierRules) -> Option<ir:
     Some(ir::SearchPathValue::Explicit { entries })
 }
 
+/// Resolve the scope of a `foreign_keys`/`foreign_key_checks` assignment.
+///
+/// Only spellings that provably select the session's system variable map to
+/// an effect: a bare name (the statement keyword, if any, selects the
+/// scope), `@@name`/`@@session.name` for the session scope, and
+/// `@@global.name` for the global scope (which provably leaves the current
+/// session untouched, so the evaluator ignores it). Anything else stays
+/// fenced: `@name` is a user variable rather than the system variable,
+/// other qualifiers name custom variables, and a qualifier contradicting
+/// an explicit `GLOBAL`/`SESSION`/`LOCAL` keyword cannot be resolved.
+fn fk_checks_scope(name: &ir::Name, keyword: Option<ContextModifier>) -> Option<ir::SessionScope> {
+    match name.0.as_slice() {
+        [single] => {
+            let single = single.0.as_str();
+            let system = single
+                .strip_prefix("@@")
+                .is_some_and(|rest| !rest.starts_with('@'))
+                || !single.starts_with('@');
+            system.then(|| context_scope(keyword))
+        }
+        [qualifier, ..] => {
+            let qualifier = qualifier.0.as_str();
+            if !qualifier.starts_with("@@") {
+                return None;
+            }
+            match (
+                qualifier
+                    .trim_start_matches('@')
+                    .to_ascii_lowercase()
+                    .as_str(),
+                keyword,
+            ) {
+                ("global", None | Some(ContextModifier::Global)) => Some(ir::SessionScope::Global),
+                ("session", None | Some(ContextModifier::Session)) => {
+                    Some(ir::SessionScope::Session)
+                }
+                _ => None,
+            }
+        }
+        [] => None,
+    }
+}
+
 fn set_effects(
     variable: &ObjectName,
     values: &[Expr],
-    scope: ir::SessionScope,
+    keyword: Option<ContextModifier>,
     rules: &ir::IdentifierRules,
 ) -> (Vec<ir::SessionEffect>, Vec<ir::ScopedBarrier>) {
+    let scope = context_scope(keyword);
     let Some(name) = name_from_object(variable, rules, ir::IdentifierClass::Other) else {
         return (
             Vec::new(),
@@ -2081,6 +2144,9 @@ fn set_effects(
         .map(|ident| ident.0.to_ascii_lowercase())
         .unwrap_or_default();
     let variable_name = last.trim_start_matches('@');
+    // TODO(dialect-alignment): the search_path/autocommit arms still conflate
+    // `@var` user variables with system variables; only the foreign_keys arm
+    // resolves @-vs-@@ spellings (see fk_checks_scope).
     match variable_name {
         "search_path" => match search_path_value(values, rules) {
             Some(path) => (
@@ -2102,6 +2168,15 @@ fn set_effects(
                     vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some("SET foreign_keys with a non-boolean value".to_string()),
+                    )],
+                );
+            };
+            let Some(scope) = fk_checks_scope(&name, keyword) else {
+                return (
+                    Vec::new(),
+                    vec![global_barrier(
+                        ir::BarrierReason::UnknownSessionEffect,
+                        Some("SET foreign_keys with an unmodeled scope or qualifier".to_string()),
                     )],
                 );
             };
@@ -2156,8 +2231,7 @@ fn set_statement_effects(
             values,
             ..
         } => {
-            let (mut set_effects, mut set_barriers) =
-                set_effects(variable, values, context_scope(*scope), rules);
+            let (mut set_effects, mut set_barriers) = set_effects(variable, values, *scope, rules);
             effects.append(&mut set_effects);
             barriers.append(&mut set_barriers);
         }
@@ -2165,12 +2239,8 @@ fn set_statement_effects(
             variables, values, ..
         } => {
             for (variable, value) in variables.iter().zip(values.iter()) {
-                let (mut set_effects, mut set_barriers) = set_effects(
-                    variable,
-                    std::slice::from_ref(value),
-                    ir::SessionScope::Session,
-                    rules,
-                );
+                let (mut set_effects, mut set_barriers) =
+                    set_effects(variable, std::slice::from_ref(value), None, rules);
                 effects.append(&mut set_effects);
                 barriers.append(&mut set_barriers);
             }
@@ -2180,7 +2250,7 @@ fn set_statement_effects(
                 let (mut set_effects, mut set_barriers) = set_effects(
                     &assignment.name,
                     std::slice::from_ref(&assignment.value),
-                    context_scope(assignment.scope),
+                    assignment.scope,
                     rules,
                 );
                 effects.append(&mut set_effects);
@@ -2374,6 +2444,9 @@ fn reset_effects(
                             }],
                             Vec::new(),
                         ),
+                        // TODO(dialect-alignment): `RESET @@global.foreign_key_checks`
+                        // would map to the session scope; no real dialect accepts
+                        // @@ in RESET, so this stays as is.
                         Some("foreign_keys" | "foreign_key_checks") => (
                             vec![ir::SessionEffect::ResetForeignKeyChecks { scope }],
                             Vec::new(),
@@ -2800,8 +2873,9 @@ fn sequence_effects_for_statement<'a>(
     statement: &Statement,
     dialect: DialectKind,
     rules: &'a ir::IdentifierRules,
+    pure_table_enabled: bool,
 ) -> SequenceVisitor<'a> {
-    let mut visitor = SequenceVisitor::new(dialect, rules);
+    let mut visitor = SequenceVisitor::new(dialect, rules, pure_table_enabled);
     match statement {
         Statement::Query(_)
         | Statement::Insert(_)
@@ -2866,11 +2940,16 @@ pub(super) fn analyze_statement(
     }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
+    // Set only by the inert-pragma branch below, whose recorded variables are
+    // provably irrelevant to dependencies and need no fence. Every other
+    // variable effect keeps the blanket barrier.
+    let mut inert_pragma_effects = false;
     // Sequence value changes survive rollback in PostgreSQL/Redshift even
     // though creation and removal of the sequence itself are transactional.
     let transactional = sequence_transactional(dialect)
         && !matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift);
-    let sequences = sequence_effects_for_statement(statement, dialect, rules);
+    let sequences =
+        sequence_effects_for_statement(statement, dialect, rules, context.pure_table_enabled);
     for sequence in sequences.writes {
         facts
             .ops
@@ -3729,9 +3808,37 @@ pub(super) fn analyze_statement(
                         )),
                     }
                 }
+            } else if matches!(
+                pragma.as_str(),
+                "journal_mode" | "synchronous" | "temp_store" | "cache_size" | "page_size"
+            ) {
+                // Storage/durability knobs: provably irrelevant to reads,
+                // writes, trigger firing, and transaction visibility, so they
+                // need no UnknownSessionEffect fence. A bare `PRAGMA
+                // journal_mode;` is a read-only query (like `PRAGMA
+                // foreign_keys;`); an assignment is recorded as an inert
+                // session variable so the script keeps its session ordering
+                // without serializing on a global fence.
+                if let Some(assignment) = value {
+                    match pragma_session_value(assignment) {
+                        Some(session_value) => {
+                            facts.session.push(ir::SessionEffect::SetVariable {
+                                scope: ir::SessionScope::Session,
+                                name: ir::Name(vec![ir::Ident(pragma.clone())]),
+                                value: session_value,
+                            });
+                            inert_pragma_effects = true;
+                        }
+                        None => facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownSessionEffect,
+                            Some(statement.to_string()),
+                        )),
+                    }
+                }
             } else {
-                // TODO(dialect-alignment): SQLite pragmas beyond foreign_keys (e.g. recursive_triggers,
-                // journal_mode, temp_store) currently emit UnknownSessionEffect barriers.
+                // Only the inert five record above; recursive_triggers, defer_foreign_keys,
+                // and unknown pragmas stay fenced, and bare-literal values (`= true`)
+                // still fail upstream parsing (see TODO.org "Upstream Gaps").
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,
                     Some(statement.to_string()),
@@ -3998,14 +4105,16 @@ pub(super) fn analyze_statement(
     }
     // Generic variables are recorded, but their effects on parsing, writes,
     // triggers, and transaction behavior are not represented by the catalog.
-    if facts.session.iter().any(|effect| {
-        matches!(
-            effect,
-            ir::SessionEffect::SetVariable { .. }
-                | ir::SessionEffect::ResetVariable { .. }
-                | ir::SessionEffect::ResetAll { .. }
-        )
-    }) {
+    if !inert_pragma_effects
+        && facts.session.iter().any(|effect| {
+            matches!(
+                effect,
+                ir::SessionEffect::SetVariable { .. }
+                    | ir::SessionEffect::ResetVariable { .. }
+                    | ir::SessionEffect::ResetAll { .. }
+            )
+        })
+    {
         facts.barriers.push(global_barrier(
             ir::BarrierReason::UnknownSessionEffect,
             Some("unmodeled session variable effects".to_string()),

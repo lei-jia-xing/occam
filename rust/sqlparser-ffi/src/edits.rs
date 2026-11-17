@@ -76,11 +76,17 @@ pub(super) struct AnalysisContext<'a> {
     pub(super) chunk_edits: bool,
     pub(super) column_ir: bool,
     pub(super) syntax_edits: bool,
+    /// Whether the per-dialect pure-builtin table ([`crate::pure`]) may lift
+    /// the routine fence. False whenever any routine DDL or parse error
+    /// exists anywhere in the script (coarse shadowing rule), restoring the
+    /// blanket fence for every unit.
+    pub(super) pure_table_enabled: bool,
 }
 
 pub(super) struct SequenceVisitor<'a> {
     dialect: DialectKind,
     rules: &'a crate::ir::IdentifierRules,
+    pure_table_enabled: bool,
     pub(super) writes: Vec<ir::NameRef>,
     pub(super) reads: Vec<ir::NameRef>,
     pub(super) unknown: bool,
@@ -88,10 +94,15 @@ pub(super) struct SequenceVisitor<'a> {
 }
 
 impl<'a> SequenceVisitor<'a> {
-    pub(super) fn new(dialect: DialectKind, rules: &'a crate::ir::IdentifierRules) -> Self {
+    pub(super) fn new(
+        dialect: DialectKind,
+        rules: &'a crate::ir::IdentifierRules,
+        pure_table_enabled: bool,
+    ) -> Self {
         Self {
             dialect,
             rules,
+            pure_table_enabled,
             writes: Vec::new(),
             reads: Vec::new(),
             unknown: false,
@@ -110,7 +121,14 @@ impl Visitor for SequenceVisitor<'_> {
             }
             Some(SequenceEffect::Read(sequence)) => self.reads.push(sequence),
             Some(SequenceEffect::Unknown) => self.unknown = true,
-            None if matches!(expr, Expr::Function(_)) => self.unknown = true,
+            None if matches!(expr, Expr::Function(_)) => {
+                // Pure builtins lift the routine fence; unknown, volatile,
+                // sequence-adjacent, aggregate, and shadowed calls keep it.
+                let pure = self.pure_table_enabled
+                    && matches!(expr, Expr::Function(function)
+                        if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
+                self.unknown |= !pure;
+            }
             _ => {}
         }
         std::ops::ControlFlow::Continue(())
@@ -120,6 +138,7 @@ impl Visitor for SequenceVisitor<'_> {
 pub(super) struct AnalysisVisitor<'a> {
     pub(super) dialect: DialectKind,
     pub(super) rules: &'a crate::ir::IdentifierRules,
+    pure_table_enabled: bool,
     /// Nested DML statements are analyzed separately by `merge_nested`, so
     /// their relations and columns must not leak into the enclosing statement.
     pub(super) gate_nested_dml: bool,
@@ -157,6 +176,7 @@ impl<'a> AnalysisVisitor<'a> {
         Self {
             dialect: context.dialect,
             rules: context.rules,
+            pure_table_enabled: context.pure_table_enabled,
             gate_nested_dml: true,
             statement_depth: 0,
             nested_dml_depth: 0,
@@ -2519,7 +2539,13 @@ impl Visitor for AnalysisVisitor<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
         self.has_function |= match expr {
-            Expr::Function(_) => true,
+            Expr::Function(function) => {
+                // Stored pure expressions (DEFAULT, CHECK, view/index bodies)
+                // lift the deferred fence like evaluated ones; everything
+                // else keeps it.
+                !(self.pure_table_enabled
+                    && crate::pure::is_pure_builtin(function, self.dialect, self.rules))
+            }
             Expr::CompoundIdentifier(idents)
                 if matches!(self.dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
             {

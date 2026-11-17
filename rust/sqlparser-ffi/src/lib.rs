@@ -7,6 +7,7 @@ mod edits;
 mod ffi;
 mod ir;
 mod parser;
+mod pure;
 mod source;
 
 pub use ffi::{occam_sql_count, occam_sql_free, occam_sql_parse, occam_sql_parse_error};
@@ -190,6 +191,23 @@ mod tests {
                 names.push(name);
             }
         }
+        names
+    }
+
+    fn has_routine_barrier(facts: &NativeFacts) -> bool {
+        facts.barriers.iter().any(|barrier| {
+            matches!(barrier.scope, BarrierScope::Global)
+                && matches!(barrier.reason, BarrierReason::UnknownStatement)
+        })
+    }
+
+    fn read_column_names(facts: &NativeFacts) -> Vec<String> {
+        let mut names: Vec<String> = reads(facts)
+            .into_iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
         names
     }
 
@@ -2526,6 +2544,406 @@ mod tests {
                 )
             };
             assert_eq!(shape(fa), shape(fb));
+        }
+    }
+
+    #[test]
+    fn pure_builtins_lift_the_routine_fence() {
+        let calls = [
+            ("abs(a)", vec!["a"]),
+            ("coalesce(a, b)", vec!["a", "b"]),
+            ("concat(a, b)", vec!["a", "b"]),
+            ("length(a)", vec!["a"]),
+            ("lower(a)", vec!["a"]),
+            ("nullif(a, b)", vec!["a", "b"]),
+            ("round(a)", vec!["a"]),
+            ("upper(a)", vec!["a"]),
+        ];
+        for dialect in [
+            DialectKind::SQLite,
+            DialectKind::PostgreSql,
+            DialectKind::MySql,
+        ] {
+            for (call, columns) in &calls {
+                let sql = format!("SELECT {call} FROM t;");
+                let units = parse(&sql, dialect).unwrap();
+                let unit_facts = facts(&units[0]);
+                assert!(
+                    unit_facts.barriers.is_empty(),
+                    "{sql} on {dialect:?}: {:?}",
+                    unit_facts.barriers
+                );
+                assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
+                assert_eq!(
+                    read_column_names(unit_facts),
+                    columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_argument_reads_are_extracted_for_fenced_calls() {
+        // Reads flow through function arguments independently of fencing: the
+        // fence never drops a read edge.
+        let units = parse("SELECT a, SUM(b) FROM t;", DialectKind::SQLite).unwrap();
+        let unit_facts = facts(&units[0]);
+        assert!(has_routine_barrier(unit_facts));
+        assert_eq!(relation_reads(unit_facts), vec!["t".to_string()]);
+        assert_eq!(
+            read_column_names(unit_facts),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_and_shaped_calls_still_fence() {
+        for dialect in [
+            DialectKind::SQLite,
+            DialectKind::PostgreSql,
+            DialectKind::MySql,
+        ] {
+            for sql in [
+                "SELECT frobnicate(a) FROM t;",
+                "SELECT count(*) FROM t;",
+                "SELECT sum(a) FROM t;",
+                "SELECT avg(a) FROM t;",
+                "SELECT min(a) FROM t;",
+                "SELECT max(a) FROM t;",
+            ] {
+                let units = parse(sql, dialect).unwrap();
+                assert!(
+                    has_routine_barrier(facts(&units[0])),
+                    "{sql} on {dialect:?}"
+                );
+            }
+        }
+        // Generic keeps the blanket fence: the table is seeded only for
+        // SQLite, PostgreSQL, and MySQL.
+        let units = parse("SELECT abs(a) FROM t;", DialectKind::Generic).unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+        // Qualification fences even under a builtin name.
+        let units = parse("SELECT pg_catalog.abs(a) FROM t;", DialectKind::PostgreSql).unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+        // Window shapes fence even under a builtin name.
+        let units = parse(
+            "SELECT abs(a) OVER (PARTITION BY b) FROM t;",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
+
+    #[test]
+    fn volatile_and_sequence_calls_still_fence() {
+        for (dialect, calls) in [
+            (DialectKind::SQLite, vec!["random()"]),
+            (
+                DialectKind::PostgreSql,
+                vec!["random()", "now()", "version()"],
+            ),
+            (DialectKind::MySql, vec!["rand()", "now()", "version()"]),
+        ] {
+            for call in calls {
+                let sql = format!("SELECT {call} FROM t;");
+                let units = parse(&sql, dialect).unwrap();
+                assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+            }
+        }
+        // Unqualified sequence functions fence; only pg_catalog-qualified
+        // spellings with valid arity are modeled.
+        let units = parse("SELECT nextval('s');", DialectKind::PostgreSql).unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
+
+    #[test]
+    fn pure_builtin_matching_respects_case_folding() {
+        // PostgreSQL folds unquoted identifiers to lower case; quoted names
+        // are exact.
+        for sql in ["SELECT ABS(a) FROM t;", "SELECT \"abs\"(a) FROM t;"] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        for sql in ["SELECT \"Abs\"(a) FROM t;", "SELECT \"ABS\"(a) FROM t;"] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+        // SQLite folds quoted identifiers too, so quoted spellings lift.
+        for sql in ["SELECT \"ABS\"(a) FROM t;", "SELECT \"Abs\"(a) FROM t;"] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        // MySQL backticks fold the same way.
+        let units = parse("SELECT `ABS`(a) FROM t;", DialectKind::MySql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+    }
+
+    #[test]
+    fn shadowed_pure_builtins_still_fence() {
+        let create = "CREATE FUNCTION abs(x INT) RETURNS INT AS $$ BEGIN RETURN x; END; $$ LANGUAGE plpgsql;";
+        let select = "SELECT abs(a) FROM t;";
+        // Shadowing disables the table regardless of definition position.
+        for script in [format!("{create} {select}"), format!("{select} {create}")] {
+            let units = parse(&script, DialectKind::PostgreSql).unwrap();
+            assert_eq!(units.len(), 2);
+            for unit in &units {
+                assert!(has_routine_barrier(facts(unit)), "{script}");
+            }
+        }
+        let units = parse(
+            "DROP FUNCTION abs; SELECT abs(a) FROM t;",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(has_routine_barrier(facts(&units[1])));
+        // A parse error anywhere also disables the table: unparsed routine
+        // DDL cannot be ruled out.
+        let units = parse("SELECT abs(a) FROM t; SELECT FROM;", DialectKind::SQLite).unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(has_routine_barrier(facts(&units[0])));
+        assert!(units[1].facts.is_none());
+    }
+
+    #[test]
+    fn stored_pure_expressions_lift_but_volatile_defaults_still_fence() {
+        for (dialect, sql) in [
+            (
+                DialectKind::SQLite,
+                "CREATE TABLE t (x INT DEFAULT abs(5));",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "CREATE TABLE t (x INT DEFAULT coalesce(1, 2));",
+            ),
+            (DialectKind::MySql, "CREATE TABLE t (x INT DEFAULT abs(5));"),
+            (
+                DialectKind::PostgreSql,
+                "CREATE VIEW v AS SELECT abs(a) FROM t;",
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        for (dialect, sql) in [
+            (
+                DialectKind::SQLite,
+                "CREATE TABLE t (x TIMESTAMP DEFAULT CURRENT_TIMESTAMP);",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "CREATE TABLE t (x TIMESTAMP DEFAULT CURRENT_TIMESTAMP);",
+            ),
+            (
+                DialectKind::MySql,
+                "CREATE TABLE t (x TIMESTAMP DEFAULT CURRENT_TIMESTAMP);",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "CREATE TABLE t (x INT DEFAULT random());",
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+    }
+
+    #[test]
+    fn parser_artifacts_still_fence() {
+        // `PARTITION BY RANGE (...)` lowers `RANGE` as Function('range'): not
+        // a table member, so it fences.
+        let units = parse(
+            "CREATE TABLE m (a INT, b INT) PARTITION BY RANGE (a, b);",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+        // MySQL index prefixes (`b(1)`) lower as Expr::Function: fenced.
+        let units = parse(
+            "CREATE TEMPORARY TABLE t1(i INT, b BLOB, PRIMARY KEY pk(i), INDEX sk(b(1)));",
+            DialectKind::MySql,
+        )
+        .unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
+    #[test]
+    fn mysql_foreign_key_checks_scope_forms() {
+        for (sql, scope, value) in [
+            ("SET foreign_key_checks = 0;", SessionScope::Session, false),
+            (
+                "SET FOREIGN_KEY_CHECKS = OFF;",
+                SessionScope::Session,
+                false,
+            ),
+            (
+                "SET SESSION foreign_key_checks = 1;",
+                SessionScope::Session,
+                true,
+            ),
+            (
+                "SET GLOBAL foreign_key_checks = 0;",
+                SessionScope::Global,
+                false,
+            ),
+            ("SET @@foreign_key_checks = 1;", SessionScope::Session, true),
+            (
+                "SET @@session.foreign_key_checks = 0;",
+                SessionScope::Session,
+                false,
+            ),
+            (
+                "SET @@global.foreign_key_checks = 0;",
+                SessionScope::Global,
+                false,
+            ),
+            (
+                "SET @@GLOBAL.foreign_key_checks = 1;",
+                SessionScope::Global,
+                true,
+            ),
+            (
+                "SET foreign_key_checks = TRUE;",
+                SessionScope::Session,
+                true,
+            ),
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).session.as_slice(),
+                    [SessionEffect::SetForeignKeyChecks {
+                        scope: actual_scope,
+                        value: actual_value,
+                    }] if actual_scope == &scope && actual_value == &value
+                ),
+                "{sql}: {:?}",
+                facts(&units[0]).session
+            );
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_foreign_key_checks_unmodeled_spellings_stay_fenced() {
+        for sql in [
+            "SET foreign_key_checks = @x;",
+            "SET @@global.foreign_key_checks = @x;",
+            "SET @foreign_key_checks = 0;",
+            "SET GLOBAL @@session.foreign_key_checks = 0;",
+            "SET SESSION @@global.foreign_key_checks = 0;",
+            "SET app.foreign_key_checks = 0;",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(
+                facts(&units[0]).barriers.iter().any(|barrier| {
+                    matches!(
+                        barrier,
+                        ScopedBarrier {
+                            scope: BarrierScope::Global,
+                            reason: BarrierReason::UnknownSessionEffect,
+                            ..
+                        }
+                    )
+                }),
+                "{sql}"
+            );
+        }
+        // Out-of-scope variables keep the blanket fence.
+        let units = parse("SET @@global.super_read_only = TRUE;", DialectKind::MySql).unwrap();
+        assert!(
+            facts(&units[0])
+                .barriers
+                .iter()
+                .any(|barrier| { matches!(barrier.reason, BarrierReason::UnknownSessionEffect) })
+        );
+    }
+
+    #[test]
+    fn sqlite_inert_pragmas_record_without_fence() {
+        for (sql, expected_name, expected) in [
+            ("PRAGMA synchronous = 2;", "synchronous", 2),
+            ("PRAGMA synchronous = 1;", "synchronous", 1),
+            ("PRAGMA temp_store = 2;", "temp_store", 2),
+            ("PRAGMA cache_size = 1000;", "cache_size", 1000),
+            ("PRAGMA page_size = 4096;", "page_size", 4096),
+        ] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).session.as_slice(),
+                    [SessionEffect::SetVariable { scope, name, value }]
+                        if scope == &SessionScope::Session
+                            && name_text(name) == *expected_name
+                            && matches!(value, SessionValue::Integer { value } if value == &expected)
+                ),
+                "{sql}: {:?}",
+                facts(&units[0]).session
+            );
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        for (sql, expected_name, expected) in [
+            ("PRAGMA journal_mode = 'wal';", "journal_mode", "wal"),
+            ("PRAGMA synchronous = 'FULL';", "synchronous", "FULL"),
+            ("PRAGMA temp_store = 'MEMORY';", "temp_store", "MEMORY"),
+            ("PRAGMA page_size = '4096';", "page_size", "4096"),
+        ] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).session.as_slice(),
+                    [SessionEffect::SetVariable { scope, name, value }]
+                        if scope == &SessionScope::Session
+                            && name_text(name) == *expected_name
+                            && matches!(value, SessionValue::Text { value } if value == expected)
+                ),
+                "{sql}: {:?}",
+                facts(&units[0]).session
+            );
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+        // Bare reads are queries: no effect and no fence.
+        for sql in ["PRAGMA journal_mode;", "PRAGMA page_size;"] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_effectful_and_unknown_pragmas_stay_fenced() {
+        for sql in [
+            "PRAGMA recursive_triggers = 0;",
+            "PRAGMA recursive_triggers = 1;",
+            "PRAGMA recursive_triggers;",
+            "PRAGMA defer_foreign_keys = 0;",
+            "PRAGMA defer_foreign_keys = 1;",
+            "PRAGMA ignore_check_constraints = 1;",
+            "PRAGMA encoding = 'UTF-8';",
+            "PRAGMA frobnicate = 1;",
+            "PRAGMA page_size = ?;",
+        ] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(
+                facts(&units[0]).barriers.iter().any(|barrier| {
+                    matches!(
+                        barrier,
+                        ScopedBarrier {
+                            scope: BarrierScope::Global,
+                            reason: BarrierReason::UnknownSessionEffect,
+                            ..
+                        }
+                    )
+                }),
+                "{sql}"
+            );
         }
     }
 }

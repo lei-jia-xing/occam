@@ -872,6 +872,63 @@ tests =
             assertBool
                 "SET @@foreign_key_checks = 1 enables cascade dependency"
                 (has (StatementId 4) enabledDeps)
+        , testCase "MySQL SET @@global.foreign_key_checks leaves the session cascade intact" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT, FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "SET @@global.foreign_key_checks = 0;"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+            graph <- analyze MySQL sql
+            let setDeps = dependenciesFor (StatementId 3) graph
+                readDeps = dependenciesFor (StatementId 5) graph
+            assertBool
+                "the global setting does not disable the session cascade"
+                (has (StatementId 4) readDeps)
+            assertBool
+                "the global setting carries no fence"
+                (not (has (StatementId 1) setDeps || has (StatementId 2) setDeps))
+        , testCase "MySQL SET @foreign_key_checks stays fenced as a user variable" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE child (pid INT, FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE);"
+                        , "SET @foreign_key_checks = 0;"
+                        , "DELETE FROM parent WHERE id = 1;"
+                        , "SELECT * FROM child;"
+                        ]
+            graph <- analyze MySQL sql
+            let setDeps = dependenciesFor (StatementId 3) graph
+                readDeps = dependenciesFor (StatementId 5) graph
+            assertBool
+                "the user variable does not disable the session cascade"
+                (has (StatementId 4) readDeps)
+            assertBool
+                "the user variable keeps its fence"
+                (has (StatementId 1) setDeps && has (StatementId 2) setDeps)
+        , testCase "SQLite storage pragmas record without fencing" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (x INT);"
+                        , "PRAGMA page_size = 4096;"
+                        , "INSERT INTO t VALUES (1);"
+                        , "SELECT * FROM t;"
+                        ]
+            graph <- analyze SQLite sql
+            let pragmaDeps = dependenciesFor (StatementId 2) graph
+                writeDeps = dependenciesFor (StatementId 3) graph
+                readDeps = dependenciesFor (StatementId 4) graph
+            assertBool
+                "the inert pragma carries no fence"
+                (not (has (StatementId 1) pragmaDeps))
+            assertBool
+                "later statements keep the pragma in the session chain"
+                (has (StatementId 2) writeDeps)
+            assertBool
+                "ordinary dependencies still resolve"
+                (has (StatementId 3) readDeps)
         , testCase "PostgreSQL COPY FROM writes to relation and COPY TO reads from relation" $ do
             let copyFromSql =
                     BSC.unlines
@@ -1142,6 +1199,37 @@ tests =
             assertBool
                 "a read of an unrelated column does not depend on the update"
                 (not (has (StatementId 3) (dependenciesFor (StatementId 5) graph)))
+        , testCase "pure builtin projections keep reads without a global fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT abs(a) FROM t;"
+                        ]
+            graph <- analyze SQLite sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the pure-builtin projection depends on its table definition"
+                (has (StatementId 2) deps)
+            assertBool
+                "no global fence chains the unrelated table"
+                (not (has (StatementId 1) deps))
+            assertEqual
+                "argument reads survive the lifted fence"
+                ["a"]
+                [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
+        , testCase "unknown function calls still fence with a global barrier" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT frobnicate(a) FROM t;"
+                        ]
+            graph <- analyze SQLite sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the unknown call still chains every prior statement"
+                (has (StatementId 1) deps && has (StatementId 2) deps)
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

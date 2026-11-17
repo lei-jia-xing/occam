@@ -3,8 +3,10 @@ use crate::edits::AnalysisContext;
 use crate::ir::{IdentifierRules, ParseConfig};
 use crate::source::{ByteSpan, SourceMap, TokenKind, dialect, token_positions};
 use crate::{DialectKind, NativeUnit};
+use sqlparser::ast::Statement;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
+
 pub(super) fn parse_units(source: &str, config: &ParseConfig) -> Result<Vec<NativeUnit>, String> {
     let mut units = Vec::new();
     walk_units(source, config, true, |unit| units.push(unit))?;
@@ -25,6 +27,17 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
         false,
         |_| {},
     )
+}
+
+/// One parsed statement awaiting analysis. Statements are analyzed only after
+/// the whole script is parsed so routine DDL anywhere in the script can
+/// disable the pure-builtin table script-wide (coarse shadowing rule).
+struct PendingUnit {
+    start: usize,
+    end: usize,
+    statement: Option<Statement>,
+    parse_error: Option<String>,
+    has_parse_error: bool,
 }
 
 fn walk_units(
@@ -71,6 +84,7 @@ fn walk_units(
 
     let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     let mut count = 0;
+    let mut pending: Vec<PendingUnit> = Vec::new();
     loop {
         while parser.peek_token_ref().token == Token::SemiColon {
             parser.advance_token();
@@ -164,15 +178,50 @@ fn walk_units(
             return Err("sqlparser returned an invalid statement boundary".to_string());
         }
         if detailed {
+            pending.push(PendingUnit {
+                start,
+                end,
+                statement,
+                parse_error,
+                has_parse_error,
+            });
+        }
+        count += 1;
+        if delimiter_pending {
+            parser.advance_token();
+        } else if !delimiter_consumed && !at_eof {
+            return Err("sqlparser failed to recover at a statement boundary".to_string());
+        }
+    }
+
+    // Coarse shadowing rule: any routine DDL or parse error anywhere in the
+    // script disables the pure-builtin table for every unit, restoring the
+    // blanket routine fence. Analysis runs only now so the flag is known.
+    let pure_table_enabled = detailed
+        && !pending.iter().any(|unit| unit.has_parse_error)
+        && !pending.iter().any(|unit| {
+            unit.statement
+                .as_ref()
+                .is_some_and(crate::pure::is_routine_ddl)
+        });
+    if detailed {
+        let source_map = source_map
+            .as_ref()
+            .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
+        for unit in pending {
+            let PendingUnit {
+                start,
+                end,
+                statement,
+                parse_error,
+                has_parse_error,
+            } = unit;
             let facts = if has_parse_error {
                 None
             } else {
                 let statement = statement.as_ref().ok_or_else(|| {
                     "sqlparser returned no statement for error-free unit".to_string()
                 })?;
-                let source_map = source_map
-                    .as_ref()
-                    .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
                 let token_start = positions.partition_point(|token| token.start < start);
                 let token_end = positions.partition_point(|token| token.end <= end);
                 let facts = analyze_statement(
@@ -187,6 +236,7 @@ fn walk_units(
                         chunk_edits: config.chunk_edits,
                         column_ir: config.column_ir || config.column_bundles,
                         syntax_edits: config.syntax_edits,
+                        pure_table_enabled,
                     },
                 );
                 for edit in &facts.edits {
@@ -210,12 +260,6 @@ fn walk_units(
                 parse_error,
                 facts,
             });
-        }
-        count += 1;
-        if delimiter_pending {
-            parser.advance_token();
-        } else if !delimiter_consumed && !at_eof {
-            return Err("sqlparser failed to recover at a statement boundary".to_string());
         }
     }
 
