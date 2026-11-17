@@ -1,49 +1,22 @@
-{- | FK-enforcement cascade-write expansion for @--dump-facts@ cross-validation.
+{- | Cascade-write expansion for @--dump-facts@ cross-validation:
+@--dump-facts@ reports raw per-statement facts with no cross-statement
+state, so this module replays just enough scan state (flag + FK catalog)
+to expand the cascade writes each statement performs.
 
-The dependency graph already models cascade writes conditional on the
-threaded enforcement flag ('Occam.Dependency.Write.applyForeignKeys'):
-with enforcement OFF a parent write touches only its target, with it ON
-@ON DELETE/UPDATE CASCADE@ (and @SET NULL@/@SET DEFAULT@) fan out to
-children, transitively. @--dump-facts@, however, reports raw per-statement
-facts with no cross-statement session or catalog state, so under @--fk-on@
-validation the engine reports cascade writes the dump never mentions.
-This module replays just enough scan state (enforcement flag plus FK
-catalog) to expand the cascade writes each statement performs.
+Scan in file order against the accumulated flag and catalog (mirrors
+'applyParentActions'); own effects apply afterwards. OFF expands
+nothing. ON: @DELETE@ via @ON DELETE CASCADE@ plus @SET NULL@/@SET
+DEFAULT@ as child @UPDATE@s; @UPDATE@ via matching @ON UPDATE@ only on
+referenced-column overlap (explicit list, else parent primary key;
+empty write columns cascade conservatively). Multi-level recursion with
+a visited guard; @NoAction@/@Restrict@ skipped.
 
-== Rule (mirrors 'applyParentActions')
+Initial flag from 'SessionInit' with in-file @PRAGMA foreign_keys@ and
+@SET foreign_key_checks@ threading, so default mode stays byte-identical
+while @--fk-on@ gains the engine-reported cascade writes.
 
-Statements are scanned in file order. Each statement expands against the
-flag and catalog accumulated from earlier statements; its own session
-effects and schema changes apply afterwards, exactly as in
-'Occam.Dependency.step':
-
-* enforcement OFF: no expansion;
-* enforcement ON: @DELETE@ expands through @ON DELETE CASCADE@ and
-  @SET NULL@/@SET DEFAULT@ (the latter two as child @UPDATE@s, matching
-  the engine's authorizer output); @UPDATE@ expands through the matching
-  @ON UPDATE@ actions only when the written columns overlap the referenced
-  parent columns (explicit list, else the parent primary key), and an
-  empty write-column list cascades conservatively. Expansion recurses
-  multi-level with a visited guard, so self-referential and cyclic FKs
-  terminate. @NoAction@ and @Restrict@ add only reads and are skipped.
-
-== Mode-dependent precision
-
-The initial flag is the frontend-resolved session ('SessionInit'): the
-dialect default (@OFF@ for SQLite) unless @--dump-facts-fk-on@ (or an
-explicit server setting) overrides it. In-file @PRAGMA foreign_keys@ and
-@SET foreign_key_checks@ assignments then thread forward exactly as the
-engine replay executes them, so occam's per-statement flag agrees with the
-engine's in both harness modes. Default mode (initial OFF, no in-file
-toggles in the corpus) expands nothing and stays byte-identical; @--fk-on@
-(initial ON) gains exactly the engine-reported cascade writes.
-
-Deliberately unmodeled: FK check __reads__. The engine's read set includes
-implementation scan columns no static fact pins down (e.g. a cascaded
-delete also reports the child's primary key alongside its FK columns), so
-reads stay raw in both modes and remain triaged mismatches under @--fk-on@.
-@TRUNCATE@ cascades are skipped as well: SQLite (the validated dialect)
-has no @TRUNCATE@, and the harness flags any @truncate@ write outright.
+Deliberately unmodeled: FK check reads (engine scan columns unpinnable)
+and @TRUNCATE@ (SQLite has none).
 -}
 module Occam.Dependency.Enforcement (
     cascadeWrites,
@@ -82,10 +55,7 @@ import Occam.Core (
  )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
-{- | Table identity for enforcement replay: temp flag plus the lowercased
-last name component, matching the harness's case-insensitive
-last-component comparison.
--}
+{- | Temp flag plus lowercased last name component. -}
 data TableKey = TableKey !Bool !Text
     deriving (Eq, Ord, Show)
 
@@ -120,9 +90,7 @@ collectTable def =
                 ++ [foreignKey | column <- tableColumns def, foreignKey <- columnReferences column]
         }
 
-{- | Scan statements in order, expanding cascade writes against the
-enforcement flag and FK catalog in effect at each writing statement.
--}
+{- | Per-statement cascade expansion against accumulated flag and catalog. -}
 cascadeWrites :: SessionInit -> [StatementUnit] -> Map StatementId [DataWrite]
 cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
     where
@@ -140,10 +108,7 @@ cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
                 tailMap = go enforced' catalog' rest
              in if null extras then tailMap else Map.insert sid extras tailMap
 
-{- | Session threading mirrors 'Occam.Dependency.Session.applySessionEffect':
-only session-scoped assignments take effect; global and transactional
-scopes leave the current session untouched.
--}
+{- | Mirrors 'Occam.Dependency.Session.applySessionEffect'. -}
 applySession :: Bool -> Bool -> SessionEffect -> Bool
 applySession initial current effect = case effect of
     SetForeignKeyChecks ScopeSession value -> value
@@ -245,11 +210,7 @@ expand :: Map TableKey TableInfo -> CatalogOp -> [DataWrite]
 expand catalog (WriteDataOp write) = expandWrite catalog write
 expand _ _ = []
 
-{- | Breadth-first cascade fan-out from one direct write. The queue carries
-the lowered write columns for @UPDATE@ overlap checks; deletes carry none.
-The visited guard is per (table, write flavor), matching the graph's
-duplicate-write suppression.
--}
+{- | Breadth-first fan-out; visited guard is per (table, write flavor). -}
 expandWrite :: Map TableKey TableInfo -> DataWrite -> [DataWrite]
 expandWrite catalog write = case dataWriteKind write of
     DeleteWrite _ -> bfs Set.empty [(keyOfTarget, True, [])]
