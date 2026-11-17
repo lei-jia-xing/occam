@@ -83,10 +83,18 @@ ALIGNMENT RULES (engine = authorizer callback stream per statement):
       unqualified UPDATE/DELETE report only UPDATE/DELETE, while occam
       conservatively models the target scan. Qualified accesses still
       compare strictly via the WHERE-clause READs the engine does report.
-  R-fk-off: foreign_keys stays at the SQLite/Python default OFF, so FK
-      enforcement reads and cascade writes (which the authorizer DOES
-      report when enforcement is on) are out of scope: config-dependent
-      runtime behavior, not statement dependencies.
+R-fk-off (default): foreign_keys stays at the SQLite/Python default
+    OFF, so FK enforcement reads and cascade writes (which the
+    authorizer DOES report when enforcement is on) are out of scope:
+    config-dependent runtime behavior, not statement dependencies.
+    FK-ON VARIANT (--fk-on): each fresh DB runs PRAGMA foreign_keys=ON
+    before replay, lifting R-fk-off: enforcement reads and cascade
+    writes arrive UNSOURCED (no trigger-style source tag) and are
+    fully comparable, so FK-bearing statements that agree by default
+    may mismatch here. Expected buckets are adjusted explicitly per
+    statement in triage (each divergence classified OCCAM BUG /
+    GRANULARITY / ENGINE QUIRK); there is deliberately no blanket
+    rule dropping FK traffic, so this mode quantifies the gap.
   R-wildcard: empty occam column lists (SELECT *, unqualified DML target
       scans) and NULL/empty engine columns match any column set.
 
@@ -116,9 +124,12 @@ ALIGNMENT RULES (engine = authorizer callback stream per statement):
       (no occam counterpart by design) are flagged for triage.
   R-occam-parse: occam per-statement parse_error + engine success =
       mismatch (frontend gap); + engine error = engine-error bucket.
-  Known engine blind spot (no tolerance rule; triage only): INSERT..SELECT
-      eligible for the transfer (xfer) optimization reports INSERT but no
-      source READs. None of the corpus files use INSERT..SELECT.
+Known engine blind spot (no tolerance rule; triage only): INSERT..SELECT
+    eligible for the transfer (xfer) optimization reports INSERT but no
+    source READs. Pinned in-corpus by
+    benchmarks/xval_corpus/02_insert_select_xfer.sql (xfer shape = two
+    tables with identical schemas + plain SELECT *; same-table
+    INSERT..SELECT does NOT take xfer and reports READs normally).
 
 Output: human summary on stdout + machine JSON (--out). Mismatch records
 carry statement sha256 + a <=200-char preview, never full SQL text.
@@ -139,6 +150,7 @@ DEFAULT_GLOBS = [
     "benchmarks/seeds/*.sql",
     "benchmarks/real_fuzz_corpus/sqlite_*.sql",
     "benchmarks/column_proof/*.sql",
+    "benchmarks/xval_corpus/*.sql",
 ]
 
 ACTION = {
@@ -585,7 +597,7 @@ def execute_file(con, sql_bytes, units):
     return out
 
 
-def process_file(occam_bin, path):
+def process_file(occam_bin, path, fk_on=False):
     with open(path, "rb") as f:
         sql_bytes = f.read()
     rel = os.path.relpath(path, ROOT)
@@ -608,6 +620,8 @@ def process_file(occam_bin, path):
                 schema_objs.add(last(d["target"]))
 
     con = sqlite3.connect(":memory:", autocommit=True)
+    if fk_on:
+        con.execute("PRAGMA foreign_keys=ON")
     try:
         ran = execute_file(con, sql_bytes, units)
     finally:
@@ -710,6 +724,8 @@ def main(argv=None):
     ap.add_argument("--occam", default=None, help="occam binary (default: cabal build + list-bin)")
     ap.add_argument("--corpus", action="append", default=[], help="glob rel. to repo root (repeatable)")
     ap.add_argument("--out", default="benchmarks/cross_validate_report.json", help="machine JSON output")
+    ap.add_argument("--fk-on", action="store_true",
+                    help="PRAGMA foreign_keys=ON per fresh DB before replay (lifts R-fk-off)")
     args = ap.parse_args(argv)
 
     occam_bin = resolve_occam(args.occam)
@@ -719,7 +735,7 @@ def main(argv=None):
         print("no corpus files matched", file=sys.stderr)
         return 2
 
-    results = [process_file(occam_bin, p) for p in files]
+    results = [process_file(occam_bin, p, fk_on=args.fk_on) for p in files]
     counts, hist = summarize(results)
     compared = counts.get("agree", 0) + counts.get("mismatch", 0)
     total = counts.get("statements", 0)
@@ -742,6 +758,9 @@ def main(argv=None):
         "summary": summary,
         "files": results,
     }
+    if args.fk_on:
+        # Gated so default-mode output stays byte-identical to before.
+        report["fk_enforcement"] = True
     out_path = os.path.join(ROOT, args.out)
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2, sort_keys=True)
@@ -751,6 +770,8 @@ def main(argv=None):
     print("corpus: %s" % " ".join(patterns))
     print("occam:  %s  sha256=%.12s" % (occam_bin, report["occam"]["sha256"]))
     print("sqlite: %s  python: %s" % (sqlite3.sqlite_version, sys.version.split()[0]))
+    if args.fk_on:
+        print("fk_enforcement: ON (R-fk-off lifted)")
     print("files=%d statements=%d agree=%d abstain=%d engine-error=%d mismatch=%d anomaly=%d" % (
         counts["files"], total, counts.get("agree", 0), counts.get("abstain", 0),
         counts.get("engine-error", 0), counts.get("mismatch", 0), counts.get("anomaly", 0)))
