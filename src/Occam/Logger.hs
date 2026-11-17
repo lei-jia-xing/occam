@@ -40,12 +40,12 @@ import System.Console.ANSI (
     setSGRCode,
  )
 import System.Environment (lookupEnv)
-import System.IO (stdout)
+import System.IO (stderr)
 import System.Log.FastLogger (
     LoggerSet,
     defaultBufSize,
     flushLogStr,
-    newStdoutLoggerSet,
+    newStderrLoggerSet,
     pushLogStr,
     rmLoggerSet,
     toLogStr,
@@ -136,11 +136,11 @@ logError' Logger {..} comp msg meta =
 -- | Bracket-managed high-performance logger using fast-logger.
 withLogger :: LogConfig -> (Logger -> IO a) -> IO a
 withLogger cfg action = do
-    supportsANSI <- hSupportsANSI stdout
+    supportsANSI <- hSupportsANSI stderr
     noColor <- lookupEnv "NO_COLOR"
     let colorSupported = supportsANSI && isNothing noColor && logUseColor cfg
         resolvedCfg = cfg {logUseColor = colorSupported}
-    bracket (newStdoutLoggerSet defaultBufSize) rmLoggerSet \lset -> do
+    bracket (newStderrLoggerSet defaultBufSize) rmLoggerSet \lset -> do
         logger <- newFastLogger resolvedCfg lset
         res <- action logger
         loggerFlush logger

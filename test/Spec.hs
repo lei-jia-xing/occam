@@ -380,6 +380,23 @@ phase5Tests =
                      in assertBool ("--help hides dialect: " ++ name) (name `isInfixOf` helpOut)
                 )
                 ([minBound .. maxBound] :: [SQLDialect])
+        , testCase "--out - keeps stdout pure SQL under --verbose" $
+            withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\n" $ \input _ -> do
+                (code, out, err) <- runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
+                assertEqual ("reduction failed: " ++ err) ExitSuccess code
+                assertBool
+                    "stdout polluted with log output"
+                    (not (any (`isInfixOf` out) ["[DEBUG]", "[INFO ", "[WARN ", "[ERROR]"]))
+                assertBool "stdout missing reduced SQL" ("INSERT" `isInfixOf` out)
+                assertBool "expected logs on stderr" (not (null err))
+        , testCase "--log-level debug emits logs in text mode" $
+            withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
+                (code, _, err) <-
+                    runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--log-level", "debug"]
+                assertEqual ("reduction failed: " ++ err) ExitSuccess code
+                -- No component emits debug-level messages yet, so INFO visibility is the
+                -- observable proof the flag took effect (text mode used to force WARN).
+                assertBool "text mode ignored --log-level debug" ("[INFO " `isInfixOf` err)
         ]
 
 -- ----------------------------------------------------------------------------

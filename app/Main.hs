@@ -242,7 +242,11 @@ reductionOptionsParser =
                 <> help
                     "Column co-reduction listing: off, single, or atomic (default: off; non-off requires --intra-statement)"
             )
-        <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
+        <*> toggle
+            True
+            "unrestricted"
+            "no-unrestricted"
+            "unrestricted fallback search (final deletion audit always runs)"
         <*> toggle True "cache" "no-cache" "candidate caching"
         <*> option
             (eitherReader parseSQLDialect)
@@ -319,8 +323,7 @@ runOccam opts@Options {..} = do
     let effectiveLevel
             | optQuiet = LevelError
             | optVerbose = LevelDebug
-            | optLogFormat == FormatJSON = optLogLevel
-            | otherwise = LevelWarn
+            | otherwise = optLogLevel
         effectiveFormat = optLogFormat
         logCfg =
             LogConfig
