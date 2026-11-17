@@ -125,3 +125,33 @@
 - Split `src/Occam/Dependency.hs` (4281 lines) into a 246-line real orchestrator plus 11 internal modules under `src/Occam/Dependency/`: State, Resolve, Barrier, Query, Session, Transaction, Write, Define, Alter, Drop, Rename. Public API (`DependencyGraph`, `emptyGraph`, `buildGraph`, `analyzeStatements`) unchanged with zero caller migration; no shims or reexports.
 - All 181 relocated definitions moved byte-identical except one approved normalization: generic `lastMaybe` replaced by domain `nameLast :: Name -> Maybe Ident` in `State`, migrated at its two use sites (`Alter.indexKeyName`, `Drop.markResolutionChange`).
 - Narrow combined verification reported green: `cabal build all --enable-tests --ghc-options=-Werror` exits 0 with 0 warnings; targeted tasty union 113/113 including Dependency analysis and DAG properties. Local `ghc -Werror` sweep and `fourmolu --mode check` on the 12 files also clean.
+
+** DONE Pure-builtin routine fence relief [2026-11]
+- 8-name allowlist (abs, coalesce, concat, length, lower, nullif, round, upper) lifts the routine fence in both the SequenceVisitor and has_function positions.
+- Scope: SQLite, PostgreSQL, and MySQL only; unqualified single-part names; script-wide disable on any routine DDL or parse error (shadowing rule).
+- Aggregates, volatile/sequence-adjacent names, qualified names, and window/filter/grouping call shapes stay fenced.
+
+** DONE Session-effect modeling for SET and PRAGMA [2026-11]
+- system_var_scope resolves foreign_keys/foreign_key_checks, autocommit, and search_path to session/global effects; @@global maps to global (ignored), @user vars and foreign qualifiers fence.
+- Five inert storage pragmas (journal_mode, synchronous, temp_store, cache_size, page_size) record fenceless session variables; bare recursive_triggers/defer_foreign_keys reads lift as queries.
+- Non-boolean values, unknown pragmas, and effectful assignments keep the UnknownSessionEffect fence.
+
+** DONE Column generation solver and namespace resolver [2026-11]
+- Per-table generation chains (TableScope/build_chain): other-table ops isolated; per-column ADD/DROP/RENAME lifting; unambiguous renames followed; drops never followed.
+- Namespace fallback on canonical spellings: sibling DDL fences the whole table, sibling DML narrows per column under the same-table hypothesis.
+- ALTER COLUMN/opaque shapes, implicit-positional inserts under ADD/DROP, LIKE/sources/temp, and zero/non-unique definitions stay fenced; fence-boundary module docs rewritten.
+
+** DONE Partition/inheritance routing and OUTPUT INTO modeling [2026-11]
+- Parent/child routing facts with childrenOf fan-out in reads and writes (INSERT parent-only under plain INHERITS, ONLY skips children) plus attach/detach partition ops.
+- OUTPUT INTO a table adds a write edge; OUTPUT INTO a table variable fences at relation scope.
+- Barrier-count delta on the partition-heavy partprune corpus file: 20 to 1 (barrier census, not a speedup claim).
+
+** DONE Engine cross-validation harness and dependency fixes [2026-11]
+- Hidden --dump-facts plus cross_validate_deps.py replays corpus statements in SQLite with a set_authorizer ground-truth callback.
+- Per-statement agree/abstain/engine-error/mismatch buckets with documented alignment rules; deterministic ordering and JSON output.
+- Found and fixed missing ON CONFLICT arbiter/SET target-row reads; fenced statements count as abstain, never mismatch.
+
+** DONE CLI and build hygiene batch [2026-11]
+- Diagnostics moved to stderr (unbreaking --out -); text mode honors --log-level with new INFO default; --no-unrestricted help clarified.
+- Makefile rust-fresh content-stamp guard on build/build-check/test; CI gains fourmolu/hlint/fmt/clippy/-Werror parity with a rust-aware cache key.
+- Shell completions switched from the external usage-KDL chain to optparse-native generation (parser as single source; bash/zsh/fish from the binary; PowerShell/Nushell dropped).
