@@ -2021,6 +2021,8 @@ fn trigger_effects_from_facts(facts: ir::NativeFacts, effects: &mut Vec<ir::Trig
             | ir::CatalogOp::AlterTable(_)
             | ir::CatalogOp::AttachPartition(_)
             | ir::CatalogOp::DetachPartition(_)
+            | ir::CatalogOp::AttachInherit(_)
+            | ir::CatalogOp::DetachInherit(_)
             | ir::CatalogOp::Drop(_)
             | ir::CatalogOp::Rename(_)
             | ir::CatalogOp::Refresh(_) => effects.push(ir::TriggerEffect::Barrier {
@@ -3179,9 +3181,32 @@ fn alter_change(
                 )),
             }
         }
+        AlterTableOperation::Inherit { parent } => {
+            // Unlike `ATTACH PARTITION` (named child, target parent), the
+            // `INHERIT` target is the child and the operand is the parent.
+            match relation_ref(parent, dialect, rules) {
+                Some(parent) => ops.push(ir::CatalogOp::AttachInherit(ir::PartitionLink {
+                    parent,
+                    child: table.clone(),
+                })),
+                None => barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownAlter,
+                    Some(operation.to_string()),
+                )),
+            }
+        }
+        AlterTableOperation::NoInherit { parent } => match relation_ref(parent, dialect, rules) {
+            Some(parent) => ops.push(ir::CatalogOp::DetachInherit(ir::PartitionLink {
+                parent,
+                child: table.clone(),
+            })),
+            None => barriers.push(global_barrier(
+                ir::BarrierReason::UnknownAlter,
+                Some(operation.to_string()),
+            )),
+        },
         // ClickHouse `ATTACH/DETACH PARTITION` (a partition expression, not a
-        // table name), `INHERIT` / `NO INHERIT`, and every other operation
-        // keep the blanket fence.
+        // table name) and every other operation keep the blanket fence.
         _ => barriers.push(global_barrier(
             ir::BarrierReason::UnknownAlter,
             Some(operation.to_string()),

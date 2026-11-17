@@ -8,7 +8,6 @@ import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Occam.Core (
-    BarrierReason (..),
     BarrierScope (..),
     BeginPolicy (..),
     CatalogOp (..),
@@ -118,6 +117,14 @@ isAttach _ = False
 isDetach :: CatalogOp -> Bool
 isDetach (DetachPartitionOp _) = True
 isDetach _ = False
+
+isAttachInherit :: CatalogOp -> Bool
+isAttachInherit (AttachInheritOp _) = True
+isAttachInherit _ = False
+
+isDetachInherit :: CatalogOp -> Bool
+isDetachInherit (DetachInheritOp _) = True
+isDetachInherit _ = False
 
 hasRead :: [Text] -> [CatalogOp] -> Bool
 hasRead parts ops =
@@ -1750,20 +1757,84 @@ tests =
                 "no extra write edge is recorded"
                 1
                 (length (writesFor (StatementId 2) graph))
-        , testCase "ALTER INHERIT keeps its fence" $ do
+        , testCase "INHERIT adds and NO INHERIT drops inheritance parents" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p1 (a INT);"
+                        , "CREATE TABLE p2 (a INT);"
+                        , "CREATE TABLE p3 (a INT);"
+                        , "CREATE TABLE c (a INT) INHERITS (p1, p2);"
+                        , "INSERT INTO c VALUES (1);"
+                        , "SELECT * FROM p3;"
+                        , "ALTER TABLE c INHERIT p3;"
+                        , "SELECT * FROM p3;"
+                        , "ALTER TABLE c NO INHERIT p2;"
+                        , "SELECT * FROM p2;"
+                        , "SELECT * FROM p1;"
+                        , "SELECT * FROM p3;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "inherit and no-inherit emit no fence"
+                ( null (factBarriers (factsFor (StatementId 7) graph))
+                    && null (factBarriers (factsFor (StatementId 9) graph))
+                )
+            assertBool
+                "INHERIT emits an inherit link op"
+                (any isAttachInherit (opsFor (StatementId 7) graph))
+            assertBool
+                "NO INHERIT emits an inherit unlink op"
+                (any isDetachInherit (opsFor (StatementId 9) graph))
+            assertEqual
+                "the pre-INHERIT read sees only its parent"
+                (Set.fromList [StatementId 3])
+                (dependenciesFor (StatementId 6) graph)
+            assertEqual
+                "the post-INHERIT read sees the link and the child"
+                (Set.fromList [StatementId 3, StatementId 4, StatementId 5, StatementId 7])
+                (dependenciesFor (StatementId 8) graph)
+            assertEqual
+                "dropping an INHERITS-origin parent removes the child"
+                (Set.fromList [StatementId 2, StatementId 9])
+                (dependenciesFor (StatementId 10) graph)
+            assertEqual
+                "the untouched parent still sees the child"
+                (Set.fromList [StatementId 1, StatementId 4, StatementId 5])
+                (dependenciesFor (StatementId 11) graph)
+            assertEqual
+                "the INHERIT-added parent still sees the child"
+                (Set.fromList [StatementId 3, StatementId 4, StatementId 5, StatementId 7])
+                (dependenciesFor (StatementId 12) graph)
+        , testCase "INSERT into an INHERIT-added parent lands parent-only" $ do
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE p (a INT);"
                         , "CREATE TABLE c (a INT);"
                         , "ALTER TABLE c INHERIT p;"
+                        , "INSERT INTO p VALUES (5);"
+                        , "SELECT * FROM c;"
+                        , "SELECT * FROM p;"
+                        , "UPDATE p SET a = 6;"
+                        , "SELECT * FROM c;"
                         ]
             graph <- analyze PostgreSQL sql
             assertBool
-                "unmodeled inheritance changes stay fenced"
-                ( any
-                    ((== UnknownAlterBarrier) . barrierReason)
-                    (factBarriers (factsFor (StatementId 3) graph))
-                )
+                "INHERIT emits no fence"
+                (null (factBarriers (factsFor (StatementId 3) graph)))
+            assertBool
+                "INHERIT emits an inherit link op"
+                (any isAttachInherit (opsFor (StatementId 3) graph))
+            assertEqual
+                "the child read misses the parent-only INSERT (a partition-misfiled link would route it here)"
+                (Set.fromList [StatementId 2])
+                (dependenciesFor (StatementId 5) graph)
+            assertEqual
+                "the parent read sees the child and the INSERT"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 4])
+                (dependenciesFor (StatementId 6) graph)
+            assertBool
+                "non-INSERT parent writes still fan out to INHERIT-added children"
+                (has (StatementId 7) (dependenciesFor (StatementId 8) graph))
         , testCase "upsert conflict targets and SET sources read the target row" $ do
             let sql =
                     BSC.unlines

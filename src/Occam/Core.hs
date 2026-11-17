@@ -390,14 +390,17 @@ data CatalogOp
     | AlterTableOp !AlterTable
     | AttachPartitionOp !PartitionLink
     | DetachPartitionOp !PartitionLink
+    | AttachInheritOp !PartitionLink
+    | DetachInheritOp !PartitionLink
     | DropCatalogOp !DropOp
     | RenameOp !RenameOp
     | RefreshCatalogOp !RefreshOp
     deriving (Eq, Show)
 
-{- | PostgreSQL partition routing link: the child's rows are read through
-the parent from the linking statement on (`PARTITION OF` / `ATTACH`),
-until a detach breaks it.
+{- | Parent/child routing link. Partition ops (`PARTITION OF` / `ATTACH` /
+`DETACH`) and inheritance ops (`INHERITS` / `INHERIT` / `NO INHERIT`) share
+the shape; the op selects the set (`relPartitionParents` vs
+`relInheritParents`), which is what `INSERT` routing distinguishes.
 -}
 data PartitionLink = PartitionLink
     { linkParent :: !NameRef

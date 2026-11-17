@@ -3191,8 +3191,49 @@ mod tests {
                 "{sql}"
             );
         }
-        // `INHERIT` / `NO INHERIT` are out of scope and keep the fence.
-        for sql in ["ALTER TABLE c INHERIT p;", "ALTER TABLE c NO INHERIT p;"] {
+    }
+
+    #[test]
+    fn inherit_no_inherit_emit_link_ops() {
+        // Unlike `ATTACH PARTITION` (target parent, named child), the
+        // `INHERIT` target is the child and the operand is the parent.
+        let units = parse("ALTER TABLE c INHERIT p;", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(matches!(
+            facts(&units[0]).ops.as_slice(),
+            [CatalogOp::AttachInherit(link)]
+                if name_text(&link.parent.name) == "p" && name_text(&link.child.name) == "c"
+        ));
+        let units = parse("ALTER TABLE c NO INHERIT p;", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(matches!(
+            facts(&units[0]).ops.as_slice(),
+            [CatalogOp::DetachInherit(link)]
+                if name_text(&link.parent.name) == "p" && name_text(&link.child.name) == "c"
+        ));
+        // Schema-qualified operands keep their qualification on the right end.
+        let units = parse("ALTER TABLE s.c INHERIT s.p;", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(matches!(
+            facts(&units[0]).ops.as_slice(),
+            [CatalogOp::AttachInherit(link)]
+                if name_text(&link.parent.name) == "s.p" && name_text(&link.child.name) == "s.c"
+        ));
+    }
+
+    #[test]
+    fn malformed_inherit_and_other_alters_keep_fence() {
+        // An unresolvable parent shape fences with no link op.
+        let units = parse("ALTER TABLE c INHERIT a.b.c.d.e;", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).ops.is_empty());
+        assert!(
+            facts(&units[0])
+                .barriers
+                .iter()
+                .any(|barrier| matches!(barrier.reason, BarrierReason::UnknownAlter))
+        );
+        // Unmodeled `ALTER TABLE` actions keep the blanket fence.
+        for sql in ["ALTER TABLE t OWNER TO app;", "ALTER TABLE t SET LOGGED;"] {
             let units = parse(sql, DialectKind::PostgreSql).unwrap();
             assert!(
                 facts(&units[0])

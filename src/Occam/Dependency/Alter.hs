@@ -1,4 +1,4 @@
--- | ALTER TABLE: column, constraint, index, and partition-routing changes.
+-- | ALTER TABLE: column, constraint, index, and partition/inheritance-routing changes.
 module Occam.Dependency.Alter (
     constraintColumnsOf,
     introducedForeignKeysOf,
@@ -7,6 +7,8 @@ module Occam.Dependency.Alter (
     processAlterTable,
     processAttachPartition,
     processDetachPartition,
+    processAttachInherit,
+    processDetachInherit,
     applyAlterChange,
     renameConstraintName,
     validateConstraintValue,
@@ -269,6 +271,68 @@ attachDetachPartition sid eval link isAttach =
                                                 `notElem` resolveRelationKeys session currentCatalog reference
                                         )
                                         (relPartitionParents child)
+                        }
+                parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
+                catalog1 =
+                    insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
+             in current1 {evalCatalog = catalog1}
+     in mutateResolved step eval pairs
+
+{- | `ALTER TABLE child INHERIT parent`: add `parent` to the child's
+inheritance set. Mirror of `attachDetachPartition` with the set swapped:
+the link lands in `relInheritParents`, so parent reads and non-`INSERT`
+parent writes fan out to the child while `INSERT` stays parent-only,
+exactly like `INHERITS`. Filing it as a partition link would route
+`INSERT` by key into the child (over-approx).
+-}
+processAttachInherit :: StatementId -> Eval -> PartitionLink -> Eval
+processAttachInherit sid eval link = attachDetachInherit sid eval link True
+
+{- | `ALTER TABLE child NO INHERIT parent`: remove `parent` from the child's
+inheritance set. `INHERITS`-origin links live in the same set, so they are
+removed too; a partition detach would filter the other set and no-op.
+Earlier statements keep their snapshot edges; later parent reads exclude
+the child but depend on the detach through the parent schema write.
+-}
+processDetachInherit :: StatementId -> Eval -> PartitionLink -> Eval
+processDetachInherit sid eval link = attachDetachInherit sid eval link False
+
+attachDetachInherit :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
+attachDetachInherit sid eval link isAttach =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        existing reference =
+            filter
+                (`Map.member` catalogRelations catalog)
+                (resolveRelationKeys session catalog reference)
+        pairs =
+            [ (parentKey, childKey)
+            | parentKey <- existing (linkParent link)
+            , childKey <- existing (linkChild link)
+            ]
+        step current (parentKey, childKey) =
+            let currentCatalog = evalCatalog current
+                child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
+                parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
+                deps =
+                    relationDefinitionDeps currentCatalog parentKey
+                        `Set.union` relationDefinitionDeps currentCatalog childKey
+                current1 =
+                    addTouches
+                        (relationTouchKeys parentKey ++ relationTouchKeys childKey)
+                        (addDeps deps current)
+                child1 =
+                    child
+                        { relInheritParents =
+                            if isAttach
+                                then Set.insert (linkParent link) (relInheritParents child)
+                                else
+                                    Set.filter
+                                        ( \reference ->
+                                            parentKey
+                                                `notElem` resolveRelationKeys session currentCatalog reference
+                                        )
+                                        (relInheritParents child)
                         }
                 parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
                 catalog1 =

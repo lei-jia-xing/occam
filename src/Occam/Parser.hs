@@ -770,6 +770,8 @@ instance FromJSON CatalogOp where
             "alter_table" -> AlterTableOp <$> parseJSON (Object objectValue)
             "attach_partition" -> AttachPartitionOp <$> parseJSON (Object objectValue)
             "detach_partition" -> DetachPartitionOp <$> parseJSON (Object objectValue)
+            "attach_inherit" -> AttachInheritOp <$> parseJSON (Object objectValue)
+            "detach_inherit" -> DetachInheritOp <$> parseJSON (Object objectValue)
             "drop" -> DropCatalogOp <$> parseJSON (Object objectValue)
             "rename" -> RenameOp <$> parseJSON (Object objectValue)
             "refresh" -> RefreshCatalogOp <$> parseJSON (Object objectValue)

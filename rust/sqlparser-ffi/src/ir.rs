@@ -165,6 +165,18 @@ pub enum CatalogOp {
     /// before the detach keep their edges (the scan snapshots dependencies
     /// in order); statements after it observe the parent without the child.
     DetachPartition(PartitionLink),
+    /// PostgreSQL `ALTER TABLE child INHERIT parent`: adds `parent` to the
+    /// child's inheritance set. A separate op (not an `AlterChange`, and not
+    /// a partition op): inheritance links live in the inherit-parents set
+    /// where `INSERT` into the parent lands parent-only, while partition
+    /// links route `INSERT` by key. Filing an inherit link as a partition
+    /// link would over-approximate `INSERT` fan-out.
+    AttachInherit(PartitionLink),
+    /// PostgreSQL `ALTER TABLE child NO INHERIT parent`: removes `parent`
+    /// from the child's inheritance set, whether the link came from
+    /// `INHERITS` or a prior `INHERIT` (same set). Partition detach only
+    /// filters the partition-parents set, so it would no-op here.
+    DetachInherit(PartitionLink),
     Drop(DropOp),
     Rename(RenameOp),
     Refresh(RefreshOp),
