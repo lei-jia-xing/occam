@@ -2154,7 +2154,8 @@ fn search_path_value(values: &[Expr], rules: &ir::IdentifierRules) -> Option<ir:
     Some(ir::SearchPathValue::Explicit { entries })
 }
 
-/// Resolve the scope of a `foreign_keys`/`foreign_key_checks` assignment.
+/// Resolve the scope of a system-variable assignment (`foreign_keys`,
+/// `autocommit`, `search_path`).
 ///
 /// Only spellings that provably select the session's system variable map to
 /// an effect: a bare name (the statement keyword, if any, selects the
@@ -2164,7 +2165,7 @@ fn search_path_value(values: &[Expr], rules: &ir::IdentifierRules) -> Option<ir:
 /// fenced: `@name` is a user variable rather than the system variable,
 /// other qualifiers name custom variables, and a qualifier contradicting
 /// an explicit `GLOBAL`/`SESSION`/`LOCAL` keyword cannot be resolved.
-fn fk_checks_scope(name: &ir::Name, keyword: Option<ContextModifier>) -> Option<ir::SessionScope> {
+fn system_var_scope(name: &ir::Name, keyword: Option<ContextModifier>) -> Option<ir::SessionScope> {
     match name.0.as_slice() {
         [single] => {
             let single = single.0.as_str();
@@ -2218,23 +2219,31 @@ fn set_effects(
         .map(|ident| ident.0.to_ascii_lowercase())
         .unwrap_or_default();
     let variable_name = last.trim_start_matches('@');
-    // TODO(dialect-alignment): the search_path/autocommit arms still conflate
-    // `@var` user variables with system variables; only the foreign_keys arm
-    // resolves @-vs-@@ spellings (see fk_checks_scope).
     match variable_name {
-        "search_path" => match search_path_value(values, rules) {
-            Some(path) => (
-                vec![ir::SessionEffect::SetSearchPath { scope, path }],
-                Vec::new(),
-            ),
-            None => (
-                Vec::new(),
-                vec![global_barrier(
-                    ir::BarrierReason::UnknownSessionEffect,
-                    Some("SET search_path with a non-name value".to_string()),
-                )],
-            ),
-        },
+        "search_path" => {
+            let Some(scope) = system_var_scope(&name, keyword) else {
+                return (
+                    Vec::new(),
+                    vec![global_barrier(
+                        ir::BarrierReason::UnknownSessionEffect,
+                        Some("SET search_path with an unmodeled scope or qualifier".to_string()),
+                    )],
+                );
+            };
+            match search_path_value(values, rules) {
+                Some(path) => (
+                    vec![ir::SessionEffect::SetSearchPath { scope, path }],
+                    Vec::new(),
+                ),
+                None => (
+                    Vec::new(),
+                    vec![global_barrier(
+                        ir::BarrierReason::UnknownSessionEffect,
+                        Some("SET search_path with a non-name value".to_string()),
+                    )],
+                ),
+            }
+        }
         "foreign_keys" | "foreign_key_checks" => {
             let Some(value) = values.first().and_then(expr_bool) else {
                 return (
@@ -2245,7 +2254,7 @@ fn set_effects(
                     )],
                 );
             };
-            let Some(scope) = fk_checks_scope(&name, keyword) else {
+            let Some(scope) = system_var_scope(&name, keyword) else {
                 return (
                     Vec::new(),
                     vec![global_barrier(
@@ -2266,6 +2275,15 @@ fn set_effects(
                     vec![global_barrier(
                         ir::BarrierReason::UnknownSessionEffect,
                         Some("SET autocommit with a non-boolean value".to_string()),
+                    )],
+                );
+            };
+            let Some(scope) = system_var_scope(&name, keyword) else {
+                return (
+                    Vec::new(),
+                    vec![global_barrier(
+                        ir::BarrierReason::UnknownSessionEffect,
+                        Some("SET autocommit with an unmodeled scope or qualifier".to_string()),
                     )],
                 );
             };
@@ -2504,12 +2522,24 @@ fn reset_effects(
         Reset::ConfigurationParameter(name) => {
             match name_from_object(name, rules, ir::IdentifierClass::Other) {
                 Some(name) => {
+                    // No real dialect accepts `@`/`@@` spellings in RESET
+                    // (PostgreSQL takes a bare configuration parameter; MySQL
+                    // has no `RESET var` form at all), so anything with `@`
+                    // stays fenced even when the permissive parser accepts it.
+                    if name.0.iter().any(|ident| ident.0.starts_with('@')) {
+                        return (
+                            Vec::new(),
+                            vec![global_barrier(
+                                ir::BarrierReason::UnknownSessionEffect,
+                                Some("RESET with an unmodeled variable spelling".to_string()),
+                            )],
+                        );
+                    }
                     let scope = ir::SessionScope::Session;
                     match name
                         .last()
                         .map(|ident| ident.0.to_ascii_lowercase())
                         .as_deref()
-                        .map(|s| s.trim_start_matches('@'))
                     {
                         Some("search_path") => (
                             vec![ir::SessionEffect::SetSearchPath {
@@ -2518,9 +2548,6 @@ fn reset_effects(
                             }],
                             Vec::new(),
                         ),
-                        // TODO(dialect-alignment): `RESET @@global.foreign_key_checks`
-                        // would map to the session scope; no real dialect accepts
-                        // @@ in RESET, so this stays as is.
                         Some("foreign_keys" | "foreign_key_checks") => (
                             vec![ir::SessionEffect::ResetForeignKeyChecks { scope }],
                             Vec::new(),
@@ -3165,7 +3192,9 @@ pub(super) fn analyze_statement(
             // PostgreSQL partitioning and inheritance route child rows
             // through the parent. The attachment is a fact (`partition_parent`
             // / `inherit_parents`); the graph builder expands parent reads
-            // over the children and records parent writes on them. `FOR
+            // over the children and records parent writes on them (`INSERT`
+            // fans out to partition children only; plain `INHERITS` inserts
+            // land parent-only). `FOR
             // VALUES` bounds and the `PARTITION BY` scheme are parsed and
             // ignored: they fix row placement (which child holds a row), but
             // every edge in the model is table-level, so no edge needs them.
@@ -3958,6 +3987,14 @@ pub(super) fn analyze_statement(
                         )),
                     }
                 }
+            } else if value.is_none()
+                && matches!(pragma.as_str(), "recursive_triggers" | "defer_foreign_keys")
+            {
+                // A bare `PRAGMA recursive_triggers;` / `PRAGMA
+                // defer_foreign_keys;` is a read-only flag query (like `PRAGMA
+                // foreign_keys;`): it returns the current setting and mutates
+                // nothing. Assignments stay fenced below (they change trigger
+                // firing / FK enforcement timing).
             } else if matches!(
                 pragma.as_str(),
                 "journal_mode" | "synchronous" | "temp_store" | "cache_size" | "page_size"
@@ -3986,8 +4023,8 @@ pub(super) fn analyze_statement(
                     }
                 }
             } else {
-                // Only the inert five record above; recursive_triggers, defer_foreign_keys,
-                // and unknown pragmas stay fenced, and bare-literal values (`= true`)
+                // Assignments to recursive_triggers/defer_foreign_keys and unknown
+                // pragmas stay fenced, and bare-literal values (`= true`)
                 // still fail upstream parsing (see TODO.org "Upstream Gaps").
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,

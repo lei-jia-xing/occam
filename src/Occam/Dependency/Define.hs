@@ -197,12 +197,13 @@ processDefineTable sid eval definition =
                             , relUnresolvedSources = unresolved
                             , relSourceReads = tableSources definition
                             , -- Stored unresolved and resolved at use, like
-                              -- foreign-key parents.
-                              relParents =
+                              -- foreign-key parents. Partition and inheritance
+                              -- parents stay distinct for `INSERT` routing.
+                              relPartitionParents =
                                 Set.fromList
-                                    ( maybeToList (tablePartitionParent definition)
-                                        ++ tableInheritParents definition
-                                    )
+                                    (maybeToList (tablePartitionParent definition))
+                            , relInheritParents =
+                                Set.fromList (tableInheritParents definition)
                             , relOnCommit = tableOnCommit definition
                             , relOnCommitFrameId =
                                 case tableOnCommit definition of

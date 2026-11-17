@@ -259,16 +259,16 @@ attachDetachPartition sid eval link isAttach =
                         (addDeps deps current)
                 child1 =
                     child
-                        { relParents =
+                        { relPartitionParents =
                             if isAttach
-                                then Set.insert (linkParent link) (relParents child)
+                                then Set.insert (linkParent link) (relPartitionParents child)
                                 else
                                     Set.filter
                                         ( \reference ->
                                             parentKey
                                                 `notElem` resolveRelationKeys session currentCatalog reference
                                         )
-                                        (relParents child)
+                                        (relPartitionParents child)
                         }
                 parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
                 catalog1 =

@@ -56,6 +56,7 @@ import Occam.Dependency.Barrier (relationTouchKeys, sequenceTouchKeys, triggerTo
 import Occam.Dependency.Query (
     allForeignKeys,
     childrenOf,
+    partitionChildrenOf,
     referencedParentColumns,
     relationReadDeps,
     relationWriteDeps,
@@ -290,12 +291,13 @@ writeRelation sid eval key kind columns only =
                         }
         evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
         evalCascades = applyForeignKeys sid evalTriggers key kind columns
-        -- A parent write also lands on partition/inheritance children
-        -- (routed by key for partitions; `UPDATE`/`DELETE`/`TRUNCATE` fan
-        -- out for both). Recursing through `writeRelation` reuses trigger
-        -- matching, cascades, and the visited guard uniformly; `ONLY`
-        -- skips the children. `INHERITS` inserts land on the parent only,
-        -- so recording them on children over-approximates, soundly.
+        -- A parent write also lands on partition/inheritance children.
+        -- `INSERT` (including `COPY FROM`, modeled as `InsertWrite`)
+        -- routes by key into partition children but lands parent-only
+        -- under plain `INHERITS`, so it fans out to partition children
+        -- only; every other write kind fans out to both. Recursing
+        -- through `writeRelation` reuses trigger matching, cascades, and
+        -- the visited guard uniformly; `ONLY` skips the children.
         evalChildren =
             if only
                 then evalCascades
@@ -303,7 +305,10 @@ writeRelation sid eval key kind columns only =
                     foldl'
                         (writePartitionChild sid kind columns)
                         evalCascades
-                        (childrenOf session catalog key)
+                        ( case kind of
+                            InsertWrite _ -> partitionChildrenOf session catalog key
+                            _ -> childrenOf session catalog key
+                        )
      in if isView && null insteadOf
             then addViewWriteBarriers evalChildren key
             else evalChildren

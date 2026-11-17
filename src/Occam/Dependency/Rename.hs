@@ -362,15 +362,16 @@ updatePartitionParents session resolutionCatalog oldKey newKey catalog =
         newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
         adjust relation =
             relation
-                { relParents =
-                    Set.map
-                        ( \reference ->
-                            if resolveRelationKeys session resolutionCatalog reference == [oldKey]
-                                then newReference
-                                else reference
-                        )
-                        (relParents relation)
+                { relPartitionParents = rewrite (relPartitionParents relation)
+                , relInheritParents = rewrite (relInheritParents relation)
                 }
+        rewrite =
+            Set.map
+                ( \reference ->
+                    if resolveRelationKeys session resolutionCatalog reference == [oldKey]
+                        then newReference
+                        else reference
+                )
 
 renameSourceReadColumns ::
     SessionState ->

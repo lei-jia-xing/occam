@@ -440,9 +440,12 @@ tests =
                         ("hidden reads retain writes after the opaque operation: " ++ BSC.unpack operation)
                         (has (StatementId 3) readDeps)
                 )
+                -- NOTE: `INHERITS` is fully modeled (not opaque) and `INSERT`
+                -- into an `INHERITS` parent lands parent-only, so it keeps no
+                -- edge to the child write; see "INHERITS INSERT lands
+                -- parent-only while other writes fan out".
                 [ (PostgreSQL, "CREATE EXTENSION hstore;", "hidden_view")
                 , (PostgreSQL, "GRANT SELECT ON t TO PUBLIC;", "hidden_view")
-                , (PostgreSQL, "CREATE TABLE hidden_view (b INT) INHERITS (t);", "hidden_view")
                 , (PostgreSQL, "SELECT mutate_t();", "t")
                 , (SQLite, "PRAGMA recursive_triggers=0;", "hidden_view")
                 ]
@@ -918,6 +921,73 @@ tests =
             assertBool
                 "the user variable keeps its fence"
                 (has (StatementId 1) setDeps && has (StatementId 2) setDeps)
+        , testCase "MySQL SET @autocommit stays fenced as a user variable" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT PRIMARY KEY);"
+                        , "SET @autocommit = 0;"
+                        , "INSERT INTO t VALUES (1);"
+                        , "SELECT * FROM t;"
+                        ]
+            graph <- analyze MySQL sql
+            let setDeps = dependenciesFor (StatementId 2) graph
+                readDeps = dependenciesFor (StatementId 4) graph
+            assertBool
+                "the user variable records no session effect"
+                (null (factSession (factsFor (StatementId 2) graph)))
+            assertBool
+                "the user variable keeps its fence"
+                (has (StatementId 1) setDeps)
+            assertBool
+                "ordinary dependencies still resolve"
+                (has (StatementId 3) readDeps)
+        , testCase "MySQL SET @@autocommit maps without a fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT PRIMARY KEY);"
+                        , "SET @@autocommit = 0;"
+                        , "INSERT INTO t VALUES (1);"
+                        , "SELECT * FROM t;"
+                        ]
+            graph <- analyze MySQL sql
+            let setDeps = dependenciesFor (StatementId 2) graph
+                writeDeps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the system spelling carries no fence"
+                (not (has (StatementId 1) setDeps))
+            assertBool
+                "later statements keep the setting in the session chain"
+                (has (StatementId 2) writeDeps)
+        , testCase "SET @search_path stays fenced as a user variable" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT);"
+                        , "SET @search_path = 'public';"
+                        , "SELECT * FROM t;"
+                        ]
+            graph <- analyze MySQL sql
+            let setDeps = dependenciesFor (StatementId 2) graph
+            assertBool
+                "the user variable records no session effect"
+                (null (factSession (factsFor (StatementId 2) graph)))
+            assertBool
+                "the user variable keeps its fence"
+                (has (StatementId 1) setDeps)
+        , testCase "RESET @@global stays fenced" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT PRIMARY KEY);"
+                        , "RESET @@global.foreign_key_checks;"
+                        , "SELECT * FROM t;"
+                        ]
+            graph <- analyze MySQL sql
+            let resetDeps = dependenciesFor (StatementId 2) graph
+            assertBool
+                "the @@ RESET records no session effect"
+                (null (factSession (factsFor (StatementId 2) graph)))
+            assertBool
+                "the @@ RESET keeps its fence"
+                (has (StatementId 1) resetDeps)
         , testCase "SQLite storage pragmas record without fencing" $ do
             let sql =
                     BSC.unlines
@@ -939,6 +1009,40 @@ tests =
             assertBool
                 "ordinary dependencies still resolve"
                 (has (StatementId 3) readDeps)
+        , testCase "bare PRAGMA flag reads lift without a fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (x INT);"
+                        , "PRAGMA recursive_triggers;"
+                        , "INSERT INTO t VALUES (1);"
+                        , "SELECT * FROM t;"
+                        ]
+                fencedSql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (x INT);"
+                        , "PRAGMA recursive_triggers = 0;"
+                        , "INSERT INTO t VALUES (1);"
+                        ]
+            graph <- analyze SQLite sql
+            fencedGraph <- analyze SQLite fencedSql
+            let pragmaDeps = dependenciesFor (StatementId 2) graph
+                writeDeps = dependenciesFor (StatementId 3) graph
+                readDeps = dependenciesFor (StatementId 4) graph
+            assertBool
+                "the bare read carries no fence"
+                (not (has (StatementId 1) pragmaDeps))
+            assertBool
+                "the bare read records no session effect"
+                (null (factSession (factsFor (StatementId 2) graph)))
+            assertBool
+                "the bare read stays out of the session chain"
+                (not (has (StatementId 2) writeDeps))
+            assertBool
+                "ordinary dependencies still resolve"
+                (has (StatementId 3) readDeps)
+            assertBool
+                "the assignment keeps its fence"
+                (has (StatementId 1) (dependenciesFor (StatementId 2) fencedGraph))
         , testCase "PostgreSQL COPY FROM writes to relation and COPY TO reads from relation" $ do
             let copyFromSql =
                     BSC.unlines
@@ -1316,6 +1420,38 @@ tests =
             assertBool
                 "the routed parent write reaches direct child reads"
                 (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+        , testCase "INHERITS INSERT lands parent-only while other writes fan out" $ do
+            let insertSql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT);"
+                        , "CREATE TABLE c (a INT) INHERITS (p);"
+                        , "INSERT INTO p VALUES (5);"
+                        , "SELECT * FROM c;"
+                        , "SELECT * FROM p;"
+                        ]
+                updateSql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT);"
+                        , "CREATE TABLE c (a INT) INHERITS (p);"
+                        , "UPDATE p SET a = 6;"
+                        , "SELECT * FROM c;"
+                        ]
+            insertGraph <- analyze PostgreSQL insertSql
+            updateGraph <- analyze PostgreSQL updateSql
+            let childRead = dependenciesFor (StatementId 4) insertGraph
+                parentRead = dependenciesFor (StatementId 5) insertGraph
+            assertBool
+                "the child read keeps its own definition"
+                (has (StatementId 2) childRead)
+            assertBool
+                "the parent INSERT is not recorded on the INHERITS child"
+                (not (has (StatementId 3) childRead))
+            assertBool
+                "the parent read still sees the child definition and the INSERT"
+                (has (StatementId 1) parentRead && has (StatementId 2) parentRead && has (StatementId 3) parentRead)
+            assertBool
+                "the parent UPDATE still fans out to the INHERITS child"
+                (has (StatementId 3) (dependenciesFor (StatementId 4) updateGraph))
         , testCase "attach establishes routing and detach breaks it" $ do
             let sql =
                     BSC.unlines

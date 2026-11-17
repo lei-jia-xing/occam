@@ -189,9 +189,8 @@ pub struct TableDef {
     /// the parent (and parent writes route into the child by key).
     pub partition_parent: Option<NameRef>,
     /// PostgreSQL `INHERITS` parents: same read routing as partitions;
-    /// writes route conservatively (parent writes are also recorded on the
-    /// children, which over-approximates `INHERITS` inserts that land only
-    /// on the parent, but never misses an edge).
+    /// non-`INSERT` parent writes fan out to the children, while `INSERT`
+    /// lands parent-only (partition `INSERT` routes by key instead).
     pub inherit_parents: Vec<NameRef>,
     pub on_commit: Option<OnCommitAction>,
     pub if_not_exists: bool,

@@ -1237,6 +1237,43 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
                 ir::CatalogOp::AlterTable(alter) => {
                     relation_names.insert(alter.table.name.clone());
                     ddl_names.insert(alter.table.name.clone());
+                    // `ALTER TABLE u ADD ... REFERENCES t(b)` introduces a
+                    // parent-side foreign key exactly like `CREATE TABLE`;
+                    // fence the referenced column (or the whole parent when
+                    // its columns are implicit), same as above.
+                    let mut parents = Vec::new();
+                    for change in &alter.changes {
+                        match change {
+                            ir::AlterChange::AddColumn {
+                                column,
+                                constraints,
+                            } => {
+                                parents.extend(column.references.iter());
+                                for constraint in constraints {
+                                    if let ir::Constraint::ForeignKey(key) = constraint {
+                                        parents.push(key);
+                                    }
+                                }
+                            }
+                            ir::AlterChange::AddConstraint {
+                                constraint: ir::Constraint::ForeignKey(key),
+                            } => {
+                                parents.push(key);
+                            }
+                            _ => {}
+                        }
+                    }
+                    for key in parents {
+                        relation_names.insert(key.parent.name.clone());
+                        if key.parent_columns.is_empty() {
+                            parent_opaque.insert(key.parent.name.clone());
+                        } else {
+                            parent_columns
+                                .entry(key.parent.name.clone())
+                                .or_default()
+                                .extend(key.parent_columns.iter().cloned());
+                        }
+                    }
                 }
                 ir::CatalogOp::Drop(drop) => {
                     for object in &drop.objects {
@@ -1524,6 +1561,42 @@ mod tests {
             target(&targets, "b").blocked.as_deref(),
             Some(BLOCK_DEPENDENT)
         );
+    }
+
+    #[test]
+    fn alter_parent_fk_blocks_referenced_column() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT);\nALTER TABLE u ADD FOREIGN KEY (x) REFERENCES t(b);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_DEPENDENT)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
+    }
+
+    #[test]
+    fn alter_implicit_parent_fk_blocks_whole_parent() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT);\nALTER TABLE u ADD FOREIGN KEY (x) REFERENCES t;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_DEPENDENT)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_DEPENDENT)
+        );
+    }
+
+    #[test]
+    fn alter_add_column_parent_fk_blocks_referenced_column() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT);\nALTER TABLE u ADD COLUMN y INT REFERENCES t(b);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_DEPENDENT)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
     }
 
     #[test]

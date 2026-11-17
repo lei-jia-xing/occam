@@ -3060,6 +3060,116 @@ mod tests {
     }
 
     #[test]
+    fn mysql_autocommit_scope_forms() {
+        for (sql, scope, value) in [
+            ("SET autocommit = 0;", SessionScope::Session, false),
+            ("SET SESSION autocommit = 1;", SessionScope::Session, true),
+            ("SET GLOBAL autocommit = 0;", SessionScope::Global, false),
+            ("SET @@autocommit = 1;", SessionScope::Session, true),
+            (
+                "SET @@session.autocommit = 0;",
+                SessionScope::Session,
+                false,
+            ),
+            ("SET @@global.autocommit = 0;", SessionScope::Global, false),
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).session.as_slice(),
+                    [SessionEffect::SetAutocommit {
+                        scope: actual_scope,
+                        value: actual_value,
+                    }] if actual_scope == &scope && actual_value == &value
+                ),
+                "{sql}: {:?}",
+                facts(&units[0]).session
+            );
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn system_var_user_spellings_stay_fenced() {
+        for sql in [
+            "SET @autocommit = 0;",
+            "SET @search_path = 'public';",
+            "SET GLOBAL @@session.autocommit = 0;",
+            "SET SESSION @@global.autocommit = 0;",
+            "SET app.autocommit = 0;",
+            "SET app.search_path = 'public';",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(
+                facts(&units[0]).barriers.iter().any(|barrier| {
+                    matches!(
+                        barrier,
+                        ScopedBarrier {
+                            scope: BarrierScope::Global,
+                            reason: BarrierReason::UnknownSessionEffect,
+                            ..
+                        }
+                    )
+                }),
+                "{sql}"
+            );
+        }
+        // Bare system spellings still map without a fence.
+        let units = parse("SET autocommit = 1;", DialectKind::MySql).unwrap();
+        assert!(matches!(
+            facts(&units[0]).session.as_slice(),
+            [SessionEffect::SetAutocommit {
+                scope: SessionScope::Session,
+                value: true,
+            }]
+        ));
+        assert!(facts(&units[0]).barriers.is_empty());
+        let units = parse("SET search_path TO public;", DialectKind::PostgreSql).unwrap();
+        assert!(matches!(
+            facts(&units[0]).session.as_slice(),
+            [SessionEffect::SetSearchPath { .. }]
+        ));
+        assert!(facts(&units[0]).barriers.is_empty());
+    }
+
+    #[test]
+    fn reset_at_spellings_stay_fenced() {
+        for sql in [
+            "RESET @search_path;",
+            "RESET @foreign_key_checks;",
+            "RESET @@global.foreign_key_checks;",
+            "RESET @@session.search_path;",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(
+                facts(&units[0]).barriers.iter().any(|barrier| {
+                    matches!(
+                        barrier,
+                        ScopedBarrier {
+                            scope: BarrierScope::Global,
+                            reason: BarrierReason::UnknownSessionEffect,
+                            ..
+                        }
+                    )
+                }),
+                "{sql}"
+            );
+        }
+        // Bare RESET forms still map without a fence.
+        for sql in ["RESET search_path;", "RESET foreign_key_checks;"] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(!facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn sqlite_inert_pragmas_record_without_fence() {
         for (sql, expected_name, expected) in [
             ("PRAGMA synchronous = 2;", "synchronous", 2),
@@ -3117,12 +3227,17 @@ mod tests {
         for sql in [
             "PRAGMA recursive_triggers = 0;",
             "PRAGMA recursive_triggers = 1;",
-            "PRAGMA recursive_triggers;",
+            "PRAGMA recursive_triggers(0);",
             "PRAGMA defer_foreign_keys = 0;",
             "PRAGMA defer_foreign_keys = 1;",
+            "PRAGMA defer_foreign_keys(1);",
             "PRAGMA ignore_check_constraints = 1;",
+            "PRAGMA ignore_check_constraints;",
             "PRAGMA encoding = 'UTF-8';",
+            "PRAGMA encoding;",
             "PRAGMA frobnicate = 1;",
+            "PRAGMA frobnicate;",
+            "PRAGMA integrity_check;",
             "PRAGMA page_size = ?;",
         ] {
             let units = parse(sql, DialectKind::SQLite).unwrap();
@@ -3141,6 +3256,23 @@ mod tests {
                 }),
                 "{sql}"
             );
+        }
+    }
+
+    #[test]
+    fn sqlite_pure_pragma_reads_lift_without_fence() {
+        // Bare flag queries return the current setting and mutate nothing,
+        // exactly like `PRAGMA foreign_keys;`.
+        for sql in [
+            "PRAGMA recursive_triggers;",
+            "PRAGMA defer_foreign_keys;",
+            "PRAGMA main.recursive_triggers;",
+            "PRAGMA foreign_keys;",
+        ] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).session.is_empty(), "{sql}");
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
         }
     }
 }

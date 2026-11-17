@@ -8,6 +8,8 @@ module Occam.Dependency.Query (
     relationIndexDeps,
     relationTriggerDeps,
     childrenOf,
+    partitionChildrenOf,
+    inheritChildrenOf,
     relationReadDeps,
     relationWriteDeps,
     relationAllDeps,
@@ -33,6 +35,7 @@ import Occam.Core (
     IndexRole (..),
     IndexSchemaPlacement (..),
     Name (..),
+    NameRef (..),
     ReadMode (..),
     RelationKind (..),
     StatementId,
@@ -182,14 +185,38 @@ dropped-and-recreated parents re-link and renames are rewritten away.
 -}
 childrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
 childrenOf session catalog key =
+    childrenWith
+        session
+        catalog
+        key
+        (\relation -> relPartitionParents relation `Set.union` relInheritParents relation)
+
+{- | Partition children only (`PARTITION OF`, `ATTACH PARTITION`).
+`INSERT` into the parent routes into these by key; plain `INHERITS`
+inserts land parent-only.
+-}
+partitionChildrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
+partitionChildrenOf session catalog key =
+    childrenWith session catalog key relPartitionParents
+
+{- | Inheritance children only (`INHERITS`). Parent reads expand over
+these and non-`INSERT` writes fan out to them, but `INSERT` does not.
+-}
+inheritChildrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
+inheritChildrenOf session catalog key =
+    childrenWith session catalog key relInheritParents
+
+childrenWith ::
+    SessionState -> Catalog -> RelationKey -> (RelationState -> Set.Set NameRef) -> [RelationKey]
+childrenWith session catalog key parents =
     [ childKey
     | (childKey, relation) <- Map.toList (catalogRelations catalog)
-    , not (Set.null (relParents relation))
+    , not (Set.null (parents relation))
     , childKey /= key
     , key
         `elem` concatMap
             (resolveRelationKeys session catalog)
-            (Set.toList (relParents relation))
+            (Set.toList (parents relation))
     ]
 
 relationReadDeps ::
