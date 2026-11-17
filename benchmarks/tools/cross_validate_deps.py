@@ -133,6 +133,23 @@ Known engine blind spot (no tolerance rule; triage only): INSERT..SELECT
     tables with identical schemas + plain SELECT *; same-table
     INSERT..SELECT does NOT take xfer and reports READs normally).
 
+Known gaps (KNOWN_GAPS below, keyed by (file, statement index)): every
+currently-triaged NON-agree verdict that is NOT an occam bug lives here
+with its exact expected reasons, scoped per mode ("default", "--fk-on",
+or "both"). The harness exits 0 only when every non-agree verdict is an
+unpinned abstain/engine-error or a mismatch covered by a pin with
+exactly-matching reasons; any NEW mismatch, any pin whose reasons
+drifted, and any pin that no longer reproduces (stale: statement now
+agrees, or vanished) exits NONZERO. Pins for files outside the
+current --corpus run are skipped (listed, not failed), so subset runs
+stay usable; the nightly gate always runs the full default corpus.
+Re-triage workflow when the gate fails: (1) re-run to confirm (output
+is deterministic); (2) for each NEW/changed item decide OCCAM BUG
+(fix modeling, no pin) vs ENGINE QUIRK / UPSTREAM PARSE GAP /
+DELIBERATELY-UNMODELED (add or update a pin with a note naming the
+root cause); (3) delete pins that went stale because the underlying
+gap was fixed, never to silence the gate; (4) keep both modes green.
+
 Output: human summary on stdout + machine JSON (--out). Mismatch records
 carry statement sha256 + a <=200-char preview, never full SQL text.
 Deterministic: statement order, sorted sets, sort_keys JSON.
@@ -177,6 +194,168 @@ TXMAP = {
     ("SAVEPOINT", "RELEASE"): "TxReleaseSavepoint",
     ("SAVEPOINT", "ROLLBACK"): "TxRollbackTo",
 }
+# Triaged non-agree verdicts that are NOT occam bugs, keyed by
+# (repo-relative file, statement index) -> {mode: (expected reasons, note)}.
+# Mode is "default", "fk-on", or "both" (same expectation in both modes).
+# Reasons must match EXACTLY (sorted); any drift fails the gate. Verified
+# against default + --fk-on runs on 2026-11-17 (sqlite 3.53.3); re-verify
+# (never blindly extend) per the header workflow. Abstains (incl. VACUUM
+# 04#5) and engine-errors pass unpinned by design.
+KNOWN_GAPS = {
+    # -- upstream parse gaps (engine succeeds, occam parse_error) --
+    ("benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql", 0): {
+        "both": (["occam-parse-error"],
+                 "upstream grammar rejects boolean PRAGMA value `= true` "
+                 "(TODO.org Upstream Gaps); engine runs it (recursive_triggers=true)"),
+    },
+    ("benchmarks/xval_corpus/04_maintenance.sql", 4): {
+        "both": (["occam-parse-error"],
+                 "REINDEX unsupported by occam frontend; engine succeeds (REINDEX(mi))"),
+    },
+    ("benchmarks/xval_corpus/06_midfile_toggle.sql", 4): {
+        "both": (["occam-parse-error"],
+                 "upstream grammar rejects bare `PRAGMA foreign_keys=ON` "
+                 "(Expected: a concrete value, found: ON); same boolean-PRAGMA "
+                 "gap class as recursive_trigger#0"),
+    },
+    # -- engine quirks / by-design gaps --
+    ("benchmarks/xval_corpus/02_insert_select_xfer.sql", 3): {
+        "both": (["occam-only-read:isel_src"],
+                 "engine transfer (xfer) optimization reports INSERT with zero "
+                 "source READs; occam's conservative source read is correct"),
+    },
+    ("benchmarks/xval_corpus/04_maintenance.sql", 3): {
+        "both": (["engine-only-maintenance:ANALYZE(m)"],
+                 "ANALYZE has no occam counterpart by design (C-maintenance)"),
+    },
+    # -- mid-file toggle knock-on (default) / enforcement reads (fk-on) --
+    ("benchmarks/xval_corpus/06_midfile_toggle.sql", 5): {
+        "default": (["engine-only-delete:tgl_c", "engine-only-read:tgl_c"],
+                    "knock-on of 06#4: engine executes the toggle and cascades, "
+                    "occam never threads enforcement ON (toggle unparsed) so the "
+                    "DELETE does not expand; if upstream ever parses bare ON, #4 "
+                    "and this pin go stale together and the DELETE must agree"),
+        "fk-on": (["engine-only-read:tgl_c"],
+                  "writes agree via initial-ON expansion (parent+child DELETE); "
+                  "only deliberately-unmodeled FK check reads diverge"),
+    },
+    # -- fk-on only: enforcement-check reads surface unsourced and are
+    # -- deliberately unmodeled (Enforcement.hs); writes agree everywhere,
+    # -- including expanded cascades (03#6-7, 05#4-5). Default mode agrees.
+    ("benchmarks/seeds/01_cte_recursive_analytics.sql", 1): {
+        "fk-on": (["engine-only-read:employees"],
+                  "self-referential FK check reads (emp_id, manager_id) on INSERT"),
+    },
+    ("benchmarks/seeds/04_multitable_diamond_dag.sql", 4): {
+        "fk-on": (["engine-only-read:cluster_node_left", "engine-only-read:cluster_node_right"],
+                  "FK enforcement scans on parent INSERT"),
+    },
+    ("benchmarks/seeds/04_multitable_diamond_dag.sql", 5): {
+        "fk-on": (["engine-only-read:cluster_root", "engine-only-read:cluster_sink"],
+                  "FK enforcement scans on child INSERT"),
+    },
+    ("benchmarks/seeds/04_multitable_diamond_dag.sql", 6): {
+        "fk-on": (["engine-only-read:cluster_root", "engine-only-read:cluster_sink"],
+                  "FK enforcement scans on child INSERT"),
+    },
+    ("benchmarks/seeds/04_multitable_diamond_dag.sql", 7): {
+        "fk-on": (["engine-only-read:cluster_node_left", "engine-only-read:cluster_node_right"],
+                  "FK enforcement scans on sink INSERT"),
+    },
+    ("benchmarks/xval_corpus/03_fk_cascade.sql", 3): {
+        "fk-on": (["engine-only-read:emp"], "FK enforcement scans on parent INSERT"),
+    },
+    ("benchmarks/xval_corpus/03_fk_cascade.sql", 4): {
+        "fk-on": (["engine-only-read:dept", "engine-only-read:task"],
+                  "FK enforcement scans on child INSERT"),
+    },
+    ("benchmarks/xval_corpus/03_fk_cascade.sql", 5): {
+        "fk-on": (["engine-only-read:emp"], "FK enforcement scans on child INSERT"),
+    },
+    ("benchmarks/xval_corpus/03_fk_cascade.sql", 6): {
+        "fk-on": (["engine-only-read:emp"],
+                  "writes agree via expansion (parent+child UPDATE); check reads diverge"),
+    },
+    ("benchmarks/xval_corpus/03_fk_cascade.sql", 7): {
+        "fk-on": (["engine-only-read:emp", "engine-only-read:task"],
+                  "writes agree via expansion (3-level cascade DELETE); check reads diverge"),
+    },
+    ("benchmarks/xval_corpus/05_set_null_default.sql", 2): {
+        "fk-on": (["engine-only-read:snd_c"], "FK enforcement scans on parent INSERT"),
+    },
+    ("benchmarks/xval_corpus/05_set_null_default.sql", 3): {
+        "fk-on": (["engine-only-read:snd_p"], "FK enforcement scans on child INSERT"),
+    },
+    ("benchmarks/xval_corpus/05_set_null_default.sql", 4): {
+        "fk-on": (["engine-only-read:snd_c"],
+                  "writes agree via expansion (parent DELETE + SET NULL child "
+                  "UPDATE); check reads diverge"),
+    },
+    ("benchmarks/xval_corpus/05_set_null_default.sql", 5): {
+        "fk-on": (["engine-only-read:snd_c"],
+                  "writes agree via expansion (parent UPDATE + SET DEFAULT child "
+                  "UPDATE); check reads diverge"),
+    },
+    ("benchmarks/xval_corpus/06_midfile_toggle.sql", 2): {
+        "fk-on": (["engine-only-read:tgl_c"], "FK enforcement scans on parent INSERT"),
+    },
+    ("benchmarks/xval_corpus/06_midfile_toggle.sql", 3): {
+        "fk-on": (["engine-only-read:tgl_p"], "FK enforcement scans on child INSERT"),
+    },
+}
+
+
+def pin_for(key, mode):
+    """Active pin (expected reasons, note) for key in mode, or None."""
+    entry = KNOWN_GAPS.get(key)
+    if not entry:
+        return None
+    if mode in entry:
+        return entry[mode]
+    return entry.get("both")
+
+
+def check_gate(results, mode):
+    """Return (failures, pinned, skipped). Failures is a list of lines."""
+    by_file = {f["file"]: f for f in results if not f.get("dump_error")}
+    seen = {(f["file"], s["index"]): s
+            for f in results for s in f.get("statements", [])}
+    failures, changed = [], set()
+    pinned = 0
+    for f in results:
+        if f.get("dump_error"):
+            failures.append("DUMP-ERROR %s: %s" % (f["file"], f["dump_error"][:120]))
+    for key in sorted(seen):
+        s = seen[key]
+        if s["verdict"] in ("agree", "abstain", "engine-error"):
+            continue
+        pin = pin_for(key, mode)
+        if (pin is not None and s["verdict"] == "mismatch"
+                and sorted(s["reasons"]) == sorted(pin[0])):
+            pinned += 1
+        elif pin is not None and s["verdict"] == "mismatch":
+            changed.add(key)
+            failures.append("PIN-DRIFT %s#%d: pinned [%s] but got [%s] (%s)" % (
+                key[0], key[1], " ".join(sorted(pin[0])), " ".join(sorted(s["reasons"])), pin[1]))
+        else:
+            failures.append("NEW %s %s#%d: [%s] %s" % (
+                s["verdict"], key[0], key[1], " ".join(sorted(s.get("reasons", []))),
+                s["preview"][:120]))
+    skipped = []
+    for key in sorted(KNOWN_GAPS):
+        pin = pin_for(key, mode)
+        if pin is None or key in changed:
+            continue
+        if key[0] not in by_file:
+            skipped.append("%s#%d (file not in run)" % key)
+            continue
+        s = seen.get(key)
+        if s is None:
+            failures.append("STALE %s#%d: statement vanished (%s)" % (key[0], key[1], pin[1]))
+        elif s["verdict"] in ("agree", "abstain", "engine-error"):
+            failures.append("STALE %s#%d: now %s, pin no longer reproduces (%s)" % (
+                key[0], key[1], s["verdict"], pin[1]))
+    return failures, pinned, skipped
 
 
 def last(name):
@@ -806,8 +985,17 @@ def main(argv=None):
             print("    reasons: %s" % " ".join(s["reasons"]))
             print("    occam:  %s" % json.dumps(s["occam"], sort_keys=True))
             print("    engine: %s" % json.dumps(s["engine"], sort_keys=True))
+    mode = "fk-on" if args.fk_on else "default"
+    failures, pinned, skipped = check_gate(results, mode)
+    print("--- known gaps (%s) ---" % mode)
+    print("pinned=%d skipped=%d failures=%d" % (pinned, len(skipped), len(failures)))
+    for line in failures:
+        print("GATE-FAIL %s" % line)
+    for line in skipped:
+        print("GATE-SKIP %s" % line)
     print("wrote %s" % args.out)
-    return 0
+    print("gate: %s" % ("PASS" if not failures else "FAIL"))
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":
