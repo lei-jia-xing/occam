@@ -45,6 +45,7 @@ module Occam.Core (
     SequenceWrite (..),
     AlterChange (..),
     AlterTable (..),
+    PartitionLink (..),
     DropMode (..),
     DropObject (..),
     RenameOp (..),
@@ -135,6 +136,8 @@ data ReadFact = ReadFact
     { readSource :: !NameRef
     , readMode :: !ReadMode
     , readColumns :: ![Ident]
+    , readOnly :: !Bool
+    -- ^ PostgreSQL @ONLY@: skip partition/inheritance children.
     }
     deriving (Eq, Show)
 
@@ -198,6 +201,10 @@ data TableDef = TableDef
     , tableConstraints :: ![Constraint]
     , tableSources :: ![ReadFact]
     , tableLike :: !(Maybe NameRef)
+    , tablePartitionParent :: !(Maybe NameRef)
+    -- ^ PostgreSQL @PARTITION OF@ parent.
+    , tableInheritParents :: ![NameRef]
+    -- ^ PostgreSQL @INHERITS@ parents.
     , tableOnCommit :: !(Maybe OnCommitAction)
     , tableIfNotExists :: !Bool
     , tableOrReplace :: !Bool
@@ -317,6 +324,8 @@ data DataWrite = DataWrite
     , dataWriteColumns :: ![Ident]
     , dataWriteUnqualifiedColumns :: ![Ident]
     , dataWriteReads :: ![ReadFact]
+    , dataWriteOnly :: !Bool
+    -- ^ PostgreSQL @ONLY@ on the target: skip routing into children.
     }
     deriving (Eq, Show)
 
@@ -379,9 +388,21 @@ data CatalogOp
     | WriteDataOp !DataWrite
     | WriteSequenceOp !SequenceWrite
     | AlterTableOp !AlterTable
+    | AttachPartitionOp !PartitionLink
+    | DetachPartitionOp !PartitionLink
     | DropCatalogOp !DropOp
     | RenameOp !RenameOp
     | RefreshCatalogOp !RefreshOp
+    deriving (Eq, Show)
+
+{- | PostgreSQL partition routing link: the child's rows are read through
+the parent from the linking statement on (`PARTITION OF` / `ATTACH`),
+until a detach breaks it.
+-}
+data PartitionLink = PartitionLink
+    { linkParent :: !NameRef
+    , linkChild :: !NameRef
+    }
     deriving (Eq, Show)
 
 data DropOp = DropOp

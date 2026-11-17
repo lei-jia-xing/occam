@@ -48,13 +48,15 @@
 //! script model which has no external routine catalog) shadowing these names
 //! are assumed absent.
 //!
-//! Two sqlparser AST-shape artifacts lower as `Expr::Function` and are NOT
-//! table members, so they stay fenced: `PARTITION BY RANGE` parses with
-//! `Function('range')`, and MySQL index prefixes such as `KEY (b(1))` parse
-//! as `Expr::Function`. They are deliberately not excluded structurally:
-//! that would need parent-context tracking in two visitors, and both occur in
-//! DDL that fences on other grounds (partition routing, index modeling).
-//! Adding `range` or `b` to the name table would be unsound and is never done.
+//! One sqlparser AST-shape artifact lowers as `Expr::Function` and is NOT a
+//! table member, so it stays fenced: MySQL index prefixes such as `KEY
+//! (b(1))` parse as `Expr::Function`. It is deliberately not excluded
+//! structurally: that would need parent-context tracking in two visitors for
+//! DDL that fences on other grounds (index modeling). Adding `b` to the name
+//! table would be unsound and is never done. (`PARTITION BY RANGE` used to
+//! fence the same way; it is now excluded structurally via
+//! `ignored_function_roots` because partition routing is modeled and the
+//! scheme keyword names no routine.)
 
 use crate::DialectKind;
 use crate::ir;

@@ -20,7 +20,7 @@ import Occam.Core (
     Statement (..),
     StatementId,
  )
-import Occam.Dependency.Alter (processAlterTable)
+import Occam.Dependency.Alter (processAlterTable, processAttachPartition, processDetachPartition)
 import Occam.Dependency.Barrier (barrierKeysForScope, lastBarrierDeps, touchersForBarrier)
 import Occam.Dependency.Define (
     processDefineIndex,
@@ -175,6 +175,8 @@ processOp sid eval op =
         WriteDataOp write -> processDataWrite sid eval write
         WriteSequenceOp write -> processSequenceWrite sid eval write
         AlterTableOp alter -> processAlterTable sid eval alter
+        AttachPartitionOp link -> processAttachPartition sid eval link
+        DetachPartitionOp link -> processDetachPartition sid eval link
         DropCatalogOp dropOp -> processDrop sid eval dropOp
         RenameOp renameOp -> processRename sid eval renameOp
         RefreshCatalogOp refresh -> processRefresh sid eval refresh

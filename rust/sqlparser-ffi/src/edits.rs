@@ -9,7 +9,7 @@ use sqlparser::ast::{
     AlterTableOperation, CastKind, ColumnDef, DataType, Expr, FunctionArg, FunctionArgExpr,
     GroupByExpr, GroupByWithModifier, InTarget, LimitClause, ObjectName, OffsetRows, Parens, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
-    TableConstraint, TableFactor, TableWithJoins, ValueWithSpan, Visitor,
+    TableConstraint, TableFactor, TableInheritance, TableWithJoins, ValueWithSpan, Visitor,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Tokenizer};
@@ -54,6 +54,9 @@ pub(super) struct RelationUse {
     pub(super) scope: usize,
     pub(super) alias: Option<String>,
     pub(super) factor: usize,
+    /// PostgreSQL `ONLY` on this table factor: partition/inheritance
+    /// children are excluded from the read.
+    pub(super) only: bool,
 }
 
 pub(super) enum WholeRowUse {
@@ -151,6 +154,11 @@ pub(super) struct AnalysisVisitor<'a> {
     pub(super) unmodeled_relation_spans: Vec<Span>,
     pub(super) unmodeled_table_source: bool,
     pub(super) has_function: bool,
+    /// Subtrees whose function calls never fence (PostgreSQL `PARTITION BY`
+    /// scheme expressions, which lower the scheme keyword as `Function`).
+    /// Any expression whose span falls inside a root is skipped by the
+    /// deferred-function check.
+    pub(super) ignored_function_roots: Vec<Span>,
     pub(super) select_into_count: usize,
     /// Column reference and the alias scope in which it appeared.
     pub(super) columns: Vec<(Vec<String>, usize)>,
@@ -163,8 +171,9 @@ pub(super) struct AnalysisVisitor<'a> {
     /// Alias and factor limits for the next `Query`, set when the query is the
     /// subquery of a derived table.
     pending_derived_limits: Option<(Span, usize, usize)>,
-    /// The span, factor position, and alias of the next table relation name.
-    current_relation: Option<(Span, usize, Option<String>)>,
+    /// The span, factor position, alias, and `ONLY` marker of the next table
+    /// relation name.
+    current_relation: Option<(Span, usize, Option<String>, bool)>,
     pub(super) edits: Vec<NativeEdit>,
     tokens: &'a [TokenPosition],
     unit: ByteSpan,
@@ -187,6 +196,7 @@ impl<'a> AnalysisVisitor<'a> {
             unmodeled_relation_spans: Vec::new(),
             unmodeled_table_source: false,
             has_function: false,
+            ignored_function_roots: Vec::new(),
             select_into_count: 0,
             columns: Vec::new(),
             whole_rows: Vec::new(),
@@ -247,6 +257,12 @@ impl<'a> AnalysisVisitor<'a> {
         }
     }
 
+    fn in_ignored_function_root(roots: &[Span], span: Span) -> bool {
+        roots
+            .iter()
+            .any(|root| root.start <= span.start && span.end <= root.end)
+    }
+
     fn record_relation(&mut self, name: Option<ir::NameRef>, span: Span) {
         let is_cte = name.as_ref().is_some_and(|reference| {
             !reference.temp
@@ -255,13 +271,13 @@ impl<'a> AnalysisVisitor<'a> {
                     self.mapped_span(span).map_or(0, |span| span.0),
                 )
         });
-        let (factor, alias) = match &self.current_relation {
-            Some((relation_span, factor, alias)) if *relation_span == span => {
-                let result = (*factor, alias.clone());
+        let (factor, alias, only) = match &self.current_relation {
+            Some((relation_span, factor, alias, only)) if *relation_span == span => {
+                let result = (*factor, alias.clone(), *only);
                 self.current_relation = None;
                 result
             }
-            _ => (0, None),
+            _ => (0, None, false),
         };
         self.relations.push(RelationUse {
             name,
@@ -270,6 +286,7 @@ impl<'a> AnalysisVisitor<'a> {
             scope: self.current_alias_scope(),
             alias,
             factor,
+            only,
         });
     }
 
@@ -2448,7 +2465,11 @@ impl Visitor for AnalysisVisitor<'_> {
         self.current_relation = None;
         match factor {
             TableFactor::Table {
-                name, alias, args, ..
+                name,
+                alias,
+                args,
+                inheritance,
+                ..
             } => {
                 let alias_name = alias.as_ref().map(|alias| {
                     canonical_ident_string(
@@ -2457,7 +2478,10 @@ impl Visitor for AnalysisVisitor<'_> {
                         crate::ir::IdentifierClass::Relation,
                     )
                 });
-                self.current_relation = Some((name.span(), factor_index, alias_name));
+                // `ONLY t` excludes partition/inheritance children; `t *` and
+                // the unmarked form include them.
+                let only = matches!(inheritance, Some(TableInheritance::Only { .. }));
+                self.current_relation = Some((name.span(), factor_index, alias_name, only));
                 if args.is_some() {
                     self.unmodeled_relation_spans.push(name.span());
                     if let Some(alias) = alias {
@@ -2538,25 +2562,31 @@ impl Visitor for AnalysisVisitor<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
-        self.has_function |= match expr {
-            Expr::Function(function) => {
-                // Stored pure expressions (DEFAULT, CHECK, view/index bodies)
-                // lift the deferred fence like evaluated ones; everything
-                // else keeps it.
-                !(self.pure_table_enabled
-                    && crate::pure::is_pure_builtin(function, self.dialect, self.rules))
-            }
-            Expr::CompoundIdentifier(idents)
-                if matches!(self.dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
-            {
-                idents.len() > 1
-                    && idents.last().is_some_and(|ident| {
-                        ident.value.eq_ignore_ascii_case("nextval")
-                            || ident.value.eq_ignore_ascii_case("currval")
-                    })
-            }
-            _ => false,
-        };
+        // Expressions inside an ignored root (PostgreSQL `PARTITION BY`
+        // schemes) never fence: the scheme keyword lowers as `Function` but
+        // names no routine, and the scheme affects row placement, not
+        // table-level dependencies.
+        let ignored = Self::in_ignored_function_root(&self.ignored_function_roots, expr.span());
+        self.has_function |= !ignored
+            && match expr {
+                Expr::Function(function) => {
+                    // Stored pure expressions (DEFAULT, CHECK, view/index bodies)
+                    // lift the deferred fence like evaluated ones; everything
+                    // else keeps it.
+                    !(self.pure_table_enabled
+                        && crate::pure::is_pure_builtin(function, self.dialect, self.rules))
+                }
+                Expr::CompoundIdentifier(idents)
+                    if matches!(self.dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
+                {
+                    idents.len() > 1
+                        && idents.last().is_some_and(|ident| {
+                            ident.value.eq_ignore_ascii_case("nextval")
+                                || ident.value.eq_ignore_ascii_case("currval")
+                        })
+                }
+                _ => false,
+            };
         let record_columns = self.nested_dml_depth == 0;
         let scope = self.current_alias_scope();
         match expr {

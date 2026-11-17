@@ -1,10 +1,12 @@
--- | ALTER TABLE: column, constraint, and index changes.
+-- | ALTER TABLE: column, constraint, index, and partition-routing changes.
 module Occam.Dependency.Alter (
     constraintColumnsOf,
     introducedForeignKeysOf,
     dropColumnDependentViews,
     viewDependsOnColumn,
     processAlterTable,
+    processAttachPartition,
+    processDetachPartition,
     applyAlterChange,
     renameConstraintName,
     validateConstraintValue,
@@ -24,6 +26,7 @@ import Occam.Core (
     DropMode (..),
     ForeignKey (..),
     Ident (..),
+    PartitionLink (..),
     ReadFact (..),
     ReadMode (..),
     RelationKind (..),
@@ -36,6 +39,7 @@ import Occam.Dependency.Query (
     referencedParentColumns,
     relationAllDeps,
     relationConstraintDeps,
+    relationDefinitionDeps,
     relationReadDeps,
  )
 import Occam.Dependency.Resolve (resolveRelationKeys)
@@ -164,6 +168,7 @@ processAlterTable sid eval alter =
                         else ReadData
                     )
                     []
+                    False
                 | foreignKey <- introducedForeignKeys
                 , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
                 ]
@@ -172,7 +177,7 @@ processAlterTable sid eval alter =
                 relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
                 validationDeps =
                     Set.unions
-                        [ relationReadDeps session currentCatalog parentKey ReadData []
+                        [ relationReadDeps session currentCatalog parentKey ReadData [] False
                         | ValidateConstraint name <- changes
                         , constraintKey <- Set.toList (relConstraints relation)
                         , constraintKeyIdentity constraintKey == NamedConstraint name
@@ -213,6 +218,63 @@ processAlterTable sid eval alter =
                     relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
              in current1 {evalCatalog = insertRelation key relation2 catalog1}
      in mutateResolved stepKey eval keys
+
+{- | `ALTER TABLE parent ATTACH PARTITION child`: route the child's rows
+through the parent from here on. The parent records a schema write so
+later parent reads depend on the attach.
+-}
+processAttachPartition :: StatementId -> Eval -> PartitionLink -> Eval
+processAttachPartition sid eval link = attachDetachPartition sid eval link True
+
+{- | `ALTER TABLE parent DETACH PARTITION child`: break routing. Earlier
+statements keep their snapshot edges; later parent reads exclude the
+child but depend on the detach itself through the parent schema write.
+-}
+processDetachPartition :: StatementId -> Eval -> PartitionLink -> Eval
+processDetachPartition sid eval link = attachDetachPartition sid eval link False
+
+attachDetachPartition :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
+attachDetachPartition sid eval link isAttach =
+    let session = evalSession eval
+        catalog = evalCatalog eval
+        existing reference =
+            filter
+                (`Map.member` catalogRelations catalog)
+                (resolveRelationKeys session catalog reference)
+        pairs =
+            [ (parentKey, childKey)
+            | parentKey <- existing (linkParent link)
+            , childKey <- existing (linkChild link)
+            ]
+        step current (parentKey, childKey) =
+            let currentCatalog = evalCatalog current
+                child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
+                parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
+                deps =
+                    relationDefinitionDeps currentCatalog parentKey
+                        `Set.union` relationDefinitionDeps currentCatalog childKey
+                current1 =
+                    addTouches
+                        (relationTouchKeys parentKey ++ relationTouchKeys childKey)
+                        (addDeps deps current)
+                child1 =
+                    child
+                        { relParents =
+                            if isAttach
+                                then Set.insert (linkParent link) (relParents child)
+                                else
+                                    Set.filter
+                                        ( \reference ->
+                                            parentKey
+                                                `notElem` resolveRelationKeys session currentCatalog reference
+                                        )
+                                        (relParents child)
+                        }
+                parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
+                catalog1 =
+                    insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
+             in current1 {evalCatalog = catalog1}
+     in mutateResolved step eval pairs
 
 applyAlterChange ::
     SessionState ->

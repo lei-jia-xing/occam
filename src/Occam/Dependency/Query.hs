@@ -7,6 +7,7 @@ module Occam.Dependency.Query (
     referencedParentColumns,
     relationIndexDeps,
     relationTriggerDeps,
+    childrenOf,
     relationReadDeps,
     relationWriteDeps,
     relationAllDeps,
@@ -175,8 +176,25 @@ relationTriggerDeps catalog relation =
         , Just trigger <- [Map.lookup key (catalogTriggers catalog)]
         ]
 
-relationReadDeps :: SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Set StatementId
-relationReadDeps session catalog key mode columns =
+{- | Partition/inheritance children of a parent: relations whose stored
+parent references resolve to it. Name-based like foreign-key parents, so
+dropped-and-recreated parents re-link and renames are rewritten away.
+-}
+childrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
+childrenOf session catalog key =
+    [ childKey
+    | (childKey, relation) <- Map.toList (catalogRelations catalog)
+    , not (Set.null (relParents relation))
+    , childKey /= key
+    , key
+        `elem` concatMap
+            (resolveRelationKeys session catalog)
+            (Set.toList (relParents relation))
+    ]
+
+relationReadDeps ::
+    SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Bool -> Set StatementId
+relationReadDeps session catalog key mode columns only =
     go Set.empty key
     where
         go seen current
@@ -215,7 +233,23 @@ relationReadDeps session catalog key mode columns =
                                     , sourceKey <- resolveRelationKeys session catalog reference
                                     , Map.member sourceKey (catalogRelations catalog)
                                     ]
-                         in base `Set.union` dataDeps `Set.union` sourceDeps `Set.union` unresolvedDeps
+                            -- Partition/inheritance children contribute their
+                            -- rows to the parent read (definitions always,
+                            -- writes in data mode), transitively through
+                            -- grandchildren. `ONLY` skips them.
+                            childDeps =
+                                if only
+                                    then Set.empty
+                                    else
+                                        Set.unions
+                                            [ go seen' child
+                                            | child <- childrenOf session catalog current
+                                            ]
+                         in base
+                                `Set.union` dataDeps
+                                `Set.union` sourceDeps
+                                `Set.union` unresolvedDeps
+                                `Set.union` childDeps
 
 relationWriteDeps ::
     SessionState -> Catalog -> RelationKey -> WriteKind -> [Ident] -> Set StatementId
@@ -235,13 +269,13 @@ relationWriteDeps session catalog key kind columns =
                                 `Set.union` relationColumnWriteDeps session catalog key relation columns
                 sourceDeps =
                     Set.unions
-                        [ relationReadDeps session catalog source ReadData []
+                        [ relationReadDeps session catalog source ReadData [] False
                         | relKind relation == ViewRelation
                         , source <- Set.toList (relSources relation)
                         ]
                 unresolvedDeps =
                     Set.unions
-                        [ relationReadDeps session catalog sourceKey ReadData []
+                        [ relationReadDeps session catalog sourceKey ReadData [] False
                         | relKind relation == ViewRelation
                         , reference <- Set.toList (relUnresolvedSources relation)
                         , sourceKey <- resolveRelationKeys session catalog reference
@@ -251,7 +285,7 @@ relationWriteDeps session catalog key kind columns =
 
 relationAllDeps :: SessionState -> Catalog -> RelationKey -> Set StatementId
 relationAllDeps session catalog key =
-    relationReadDeps session catalog key ReadData []
+    relationReadDeps session catalog key ReadData [] False
         `Set.union` relationWriteDeps session catalog key (DeleteWrite DeleteFilteredRows) []
 
 -- Foreign keys and constraint names

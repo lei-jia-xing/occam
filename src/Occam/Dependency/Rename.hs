@@ -5,6 +5,7 @@ module Occam.Dependency.Rename (
     moveRelationObjects,
     updateViewSources,
     updateForeignKeyParents,
+    updatePartitionParents,
     renameSourceReadColumns,
     renameTriggerColumns,
     renameTriggerRelations,
@@ -107,22 +108,28 @@ processRename sid eval renameOp =
                                 { relSchemaWrites = Set.insert sid (relSchemaWrites relation1)
                                 }
                         catalog2 =
-                            updateForeignKeyParents
+                            updatePartitionParents
                                 session
                                 currentCatalog
                                 oldKey
                                 newKey
-                                ( updateTriggerRelations
+                                ( updateForeignKeyParents
                                     session
                                     currentCatalog
                                     oldKey
                                     newKey
-                                    ( updateViewSources
+                                    ( updateTriggerRelations
                                         session
                                         currentCatalog
                                         oldKey
                                         newKey
-                                        (insertRelation newKey relation2 (deleteRelation oldKey catalog1))
+                                        ( updateViewSources
+                                            session
+                                            currentCatalog
+                                            oldKey
+                                            newKey
+                                            (insertRelation newKey relation2 (deleteRelation oldKey catalog1))
+                                        )
                                     )
                                 )
                      in (addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey) (addDeps deps current))
@@ -338,6 +345,32 @@ updateForeignKeyParents session resolutionCatalog oldKey newKey catalog =
                                         }
                             }
                 _ -> state
+
+updatePartitionParents ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    RelationKey ->
+    Catalog ->
+    Catalog
+updatePartitionParents session resolutionCatalog oldKey newKey catalog =
+    catalog
+        { catalogRelations =
+            Map.map adjust (catalogRelations catalog)
+        }
+    where
+        newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+        adjust relation =
+            relation
+                { relParents =
+                    Set.map
+                        ( \reference ->
+                            if resolveRelationKeys session resolutionCatalog reference == [oldKey]
+                                then newReference
+                                else reference
+                        )
+                        (relParents relation)
+                }
 
 renameSourceReadColumns ::
     SessionState ->

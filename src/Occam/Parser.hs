@@ -86,6 +86,7 @@ import Occam.Core (
     NameRef (..),
     ObjectRef (..),
     OnCommitAction (..),
+    PartitionLink (..),
     ReadFact (..),
     ReadMode (..),
     ReferentialAction (..),
@@ -389,6 +390,7 @@ instance FromJSON ReadFact where
             <$> objectValue .: "source"
             <*> objectValue .: "mode"
             <*> objectValue .: "columns"
+            <*> objectValue .: "only"
 
 instance FromJSON RelationKind where
     parseJSON = withText "RelationKind" \name ->
@@ -502,6 +504,8 @@ instance FromJSON TableDef where
             <*> objectValue .: "constraints"
             <*> objectValue .: "sources"
             <*> objectValue .: "like"
+            <*> objectValue .: "partition_parent"
+            <*> objectValue .: "inherit_parents"
             <*> objectValue .: "on_commit"
             <*> objectValue .: "if_not_exists"
             <*> objectValue .: "or_replace"
@@ -666,6 +670,7 @@ instance FromJSON DataWrite where
             <*> objectValue .: "columns"
             <*> objectValue .: "unqualified_columns"
             <*> objectValue .: "reads"
+            <*> objectValue .: "only"
 
 instance FromJSON SequenceWrite where
     parseJSON = withObject "SequenceWrite" \objectValue ->
@@ -696,6 +701,12 @@ instance FromJSON AlterTable where
         AlterTable
             <$> objectValue .: "table"
             <*> objectValue .: "changes"
+
+instance FromJSON PartitionLink where
+    parseJSON = withObject "PartitionLink" \objectValue ->
+        PartitionLink
+            <$> objectValue .: "parent"
+            <*> objectValue .: "child"
 
 instance FromJSON DropMode where
     parseJSON = withText "DropMode" \name ->
@@ -757,6 +768,8 @@ instance FromJSON CatalogOp where
             "write_data" -> WriteDataOp <$> parseJSON (Object objectValue)
             "write_sequence" -> WriteSequenceOp <$> parseJSON (Object objectValue)
             "alter_table" -> AlterTableOp <$> parseJSON (Object objectValue)
+            "attach_partition" -> AttachPartitionOp <$> parseJSON (Object objectValue)
+            "detach_partition" -> DetachPartitionOp <$> parseJSON (Object objectValue)
             "drop" -> DropCatalogOp <$> parseJSON (Object objectValue)
             "rename" -> RenameOp <$> parseJSON (Object objectValue)
             "refresh" -> RefreshCatalogOp <$> parseJSON (Object objectValue)

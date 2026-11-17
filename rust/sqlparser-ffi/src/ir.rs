@@ -155,9 +155,25 @@ pub enum CatalogOp {
     WriteData(DataWrite),
     WriteSequence(SequenceWrite),
     AlterTable(AlterTable),
+    /// PostgreSQL `ALTER TABLE parent ATTACH PARTITION child ...`: routes the
+    /// child's rows into parent reads from this statement on. A separate op
+    /// (not an `AlterChange`) so the column pass, which matches `AlterChange`
+    /// exhaustively, keeps compiling untouched.
+    AttachPartition(PartitionLink),
+    /// PostgreSQL `ALTER TABLE parent DETACH PARTITION child ...`: breaks the
+    /// routing established by `PARTITION OF` or a prior attach. Statements
+    /// before the detach keep their edges (the scan snapshots dependencies
+    /// in order); statements after it observe the parent without the child.
+    DetachPartition(PartitionLink),
     Drop(DropOp),
     Rename(RenameOp),
     Refresh(RefreshOp),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PartitionLink {
+    pub parent: NameRef,
+    pub child: NameRef,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,6 +185,14 @@ pub struct TableDef {
     pub constraints: Vec<Constraint>,
     pub sources: Vec<ReadFact>,
     pub like: Option<NameRef>,
+    /// PostgreSQL `PARTITION OF` parent: the child's rows are read through
+    /// the parent (and parent writes route into the child by key).
+    pub partition_parent: Option<NameRef>,
+    /// PostgreSQL `INHERITS` parents: same read routing as partitions;
+    /// writes route conservatively (parent writes are also recorded on the
+    /// children, which over-approximates `INHERITS` inserts that land only
+    /// on the parent, but never misses an edge).
+    pub inherit_parents: Vec<NameRef>,
     pub on_commit: Option<OnCommitAction>,
     pub if_not_exists: bool,
     pub or_replace: bool,
@@ -383,6 +407,10 @@ pub struct ReadFact {
     pub source: NameRef,
     pub mode: ReadMode,
     pub columns: Vec<Ident>,
+    /// PostgreSQL `ONLY` qualifier (`FROM ONLY t`): the read observes the
+    /// named table's own rows and skips partition/inheritance children.
+    /// Absent the marker (or with `t *`), children are included.
+    pub only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -396,6 +424,10 @@ pub struct DataWrite {
     #[serde(default)]
     pub unqualified_columns: Vec<Ident>,
     pub reads: Vec<ReadFact>,
+    /// PostgreSQL `ONLY` qualifier on the write target (`UPDATE ONLY t`,
+    /// `DELETE FROM ONLY t`, `TRUNCATE ONLY t`): the write does not route
+    /// into partition/inheritance children.
+    pub only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

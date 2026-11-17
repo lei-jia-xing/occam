@@ -8,6 +8,7 @@ import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Occam.Core (
+    BarrierReason (..),
     BarrierScope (..),
     BeginPolicy (..),
     CatalogOp (..),
@@ -104,6 +105,13 @@ hasStatementRead parts sid graph =
 
 renamesFor :: StatementId -> DependencyGraph -> [RenameOp]
 renamesFor sid graph = [rename | RenameOp rename <- opsFor sid graph]
+isAttach :: CatalogOp -> Bool
+isAttach (AttachPartitionOp _) = True
+isAttach _ = False
+
+isDetach :: CatalogOp -> Bool
+isDetach (DetachPartitionOp _) = True
+isDetach _ = False
 
 hasRead :: [Text] -> [CatalogOp] -> Bool
 hasRead parts ops =
@@ -486,6 +494,8 @@ tests =
                         []
                         Nothing
                         Nothing
+                        []
+                        Nothing
                         False
                         False
                 index =
@@ -522,14 +532,14 @@ tests =
                             , emptySemanticFacts
                                 { factOps =
                                     [ WriteDataOp
-                                        (DataWrite (ref ["t"]) (InsertWrite ConflictError) [Ident "id"] [] [])
+                                        (DataWrite (ref ["t"]) (InsertWrite ConflictError) [Ident "id"] [] [] False)
                                     ]
                                 }
                             )
                         ,
                             ( StatementId 5
                             , emptySemanticFacts
-                                { factOps = [ReadOp (ReadFact (ref ["t"]) ReadData [Ident "id"])]
+                                { factOps = [ReadOp (ReadFact (ref ["t"]) ReadData [Ident "id"] False)]
                                 }
                             )
                         ]
@@ -1230,6 +1240,182 @@ tests =
             assertBool
                 "the unknown call still chains every prior statement"
                 (has (StatementId 1) deps && has (StatementId 2) deps)
+        , testCase "partitioned parent reads depend on child definitions and writes" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT) PARTITION BY RANGE (a);"
+                        , "CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);"
+                        , "INSERT INTO c VALUES (5);"
+                        , "SELECT * FROM p;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "the partition parent carries no routine fence"
+                (null (factBarriers (factsFor (StatementId 1) graph)))
+            assertBool
+                "the partition child carries no DDL fence"
+                (null (factBarriers (factsFor (StatementId 2) graph)))
+            assertEqual
+                "the child fact binds its partition parent"
+                (Just (ref ["p"]))
+                (tableDefinition ["c"] (opsFor (StatementId 2) graph) >>= tablePartitionParent)
+            assertEqual
+                "the parent read sees the child definition and write"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3])
+                (dependenciesFor (StatementId 4) graph)
+        , testCase "inheritance children route parent reads like partitions" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT);"
+                        , "CREATE TABLE c (a INT) INHERITS (p);"
+                        , "INSERT INTO c VALUES (5);"
+                        , "SELECT * FROM p;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "the inheriting child carries no DDL fence"
+                (null (factBarriers (factsFor (StatementId 2) graph)))
+            assertEqual
+                "the parent read sees the child definition and write"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3])
+                (dependenciesFor (StatementId 4) graph)
+        , testCase "ONLY skips partition children on reads and writes" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT) PARTITION BY RANGE (a);"
+                        , "CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);"
+                        , "INSERT INTO c VALUES (5);"
+                        , "SELECT * FROM ONLY p;"
+                        , "UPDATE ONLY p SET a = 6;"
+                        , "SELECT * FROM c;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let onlyRead = dependenciesFor (StatementId 4) graph
+                childRead = dependenciesFor (StatementId 6) graph
+            assertBool
+                "an ONLY parent read keeps the parent definition"
+                (has (StatementId 1) onlyRead)
+            assertBool
+                "an ONLY parent read skips the children"
+                (not (has (StatementId 2) onlyRead) && not (has (StatementId 3) onlyRead))
+            assertBool
+                "the child read keeps its own definition and write"
+                (has (StatementId 2) childRead && has (StatementId 3) childRead)
+            assertBool
+                "an ONLY parent write is not recorded on the child"
+                (not (has (StatementId 5) childRead))
+        , testCase "parent writes route into partition children" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT) PARTITION BY RANGE (a);"
+                        , "CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);"
+                        , "INSERT INTO p VALUES (5);"
+                        , "SELECT * FROM c;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "the routed parent write reaches direct child reads"
+                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+        , testCase "attach establishes routing and detach breaks it" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT) PARTITION BY RANGE (a);"
+                        , "CREATE TABLE c (a INT);"
+                        , "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (1) TO (10);"
+                        , "INSERT INTO c VALUES (5);"
+                        , "SELECT * FROM p;"
+                        , "ALTER TABLE p DETACH PARTITION c;"
+                        , "SELECT * FROM p;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "attach and detach emit no fence"
+                ( null (factBarriers (factsFor (StatementId 3) graph))
+                    && null (factBarriers (factsFor (StatementId 6) graph))
+                )
+            assertBool
+                "attach emits a partition link op"
+                (any isAttach (opsFor (StatementId 3) graph))
+            assertBool
+                "detach emits a partition unlink op"
+                (any isDetach (opsFor (StatementId 6) graph))
+            assertEqual
+                "the pre-detach read sees the attach and the child"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 3, StatementId 4])
+                (dependenciesFor (StatementId 5) graph)
+            let postDetach = dependenciesFor (StatementId 7) graph
+            assertBool
+                "the post-detach read keeps the parent and the routing changes"
+                ( has (StatementId 1) postDetach
+                    && has (StatementId 3) postDetach
+                    && has (StatementId 6) postDetach
+                )
+            assertBool
+                "the post-detach read drops the detached child"
+                (not (has (StatementId 2) postDetach) && not (has (StatementId 4) postDetach))
+        , testCase "OUTPUT INTO adds a write edge to the target table" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT);"
+                        , "CREATE TABLE t2 (a INT);"
+                        , "INSERT INTO t (a) OUTPUT inserted.a INTO t2 SELECT a FROM t;"
+                        , "SELECT * FROM t2;"
+                        ]
+            graph <- analyze MsSql sql
+            assertBool
+                "OUTPUT INTO a real table carries no fence"
+                (null (factBarriers (factsFor (StatementId 3) graph)))
+            assertEqual
+                "the host and OUTPUT writes are both recorded"
+                (Set.fromList ["t", "t2"])
+                ( Set.fromList
+                    [nameText (nameRefName (dataWriteTarget write)) | write <- writesFor (StatementId 3) graph]
+                )
+            assertBool
+                "later reads of the OUTPUT target retain the statement"
+                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+        , testCase "OUTPUT INTO a table variable fences at relation scope" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT);"
+                        , "UPDATE t SET a = 1 OUTPUT deleted.a INTO @var;"
+                        ]
+            graph <- analyze MsSql sql
+            assertEqual
+                "the table variable is fenced without a global barrier"
+                [RelationScope (ref ["@var"])]
+                [barrierScope barrier | barrier <- factBarriers (factsFor (StatementId 2) graph)]
+            assertBool
+                "the host write is still recorded"
+                (hasWrite ["t"] UpdateWrite (opsFor (StatementId 2) graph))
+        , testCase "OUTPUT without INTO adds no edge and no fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT);"
+                        , "DELETE FROM t OUTPUT deleted.*;"
+                        ]
+            graph <- analyze MsSql sql
+            assertBool
+                "a read-only OUTPUT projection carries no fence"
+                (null (factBarriers (factsFor (StatementId 2) graph)))
+            assertEqual
+                "no extra write edge is recorded"
+                1
+                (length (writesFor (StatementId 2) graph))
+        , testCase "ALTER INHERIT keeps its fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (a INT);"
+                        , "CREATE TABLE c (a INT);"
+                        , "ALTER TABLE c INHERIT p;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "unmodeled inheritance changes stay fenced"
+                ( any
+                    ((== UnknownAlterBarrier) . barrierReason)
+                    (factBarriers (factsFor (StatementId 3) graph))
+                )
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

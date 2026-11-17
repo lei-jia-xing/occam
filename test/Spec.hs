@@ -645,6 +645,8 @@ factOp fact =
                     , tableConstraints = []
                     , tableSources = []
                     , tableLike = Nothing
+                    , tablePartitionParent = Nothing
+                    , tableInheritParents = []
                     , tableOnCommit = Nothing
                     , tableIfNotExists = False
                     , tableOrReplace = False
@@ -657,6 +659,7 @@ factOp fact =
                     , dataWriteColumns = []
                     , dataWriteUnqualifiedColumns = []
                     , dataWriteReads = []
+                    , dataWriteOnly = False
                     }
         ReadTableFact name ->
             ReadOp
@@ -664,6 +667,7 @@ factOp fact =
                     { readSource = NameRef (Name [Ident name]) False
                     , readMode = ReadData
                     , readColumns = []
+                    , readOnly = False
                     }
 
 newtype SmallFactGraph = SmallFactGraph [[ArbitraryFact]]

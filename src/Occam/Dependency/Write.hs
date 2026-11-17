@@ -55,6 +55,7 @@ import Occam.Core (
 import Occam.Dependency.Barrier (relationTouchKeys, sequenceTouchKeys, triggerTouchKeys)
 import Occam.Dependency.Query (
     allForeignKeys,
+    childrenOf,
     referencedParentColumns,
     relationReadDeps,
     relationWriteDeps,
@@ -136,7 +137,7 @@ processRead _ eval readFact =
                     addTouches
                         (relationTouchKeys key)
                         ( addDeps
-                            (relationReadDeps session catalog key (readMode readFact) (readColumns readFact))
+                            (relationReadDeps session catalog key (readMode readFact) (readColumns readFact) (readOnly readFact))
                             current
                         )
                 )
@@ -256,11 +257,11 @@ processDataWrite sid eval write =
                 -- columns belongs to a different table in a multi-table update.
                 if null columns && not (null unqualified)
                     then current
-                    else writeRelation sid current key (dataWriteKind write) columns
+                    else writeRelation sid current key (dataWriteKind write) columns (dataWriteOnly write)
      in mutateResolved applyTarget evalReads targetKeys
 
-writeRelation :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-writeRelation sid eval key kind columns =
+writeRelation :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Bool -> Eval
+writeRelation sid eval key kind columns only =
     let session = evalSession eval
         catalog = evalCatalog eval
         relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
@@ -289,9 +290,30 @@ writeRelation sid eval key kind columns =
                         }
         evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
         evalCascades = applyForeignKeys sid evalTriggers key kind columns
+        -- A parent write also lands on partition/inheritance children
+        -- (routed by key for partitions; `UPDATE`/`DELETE`/`TRUNCATE` fan
+        -- out for both). Recursing through `writeRelation` reuses trigger
+        -- matching, cascades, and the visited guard uniformly; `ONLY`
+        -- skips the children. `INHERITS` inserts land on the parent only,
+        -- so recording them on children over-approximates, soundly.
+        evalChildren =
+            if only
+                then evalCascades
+                else
+                    foldl'
+                        (writePartitionChild sid kind columns)
+                        evalCascades
+                        (childrenOf session catalog key)
      in if isView && null insteadOf
-            then addViewWriteBarriers evalCascades key
-            else evalCascades
+            then addViewWriteBarriers evalChildren key
+            else evalChildren
+
+writePartitionChild :: StatementId -> WriteKind -> [Ident] -> Eval -> RelationKey -> Eval
+writePartitionChild sid kind columns current childKey =
+    let signature = writeSignature kind columns
+     in if Set.member (childKey, signature) (evalVisitedWrites current)
+            then current
+            else writeRelation sid current childKey kind columns False
 
 addViewWriteBarriers :: Eval -> RelationKey -> Eval
 addViewWriteBarriers eval key =
@@ -394,7 +416,8 @@ processDmlEvent sid eval event =
                 DmlTruncate target' behavior ->
                     (target', TruncateWrite behavior ContinueIdentity, [])
      in mutateResolved
-            (\current key -> writeRelation sid current key kind columns)
+            -- Trigger-body DML carries no `ONLY` marker: route conservatively.
+            (\current key -> writeRelation sid current key kind columns False)
             eval
             (resolveRelationKeys session catalog target)
 
@@ -472,7 +495,7 @@ applyChildChecks _sid eval key kind _columns =
                         then
                             addDeps
                                 ( Set.unions
-                                    [ relationReadDeps session catalog parentKey ReadData []
+                                    [ relationReadDeps session catalog parentKey ReadData [] False
                                     | parentKey <-
                                         resolveRelationKeys
                                             session
@@ -538,6 +561,7 @@ applyParentActions sid eval key kind columns =
                                                 childKey
                                                 ReadSchema
                                                 []
+                                                False
                                      in addDeps (childDeps `Set.union` constraintDeps) current
                                 else current
                         )
@@ -585,11 +609,11 @@ applyParentActions sid eval key kind columns =
                             (foreignKeyChildColumns foreignKey)
                     Restrict ->
                         addDeps
-                            (relationReadDeps session catalog (constraintStateTable state) ReadData [])
+                            (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
                             current
                     NoAction ->
                         addDeps
-                            (relationReadDeps session catalog (constraintStateTable state) ReadData [])
+                            (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
                             current
 
         foreignKeyEventMatches action updatedParentColumns _parentKey _state foreignKey =
@@ -618,7 +642,7 @@ applyParentActions sid eval key kind columns =
             let signature = writeSignature childKind childColumns
              in if Set.member (childKey, signature) (evalVisitedWrites current)
                     then current
-                    else writeRelation sid current childKey childKind childColumns
+                    else writeRelation sid current childKey childKind childColumns False
 
 -- Refresh
 processRefresh :: StatementId -> Eval -> RefreshOp -> Eval
@@ -633,7 +657,7 @@ processRefresh sid eval refresh =
             let currentCatalog = evalCatalog current
                 relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
                 mode = refreshSourceMode refresh
-                deps = relationReadDeps session currentCatalog key ReadSchema []
+                deps = relationReadDeps session currentCatalog key ReadSchema [] False
                 sourceReads = [readFact {readMode = mode} | readFact <- relSourceReads relation]
                 evalReads = foldl' (processRead sid) current sourceReads
                 relation1 =

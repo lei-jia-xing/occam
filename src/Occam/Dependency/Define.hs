@@ -17,7 +17,7 @@ module Occam.Dependency.Define (
 ) where
 
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, isJust, listToMaybe)
+import Data.Maybe (catMaybes, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Occam.Core (
@@ -108,7 +108,7 @@ tableConstraintValues definition =
 foreignKeyParentDeps :: SessionState -> Catalog -> [Constraint] -> Set StatementId
 foreignKeyParentDeps session catalog constraints =
     Set.unions
-        [ relationReadDeps session catalog parentKey ReadSchema []
+        [ relationReadDeps session catalog parentKey ReadSchema [] False
         | ForeignKeyConstraint foreignKey <- constraints
         , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
         ]
@@ -150,7 +150,7 @@ processDefineTable sid eval definition =
                 Nothing -> Set.empty
                 Just reference ->
                     Set.unions
-                        [ relationReadDeps session catalog source ReadSchema []
+                        [ relationReadDeps session catalog source ReadSchema [] False
                         | source <- resolveRelationKeys session catalog reference
                         ]
         existingDeps =
@@ -196,6 +196,13 @@ processDefineTable sid eval definition =
                                 resolvedSourceKeys session catalog (tableSources definition)
                             , relUnresolvedSources = unresolved
                             , relSourceReads = tableSources definition
+                            , -- Stored unresolved and resolved at use, like
+                              -- foreign-key parents.
+                              relParents =
+                                Set.fromList
+                                    ( maybeToList (tablePartitionParent definition)
+                                        ++ tableInheritParents definition
+                                    )
                             , relOnCommit = tableOnCommit definition
                             , relOnCommitFrameId =
                                 case tableOnCommit definition of
@@ -276,7 +283,7 @@ processDefineIndex sid eval definition =
                 _ -> resolveIndexKeys session catalog (indexRef definition)
         tableDeps =
             Set.unions
-                [ relationReadDeps session catalog tableKey ReadData (indexColumns definition)
+                [ relationReadDeps session catalog tableKey ReadData (indexColumns definition) False
                 | tableKey <- tableKeys
                 ]
         stepKey current indexKey =
@@ -358,7 +365,7 @@ triggerBodyDeps session catalog body =
                         ]
                 TriggerRead readFact ->
                     Set.unions
-                        [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact)
+                        [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact) (readOnly readFact)
                         | key <- resolveRelationKeys session catalog (readSource readFact)
                         ]
                 TriggerWriteSequence write ->
@@ -412,7 +419,7 @@ processDefineTrigger sid eval definition =
         bodyDeps = triggerBodyDeps session catalog (triggerBody definition)
         whenDeps =
             Set.unions
-                [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact)
+                [ relationReadDeps session catalog key (readMode readFact) (readColumns readFact) (readOnly readFact)
                 | readFact <- triggerWhenReads definition
                 , key <- resolveRelationKeys session catalog (readSource readFact)
                 ]

@@ -2751,14 +2751,6 @@ mod tests {
 
     #[test]
     fn parser_artifacts_still_fence() {
-        // `PARTITION BY RANGE (...)` lowers `RANGE` as Function('range'): not
-        // a table member, so it fences.
-        let units = parse(
-            "CREATE TABLE m (a INT, b INT) PARTITION BY RANGE (a, b);",
-            DialectKind::PostgreSql,
-        )
-        .unwrap();
-        assert!(has_routine_barrier(facts(&units[0])));
         // MySQL index prefixes (`b(1)`) lower as Expr::Function: fenced.
         let units = parse(
             "CREATE TEMPORARY TABLE t1(i INT, b BLOB, PRIMARY KEY pk(i), INDEX sk(b(1)));",
@@ -2766,6 +2758,211 @@ mod tests {
         )
         .unwrap();
         assert!(has_routine_barrier(facts(&units[0])));
+    }
+
+    #[test]
+    fn partition_by_scheme_lifts_but_partition_of_binds_parent() {
+        // `PARTITION BY RANGE/LIST/HASH (...)` lowers the scheme keyword as
+        // Function: structurally excluded from the routine fence because it
+        // names no routine and creates no dependency edge.
+        for scheme in ["RANGE", "LIST", "HASH"] {
+            let sql = format!("CREATE TABLE m (a INT, b INT) PARTITION BY {scheme} (a, b);");
+            let units = parse(&sql, DialectKind::PostgreSql).unwrap();
+            assert!(
+                facts(&units[0]).barriers.is_empty(),
+                "{sql}: {:?}",
+                facts(&units[0]).barriers
+            );
+            assert!(table_def(facts(&units[0])).is_some(), "{sql}");
+        }
+        // `PARTITION OF` binds the child to its parent with no fence.
+        let units = parse(
+            "CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        let table = table_def(facts(&units[0])).expect("partition child def");
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert_eq!(
+            table
+                .partition_parent
+                .as_ref()
+                .map(|parent| name_text(&parent.name)),
+            Some("p".to_string())
+        );
+        assert!(table.inherit_parents.is_empty());
+        // Routine shapes inside `FOR VALUES` bounds still fence.
+        let units = parse(
+            "CREATE TABLE c PARTITION OF p FOR VALUES IN (f(1));",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
+    #[test]
+    fn inherits_binds_parents_without_fence() {
+        let units = parse(
+            "CREATE TABLE c (a INT) INHERITS (p1, p2);",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        let table = table_def(facts(&units[0])).expect("inherit child def");
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(table.partition_parent.is_none());
+        let parents: Vec<String> = table
+            .inherit_parents
+            .iter()
+            .map(|parent| name_text(&parent.name))
+            .collect();
+        assert_eq!(parents, vec!["p1".to_string(), "p2".to_string()]);
+        // An unresolvable parent shape keeps the fence.
+        let units = parse(
+            "CREATE TABLE c PARTITION OF a.b.c.d.e FOR VALUES IN (1);",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(
+            facts(&units[0])
+                .barriers
+                .iter()
+                .any(|barrier| matches!(barrier.reason, BarrierReason::UnknownDdl)),
+            "{:?}",
+            facts(&units[0]).barriers
+        );
+    }
+
+    #[test]
+    fn attach_detach_partition_emit_link_ops() {
+        let units = parse(
+            "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (1) TO (10);",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(matches!(
+            facts(&units[0]).ops.as_slice(),
+            [CatalogOp::AttachPartition(link)]
+                if name_text(&link.parent.name) == "p" && name_text(&link.child.name) == "c"
+        ));
+        for sql in [
+            "ALTER TABLE p DETACH PARTITION c;",
+            "ALTER TABLE p DETACH PARTITION c FINALIZE;",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).ops.as_slice(),
+                    [CatalogOp::DetachPartition(link)]
+                        if name_text(&link.parent.name) == "p"
+                            && name_text(&link.child.name) == "c"
+                ),
+                "{sql}"
+            );
+        }
+        // `INHERIT` / `NO INHERIT` are out of scope and keep the fence.
+        for sql in ["ALTER TABLE c INHERIT p;", "ALTER TABLE c NO INHERIT p;"] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(
+                facts(&units[0])
+                    .barriers
+                    .iter()
+                    .any(|barrier| matches!(barrier.reason, BarrierReason::UnknownAlter)),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_marker_threads_through_reads_and_writes() {
+        let units = parse("SELECT * FROM ONLY t;", DialectKind::PostgreSql).unwrap();
+        assert_eq!(reads(facts(&units[0])).len(), 1);
+        assert!(reads(facts(&units[0]))[0].only);
+        for sql in ["SELECT * FROM t;", "SELECT * FROM t *;"] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert_eq!(reads(facts(&units[0])).len(), 1, "{sql}");
+            assert!(!reads(facts(&units[0]))[0].only, "{sql}");
+        }
+        for sql in [
+            "UPDATE ONLY t SET a = 1;",
+            "DELETE FROM ONLY t;",
+            "TRUNCATE ONLY t;",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert_eq!(writes(facts(&units[0])).len(), 1, "{sql}");
+            assert!(writes(facts(&units[0]))[0].only, "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET a = 1;",
+            "DELETE FROM t;",
+            "TRUNCATE t;",
+            "INSERT INTO t VALUES (1);",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert_eq!(writes(facts(&units[0])).len(), 1, "{sql}");
+            assert!(!writes(facts(&units[0]))[0].only, "{sql}");
+        }
+    }
+
+    #[test]
+    fn output_into_table_adds_write_edge() {
+        for sql in [
+            "INSERT INTO t (a) OUTPUT inserted.a INTO t2 SELECT a FROM s;",
+            "UPDATE t SET a = 1 OUTPUT inserted.a INTO t2;",
+            "DELETE FROM t OUTPUT deleted.a INTO t2;",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = 1 OUTPUT inserted.a INTO t2;",
+        ] {
+            let units = parse(sql, DialectKind::MsSql).unwrap();
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+            let targets: Vec<String> = writes(facts(&units[0]))
+                .iter()
+                .map(|write| name_text(&write.target.name))
+                .collect();
+            assert_eq!(targets, vec!["t".to_string(), "t2".to_string()], "{sql}");
+            assert!(
+                matches!(writes(facts(&units[0]))[1].kind, WriteKind::Insert { .. }),
+                "{sql}"
+            );
+        }
+        // A qualified target resolves through the same path.
+        let units = parse(
+            "DELETE FROM t OUTPUT deleted.a INTO dbo.t2;",
+            DialectKind::MsSql,
+        )
+        .unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert_eq!(
+            name_text(&writes(facts(&units[0]))[1].target.name),
+            "dbo.t2".to_string()
+        );
+    }
+
+    #[test]
+    fn output_into_variable_fences_at_relation_scope() {
+        let units = parse(
+            "UPDATE t SET a = 1 OUTPUT deleted.a INTO @var;",
+            DialectKind::MsSql,
+        )
+        .unwrap();
+        assert_eq!(facts(&units[0]).barriers.len(), 1);
+        assert!(matches!(
+            facts(&units[0]).barriers.as_slice(),
+            [ScopedBarrier {
+                scope: BarrierScope::Relation { .. },
+                reason: BarrierReason::UnknownDml,
+                ..
+            }]
+        ));
+        // The host write is still recorded.
+        assert_eq!(writes(facts(&units[0])).len(), 1);
+    }
+
+    #[test]
+    fn output_without_into_has_no_extra_edge() {
+        let units = parse("DELETE FROM t OUTPUT deleted.*;", DialectKind::MsSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        assert_eq!(writes(facts(&units[0])).len(), 1);
+        assert_eq!(reads(facts(&units[0])).len(), 0);
     }
     #[test]
     fn mysql_foreign_key_checks_scope_forms() {

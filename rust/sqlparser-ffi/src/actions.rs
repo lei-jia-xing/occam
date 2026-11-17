@@ -468,10 +468,56 @@ fn select_into_definition(
         constraints: Vec::new(),
         sources: Vec::new(),
         like: None,
+        partition_parent: None,
+        inherit_parents: Vec::new(),
         on_commit: None,
         if_not_exists: false,
         or_replace: false,
     })
+}
+/// The target of an MSSQL `OUTPUT ... INTO` clause.
+enum OutputInto {
+    /// A real table: the statement additionally inserts its output rows
+    /// into it.
+    Table(ir::NameRef),
+    /// A table variable (`@var`): no variable catalog exists, so its uses
+    /// are coupled through a relation-scoped fence on the variable name
+    /// instead of a global barrier. Table variables are batch-scoped and
+    /// cannot alias real tables, so only `@var` touches can observe them.
+    TableVariable(ir::NameRef),
+    /// Anything else (multiple targets, computed targets): unprovable.
+    Unmodeled,
+}
+
+fn output_into_target(
+    into: &SelectInto,
+    dialect: DialectKind,
+    rules: &ir::IdentifierRules,
+) -> OutputInto {
+    let [target] = into.targets.as_slice() else {
+        return OutputInto::Unmodeled;
+    };
+    let parts = match target {
+        Expr::Identifier(ident) => std::slice::from_ref(ident),
+        Expr::CompoundIdentifier(parts) => parts.as_slice(),
+        _ => return OutputInto::Unmodeled,
+    };
+    if parts.is_empty() || parts.len() > 4 {
+        return OutputInto::Unmodeled;
+    }
+    let is_variable = parts
+        .iter()
+        .any(|ident| ident.quote_style.is_none() && ident.value.starts_with('@'));
+    let name: Vec<ir::Ident> = parts
+        .iter()
+        .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Relation))
+        .collect();
+    let reference = relation_from_parts(name, dialect);
+    if is_variable {
+        OutputInto::TableVariable(reference)
+    } else {
+        OutputInto::Table(reference)
+    }
 }
 
 fn qualify_rename(old: &ir::Name, new: ir::Name) -> ir::Name {
@@ -504,11 +550,17 @@ fn global_barrier(reason: ir::BarrierReason, detail: Option<String>) -> ir::Scop
     barrier(ir::BarrierScope::Global, reason, detail)
 }
 
-fn read_fact(source: ir::NameRef, mode: ir::ReadMode, columns: Vec<ir::Ident>) -> ir::ReadFact {
+fn read_fact(
+    source: ir::NameRef,
+    mode: ir::ReadMode,
+    columns: Vec<ir::Ident>,
+    only: bool,
+) -> ir::ReadFact {
     ir::ReadFact {
         source,
         mode,
         columns,
+        only,
     }
 }
 
@@ -717,7 +769,7 @@ fn visitor_reads(
                 &collector.whole_rows,
                 &collector.aliases,
             );
-            read_fact(reference.clone(), mode, columns)
+            read_fact(reference.clone(), mode, columns, usage.only)
         })
         .collect()
 }
@@ -959,6 +1011,8 @@ fn table_definition(
     rules: &ir::IdentifierRules,
     sources: Vec<ir::ReadFact>,
     like: Option<ir::NameRef>,
+    partition_parent: Option<ir::NameRef>,
+    inherit_parents: Vec<ir::NameRef>,
 ) -> Option<ir::TableDef> {
     let (name, temporary) = definition_name(&create.name, dialect, rules, create.temporary)?;
     let mut columns = Vec::new();
@@ -995,6 +1049,8 @@ fn table_definition(
         constraints,
         sources,
         like,
+        partition_parent,
+        inherit_parents,
         on_commit: create
             .on_commit
             .as_ref()
@@ -1292,12 +1348,26 @@ fn insert_column_info(
     )
 }
 
+/// Whether a DML table factor excludes partition/inheritance children
+/// (`ONLY t`). Anything else (`t *`, unmarked, non-table factors) includes
+/// them.
+fn table_factor_only(factor: &TableFactor) -> bool {
+    matches!(
+        factor,
+        TableFactor::Table {
+            inheritance: Some(TableInheritance::Only { .. }),
+            ..
+        }
+    )
+}
+
 /// One physical table factor that can be named by a DML statement.
 #[derive(Clone, Debug)]
 struct TableSource {
     name: ObjectName,
     alias: Option<String>,
     table_parts: Vec<String>,
+    only: bool,
 }
 
 impl TableSource {
@@ -1389,6 +1459,7 @@ fn table_factor_source(factor: &TableFactor, rules: &ir::IdentifierRules) -> Opt
         name: name.clone(),
         alias,
         table_parts: parts.into_iter().map(|part| part.0).collect(),
+        only: table_factor_only(factor),
     })
 }
 
@@ -1424,6 +1495,7 @@ fn source_from_name(name: &ObjectName, rules: &ir::IdentifierRules) -> Option<Ta
         name: name.clone(),
         alias: None,
         table_parts: parts.into_iter().map(|part| part.0).collect(),
+        only: false,
     })
 }
 
@@ -1754,6 +1826,8 @@ fn trigger_effects_from_facts(facts: ir::NativeFacts, effects: &mut Vec<ir::Trig
             | ir::CatalogOp::DefineType(_)
             | ir::CatalogOp::DefineSchema(_)
             | ir::CatalogOp::AlterTable(_)
+            | ir::CatalogOp::AttachPartition(_)
+            | ir::CatalogOp::DetachPartition(_)
             | ir::CatalogOp::Drop(_)
             | ir::CatalogOp::Rename(_)
             | ir::CatalogOp::Refresh(_) => effects.push(ir::TriggerEffect::Barrier {
@@ -2856,6 +2930,38 @@ fn alter_change(
                 name: canonical_ident(name, rules, ir::IdentifierClass::Other),
             });
         }
+        AlterTableOperation::AttachPartitionOf { partition, .. } => {
+            // The `FOR VALUES` bound fixes row placement, not table-level
+            // dependencies, so it is parsed and ignored like `PARTITION OF`
+            // bounds. The link itself is the fact.
+            match relation_ref(partition, dialect, rules) {
+                Some(child) => ops.push(ir::CatalogOp::AttachPartition(ir::PartitionLink {
+                    parent: table.clone(),
+                    child,
+                })),
+                None => barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownAlter,
+                    Some(operation.to_string()),
+                )),
+            }
+        }
+        AlterTableOperation::DetachPartitionOf { partition, .. } => {
+            // `CONCURRENTLY` / `FINALIZE` only change how the detach executes,
+            // not the routing outcome, so the mode is ignored.
+            match relation_ref(partition, dialect, rules) {
+                Some(child) => ops.push(ir::CatalogOp::DetachPartition(ir::PartitionLink {
+                    parent: table.clone(),
+                    child,
+                })),
+                None => barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownAlter,
+                    Some(operation.to_string()),
+                )),
+            }
+        }
+        // ClickHouse `ATTACH/DETACH PARTITION` (a partition expression, not a
+        // table name), `INHERIT` / `NO INHERIT`, and every other operation
+        // keep the blanket fence.
         _ => barriers.push(global_barrier(
             ir::BarrierReason::UnknownAlter,
             Some(operation.to_string()),
@@ -2938,6 +3044,15 @@ pub(super) fn analyze_statement(
         // relations inside nested data-modifying CTEs.
         visitor.gate_nested_dml = false;
     }
+    if let Statement::CreateTable(create) = statement
+        && let Some(partition_by) = &create.partition_by
+    {
+        // The partitioning scheme lowers its keyword (`RANGE`/`LIST`/`HASH`)
+        // as `Function`, but it names no routine and creates no dependency
+        // edge, so the whole scheme subtree is excluded from the
+        // deferred-function check.
+        visitor.ignored_function_roots.push(partition_by.span());
+    }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
     // Set only by the inert-pragma branch below, whose recorded variables are
@@ -2963,6 +3078,7 @@ pub(super) fn analyze_statement(
             sequence,
             ir::ReadMode::Data,
             Vec::new(),
+            false,
         )));
     }
     // Stored expressions are not propagated by the catalog model. Fence their
@@ -2993,8 +3109,11 @@ pub(super) fn analyze_statement(
             Some("SELECT INTO outside a standalone query".to_string()),
         ));
     }
-    // TODO(dialect-alignment): MSSQL `OUTPUT ... INTO table` clause currently triggers an
-    // UnknownDml barrier. Support writing to temporary/table variables when parsed.
+    // MSSQL `OUTPUT ... INTO`: the output rows are additionally inserted
+    // into the target. A real table becomes a second write edge (emitted
+    // after the match so it lands after the host write); a table variable
+    // has no catalog entry and is fenced at relation scope; `OUTPUT`
+    // without `INTO` is a read-only projection with no extra edge.
     let output = match statement {
         Statement::Insert(insert) => insert.output.as_ref(),
         Statement::Update(update) => update.output.as_ref(),
@@ -3002,18 +3121,6 @@ pub(super) fn analyze_statement(
         Statement::Merge(merge) => merge.output.as_ref(),
         _ => None,
     };
-    if matches!(
-        output,
-        Some(OutputClause::Output {
-            into_table: Some(_),
-            ..
-        })
-    ) {
-        facts.barriers.push(global_barrier(
-            ir::BarrierReason::UnknownDml,
-            Some("unmodeled OUTPUT INTO target".to_string()),
-        ));
-    }
     if implicit_commit(dialect, statement) {
         // The statement runs in its own implicit transaction: close any active
         // transaction before it and the implicit one after it.
@@ -3055,15 +3162,34 @@ pub(super) fn analyze_statement(
         Statement::CreateTable(create) => {
             // NOTE: PostgreSQL `CREATE TABLE` manual: https://www.postgresql.org/docs/current/sql-createtable.html
             // MySQL `CREATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/create-table.html
-            // TODO(dialect-alignment): PostgreSQL table inheritance (`INHERITS`) and table partitioning
-            // (`PARTITION OF`) currently emit an UnknownDdl barrier. To align: track child-to-parent routing
-            // and partition attachment in Occam's catalog.
-            if create
-                .inherits
-                .as_ref()
-                .is_some_and(|parents| !parents.is_empty())
-                || create.partition_of.is_some()
-            {
+            // PostgreSQL partitioning and inheritance route child rows
+            // through the parent. The attachment is a fact (`partition_parent`
+            // / `inherit_parents`); the graph builder expands parent reads
+            // over the children and records parent writes on them. `FOR
+            // VALUES` bounds and the `PARTITION BY` scheme are parsed and
+            // ignored: they fix row placement (which child holds a row), but
+            // every edge in the model is table-level, so no edge needs them.
+            // Bound expressions are still visited, so routine shapes inside
+            // bounds keep their existing fences; only the scheme keyword
+            // (which lowers as `Function`) is structurally excluded from the
+            // deferred-function check (see `ignored_function_roots`).
+            let mut unmodeled_parent = false;
+            let partition_parent = create.partition_of.as_ref().and_then(|parent| {
+                relation_ref(parent, dialect, rules).or_else(|| {
+                    unmodeled_parent = true;
+                    None
+                })
+            });
+            let mut inherit_parents = Vec::new();
+            if let Some(inherits) = &create.inherits {
+                for parent in inherits {
+                    match relation_ref(parent, dialect, rules) {
+                        Some(reference) => inherit_parents.push(reference),
+                        None => unmodeled_parent = true,
+                    }
+                }
+            }
+            if unmodeled_parent {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownDdl,
                     Some("unmodeled inherited or partitioned table effects".to_string()),
@@ -3100,27 +3226,37 @@ pub(super) fn analyze_statement(
             if let Some(clone) = &create.clone
                 && let Some(reference) = relation_ref(clone, dialect, rules)
             {
-                sources.push(read_fact(reference, ir::ReadMode::Data, Vec::new()));
+                sources.push(read_fact(reference, ir::ReadMode::Data, Vec::new(), false));
             }
-            if let Some(inherits) = &create.inherits {
-                for parent in inherits {
-                    if let Some(reference) = relation_ref(parent, dialect, rules) {
-                        sources.push(read_fact(reference, ir::ReadMode::Schema, Vec::new()));
-                    }
-                }
-            }
-            if let Some(parent) = &create.partition_of
-                && let Some(reference) = relation_ref(parent, dialect, rules)
+            // The child definition requires its parents to exist.
+            for reference in partition_parent
+                .iter()
+                .chain(inherit_parents.iter())
+                .cloned()
             {
-                sources.push(read_fact(reference, ir::ReadMode::Schema, Vec::new()));
+                sources.push(read_fact(
+                    reference,
+                    ir::ReadMode::Schema,
+                    Vec::new(),
+                    false,
+                ));
             }
-            if let Some(table) = table_definition(create, dialect, rules, sources, like) {
+            if let Some(table) = table_definition(
+                create,
+                dialect,
+                rules,
+                sources,
+                like,
+                partition_parent,
+                inherit_parents,
+            ) {
                 for constraint in &table.constraints {
                     if let ir::Constraint::ForeignKey(reference) = constraint {
                         facts.ops.push(ir::CatalogOp::Read(read_fact(
                             reference.parent.clone(),
                             ir::ReadMode::Schema,
                             reference.parent_columns.clone(),
+                            false,
                         )));
                     }
                 }
@@ -3130,6 +3266,7 @@ pub(super) fn analyze_statement(
                             reference.parent.clone(),
                             ir::ReadMode::Schema,
                             reference.parent_columns.clone(),
+                            false,
                         )));
                     }
                 }
@@ -3544,6 +3681,8 @@ pub(super) fn analyze_statement(
                         columns: insert_columns(insert, rules),
                         unqualified_columns: Vec::new(),
                         reads,
+                        // `INSERT` targets carry no `ONLY` marker.
+                        only: false,
                     }));
                     add_unmodeled_barriers(&mut facts, &visitor, &excluded);
                     merge_nested(&mut facts, nested, context);
@@ -3562,7 +3701,7 @@ pub(super) fn analyze_statement(
         }
         Statement::Update(update) => {
             let targets = update_targets(update, rules);
-            let resolved: Vec<(ir::NameRef, Vec<ir::Ident>, Vec<ir::Ident>)> = targets
+            let resolved: Vec<(ir::NameRef, Vec<ir::Ident>, Vec<ir::Ident>, bool)> = targets
                 .iter()
                 .filter_map(|target| {
                     relation_ref(&target.source.name, dialect, rules).map(|reference| {
@@ -3570,6 +3709,7 @@ pub(super) fn analyze_statement(
                             reference,
                             target.columns.clone(),
                             target.unqualified_columns.clone(),
+                            target.source.only,
                         )
                     })
                 })
@@ -3589,13 +3729,14 @@ pub(super) fn analyze_statement(
                 ));
             } else {
                 let reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
-                for (target, columns, unqualified_columns) in resolved {
+                for (target, columns, unqualified_columns, only) in resolved {
                     facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
                         target,
                         kind: ir::WriteKind::Update,
                         columns,
                         unqualified_columns,
                         reads: reads.clone(),
+                        only,
                     }));
                 }
                 add_unmodeled_barriers(&mut facts, &visitor, &excluded);
@@ -3604,9 +3745,12 @@ pub(super) fn analyze_statement(
         }
         Statement::Delete(delete) => {
             let targets = delete_targets(delete, rules);
-            let resolved: Vec<ir::NameRef> = targets
+            let resolved: Vec<(ir::NameRef, bool)> = targets
                 .iter()
-                .filter_map(|target| relation_ref(&target.source.name, dialect, rules))
+                .filter_map(|target| {
+                    relation_ref(&target.source.name, dialect, rules)
+                        .map(|reference| (reference, target.source.only))
+                })
                 .collect();
             let nested = collect_dml_in_statement(statement);
             // A `DELETE` scans the target table, so its name is a real read.
@@ -3623,7 +3767,7 @@ pub(super) fn analyze_statement(
                 ));
             } else {
                 let reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
-                for target in resolved {
+                for (target, only) in resolved {
                     facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
                         target,
                         kind: ir::WriteKind::Delete {
@@ -3632,6 +3776,7 @@ pub(super) fn analyze_statement(
                         columns: Vec::new(),
                         unqualified_columns: Vec::new(),
                         reads: reads.clone(),
+                        only,
                     }));
                 }
                 add_unmodeled_barriers(&mut facts, &visitor, &excluded);
@@ -3653,6 +3798,8 @@ pub(super) fn analyze_statement(
                         columns: merge_columns(merge, rules),
                         unqualified_columns: Vec::new(),
                         reads,
+                        // `MERGE` targets carry no `ONLY` marker.
+                        only: false,
                     }));
                     add_unmodeled_barriers(&mut facts, &visitor, &excluded);
                     merge_nested(&mut facts, nested, context);
@@ -3687,6 +3834,7 @@ pub(super) fn analyze_statement(
                             columns: Vec::new(),
                             unqualified_columns: Vec::new(),
                             reads: Vec::new(),
+                            only: table.only,
                         }));
                     }
                     None => facts.barriers.push(global_barrier(
@@ -3712,6 +3860,7 @@ pub(super) fn analyze_statement(
                                 target,
                                 ir::ReadMode::Data,
                                 col_idents,
+                                false,
                             ))),
                             None => facts.barriers.push(global_barrier(
                                 ir::BarrierReason::UnknownDml,
@@ -3749,6 +3898,7 @@ pub(super) fn analyze_statement(
                                     columns: col_idents,
                                     unqualified_columns: Vec::new(),
                                     reads: Vec::new(),
+                                    only: false,
                                 }))
                             }
                             None => facts.barriers.push(global_barrier(
@@ -3949,6 +4099,7 @@ pub(super) fn analyze_statement(
                     reference,
                     ir::ReadMode::Schema,
                     Vec::new(),
+                    false,
                 )));
             } else {
                 facts.barriers.push(global_barrier(
@@ -4020,6 +4171,7 @@ pub(super) fn analyze_statement(
                         target.clone(),
                         ir::ReadMode::Data,
                         cols,
+                        false,
                     )));
                     facts.barriers.push(barrier(
                         ir::BarrierScope::Relation { relation: target },
@@ -4097,11 +4249,40 @@ pub(super) fn analyze_statement(
         // 3. MySQL: User session variables (`@var := expr`) and dynamic `PREPARE .. FROM @var`.
         // 4. SQLite: `CREATE VIRTUAL TABLE ... USING module(...)` and hidden shadow tables (t_data, t_idx).
         // 5. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`) and `CREATE MACRO`.
-        // 6. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`, `OUTPUT INTO @var`).
+        // 6. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`). (`OUTPUT ... INTO`
+        //    is modeled, not a fallback: real table -> second write edge, `@var` -> relation-
+        //    scoped fence, anything else -> global `UnknownDml` fence.)
         _ => facts.barriers.push(global_barrier(
             ir::BarrierReason::UnknownStatement,
             Some(statement.to_string()),
         )),
+    }
+    if let Some(OutputClause::Output {
+        into_table: Some(into),
+        ..
+    }) = output
+    {
+        match output_into_target(into, dialect, rules) {
+            OutputInto::Table(target) => facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
+                target,
+                kind: ir::WriteKind::Insert {
+                    conflict: ir::ConflictAction::Error,
+                },
+                columns: Vec::new(),
+                unqualified_columns: Vec::new(),
+                reads: Vec::new(),
+                only: false,
+            })),
+            OutputInto::TableVariable(variable) => facts.barriers.push(barrier(
+                ir::BarrierScope::Relation { relation: variable },
+                ir::BarrierReason::UnknownDml,
+                Some("unmodeled OUTPUT INTO table variable".to_string()),
+            )),
+            OutputInto::Unmodeled => facts.barriers.push(global_barrier(
+                ir::BarrierReason::UnknownDml,
+                Some("unmodeled OUTPUT INTO target".to_string()),
+            )),
+        }
     }
     // Generic variables are recorded, but their effects on parsing, writes,
     // triggers, and transaction behavior are not represented by the catalog.

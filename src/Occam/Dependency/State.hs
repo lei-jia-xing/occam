@@ -152,6 +152,12 @@ data RelationState = RelationState
     , -- The reads that defined a view or table source, retaining the columns
       -- used so column drops can distinguish dependent from unaffected views.
       relSourceReads :: ![ReadFact]
+    , -- PostgreSQL partition/inheritance parents (`PARTITION OF`, `INHERITS`,
+      -- `ATTACH PARTITION`). Stored unresolved like foreign-key parents and
+      -- resolved at use, so renames rewrite them the same way. Reads of a
+      -- parent expand over its children; writes to a parent are also
+      -- recorded on the children.
+      relParents :: !(Set NameRef)
     , relOnCommit :: !(Maybe OnCommitAction)
     , relOnCommitFrameId :: !(Maybe Int)
     , relTransactional :: !Bool
@@ -244,6 +250,7 @@ newRelation kind =
         , relSources = Set.empty
         , relUnresolvedSources = Set.empty
         , relSourceReads = []
+        , relParents = Set.empty
         , relOnCommit = Nothing
         , relOnCommitFrameId = Nothing
         , relTransactional = True
