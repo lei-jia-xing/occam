@@ -10,8 +10,8 @@ changing reduction behavior?
   plumbing at legacy default TRUE (zero behavior change vs A).
 - B = gate ACTIVE: default flipped to False with all consumers explicit-True.
 - Same instrumentation in A2 and B; the default flip is the one isolated
-  optimization. Freeze each with `benchmarks/tools/freeze_build.py` (binaries +
-  all compile inputs + helper identity) before running anything against it.
+  optimization. Before running anything against a build, record its commit
+  SHA + binary SHA256 + fixed input/argv; no freeze helper is required.
 
 ## Cohorts (matched exactly, helper bytes identical within/across the pair)
 
