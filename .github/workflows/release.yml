@@ -68,12 +68,12 @@ jobs:
         run: cabal update
 
       - name: Build occam executable
-        run: cabal build exe:occam
+        run: cabal build -f static-rust exe:occam
 
       - name: Package Binary & Generate Checksum
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
-          BIN_PATH="$(cabal list-bin occam)"
+          BIN_PATH="$(cabal list-bin -f static-rust occam)"
           echo "Found binary at: ${BIN_PATH}"
 
           mkdir -p dist

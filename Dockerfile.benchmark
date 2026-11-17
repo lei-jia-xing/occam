@@ -31,9 +31,9 @@ RUN curl --proto '=https' --tlsv1.2 --silent --show-error --fail \
 WORKDIR /workspace
 COPY . /workspace
 
-RUN cabal build exe:occam exe:occam-eval \
-    && install -D -m 0755 "$(cabal list-bin exe:occam)" /opt/occam/bin/occam \
-    && install -D -m 0755 "$(cabal list-bin exe:occam-eval)" /opt/occam/bin/occam-eval
+RUN cabal build -f static-rust exe:occam exe:occam-eval \
+    && install -D -m 0755 "$(cabal list-bin -f static-rust exe:occam)" /opt/occam/bin/occam \
+    && install -D -m 0755 "$(cabal list-bin -f static-rust exe:occam-eval)" /opt/occam/bin/occam-eval
 
 FROM ubuntu:24.04 AS benchmark
 

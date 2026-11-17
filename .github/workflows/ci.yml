@@ -82,6 +82,12 @@ jobs:
       - name: Run Haskell tests
         run: cabal test all --test-show-details=direct --ghc-options=-Werror
 
+      - name: Build all targets (static-rust)
+        run: cabal build all --enable-tests --ghc-options=-Werror -f static-rust
+
+      - name: Run Haskell tests (static-rust)
+        run: cabal test all --test-show-details=direct --ghc-options=-Werror -f static-rust
+
       - name: Run Rust tests
         run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 

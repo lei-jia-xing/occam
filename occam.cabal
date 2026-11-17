@@ -21,11 +21,15 @@ source-repository head
 
 custom-setup
     setup-depends: base >= 4.18 && < 5
-                 , Cabal >= 3.0 && < 4
+                 , Cabal >= 3.12 && < 4
                  , process >= 1.6 && < 1.7
                  , directory >= 1.3 && < 1.4
                  , filepath >= 1.4 && < 1.6
 
+flag static-rust
+    description: Link the Rust sqlparser frontend statically for a single self-contained binary (release mode). Default off: link dynamically against the cargo-built cdylib (dev mode).
+    manual: True
+    default: False
 common warnings
     ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
                  -Wincomplete-uni-patterns -Wmissing-export-lists
@@ -85,7 +89,12 @@ library
     if !os(windows)
         build-depends: unix >= 2.7 && < 2.9
     hs-source-dirs:   src
-    extra-bundled-libraries: Coccam_sqlparser
+    -- Windows is static-only in v1: dynamic cdylib linking is not supported there.
+    -- In dynamic mode Setup.hs adds the absolute cargo target dir + rpath at configure time.
+    if flag(static-rust) || os(windows)
+        extra-bundled-libraries: Coccam_sqlparser
+    else
+        extra-libraries: occam_sqlparser
 
 executable occam
     import:           warnings, language

@@ -87,10 +87,11 @@ cabal test
 
 `nix develop` provides GHC, Cabal, Rust/Cargo, rust-analyzer with matching standard-library sources, Rustfmt, Clippy, Fourmolu, HLint, HLS, and Python 3. Run `make hooks` once per checkout to enable the repository's pre-commit hook.
 
-The Cabal setup hook builds the locked Rust crate and bundles its static library during ordinary builds; no manual Cargo pre-build is required. `Dockerfile.benchmark` uses a two-stage build and copies only the Occam binaries and benchmark entrypoint into runtime. `benchmarks/docker_run.sh` bind-mounts the checkout at `/workspace`.
+The Cabal setup hook builds the locked Rust crate during ordinary builds; static (`-f static-rust`) builds additionally bundle it, so no manual Cargo pre-build is required. `Dockerfile.benchmark` uses a two-stage build and copies only the Occam binaries and benchmark entrypoint into runtime. `benchmarks/docker_run.sh` bind-mounts the checkout at `/workspace`.
 
-Rust edits are picked up automatically when building via `make build`, `make build-check`, or `make test`, which stamp the Rust source fingerprint (Cargo.toml, Cargo.lock, src/*.rs) into gitignored `cabal.project.local`, rewriting only on mismatch to force a full rebuild plus relink.
-Bare `cabal build` after Rust-only changes may link a stale static library — rerun via a make target (build freshness is content-checked, so plain `touch` cannot invalidate it).
+Dev builds link the Rust frontend dynamically at load time: edit Rust, run `cargo build --locked --release --manifest-path rust/sqlparser-ffi/Cargo.toml --target-dir rust/sqlparser-ffi/target` (as `make build`, `make build-check`, and `make test` do first), then rerun the same binary with zero Haskell rebuild. The loader finds the cdylib via an absolute rpath to `rust/sqlparser-ffi/target/release` baked at configure time, so FFI signature changes still require a Haskell rebuild.
+Release builds pass `-f static-rust` for a single self-contained binary (used by `Dockerfile.benchmark` and the release workflow). Windows is static-only in v1.
+Bare `cabal build` does not run Cargo when Cabal considers Haskell fresh — use a make target (or run Cargo manually) after Rust edits.
 
 The source distribution also includes the Rust crate and `Cargo.lock`; an extracted archive build and an installed-library consumer outside the checkout were verified.
 

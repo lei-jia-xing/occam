@@ -1,35 +1,22 @@
-.PHONY: all build build-check test rust-fresh fmt fmt-check lint rust-check benchmark-test proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test proof-check check hooks dev clean completions install-completions
 
 all: build
 
-build: rust-fresh
+build:
+	cargo build --locked --release --manifest-path rust/sqlparser-ffi/Cargo.toml --target-dir rust/sqlparser-ffi/target
 	cabal build
 
-build-check: rust-fresh
+build-check:
+	cargo build --locked --release --manifest-path rust/sqlparser-ffi/Cargo.toml --target-dir rust/sqlparser-ffi/target
 	cabal build all --enable-tests --ghc-options=-Werror
 
-test: rust-fresh
+test:
+	cargo build --locked --release --manifest-path rust/sqlparser-ffi/Cargo.toml --target-dir rust/sqlparser-ffi/target
 	cabal test all --ghc-options=-Werror
 	cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 
-# Rust sources are not cabal build inputs: Setup.hs only runs cargo when cabal
-# decides to build, so bare `cabal build` after Rust-only edits may link a
-# stale staticlib. Always use these make targets (guard detects by content, not mtime).
-rust-fresh:
-	@if [ -d dist-newstyle ]; then \
-		[ -f rust/sqlparser-ffi/Cargo.toml ] && [ -f rust/sqlparser-ffi/Cargo.lock ] || exit 1; \
-		fp=$$(sha256sum rust/sqlparser-ffi/Cargo.toml rust/sqlparser-ffi/Cargo.lock rust/sqlparser-ffi/src/*.rs | sha256sum | cut -c1-16); [ -n "$$fp" ] || exit 1; \
-		cur=$$(grep '^  ghc-options: -DOCCAM_RUST_STAMP=' cabal.project.local 2>/dev/null | tail -1 | sed 's/.*=//'); \
-		if [ "$$fp" != "$$cur" ]; then \
-			echo "rust-fresh: Rust fingerprint $$fp differs from stamp ($${cur:-none}); restamping"; \
-			touch cabal.project.local; \
-			if [ -n "$$cur" ]; then \
-				tmp=$$(mktemp) && sed "s/^  ghc-options: -DOCCAM_RUST_STAMP=.*/  ghc-options: -DOCCAM_RUST_STAMP=$$fp/" cabal.project.local > "$$tmp" && mv "$$tmp" cabal.project.local || exit 1; \
-			else \
-				{ echo; echo 'package occam'; echo "  ghc-options: -DOCCAM_RUST_STAMP=$$fp"; } >> cabal.project.local || exit 1; \
-			fi; \
-		fi; \
-	fi
+# Cargo runs first (its fingerprinting is the freshness mechanism); stale
+# -DOCCAM_RUST_STAMP lines in gitignored cabal.project.local are a harmless unused -D.
 
 benchmark-test:
 	python3 -m unittest discover -s benchmarks
