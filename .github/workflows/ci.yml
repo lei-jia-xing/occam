@@ -23,6 +23,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -42,21 +44,48 @@ jobs:
             ~/.cabal/packages
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project') }}
+          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project', 'rust/sqlparser-ffi/src/*.rs', 'rust/sqlparser-ffi/Cargo.toml', 'rust/sqlparser-ffi/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cabal-
 
       - name: Update Cabal package list
         run: cabal update
 
+      - name: Check Haskell formatting
+        uses: haskell-actions/run-fourmolu@v12
+        with:
+          version: "0.19.0.1"
+          pattern: |
+            src/**/*.hs
+            app/**/*.hs
+            test/**/*.hs
+            bench/**/*.hs
+            Setup.hs
+
+      - name: Set up HLint
+        uses: haskell-actions/hlint-setup@v2
+        with:
+          version: "3.10"
+
+      - name: Run HLint
+        run: hlint src app test bench Setup.hs
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path rust/sqlparser-ffi/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets -- -D warnings
+
       - name: Build all targets
-        run: cabal build all --enable-tests
+        run: cabal build all --enable-tests --ghc-options=-Werror
 
       - name: Run Haskell tests
-        run: cabal test all --test-show-details=direct
+        run: cabal test all --test-show-details=direct --ghc-options=-Werror
 
       - name: Run Rust tests
         run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 
       - name: Run Python benchmark tests
         run: make benchmark-test
+
+# proof-check (cd proofs && lake build) stays nightly/manual: elan + Lean dependency setup is too heavy to cache cheaply here.
