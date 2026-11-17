@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 mod actions;
+mod columns;
 mod edits;
 mod ffi;
 mod ir;
@@ -58,14 +59,18 @@ enum DialectKind {
 struct NativeResponse {
     initial_session: SessionInit,
     units: Vec<NativeUnit>,
+    /// Response-level column targets. Skipped when empty, so parses without
+    /// `column_ir` keep the legacy payload bit-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    columns: Vec<columns::ColumnTarget>,
 }
 
 #[derive(Serialize)]
 struct NativeUnit {
-    start: usize,
-    end: usize,
-    parse_error: Option<String>,
-    facts: Option<NativeFacts>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) parse_error: Option<String>,
+    pub(crate) facts: Option<NativeFacts>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -75,6 +80,7 @@ enum NativeEditCategory {
     Clause,
     Constraint,
     List,
+    Column,
     Type,
     Literal,
 }
@@ -99,6 +105,9 @@ mod tests {
                 dialect,
                 server: ServerConfig::default(),
                 chunk_edits: false,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
             },
         )
     }
@@ -110,6 +119,9 @@ mod tests {
                 dialect,
                 server: ServerConfig::default(),
                 chunk_edits: true,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
             },
         )
     }
@@ -500,6 +512,9 @@ mod tests {
             dialect: DialectKind::SQLite,
             server: ServerConfig::default(),
             chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits: true,
         })
         .unwrap();
         let mut output: *mut u8 = std::ptr::null_mut();
@@ -1507,6 +1522,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits: true,
         };
         assert!(
             !crate::ffi::session_init(&config(DialectKind::SQLite, None)).foreign_key_checks,
@@ -2468,5 +2486,46 @@ mod tests {
         let units_bare = parse(sql_bare, DialectKind::PostgreSql).unwrap();
         assert_eq!(units_bare.len(), 1);
         assert!(units_bare[0].parse_error.is_none());
+    }
+
+    #[test]
+    fn syntax_edit_gate_drops_only_edits() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2), (3, 4);\nSELECT a FROM t ORDER BY a;";
+        let full = parse(sql, DialectKind::SQLite).expect("parse");
+        let gated = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: ServerConfig::default(),
+                chunk_edits: false,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: false,
+            },
+        )
+        .expect("parse");
+        assert_eq!(full.len(), gated.len());
+        let edit_count = |units: &[NativeUnit]| {
+            units
+                .iter()
+                .filter_map(|unit| unit.facts.as_ref())
+                .map(|facts| facts.edits.len())
+                .sum::<usize>()
+        };
+        assert!(edit_count(&full) > 0, "fixture must carry edits");
+        assert_eq!(edit_count(&gated), 0, "gate must drop all edits");
+        for (a, b) in full.iter().zip(gated.iter()) {
+            assert_eq!((a.start, a.end), (b.start, b.end));
+            let fa = facts(a);
+            let fb = facts(b);
+            // Dependency/semantic facts are identical; only edits differ.
+            let shape = |f: &NativeFacts| {
+                format!(
+                    "{:?}",
+                    (&f.ops, &f.session, &f.pre_tx, &f.post_tx, &f.barriers)
+                )
+            };
+            assert_eq!(shape(fa), shape(fb));
+        }
     }
 }

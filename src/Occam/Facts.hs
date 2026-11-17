@@ -3,6 +3,11 @@ module Occam.Facts (
     StatementFacts (..),
     ParserEdit (..),
     ParserEditCategory (..),
+    ColumnSite (..),
+    ColumnSiteKind (..),
+    ColumnTarget (..),
+    editCategoryName,
+    parseEditCategoryName,
 ) where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), withObject, withText, (.:))
@@ -10,7 +15,8 @@ import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Occam.Core (SemanticFacts (..), Statement (..))
+import GHC.Generics (Generic)
+import Occam.Core (Ident (..), Name (..), SemanticFacts (..), Statement (..))
 
 -- | One parsed statement together with the facts the frontend extracted.
 data StatementUnit = StatementUnit
@@ -31,9 +37,10 @@ data ParserEditCategory
     | EditClause
     | EditConstraint
     | EditList
+    | EditColumn
     | EditType
     | EditLiteral
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show, Generic)
 
 instance ToJSON ParserEditCategory where
     toJSON category = toJSON (editCategoryName category)
@@ -47,6 +54,7 @@ editCategoryName EditExpression = "expression"
 editCategoryName EditClause = "clause"
 editCategoryName EditConstraint = "constraint"
 editCategoryName EditList = "list"
+editCategoryName EditColumn = "column"
 editCategoryName EditType = "type"
 editCategoryName EditLiteral = "literal"
 
@@ -55,6 +63,7 @@ parseEditCategoryName "expression" = Just EditExpression
 parseEditCategoryName "clause" = Just EditClause
 parseEditCategoryName "constraint" = Just EditConstraint
 parseEditCategoryName "list" = Just EditList
+parseEditCategoryName "column" = Just EditColumn
 parseEditCategoryName "type" = Just EditType
 parseEditCategoryName "literal" = Just EditLiteral
 parseEditCategoryName _ = Nothing
@@ -76,3 +85,46 @@ instance FromJSON ParserEdit where
             <*> (TE.encodeUtf8 <$> objectValue .: "replacement")
             <*> objectValue .: "category"
             <*> objectValue .: "label"
+
+data ColumnSiteKind
+    = CreateDefSite
+    | InsertListSite
+    | ValuesItemSite
+    deriving (Eq, Ord, Show, Generic)
+
+instance FromJSON ColumnSiteKind where
+    parseJSON = withText "ColumnSiteKind" \name ->
+        case name of
+            "create_def" -> pure CreateDefSite
+            "insert_list_item" -> pure InsertListSite
+            "values_item" -> pure ValuesItemSite
+            _ -> fail ("unknown column site kind: " <> T.unpack name)
+
+data ColumnSite = ColumnSite
+    { siteStmt :: !Int
+    , siteStart :: !Int
+    , siteEnd :: !Int
+    , siteKind :: !ColumnSiteKind
+    }
+    deriving (Eq, Show, Generic)
+
+instance FromJSON ColumnSite where
+    parseJSON = withObject "ColumnSite" \objectValue ->
+        ColumnSite
+            <$> objectValue .: "stmt"
+            <*> objectValue .: "start"
+            <*> objectValue .: "end"
+            <*> objectValue .: "kind"
+
+{- | One column's atomic co-reduction bundle. 'targetBlocked' carries the
+frontend's skip cause; blocked targets are never oracle-tested. 'FromJSON'
+lives in "Occam.Parser" beside the other name-keyed instances.
+-}
+data ColumnTarget = ColumnTarget
+    { targetTable :: !Name
+    , targetColumn :: !Ident
+    , targetOrdinal :: !Int
+    , targetSites :: ![ColumnSite]
+    , targetBlocked :: !(Maybe Text)
+    }
+    deriving (Eq, Show, Generic)

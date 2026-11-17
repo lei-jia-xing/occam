@@ -497,6 +497,7 @@ testPoolWith jobs decide =
             , poolCacheEnabled = False
             , poolPermits = Nothing
             , poolPrecomputed = Map.empty
+            , poolMetrics = Nothing
             , poolExecute = fmap (observationDetails . toObservation) . decide
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()

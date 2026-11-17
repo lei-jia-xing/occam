@@ -835,4 +835,60 @@ The 64-row SUM feature proof is a single paired trial (same adapter/predicate, b
 
 Canonical evidence: [`list-chunk-proof-20261116-a/proof_result.json`](benchmark_artifacts/list-chunk-proof-20261116-a/proof_result.json), [`external-comparison-list-chunks-20261116-a/`](benchmark_artifacts/external-comparison-list-chunks-20261116-a/), and [`external-comparison-list-chunks-analysis-20261116-a/report.md`](benchmark_artifacts/external-comparison-list-chunks-analysis-20261116-a/report.md).
 
-Concurrency was assessed but not implemented: external predicate state, budgets, cache, and checkpoints are not thread-safe by default, so no parallel oracle flag is offered.
+Historical note (superseded): concurrency was once assessed-but-not-implemented with no parallel flag. Current: bounded ordered oracle concurrency via `--jobs` (default 1); explicit N declares the external oracle AND reset support N concurrent isolated calls (see `occam --help`, TODO completed milestones).
+
+## Column ablation: predicate sidecar, three-arm runner, mechanism fixtures (2026-11-17)
+
+Predicate diagnostic sidecar (metrics only): setting `OCCAM_ORACLE_DIAG=<jsonl>`
+makes `tools/scale_study.py oracle` append one bounded row per verdict —
+`{"reason": accepted|sql_error|result_mismatch, "stdin_sha256": <exact STDIN
+bytes>}` — keyed by the raw input bytes (CRLF/UTF-8 significant, matching the
+wrapper audit digest), never SQL text or DB error strings. Exit codes and
+stdout/stderr bytes are unchanged; when unset, the sidecar path performs no
+hash/serialization/file IO. A failed ENABLED write leaves no row, preserves the
+verdict, and emits one bounded stderr warning (the documented exception to byte
+identity, which still holds on all normal paths); analysis additionally reports
+digest join coverage as incomplete. Appends are single small atomic writes
+(line-buffered O_APPEND), isolated per call. Verified once by
+`/tmp/occam-sidecar-check.py` (10/10: off/on identity incl. CRLF/UTF-8/invalid
+bytes, strict-encoding malformed bytes, exact-byte digests, bounded reasons,
+IO-failure warning, append mode). Helper evolution note: `scale_study.py` is now
+SHA `b4338c87…`; the case-contract guard correctly refuses `--reuse-cases-from`
+older bundles — new runs pin SQL bytes and mint fresh contracts.
+
+Three-arm runner `tools/run_three_arm.py` (internal line): strict 8 cases × 2
+reps × arms `column-off`/`column-single`/`column-atomic` via native `occam-eval
+--profile`, reusing the baseline resource/budget/count/final-check protocol
+(20s wall, 1s per call, one CPU, `GHCRTS=-N1`, twice-validated checkpoints).
+Each child records its native `evaluationCostAttribution` section and, with
+`--diag`, sidecar completeness against audited digests. Reports per-arm
+completed/censored tables, joint-completion ratios only, cost presence, and
+diag coverage — no pooled speedups, no winner claims. Ran 48 children on
+frozen A (ee86…); results [`column-triad-20261116-a/report.md`](benchmark_artifacts/column-triad-20261116-a/report.md) +
+analysis [`column-triad-analysis-20261116-a/report.md`](benchmark_artifacts/column-triad-analysis-20261116-a/report.md).
+
+Mechanism proof fixtures in `benchmarks/column_proof/` (`explicit`,
+`implicit`, `star`): tiny SQLite cases with verified 2-row rowsets that
+disentangle listing coverage from joint search. Throwaway proof only, separate
+from the primary cohort and never pooled with it.
+
+## Column evidence index (2026-11-17)
+
+- Baseline (matched Occam-vs-SQLancer, SQLite): [`external-comparison-baseline-20261116-a/`](benchmark_artifacts/external-comparison-baseline-20261116-a/) + [`external-comparison-baseline-analysis-20261116-a/report.md`](benchmark_artifacts/external-comparison-baseline-analysis-20261116-a/report.md) — 32 children, 0/16 joint pairs, no speed claims.
+- Triad (column off/single/atomic, internal): [`column-triad-20261116-a/`](benchmark_artifacts/column-triad-20261116-a/) — 48 children; Completed counts verified completions only.
+- Valley proof (mechanism + restart, throwaway, never pooled): [`column-mechanism-20261116-a/`](benchmark_artifacts/column-mechanism-20261116-a/) + [`column-mechanism-20261116-a-restart/valley_report.json`](benchmark_artifacts/column-mechanism-20261116-a-restart/valley_report.json) — HOLDS on handcrafted fixtures only.
+- A scope limitation (historical): frozen-A candidate-build covers intra-statement singles+bundles only; statement assembly unmetered (see TODO [#A] timers task, landed in A2/B). Never present unmeasured scope as 0.
+- Anomaly: [`anomaly-prefinal-mechanism-20261116-a/ANOMALY.md`](benchmark_artifacts/anomaly-prefinal-mechanism-20261116-a/ANOMALY.md) (pre-fix void run deleted in error; resolved by re-run, nothing reconstructed).
+- Dependency ledger supplement: [`column-A-freeze-20261116-b-supplement/LEDGER.json`](benchmark_artifacts/column-A-freeze-20261116-b-supplement/LEDGER.json) (rust manifests + local flags bound to f56a/ee86).
+- Freezes: [`column-A-freeze-20261116-b/`](benchmark_artifacts/column-A-freeze-20261116-b/) (final A, f56a/ee86); [`column-A-freeze-20261116-a/`](benchmark_artifacts/column-A-freeze-20261116-a/) (pre-fix 4a98, preserved immutable, superseded).
+
+Preserved wording: atomic is not generally faster; checkpoint size is not completion; diagnostic coverage counts (e.g. 33/48) are DIGEST-presence coverage, not necessarily per-execution complete classification; missing diagnostics are unavailable/incomplete, never 0.
+
+## A2/B paired evidence (2026-11-17)
+
+- Freezes: [`column-A2-freeze-20261116-a/`](benchmark_artifacts/column-A2-freeze-20261116-a/) (metering-complete control, 8bec/e63b); [`column-B-freeze-20261116-a/`](benchmark_artifacts/column-B-freeze-20261116-a/) (gate active, 1177/55bb). Shared helper bytes: [`shared-helpers-20261116-a/`](benchmark_artifacts/shared-helpers-20261116-a/).
+- Micro (engine mechanics, A2-then-B blocks, NOT interleaved): [`column-A2-parse-profile-20261116-a/`](benchmark_artifacts/column-A2-parse-profile-20261116-a/) + [`column-B-parse-profile-20261116-a/`](benchmark_artifacts/column-B-parse-profile-20261116-a/) — alloc is the strong control, wall observed with host load unmeasured.
+- Matched off-only (8×2×2, joint-completed only): [`column-triad-A2-off-20261116-a/`](benchmark_artifacts/column-triad-A2-off-20261116-a/) + [`column-triad-B-off-20261116-a/`](benchmark_artifacts/column-triad-B-off-20261116-a/).
+- Paired analysis: [`column-ab-paired-20261116-a/report.md`](benchmark_artifacts/column-ab-paired-20261116-a/report.md) — statuses/endpoint SIZES same 16/16; joint 4/16; observations same; ordered trace identity only 21/21 fixture; decode/alloc down; no 632/external comparison.
+- B trace proof (good's, retained): [`occam-b-trace-20261116-a/`](benchmark_artifacts/occam-b-trace-20261116-a/) — 21/21 identical oracle hashes + identical final SQL.
+- Candidate-build scope is COMPLETE in A2/B (statement timers present); never compare A2/B cost tables against A scope-incomplete data. Parser default is facts-only with explicit IR for actual edit consumers; columns stay OFF by default.

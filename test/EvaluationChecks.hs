@@ -3,6 +3,7 @@ module EvaluationChecks (tests) where
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
 import Control.Monad (when)
+import Data.Aeson (decode, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -14,11 +15,17 @@ import Occam.Evaluation (
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
+    metricPolicyForReduction,
     parseSQLDialect,
     runEvaluatedReduction,
     sqlDialectName,
  )
 import Occam.Logger (nullLogger)
+import Occam.Metrics (
+    FamilyCounters (..),
+    FamilyTag (..),
+    MetricsSnapshot (..),
+ )
 import Occam.Oracle (
     OracleConfig (..),
     OracleObservationDetails (..),
@@ -51,7 +58,16 @@ tests =
                     _ <- poolOracle pool candidate
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
             let metrics = evaluationMetrics result
             assertEqual "accepted checkpoint survives execution cap" candidate (evaluatedSQL result)
             assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
@@ -90,7 +106,7 @@ tests =
                 action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                    runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
                 saved <- BS.readFile checkpoint
                 assertEqual "the structural candidate is persisted" candidate saved
                 pure value
@@ -124,7 +140,7 @@ tests =
                 action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                    runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
                 saved <- BS.readFile checkpoint
                 assertEqual "both fine edits are checkpointed before coarse replay" candidate saved
                 pure value
@@ -168,7 +184,7 @@ tests =
                 action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                    runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
                 saved <- BS.readFile checkpoint
                 assertEqual "both later literal reductions are checkpointed" afterBoth saved
                 pure value
@@ -198,7 +214,16 @@ tests =
                         action _ pool = poolOracle pool candidate >> pure candidate
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
-                            runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                            runEvaluatedReduction
+                                Nothing
+                                config
+                                GenericSQL
+                                oracleCfg
+                                Nothing
+                                nullLogger
+                                initial
+                                checkpoint
+                                action
                         saved <- BS.readFile checkpoint
                         assertEqual "exhausted budget cannot replace accepted SQL" initial saved
                         pure value
@@ -225,7 +250,16 @@ tests =
                     threadDelay 2000000
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
             let metrics = evaluationMetrics result
             assertEqual "checkpoint remains the last accepted SQL" candidate (evaluatedSQL result)
             assertEqual "timeout is not reported as completion" EvaluationTimeout (evaluationStatus metrics)
@@ -243,7 +277,16 @@ tests =
                     _ <- poolOracle pool initial
                     pure initial
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
             let metrics = evaluationMetrics result
             assertEqual "in-flight oracle attempt is counted" 1 (evaluationOracleAttempts metrics)
             assertEqual "oracle process start survives cancellation" 1 (evaluationDatabaseObservations metrics)
@@ -261,7 +304,16 @@ tests =
                     pure candidate
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                    runEvaluatedReduction
+                        Nothing
+                        config
+                        GenericSQL
+                        oracleCfg
+                        Nothing
+                        nullLogger
+                        initial
+                        checkpoint
+                        action
                 saved <- BS.readFile checkpoint
                 assertEqual "audit result is checkpointed" "" saved
                 pure value
@@ -284,7 +336,7 @@ tests =
                     withPredicatePool 1 False (const (pure True)) (\inner -> reduceSQL SQLite inner invalidUtf8)
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
-                    runEvaluatedReduction config SQLite oracleCfg Nothing nullLogger initial checkpoint action
+                    runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
                 saved <- BS.readFile checkpoint
                 assertEqual "failed parser input cannot overwrite the accepted checkpoint" candidate saved
                 pure value
@@ -345,7 +397,16 @@ tests =
                             [(OracleAccepted, _)] -> pure acceptSQL
                             _ -> assertFailure "ordered head accept was lost to speculation"
                 result <- withCheckpoint $ \checkpoint ->
-                    runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger acceptSQL checkpoint action
+                    runEvaluatedReduction
+                        Nothing
+                        config
+                        GenericSQL
+                        oracleCfg
+                        Nothing
+                        nullLogger
+                        acceptSQL
+                        checkpoint
+                        action
                 let metrics = evaluationMetrics result
                 assertEqual "slow loser must not time out" 0 (evaluationTimedOutObservations metrics)
                 assertEqual "cancelled work is not an error" 0 (evaluationOracleErrors metrics)
@@ -365,7 +426,16 @@ tests =
                     writeIORef liveAtEndRef live
                     pure candidate
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
             let metrics = evaluationMetrics result
             liveAtEnd <- readIORef liveAtEndRef
             assertEqual "workers outlived the reduction action" 0 liveAtEnd
@@ -379,11 +449,128 @@ tests =
                 reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
                 action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
             result <- withCheckpoint $ \checkpoint ->
-                runEvaluatedReduction config GenericSQL oracleCfg Nothing nullLogger initial checkpoint action
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
             let metrics = evaluationMetrics result
             assertEqual "parallel reduction lost the empty fixed point" "" (evaluatedSQL result)
             assertEqual "parallel run did not complete" EvaluationCompleted (evaluationStatus metrics)
             assertBool "parallel result failed final validation" (evaluationValidationPassed metrics)
+        , testCase "cost attribution is captured on budget exhaustion" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = evaluationConfig False Nothing (Just 3)
+                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                action _ pool = do
+                    _ <- poolOracle pool candidate
+                    _ <- poolOracle pool candidate
+                    pure candidate
+            policy <- case metricPolicyForReduction reducerConfig 1 of
+                Left err -> assertFailure ("test policy rejected: " ++ show err)
+                Right p -> pure p
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction
+                    (Just policy)
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
+            let metrics = evaluationMetrics result
+            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget (evaluationStatus metrics)
+            assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
+            case evaluationCostAttribution metrics of
+                Nothing -> assertFailure "cost section missing on budget end"
+                Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
+                    Nothing -> assertFailure "untagged pool work missing a family"
+                    Just counters -> do
+                        assertEqual "one physical worker started" 1 (physicalStarts counters)
+                        assertEqual "one ordered accept retired" 1 (retiredAccept counters)
+            assertEqual "cost section round-trips through JSON" (Just metrics) (decode (encode metrics))
+        , testCase "cost attribution is captured on wall-clock timeout" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 5000000 "exit 0"
+                config = evaluationConfig True (Just 4000000) Nothing
+                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                action _ pool = do
+                    _ <- poolOracle pool candidate
+                    threadDelay 30000000
+                    pure candidate
+            policy <- case metricPolicyForReduction reducerConfig 1 of
+                Left err -> assertFailure ("test policy rejected: " ++ show err)
+                Right p -> pure p
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction
+                    (Just policy)
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
+            let metrics = evaluationMetrics result
+            assertEqual "timeout is not reported as completion" EvaluationTimeout (evaluationStatus metrics)
+            assertEqual "one reduction call ran before the stall" 1 (evaluationOracleAttempts metrics)
+            case evaluationCostAttribution metrics of
+                Nothing -> assertFailure "cost section missing after drained timeout"
+                Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
+                    Nothing -> assertFailure "untagged pool work missing from drained snapshot"
+                    Just counters -> do
+                        assertEqual "physical start preserved across timeout" 1 (physicalStarts counters)
+                        assertEqual "ordered accept preserved across timeout" 1 (retiredAccept counters)
+        , testCase "inconclusive oracle error keeps attributed counts and a validated checkpoint" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                sleeping = "SELECT SLEEP;\n"
+                oracleCfg =
+                    predicateOracle
+                        2000000
+                        "sql=$(cat); case \"$sql\" in *SLEEP*) sleep 10;; *) exit 0;; esac"
+                config = evaluationConfig True Nothing Nothing
+                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                action _ pool = do
+                    _ <- poolOracle pool candidate
+                    _ <- poolOracle pool sleeping
+                    pure sleeping
+            policy <- case metricPolicyForReduction reducerConfig 1 of
+                Left err -> assertFailure ("test policy rejected: " ++ show err)
+                Right p -> pure p
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction
+                    (Just policy)
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
+            let metrics = evaluationMetrics result
+            assertEqual "inconclusive oracle is reported as an error" EvaluationError (evaluationStatus metrics)
+            assertEqual "last accepted checkpoint survives the error" candidate (evaluatedSQL result)
+            assertBool "accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+            case evaluationCostAttribution metrics of
+                Nothing -> assertFailure "cost section missing on inconclusive error"
+                Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
+                    Nothing -> assertFailure "untagged pool work missing a family"
+                    Just counters -> do
+                        assertEqual "ordered accept retired before the error" 1 (retiredAccept counters)
+                        assertEqual "inconclusive retirement attributed" 1 (retiredInconclusive counters)
         ]
 
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig

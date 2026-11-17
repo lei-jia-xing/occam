@@ -1,5 +1,8 @@
 module Occam.Reducer (
     ReductionConfig (..),
+    ColumnMode (..),
+    columnModeName,
+    reductionSearchPolicy,
     defaultReductionConfig,
     isValidClosure,
     closeSet,
@@ -19,12 +22,13 @@ module Occam.Reducer (
     findInterestingPrefix,
 ) where
 
+import Control.Monad (when)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -32,19 +36,31 @@ import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
+    Ident (..),
     OracleOutcome (..),
     SessionInit (..),
     Span (..),
     Statement (..),
     StatementId (..),
+    nameText,
     oracleAccepts,
  )
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
  )
+import Occam.Facts (editCategoryName)
 import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
+import Occam.Metrics (
+    FamilyTag (..),
+    MetricsStore,
+    ParseKind (..),
+    recordCandidateBuildTiming,
+    recordGeneratedSkipped,
+ )
 import Occam.Parser (
+    ColumnSite (..),
+    ColumnTarget (..),
     ParseOptions (..),
     ParsedSQL (..),
     ParserEdit (..),
@@ -54,10 +70,32 @@ import Occam.Parser (
     StatementUnit (..),
     defaultParseOptions,
     defaultSQLDialect,
-    parseSQL,
+    parseSQLTimed,
  )
-import Occam.Pool (OraclePool, poolJobCount, poolOracle, testOrdered)
+import Occam.Pool (OraclePool, poolJobCount, poolMetricsStore, poolOracle, testOrderedTagged)
 import Occam.Slicer (backwardSlice, backwardSliceMany)
+
+data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
+    deriving (Eq, Show)
+
+columnModeName :: ColumnMode -> T.Text
+columnModeName ColumnOff = "off"
+columnModeName ColumnSingle = "single"
+columnModeName ColumnAtomic = "atomic"
+
+syntaxPolicyName :: ColumnMode -> T.Text
+syntaxPolicyName ColumnOff = "phase-forward-sweep-list-chunks"
+syntaxPolicyName ColumnSingle = "phase-forward-sweep-list-chunks+column-single"
+syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
+
+{- | Total policy description. Without intra-statement passes the column mode
+never executes, so the base policy is reported; the invalid combination is
+rejected by the reducer entry guard before any oracle call.
+-}
+reductionSearchPolicy :: ReductionConfig -> T.Text
+reductionSearchPolicy config
+    | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
+    | otherwise = syntaxPolicyName (reductionColumnMode config)
 
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
@@ -65,6 +103,7 @@ data ReductionConfig = ReductionConfig
     , reductionIntraStatement :: !Bool
     , reductionUnrestricted :: !Bool
     , reductionDialect :: !SQLDialect
+    , reductionColumnMode :: !ColumnMode
     }
     deriving (Eq, Show)
 
@@ -76,6 +115,7 @@ defaultReductionConfig =
         , reductionIntraStatement = False
         , reductionUnrestricted = True
         , reductionDialect = defaultSQLDialect
+        , reductionColumnMode = ColumnOff
         }
 
 seconds :: Word64 -> Double
@@ -97,18 +137,41 @@ timedStage logger stage action = do
     logStage logger stage (finished - started)
     pure result
 
-parseUnitsOrThrow :: ParseOptions -> ByteString -> IO (SessionInit, [StatementUnit])
-parseUnitsOrThrow options sql = do
-    parsed <- parseSQL options sql
+kindOfOptions :: ParseOptions -> ParseKind
+kindOfOptions options
+    | parseColumnIR options || parseColumnBundles options = ParseColumnIR
+    | parseChunkEdits options = ParseSyntaxChunks
+    | otherwise = ParseStatementOnly
+
+parseUnitsOrThrow ::
+    Maybe MetricsStore ->
+    ParseOptions ->
+    ByteString ->
+    IO (SessionInit, [StatementUnit], [ColumnTarget])
+parseUnitsOrThrow store options sql = do
+    parsed <- parseSQLTimed store (kindOfOptions options) options sql
     case parsed of
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
-        Right result -> pure (parsedInitialSession result, parsedUnits result)
+        Right result -> pure (parsedInitialSession result, parsedUnits result, parsedColumns result)
 
 {- | The syntax pass alone opts into list-chunk deletions; statement-only
 parses keep the legacy payload without chunk materialization.
 -}
 syntaxParseOptions :: SQLDialect -> ParseOptions
-syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True}
+syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True, parseSyntaxEdits = True}
+
+-- | Single-point column sites only: no bundle planning or payload.
+columnSingleParseOptions :: SQLDialect -> ParseOptions
+columnSingleParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True}
+
+-- | Full atomic bundles; implies single-point geometry.
+columnAtomicParseOptions :: SQLDialect -> ParseOptions
+columnAtomicParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True, parseColumnBundles = True}
+
+columnParseOptions :: ColumnMode -> SQLDialect -> ParseOptions
+columnParseOptions ColumnOff = syntaxParseOptions
+columnParseOptions ColumnSingle = columnSingleParseOptions
+columnParseOptions ColumnAtomic = columnAtomicParseOptions
 
 {- | A retained candidate set K is closed iff every kept statement's direct
 predecessors are also retained.
@@ -363,7 +426,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
 
         testBatch [] = pure Nothing
         testBatch batch = do
-            outcomes <- testOrdered pool [sql | (_, sql) <- batch]
+            outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- batch]
             let retired = zip batch outcomes
             mapM_ recordRetired retired
             pure $ listToMaybe [kept | ((kept, _), (outcome, _)) <- retired, outcome == OracleAccepted]
@@ -379,14 +442,16 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                 case maybeKept of
                     Nothing -> pure Nothing
                     Just kept -> do
-                        let candidateSQL = statementSQL baseSQL allStatements kept
+                        candidateSQL <- timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL allStatements kept)
                         if BS.length candidateSQL >= currentLen
                             then pure Nothing
                             else do
                                 evaluated <- readIORef (fbEvaluated feedback)
                                 case Map.lookup candidateSQL evaluated of
                                     Just CandidateAccepted -> pure (Just (SeedAccepted kept))
-                                    Just CandidateRejected -> pure Nothing
+                                    Just CandidateRejected -> do
+                                        recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                        pure Nothing
                                     Nothing -> pure (Just (SeedFresh kept candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
@@ -396,7 +461,7 @@ statementDdmin dialect pool initialSQL = do
     if not initialOK
         then pure initialSQL
         else do
-            (_, units) <- parseUnitsOrThrow (defaultParseOptions dialect) initialSQL
+            (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
             let allStatements = map unitStatement units
             reduced <-
                 searchStatements plainCandidate pool initialSQL allStatements allStatements
@@ -416,7 +481,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
     outcome <-
         if initialOK
             then do
-                (_, units) <- parseUnitsOrThrow (defaultParseOptions dialect) initialSQL
+                (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
                 let statements = map unitStatement units
                 loop initialSQL statements (statementIds statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
@@ -459,16 +524,24 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                         [] -> pure (currentKept, attempts, removals)
                         _ -> do
                             let currentLen = BS.length currentSQL
-                                candidates =
-                                    [ (statement, renderKept baseSQL allStatements (Set.delete (stmtId statement) currentKept))
-                                    | statement <- batch
-                                    ]
-                                testables =
+                            candidates <-
+                                mapM
+                                    ( \statement -> do
+                                        bytes <-
+                                            timeStatementBuild
+                                                (poolMetricsStore pool)
+                                                (renderKept baseSQL allStatements (Set.delete (stmtId statement) currentKept))
+                                        pure (statement, bytes)
+                                    )
+                                    batch
+                            let testables =
                                     [(statement, sql) | (statement, sql) <- candidates, BS.length sql < currentLen]
                             if null testables
-                                then go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
+                                then do
+                                    mapM_ (const (recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking")) batch
+                                    go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
                                 else do
-                                    outcomes <- testOrdered pool [sql | (_, sql) <- testables]
+                                    outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
                                     let retired = zip testables outcomes
                                         tested = length outcomes
                                     case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
@@ -529,7 +602,7 @@ findInterestingPrefix pool baseSQL statements
             | otherwise = do
                 let mid = low + (high - low) `div` 2
                     prefix = take mid statements
-                    candidate = statementSQL baseSQL statements prefix
+                candidate <- timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL statements prefix)
                 ok <- oracleAccepts (poolOracle pool) candidate
                 let tests' = tests + 1
                 if ok
@@ -546,10 +619,10 @@ data SQLAnalysis = SQLAnalysis
     , analyzedGraph :: !DependencyGraph
     }
 
-analyzeSQL :: Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
-analyzeSQL logger dialect sql = do
+analyzeSQL :: Maybe MetricsStore -> Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
+analyzeSQL store logger dialect sql = do
     started <- getMonotonicTimeNSec
-    (initialSession, units) <- parseUnitsOrThrow (defaultParseOptions dialect) sql
+    (initialSession, units, _) <- parseUnitsOrThrow store (defaultParseOptions dialect) sql
     let statements = map unitStatement units
         graph = analyzeStatements initialSession units
     graph `seq` pure ()
@@ -607,7 +680,8 @@ sliceWithAnalysis logger pool analysis sql = do
                         ]
                     pure candidate
                 lastStatement = last statements
-                (lastRetained, lastCandidate) = sliceFor lastStatement
+                (lastRetained, lastCandidateRaw) = sliceFor lastStatement
+            lastCandidate <- timeStatementBuild (poolMetricsStore pool) lastCandidateRaw
             lastAccepted <-
                 if BS.length lastCandidate < BS.length sql
                     then oracleAccepts (poolOracle pool) lastCandidate
@@ -617,7 +691,8 @@ sliceWithAnalysis logger pool analysis sql = do
                     case maybeTarget of
                         Nothing -> pure bestCandidate
                         Just (targetStatement, prefixSQL, prefixLength) -> do
-                            let (retained, candidate) = sliceFor targetStatement
+                            let (retained, candidateRaw) = sliceFor targetStatement
+                            candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
                             if BS.length candidate >= BS.length sql
                                 then pure bestCandidate
                                 else do
@@ -670,6 +745,8 @@ reduceSQLWithLogger dialect =
 
 reduceSQLWithConfig :: ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
 reduceSQLWithConfig config logger pool initialSQL = do
+    when (reductionColumnMode config /= ColumnOff && not (reductionIntraStatement config)) $
+        ioError (userError "reductionColumnMode requires reductionIntraStatement")
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then do
@@ -709,7 +786,7 @@ reduceIterationWithConfig config logger pool initialSQL = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedStage logger "backward-slicing" do
-                analysis <- analyzeSQL logger (reductionDialect config) initialSQL
+                analysis <- analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) initialSQL
                 sliceWithAnalysis logger pool analysis initialSQL
             else pure (initialSQL, Nothing)
     searched <-
@@ -718,7 +795,7 @@ reduceIterationWithConfig config logger pool initialSQL = do
                 analysis <-
                     case reusableAnalysis of
                         Just cached -> pure cached
-                        Nothing -> analyzeSQL logger (reductionDialect config) sliced
+                        Nothing -> analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) sliced
                 closureSearchWithAnalysis logger pool sliced analysis
             else
                 timedStage
@@ -750,9 +827,10 @@ reduceIterationWithConfig config logger pool initialSQL = do
                         "intra-statement-rewrites"
                         ( reduceSyntaxWithDialect
                             logger
-                            (syntaxParseOptions (reductionDialect config))
+                            (columnParseOptions (reductionColumnMode config) (reductionDialect config))
                             pool
                             (const True)
+                            (reductionColumnMode config)
                             base
                         )
                 (False, False) -> pure base
@@ -768,9 +846,10 @@ reduceIterationWithConfig config logger pool initialSQL = do
                     "intra-statement-rewrites"
                     ( reduceSyntaxWithDialect
                         logger
-                        (syntaxParseOptions (reductionDialect config))
+                        (columnParseOptions (reductionColumnMode config) (reductionDialect config))
                         pool
                         (const True)
+                        (reductionColumnMode config)
                         afterAudit
                     )
             if BS.length afterSyntax < BS.length current
@@ -798,18 +877,20 @@ pruneClauses :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 pruneClauses dialect pool =
     reduceSyntaxWithDialect
         nullLogger
-        (defaultParseOptions dialect)
+        ((defaultParseOptions dialect) {parseSyntaxEdits = True})
         pool
         ((== EditClause) . parserEditCategory)
+        ColumnOff
 
 -- Expression-only public pass.
 simplifyExpressions :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 simplifyExpressions dialect pool =
     reduceSyntaxWithDialect
         nullLogger
-        (defaultParseOptions dialect)
+        ((defaultParseOptions dialect) {parseSyntaxEdits = True})
         pool
         ((== EditExpression) . parserEditCategory)
+        ColumnOff
 
 data SyntaxStats = SyntaxStats
     { syntaxAttempts :: !Int
@@ -818,14 +899,20 @@ data SyntaxStats = SyntaxStats
     }
 
 reduceSyntaxWithDialect ::
-    Logger -> ParseOptions -> OraclePool -> (ParserEdit -> Bool) -> ByteString -> IO ByteString
-reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
+    Logger ->
+    ParseOptions ->
+    OraclePool ->
+    (ParserEdit -> Bool) ->
+    ColumnMode ->
+    ByteString ->
+    IO ByteString
+reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
     logInfo'
         logger
         "occam::reducer"
         "Using ordinal-forward syntax candidate schedule"
-        [ ("search_policy", toJSON ("phase-forward-sweep-list-chunks" :: T.Text))
-        , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
+        [ ("search_policy", toJSON (syntaxPolicyName mode))
+        , ("category_order", toJSON categoryOrderName)
         ]
     stats <- newIORef (SyntaxStats 0 0 0)
     result <- go stats initialSQL
@@ -837,62 +924,69 @@ reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
         [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
         , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
         , ("replacement_oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
-        , ("search_policy", toJSON ("phase-forward-sweep-list-chunks" :: T.Text))
-        , ("category_order", toJSON ("clause,list,constraint,type,expression,literal" :: T.Text))
+        , ("search_policy", toJSON (syntaxPolicyName mode))
+        , ("category_order", toJSON categoryOrderName)
         ]
     pure result
     where
-        categoryOrder =
-            [ EditClause
-            , EditList
-            , EditConstraint
-            , EditType
-            , EditExpression
-            , EditLiteral
-            ]
+        store = poolMetricsStore pool
+        categoryOrder = case mode of
+            -- Off keeps the exact legacy six-category order and metadata;
+            -- only non-off modes add the Column category.
+            ColumnOff -> [EditClause, EditList, EditConstraint, EditType, EditExpression, EditLiteral]
+            _ -> [EditClause, EditList, EditColumn, EditConstraint, EditType, EditExpression, EditLiteral]
+        categoryOrderName = T.intercalate "," (map editCategoryName categoryOrder)
         parseEdits currentSQL = do
-            (_, units) <- parseUnitsOrThrow options currentSQL
+            (_, units, columns) <- parseUnitsOrThrow store options currentSQL
             let edits =
                     concatMap
                         (filter shouldRun . maybe [] factEdits . unitFacts)
                         units
+            -- Blocked bundles are counted once per snapshot with the
+            -- frontend's cause; they never enter the candidate stream.
+            mapM_
+                (maybe (pure ()) (recordGeneratedSkipped store) . targetBlocked)
+                columns
             -- Fold into ordered buckets once; category transitions reuse this snapshot.
-            pure (groupEdits edits)
+            pure (groupEdits edits, [target | target <- columns, isNothing (targetBlocked target)])
 
         groupEdits edits =
-            let (clauses, lists, constraints, types, expressions, literals) =
-                    foldr distribute ([], [], [], [], [], []) edits
+            let (clauses, lists, columns, constraints, types, expressions, literals) =
+                    foldr distribute ([], [], [], [], [], [], []) edits
              in [ (EditClause, clauses)
                 , (EditList, lists)
+                , (EditColumn, columns)
                 , (EditConstraint, constraints)
                 , (EditType, types)
                 , (EditExpression, expressions)
                 , (EditLiteral, literals)
                 ]
 
-        distribute edit (clauses, lists, constraints, types, expressions, literals) =
+        distribute edit (clauses, lists, columns, constraints, types, expressions, literals) =
             case parserEditCategory edit of
-                EditClause -> (edit : clauses, lists, constraints, types, expressions, literals)
-                EditList -> (clauses, edit : lists, constraints, types, expressions, literals)
-                EditConstraint -> (clauses, lists, edit : constraints, types, expressions, literals)
-                EditType -> (clauses, lists, constraints, edit : types, expressions, literals)
-                EditExpression -> (clauses, lists, constraints, types, edit : expressions, literals)
-                EditLiteral -> (clauses, lists, constraints, types, expressions, edit : literals)
+                EditClause -> (edit : clauses, lists, columns, constraints, types, expressions, literals)
+                EditList -> (clauses, edit : lists, columns, constraints, types, expressions, literals)
+                EditColumn -> (clauses, lists, edit : columns, constraints, types, expressions, literals)
+                EditConstraint -> (clauses, lists, columns, edit : constraints, types, expressions, literals)
+                EditType -> (clauses, lists, columns, constraints, edit : types, expressions, literals)
+                EditExpression -> (clauses, lists, columns, constraints, types, edit : expressions, literals)
+                EditLiteral -> (clauses, lists, columns, constraints, types, expressions, edit : literals)
 
         go stats currentSQL = do
-            phases <- parseEdits currentSQL
-            visitPhases stats currentSQL phases categoryOrder False
+            (phases, bundles) <- parseEdits currentSQL
+            visitPhases stats currentSQL phases bundles categoryOrder False
 
-        visitPhases stats currentSQL phases [] shrunk
-            | shrunk = visitPhases stats currentSQL phases categoryOrder False
+        visitPhases stats currentSQL phases bundles [] shrunk
+            | shrunk = visitPhases stats currentSQL phases bundles categoryOrder False
             | otherwise = pure currentSQL
-        visitPhases stats currentSQL phases (category : rest) shrunk = do
-            (nextSQL, nextPhases, categoryShrunk) <-
-                exhaustCategory stats currentSQL phases category
+        visitPhases stats currentSQL phases bundles (category : rest) shrunk = do
+            (nextSQL, nextPhases, nextBundles, categoryShrunk) <-
+                exhaustCategory stats currentSQL phases bundles category
             visitPhases
                 stats
                 nextSQL
                 nextPhases
+                nextBundles
                 rest
                 (shrunk || categoryShrunk)
         -- After a strict shrink, reparse and resume at the accepted ordinal.
@@ -900,27 +994,32 @@ reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
         -- Each window pulls testable edits from the unchanged snapshot and
         -- retires them in parser-emitted order.
         jobs = poolJobCount pool
-        exhaustCategory stats sourceSQL phases category =
-            sweep False 0 sourceSQL phases (phaseCandidates category phases)
+        -- The Column stream in atomic mode is bundles first (joint moves
+        -- subsume their singles), then the identical singles in the identical
+        -- relative order as single mode. Any other category is singles only.
+        initialStream phases bundles category
+            | category == EditColumn && mode == ColumnAtomic =
+                map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
+            | otherwise = map SingleCandidate (phaseCandidates category phases)
+        exhaustCategory stats sourceSQL phases bundles category =
+            sweep False 0 sourceSQL phases bundles (initialStream phases bundles category)
             where
-                sweep changed _ currentSQL currentPhases [] =
-                    pure (currentSQL, currentPhases, changed)
-                sweep changed ordinal currentSQL currentPhases edits = do
-                    let (windowTasks, nextOrdinal, rest) = fillWindow currentSQL ordinal edits
+                sweep changed _ currentSQL currentPhases currentBundles [] =
+                    pure (currentSQL, currentPhases, currentBundles, changed)
+                sweep changed ordinal currentSQL currentPhases currentBundles candidates = do
+                    (windowTasks, nextOrdinal, rest) <- fillWindow currentSQL ordinal candidates
                     if null windowTasks
-                        then sweep changed nextOrdinal currentSQL currentPhases rest
+                        then sweep changed nextOrdinal currentSQL currentPhases currentBundles rest
                         else do
                             started <- getMonotonicTimeNSec
-                            outcomes <- testOrdered pool [candidate | (_, _, candidate) <- windowTasks]
+                            outcomes <-
+                                testOrderedTagged pool [(candidateTag candidate, bytes) | (_, candidate, bytes) <- windowTasks]
                             finished <- getMonotonicTimeNSec
                             let elapsed = finished - started
                                 retired = zip windowTasks outcomes
                                 tested = length outcomes
                             case listToMaybe [(o, e, c) | ((o, e, c), (outcome, _)) <- retired, outcome == OracleAccepted] of
-                                Just (acceptedOrdinal, edit, candidate) -> do
-                                    let editStart = parserEditStart edit
-                                        editEnd = parserEditEnd edit
-                                        replacement = parserEditReplacement edit
+                                Just (acceptedOrdinal, candidate, acceptedBytes) -> do
                                     modifyIORef'
                                         stats
                                         ( \s ->
@@ -930,26 +1029,16 @@ reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
                                                 }
                                         )
-                                    logInfo'
-                                        logger
-                                        "occam::reducer"
-                                        "Accepted byte-preserving syntax rewrite"
-                                        [ ("rewrite_kind", toJSON (parserEditLabel edit))
-                                        , ("rewrite_category", toJSON (parserEditCategory edit))
-                                        , ("span_start", toJSON editStart)
-                                        , ("span_end", toJSON editEnd)
-                                        , ("replacement", toJSON (TE.decodeUtf8Lenient replacement))
-                                        , ("bytes_before", toJSON (BS.length currentSQL))
-                                        , ("bytes_after", toJSON (BS.length candidate))
-                                        ]
-                                    freshPhases <- parseEdits candidate
+                                    logAccept candidate currentSQL acceptedBytes
+                                    (freshPhases, freshBundles) <- parseEdits acceptedBytes
                                     let freshCandidates =
-                                            drop acceptedOrdinal (phaseCandidates category freshPhases)
+                                            drop acceptedOrdinal (initialStream freshPhases freshBundles category)
                                     sweep
                                         True
                                         acceptedOrdinal
-                                        candidate
+                                        acceptedBytes
                                         freshPhases
+                                        freshBundles
                                         freshCandidates
                                 Nothing -> do
                                     modifyIORef'
@@ -960,26 +1049,67 @@ reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
                                                 }
                                         )
-                                    sweep changed nextOrdinal currentSQL currentPhases rest
+                                    sweep changed nextOrdinal currentSQL currentPhases currentBundles rest
+
+                logAccept (SingleCandidate edit) currentSQL acceptedBytes =
+                    let editStart = parserEditStart edit
+                        editEnd = parserEditEnd edit
+                        replacement = parserEditReplacement edit
+                     in logInfo'
+                            logger
+                            "occam::reducer"
+                            "Accepted byte-preserving syntax rewrite"
+                            [ ("rewrite_kind", toJSON (parserEditLabel edit))
+                            , ("rewrite_category", toJSON (parserEditCategory edit))
+                            , ("span_start", toJSON editStart)
+                            , ("span_end", toJSON editEnd)
+                            , ("replacement", toJSON (TE.decodeUtf8Lenient replacement))
+                            , ("bytes_before", toJSON (BS.length currentSQL))
+                            , ("bytes_after", toJSON (BS.length acceptedBytes))
+                            ]
+                logAccept (BundleCandidate target) currentSQL acceptedBytes =
+                    logInfo'
+                        logger
+                        "occam::reducer"
+                        "Accepted atomic column co-reduction"
+                        [ ("rewrite_kind", toJSON ("remove-column-bundle" :: T.Text))
+                        , ("rewrite_category", toJSON EditColumn)
+                        , ("table", toJSON (nameText (targetTable target)))
+                        , ("column", toJSON (identText (targetColumn target)))
+                        , ("sites", toJSON (length (targetSites target)))
+                        , ("bytes_before", toJSON (BS.length currentSQL))
+                        , ("bytes_after", toJSON (BS.length acceptedBytes))
+                        ]
 
                 fillWindow currentSQL ordinal = fill jobs ordinal []
                     where
-                        fill _ o acc [] = (reverse acc, o, [])
-                        fill 0 o acc rest = (reverse acc, o, rest)
-                        fill n o acc (edit : rest)
-                            | BS.length (parserEditReplacement edit) >= parserEditEnd edit - parserEditStart edit =
-                                fill n (o + 1) acc rest
-                            | otherwise =
-                                fill
-                                    (n - 1)
-                                    (o + 1)
-                                    ( ( o
-                                      , edit
-                                      , replaceSpan (parserEditStart edit) (parserEditEnd edit) (parserEditReplacement edit) currentSQL
-                                      )
-                                        : acc
-                                    )
-                                    rest
+                        fill _ o acc [] = pure (reverse acc, o, [])
+                        fill 0 o acc rest = pure (reverse acc, o, rest)
+                        fill n o acc (candidate : rest) = do
+                            (built, buildMicros) <- timeCandidateBuild currentSQL candidate
+                            case built of
+                                Nothing -> do
+                                    recordGeneratedSkipped store "nonshrinking"
+                                    fill n (o + 1) acc rest
+                                Just bytes -> do
+                                    recordCandidateBuildTiming store (candidateTag candidate) buildMicros
+                                    fill (n - 1) (o + 1) ((o, candidate, bytes) : acc) rest
+
+                timeCandidateBuild currentSQL candidate = case store of
+                    -- Unmeasured: no clocks, no extra forcing, same engine.
+                    Nothing -> pure (buildCandidate, 0)
+                    Just _ -> do
+                        started <- getMonotonicTimeNSec
+                        -- Force the assembled bytes before stopping the clock;
+                        -- an O(1) length touch, never a deepseq.
+                        let forced = maybe 0 BS.length buildCandidate
+                        forced `seq` pure ()
+                        finished <- getMonotonicTimeNSec
+                        pure (buildCandidate, fromIntegral ((finished - started) `div` 1000))
+                    where
+                        buildCandidate = case candidate of
+                            SingleCandidate edit -> singleBytes currentSQL edit
+                            BundleCandidate target -> bundleBytes currentSQL target
 
         phaseCandidates category phases =
             fromMaybe [] (lookup category phases)
@@ -987,3 +1117,64 @@ reduceSyntaxWithDialect logger options pool shouldRun initialSQL = do
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
 replaceSpan start end replacement source =
     BS.concat [BS.take start source, replacement, BS.drop end source]
+
+data SyntaxCandidate
+    = SingleCandidate !ParserEdit
+    | BundleCandidate !ColumnTarget
+
+candidateTag :: SyntaxCandidate -> FamilyTag
+candidateTag (SingleCandidate edit) = TagSyntax (parserEditCategory edit) (parserEditLabel edit)
+candidateTag (BundleCandidate _) = TagBundle "remove-column-bundle"
+
+singleBytes :: ByteString -> ParserEdit -> Maybe ByteString
+singleBytes currentSQL edit
+    | BS.length (parserEditReplacement edit) >= parserEditEnd edit - parserEditStart edit = Nothing
+    | otherwise =
+        Just
+            (replaceSpan (parserEditStart edit) (parserEditEnd edit) (parserEditReplacement edit) currentSQL)
+
+bundleBytes :: ByteString -> ColumnTarget -> Maybe ByteString
+bundleBytes currentSQL target =
+    applySpans [(siteStart site, siteEnd site) | site <- targetSites target] currentSQL
+
+{- | Single-pass multi-span deletion assembly. Input spans must be sorted by
+start (the frontend sorts once at build); this pass only verifies
+non-overlap, splices kept slices with one 'BS.concat', and accepts only on
+strict total shrink.
+-}
+applySpans :: [(Int, Int)] -> ByteString -> Maybe ByteString
+applySpans spans source = case spans of
+    [] -> Nothing
+    (start, end) : rest
+        | start < 0 || start >= end || end > sourceLength -> Nothing
+        | otherwise -> go rest end [BS.take start source] (end - start)
+    where
+        sourceLength = BS.length source
+        go [] previousEnd acc removed =
+            let candidate = BS.concat (reverse (BS.drop previousEnd source : acc))
+             in if removed > 0 && BS.length candidate < sourceLength then Just candidate else Nothing
+        go ((start, end) : more) previousEnd acc removed
+            | start < previousEnd || start >= end || end > sourceLength = Nothing
+            | otherwise =
+                go
+                    more
+                    end
+                    (BS.take (start - previousEnd) (BS.drop previousEnd source) : acc)
+                    (removed + (end - start))
+
+{- | Time statement-candidate byte assembly when measured; otherwise return
+the bytes untouched with no clocks and no extra forcing. The actual length
+is forced only when a store is present. No candidate, order, or oracle
+change either way.
+-}
+timeStatementBuild :: Maybe MetricsStore -> ByteString -> IO ByteString
+timeStatementBuild Nothing bytes = pure bytes
+timeStatementBuild (Just store) bytes = do
+    started <- getMonotonicTimeNSec
+    BS.length bytes `seq` pure ()
+    finished <- getMonotonicTimeNSec
+    recordCandidateBuildTiming
+        (Just store)
+        TagStatement
+        (fromIntegral ((finished - started) `div` 1000))
+    pure bytes

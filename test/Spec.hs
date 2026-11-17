@@ -1,6 +1,7 @@
 module Main (main) where
 
 import Benchmark (BenchmarkMetric (..))
+import ColumnChecks qualified
 import Control.Exception (bracket, try)
 import Control.Monad (when)
 import Data.Aeson (eitherDecodeStrict')
@@ -57,6 +58,7 @@ import Occam.Reducer
 import Occam.Slicer
 import OracleChecks qualified
 import PoolChecks qualified
+import PoolMetricsChecks qualified
 import ReductionChecks qualified
 import System.Directory (
     doesDirectoryExist,
@@ -103,7 +105,9 @@ tests =
         , EvaluationChecks.tests
         , OracleChecks.tests
         , PoolChecks.tests
+        , PoolMetricsChecks.tests
         , ReductionChecks.tests
+        , ColumnChecks.tests
         , propertyTests
         , generativeFuzzTests
         , mutationalFuzzTests
@@ -324,6 +328,36 @@ phase5Tests =
                         ["0", "-1", "abc"]
                 )
                 [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
+        , testCase "CLI rejects bad column modes before any oracle call" $
+            withCLIInput "SELECT 1;" $ \input outDir -> do
+                (helpCode, helpOut, _) <- runOccamCLI ["--help"]
+                assertEqual "help must exit zero" ExitSuccess helpCode
+                assertBool "help hides --column-mode" ("--column-mode" `elem` words helpOut)
+                mapM_
+                    ( \mode -> do
+                        (code, _, _) <-
+                            runOccamCLI [input, "--oracle", "exit 0", "--out", outDir, "--column-mode", mode, "--quiet"]
+                        assertBool ("bad --column-mode was accepted: " ++ mode) (code /= ExitSuccess)
+                        exists <- doesDirectoryExist outDir
+                        assertBool "reduction started with bad --column-mode" (not exists)
+                    )
+                    ["bogus", "single-atomic"]
+        , testCase "CLI requires --intra-statement for column modes and starts no oracle" $
+            withCLIInput "SELECT 1;" $ \input outDir ->
+                withCLIInput "" $ \calls _ -> do
+                    let oracle = "cat >/dev/null; printf x >> " ++ show calls
+                    mapM_
+                        ( \mode -> do
+                            (code, _, err) <-
+                                runOccamCLI [input, "--oracle", oracle, "--out", outDir, "--column-mode", mode, "--quiet"]
+                            assertBool ("column mode without intra-statement was accepted: " ++ mode) (code /= ExitSuccess)
+                            assertBool "wrong rejection reason" ("--intra-statement" `elem` words err)
+                            exists <- doesDirectoryExist outDir
+                            assertBool "reduction started without --intra-statement" (not exists)
+                        )
+                        ["single", "atomic"]
+                    observed <- BSC.readFile calls
+                    assertEqual "oracle ran before validation" "" observed
         ]
 
 -- ----------------------------------------------------------------------------
@@ -478,6 +512,7 @@ testPredicatePool predicate =
             , poolCacheEnabled = False
             , poolPermits = Nothing
             , poolPrecomputed = Map.empty
+            , poolMetrics = Nothing
             , poolExecute = predicateDetails predicate
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
@@ -491,6 +526,7 @@ testCountingPool jobs execute =
             , poolCacheEnabled = True
             , poolPermits = Nothing
             , poolPrecomputed = Map.empty
+            , poolMetrics = Nothing
             , poolExecute = execute
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()

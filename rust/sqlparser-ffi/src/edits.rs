@@ -6,10 +6,10 @@ use crate::ir;
 use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
 use crate::{DialectKind, NativeEdit, NativeEditCategory};
 use sqlparser::ast::{
-    AlterTableOperation, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
-    GroupByWithModifier, InTarget, LimitClause, ObjectName, OffsetRows, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableConstraint, TableFactor,
-    TableWithJoins, ValueWithSpan, Visitor,
+    AlterTableOperation, CastKind, ColumnDef, DataType, Expr, FunctionArg, FunctionArgExpr,
+    GroupByExpr, GroupByWithModifier, InTarget, LimitClause, ObjectName, OffsetRows, Parens, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
+    TableConstraint, TableFactor, TableWithJoins, ValueWithSpan, Visitor,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Tokenizer};
@@ -74,6 +74,8 @@ pub(super) struct AnalysisContext<'a> {
     pub(super) tokens: &'a [TokenPosition],
     pub(super) unit: ByteSpan,
     pub(super) chunk_edits: bool,
+    pub(super) column_ir: bool,
+    pub(super) syntax_edits: bool,
 }
 
 pub(super) struct SequenceVisitor<'a> {
@@ -148,6 +150,7 @@ pub(super) struct AnalysisVisitor<'a> {
     tokens: &'a [TokenPosition],
     unit: ByteSpan,
     chunk_edits: bool,
+    syntax_edits: bool,
 }
 impl<'a> AnalysisVisitor<'a> {
     pub(super) fn new(context: AnalysisContext<'a>) -> Self {
@@ -182,6 +185,7 @@ impl<'a> AnalysisVisitor<'a> {
             tokens: context.tokens,
             unit: context.unit,
             chunk_edits: context.chunk_edits,
+            syntax_edits: context.syntax_edits,
         }
     }
 
@@ -796,6 +800,12 @@ impl<'a> AnalysisVisitor<'a> {
         category: NativeEditCategory,
         label: impl Into<Cow<'static, str>>,
     ) {
+        // Statement-only parses skip all edit IR: no allocation, validation,
+        // or downstream JSON/decode work. Semantic collection continues
+        // untouched in the same traversal.
+        if !self.syntax_edits {
+            return;
+        }
         let Some(range) = ByteSpan::checked(self.source, start, end) else {
             return;
         };
@@ -1731,6 +1741,121 @@ impl<'a> AnalysisVisitor<'a> {
         } else {
             None
         }
+    }
+
+    pub(super) fn add_column_edit(&mut self, start: usize, end: usize, label: &'static str) {
+        // Column spans are derived, never trusted: anything outside the unit
+        // is dropped rather than risking a hard parse error downstream.
+        if start < self.unit.start || end > self.unit.end {
+            return;
+        }
+        self.add_edit_bytes(start, end, "", NativeEditCategory::Column, label);
+    }
+
+    /// Whole-definition deletion span for one `CREATE TABLE` column, reusing
+    /// the table-body item convention: a non-first item takes its preceding
+    /// comma and whitespace, a first item takes the following comma.
+    /// Singleton bodies and unmappable boundaries yield nothing (a survivor
+    /// is required).
+    pub(super) fn column_def_span(&self, column: &ColumnDef) -> Option<(usize, usize)> {
+        let (inner_start, inner_end) = self.mapped_span(column.name.span)?;
+        let (open, close) = self.enclosing_parentheses(inner_start, inner_end)?;
+        let body_start = open + 1;
+        let body_end = close.checked_sub(1)?;
+        if body_start > body_end {
+            return None;
+        }
+        let (item_start, item_end) = self.table_body_item(body_start, body_end, inner_start)?;
+        // The column name must be the first significant token of its item;
+        // otherwise the target resolved into a neighboring item.
+        let index = self.tokens.partition_point(|token| token.end <= item_start);
+        let (_, first) = self.next_significant(index, item_end)?;
+        if first.start != inner_start {
+            return None;
+        }
+        if item_start > body_start {
+            let comma_start = item_start.checked_sub(1)?;
+            let edit_start = preceding_whitespace(self.source.as_bytes(), comma_start);
+            let edit_end = if item_end < body_end {
+                item_end
+            } else {
+                body_end
+            };
+            Some((edit_start, edit_end))
+        } else if item_end < body_end {
+            Some((item_start, item_end + 1))
+        } else {
+            None
+        }
+    }
+
+    /// Source spans of an `INSERT` explicit column list, in order.
+    pub(super) fn insert_list_item_spans(
+        &self,
+        columns: &[ObjectName],
+    ) -> Option<Vec<(usize, usize)>> {
+        let spans: Option<Vec<(usize, usize)>> = columns
+            .iter()
+            .map(|column| self.object_name_source_span(column))
+            .collect();
+        let spans = spans?;
+        // All items must sit inside one enclosing pair (the column list).
+        if spans.len() >= 2 {
+            let (open, close) = self.enclosing_parentheses(spans[0].0, spans[spans.len() - 1].1)?;
+            if spans
+                .iter()
+                .any(|(start, end)| *start <= open || *end >= close)
+            {
+                return None;
+            }
+        }
+        Some(spans)
+    }
+
+    /// Source spans of one `VALUES` row's items, in order. Every item must
+    /// resolve and sit inside the row's own parentheses.
+    pub(super) fn values_item_spans(
+        &self,
+        row: &Parens<Vec<Expr>>,
+        explicit_row: bool,
+    ) -> Option<Vec<(usize, usize)>> {
+        let (row_start, row_end) = self.values_row_span(row, explicit_row)?;
+        let mut spans = Vec::with_capacity(row.content.len());
+        for item in &row.content {
+            let span = self.expression_source_span(item)?;
+            if span.0 < row_start || span.1 > row_end {
+                return None;
+            }
+            spans.push(span);
+        }
+        Some(spans)
+    }
+
+    /// Comma-gated deletion spans for comma-separated item spans, following
+    /// the single-item list convention: the first item runs through the next
+    /// item's start, others run from the previous item's end. Each range must
+    /// contain a top-level comma; anything else (including singleton lists)
+    /// yields `None` per item so callers can skip precisely.
+    pub(super) fn comma_delete_spans(
+        &self,
+        spans: &[(usize, usize)],
+    ) -> Vec<Option<(usize, usize)>> {
+        if spans.len() < 2 {
+            return vec![None; spans.len()];
+        }
+        (0..spans.len())
+            .map(|index| {
+                let range = if index == 0 {
+                    (spans[index].0, spans[index + 1].0)
+                } else {
+                    (spans[index - 1].1, spans[index].1)
+                };
+                if range.0 >= range.1 {
+                    return None;
+                }
+                self.find_comma(range.0, range.1).map(|_| range)
+            })
+            .collect()
     }
 
     fn cast_type_span(

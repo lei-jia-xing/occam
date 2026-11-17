@@ -181,6 +181,8 @@ tests =
             assertEqual "both tasks started physically" 2 attempts
             billed <- readIORef billedRef
             assertEqual "only completed work is billed" 1 billed
+            cancelled <- poolCancelled pool
+            assertEqual "worker errors are failed work, not cancellations" 0 cancelled
         , testCase "early acceptance never forces a lazy infinite tail" $ do
             pool <- testPool 2 Nothing (const (pure acceptDetails)) (const (pure ())) (\_ _ _ _ -> pure ())
             let candidates = "accept-now" : repeat "never-forced"
@@ -242,6 +244,7 @@ testPool jobs permits execute bill retire =
             , poolCacheEnabled = True
             , poolPermits = permits
             , poolPrecomputed = Map.empty
+            , poolMetrics = Nothing
             , poolExecute = execute
             , poolBill = bill
             , poolRetire = retire

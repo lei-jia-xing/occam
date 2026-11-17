@@ -18,15 +18,19 @@ import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationResult (..),
+    metricPolicyForReduction,
     runEvaluatedReduction,
     sqlDialectName,
  )
 import Occam.Logger (Logger)
+import Occam.Metrics (MetricPolicy)
 import Occam.Oracle (OracleConfig)
 import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Pool (OraclePool)
 import Occam.Reducer (
+    ColumnMode (..),
     ReductionConfig (..),
+    columnModeName,
     defaultReductionConfig,
     reduceSQLWithConfig,
     statementAudit,
@@ -57,7 +61,7 @@ instance FromJSON BenchmarkMetric
 
 type BenchmarkAction = Logger -> OraclePool -> ByteString -> IO ByteString
 
-type BenchmarkProfile = (Text, Bool, Value, BenchmarkAction)
+type BenchmarkProfile = (Text, Bool, Value, Maybe MetricPolicy, BenchmarkAction)
 
 data Profile
     = Full
@@ -71,6 +75,9 @@ data Profile
     | StatementFixedPoint
     | StatementWithSyntax
     | NoCache
+    | ColumnOffProfile
+    | ColumnSingleProfile
+    | ColumnAtomicProfile
     deriving (Eq, Show, Enum, Bounded)
 
 profileName :: Profile -> Text
@@ -86,6 +93,9 @@ profileName = \case
     StatementFixedPoint -> "statement-ddmin-fixed-point"
     StatementWithSyntax -> "statement-ddmin-with-syntax"
     NoCache -> "no-cache"
+    ColumnOffProfile -> "column-off"
+    ColumnSingleProfile -> "column-single"
+    ColumnAtomicProfile -> "column-atomic"
 
 parseProfile :: String -> Either String Profile
 parseProfile name =
@@ -112,8 +122,15 @@ runProfileBenchmark ::
 runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql outDir = do
     initialStmts <- countStatementsOrFail dialect sql
     let cacheEnabled = profileCacheEnabled profile
-        baseConfig = defaultReductionConfig {reductionDialect = dialect, reductionIntraStatement = True}
+        baseConfig =
+            defaultReductionConfig
+                { reductionDialect = dialect
+                , reductionIntraStatement = True
+                , reductionColumnMode = ColumnOff
+                }
         config = case profile of
+            ColumnSingleProfile -> baseConfig {reductionColumnMode = ColumnSingle}
+            ColumnAtomicProfile -> baseConfig {reductionColumnMode = ColumnAtomic}
             NoSlicing -> baseConfig {reductionSlicing = False}
             NoClosure -> baseConfig {reductionClosure = False}
             GraphOff -> baseConfig {reductionSlicing = False, reductionClosure = False}
@@ -144,6 +161,15 @@ runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql out
                 , \_ pool input -> statementDdmin dialect pool input
                 )
             _ -> (reductionSettings cacheEnabled config, reduceSQLWithConfig config)
+    -- Statement-only probes carry no reducer policy; every reducer-backed
+    -- profile derives its exact named policy from its own config. The Left
+    -- branch is unreachable (profiles are static and valid) but fails loudly.
+    metricsPolicy <- case profile of
+        Sequential -> pure Nothing
+        StatementDdmin -> pure Nothing
+        _ -> case metricPolicyForReduction config (evaluationJobs evaluationConfig) of
+            Left err -> ioError (userError ("invalid benchmark profile configuration: " ++ T.unpack err))
+            Right policy -> pure (Just policy)
     runOne
         dialect
         evaluationConfig
@@ -152,7 +178,7 @@ runProfileBenchmark profile dialect evaluationConfig oracleConfig logger sql out
         sql
         initialStmts
         outDir
-        (profileName profile, cacheEnabled, settings, action)
+        (profileName profile, cacheEnabled, settings, metricsPolicy, action)
 
 runOne ::
     SQLDialect ->
@@ -164,13 +190,14 @@ runOne ::
     FilePath ->
     BenchmarkProfile ->
     IO BenchmarkMetric
-runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (name, cacheEnabled, settings, action) = do
+runOne dialect evaluationConfig oracleConfig logger sql initialStmts outDir (name, cacheEnabled, settings, metricsPolicy, action) = do
     let sqlPath = outDir </> "minimal.sql"
         metricsPath = outDir </> "profile.json"
         runConfig = evaluationConfig {evaluationCacheEnabled = cacheEnabled}
         initialBytes = BS.length sql
     EvaluationResult {..} <-
         runEvaluatedReduction
+            metricsPolicy
             runConfig
             dialect
             oracleConfig
@@ -221,6 +248,7 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "slicing" .= reductionSlicing
         , "closure" .= reductionClosure
         , "intra_statement" .= reductionIntraStatement
+        , "column_mode" .= columnModeName reductionColumnMode
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled
         , "dialect" .= sqlDialectName reductionDialect

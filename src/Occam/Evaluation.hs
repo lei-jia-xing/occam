@@ -7,11 +7,12 @@ module Occam.Evaluation (
     EvaluationStatus (..),
     MinimalityClaim (..),
     evaluationStatusName,
+    metricPolicyForReduction,
     minimalityClaimName,
     parseSQLDialect,
-    sqlDialectName,
     runEvaluatedReduction,
     runEvaluatedReductionWithProgress,
+    sqlDialectName,
 ) where
 
 import Control.Exception (
@@ -43,6 +44,12 @@ import GHC.Generics (Generic)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleOutcome (..))
 import Occam.Logger (Logger (..), logInfo')
+import Occam.Metrics (
+    MetricPolicy (..),
+    MetricsSnapshot,
+    newMetricsStore,
+    snapshotMetrics,
+ )
 import Occam.Oracle (
     OracleConfig (..),
     OracleObservation (..),
@@ -68,6 +75,10 @@ import Occam.Pool (
  )
 import Occam.Reducer (
     AuditStats (..),
+    ColumnMode (..),
+    ReductionConfig (..),
+    columnModeName,
+    reductionSearchPolicy,
     statementAuditWithLogger,
  )
 import System.Directory (removeFile, renameFile)
@@ -246,6 +257,7 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationMinimalityClaim :: !MinimalityClaim
     , evaluationCurve :: ![EvaluationPoint]
     , evaluationStages :: ![Value]
+    , evaluationCostAttribution :: !(Maybe MetricsSnapshot)
     }
     deriving (Eq, Show, Generic)
 
@@ -267,10 +279,27 @@ ticks = toInteger <$> getMonotonicTimeNSec
 seconds :: Ticks -> Ticks -> Double
 seconds start end = fromIntegral (end - start) / 1000000000
 
+{- | Exact named policy for one reducer configuration. Names come from the
+canonical 'Occam.Reducer' helpers; @(intra=False, mode/=off)@ is a config
+error, never a silent relabel, and must be rejected before any oracle call.
+-}
+metricPolicyForReduction :: ReductionConfig -> Int -> Either Text MetricPolicy
+metricPolicyForReduction config jobs
+    | not (reductionIntraStatement config) && reductionColumnMode config /= ColumnOff =
+        Left "column-mode requires --intra-statement"
+    | otherwise =
+        Right
+            MetricPolicy
+                { metricSearchPolicy = reductionSearchPolicy config
+                , metricColumnMode = columnModeName (reductionColumnMode config)
+                , metricJobs = jobs
+                }
+
 {- | Run one reducer with shared budgets/cache/audit policy, uncached repeated
 final checks, and an atomically persisted best accepted result.
 -}
 runEvaluatedReduction ::
+    Maybe MetricPolicy ->
     EvaluationConfig ->
     SQLDialect ->
     OracleConfig ->
@@ -284,6 +313,7 @@ runEvaluatedReduction = runEvaluatedReductionWithProgress (\_ -> pure ())
 
 runEvaluatedReductionWithProgress ::
     (EvaluationProgress -> IO ()) ->
+    Maybe MetricPolicy ->
     EvaluationConfig ->
     SQLDialect ->
     OracleConfig ->
@@ -293,7 +323,7 @@ runEvaluatedReductionWithProgress ::
     FilePath ->
     ReductionAction ->
     IO EvaluationResult
-runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
+runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
     when (evaluationJobs config <= 0) $
         ioError (userError ("Evaluation jobs must be positive, got " ++ show (evaluationJobs config)))
     startedAt <- ticks
@@ -420,6 +450,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                     , pointAccepted = accepted
                     }
                     : points
+    metricsStore <- traverse newMetricsStore metricsPolicy
     pool <-
         newOraclePool
             PoolConfig
@@ -427,6 +458,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                 , poolCacheEnabled = evaluationCacheEnabled config
                 , poolPermits = reductionCallLimit
                 , poolPrecomputed = precomputedObservations
+                , poolMetrics = metricsStore
                 , poolExecute =
                     observeExternalOracleDetailedWith
                         (atomicModifyIORef' databaseRef (\n -> (n + 1, ())))
@@ -503,6 +535,10 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
             Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
     reductionEnd <- ticks
     let reductionSeconds = seconds reductionStart reductionEnd
+    -- The pool is closed (workers drained) on every path above, including
+    -- timeout: capture cost attribution after the drain so canceled and
+    -- unselected counters are retained on all end statuses.
+    costAttribution <- traverse snapshotMetrics metricsStore
     (status, failure, skipValidation) <- case reductionOutcome of
         Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
         Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
@@ -663,6 +699,7 @@ runEvaluatedReductionWithProgress onProgress config dialect oracleCfg preflightO
                         else MinimalityNotEstablished
                 , evaluationCurve = curve
                 , evaluationStages = stages
+                , evaluationCostAttribution = costAttribution
                 }
     pure EvaluationResult {evaluatedSQL = finalSQL, evaluationMetrics = metrics}
     where

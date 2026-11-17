@@ -166,6 +166,22 @@ def reset(path):
     return 0
 
 
+def _write_diag_row(path, digest, reason):
+    """Append one bounded diagnostic row; never affects the oracle verdict."""
+    if path is None or digest is None:
+        return
+    try:
+        with open(path, "a", encoding="utf-8", buffering=1) as handle:
+            handle.write(json.dumps({"reason": reason, "stdin_sha256": digest}, sort_keys=True) + "\n")
+    except OSError:
+        # Diagnostics must never flip a verdict, but a failed ENABLED write
+        # is explicit, not silent: one bounded stderr warning (the documented
+        # exception to byte identity, which still holds on all normal paths).
+        # Analysis additionally reports digest join coverage as incomplete.
+        try:
+            print("study oracle: diagnostic sidecar unavailable; verdict unchanged", file=sys.stderr)
+        except OSError:
+            pass
 def oracle(path):
     case = load_case(path)
     if case.get("reset_mode"):
@@ -182,11 +198,32 @@ def oracle(path):
             and state_signature(connection) != case["state_signature"]
         ):
             raise RuntimeError("schema/data/sequence/PRAGMA state was not restored")
+        diag_path = os.environ.get("OCCAM_ORACLE_DIAG")
+        stdin_digest = None
         try:
-            rows = execute_sql(connection, sys.stdin.read())
+            if diag_path is None:
+                sql_text = sys.stdin.read()
+            else:
+                import hashlib
+                import io
+
+                stdin_bytes = sys.stdin.buffer.read()
+                stdin_digest = hashlib.sha256(stdin_bytes).hexdigest()
+                sql_text = io.TextIOWrapper(
+                    io.BytesIO(stdin_bytes),
+                    encoding=sys.stdin.encoding,
+                    errors=sys.stdin.errors,
+                    newline=None,  # sys.stdin is always universal-newlines mode
+                ).read()
+            rows = execute_sql(connection, sql_text)
         except (sqlite3.Error, UnicodeError):
+            _write_diag_row(diag_path, stdin_digest, "sql_error")
             return 1
-        return 0 if rows == case["expected_rows"] else 1
+        if rows == case["expected_rows"]:
+            _write_diag_row(diag_path, stdin_digest, "accepted")
+            return 0
+        _write_diag_row(diag_path, stdin_digest, "result_mismatch")
+        return 1
     finally:
         connection.close()
 

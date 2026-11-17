@@ -18,6 +18,9 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
             dialect: kind,
             server: Default::default(),
             chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits: true,
         },
         false,
         |_| {},
@@ -182,6 +185,8 @@ fn walk_units(
                         tokens: &positions[token_start..token_end],
                         unit: ByteSpan { start, end },
                         chunk_edits: config.chunk_edits,
+                        column_ir: config.column_ir || config.column_bundles,
+                        syntax_edits: config.syntax_edits,
                     },
                 );
                 for edit in &facts.edits {

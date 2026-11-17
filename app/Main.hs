@@ -16,6 +16,7 @@ import Occam.Evaluation (
     EvaluationMetrics (..),
     EvaluationResult (..),
     EvaluationStatus (..),
+    metricPolicyForReduction,
     parseSQLDialect,
     runEvaluatedReductionWithProgress,
     sqlDialectName,
@@ -37,7 +38,9 @@ import Occam.Oracle (
  )
 import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
+    ColumnMode (..),
     ReductionConfig (..),
+    columnModeName,
     defaultReductionConfig,
     reduceSQLWithConfig,
  )
@@ -102,6 +105,7 @@ data ReductionOptions = ReductionOptions
     { optSlicing :: !Bool
     , optClosure :: !Bool
     , optIntraStatement :: !Bool
+    , optColumnMode :: !ColumnMode
     , optUnrestricted :: !Bool
     , optCache :: !Bool
     , optDialect :: !SQLDialect
@@ -225,6 +229,14 @@ reductionOptionsParser =
         <$> toggle True "slicing" "no-slicing" "dependency slicing"
         <*> toggle True "closure" "no-closure" "dependency closure"
         <*> toggle False "intra-statement" "no-intra-statement" "intra-statement reductions"
+        <*> option
+            (eitherReader parseColumnMode)
+            ( long "column-mode"
+                <> metavar "MODE"
+                <> value ColumnOff
+                <> help
+                    "Column co-reduction listing: off, single, or atomic (default: off; non-off requires --intra-statement)"
+            )
         <*> toggle True "unrestricted" "no-unrestricted" "unrestricted reductions"
         <*> toggle True "cache" "no-cache" "candidate caching"
         <*> option
@@ -268,6 +280,13 @@ parseJobs s = case reads s of
         , n <= toInteger (maxBound :: Int) ->
             Right (fromInteger n)
     _ -> Left "Expected a positive --jobs value"
+
+parseColumnMode :: String -> Either String ColumnMode
+parseColumnMode s = case map toLower s of
+    "off" -> Right ColumnOff
+    "single" -> Right ColumnSingle
+    "atomic" -> Right ColumnAtomic
+    _ -> Left "Expected off, single, or atomic"
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -357,6 +376,15 @@ usageSpecText =
         , "flag \"--no-closure\" help=\"Disable dependency closure minimization pass\""
         , "flag \"--intra-statement\" help=\"Enable intra-statement AST clause and expression pruning (default: off)\""
         , "flag \"--no-intra-statement\" help=\"Disable intra-statement AST clause and expression pruning\""
+        , "flag \"--column-mode <MODE>\" default=\"off\" help=\"Column co-reduction listing (requires --intra-statement unless off)\" {"
+        , "    arg <MODE> {"
+        , "        choices {"
+        , "            choice \"off\" help=\"No column co-reduction (default)\""
+        , "            choice \"single\" help=\"Per-column single sites\""
+        , "            choice \"atomic\" help=\"Joint bundles plus identical singles\""
+        , "        }"
+        , "    }"
+        , "}"
         , "flag \"--unrestricted\" help=\"Enable unrestricted statement ddmin fallback (default: on)\""
         , "flag \"--no-unrestricted\" help=\"Disable unrestricted statement ddmin fallback\""
         , "flag \"--cache\" help=\"Enable candidate query hash memoization (default: on)\""
@@ -429,6 +457,11 @@ runOccamWithLogger logger Options {..} = do
                 && optJobs > 0
     unless validBudget do
         hPutStrLn stderr "Error: timeout, budget, execution, and job limits must be positive"
+        exitFailure
+
+    let columnMode = optColumnMode optReductionOptions
+    when (columnMode /= ColumnOff && not (optIntraStatement optReductionOptions)) do
+        hPutStrLn stderr "Error: --column-mode single|atomic requires --intra-statement"
         exitFailure
 
     initialSQL <-
@@ -529,9 +562,15 @@ runOccamWithLogger logger Options {..} = do
     unless writeToStdout (createDirectoryIfMissing True optOutDir)
     logInfo logger "occam::reducer" "Running hierarchical reduction engine..."
 
+    metricsPolicy <- case metricPolicyForReduction reductionConfig optJobs of
+        Left err -> do
+            hPutStrLn stderr ("occam: error: " ++ T.unpack err)
+            exitFailure
+        Right policy -> pure (Just policy)
     result <-
         runEvaluatedReductionWithProgress
             (uiOnProgress ui)
+            metricsPolicy
             budgetConfig
             dialect
             oracleCfg
@@ -642,6 +681,7 @@ toReductionConfig ReductionOptions {..} =
         { reductionSlicing = optSlicing
         , reductionClosure = optClosure
         , reductionIntraStatement = optIntraStatement
+        , reductionColumnMode = optColumnMode
         , reductionUnrestricted = optUnrestricted
         , reductionDialect = optDialect
         }
@@ -652,6 +692,7 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         [ "slicing" .= reductionSlicing
         , "closure" .= reductionClosure
         , "intra_statement" .= reductionIntraStatement
+        , "column_mode" .= columnModeName reductionColumnMode
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled
         , "dialect" .= sqlDialectName reductionDialect

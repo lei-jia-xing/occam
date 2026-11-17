@@ -14,11 +14,15 @@ module Occam.Parser (
     StatementFacts (..),
     ParserEdit (..),
     ParserEditCategory (..),
+    ColumnSite (..),
+    ColumnSiteKind (..),
+    ColumnTarget (..),
     parseSQL,
+    parseSQLTimed,
     countStatements,
 ) where
 
-import Control.Exception (finally)
+import Control.Exception (evaluate, finally, mask)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -30,6 +34,7 @@ import Data.Aeson (
     withBool,
     withObject,
     withText,
+    (.!=),
     (.:),
     (.:?),
     (.=),
@@ -40,14 +45,16 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Foldable (toList)
+import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Foreign (Ptr, alloca, castPtr, nullPtr, peek, poke)
 import Foreign.C.Types (CInt (..), CSize (..), CUInt (..))
+import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
     AlterChange (..),
     AlterTable (..),
@@ -112,11 +119,15 @@ import Occam.Core (
     WriteKind (..),
  )
 import Occam.Facts (
+    ColumnSite (..),
+    ColumnSiteKind (..),
+    ColumnTarget (..),
     ParserEdit (..),
     ParserEditCategory (..),
     StatementFacts (..),
     StatementUnit (..),
  )
+import Occam.Metrics (MetricsStore, ParseKind (..), recordParseTiming)
 
 -- Keep dialect selection at the frontend boundary: parsing and every derived
 -- fact use the same selected sqlparser dialect.
@@ -183,20 +194,29 @@ defaultServerConfig =
         , serverColumnNamesCaseSensitive = Nothing
         , serverQuotedIdentifiersCaseSensitive = Nothing
         }
-
 data ParseOptions = ParseOptions
     { parseDialect :: !SQLDialect
     , parseServerConfig :: !ServerConfig
     , parseChunkEdits :: !Bool
+    , parseColumnIR :: !Bool
+    , parseColumnBundles :: !Bool
+    , parseSyntaxEdits :: !Bool
     }
     deriving (Eq, Show)
 
+{- | Facts-only defaults: statements, boundaries, and dependency/semantic
+facts, but no per-edit syntax IR. Passes that consume 'factEdits' must
+request 'parseSyntaxEdits' explicitly (see 'Occam.Reducer' syntax options).
+-}
 defaultParseOptions :: SQLDialect -> ParseOptions
 defaultParseOptions dialect =
     ParseOptions
         { parseDialect = dialect
         , parseServerConfig = defaultServerConfig
         , parseChunkEdits = False
+        , parseColumnIR = False
+        , parseColumnBundles = False
+        , parseSyntaxEdits = False
         }
 
 instance ToJSON ServerConfig where
@@ -222,6 +242,9 @@ instance ToJSON ParseOptions where
             [ "dialect" .= dialectName (parseDialect options)
             , "server" .= parseServerConfig options
             , "chunk_edits" .= parseChunkEdits options
+            , "column_ir" .= parseColumnIR options
+            , "column_bundles" .= parseColumnBundles options
+            , "syntax_edits" .= parseSyntaxEdits options
             ]
 
 data ParserErrorKind
@@ -246,12 +269,14 @@ data ParserError = ParserError
 data ParsedSQL = ParsedSQL
     { parsedInitialSession :: !SessionInit
     , parsedUnits :: ![StatementUnit]
+    , parsedColumns :: ![ColumnTarget]
     }
     deriving (Eq, Show)
 
 data NativeResponse = NativeResponse
     { responseInitialSession :: !SessionInit
     , responseUnits :: ![NativeUnit]
+    , responseColumns :: ![ColumnTarget]
     }
 
 data NativeUnit = NativeUnit
@@ -271,6 +296,16 @@ instance FromJSON NativeResponse where
         NativeResponse
             <$> objectValue .: "initial_session"
             <*> objectValue .: "units"
+            <*> objectValue .:? "columns" .!= []
+
+instance FromJSON ColumnTarget where
+    parseJSON = withObject "ColumnTarget" \objectValue ->
+        ColumnTarget
+            <$> objectValue .: "table"
+            <*> objectValue .: "column"
+            <*> objectValue .: "ordinal"
+            <*> objectValue .: "sites"
+            <*> objectValue .: "blocked"
 
 instance FromJSON NativeUnit where
     parseJSON = withObject "NativeUnit" \objectValue ->
@@ -880,41 +915,79 @@ foreign import ccall unsafe "occam_sql_count"
 foreign import ccall unsafe "occam_sql_free"
     c_freeSQL :: Ptr Word8 -> CSize -> IO ()
 
+-- | Untimed parse; delegates to the single timed implementation.
 parseSQL :: ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
-parseSQL options sql =
+parseSQL = parseSQLTimed Nothing ParseStatementOnly
+
+{- | The single native-parse implementation. Splits the native FFI call wall
+from the JSON-decode plus Haskell-validation wall with honest labels; the
+decoded result spine is forced before the decode clock stops, so laziness
+cannot report zero for work the caller needs anyway. Clocks and forcing
+exist only when a store is present: the unmeasured path pays nothing.
+-}
+parseSQLTimed ::
+    Maybe MetricsStore -> ParseKind -> ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
+parseSQLTimed store kind options sql =
     BSU.unsafeUseAsCStringLen sql \(input, inputLength) ->
         BSU.unsafeUseAsCStringLen configBytes \(configPointer, configLength) ->
             alloca \outputPointer -> alloca \outputLength -> do
                 poke outputPointer nullPtr
                 poke outputLength 0
-                status <-
-                    c_parseSQL
-                        (castPtr configPointer)
-                        (fromIntegral configLength)
-                        (castPtr input)
-                        (fromIntegral inputLength)
-                        outputPointer
-                        outputLength
-                if status /= 0
-                    then Left <$> nativeError status
-                    else do
-                        pointer <- peek outputPointer
-                        length' <- peek outputLength
-                        if pointer == nullPtr
-                            then pure (Left (ParserError ParserNullResult "sqlparser returned a null result buffer"))
-                            else do
-                                let free = c_freeSQL pointer length'
-                                    decode = do
-                                        bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
-                                        case eitherDecodeStrict' bytes of
-                                            Left message -> pure (Left (ParserError ParserDecodeFailure (T.pack message)))
-                                            Right response ->
-                                                pure $ do
-                                                    units <- makeUnits sql (responseUnits response)
-                                                    pure (ParsedSQL (responseInitialSession response) units)
-                                finally decode free
+                -- The FFI call through `finally` registration runs masked, so
+                -- the natively allocated buffer can never leak to an async
+                -- exception arriving between return and handler installation
+                -- (safe FFI performs no interruptible C work anyway); only the
+                -- decode work inside the installed `finally` runs restored.
+                mask $ \restore -> do
+                    ffiStart <- clockIf
+                    status <-
+                        c_parseSQL
+                            (castPtr configPointer)
+                            (fromIntegral configLength)
+                            (castPtr input)
+                            (fromIntegral inputLength)
+                            outputPointer
+                            outputLength
+                    ffiEnd <- clockIf
+                    let ffiMicros = microsBetween ffiStart ffiEnd
+                    if status /= 0
+                        then do
+                            recordParseTiming store kind ffiMicros 0
+                            Left <$> nativeError status
+                        else do
+                            pointer <- peek outputPointer
+                            length' <- peek outputLength
+                            if pointer == nullPtr
+                                then do
+                                    recordParseTiming store kind ffiMicros 0
+                                    pure (Left (ParserError ParserNullResult "sqlparser returned a null result buffer"))
+                                else do
+                                    let free = c_freeSQL pointer length'
+                                        run = restore $ do
+                                            bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
+                                            let parsed = case eitherDecodeStrict' bytes of
+                                                    Left message -> Left (ParserError ParserDecodeFailure (T.pack message))
+                                                    Right response -> do
+                                                        units <- makeUnits sql (responseUnits response)
+                                                        columns <- validateColumns sql units (responseColumns response)
+                                                        pure (ParsedSQL (responseInitialSession response) units columns)
+                                            case store of
+                                                Nothing -> pure parsed
+                                                Just _ -> evaluate (forceParsed parsed)
+                                        -- Decode elapsed finalizes even on async abort,
+                                        -- before the buffer is freed.
+                                        timed =
+                                            run
+                                                `finally` ( do
+                                                                decodeEnd <- clockIf
+                                                                recordParseTiming store kind ffiMicros (microsBetween ffiEnd decodeEnd)
+                                                          )
+                                    finally timed free
     where
         configBytes = BL.toStrict (encode options)
+        clockIf = case store of
+            Nothing -> pure 0
+            Just _ -> getMonotonicTimeNSec
         nativeError status =
             alloca \messagePointer -> alloca \messageLength -> do
                 poke messagePointer nullPtr
@@ -1038,3 +1111,45 @@ makeUnits source = go 0 1
                         && isBoundary (parserEditEnd edit)
 
         makeFacts native = StatementFacts (nativeSemantics native) (nativeEdits native)
+
+{- | Validate response-level column targets against the units they cite:
+statement ids resolve, every site sits inside its unit, and no site splits
+UTF-8. Ordering and non-overlap are the frontend's contract, rechecked by
+the bundle assembler before any candidate is built.
+-}
+validateColumns ::
+    ByteString -> [StatementUnit] -> [ColumnTarget] -> Either ParserError [ColumnTarget]
+validateColumns _ _ [] = Right []
+validateColumns source units targets = do
+    let unitBounds = IntMap.fromList (zip [1 ..] (map (statementBounds . unitStatement) units))
+        badRange = Left (ParserError ParserInvalidEditRange "sqlparser returned an invalid column span")
+        checkSite site = do
+            unitBound <- maybe badRange Right (IntMap.lookup (siteStmt site) unitBounds)
+            if validSite unitBound site
+                then Right ()
+                else badRange
+    mapM_ (mapM_ checkSite . targetSites) targets
+    pure targets
+    where
+        sourceLength = BS.length source
+        isBoundary offset =
+            offset == 0 || offset == sourceLength || BS.index source offset .&. 0xc0 /= 0x80
+        statementBounds statement =
+            let Span start end = stmtSpan statement in (start, end)
+        validSite (unitStart, unitEnd) site =
+            siteStart site >= unitStart
+                && siteStart site < siteEnd site
+                && siteEnd site <= unitEnd
+                && isBoundary (siteStart site)
+                && isBoundary (siteEnd site)
+
+microsBetween :: Word64 -> Word64 -> Int
+microsBetween start end = fromIntegral ((end - start) `div` 1000)
+
+{- | Force exactly the result spine the caller traverses anyway. Never a
+deepseq of IR for measurement.
+-}
+forceParsed :: Either ParserError ParsedSQL -> Either ParserError ParsedSQL
+forceParsed (Left err) = err `seq` Left err
+forceParsed (Right parsed) =
+    length (parsedUnits parsed) `seq` length (parsedColumns parsed) `seq` Right parsed

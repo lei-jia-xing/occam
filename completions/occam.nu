@@ -54,6 +54,15 @@ flag --closure help="Enable dependency closure minimization pass (default: on)"
 flag --no-closure help="Disable dependency closure minimization pass"
 flag --intra-statement help="Enable intra-statement AST clause and expression pruning (default: off)"
 flag --no-intra-statement help="Disable intra-statement AST clause and expression pruning"
+flag --column-mode help="Column co-reduction listing (requires --intra-statement unless off)" default=off {
+    arg <MODE> {
+        choices {
+            choice off help="No column co-reduction (default)"
+            choice single help="Per-column single sites"
+            choice atomic help="Joint bundles plus identical singles"
+        }
+    }
+}
 flag --unrestricted help="Enable unrestricted statement ddmin fallback (default: on)"
 flag --no-unrestricted help="Disable unrestricted statement ddmin fallback"
 flag --cache help="Enable candidate query hash memoization (default: on)"

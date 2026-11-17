@@ -10,8 +10,23 @@ pub struct ParseConfig {
     /// Off by default so statement-only parses keep the legacy payload.
     #[serde(default)]
     pub chunk_edits: bool,
+    /// Collect per-unit column geometry and emit single-point column edits.
+    /// Off by default; statement-only and syntax-only parses keep the legacy
+    /// payload bit-identical.
+    #[serde(default)]
+    pub column_ir: bool,
+    /// Assemble response-level atomic bundle targets (implies collection).
+    /// Off by default; single-point-only parses skip all binding/planning
+    /// work and carry no bundle payload.
+    #[serde(default)]
+    pub column_bundles: bool,
+    /// Emit per-edit syntax IR (single-point candidate spans). Statement-only
+    /// dependency parses leave this false to skip unconsumed edit allocation,
+    /// JSON, and decode; the syntax and column passes request it explicitly.
+    /// Off by default: dependency/semantic facts are unaffected.
+    #[serde(default)]
+    pub syntax_edits: bool,
 }
-
 /// Server/session configuration that is independent of a particular SQL text.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -120,6 +135,10 @@ pub struct NativeFacts {
     pub post_tx: Vec<TxEffect>,
     pub barriers: Vec<ScopedBarrier>,
     pub edits: Vec<crate::NativeEdit>,
+    /// Per-unit column geometry for response-level assembly. In-memory only,
+    /// never serialized; empty unless `column_ir` is on.
+    #[serde(skip)]
+    pub column: crate::columns::ColumnUnit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

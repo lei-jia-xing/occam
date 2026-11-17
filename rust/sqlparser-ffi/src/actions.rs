@@ -606,14 +606,13 @@ fn relation_qualifier_matches(
     }
 }
 
-fn relation_columns(
+fn relation_whole_row(
     relation: &ir::NameRef,
     usage: &crate::edits::RelationUse,
-    columns: &[(Vec<String>, usize)],
     whole_rows: &[crate::edits::WholeRowUse],
     aliases: &[crate::edits::AliasScope],
-) -> Vec<ir::Ident> {
-    if whole_rows.iter().any(|whole_row| match whole_row {
+) -> bool {
+    whole_rows.iter().any(|whole_row| match whole_row {
         crate::edits::WholeRowUse::Source(span) => *span == usage.span,
         crate::edits::WholeRowUse::Projection { qualifier, scope } => {
             if qualifier.is_empty() {
@@ -622,7 +621,17 @@ fn relation_columns(
                 relation_qualifier_matches(relation, usage, qualifier, *scope, aliases)
             }
         }
-    }) {
+    })
+}
+
+fn relation_columns(
+    relation: &ir::NameRef,
+    usage: &crate::edits::RelationUse,
+    columns: &[(Vec<String>, usize)],
+    whole_rows: &[crate::edits::WholeRowUse],
+    aliases: &[crate::edits::AliasScope],
+) -> Vec<ir::Ident> {
+    if relation_whole_row(relation, usage, whole_rows, aliases) {
         return Vec::new();
     }
     let mut result = Vec::new();
@@ -715,6 +724,22 @@ fn visitor_reads(
 
 fn add_reads(facts: &mut ir::NativeFacts, reads: Vec<ir::ReadFact>) {
     facts.ops.extend(reads.into_iter().map(ir::CatalogOp::Read));
+}
+
+/// Tables covered by a whole-row use in this statement, resolved with the
+/// exact matcher read attribution uses, so star fences stay consistent with
+/// empty-column reads.
+fn column_stars(collector: &AnalysisVisitor<'_>) -> Vec<ir::NameRef> {
+    let mut stars = Vec::new();
+    let mut seen = HashSet::new();
+    for (reference, usage) in visitor_relations(collector, &[]) {
+        if relation_whole_row(reference, usage, &collector.whole_rows, &collector.aliases)
+            && seen.insert(reference.clone())
+        {
+            stars.push(reference.clone());
+        }
+    }
+    stars
 }
 
 fn referential_action(action: Option<ReferentialAction>) -> ir::ReferentialAction {
@@ -1154,6 +1179,119 @@ fn insert_columns(insert: &Insert, rules: &ir::IdentifierRules) -> Vec<ir::Ident
     columns
 }
 
+/// A plain `VALUES` query source: positional rows with no `WITH` wrapper.
+/// Ordering/limits do not move item positions, so only the body shape and
+/// the absence of CTEs matter.
+fn values_source(query: &Query) -> Option<&Values> {
+    if query.with.is_some() {
+        return None;
+    }
+    match query.body.as_ref() {
+        SetExpr::Values(values) => Some(values),
+        _ => None,
+    }
+}
+
+/// Column geometry for one `INSERT`: per-unit assembly input plus the raw
+/// single-point sites (span validity only — emitted regardless of shape).
+/// `force_exotic` marks shapes the `UnknownDml` arm already fenced.
+fn insert_column_info(
+    visitor: &AnalysisVisitor<'_>,
+    insert: &Insert,
+    dialect: DialectKind,
+    rules: &ir::IdentifierRules,
+    force_exotic: bool,
+) -> (
+    crate::columns::InsertColumns,
+    Vec<(usize, usize, &'static str)>,
+) {
+    use crate::columns::{InsertColumns, InsertShape};
+    let mut singles = Vec::new();
+    let target =
+        table_object_name(&insert.table).and_then(|name| relation_ref(name, dialect, rules));
+    let mut tainted = force_exotic;
+    let explicit = if insert.columns.is_empty() {
+        None
+    } else {
+        let deletions = visitor
+            .insert_list_item_spans(&insert.columns)
+            .map(|spans| visitor.comma_delete_spans(&spans))
+            .unwrap_or_default();
+        if deletions.len() != insert.columns.len() {
+            tainted = true;
+        }
+        let mut list = Vec::with_capacity(insert.columns.len());
+        for (index, column) in insert.columns.iter().enumerate() {
+            let resolved = name_from_object(column, rules, ir::IdentifierClass::Column)
+                .and_then(|name| last_ident(&name));
+            let span = deletions.get(index).copied().flatten();
+            match resolved {
+                Some(ident) => {
+                    if let Some((start, end)) = span {
+                        singles.push((start, end, "remove-column_insert_item"));
+                    }
+                    list.push((ident, span));
+                }
+                None => tainted = true,
+            }
+        }
+        Some(list)
+    };
+    // Positional binding is unsound under any of these; assembly fences the
+    // whole target table. Singles above are unaffected (span validity only).
+    tainted = tainted
+        || insert.overwrite
+        || insert.partitioned.is_some()
+        || insert.multi_table_insert_type.is_some()
+        || !insert.multi_table_into_clauses.is_empty()
+        || !insert.multi_table_when_clauses.is_empty()
+        || insert.multi_table_else_clause.is_some()
+        || insert.by_name
+        || !insert.assignments.is_empty()
+        || !insert.after_columns.is_empty()
+        || insert.output.is_some()
+        || insert.returning.is_some()
+        || insert.on.is_some()
+        || insert_conflict(insert) != ir::ConflictAction::Error;
+    let mut rows = Vec::new();
+    let shape = if tainted {
+        InsertShape::Exotic
+    } else {
+        match insert.source.as_deref() {
+            None => InsertShape::Neutral,
+            Some(query) => match values_source(query) {
+                Some(values) => {
+                    for row in &values.rows {
+                        match visitor.values_item_spans(row, values.explicit_row) {
+                            Some(items) => {
+                                let deletions = visitor.comma_delete_spans(&items);
+                                for span in deletions.iter().flatten() {
+                                    singles.push((span.0, span.1, "remove-column_values_item"));
+                                }
+                                rows.push(deletions);
+                            }
+                            // Unmappable rows contribute no positional claim;
+                            // bundles needing them fail arity, singles skip.
+                            None => rows.push(Vec::new()),
+                        }
+                    }
+                    InsertShape::PlainValues
+                }
+                None => InsertShape::SelectSource,
+            },
+        }
+    };
+    (
+        InsertColumns {
+            target,
+            explicit,
+            rows,
+            shape,
+        },
+        singles,
+    )
+}
+
 /// One physical table factor that can be named by a DML statement.
 #[derive(Clone, Debug)]
 struct TableSource {
@@ -1524,8 +1662,15 @@ fn merge_nested(
     statements: Vec<Statement>,
     context: AnalysisContext<'_>,
 ) {
+    // Nested analyses never collect column geometry: their spans belong to
+    // the parent unit but their bindings do not, and merged ops already feed
+    // the conservative reference fences.
+    let nested_context = AnalysisContext {
+        column_ir: false,
+        ..context
+    };
     for statement in statements {
-        let nested = analyze_statement(&statement, context);
+        let nested = analyze_statement(&statement, nested_context);
         facts.ops.extend(nested.ops);
         facts.session.extend(nested.session);
         facts.pre_tx.extend(nested.pre_tx);
@@ -2796,6 +2941,11 @@ pub(super) fn analyze_statement(
         facts.pre_tx.push(ir::TxEffect::Commit { chain: false });
         facts.post_tx.push(ir::TxEffect::Commit { chain: false });
     }
+    // Column-reduction geometry (response-level assembly input) plus the raw
+    // single-point sites. Collected only when the column gate is on; nested
+    // analyses run with the gate off, so each unit holds at most one shape.
+    let mut column_unit = crate::columns::ColumnUnit::default();
+    let mut column_singles: Vec<(usize, usize, &'static str)> = Vec::new();
     match statement {
         Statement::Query(query) => {
             let nested = collect_dml_in_query(query);
@@ -2913,6 +3063,20 @@ pub(super) fn analyze_statement(
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
             merge_nested(&mut facts, nested, context);
+            if context.column_ir {
+                let mut columns = Vec::with_capacity(create.columns.len());
+                for column in &create.columns {
+                    let name = canonical_ident(&column.name, rules, ir::IdentifierClass::Column);
+                    let span = visitor.column_def_span(column);
+                    if let Some((start, end)) = span {
+                        column_singles.push((start, end, "remove-column_create_def"));
+                    }
+                    columns.push((name, span));
+                }
+                column_unit
+                    .creates
+                    .push(crate::columns::CreateColumns { columns });
+            }
         }
         Statement::CreateView(create) => {
             // NOTE: PostgreSQL `CREATE VIEW` manual: https://www.postgresql.org/docs/current/sql-createview.html
@@ -3276,6 +3440,12 @@ pub(super) fn analyze_statement(
                 ir::BarrierReason::UnknownDml,
                 Some("unmodeled overwrite, partition, or multi-table INSERT".to_string()),
             ));
+            if context.column_ir {
+                let (info, mut singles) =
+                    insert_column_info(&visitor, insert, dialect, rules, true);
+                column_unit.inserts.push(info);
+                column_singles.append(&mut singles);
+            }
         }
         Statement::Insert(insert) => {
             let target_name = table_object_name(&insert.table);
@@ -3303,6 +3473,12 @@ pub(super) fn analyze_statement(
                     ir::BarrierReason::UnknownDml,
                     Some(insert.table.to_string()),
                 )),
+            }
+            if context.column_ir {
+                let (info, mut singles) =
+                    insert_column_info(&visitor, insert, dialect, rules, false);
+                column_unit.inserts.push(info);
+                column_singles.append(&mut singles);
             }
         }
         Statement::Update(update) => {
@@ -3844,6 +4020,14 @@ pub(super) fn analyze_statement(
         ir::CatalogOp::WriteSequence(write) => seen_sequences.insert(write.sequence.clone()),
         _ => true,
     });
+    if context.column_ir {
+        column_unit.stars = column_stars(&visitor);
+        column_unit.unknown_source = visitor.unmodeled_table_source;
+        facts.column = column_unit;
+        for (start, end, label) in column_singles {
+            visitor.add_column_edit(start, end, label);
+        }
+    }
     facts.edits = visitor.edits;
     facts
 }

@@ -1,0 +1,3 @@
+CREATE TABLE t(a INT, b INT);
+INSERT INTO t(a, b) VALUES (1, 10), (2, 20);
+SELECT t.a FROM t ORDER BY t.a;

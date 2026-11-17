@@ -68,9 +68,15 @@ pub(crate) fn session_init(config: &ParseConfig) -> SessionInit {
 
 fn facts_json(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
     let units = parse_units(sql, config).ok()?;
+    let columns = if config.column_bundles {
+        crate::columns::assemble_columns(&units, sql)
+    } else {
+        Vec::new()
+    };
     serde_json::to_vec(&NativeResponse {
         initial_session: session_init(config),
         units,
+        columns,
     })
     .ok()
 }
@@ -291,6 +297,9 @@ mod tests {
                 ..Default::default()
             },
             chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits: true,
         };
         let init = session_init(&config);
         assert_eq!(init.namespace_prefix[0].0, "Tenant");
@@ -322,5 +331,60 @@ mod tests {
         assert_eq!(len, 3);
         let bytes = unsafe { Vec::from_raw_parts(data, len, len) };
         assert_eq!(bytes, b"abc");
+    }
+
+    fn response_json(sql: &str, column_ir: bool, column_bundles: bool) -> serde_json::Value {
+        let config = ParseConfig {
+            dialect: DialectKind::SQLite,
+            server: crate::ir::ServerConfig::default(),
+            chunk_edits: false,
+            column_ir,
+            column_bundles,
+            syntax_edits: true,
+        };
+        let json = facts_json(sql, &config).expect("facts json");
+        serde_json::from_slice(&json).expect("response json")
+    }
+
+    fn has_column_edits(response: &serde_json::Value) -> bool {
+        response["units"]
+            .as_array()
+            .expect("units")
+            .iter()
+            .filter_map(|unit| unit.get("facts"))
+            .filter_map(|facts| facts.get("edits"))
+            .filter_map(serde_json::Value::as_array)
+            .flat_map(|edits| edits.iter())
+            .any(|edit| edit.get("category") == Some(&serde_json::Value::from("column")))
+    }
+
+    #[test]
+    fn column_payload_gates_independently() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        // Off: legacy payload, no bundle key, no column edits.
+        let off = response_json(sql, false, false);
+        assert!(off.get("columns").is_none(), "no bundle key when off");
+        assert!(!has_column_edits(&off), "no column edits when off");
+        // Sites only: raw single-point edits, but no binding/planning payload.
+        let sites = response_json(sql, true, false);
+        assert!(
+            sites.get("columns").is_none(),
+            "no bundle key without bundles"
+        );
+        assert!(has_column_edits(&sites), "column singles emitted");
+        // Bundles: implies collection, adds the response-level targets.
+        let bundles = response_json(sql, false, true);
+        let targets = bundles
+            .get("columns")
+            .expect("bundle key")
+            .as_array()
+            .expect("array");
+        assert_eq!(targets.len(), 2);
+        assert!(has_column_edits(&bundles), "bundles imply singles geometry");
+        assert_eq!(
+            targets[0].get("column"),
+            Some(&serde_json::Value::from("a"))
+        );
+        assert!(targets[0].get("blocked").expect("blocked").is_null());
     }
 }

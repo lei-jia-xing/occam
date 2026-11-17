@@ -49,6 +49,7 @@ library
                     , Occam.Dependency
                     , Occam.Evaluation
                     , Occam.Logger
+                    , Occam.Metrics
                     , Occam.Oracle
                     , Occam.Reducer
                     , Occam.Slicer
@@ -141,10 +142,12 @@ test-suite occam-test
     other-modules:    Benchmark
                     , Fuzz
                     , MutationalFuzz
+                    , ColumnChecks
                     , DependencyChecks
                     , EvaluationChecks
                     , OracleChecks
                     , PoolChecks
+                    , PoolMetricsChecks
                     , ReductionChecks
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
