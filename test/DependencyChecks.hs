@@ -15,6 +15,7 @@ import Occam.Core (
     ColumnDef (..),
     ConflictAction (..),
     DataWrite (..),
+    DeleteScope (..),
     Ident (..),
     IndexDef (..),
     IndexRef (..),
@@ -38,7 +39,7 @@ import Occam.Core (
     WriteKind (..),
     nameText,
  )
-import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
+import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph, cascadeWrites)
 import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
@@ -858,6 +859,161 @@ tests =
             assertBool
                 "an explicit PRAGMA foreign_keys = 1 restores cascading"
                 (has (StatementId 4) enabledDeps')
+        , testCase "SQLite FK cascade chain stays quiet when enforcement is off (03 shapes)" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE dept (did INTEGER PRIMARY KEY, dname TEXT NOT NULL);"
+                        , "CREATE TABLE emp (eid INTEGER PRIMARY KEY, did INTEGER NOT NULL REFERENCES dept(did) ON DELETE CASCADE ON UPDATE CASCADE, ename TEXT NOT NULL);"
+                        , "CREATE TABLE task (tid INTEGER PRIMARY KEY, eid INTEGER NOT NULL REFERENCES emp(eid) ON DELETE CASCADE, title TEXT NOT NULL);"
+                        , "INSERT INTO dept VALUES (1, 'eng'), (2, 'ops');"
+                        , "INSERT INTO emp VALUES (10, 1, 'amy'), (20, 2, 'bob');"
+                        , "INSERT INTO task VALUES (100, 10, 'build'), (200, 20, 'deploy');"
+                        , "UPDATE dept SET did = 7 WHERE did = 2;"
+                        , "SELECT * FROM emp;"
+                        , "DELETE FROM dept WHERE did = 1;"
+                        , "SELECT * FROM emp;"
+                        , "SELECT * FROM task;"
+                        ]
+            graph <- analyze SQLite sql
+            let afterUpdate = dependenciesFor (StatementId 8) graph
+                afterDeleteEmp = dependenciesFor (StatementId 10) graph
+                afterDeleteTask = dependenciesFor (StatementId 11) graph
+            assertBool
+                "ordinary child reads still resolve without enforcement"
+                (has (StatementId 5) afterUpdate)
+            assertBool
+                "the SQLite default does not cascade the parent update"
+                (not (has (StatementId 7) afterUpdate))
+            assertBool
+                "the SQLite default does not cascade the parent delete to the child"
+                (not (has (StatementId 9) afterDeleteEmp))
+            assertBool
+                "the SQLite default does not cascade the parent delete transitively"
+                (not (has (StatementId 9) afterDeleteTask))
+        , testCase "SQLite FK cascade chain fires when enforcement is on (03 shapes)" $ do
+            let schema =
+                    [ "CREATE TABLE dept (did INTEGER PRIMARY KEY, dname TEXT NOT NULL);"
+                    , "CREATE TABLE emp (eid INTEGER PRIMARY KEY, did INTEGER NOT NULL REFERENCES dept(did) ON DELETE CASCADE ON UPDATE CASCADE, ename TEXT NOT NULL);"
+                    , "CREATE TABLE task (tid INTEGER PRIMARY KEY, eid INTEGER NOT NULL REFERENCES emp(eid) ON DELETE CASCADE, title TEXT NOT NULL);"
+                    ]
+                body =
+                    [ "INSERT INTO dept VALUES (1, 'eng'), (2, 'ops');"
+                    , "INSERT INTO emp VALUES (10, 1, 'amy'), (20, 2, 'bob');"
+                    , "INSERT INTO task VALUES (100, 10, 'build'), (200, 20, 'deploy');"
+                    , "UPDATE dept SET did = 7 WHERE did = 2;"
+                    , "SELECT * FROM emp;"
+                    , "SELECT * FROM task;"
+                    , "DELETE FROM dept WHERE did = 1;"
+                    , "SELECT * FROM emp;"
+                    , "SELECT * FROM task;"
+                    ]
+                pragmaSql = BSC.unlines (schema ++ ["PRAGMA foreign_keys = 1;"] ++ body)
+                plainSql = BSC.unlines (schema ++ body)
+                enforcedOptions =
+                    (defaultParseOptions SQLite)
+                        { parseServerConfig =
+                            (parseServerConfig (defaultParseOptions SQLite))
+                                { serverForeignKeyChecks = Just True
+                                }
+                        }
+            pragmaGraph <- analyze SQLite pragmaSql
+            enforcedGraph <- analyzeWith enforcedOptions plainSql
+            -- With the PRAGMA at statement 4, UPDATE is 8 and DELETE is 11;
+            -- without it (server-enforced initial state), UPDATE is 7 and DELETE is 10.
+            let check graph update delete empAfterUpdate taskAfterUpdate empAfterDelete taskAfterDelete = do
+                    assertBool
+                        "the parent update cascades to the direct child"
+                        (has update (dependenciesFor empAfterUpdate graph))
+                    assertBool
+                        "the update cascade stops where the child key is untouched"
+                        (not (has update (dependenciesFor taskAfterUpdate graph)))
+                    assertBool
+                        "the parent delete cascades to the direct child"
+                        (has delete (dependenciesFor empAfterDelete graph))
+                    assertBool
+                        "the parent delete cascades transitively down the chain"
+                        (has delete (dependenciesFor taskAfterDelete graph))
+            check
+                pragmaGraph
+                (StatementId 8)
+                (StatementId 11)
+                (StatementId 9)
+                (StatementId 10)
+                (StatementId 12)
+                (StatementId 13)
+            check
+                enforcedGraph
+                (StatementId 7)
+                (StatementId 10)
+                (StatementId 8)
+                (StatementId 9)
+                (StatementId 11)
+                (StatementId 12)
+        , testCase "--dump-facts cascade expansion follows modeled enforcement" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE dept (did INTEGER PRIMARY KEY, dname TEXT NOT NULL);"
+                        , "CREATE TABLE emp (eid INTEGER PRIMARY KEY, did INTEGER NOT NULL REFERENCES dept(did) ON DELETE CASCADE ON UPDATE CASCADE, ename TEXT NOT NULL);"
+                        , "CREATE TABLE task (tid INTEGER PRIMARY KEY, eid INTEGER NOT NULL REFERENCES emp(eid) ON DELETE CASCADE, title TEXT NOT NULL);"
+                        , "INSERT INTO dept VALUES (1, 'eng'), (2, 'ops');"
+                        , "INSERT INTO emp VALUES (10, 1, 'amy'), (20, 2, 'bob');"
+                        , "INSERT INTO task VALUES (100, 10, 'build'), (200, 20, 'deploy');"
+                        , "UPDATE dept SET did = 7 WHERE did = 2;"
+                        , "SELECT * FROM emp;"
+                        , "SELECT * FROM task;"
+                        , "DELETE FROM dept WHERE did = 1;"
+                        , "SELECT * FROM emp;"
+                        , "SELECT * FROM task;"
+                        ]
+                enforcedOptions =
+                    (defaultParseOptions SQLite)
+                        { parseServerConfig =
+                            (parseServerConfig (defaultParseOptions SQLite))
+                                { serverForeignKeyChecks = Just True
+                                }
+                        }
+                parse options = do
+                    result <- parseSQL options sql
+                    case result of
+                        Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                        Right parsed -> pure parsed
+            defaultParsed <- parse (defaultParseOptions SQLite)
+            enforcedParsed <- parse enforcedOptions
+            let defaultExtras = cascadeWrites (parsedInitialSession defaultParsed) (parsedUnits defaultParsed)
+                enforcedExtras = cascadeWrites (parsedInitialSession enforcedParsed) (parsedUnits enforcedParsed)
+                targets sid =
+                    [ nameText (nameRefName (dataWriteTarget write))
+                    | write <- Map.findWithDefault [] sid enforcedExtras
+                    ]
+            assertBool
+                "the SQLite default expands no cascade writes"
+                (Map.null defaultExtras)
+            assertEqual
+                "only the parent UPDATE and DELETE expand"
+                [StatementId 7, StatementId 10]
+                (Map.keys enforcedExtras)
+            assertEqual
+                "the parent update cascades to the direct child"
+                ["emp"]
+                (targets (StatementId 7))
+            case Map.findWithDefault [] (StatementId 7) enforcedExtras of
+                [write] -> do
+                    assertEqual "the cascaded update keeps its kind" UpdateWrite (dataWriteKind write)
+                    assertEqual
+                        "the cascaded update writes the child key"
+                        ["did"]
+                        (map identText (dataWriteColumns write))
+                writes -> assertFailure ("expected one cascaded update, got " ++ show (length writes))
+            assertEqual
+                "the parent delete cascades down the chain"
+                ["emp", "task"]
+                (targets (StatementId 10))
+            assertBool
+                "cascaded deletes carry the delete kind"
+                ( all
+                    (\write -> dataWriteKind write == DeleteWrite DeleteAllRows)
+                    (Map.findWithDefault [] (StatementId 10) enforcedExtras)
+                )
         , testCase "MySQL SET foreign_key_checks dynamically controls foreign key cascading" $ do
             let baseSql =
                     BSC.unlines

@@ -3,6 +3,7 @@ module Occam.Dependency (
     emptyGraph,
     buildGraph,
     analyzeStatements,
+    cascadeWrites,
 ) where
 
 import Data.Map.Strict (Map)
@@ -32,6 +33,7 @@ import Occam.Dependency.Define (
     processDefineView,
  )
 import Occam.Dependency.Drop (processDrop)
+import Occam.Dependency.Enforcement (cascadeWrites)
 import Occam.Dependency.Rename (processRename)
 import Occam.Dependency.Session (applySessionEffects)
 import Occam.Dependency.State (

@@ -6,6 +6,8 @@ import Data.Aeson (FromJSON, ToJSON, Value, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -42,6 +44,7 @@ import Occam.Core (
     SessionEffect (..),
     Span (..),
     Statement (..),
+    StatementId (..),
     TableDef (..),
     TriggerBody (..),
     TriggerDef (..),
@@ -53,6 +56,7 @@ import Occam.Core (
     WriteKind (..),
     nameText,
  )
+import Occam.Dependency (cascadeWrites)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -81,9 +85,11 @@ import Occam.Oracle (
     withCandidateWorkdir,
  )
 import Occam.Parser (
+    ParseOptions (..),
     ParsedSQL (..),
     ParserError (..),
     SQLDialect (..),
+    ServerConfig (..),
     countStatements,
     defaultParseOptions,
     dialectName,
@@ -154,6 +160,7 @@ data Options = Options
     , optJobs :: !Int
     , optReductionOptions :: !ReductionOptions
     , optDumpFacts :: !Bool
+    , optDumpFactsFkOn :: !Bool
     }
     deriving (Eq, Show)
 
@@ -286,6 +293,10 @@ optionsParser =
             ( long "dump-facts"
                 <> internal
             )
+        <*> switch
+            ( long "dump-facts-fk-on"
+                <> internal
+            )
 
 reductionOptionsParser :: Parser ReductionOptions
 reductionOptionsParser =
@@ -405,7 +416,7 @@ runOccamWithLogger :: Logger -> Options -> IO ()
 runOccamWithLogger logger Options {..} = do
     let dialect = optDialect optReductionOptions
     when optDumpFacts do
-        dumpStatementFacts dialect optInputFile
+        dumpStatementFacts dialect optDumpFactsFkOn optInputFile
         exitSuccess
     oracleCmd <- case optOracleCmd of
         Just cmd -> pure cmd
@@ -667,8 +678,8 @@ reductionSettings cacheEnabled ReductionConfig {..} =
 {- | Hidden @--dump-facts@ handler: parse INPUT with the selected dialect and
 print per-statement modeled facts as JSON on stdout. No oracle interaction.
 -}
-dumpStatementFacts :: SQLDialect -> FilePath -> IO ()
-dumpStatementFacts dialect inputFile = do
+dumpStatementFacts :: SQLDialect -> Bool -> FilePath -> IO ()
+dumpStatementFacts dialect fkOn inputFile = do
     sql <-
         if inputFile == "-"
             then BS.getContents
@@ -678,7 +689,15 @@ dumpStatementFacts dialect inputFile = do
                     hPutStrLn stderr ("occam: error: cannot open '" ++ inputFile ++ "': No such file or directory")
                     exitFailure
                 BS.readFile inputFile
-    parsed <- parseSQL (defaultParseOptions dialect) sql
+    let baseOptions = defaultParseOptions dialect
+        parseOptions
+            | fkOn =
+                baseOptions
+                    { parseServerConfig =
+                        (parseServerConfig baseOptions) {serverForeignKeyChecks = Just True}
+                    }
+            | otherwise = baseOptions
+    parsed <- parseSQL parseOptions sql
     case parsed of
         Left err -> do
             hPutStrLn stderr ("occam: error: failed to parse input: " ++ T.unpack (parserErrorMessage err))
@@ -689,11 +708,13 @@ factDumpJson :: SQLDialect -> ParsedSQL -> Value
 factDumpJson dialect parsed =
     object
         [ "dialect" .= dialectName dialect
-        , "statements" .= zipWith statementFactsJson [0 :: Int ..] (parsedUnits parsed)
+        , "statements" .= zipWith (statementFactsJson extras) [0 :: Int ..] (parsedUnits parsed)
         ]
+    where
+        extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
 
-statementFactsJson :: Int -> StatementUnit -> Value
-statementFactsJson idx unit =
+statementFactsJson :: Map StatementId [DataWrite] -> Int -> StatementUnit -> Value
+statementFactsJson extras idx unit =
     object
         [ "index" .= idx
         , "start" .= startByte
@@ -712,8 +733,9 @@ statementFactsJson idx unit =
         Span startByte endByte = stmtSpan (unitStatement unit)
         semantics = maybe (SemanticFacts [] [] [] [] []) factSemantics (unitFacts unit)
         ops = factOps semantics
+        cascadeExtras = Map.findWithDefault [] (stmtId (unitStatement unit)) extras
         readsJson = map readFactJson (concatMap opReads ops)
-        writesJson = concatMap opWrites ops
+        writesJson = concatMap opWrites ops ++ map dataWriteJson cascadeExtras
         ddlJson = concatMap opDdl ops
 
 {- | Reads evaluated when the statement itself runs: direct reads, DML source

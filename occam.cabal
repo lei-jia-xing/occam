@@ -61,6 +61,7 @@ library
                     , Occam.Dependency.Barrier
                     , Occam.Dependency.Define
                     , Occam.Dependency.Drop
+                    , Occam.Dependency.Enforcement
                     , Occam.Dependency.Query
                     , Occam.Dependency.Rename
                     , Occam.Dependency.Resolve

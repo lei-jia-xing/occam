@@ -95,6 +95,8 @@ R-fk-off (default): foreign_keys stays at the SQLite/Python default
     statement in triage (each divergence classified OCCAM BUG /
     GRANULARITY / ENGINE QUIRK); there is deliberately no blanket
     rule dropping FK traffic, so this mode quantifies the gap.
+    The occam invocation gains --dump-facts-fk-on so its modeled initial
+    enforcement agrees with the engine's; default mode is unaffected.
   R-wildcard: empty occam column lists (SELECT *, unqualified DML target
       scans) and NULL/empty engine columns match any column set.
 
@@ -601,7 +603,12 @@ def process_file(occam_bin, path, fk_on=False):
     with open(path, "rb") as f:
         sql_bytes = f.read()
     rel = os.path.relpath(path, ROOT)
-    proc = run([occam_bin, path, "--dump-facts", "--dialect", "sqlite"])
+    occam_args = [occam_bin, path, "--dump-facts", "--dialect", "sqlite"]
+    if fk_on:
+        # Mirror the out-of-band PRAGMA below in occam's modeled initial
+        # session so cascade-write expansion agrees with the engine.
+        occam_args.append("--dump-facts-fk-on")
+    proc = run(occam_args)
     if proc.returncode != 0:
         return {"file": rel, "dump_error": (proc.stderr or "").strip()[-500:], "statements": []}
     try:
