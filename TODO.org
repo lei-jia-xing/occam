@@ -53,6 +53,22 @@
 ** TODO [#B] Candidate proposals (UNSELECTED, not implementation)
 - Pair-aware search and certificate proposals remain candidates until evidence explicitly selects them; neither implemented nor claimed.
 
+* Upstream Gaps (recorded, not scheduled)
+# Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.
+- `CREATE STATISTICS` unsupported by grammar -- 10 units: benchmarks/real_fuzz_corpus/pg_stack_overflow_27stmts.sql (s0-s7), pg_fuzzer_mcv_clauses.sql:3, pg_fuzzer_mcv_enhanced.sql:30
+- MySQL BINARY/charset column syntax unparsed -- benchmarks/real_fuzz_corpus/mysql_bug88355.sql:1,3
+- `PRAGMA recursive_triggers = true` boolean literal unparsed -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
+- `CREATE VIRTUAL TABLE ... USING fts5/fts4` exposes no module/shadow-table structure -- TODO(upstream-sqlparser) catch-all in analyze_statement (virtual-table item) + sqlite_fuzz_fts5_savepoint.sql:1-2
+- Standalone `TABLE t` rejected -- README.md:77 ("Parser limits" paragraph)
+- CTAS `WITH NO DATA` rejected under Snowflake -- README.md:77
+- PL/pgSQL & PL/SQL bodies stored as unparsed strings -- TODO(upstream-sqlparser) catch-all in analyze_statement (procedural-body item)
+- MySQL `DELIMITER` client command outside grammar -- TODO(upstream-sqlparser) catch-all in analyze_statement (DELIMITER item)
+- MySQL `@var := expr` + dynamic `PREPARE .. FROM @var` -- TODO(upstream-sqlparser) catch-all in analyze_statement (@var/PREPARE item)
+- DuckDB direct file queries (`SELECT * FROM 'file.parquet'`) + `CREATE MACRO` -- TODO(upstream-sqlparser) catch-all in analyze_statement (DuckDB file-query/macro item)
+- MSSQL T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`, `OUTPUT INTO @var`) -- TODO(upstream-sqlparser) catch-all in analyze_statement (T-SQL batch item)
+- Incomplete `Spanned` impls (window, NULL-treatment, ODBC, unknown) block whole-node byte edits -- README.md:35
+- QUESTION (not defect): `PARTITION BY RANGE` as Function('range')? MySQL index prefix `b(1)` as Expr::Function? -- verify whether intended representation; any Expr::Function trips the routine fence (SequenceVisitor pre_visit_expr Expr::Function arm, AnalysisVisitor has_function arm, routine-barrier site in analyze_statement); cf. mysql_bug_91975.sql:3, benchmarks/fuzz_corpus/fuzz_pg_100_02.sql:51
+
 * Completed Milestones
 ** DONE Comprehensive multi-shell completions for `occam` via `usage` [2026-11]
 - Authored `occam.usage.kdl` with context-aware file filtering (`file:sql`), directory completion, and full dialect descriptions.
