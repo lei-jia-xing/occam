@@ -56,7 +56,8 @@ library
                     , Occam.Parser
                     , Occam.Pool
                     , Occam.UI
-    other-modules:    Occam.Dependency.Alter
+    other-modules:    Paths_occam
+                    , Occam.Dependency.Alter
                     , Occam.Dependency.Barrier
                     , Occam.Dependency.Define
                     , Occam.Dependency.Drop

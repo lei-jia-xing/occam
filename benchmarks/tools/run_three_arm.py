@@ -196,7 +196,7 @@ def run_one(args, case, arm, repetition, environment):
         isinstance(metrics, dict)
         and native_status == "completed"
         and (metrics.get("evaluationValidationPassed") is True)
-        and metrics.get("evaluationValidationRepeats") == 2
+        and metrics.get("evaluationValidationObservations") == 2
     )
     native_censored = {"timeout", "execution-budget", "error", "validation-failed", "validation-incomplete"}
     output_exists = output.is_file()

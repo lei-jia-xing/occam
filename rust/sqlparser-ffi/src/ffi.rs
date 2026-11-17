@@ -279,6 +279,23 @@ mod tests {
     }
 
     #[test]
+    fn dialect_codes_cover_all_dialects_exactly_once() {
+        // Guards the u32 code table against duplicate and out-of-range codes.
+        // Haskell's dialect round-trip exercises every u32 code through
+        // countStatements/FFI into dialect_from_code: range errors fail there,
+        // while a swapped-but-valid code would still pass.
+        let kinds: Vec<DialectKind> = (0..16).filter_map(dialect_from_code).collect();
+        assert_eq!(kinds.len(), 16);
+        for (i, left) in kinds.iter().enumerate() {
+            for right in &kinds[i + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+        assert_eq!(dialect_from_code(16), None);
+        assert_eq!(dialect_from_code(u32::MAX), None);
+    }
+
+    #[test]
     fn config_identifiers_honor_quotes_for_all_session_fields() {
         let rules = IdentifierRules::for_dialect(DialectKind::PostgreSql, &Default::default());
         assert_eq!(session_config_ident("\"MixedUser\"", &rules).0, "MixedUser");

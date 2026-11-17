@@ -67,13 +67,13 @@ clean:
 
 completions:
 	@mkdir -p completions
-	usage generate completion bash occam -f occam.usage.kdl > completions/occam.bash
-	usage generate completion zsh occam -f occam.usage.kdl > completions/_occam
-	usage generate completion fish occam -f occam.usage.kdl > completions/occam.fish
-	usage generate completion powershell occam -f occam.usage.kdl > completions/occam.ps1
-	usage generate completion nu occam -f occam.usage.kdl > completions/occam.nu
+	cabal build exe:occam
+	BIN=$$(cabal list-bin exe:occam); \
+	$$BIN --bash-completion-script occam > completions/occam.bash && \
+	$$BIN --zsh-completion-script occam > completions/_occam && \
+	$$BIN --fish-completion-script occam > completions/occam.fish
 
-install-completions:
-	usage generate completion bash occam -f occam.usage.kdl --install
-	usage generate completion zsh occam -f occam.usage.kdl --install
-	usage generate completion fish occam -f occam.usage.kdl --install
+install-completions: completions
+	install -D -m 644 completions/occam.bash ~/.local/share/bash-completion/completions/occam
+	install -D -m 644 completions/_occam ~/.zsh/completions/_occam
+	install -D -m 644 completions/occam.fish ~/.config/fish/completions/occam.fish

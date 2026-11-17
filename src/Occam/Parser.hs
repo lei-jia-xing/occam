@@ -2,6 +2,8 @@
 
 module Occam.Parser (
     SQLDialect (..),
+    dialectName,
+    dialectCode,
     defaultSQLDialect,
     ServerConfig (..),
     defaultServerConfig,

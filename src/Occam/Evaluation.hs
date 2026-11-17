@@ -61,7 +61,7 @@ import Occam.Oracle (
     observeExternalOracleDetailedWith,
     oracleObservationMatches,
  )
-import Occam.Parser (SQLDialect (..), countStatements)
+import Occam.Parser (SQLDialect (..), countStatements, dialectName)
 import Occam.Pool (
     ExecutionBudgetReached (..),
     OraclePool,
@@ -183,26 +183,13 @@ parseSQLDialect value = case map toLower value of
     "sparksql" -> Right Spark
     "teradata" -> Right Teradata
     _ ->
-        Left
-            "Expected generic, postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
+        Left ("Expected one of: " ++ T.unpack (T.intercalate ", " (map dialectName [minBound .. maxBound])))
 
+{- | Canonical CLI spelling. Single source is 'dialectName'; this alias keeps
+the CLI-layer name stable for existing callers.
+-}
 sqlDialectName :: SQLDialect -> Text
-sqlDialectName GenericSQL = "generic"
-sqlDialectName PostgreSQL = "postgresql"
-sqlDialectName MySQL = "mysql"
-sqlDialectName SQLite = "sqlite"
-sqlDialectName DuckDB = "duckdb"
-sqlDialectName ClickHouse = "clickhouse"
-sqlDialectName Oracle = "oracle"
-sqlDialectName Ansi = "ansi"
-sqlDialectName BigQuery = "bigquery"
-sqlDialectName Databricks = "databricks"
-sqlDialectName Hive = "hive"
-sqlDialectName MsSql = "mssql"
-sqlDialectName Redshift = "redshift"
-sqlDialectName Snowflake = "snowflake"
-sqlDialectName Spark = "spark"
-sqlDialectName Teradata = "teradata"
+sqlDialectName = dialectName
 
 data EvaluationPoint = EvaluationPoint
     { pointElapsedSeconds :: !Double
@@ -242,7 +229,6 @@ data EvaluationMetrics = EvaluationMetrics
     , evaluationCacheHits :: !Int
     , evaluationCacheMisses :: !Int
     , evaluationCacheJoins :: !Int
-    , evaluationValidationRepeats :: !Int
     , evaluationValidationSeconds :: !Double
     , evaluationValidationOracleSeconds :: !Double
     , evaluationValidationResetSeconds :: !Double
@@ -681,7 +667,6 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
                 , evaluationCacheHits = cacheHits cacheStats
                 , evaluationCacheMisses = cacheMisses cacheStats
                 , evaluationCacheJoins = cacheJoins cacheStats
-                , evaluationValidationRepeats = validationObservations
                 , evaluationValidationSeconds = validationSeconds
                 , evaluationValidationOracleSeconds = validationOracleSeconds
                 , evaluationValidationResetSeconds = validationResetSeconds

@@ -210,7 +210,7 @@ the retained native stats show cap-boundary signatures in its completed
 children, with no explicit termination reason. In the new run all 16 Occam
 children log coarse-to-fine order but time out before terminal syntax summaries.
 Each native timeout records one preflight and completed final-validation fields
-(`evaluationValidationDatabaseObservations=2`, `evaluationValidationRepeats=2`,
+(`evaluationValidationDatabaseObservations=2`, `evaluationValidationObservations=2`,
 `evaluationValidationPassed=true`); these are separate from the three common
 checks. Reduction observations and cache requests are exact through cutoff,
 not total cost to saturation, and the native audit remains incomplete.

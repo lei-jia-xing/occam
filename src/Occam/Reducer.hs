@@ -10,8 +10,6 @@ module Occam.Reducer (
     cutRemovedStatements,
     cutRemovedStatementIds,
     partitionChunks,
-    pruneClauses,
-    simplifyExpressions,
     reduceSQL,
     reduceSQLWithLogger,
     reduceSQLWithConfig,
@@ -873,30 +871,15 @@ reduceIterationWithConfig config logger pool initialSQL = do
                         ]
                     pure afterSyntax
 
-pruneClauses :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
-pruneClauses dialect pool =
-    reduceSyntaxWithDialect
-        nullLogger
-        ((defaultParseOptions dialect) {parseSyntaxEdits = True})
-        pool
-        ((== EditClause) . parserEditCategory)
-        ColumnOff
-
--- Expression-only public pass.
-simplifyExpressions :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
-simplifyExpressions dialect pool =
-    reduceSyntaxWithDialect
-        nullLogger
-        ((defaultParseOptions dialect) {parseSyntaxEdits = True})
-        pool
-        ((== EditExpression) . parserEditCategory)
-        ColumnOff
-
 data SyntaxStats = SyntaxStats
     { syntaxAttempts :: !Int
     , syntaxAccepted :: !Int
     , syntaxElapsed :: !Word64
     }
+
+-- | Canonical syntax-edit category order.
+allEditCategories :: [ParserEditCategory]
+allEditCategories = [EditClause, EditList, EditColumn, EditConstraint, EditType, EditExpression, EditLiteral]
 
 reduceSyntaxWithDialect ::
     Logger ->
@@ -931,10 +914,9 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
     where
         store = poolMetricsStore pool
         categoryOrder = case mode of
-            -- Off keeps the exact legacy six-category order and metadata;
-            -- only non-off modes add the Column category.
-            ColumnOff -> [EditClause, EditList, EditConstraint, EditType, EditExpression, EditLiteral]
-            _ -> [EditClause, EditList, EditColumn, EditConstraint, EditType, EditExpression, EditLiteral]
+            -- Off keeps the exact legacy six-category order.
+            ColumnOff -> filter (/= EditColumn) allEditCategories
+            _ -> allEditCategories
         categoryOrderName = T.intercalate "," (map editCategoryName categoryOrder)
         parseEdits currentSQL = do
             (_, units, columns) <- parseUnitsOrThrow store options currentSQL
@@ -951,26 +933,8 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
             pure (groupEdits edits, [target | target <- columns, isNothing (targetBlocked target)])
 
         groupEdits edits =
-            let (clauses, lists, columns, constraints, types, expressions, literals) =
-                    foldr distribute ([], [], [], [], [], [], []) edits
-             in [ (EditClause, clauses)
-                , (EditList, lists)
-                , (EditColumn, columns)
-                , (EditConstraint, constraints)
-                , (EditType, types)
-                , (EditExpression, expressions)
-                , (EditLiteral, literals)
-                ]
-
-        distribute edit (clauses, lists, columns, constraints, types, expressions, literals) =
-            case parserEditCategory edit of
-                EditClause -> (edit : clauses, lists, columns, constraints, types, expressions, literals)
-                EditList -> (clauses, edit : lists, columns, constraints, types, expressions, literals)
-                EditColumn -> (clauses, lists, edit : columns, constraints, types, expressions, literals)
-                EditConstraint -> (clauses, lists, columns, edit : constraints, types, expressions, literals)
-                EditType -> (clauses, lists, columns, constraints, edit : types, expressions, literals)
-                EditExpression -> (clauses, lists, columns, constraints, types, edit : expressions, literals)
-                EditLiteral -> (clauses, lists, columns, constraints, types, expressions, edit : literals)
+            let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
+             in [(cat, Map.findWithDefault [] cat buckets) | cat <- allEditCategories]
 
         go stats currentSQL = do
             (phases, bundles) <- parseEdits currentSQL

@@ -2,14 +2,15 @@ module Main (main) where
 
 import Benchmark (BenchmarkMetric (..))
 import ColumnChecks qualified
-import Control.Exception (bracket, try)
+import Control.Exception (SomeException, bracket, try)
 import Control.Monad (when)
 import Data.Aeson (eitherDecodeStrict')
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.Char (isSpace)
 import Data.Graph qualified as Graph
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (subsequences)
+import Data.List (isInfixOf, subsequences)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -43,7 +44,7 @@ import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
 import Occam.Logger (nullLogger)
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
+import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, dialectName, parseSQL)
 import Occam.Pool (
     OraclePool,
     PoolConfig (..),
@@ -68,10 +69,11 @@ import System.Directory (
     removeDirectoryRecursive,
     removeFile,
  )
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
-import System.Process (readProcessWithExitCode)
+import System.Process (readProcess, readProcessWithExitCode)
 import Test.QuickCheck (
     Arbitrary (..),
     Property,
@@ -175,16 +177,34 @@ phase3Tests =
 -- ----------------------------------------------------------------------------
 
 getOccamBinary :: IO FilePath
-getOccamBinary = do
-    mPath <- findExecutable "occam"
-    case mPath of
-        Just p -> pure p
-        Nothing -> do
-            let localPath = "dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/x/occam/build/occam/occam"
-            exists <- doesFileExist localPath
-            if exists
-                then pure localPath
-                else pure "cabal"
+getOccamBinary = resolveBinary "OCCAM_BIN" "occam"
+
+-- | Env override, then PATH, then `cabal list-bin`; "cabal" means `cabal run`.
+resolveBinary :: String -> String -> IO FilePath
+resolveBinary envVar name = do
+    mEnv <- lookupEnv envVar
+    case mEnv of
+        Just p -> do
+            exists <- doesFileExist p
+            if exists then pure p else fromPath
+        Nothing -> fromPath
+    where
+        fromPath = do
+            mPath <- findExecutable name
+            maybe fromListBin pure mPath
+        fromListBin = do
+            mPath <- tryListBin name
+            maybe (pure "cabal") pure mPath
+
+tryListBin :: String -> IO (Maybe FilePath)
+tryListBin name = do
+    result <- try (readProcess "cabal" ["list-bin", name] "") :: IO (Either SomeException String)
+    case result of
+        Left _ -> pure Nothing
+        Right out -> do
+            let path = stripEnd out
+            exists <- doesFileExist path
+            pure (if exists then Just path else Nothing)
 
 runOccamCLI :: [String] -> IO (ExitCode, String, String)
 runOccamCLI cliArgs = do
@@ -194,17 +214,7 @@ runOccamCLI cliArgs = do
         else readProcessWithExitCode bin cliArgs ""
 
 getOccamEvalBinary :: IO FilePath
-getOccamEvalBinary = do
-    mPath <- findExecutable "occam-eval"
-    case mPath of
-        Just p -> pure p
-        Nothing -> do
-            let localPath =
-                    "dist-newstyle/build/x86_64-linux/ghc-9.10.3/occam-0.1.0.0/x/occam-eval/build/occam-eval/occam-eval"
-            exists <- doesFileExist localPath
-            if exists
-                then pure localPath
-                else pure "cabal"
+getOccamEvalBinary = resolveBinary "OCCAM_EVAL_BIN" "occam-eval"
 
 runOccamEvalCLI :: [String] -> IO (ExitCode, String, String)
 runOccamEvalCLI cliArgs = do
@@ -228,6 +238,9 @@ withCLIInput sql action =
             removeFile path
             exists <- doesDirectoryExist (path ++ ".out")
             when exists (removeDirectoryRecursive (path ++ ".out"))
+
+stripEnd :: String -> String
+stripEnd = reverse . dropWhile isSpace . reverse
 
 phase5Tests :: TestTree
 phase5Tests =
@@ -358,6 +371,15 @@ phase5Tests =
                         ["single", "atomic"]
                     observed <- BSC.readFile calls
                     assertEqual "oracle ran before validation" "" observed
+        , testCase "help advertises all selected dialects" $ do
+            (helpCode, helpOut, _) <- runOccamCLI ["--help"]
+            assertEqual "help must exit zero" ExitSuccess helpCode
+            mapM_
+                ( \dialect ->
+                    let name = T.unpack (dialectName dialect)
+                     in assertBool ("--help hides dialect: " ++ name) (name `isInfixOf` helpOut)
+                )
+                ([minBound .. maxBound] :: [SQLDialect])
         ]
 
 -- ----------------------------------------------------------------------------

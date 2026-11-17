@@ -35,6 +35,7 @@ import Occam.Oracle (
     OracleConfig (..),
     OracleObservationDetails (..),
     prepareOracle,
+    withCandidateWorkdir,
  )
 import Occam.Parser (SQLDialect (..), countStatements)
 import Occam.Reducer (
@@ -53,6 +54,8 @@ import Options.Applicative (
     Parser,
     ParserInfo,
     auto,
+    bashCompleter,
+    completer,
     eitherReader,
     execParser,
     flag',
@@ -143,6 +146,7 @@ optionsParser =
         <$> strArgument
             ( metavar "INPUT.sql"
                 <> help "Path to fuzz SQL input, or '-' for stdin"
+                <> completer (bashCompleter "file")
             )
         <*> strOption
             ( long "oracle"
@@ -156,6 +160,7 @@ optionsParser =
                 <> value "occam-out"
                 <> showDefault
                 <> help "Directory where reduced artifacts will be written, or '-' for stdout"
+                <> completer (bashCompleter "directory")
             )
         <*> optional
             ( strOption
@@ -297,127 +302,10 @@ versionOption =
             <> help "Show version information"
         )
 
-usageSpecOption :: Parser (a -> a)
-usageSpecOption =
-    infoOption
-        usageSpecText
-        ( long "usage-spec"
-            <> help "Print CLI usage specification (KDL format for 'usage' shell completion generator)"
-        )
-
-usageSpecText :: String
-usageSpecText =
-    unlines
-        [ "name \"Occam\""
-        , "bin \"occam\""
-        , "version \"" ++ Occam.version ++ "\""
-        , "about \"Occam: Dependency-Aware Multi-Statement SQL Test Case Minimizer\""
-        , ""
-        , "arg \"<INPUT.sql>\" help=\"Path to fuzz SQL input, or '-' for stdin\""
-        , "complete \"INPUT.sql\" type=\"file:sql\""
-        , ""
-        , "flag \"--oracle <COMMAND>\" help=\"Interestingness predicate command (SQL on stdin; exit 0 accepts)\" required=#true {"
-        , "    arg <COMMAND>"
-        , "}"
-        , "complete oracle type=command_args"
-        , ""
-        , "flag \"-o --out <DIR>\" default=\"occam-out\" help=\"Directory where reduced artifacts will be written, or '-' for stdout\" {"
-        , "    arg <DIR>"
-        , "}"
-        , "complete out type=dir"
-        , ""
-        , "flag \"--reset <COMMAND>\" help=\"Lightweight state reset command (e.g. dropdb/createdb or custom reset script)\" {"
-        , "    arg <COMMAND>"
-        , "}"
-        , "complete reset type=command_args"
-        , ""
-        , "flag \"--timeout <SECONDS>\" default=\"10.0\" help=\"Per-execution timeout in seconds for each oracle run\" {"
-        , "    arg <SECONDS>"
-        , "}"
-        , ""
-        , "flag \"--log-level <LEVEL>\" default=\"info\" help=\"Log severity level\" {"
-        , "    arg <LEVEL> {"
-        , "        choices {"
-        , "            choice \"debug\" help=\"Verbose diagnostic and internal graph transition logging\""
-        , "            choice \"info\" help=\"Informational milestones, reduction steps, and summaries (default)\""
-        , "            choice \"warn\" help=\"Warnings and non-fatal oracle or parse anomalies\""
-        , "            choice \"error\" help=\"Fatal errors and test failures only\""
-        , "        }"
-        , "    }"
-        , "}"
-        , ""
-        , "flag \"--log-format <FORMAT>\" default=\"text\" help=\"Log output format\" {"
-        , "    arg <FORMAT> {"
-        , "        choices {"
-        , "            choice \"text\" help=\"Human-readable text logs with timestamps and component tags (default)\""
-        , "            choice \"json\" help=\"Structured newline-delimited JSON logs for pipelines\""
-        , "        }"
-        , "    }"
-        , "}"
-        , ""
-        , "flag \"-v --verbose\" help=\"Enable verbose debug output (equivalent to --log-level debug)\""
-        , "flag \"-q --quiet\" help=\"Suppress info logs and banners (equivalent to --log-level error)\""
-        , "flag \"--usage-spec\" help=\"Print CLI usage specification (KDL format for 'usage' shell completion generator)\""
-        , "flag \"--version\" help=\"Show version information\""
-        , "flag \"-h --help\" help=\"Show help information\""
-        , "flag \"--budget <SECONDS>\" help=\"Shared wall-clock cap including initial check, reduction, and audit\" {"
-        , "    arg <SECONDS>"
-        , "}"
-        , "flag \"--max-oracle-executions <N>\" help=\"Maximum uncached oracle attempts including initial check and validation\" {"
-        , "    arg <N>"
-        , "}"
-        , "flag \"--jobs <N>\" default=\"1\" help=\"Maximum concurrent oracle/reset executions; declares N concurrent independent calls with independent database state\" {"
-        , "    arg <N>"
-        , "}"
-        , ""
-        , "flag \"--slicing\" help=\"Enable backward dependency slicing pass (default: on)\""
-        , "flag \"--no-slicing\" help=\"Disable backward dependency slicing pass\""
-        , "flag \"--closure\" help=\"Enable dependency closure minimization pass (default: on)\""
-        , "flag \"--no-closure\" help=\"Disable dependency closure minimization pass\""
-        , "flag \"--intra-statement\" help=\"Enable intra-statement AST clause and expression pruning (default: off)\""
-        , "flag \"--no-intra-statement\" help=\"Disable intra-statement AST clause and expression pruning\""
-        , "flag \"--column-mode <MODE>\" default=\"off\" help=\"Column co-reduction listing (requires --intra-statement unless off)\" {"
-        , "    arg <MODE> {"
-        , "        choices {"
-        , "            choice \"off\" help=\"No column co-reduction (default)\""
-        , "            choice \"single\" help=\"Per-column single sites\""
-        , "            choice \"atomic\" help=\"Joint bundles plus identical singles\""
-        , "        }"
-        , "    }"
-        , "}"
-        , "flag \"--unrestricted\" help=\"Enable unrestricted statement ddmin fallback (default: on)\""
-        , "flag \"--no-unrestricted\" help=\"Disable unrestricted statement ddmin fallback\""
-        , "flag \"--cache\" help=\"Enable candidate query hash memoization (default: on)\""
-        , "flag \"--no-cache\" help=\"Disable candidate query hash memoization\""
-        , ""
-        , "flag \"--dialect <DIALECT>\" default=\"generic\" help=\"SQL dependency analysis dialect\" {"
-        , "    arg <DIALECT> {"
-        , "        choices {"
-        , "            choice \"generic\" help=\"Generic ANSI SQL with common relational constructs (default)\""
-        , "            choice \"postgresql\" help=\"PostgreSQL (schemas, dollar quotes, ::type casts, CTEs, RETURNING)\""
-        , "            choice \"mysql\" help=\"MySQL 8.0 (backticks, version comments, ON DUPLICATE KEY)\""
-        , "            choice \"sqlite\" help=\"SQLite 3 (WITHOUT ROWID, STRICT mode, savepoints, triggers)\""
-        , "            choice \"duckdb\" help=\"DuckDB (column references, list/struct comprehensions)\""
-        , "            choice \"clickhouse\" help=\"ClickHouse (table engines, tuple types, case folding)\""
-        , "            choice \"oracle\" help=\"Oracle database dialect\""
-        , "            choice \"ansi\" help=\"Strict ANSI SQL standard\""
-        , "            choice \"bigquery\" help=\"Google BigQuery dialect\""
-        , "            choice \"databricks\" help=\"Databricks SQL dialect\""
-        , "            choice \"hive\" help=\"Apache Hive QL dialect\""
-        , "            choice \"mssql\" help=\"Microsoft SQL Server (T-SQL) dialect\""
-        , "            choice \"redshift\" help=\"Amazon Redshift dialect\""
-        , "            choice \"snowflake\" help=\"Snowflake SQL dialect\""
-        , "            choice \"spark\" help=\"Apache Spark SQL dialect\""
-        , "            choice \"teradata\" help=\"Teradata SQL dialect\""
-        , "        }"
-        , "    }"
-        , "}"
-        ]
-
 optsInfo :: ParserInfo Options
 optsInfo =
     info
-        (optionsParser <**> versionOption <**> usageSpecOption <**> helper)
+        (optionsParser <**> versionOption <**> helper)
         ( fullDesc
             <> progDesc "Occam: Dependency-Aware SQL Test Case Minimizer"
             <> header ("Occam v" ++ Occam.version ++ " - Multi-statement SQL reducer")
@@ -442,6 +330,14 @@ runOccam opts@Options {..} = do
                 }
         runWithLogger logger = runOccamWithLogger logger opts
     withLogger logCfg runWithLogger
+
+{- | Reduction checkpoint location. Stdout runs get a per-run temporary
+directory (cleaned on exit); directory runs checkpoint the output file.
+-}
+withCheckpointPath :: Bool -> FilePath -> (FilePath -> IO a) -> IO a
+withCheckpointPath writeToStdout minimalPath action
+    | not writeToStdout = action minimalPath
+    | otherwise = withCandidateWorkdir (\tmpDir -> action (tmpDir </> "occam-checkpoint.sql"))
 
 runOccamWithLogger :: Logger -> Options -> IO ()
 runOccamWithLogger logger Options {..} = do
@@ -557,7 +453,6 @@ runOccamWithLogger logger Options {..} = do
     let writeToStdout = optOutDir == "-"
         minimalPath = if writeToStdout then "" else optOutDir </> "minimal.sql"
         statsPath = if writeToStdout then "" else optOutDir </> "stats.json"
-        checkpointPath = if writeToStdout then "/tmp/occam-checkpoint.sql" else minimalPath
 
     unless writeToStdout (createDirectoryIfMissing True optOutDir)
     logInfo logger "occam::reducer" "Running hierarchical reduction engine..."
@@ -568,17 +463,18 @@ runOccamWithLogger logger Options {..} = do
             exitFailure
         Right policy -> pure (Just policy)
     result <-
-        runEvaluatedReductionWithProgress
-            (uiOnProgress ui)
-            metricsPolicy
-            budgetConfig
-            dialect
-            oracleCfg
-            (Just (detailedObservation preflightDetails))
-            logger
-            initialSQL
-            checkpointPath
-            (\reducerLogger oracle -> reduceSQLWithConfig reductionConfig reducerLogger oracle initialSQL)
+        withCheckpointPath writeToStdout minimalPath $ \checkpointPath ->
+            runEvaluatedReductionWithProgress
+                (uiOnProgress ui)
+                metricsPolicy
+                budgetConfig
+                dialect
+                oracleCfg
+                (Just (detailedObservation preflightDetails))
+                logger
+                initialSQL
+                checkpointPath
+                (\reducerLogger oracle -> reduceSQLWithConfig reductionConfig reducerLogger oracle initialSQL)
     let reducedSQL = evaluatedSQL result
         evaluation = evaluationMetrics result
         totalHits = evaluationCacheHits evaluation

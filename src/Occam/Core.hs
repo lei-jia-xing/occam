@@ -66,7 +66,6 @@ module Occam.Core (
     OracleInconclusiveError (..),
     Oracle,
     oracleAccepts,
-    oracleFromPredicate,
 ) where
 
 import Control.Exception (Exception, throwIO)
@@ -536,11 +535,3 @@ oracleAccepts oracle candidate = do
         OracleAccepted -> pure True
         OracleRejected -> pure False
         OracleInconclusive -> throwIO OracleInconclusiveError
-
-{- | Lift a total Boolean predicate into an oracle. Use this only at
-integration boundaries that cannot report timeouts or infrastructure errors.
--}
-oracleFromPredicate :: (ByteString -> IO Bool) -> Oracle
-oracleFromPredicate predicate candidate = do
-    accepted <- predicate candidate
-    pure (if accepted then OracleAccepted else OracleRejected)

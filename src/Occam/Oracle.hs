@@ -15,6 +15,7 @@ module Occam.Oracle (
     observationOutcome,
     OracleReapFailed (..),
     prepareOracle,
+    withCandidateWorkdir,
 ) where
 
 import Control.Concurrent (

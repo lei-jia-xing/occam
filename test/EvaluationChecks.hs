@@ -7,7 +7,9 @@ import Data.Aeson (decode, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.List (sort)
 import Data.Map.Strict qualified as Map
+import Data.Text qualified as T
 import Occam.Core (OracleOutcome (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
@@ -31,7 +33,7 @@ import Occam.Oracle (
     OracleObservationDetails (..),
     prepareOracle,
  )
-import Occam.Parser (SQLDialect (..))
+import Occam.Parser (SQLDialect (..), countStatements, dialectCode, dialectName)
 import Occam.Pool (poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
@@ -71,7 +73,7 @@ tests =
             let metrics = evaluationMetrics result
             assertEqual "accepted checkpoint survives execution cap" candidate (evaluatedSQL result)
             assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
-            assertEqual "two validation calls reserved" 2 (evaluationValidationRepeats metrics)
+            assertEqual "two validation calls reserved" 2 (evaluationValidationObservations metrics)
             assertBool "last repeated target validation passes" (evaluationValidationPassed metrics)
             assertEqual "budget exhaustion is reported" EvaluationExecutionBudget (evaluationStatus metrics)
             assertEqual "uncached profile records no hits" 0 (evaluationCacheHits metrics)
@@ -234,7 +236,7 @@ tests =
                         (evaluationStatus metrics)
                     assertEqual "preflight consumed the only allowed execution" 0 (evaluationOracleAttempts metrics)
                     assertEqual "no reducer subprocess started" 0 (evaluationDatabaseObservations metrics)
-                    assertEqual "no final validations were scheduled" 0 (evaluationValidationRepeats metrics)
+                    assertEqual "no final validations were scheduled" 0 (evaluationValidationObservations metrics)
                     assertEqual
                         "no final validation subprocess started"
                         0
@@ -379,6 +381,19 @@ tests =
             assertEqual "Snowflake serialized using CLI spelling" "snowflake" (sqlDialectName Snowflake)
             assertEqual "Spark serialized using CLI spelling" "spark" (sqlDialectName Spark)
             assertEqual "Teradata serialized using CLI spelling" "teradata" (sqlDialectName Teradata)
+        , testCase "all selected dialects round-trip name, parse, and code" $ do
+            let dialects = [minBound .. maxBound] :: [SQLDialect]
+            assertEqual "sixteen selected dialects" 16 (length dialects)
+            mapM_
+                ( \dialect -> do
+                    let name = dialectName dialect
+                    assertEqual ("CLI spelling " ++ show dialect) name (sqlDialectName dialect)
+                    assertEqual ("parse round-trip " ++ show dialect) (Right dialect) (parseSQLDialect (T.unpack name))
+                )
+                dialects
+            assertEqual "distinct FFI codes 0..15" [0 .. 15] (sort (map dialectCode dialects))
+            counts <- mapM (`countStatements` "SELECT 1; SELECT 2;") dialects
+            assertEqual "every dialect counts two statements over FFI" (replicate 16 (Right 2)) counts
         , testCase "speculative losers are cancelled without timeout or error inflation" $
             withSentinelPath $ \sentinel -> do
                 let acceptSQL = "SELECT 1;\n"
@@ -440,7 +455,7 @@ tests =
             liveAtEnd <- readIORef liveAtEndRef
             assertEqual "workers outlived the reduction action" 0 liveAtEnd
             assertEqual "drained run did not complete" EvaluationCompleted (evaluationStatus metrics)
-            assertEqual "final validation did not run twice" 2 (evaluationValidationRepeats metrics)
+            assertEqual "final validation did not run twice" 2 (evaluationValidationObservations metrics)
             assertBool "final validation failed" (evaluationValidationPassed metrics)
         , testCase "parallel jobs complete a small end-to-end reduction" $ do
             let initial = "SELECT 1;\nSELECT 2;\nSELECT 3;\n"
