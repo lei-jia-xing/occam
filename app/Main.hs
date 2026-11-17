@@ -838,7 +838,7 @@ alterChangeName (DropConstraint _ _) = "drop-constraint"
 alterChangeName (RenameConstraint _ _) = "rename-constraint"
 alterChangeName (ValidateConstraint _) = "validate-constraint"
 alterChangeName (DropIndexChange _) = "drop-index"
-alterChangeName (AlterColumn _ _) = "alter-column"
+alterChangeName (AlterColumn {}) = "alter-column"
 alterChangeName (OtherChange detail) = "other:" <> detail
 
 dropObjectJson :: DropMode -> DropObject -> Value

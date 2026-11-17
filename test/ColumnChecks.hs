@@ -4,6 +4,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Map.Strict qualified as Map
+import Occam.Core (Ident (..))
+import Occam.Facts (ColumnTarget (..))
 import Occam.Logger (nullLogger)
 import Occam.Parser (
     ParseOptions (..),
@@ -41,6 +43,7 @@ tests =
         , testCase "atomic drops despite rename of another column" testAtomicRenameColumnOther
         , testCase "atomic follows a table rename" testAtomicRenameFollow
         , testCase "syntax gate drops only edits" testSyntaxGate
+        , testCase "alter-column on another column keeps the bundle" testAlterColumnOtherKeepsBundle
         ]
 
 -- ----------------------------------------------------------------------------
@@ -269,3 +272,28 @@ testSyntaxGate = do
     where
         stripEdits = map (\unit -> unit {unitFacts = fmap (\facts -> facts {factEdits = []}) (unitFacts unit)})
         unitEdits unit = maybe [] factEdits (unitFacts unit)
+
+testAlterColumnOtherKeepsBundle :: IO ()
+testAlterColumnOtherKeepsBundle = do
+    -- `ALTER COLUMN a ...` names `a` only, so `b`'s bundle survives; the
+    -- parse itself proves the extended `alter_column` wire shape decodes.
+    -- (`ALTER COLUMN` is not SQLite-executable, so this asserts bundles,
+    -- not reduction.)
+    let script =
+            BSC.unlines
+                [ "CREATE TABLE t(a INT, b INT);"
+                , "ALTER TABLE t ALTER COLUMN a SET NOT NULL;"
+                , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+                ]
+    parsed <- parseSQL (base {parseColumnIR = True, parseColumnBundles = True}) script
+    case parsed of
+        Left err -> assertFailure ("parse failed: " <> show err)
+        Right ok -> do
+            let byColumn = [(targetColumn target, targetBlocked target) | target <- parsedColumns ok]
+            assertEqual "b bundle survives" (Just Nothing) (lookup (Ident "b") byColumn)
+            assertEqual
+                "a bundle fenced"
+                (Just (Just "column-generation-ambiguous"))
+                (lookup (Ident "a") byColumn)
+    where
+        base = defaultParseOptions PostgreSQL

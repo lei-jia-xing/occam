@@ -343,7 +343,7 @@ data AlterChange
     | RenameConstraint !Ident !Ident
     | ValidateConstraint !Ident
     | DropIndexChange !Ident
-    | AlterColumn !Ident !Text
+    | AlterColumn !Ident !Text ![Ident] !Bool
     | OtherChange !Text
     deriving (Eq, Show)
 

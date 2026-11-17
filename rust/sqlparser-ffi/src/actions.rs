@@ -58,12 +58,24 @@ impl Visitor for ColumnCollector<'_> {
 }
 
 fn expr_columns(expr: &Expr, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
+    visit_columns(expr, rules)
+}
+
+/// Expression-position column references under any AST node: the single
+/// extractor behind [`expr_columns`], also shared by `ALTER COLUMN` op
+/// expressions and `CHANGE`/`MODIFY` new-definition options. Only
+/// `Expr::Identifier`/`CompoundIdentifier` positions are collected, so
+/// option names, charset/collation names, and tag/policy names (plain
+/// `Ident` positions that never denote same-table columns) are ignored;
+/// the few same-table references that live outside `Expr` (inline foreign
+/// keys, policy `USING` columns) are handled by the caller.
+fn visit_columns(node: &impl sqlparser::ast::Visit, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
     let mut collector = ColumnCollector {
         rules,
         columns: Vec::new(),
         seen: HashSet::new(),
     };
-    let _ = expr.visit(&mut collector);
+    let _ = node.visit(&mut collector);
     collector.columns
 }
 
@@ -3012,6 +3024,166 @@ fn drop_object_for(
     }
 }
 
+/// Same-table columns read by a plain `ALTER COLUMN` op. Every
+/// `AlterColumnOperation` variant is classified (exhaustive match: a new
+/// upstream variant fails to compile until it is reviewed here):
+/// - `SET DEFAULT` / `SET DATA TYPE ... USING`: the expression's columns.
+/// - `ADD GENERATED ... AS IDENTITY`: whatever `Expr`-position columns the
+///   sequence options carry (numeric by convention, so usually none).
+/// - `SET`/`DROP NOT NULL`, `DROP DEFAULT`, foreign-table `OPTIONS`: the
+///   target column only (option keys/values are FDW names, never
+///   same-table columns), so no referenced columns.
+fn alter_op_columns(op: &AlterColumnOperation, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
+    match op {
+        AlterColumnOperation::SetDefault { value } => expr_columns(value, rules),
+        AlterColumnOperation::SetDataType { using, .. } => using
+            .as_ref()
+            .map(|using| expr_columns(using, rules))
+            .unwrap_or_default(),
+        AlterColumnOperation::AddGenerated {
+            sequence_options, ..
+        } => {
+            let mut referenced = Vec::new();
+            let mut seen = HashSet::new();
+            for option in sequence_options.iter().flatten() {
+                for column in visit_columns(option, rules) {
+                    if seen.insert(column.clone()) {
+                        referenced.push(column);
+                    }
+                }
+            }
+            referenced
+        }
+        AlterColumnOperation::SetNotNull
+        | AlterColumnOperation::DropNotNull
+        | AlterColumnOperation::DropDefault
+        | AlterColumnOperation::GenericOptions { .. } => Vec::new(),
+    }
+}
+
+/// Build the IR change for a MySQL `CHANGE`/`MODIFY COLUMN` rewrite from
+/// its exposed pieces (target column, new-definition options, column
+/// position). An unclassifiable definition (unparsed dialect tokens, or a
+/// self-referencing inline foreign key with implicit parent columns)
+/// degrades to `Other`, keeping the previous whole-table fence.
+fn change_modify_change(
+    column: ir::Ident,
+    options: &[ColumnOption],
+    column_position: &Option<MySQLColumnPosition>,
+    detail: &str,
+    table: &ir::NameRef,
+    rules: &ir::IdentifierRules,
+) -> ir::AlterChange {
+    match change_modify_refs(options, table, rules) {
+        Some(referenced) => ir::AlterChange::AlterColumn {
+            column,
+            detail: detail.to_string(),
+            referenced,
+            repositions: column_position.is_some(),
+        },
+        None => ir::AlterChange::Other {
+            detail: detail.to_string(),
+        },
+    }
+}
+
+/// Same-table columns read by a `CHANGE`/`MODIFY` new definition, or
+/// `None` when the definition is opaque. `Expr`-position references
+/// (`DEFAULT`, `CHECK`, generated expressions, `ON UPDATE`, ...) are
+/// collected by [`visit_columns`]; the match below handles the only
+/// same-table references that live outside `Expr`, and is exhaustive so a
+/// new upstream `ColumnOption` variant fails to compile until reviewed:
+/// - inline `FOREIGN KEY`: child columns name this table; parent columns
+///   fence only when the parent may be this table (same trailing name,
+///   covering sibling spellings), and implicit parent columns are then
+///   unnameable (opaque, like `ADD CONSTRAINT` self-references);
+/// - masking/projection policy `USING` columns name this table's columns;
+/// - `DialectSpecific` is unparsed `Token` text (e.g. MySQL
+///   `AUTO_INCREMENT`), so absence of column references is unprovable.
+///
+/// All other variants reference columns only through `Expr` (or not at
+/// all: bare names there are constraint/charset/policy/tag names).
+fn change_modify_refs(
+    options: &[ColumnOption],
+    table: &ir::NameRef,
+    rules: &ir::IdentifierRules,
+) -> Option<Vec<ir::Ident>> {
+    let mut referenced = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |column: ir::Ident| {
+        if seen.insert(column.clone()) {
+            referenced.push(column);
+        }
+    };
+    for option in options {
+        for column in visit_columns(option, rules) {
+            push(column);
+        }
+        match option {
+            ColumnOption::ForeignKey(key) => {
+                for column in &key.columns {
+                    push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+                }
+                if alter_parent_may_be_self(&key.foreign_table, table, rules) {
+                    if key.referred_columns.is_empty() {
+                        return None;
+                    }
+                    for column in &key.referred_columns {
+                        push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+                    }
+                }
+            }
+            ColumnOption::Policy(policy) => {
+                let using = match policy {
+                    ColumnPolicy::MaskingPolicy(property)
+                    | ColumnPolicy::ProjectionPolicy(property) => &property.using_columns,
+                };
+                for column in using.iter().flatten() {
+                    push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+                }
+            }
+            ColumnOption::DialectSpecific(_) => return None,
+            ColumnOption::Null
+            | ColumnOption::NotNull
+            | ColumnOption::Default(_)
+            | ColumnOption::Materialized(_)
+            | ColumnOption::Ephemeral(_)
+            | ColumnOption::Alias(_)
+            | ColumnOption::PrimaryKey(_)
+            | ColumnOption::Unique(_)
+            | ColumnOption::Check(_)
+            | ColumnOption::CharacterSet(_)
+            | ColumnOption::Collation(_)
+            | ColumnOption::Comment(_)
+            | ColumnOption::OnUpdate(_)
+            | ColumnOption::Generated { .. }
+            | ColumnOption::Options(_)
+            | ColumnOption::GenericOptions(_)
+            | ColumnOption::Identity(_)
+            | ColumnOption::OnConflict(_)
+            | ColumnOption::Tags(_)
+            | ColumnOption::Srid(_)
+            | ColumnOption::Invisible => {}
+        }
+    }
+    Some(referenced)
+}
+
+/// Whether an inline foreign-key parent may be the altered table itself:
+/// identical trailing names after relation folding, which also covers
+/// sibling spellings (`t` vs `main.t`) that may alias. An unresolvable
+/// parent name conservatively counts as self.
+fn alter_parent_may_be_self(
+    parent: &ObjectName,
+    table: &ir::NameRef,
+    rules: &ir::IdentifierRules,
+) -> bool {
+    match name_parts(parent, rules, ir::IdentifierClass::Relation) {
+        Some(parts) => parts.last() == table.name.0.last(),
+        None => true,
+    }
+}
+
 fn alter_change(
     operation: &AlterTableOperation,
     dialect: DialectKind,
@@ -3093,10 +3265,18 @@ fn alter_change(
             changes.push(ir::AlterChange::AlterColumn {
                 column: canonical_ident(column_name, rules, ir::IdentifierClass::Column),
                 detail: op.to_string(),
+                referenced: alter_op_columns(op, rules),
+                // Plain `ALTER COLUMN` never repositions: no `FIRST`/`AFTER`
+                // exists for it, so ordinals and arity are unchanged.
+                repositions: false,
             });
         }
         AlterTableOperation::ChangeColumn {
-            old_name, new_name, ..
+            old_name,
+            new_name,
+            options,
+            column_position,
+            ..
         } => {
             let old_name = canonical_ident(old_name, rules, ir::IdentifierClass::Column);
             let new_name = canonical_ident(new_name, rules, ir::IdentifierClass::Column);
@@ -3107,16 +3287,29 @@ fn alter_change(
                     to: new_name.clone(),
                 }));
             }
-            changes.push(ir::AlterChange::AlterColumn {
-                column: new_name,
-                detail: operation.to_string(),
-            });
+            changes.push(change_modify_change(
+                new_name,
+                options,
+                column_position,
+                &operation.to_string(),
+                table,
+                rules,
+            ));
         }
-        AlterTableOperation::ModifyColumn { col_name, .. } => {
-            changes.push(ir::AlterChange::AlterColumn {
-                column: canonical_ident(col_name, rules, ir::IdentifierClass::Column),
-                detail: operation.to_string(),
-            });
+        AlterTableOperation::ModifyColumn {
+            col_name,
+            options,
+            column_position,
+            ..
+        } => {
+            changes.push(change_modify_change(
+                canonical_ident(col_name, rules, ir::IdentifierClass::Column),
+                options,
+                column_position,
+                &operation.to_string(),
+                table,
+                rules,
+            ));
         }
         AlterTableOperation::RenameConstraint { old_name, new_name } => {
             changes.push(ir::AlterChange::RenameConstraint {

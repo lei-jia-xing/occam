@@ -512,6 +512,14 @@ pub enum AlterChange {
     AlterColumn {
         column: Ident,
         detail: String,
+        /// Same-table columns read by the op's expressions (`USING`,
+        /// `SET DEFAULT`, new-definition `CHECK`/`GENERATED`/etc., parent
+        /// columns of a self-referencing inline foreign key). Empty when
+        /// the op provably reads no sibling column.
+        referenced: Vec<Ident>,
+        /// `FIRST`/`AFTER` placement was present: ordinals may shift, and
+        /// the `AFTER` anchor names a sibling this IR does not carry.
+        repositions: bool,
     },
     Other {
         detail: String,

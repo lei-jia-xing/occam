@@ -692,7 +692,12 @@ instance FromJSON AlterChange where
             "rename_constraint" -> RenameConstraint <$> objectValue .: "from" <*> objectValue .: "to"
             "validate_constraint" -> ValidateConstraint <$> objectValue .: "name"
             "drop_index" -> DropIndexChange <$> objectValue .: "name"
-            "alter_column" -> AlterColumn <$> objectValue .: "column" <*> objectValue .: "detail"
+            "alter_column" ->
+                AlterColumn
+                    <$> objectValue .: "column"
+                    <*> objectValue .: "detail"
+                    <*> objectValue .: "referenced"
+                    <*> objectValue .: "repositions"
             "other" -> OtherChange <$> objectValue .: "detail"
             _ -> fail ("unknown ALTER TABLE change: " <> T.unpack tag)
 

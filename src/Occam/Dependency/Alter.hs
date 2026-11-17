@@ -572,7 +572,7 @@ applyAlterChange session sid key (catalog, relation) change =
                         Set.difference (relIndexes relation) (Set.fromList indexKeys)
                     }
                 )
-        AlterColumn column _detail ->
+        AlterColumn column _Detail _Referenced _Repositions ->
             (catalog, relation {relColumns = Set.insert column (relColumns relation)})
         OtherChange _ -> (catalog, relation)
 

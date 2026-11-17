@@ -49,12 +49,17 @@
 //!   - `ADD`/`DROP COLUMN` still fence all when any positional (implicit
 //!     `VALUES`) insert binds: `FIRST`/`AFTER` placement is not in the IR,
 //!     so append is unprovable and ordinals may shift.
-//!   - `ALTER COLUMN` (including `CHANGE`/`MODIFY` rewrites, whose new
-//!     definition, `USING` expression, and placement hide in an opaque
-//!     detail string), generated `ADD COLUMN` expressions, opaque
+//!   - `ALTER COLUMN` narrows per op: no-expression ops (`SET`/`DROP NOT
+//!     NULL, `DROP DEFAULT`, pure type change, identity/foreign-table
+//!     options) fence the target only; `USING`/`SET DEFAULT` (and
+//!     `CHANGE`/`MODIFY` new-definition expressions) fence the target
+//!     plus the columns they read; `FIRST`/`AFTER` placement fences all
+//!     (ordinals may shift, and the `AFTER` anchor names an uncarried
+//!     sibling). `CHANGE`/`MODIFY` definitions with unparsed dialect
+//!     tokens or implicit self-referencing parent columns stay opaque
+//!     and fence all, as do generated `ADD COLUMN` expressions, opaque
 //!     constraints, and name-addressed changes (`DROP/RENAME CONSTRAINT`,
-//!     `DROP INDEX`, `VALIDATE`) fence the whole table: "other column" is
-//!     unprovable for them without frontend changes.
+//!     `DROP INDEX`, `VALIDATE`).
 //!   - Table renames are followed (sites before the rename bind the old
 //!     name, sites after bind the new name) only when unambiguous: one
 //!     outgoing rename per name, strictly ordered after the definition, no
@@ -516,11 +521,13 @@ fn build_chain(
 /// - `ADD CONSTRAINT` lifts column-wise via its classified column lists;
 ///   opaque constraints fence all, as do self-referencing foreign keys
 ///   with implicit parent columns.
-/// - `ALTER COLUMN` (including `CHANGE`/`MODIFY` rewrites, whose new
-///   definition, `USING` expression, and placement hide in an opaque
-///   detail string), generated `ADD COLUMN` expressions, and
-///   name-addressed changes (`DROP/RENAME CONSTRAINT`, `DROP INDEX`,
-///   `VALIDATE`, `Other`) fence all: names do not map to columns here.
+/// - `ALTER COLUMN` narrows: the target plus the op's referenced columns
+///   fence, except `FIRST`/`AFTER` placement fences all (ordinals may
+///   shift and the `AFTER` anchor is uncarried). `CHANGE`/`MODIFY`
+///   rewrites whose definition is opaque degrade to `Other` at emission.
+/// - Generated `ADD COLUMN` expressions and name-addressed changes
+///   (`DROP/RENAME CONSTRAINT`, `DROP INDEX`, `VALIDATE`, `Other`) fence
+///   all: names do not map to columns here.
 fn fold_generation_change(
     chain: &[ir::Name],
     implicit: bool,
@@ -565,8 +572,19 @@ fn fold_generation_change(
         ir::AlterChange::AddConstraint { constraint } => {
             fold_constraint(chain, constraint, generation);
         }
-        ir::AlterChange::AlterColumn { .. }
-        | ir::AlterChange::DropConstraint { .. }
+        ir::AlterChange::AlterColumn {
+            column,
+            referenced,
+            repositions,
+            ..
+        } => {
+            generation.touched.insert(column.clone());
+            generation.touched.extend(referenced.iter().cloned());
+            if *repositions {
+                generation.all = true;
+            }
+        }
+        ir::AlterChange::DropConstraint { .. }
         | ir::AlterChange::DropIndex { .. }
         | ir::AlterChange::RenameConstraint { .. }
         | ir::AlterChange::ValidateConstraint { .. }
@@ -1870,11 +1888,193 @@ mod tests {
     }
 
     #[test]
-    fn alter_column_other_still_fences_all() {
-        // The `USING` expression hides in an opaque detail string, so
-        // "other column" is unprovable without frontend changes.
+    fn alter_column_no_expr_fences_target_only() {
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ALTER COLUMN a SET NOT NULL;\nINSERT INTO t(a, b) VALUES (1, 2);";
         let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_pure_type_fences_target_only() {
+        // No `USING`: the op names the target only, so siblings lift.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ALTER COLUMN a TYPE BIGINT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_using_fences_target_and_refs() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t ALTER COLUMN a TYPE BIGINT USING (a + b);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "c").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_set_default_fences_target_and_refs() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t ALTER COLUMN a SET DEFAULT (b + 1);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "c").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_identity_fences_target_only() {
+        // Sequence options carry no column references here, so only the
+        // target fences.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ALTER COLUMN a ADD GENERATED ALWAYS AS IDENTITY (START WITH 10);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_generic_options_fence_target_only() {
+        // Foreign-table option keys/values are FDW names, never same-table
+        // columns.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ALTER COLUMN a OPTIONS (ADD x 'y');\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn modify_column_plain_fences_target_only() {
+        // Generic parses the same MySQL rewrite syntax (`MODIFY`, `CHANGE`,
+        // `FIRST`/`AFTER`, `AUTO_INCREMENT`) without MySQL's implicit-commit
+        // DDL effects, which fence every bundle as unknown.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT NOT NULL;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn modify_column_default_ref_fences_target_and_refs() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t MODIFY COLUMN a INT DEFAULT (b);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "c").blocked, None);
+    }
+
+    #[test]
+    fn modify_column_after_fences_all() {
+        // `AFTER` repositions: ordinals may shift and the anchor names an
+        // uncarried sibling.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT AFTER b;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn change_column_first_fences_all() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t CHANGE COLUMN a a INT FIRST;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn change_column_rename_narrows_other() {
+        // Rename `a` to `a2` plus a plain rewrite: `a` fences as the
+        // rename source, `b` is untouched and lifts.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t CHANGE COLUMN a a2 INT NOT NULL;\nINSERT INTO t(a2, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn modify_column_auto_increment_stays_fenced() {
+        // `AUTO_INCREMENT` parses to unparsed dialect `Token` text, so
+        // absence of column references is unprovable: opaque, fences all.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT AUTO_INCREMENT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn modify_column_self_fk_explicit_narrows() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t MODIFY COLUMN a INT REFERENCES t(b);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "c").blocked, None);
+    }
+
+    #[test]
+    fn modify_column_self_fk_implicit_stays_fenced() {
+        // Implicit parent columns mean the parent key: unnameable here,
+        // so the rewrite stays opaque and fences all.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT REFERENCES t;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
