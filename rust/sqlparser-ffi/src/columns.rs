@@ -1509,10 +1509,10 @@ mod tests {
 
     #[test]
     fn routine_call_keeps_global_opaque_fence() {
-        // `SUM` stays outside the pure-builtin table, so it is legitimately a
-        // global opaque barrier in native facts and every bundle blocks as
-        // unknown.
-        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT SUM(a) FROM t;";
+        // `frobnicate` stays outside the pure-builtin tables, so it is
+        // legitimately a global opaque barrier in native facts and every
+        // bundle blocks as unknown.
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT frobnicate(a) FROM t;";
         let (_, targets) = parse_both(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),

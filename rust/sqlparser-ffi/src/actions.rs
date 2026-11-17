@@ -842,6 +842,74 @@ fn index_column_ident(column: &IndexColumn, rules: &ir::IdentifierRules) -> Opti
     }
 }
 
+/// Key-part columns of an index-bearing table constraint (`PRIMARY KEY`,
+/// `UNIQUE`, `INDEX`/`KEY`, fulltext/spatial). Every other constraint shape
+/// carries no key parts.
+fn index_constraint_columns(constraint: &TableConstraint) -> &[IndexColumn] {
+    match constraint {
+        TableConstraint::PrimaryKey(primary) => &primary.columns,
+        TableConstraint::Unique(unique) => &unique.columns,
+        TableConstraint::Index(index) => &index.columns,
+        TableConstraint::FulltextOrSpatial(fulltext) => &fulltext.columns,
+        _ => &[],
+    }
+}
+
+/// Whether `expr` is a MySQL index length prefix (`col(N)`), which sqlparser
+/// lowers as `Expr::Function`. The match is structural — position plus the
+/// exact prefix shape (single-part name, one unsigned-numeric literal, no
+/// window/filter/grouping/parametric machinery) — never a name-table lookup:
+/// functional key parts require double parens and lower as `Nested`, so a
+/// bare `name(N)` in key position is the length-prefix production, a
+/// positional marker rather than a call.
+fn is_index_length_prefix(expr: &Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    if function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return false;
+    }
+    if !matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(_)]) {
+        return false;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    if arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+        || arguments.args.len() != 1
+    {
+        return false;
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(length)))] =
+        arguments.args.as_slice()
+    else {
+        return false;
+    };
+    match &length.value {
+        Value::Number(text, _) => {
+            !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// Exclude MySQL index length prefixes in `columns` from the deferred routine
+/// fence. Real calls in key position (expression indexes, column arguments,
+/// qualified names) match no prefix shape and keep fencing.
+fn ignore_index_length_prefixes(roots: &mut Vec<Span>, columns: &[IndexColumn]) {
+    for column in columns {
+        if is_index_length_prefix(&column.column.expr) {
+            roots.push(column.column.expr.span());
+        }
+    }
+}
+
 fn constraint_from_table(
     constraint: &TableConstraint,
     dialect: DialectKind,
@@ -3204,6 +3272,36 @@ pub(super) fn analyze_statement(
         // edge, so the whole scheme subtree is excluded from the
         // deferred-function check.
         visitor.ignored_function_roots.push(partition_by.span());
+    }
+    if matches!(dialect, DialectKind::MySql) {
+        // MySQL index length prefixes (`col(N)`) lower as `Expr::Function`
+        // but name no routine; only the prefix shape in key position is
+        // excluded, and only on MySQL, where the production exists. On every
+        // other dialect `b(1)` in key position keeps fencing as a call.
+        match statement {
+            Statement::CreateTable(create) => {
+                for constraint in &create.constraints {
+                    ignore_index_length_prefixes(
+                        &mut visitor.ignored_function_roots,
+                        index_constraint_columns(constraint),
+                    );
+                }
+            }
+            Statement::CreateIndex(create) => {
+                ignore_index_length_prefixes(&mut visitor.ignored_function_roots, &create.columns);
+            }
+            Statement::AlterTable(alter) => {
+                for operation in &alter.operations {
+                    if let AlterTableOperation::AddConstraint { constraint, .. } = operation {
+                        ignore_index_length_prefixes(
+                            &mut visitor.ignored_function_roots,
+                            index_constraint_columns(constraint),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();

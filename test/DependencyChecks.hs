@@ -14,6 +14,7 @@ import Occam.Core (
     CatalogOp (..),
     ColumnDef (..),
     ConflictAction (..),
+    Constraint (..),
     DataWrite (..),
     DeleteScope (..),
     Ident (..),
@@ -86,6 +87,10 @@ tableDefinition parts ops =
 definedColumns :: [Text] -> [CatalogOp] -> [Text]
 definedColumns parts ops =
     maybe [] (map (identText . columnName) . tableColumns) (tableDefinition parts ops)
+
+isNamedIndex :: Text -> Constraint -> Bool
+isNamedIndex wanted (IndexConstraint (Just (Ident name)) _ _) = wanted == name
+isNamedIndex _ _ = False
 
 readsFor :: StatementId -> DependencyGraph -> [ReadFact]
 readsFor sid graph = [readFact | ReadOp readFact <- opsFor sid graph]
@@ -1500,6 +1505,57 @@ tests =
             assertBool
                 "the unknown call still chains every prior statement"
                 (has (StatementId 1) deps && has (StatementId 2) deps)
+        , testCase "pure aggregate projections keep reads without a global fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT a, sum(b) FROM t GROUP BY a;"
+                        ]
+            graph <- analyze SQLite sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the aggregate projection depends on its table definition"
+                (has (StatementId 2) deps)
+            assertBool
+                "no global fence chains the unrelated table"
+                (not (has (StatementId 1) deps))
+            assertEqual
+                "grouping and argument reads survive the lifted fence"
+                ["a", "b"]
+                [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
+        , testCase "generic keyword coalesce keeps reads without a global fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT COALESCE(a, b) FROM t;"
+                        ]
+            graph <- analyze GenericSQL sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the generic projection depends on its table definition"
+                (has (StatementId 2) deps)
+            assertBool
+                "no global fence chains the unrelated table"
+                (not (has (StatementId 1) deps))
+            assertEqual
+                "argument reads survive the lifted fence"
+                ["a", "b"]
+                [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
+        , testCase "mysql index prefixes carry no routine fence and keep the index" $ do
+            let sql =
+                    BSC.unlines
+                        ["CREATE TEMPORARY TABLE t1 (i INT, b BLOB, PRIMARY KEY pk (i), INDEX sk (b(1)));"]
+            graph <- analyze MySQL sql
+            assertBool
+                "the index prefix carries no routine fence"
+                (null (factBarriers (factsFor (StatementId 1) graph)))
+            let constraints =
+                    maybe [] tableConstraints (tableDefinition ["t1"] (opsFor (StatementId 1) graph))
+            assertBool
+                "the index definition survives the lifted fence"
+                (any (isNamedIndex "sk") constraints)
         , testCase "partitioned parent reads depend on child definitions and writes" $ do
             let sql =
                     BSC.unlines

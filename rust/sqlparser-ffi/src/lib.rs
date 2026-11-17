@@ -2662,12 +2662,71 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn pure_aggregates_lift_the_routine_fence() {
+        let calls = [
+            ("avg(a)", vec!["a"]),
+            ("count(*)", vec![]),
+            ("count(a)", vec!["a"]),
+            ("count(DISTINCT a)", vec!["a"]),
+            ("max(a)", vec!["a"]),
+            ("min(a)", vec!["a"]),
+            ("sum(a)", vec!["a"]),
+            ("sum(DISTINCT a)", vec!["a"]),
+            ("AVG(a)", vec!["a"]),
+            ("COUNT(*)", vec![]),
+            ("MAX(a)", vec!["a"]),
+            ("MIN(a)", vec!["a"]),
+            ("SUM(a)", vec!["a"]),
+        ];
+        for dialect in [
+            DialectKind::SQLite,
+            DialectKind::PostgreSql,
+            DialectKind::MySql,
+        ] {
+            for (call, columns) in &calls {
+                let sql = format!("SELECT {call} FROM t;");
+                let units = parse(&sql, dialect).unwrap();
+                let unit_facts = facts(&units[0]);
+                assert!(
+                    unit_facts.barriers.is_empty(),
+                    "{sql} on {dialect:?}: {:?}",
+                    unit_facts.barriers
+                );
+                assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
+                assert_eq!(
+                    read_column_names(unit_facts),
+                    columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "{sql}"
+                );
+            }
+            // Grouped projections lift with the grouping columns intact.
+            let sql = "SELECT a, sum(b) FROM t GROUP BY a;";
+            let units = parse(sql, dialect).unwrap();
+            let unit_facts = facts(&units[0]);
+            assert!(
+                unit_facts.barriers.is_empty(),
+                "{sql} on {dialect:?}: {:?}",
+                unit_facts.barriers
+            );
+            assert_eq!(
+                read_column_names(unit_facts),
+                vec!["a".to_string(), "b".to_string()],
+                "{sql}"
+            );
+        }
+        // Quoted spellings follow the same folding rule as scalars.
+        let units = parse("SELECT \"sum\"(a) FROM t;", DialectKind::PostgreSql).unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
+        let units = parse("SELECT \"Sum\"(a) FROM t;", DialectKind::PostgreSql).unwrap();
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
 
     #[test]
     fn function_argument_reads_are_extracted_for_fenced_calls() {
         // Reads flow through function arguments independently of fencing: the
         // fence never drops a read edge.
-        let units = parse("SELECT a, SUM(b) FROM t;", DialectKind::SQLite).unwrap();
+        let units = parse("SELECT a, frobnicate(b) FROM t;", DialectKind::SQLite).unwrap();
         let unit_facts = facts(&units[0]);
         assert!(has_routine_barrier(unit_facts));
         assert_eq!(relation_reads(unit_facts), vec!["t".to_string()]);
@@ -2686,11 +2745,10 @@ mod tests {
         ] {
             for sql in [
                 "SELECT frobnicate(a) FROM t;",
-                "SELECT count(*) FROM t;",
-                "SELECT sum(a) FROM t;",
-                "SELECT avg(a) FROM t;",
-                "SELECT min(a) FROM t;",
-                "SELECT max(a) FROM t;",
+                // Window shapes fence even under a listed name.
+                "SELECT abs(a) OVER (PARTITION BY b) FROM t;",
+                "SELECT sum(a) OVER (PARTITION BY b) FROM t;",
+                "SELECT sum(DISTINCT a) OVER (PARTITION BY b) FROM t;",
             ] {
                 let units = parse(sql, dialect).unwrap();
                 assert!(
@@ -2699,20 +2757,116 @@ mod tests {
                 );
             }
         }
-        // Generic keeps the blanket fence: the table is seeded only for
-        // SQLite, PostgreSQL, and MySQL.
-        let units = parse("SELECT abs(a) FROM t;", DialectKind::Generic).unwrap();
-        assert!(has_routine_barrier(facts(&units[0])));
         // Qualification fences even under a builtin name.
-        let units = parse("SELECT pg_catalog.abs(a) FROM t;", DialectKind::PostgreSql).unwrap();
-        assert!(has_routine_barrier(facts(&units[0])));
-        // Window shapes fence even under a builtin name.
-        let units = parse(
-            "SELECT abs(a) OVER (PARTITION BY b) FROM t;",
+        for sql in [
+            "SELECT pg_catalog.abs(a) FROM t;",
+            "SELECT pg_catalog.sum(a) FROM t;",
+        ] {
+            let units = parse(sql, DialectKind::PostgreSql).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+    }
+
+    #[test]
+    fn unproven_aggregate_and_window_shapes_still_fence() {
+        for dialect in [
+            DialectKind::SQLite,
             DialectKind::PostgreSql,
-        )
-        .unwrap();
-        assert!(has_routine_barrier(facts(&units[0])));
+            DialectKind::MySql,
+        ] {
+            for sql in [
+                // Statistical siblings are not uniform builtins.
+                "SELECT stddev(a) FROM t;",
+                "SELECT stddev_pop(a) FROM t;",
+                "SELECT variance(a) FROM t;",
+                "SELECT var_samp(a) FROM t;",
+                // String-building aggregates are outside the proven set.
+                "SELECT group_concat(a) FROM t;",
+                "SELECT string_agg(a, ',') FROM t;",
+                // Window-only names fence.
+                "SELECT row_number() OVER (ORDER BY a) FROM t;",
+                "SELECT rank() OVER (ORDER BY a) FROM t;",
+                "SELECT lag(a) OVER (ORDER BY b) FROM t;",
+                // Ordered-set shapes fence.
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t;",
+            ] {
+                let units = parse(sql, dialect).unwrap();
+                assert!(units[0].parse_error.is_none(), "{sql} on {dialect:?}");
+                assert!(
+                    has_routine_barrier(facts(&units[0])),
+                    "{sql} on {dialect:?}"
+                );
+            }
+        }
+        // FILTER fences even under a listed name.
+        for (dialect, sql) in [
+            (
+                DialectKind::PostgreSql,
+                "SELECT sum(a) FILTER (WHERE b > 0) FROM t;",
+            ),
+            (
+                DialectKind::SQLite,
+                "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+    }
+
+    #[test]
+    fn generic_keyword_subset_lifts_but_other_names_still_fence() {
+        for (call, columns) in [
+            ("coalesce(a, b)", vec!["a", "b"]),
+            ("COALESCE(a, b)", vec!["a", "b"]),
+            ("Coalesce(a, b)", vec!["a", "b"]),
+            ("nullif(a, b)", vec!["a", "b"]),
+            ("NULLIF(a, b)", vec!["a", "b"]),
+        ] {
+            let sql = format!("SELECT {call} FROM t;");
+            let units = parse(&sql, DialectKind::Generic).unwrap();
+            let unit_facts = facts(&units[0]);
+            assert!(
+                unit_facts.barriers.is_empty(),
+                "{sql}: {:?}",
+                unit_facts.barriers
+            );
+            assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
+            assert_eq!(
+                read_column_names(unit_facts),
+                columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "{sql}"
+            );
+        }
+        // Ordinary names — scalars and aggregates alike — still fence on
+        // Generic: on an unknown engine they may resolve to user routines.
+        for sql in [
+            "SELECT abs(a) FROM t;",
+            "SELECT concat(a, b) FROM t;",
+            "SELECT sum(a) FROM t;",
+            "SELECT count(*) FROM t;",
+            "SELECT frobnicate(a) FROM t;",
+            // Quoted spellings are identifiers, not keywords.
+            "SELECT \"coalesce\"(a, b) FROM t;",
+            "SELECT \"NULLIF\"(a, b) FROM t;",
+        ] {
+            let units = parse(sql, DialectKind::Generic).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+        // Unseeded dialects keep the blanket fence bit-identically.
+        for (dialect, sql) in [
+            (DialectKind::Snowflake, "SELECT abs(a) FROM t;"),
+            (DialectKind::Snowflake, "SELECT coalesce(a, b) FROM t;"),
+            (DialectKind::DuckDB, "SELECT sum(a) FROM t;"),
+            (DialectKind::DuckDB, "SELECT nullif(a, b) FROM t;"),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(
+                has_routine_barrier(facts(&units[0])),
+                "{sql} on {dialect:?}"
+            );
+        }
     }
 
     #[test]
@@ -2778,6 +2932,34 @@ mod tests {
         .unwrap();
         assert_eq!(units.len(), 2);
         assert!(has_routine_barrier(facts(&units[1])));
+        // The coarse disable covers the aggregate and Generic tables too.
+        let units = parse(
+            "DROP FUNCTION sum; SELECT sum(a) FROM t;",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(has_routine_barrier(facts(&units[1])));
+        let units = parse(
+            "DROP FUNCTION coalesce; SELECT coalesce(a, b) FROM t;",
+            DialectKind::Generic,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(has_routine_barrier(facts(&units[1])));
+        // Macros are callable routines too: a shadowing macro disables the
+        // Generic keyword table (CREATE MACRO parses on Generic/DuckDB only,
+        // so Generic is where the disable is observable).
+        let units = parse(
+            "CREATE MACRO coalesce(a, b) AS a; SELECT coalesce(a, b) FROM t;",
+            DialectKind::Generic,
+        )
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units[0].parse_error.is_none());
+        for unit in &units {
+            assert!(has_routine_barrier(facts(unit)));
+        }
         // A parse error anywhere also disables the table: unparsed routine
         // DDL cannot be ruled out.
         let units = parse("SELECT abs(a) FROM t; SELECT FROM;", DialectKind::SQLite).unwrap();
@@ -2801,6 +2983,10 @@ mod tests {
             (
                 DialectKind::PostgreSql,
                 "CREATE VIEW v AS SELECT abs(a) FROM t;",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "CREATE VIEW v AS SELECT sum(a) FROM t;",
             ),
         ] {
             let units = parse(sql, dialect).unwrap();
@@ -2830,13 +3016,78 @@ mod tests {
     }
 
     #[test]
-    fn parser_artifacts_still_fence() {
-        // MySQL index prefixes (`b(1)`) lower as Expr::Function: fenced.
+    fn mysql_index_prefix_lifts_but_real_index_calls_fence() {
+        // MySQL index length prefixes (`b(1)`) lower as Expr::Function but
+        // name no routine: structurally excluded in key position only.
+        for sql in [
+            "CREATE TEMPORARY TABLE t1(i INT, b BLOB, PRIMARY KEY pk(i), INDEX sk(b(1)));",
+            "CREATE TABLE t (b BLOB, UNIQUE KEY uk (b(1)));",
+            "CREATE TABLE t (b BLOB, PRIMARY KEY (b(10)));",
+            "CREATE INDEX sk ON t (b(1));",
+            "CREATE INDEX sk ON t (`b`(1));",
+            "CREATE INDEX sk ON t ((lower(b)));",
+            "ALTER TABLE t ADD INDEX sk (b(1));",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(
+                facts(&units[0]).barriers.is_empty(),
+                "{sql}: {:?}",
+                facts(&units[0]).barriers
+            );
+        }
+        // The index definition survives the lifted fence.
         let units = parse(
             "CREATE TEMPORARY TABLE t1(i INT, b BLOB, PRIMARY KEY pk(i), INDEX sk(b(1)));",
             DialectKind::MySql,
         )
         .unwrap();
+        let table = table_def(facts(&units[0])).expect("index table def");
+        assert!(
+            table.constraints.iter().any(|constraint| matches!(
+                constraint,
+                Constraint::Index {
+                    name: Some(name),
+                    ..
+                } if name.0 == "sk"
+            )),
+            "{:?}",
+            table.constraints
+        );
+        let units = parse("CREATE INDEX sk ON t (b(1));", DialectKind::MySql).unwrap();
+        assert!(
+            facts(&units[0]).ops.iter().any(|op| matches!(
+                op,
+                CatalogOp::DefineIndex(index) if name_text(&index.table.name) == "t"
+            )),
+            "{:?}",
+            facts(&units[0]).ops
+        );
+        // Real calls in key position keep fencing: expression indexes lower
+        // as Nested, and column or multi-argument calls match no prefix shape.
+        for sql in [
+            "CREATE INDEX sk ON t ((f(b)));",
+            "CREATE INDEX sk ON t (f(b));",
+            "CREATE INDEX sk ON t (f(1, 2));",
+            "CREATE INDEX sk ON t (b(1.5));",
+            "CREATE TABLE t (a INT, b BLOB, INDEX sk (f(b)));",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+        // Real calls in non-index positions still fence.
+        for sql in [
+            "CREATE TABLE t (x INT DEFAULT f(1));",
+            "CREATE TABLE t (a INT, CHECK (f(a) > 0));",
+        ] {
+            let units = parse(sql, DialectKind::MySql).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+        // The prefix production exists only on MySQL: `b(1)` in key position
+        // keeps fencing elsewhere as a call.
+        let units = parse("CREATE INDEX sk ON t (b(1));", DialectKind::PostgreSql).unwrap();
+        assert!(units[0].parse_error.is_none());
         assert!(has_routine_barrier(facts(&units[0])));
     }
 

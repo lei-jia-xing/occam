@@ -154,8 +154,9 @@ pub(super) struct AnalysisVisitor<'a> {
     pub(super) unmodeled_relation_spans: Vec<Span>,
     pub(super) unmodeled_table_source: bool,
     pub(super) has_function: bool,
-    /// Subtrees whose function calls never fence (PostgreSQL `PARTITION BY`
-    /// scheme expressions, which lower the scheme keyword as `Function`).
+    /// Subtrees whose function calls never fence: PostgreSQL `PARTITION BY`
+    /// scheme expressions (which lower the scheme keyword as `Function`) and
+    /// MySQL index length prefixes (which lower `col(N)` as `Function`).
     /// Any expression whose span falls inside a root is skipped by the
     /// deferred-function check.
     pub(super) ignored_function_roots: Vec<Span>,
@@ -2563,8 +2564,9 @@ impl Visitor for AnalysisVisitor<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
         // Expressions inside an ignored root (PostgreSQL `PARTITION BY`
-        // schemes) never fence: the scheme keyword lowers as `Function` but
-        // names no routine, and the scheme affects row placement, not
+        // schemes, MySQL index length prefixes) never fence: the scheme
+        // keyword and the length prefix lower as `Function` but name no
+        // routine, and both affect row placement or key shape, not
         // table-level dependencies.
         let ignored = Self::in_ignored_function_root(&self.ignored_function_roots, expr.span());
         self.has_function |= !ignored
