@@ -57,7 +57,7 @@
 # Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.
 - `CREATE STATISTICS` unsupported by grammar -- 10 units: benchmarks/real_fuzz_corpus/pg_stack_overflow_27stmts.sql (s0-s7), pg_fuzzer_mcv_clauses.sql:3, pg_fuzzer_mcv_enhanced.sql:30
 - MySQL BINARY/charset column syntax unparsed -- benchmarks/real_fuzz_corpus/mysql_bug88355.sql:1,3
-- `PRAGMA ... = true/false` boolean literal unparsed upstream; occam-side token pre-normalization in rust/sqlparser-ffi/src/parser.rs (`true`/`false` -> `Number(1/0)`, spans preserved) -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
+- `PRAGMA recursive_triggers = true` boolean literal unparsed -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
 - `CREATE VIRTUAL TABLE ... USING fts5/fts4` exposes no module/shadow-table structure -- TODO(upstream-sqlparser) catch-all in analyze_statement (virtual-table item) + sqlite_fuzz_fts5_savepoint.sql:1-2
 - Standalone `TABLE t` rejected -- README.md:77 ("Parser limits" paragraph)
 - CTAS `WITH NO DATA` rejected under Snowflake -- README.md:77
