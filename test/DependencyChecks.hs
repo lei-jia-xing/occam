@@ -1552,6 +1552,36 @@ tests =
                     ((== UnknownAlterBarrier) . barrierReason)
                     (factBarriers (factsFor (StatementId 3) graph))
                 )
+        , testCase "upsert conflict targets and SET sources read the target row" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE item_inventory (sku VARCHAR(32) PRIMARY KEY, item_name VARCHAR(64) NOT NULL, quantity INT NOT NULL);"
+                        , "INSERT INTO item_inventory (sku, item_name, quantity) VALUES ('SKU-001', 'Widget Alpha', 30) ON CONFLICT (sku) DO UPDATE SET quantity = item_inventory.quantity + EXCLUDED.quantity;"
+                        , "INSERT INTO item_inventory (sku, item_name, quantity) VALUES ('SKU-002', 'Gadget Beta', 20) ON CONFLICT (sku) DO NOTHING;"
+                        ]
+            graph <- analyze SQLite sql
+            assertBool
+                "the upsert writes with the conflict-update action"
+                (hasWrite ["item_inventory"] (InsertWrite ConflictUpdate) (opsFor (StatementId 2) graph))
+            assertEqual
+                "the arbiter probe and SET sources read only the target"
+                (Set.singleton "item_inventory")
+                (readSources (StatementId 2) graph)
+            assertBool
+                "the arbiter and SET-source columns are covered"
+                ( Set.fromList ["sku", "quantity"]
+                    `Set.isSubsetOf` Set.fromList
+                        [identText column | readFact <- allReadFacts (StatementId 2) graph, column <- readColumns readFact]
+                )
+            assertBool
+                "DO NOTHING keeps the conflict-ignore action"
+                (hasWrite ["item_inventory"] (InsertWrite ConflictIgnore) (opsFor (StatementId 3) graph))
+            assertEqual
+                "DO NOTHING reads only the arbiter column"
+                (Set.singleton "sku")
+                ( Set.fromList
+                    [identText column | readFact <- allReadFacts (StatementId 3) graph, column <- readColumns readFact]
+                )
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

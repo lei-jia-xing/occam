@@ -4,7 +4,7 @@ import Benchmark (BenchmarkMetric (..))
 import ColumnChecks qualified
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (when)
-import Data.Aeson (eitherDecodeStrict')
+import Data.Aeson (Value, eitherDecodeStrict')
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isSpace)
@@ -397,6 +397,16 @@ phase5Tests =
                 -- No component emits debug-level messages yet, so INFO visibility is the
                 -- observable proof the flag took effect (text mode used to force WARN).
                 assertBool "text mode ignored --log-level debug" ("[INFO " `isInfixOf` err)
+        , testCase "--dump-facts emits per-statement JSON and stays hidden from --help" $
+            withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
+                (helpCode, helpOut, _) <- runOccamCLI ["--help"]
+                assertEqual "help must exit zero" ExitSuccess helpCode
+                assertBool "--dump-facts leaked into --help" (not ("dump-facts" `isInfixOf` helpOut))
+                (code, out, err) <- runOccamCLI [input, "--dump-facts", "--dialect", "sqlite"]
+                assertEqual ("--dump-facts failed: " ++ err) ExitSuccess code
+                case eitherDecodeStrict' (BSC.pack out) :: Either String Value of
+                    Left e -> assertFailure ("--dump-facts output is not JSON: " ++ e)
+                    Right _ -> assertBool "missing statements key" ("\"statements\"" `isInfixOf` out)
         ]
 
 -- ----------------------------------------------------------------------------

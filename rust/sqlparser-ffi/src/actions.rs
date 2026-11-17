@@ -3,7 +3,7 @@ use crate::edits::{AnalysisContext, AnalysisVisitor, SequenceVisitor};
 use crate::ir;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn canonical_ident(
     ident: &Ident,
@@ -1233,6 +1233,131 @@ fn insert_columns(insert: &Insert, rules: &ir::IdentifierRules) -> Vec<ir::Ident
         None | Some(_) => {}
     }
     columns
+}
+
+/// Column references in an `ON CONFLICT` clause that read the stored target
+/// row. `EXCLUDED`-qualified references name the proposed row, not stored
+/// data, so they contribute no read; anything else (bare or
+/// target-qualified) is a target-row read, mirroring plain `UPDATE` where
+/// the target stays a readable relation.
+struct ConflictReadCollector<'a> {
+    rules: &'a ir::IdentifierRules,
+    /// Each referenced column, kept only if seen outside an `EXCLUDED`
+    /// qualifier at least once.
+    stored: HashMap<ir::Ident, bool>,
+    order: Vec<ir::Ident>,
+}
+
+impl Visitor for ConflictReadCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        let (ident, excluded) = match expr {
+            Expr::Identifier(ident) => (ident, false),
+            Expr::CompoundIdentifier(idents) => match idents.last() {
+                Some(last) => {
+                    let excluded = idents.first().is_some_and(|first| {
+                        first.quote_style.is_none() && first.value.eq_ignore_ascii_case("excluded")
+                    });
+                    (last, excluded)
+                }
+                None => return std::ops::ControlFlow::Continue(()),
+            },
+            _ => return std::ops::ControlFlow::Continue(()),
+        };
+        let column = canonical_ident(ident, self.rules, ir::IdentifierClass::Column);
+        match self.stored.get_mut(&column) {
+            Some(seen_stored) => *seen_stored |= !excluded,
+            None => {
+                self.stored.insert(column.clone(), !excluded);
+                self.order.push(column);
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn conflict_expr_columns(expr: &Expr, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
+    let mut collector = ConflictReadCollector {
+        rules,
+        stored: HashMap::new(),
+        order: Vec::new(),
+    };
+    let _ = expr.visit(&mut collector);
+    let ConflictReadCollector { stored, order, .. } = collector;
+    order
+        .into_iter()
+        .filter(|column| stored.get(column).copied().unwrap_or(false))
+        .collect()
+}
+
+/// Target-row reads implied by an `ON CONFLICT` clause: the arbiter probe
+/// reads the conflict-target columns (plus the partial-index predicate, if
+/// any), and `DO UPDATE` re-reads the row through its `SET` values and
+/// `WHERE` filter. Plain `INSERT` excludes its target from visitor reads, so
+/// without this the upsert under-models exactly what the engine authorizes.
+fn conflict_read_columns(conflict: &OnConflict, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
+    let mut columns = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |column: ir::Ident| {
+        if seen.insert(column.clone()) {
+            columns.push(column);
+        }
+    };
+    if let Some(ConflictTarget::Columns {
+        columns: arbiter,
+        predicate,
+    }) = &conflict.conflict_target
+    {
+        for column in arbiter {
+            push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+        }
+        if let Some(predicate) = predicate {
+            for column in conflict_expr_columns(predicate, rules) {
+                push(column);
+            }
+        }
+    }
+    if let OnConflictAction::DoUpdate(update) = &conflict.action {
+        for assignment in &update.assignments {
+            for column in conflict_expr_columns(&assignment.value, rules) {
+                push(column);
+            }
+        }
+        if let Some(selection) = &update.selection {
+            for column in conflict_expr_columns(selection, rules) {
+                push(column);
+            }
+        }
+    }
+    columns
+}
+
+/// Attach `ON CONFLICT` target-row reads to an upsert write's reads,
+/// extending the visitor read when the target is already read (e.g. a
+/// `DO UPDATE` subquery over the target itself).
+fn merge_conflict_reads(
+    reads: &mut Vec<ir::ReadFact>,
+    target: &ir::NameRef,
+    conflict: &OnConflict,
+    rules: &ir::IdentifierRules,
+) {
+    let extra = conflict_read_columns(conflict, rules);
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(existing) = reads
+        .iter_mut()
+        .find(|read| read.mode == ir::ReadMode::Data && read.source == *target)
+    {
+        for column in extra {
+            if !existing.columns.contains(&column) {
+                existing.columns.push(column);
+            }
+        }
+    } else {
+        reads.push(read_fact(target.clone(), ir::ReadMode::Data, extra, false));
+    }
 }
 
 /// A plain `VALUES` query source: positional rows with no `WITH` wrapper.
@@ -3701,7 +3826,10 @@ pub(super) fn analyze_statement(
                 .unwrap_or_default();
             match target {
                 Some(target) => {
-                    let reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
+                    let mut reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
+                    if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
+                        merge_conflict_reads(&mut reads, &target, conflict, rules);
+                    }
                     facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
                         target,
                         kind: ir::WriteKind::Insert {
@@ -4024,8 +4152,9 @@ pub(super) fn analyze_statement(
                 }
             } else {
                 // Assignments to recursive_triggers/defer_foreign_keys and unknown
-                // pragmas stay fenced, and bare-literal values (`= true`)
-                // still fail upstream parsing (see TODO.org "Upstream Gaps").
+                // pragmas stay fenced. Boolean literals (`= true`) reach here as
+                // `Number(1/0)` via the PRAGMA pre-normalization in parser.rs; the
+                // upstream grammar gap is still recorded in TODO.org "Upstream Gaps".
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownSessionEffect,
                     Some(statement.to_string()),

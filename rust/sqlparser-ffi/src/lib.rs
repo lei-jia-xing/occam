@@ -14,7 +14,7 @@ pub use ffi::{occam_sql_count, occam_sql_free, occam_sql_parse, occam_sql_parse_
 pub(crate) use ir::*;
 
 #[cfg(test)]
-use parser::{count_units, parse_units};
+use parser::{count_units, normalize_pragma_bool_values, parse_units};
 #[cfg(test)]
 use sqlparser::dialect::SQLiteDialect;
 #[cfg(test)]
@@ -617,6 +617,86 @@ mod tests {
             &group_sql[edit.end..]
         );
         assert_eq!(reduced, "SELECT a FROM t;");
+    }
+
+    #[test]
+    fn upsert_conflict_reads_cover_arbiter_and_set_sources() {
+        let sql = "INSERT INTO item_inventory (sku, item_name, quantity) VALUES ('SKU-001', 'Widget Alpha', 30) ON CONFLICT (sku) DO UPDATE SET quantity = item_inventory.quantity + EXCLUDED.quantity;";
+        let units = parse(sql, DialectKind::SQLite).unwrap();
+        let write = writes(facts(&units[0]));
+        assert_eq!(write.len(), 1);
+        assert!(
+            matches!(
+                write[0].kind,
+                WriteKind::Insert {
+                    conflict: ConflictAction::Update
+                }
+            ),
+            "{:?}",
+            write[0].kind
+        );
+        assert_eq!(write[0].reads.len(), 1);
+        let read = &write[0].reads[0];
+        assert_eq!(name_text(&read.source.name), "item_inventory");
+        assert_eq!(read.mode, ReadMode::Data);
+        let mut columns: Vec<String> = read.columns.iter().map(|column| column.0.clone()).collect();
+        columns.sort();
+        assert_eq!(columns, vec!["quantity".to_string(), "sku".to_string()]);
+        // The proposed row is not stored data: every conflict read stays on
+        // the target table.
+        assert!(
+            write[0]
+                .reads
+                .iter()
+                .all(|read| name_text(&read.source.name) == "item_inventory"),
+            "{:?}",
+            write[0].reads
+        );
+
+        // DO NOTHING still probes the arbiter.
+        let sql = "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING;";
+        let units = parse(sql, DialectKind::SQLite).unwrap();
+        let write = writes(facts(&units[0]));
+        assert_eq!(write.len(), 1);
+        assert!(
+            matches!(
+                write[0].kind,
+                WriteKind::Insert {
+                    conflict: ConflictAction::Ignore
+                }
+            ),
+            "{:?}",
+            write[0].kind
+        );
+        assert_eq!(write[0].reads.len(), 1);
+        assert_eq!(name_text(&write[0].reads[0].source.name), "t");
+        assert_eq!(write[0].reads[0].columns, vec![Ident("a".to_string())]);
+
+        // DO UPDATE ... WHERE reads its filter columns too.
+        let sql =
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE c > 0;";
+        let units = parse(sql, DialectKind::SQLite).unwrap();
+        let write = writes(facts(&units[0]));
+        assert_eq!(write.len(), 1);
+        let mut columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        columns.sort();
+        assert_eq!(columns, vec!["a".to_string(), "c".to_string()]);
+
+        // No arbiter, no extra reads; plain INSERTs are untouched.
+        for sql in [
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING;",
+            "INSERT INTO t (a) VALUES (1);",
+            "INSERT OR IGNORE INTO t (a) VALUES (1);",
+        ] {
+            let units = parse(sql, DialectKind::SQLite).unwrap();
+            let write = writes(facts(&units[0]));
+            assert_eq!(write.len(), 1, "{sql}");
+            assert!(write[0].reads.is_empty(), "{sql}: {:?}", write[0].reads);
+        }
     }
 
     #[test]
@@ -3274,5 +3354,85 @@ mod tests {
             assert!(facts(&units[0]).session.is_empty(), "{sql}");
             assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
         }
+    }
+
+    #[test]
+    fn pragma_boolean_values_normalize_with_stable_spans() {
+        // Every spelling parses; the effectful assignment stays fenced and
+        // keeps its exact statement span.
+        for value in ["true", "false", "True", "FALSE"] {
+            let body = format!("PRAGMA recursive_triggers = {value}");
+            let sql = format!("{body};");
+            let units = parse(&sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert_eq!(&sql[units[0].start..units[0].end], body);
+            assert!(
+                facts(&units[0]).barriers.iter().any(|barrier| {
+                    matches!(
+                        barrier,
+                        ScopedBarrier {
+                            scope: BarrierScope::Global,
+                            reason: BarrierReason::UnknownSessionEffect,
+                            ..
+                        }
+                    )
+                }),
+                "{sql}"
+            );
+        }
+        // The rewrite maps onto numbers: foreign_keys keeps its modeled
+        // true/false assignment without a fence.
+        for (value, expected) in [("true", true), ("FALSE", false)] {
+            let sql = format!("PRAGMA foreign_keys = {value};");
+            let units = parse(&sql, DialectKind::SQLite).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+            assert!(
+                matches!(
+                    facts(&units[0]).session.as_slice(),
+                    [SessionEffect::SetForeignKeyChecks { value, .. }] if *value == expected
+                ),
+                "{sql}: {:?}",
+                facts(&units[0]).session
+            );
+        }
+        // Statement boundaries around a rewritten PRAGMA are untouched.
+        let sql = "SELECT 1; PRAGMA defer_foreign_keys = FALSE; SELECT 2;";
+        let units = parse(sql, DialectKind::SQLite).unwrap();
+        assert_eq!(units.len(), 3);
+        assert_eq!(
+            &sql[units[1].start..units[1].end],
+            "PRAGMA defer_foreign_keys = FALSE"
+        );
+        // Non-PRAGMA statements tokenize byte-identically: `true`/`false`
+        // outside a PRAGMA value still reach the parser as words, and every
+        // span is preserved.
+        let sql = "SELECT true, false FROM t WHERE x = TRUE AND y = False; PRAGMA cache_size = True; SELECT FALSE;";
+        let mut tokens = Vec::new();
+        sqlparser::tokenizer::Tokenizer::new(&SQLiteDialect {}, sql)
+            .tokenize_with_location_into_buf(&mut tokens)
+            .unwrap();
+        let before: Vec<(sqlparser::tokenizer::Token, sqlparser::tokenizer::Span)> = tokens
+            .iter()
+            .map(|entry| (entry.token.clone(), entry.span))
+            .collect();
+        normalize_pragma_bool_values(&mut tokens);
+        let mut rewritten = 0;
+        for (entry, (old_token, old_span)) in tokens.iter().zip(before.iter()) {
+            assert_eq!(entry.span, *old_span);
+            if entry.token == *old_token {
+                continue;
+            }
+            rewritten += 1;
+            assert!(
+                matches!(old_token, sqlparser::tokenizer::Token::Word(word) if word.value == "True" && word.quote_style.is_none()),
+                "{old_token:?}"
+            );
+            assert_eq!(
+                entry.token,
+                sqlparser::tokenizer::Token::Number("1".to_string(), false)
+            );
+        }
+        assert_eq!(rewritten, 1);
     }
 }

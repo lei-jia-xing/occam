@@ -5,7 +5,7 @@ use crate::source::{ByteSpan, SourceMap, TokenKind, dialect, token_positions};
 use crate::{DialectKind, NativeUnit};
 use sqlparser::ast::Statement;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 pub(super) fn parse_units(source: &str, config: &ParseConfig) -> Result<Vec<NativeUnit>, String> {
     let mut units = Vec::new();
@@ -40,6 +40,67 @@ struct PendingUnit {
     has_parse_error: bool,
 }
 
+/// Rewrite unquoted `true`/`false` value tokens inside `PRAGMA` statements to
+/// `Number(1)`/`Number(0)`, keeping each token's original span.
+///
+/// sqlparser 0.64 only accepts a number, string, or placeholder as a pragma
+/// value (`Expected: number or string or ? placeholder`), while SQLite
+/// executes `PRAGMA name = true` fine. The rewrite runs on the token stream
+/// — never on the source text — so every span still indexes the untouched
+/// source bytes. Only statements whose first keyword is `PRAGMA`
+/// (case-insensitive) are touched, and only `true`/`false` words after `=`
+/// or `(` (the value positions), so pragma names and every other statement
+/// tokenize byte-identically.
+pub(super) fn normalize_pragma_bool_values(tokens: &mut [TokenWithSpan]) {
+    let mut statement_start = 0;
+    let mut index = 0;
+    while index <= tokens.len() {
+        let boundary = index == tokens.len()
+            || tokens[index].token == Token::SemiColon
+            || tokens[index].token == Token::EOF;
+        if boundary {
+            normalize_pragma_statement(&mut tokens[statement_start..index]);
+            statement_start = index + 1;
+        }
+        index += 1;
+    }
+}
+
+fn normalize_pragma_statement(tokens: &mut [TokenWithSpan]) {
+    let mut content = tokens
+        .iter()
+        .filter(|entry| !matches!(entry.token, Token::Whitespace(_)));
+    let Some(first) = content.next() else {
+        return;
+    };
+    let Token::Word(word) = &first.token else {
+        return;
+    };
+    if word.quote_style.is_some() || !word.value.eq_ignore_ascii_case("pragma") {
+        return;
+    }
+    let mut value_position = false;
+    for entry in tokens.iter_mut() {
+        match &entry.token {
+            Token::Eq | Token::LParen => value_position = true,
+            Token::Word(word)
+                if value_position
+                    && word.quote_style.is_none()
+                    && (word.value.eq_ignore_ascii_case("true")
+                        || word.value.eq_ignore_ascii_case("false")) =>
+            {
+                let digit = if word.value.eq_ignore_ascii_case("true") {
+                    "1"
+                } else {
+                    "0"
+                };
+                entry.token = Token::Number(digit.to_string(), false);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn walk_units(
     source: &str,
     config: &ParseConfig,
@@ -52,6 +113,9 @@ fn walk_units(
     let mut tokenizer = Tokenizer::new(dialect, source);
     let mut tokens = Vec::new();
     let tokenizer_error = tokenizer.tokenize_with_location_into_buf(&mut tokens).err();
+    // Boolean pragma values are unrepresentable upstream; normalize the token
+    // stream (spans preserved) before positions and the parser consume it.
+    normalize_pragma_bool_values(&mut tokens);
     let source_map = detailed.then(|| SourceMap::new(source));
     let mut positions = token_positions(&tokens, source_map.as_ref())?;
     let mut lexical_suffix: Option<(usize, Option<String>)> = None;

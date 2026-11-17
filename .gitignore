@@ -43,5 +43,7 @@ benchmarks/*.jsonl
 benchmarks/**/*.jsonl
 benchmarks/fuzz_benchmark_results.jsonl
 benchmarks/benchmark_artifacts/
+# Machine-regenerable cross-validation output (sqlite-version-sensitive; never golden).
+benchmarks/cross_validate_report.json
 benchmarks/*.summary.json
 benchmarks/fuzz_benchmark_summary.*
