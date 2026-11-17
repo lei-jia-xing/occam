@@ -698,6 +698,144 @@ mod tests {
             assert!(write[0].reads.is_empty(), "{sql}: {:?}", write[0].reads);
         }
     }
+    #[test]
+    fn mysql_duplicate_key_reads_cover_keys_and_set_sources() {
+        // AST shape (sqlparser 0.64, probed): `OnInsert::DuplicateKeyUpdate`
+        // holds the `SET` assignments; `VALUES(col)` lowers as a plain
+        // `Expr::Function`; `AS new` row aliases lower as `insert_alias`
+        // with `new.col` as `CompoundIdentifier`.
+        let sql = "INSERT INTO t (id, val) VALUES (1, 2) ON DUPLICATE KEY UPDATE val = t.val + 1;";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none());
+        assert!(
+            facts(&units[0]).barriers.is_empty(),
+            "{:?}",
+            facts(&units[0]).barriers
+        );
+        let write = writes(facts(&units[0]));
+        assert_eq!(write.len(), 1);
+        assert!(
+            matches!(
+                write[0].kind,
+                WriteKind::Insert {
+                    conflict: ConflictAction::Update
+                }
+            ),
+            "{:?}",
+            write[0].kind
+        );
+        // Probe (explicit INSERT list) plus SET sources, all on the target.
+        assert_eq!(write[0].reads.len(), 1);
+        let read = &write[0].reads[0];
+        assert_eq!(name_text(&read.source.name), "t");
+        assert_eq!(read.mode, ReadMode::Data);
+        let mut columns: Vec<String> = read.columns.iter().map(|column| column.0.clone()).collect();
+        columns.sort();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert!(
+            write[0].columns.contains(&Ident("val".to_string())),
+            "{:?}",
+            write[0].columns
+        );
+
+        // `VALUES(col)` names the proposed row: excluded from stored reads,
+        // and the marker itself carries no routine fence. The probe still
+        // covers the provided keys, so reads stay present.
+        let sql = "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE a = VALUES(b);";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql}");
+        assert!(
+            facts(&units[0]).barriers.is_empty(),
+            "{sql}: {:?}",
+            facts(&units[0]).barriers
+        );
+        let write = writes(facts(&units[0]));
+        assert_eq!(write.len(), 1);
+        let mut columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        columns.sort();
+        // Probe keys only; `VALUES(b)` contributes no stored read.
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()], "{sql}");
+
+        // Mixed proposed plus stored: `VALUES(b)` excluded, bare `c` kept.
+        let sql = "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE a = VALUES(b) + c;";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        let write = writes(facts(&units[0]));
+        let mut columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "{sql}"
+        );
+
+        // Row-alias form (MySQL 8.0.19+): `new.col` is proposed, bare refs
+        // are stored.
+        let sql =
+            "INSERT INTO t (a, b) VALUES (1, 2) AS new ON DUPLICATE KEY UPDATE a = new.b + c;";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql}");
+        let write = writes(facts(&units[0]));
+        let mut columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "{sql}"
+        );
+
+        // Quoted `VALUES` may name a user routine: it fences and its arg
+        // stays a stored read (no proposed-row exclusion). MySQL quotes with
+        // backticks (double quotes are string literals, unparseable here).
+        let sql = "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = `VALUES`(b);";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql}");
+        assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        let write = writes(facts(&units[0]));
+        let columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        assert!(columns.contains(&"b".to_string()), "{sql}: {columns:?}");
+
+        // Shadowed `VALUES` (routine DDL anywhere) keeps fencing.
+        let sql = "CREATE FUNCTION values(x INT) RETURNS INT RETURN x; INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = VALUES(b);";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(has_routine_barrier(facts(&units[1])), "{sql}");
+
+        // No explicit column list: probe vacuous (mirroring `ON CONFLICT`
+        // without an arbiter); SET sources still modeled.
+        let sql = "INSERT INTO t VALUES (1, 2) ON DUPLICATE KEY UPDATE a = b + 1;";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql}");
+        let write = writes(facts(&units[0]));
+        let mut columns: Vec<String> = write[0]
+            .reads
+            .iter()
+            .flat_map(|read| read.columns.iter().map(|column| column.0.clone()))
+            .collect();
+        columns.sort();
+        assert_eq!(columns, vec!["b".to_string()], "{sql}");
+
+        // Plain INSERTs are untouched.
+        let sql = "INSERT INTO t (a) VALUES (1);";
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        let write = writes(facts(&units[0]));
+        assert!(write[0].reads.is_empty(), "{sql}: {:?}", write[0].reads);
+    }
 
     #[test]
     fn cte_production_cases_have_native_facts() {
@@ -2787,8 +2925,9 @@ mod tests {
                 "SELECT row_number() OVER (ORDER BY a) FROM t;",
                 "SELECT rank() OVER (ORDER BY a) FROM t;",
                 "SELECT lag(a) OVER (ORDER BY b) FROM t;",
-                // Ordered-set shapes fence.
+                // Ordered-set shapes fence, even under a listed aggregate name.
                 "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t;",
+                "SELECT sum(a) WITHIN GROUP (ORDER BY b) FROM t;",
             ] {
                 let units = parse(sql, dialect).unwrap();
                 assert!(units[0].parse_error.is_none(), "{sql} on {dialect:?}");
@@ -2798,21 +2937,150 @@ mod tests {
                 );
             }
         }
-        // FILTER fences even under a listed name.
+        // FILTER on aggregates lifts (tested below); scalar FILTER and
+        // Generic FILTER still fence (tested with the descent proof and the
+        // Generic subset). MySQL rejects FILTER entirely (parse error), so
+        // no MySQL FILTER case exists.
+    }
+    #[test]
+    fn filter_lifts_on_aggregates_with_condition_reads() {
+        // Aggregate FILTER is a deterministic row-subset selector; the lift
+        // relies on the descent proof below (condition columns extracted
+        // independently). MySQL has no FILTER (parse error), so only
+        // PostgreSQL and SQLite are observable here.
+        let calls = [
+            ("avg(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("count(*) FILTER (WHERE b > 0)", vec!["b"]),
+            ("count(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("count(DISTINCT a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("max(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("min(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("sum(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("sum(DISTINCT a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+            ("SUM(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
+        ];
+        for dialect in [DialectKind::PostgreSql, DialectKind::SQLite] {
+            for (call, columns) in &calls {
+                let sql = format!("SELECT {call} FROM t;");
+                let units = parse(&sql, dialect).unwrap();
+                assert!(units[0].parse_error.is_none(), "{sql} on {dialect:?}");
+                assert!(
+                    facts(&units[0]).barriers.is_empty(),
+                    "{sql} on {dialect:?}: {:?}",
+                    facts(&units[0]).barriers
+                );
+                assert_eq!(
+                    relation_reads(facts(&units[0])),
+                    vec!["t".to_string()],
+                    "{sql}"
+                );
+                assert_eq!(
+                    read_column_names(facts(&units[0])),
+                    columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "{sql}"
+                );
+            }
+        }
+        // Scalar FILTER stays fenced: the clause is aggregate-only, so a
+        // scalar FILTER is invalid SQL and never lifts — even though the
+        // parser (syntax-only) accepts it.
         for (dialect, sql) in [
             (
                 DialectKind::PostgreSql,
-                "SELECT sum(a) FILTER (WHERE b > 0) FROM t;",
+                "SELECT abs(a) FILTER (WHERE b > 0) FROM t;",
             ),
             (
                 DialectKind::SQLite,
-                "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
+                "SELECT abs(a) FILTER (WHERE b > 0) FROM t;",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "SELECT coalesce(a, b) FILTER (WHERE c > 0) FROM t;",
             ),
         ] {
             let units = parse(sql, dialect).unwrap();
             assert!(units[0].parse_error.is_none(), "{sql}");
             assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
+        // Generic never lifts FILTER (keyword table holds scalars only).
+        let units = parse(
+            "SELECT coalesce(a, b) FILTER (WHERE c > 0) FROM t;",
+            DialectKind::Generic,
+        )
+        .unwrap();
+        assert!(units[0].parse_error.is_none());
+        assert!(has_routine_barrier(facts(&units[0])));
+        // FILTER with OVER still fences (window gate dominates).
+        let units = parse(
+            "SELECT sum(a) FILTER (WHERE b > 0) OVER (PARTITION BY c) FROM t;",
+            DialectKind::PostgreSql,
+        )
+        .unwrap();
+        assert!(units[0].parse_error.is_none());
+        assert!(has_routine_barrier(facts(&units[0])));
+    }
+    #[test]
+    fn filter_and_within_group_condition_columns_are_extracted_while_fenced() {
+        // Derived-visit descent proof: sqlparser's `Visit` derive descends
+        // into `Function.filter` and `Function.within_group` (upstream
+        // `visits_function_clauses_in_source_order` test), so occam's
+        // expression analysis extracts condition columns independently of
+        // fencing. Aggregate FILTER now lifts (tested above); this pins the
+        // descent on the shapes that stay fenced (scalar FILTER, WITHIN
+        // GROUP) plus one lifted shape, so read-completeness never regresses
+        // silently.
+        for (dialect, sql, expected) in [
+            (
+                DialectKind::PostgreSql,
+                "SELECT abs(a) FILTER (WHERE b > 0) FROM t;",
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            (
+                DialectKind::SQLite,
+                "SELECT abs(a) FILTER (WHERE b > 0) FROM t;",
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            (
+                DialectKind::PostgreSql,
+                "SELECT sum(a) WITHIN GROUP (ORDER BY b) FROM t;",
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            (
+                DialectKind::SQLite,
+                "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
+                vec!["b".to_string()],
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(units[0].parse_error.is_none(), "{sql}");
+            assert_eq!(
+                relation_reads(facts(&units[0])),
+                vec!["t".to_string()],
+                "{sql}"
+            );
+            assert_eq!(read_column_names(facts(&units[0])), expected, "{sql}");
+        }
+        // Fenced shapes keep their barrier (aggregate FILTER does not).
+        for (dialect, sql) in [
+            (
+                DialectKind::PostgreSql,
+                "SELECT abs(a) FILTER (WHERE b > 0) FROM t;",
+            ),
+            (
+                DialectKind::PostgreSql,
+                "SELECT sum(a) WITHIN GROUP (ORDER BY b) FROM t;",
+            ),
+        ] {
+            let units = parse(sql, dialect).unwrap();
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
+        }
+        // Aggregate FILTER lifts (no fence) — descent plus lift together.
+        let units = parse(
+            "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
+            DialectKind::SQLite,
+        )
+        .unwrap();
+        assert!(facts(&units[0]).barriers.is_empty());
     }
 
     #[test]

@@ -1531,6 +1531,37 @@ tests =
                 "grouping and argument reads survive the lifted fence"
                 ["a", "b"]
                 [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
+        , testCase "filtered aggregate projections keep reads without a global fence" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT sum(a) FILTER (WHERE b > 0) FROM t;"
+                        ]
+            graph <- analyze SQLite sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the filtered projection depends on its table definition"
+                (has (StatementId 2) deps)
+            assertBool
+                "no global fence chains the unrelated table"
+                (not (has (StatementId 1) deps))
+            assertEqual
+                "argument and condition reads survive the lifted fence"
+                ["a", "b"]
+                [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
+        , testCase "scalar FILTER still fences with a global barrier" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT);"
+                        , "SELECT abs(a) FILTER (WHERE b > 0) FROM t;"
+                        ]
+            graph <- analyze SQLite sql
+            let deps = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the scalar FILTER still chains every prior statement"
+                (has (StatementId 1) deps && has (StatementId 2) deps)
         , testCase "generic keyword coalesce keeps reads without a global fence" $ do
             let sql =
                     BSC.unlines
@@ -1865,6 +1896,50 @@ tests =
                 ( Set.fromList
                     [identText column | readFact <- allReadFacts (StatementId 3) graph, column <- readColumns readFact]
                 )
+        , testCase "mysql duplicate-key probe and SET sources read the target row" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE unrelated (id INT);"
+                        , "CREATE TABLE t (a INT, b INT, c INT);"
+                        , "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = VALUES(b);"
+                        , "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE a = b + c;"
+                        ]
+            graph <- analyze MySQL sql
+            assertBool
+                "the VALUES upsert writes with the conflict-update action"
+                (hasWrite ["t"] (InsertWrite ConflictUpdate) (opsFor (StatementId 3) graph))
+            assertEqual
+                "the VALUES probe reads only the target"
+                (Set.singleton "t")
+                (readSources (StatementId 3) graph)
+            assertEqual
+                "VALUES(b) is proposed-row only: the probe covers just the key"
+                (Set.singleton "a")
+                ( Set.fromList
+                    [identText column | readFact <- allReadFacts (StatementId 3) graph, column <- readColumns readFact]
+                )
+            assertBool
+                "the VALUES marker carries no routine fence"
+                (null (factBarriers (factsFor (StatementId 3) graph)))
+            let deps3 = dependenciesFor (StatementId 3) graph
+            assertBool
+                "the VALUES upsert depends on its table definition"
+                (has (StatementId 2) deps3)
+            assertBool
+                "no global fence chains the unrelated table"
+                (not (has (StatementId 1) deps3))
+            assertBool
+                "the SET-source upsert writes with the conflict-update action"
+                (hasWrite ["t"] (InsertWrite ConflictUpdate) (opsFor (StatementId 4) graph))
+            assertBool
+                "probe keys and SET sources are covered"
+                ( Set.fromList ["a", "b", "c"]
+                    `Set.isSubsetOf` Set.fromList
+                        [identText column | readFact <- allReadFacts (StatementId 4) graph, column <- readColumns readFact]
+                )
+            assertBool
+                "the SET-source upsert carries no fence"
+                (null (factBarriers (factsFor (StatementId 4) graph)))
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

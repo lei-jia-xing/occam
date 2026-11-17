@@ -94,6 +94,13 @@ pub(super) struct SequenceVisitor<'a> {
     pub(super) reads: Vec<ir::NameRef>,
     pub(super) unknown: bool,
     seen: HashSet<ir::NameRef>,
+    /// Subtrees whose function calls never fence: MySQL `VALUES(col)`
+    /// proposed-row markers in `ON DUPLICATE KEY UPDATE` assignments (which
+    /// lower as `Expr::Function` but name no routine). Populated by
+    /// `sequence_effects_for_statement` only when the pure table is enabled
+    /// (no routine-DDL shadowing); shadowed `VALUES` may name a user
+    /// routine and keeps fencing.
+    pub(super) ignored_function_roots: Vec<Span>,
 }
 
 impl<'a> SequenceVisitor<'a> {
@@ -110,6 +117,7 @@ impl<'a> SequenceVisitor<'a> {
             reads: Vec::new(),
             unknown: false,
             seen: HashSet::new(),
+            ignored_function_roots: Vec::new(),
         }
     }
 }
@@ -127,10 +135,21 @@ impl Visitor for SequenceVisitor<'_> {
             None if matches!(expr, Expr::Function(_)) => {
                 // Pure builtins lift the routine fence; unknown, volatile,
                 // sequence-adjacent, aggregate, and shadowed calls keep it.
-                let pure = self.pure_table_enabled
+                // `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` never
+                // fence (ignored root, populated only when unshadowed).
+                let ignored = AnalysisVisitor::in_ignored_function_root(
+                    &self.ignored_function_roots,
+                    expr.span(),
+                );
+                let pure = !ignored
+                    && self.pure_table_enabled
                     && matches!(expr, Expr::Function(function)
                         if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
-                self.unknown |= !pure;
+                // Ignored markers are not routines at all (neither pure nor
+                // unknown); only non-ignored impure calls fence.
+                if !ignored {
+                    self.unknown |= !pure;
+                }
             }
             _ => {}
         }

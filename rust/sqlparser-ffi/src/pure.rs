@@ -13,8 +13,9 @@
 //! - Volatile and sequence-adjacent names (`random`, `nextval`/`currval`/
 //!   `setval`/`lastval`, clock calls such as `now`/`current_timestamp`,
 //!   `version`, aggregate state functions) are deliberately absent and fence.
-//! - Window/filter/grouping machinery (`OVER`, `FILTER`, `WITHIN GROUP`,
-//!   null treatment, parametric calls) fences even under a builtin name.
+//! - Window/grouping machinery (`OVER`, `WITHIN GROUP`, null treatment,
+//!   parametric calls) fences even under a builtin name. `FILTER` lifts on
+//!   aggregates only (see below); scalar `FILTER` fences.
 //! - Qualification fences: only unqualified single-part names lift, so no
 //!   schema resolution is ever assumed (`myschema.abs` may name a user
 //!   routine; even `pg_catalog.abs` fences to keep the rule minimal).
@@ -22,8 +23,9 @@
 //!   below keeps the blanket fence bit-identically.
 //!
 //! Aggregate allowlist ([`AGGREGATE_BUILTINS`], same three dialects): `avg`,
-//! `count`, `max`, `min`, and `sum` lift in the plain call shape only (no
-//! `OVER`/`FILTER`/`WITHIN GROUP`, shared gate with the scalar table). The
+//! `count`, `max`, `min`, and `sum` lift in the plain call shape (no
+//! `OVER`/`WITHIN GROUP`, shared gate with the scalar table) plus `FILTER`
+//! (aggregate-only, see below). The
 //! proof: each name is a core aggregate on all three engines computing a
 //! closed value over its input rows — no writes, no sequence use, no
 //! volatility. Argument shapes (`DISTINCT`, `ORDER BY`, `*`, expressions,
@@ -38,12 +40,22 @@
 //! what an accepted query does; `div_precision_increment` and
 //! `group_concat_max_len`-style settings alter result values (precision,
 //! truncation), not effects — and `group_concat` itself is not listed.
-//! Errors (overflow, division by zero) are errors, not writes. Everything
+//! Errors (overflow, division by zero) are errors, not writes. `FILTER`
+//! (`agg(args) FILTER (WHERE cond)`) lifts on the five aggregates: it is a
+//! deterministic row-subset selector over the same input rows — no writes,
+//! no sequence use, no volatility — and its condition columns are extracted
+//! by the derived-visit descent (pinned by
+//! `filter_and_within_group_condition_columns_are_extracted_while_fenced`),
+//! so lifting never drops a read edge. `FILTER` on scalar names fences:
+//! the clause is aggregate-only on every covered engine (PostgreSQL:
+//! aggregate `FILTER`; SQLite: aggregate `FILTER`; MySQL: no `FILTER` at
+//! all, unparseable), so a scalar `FILTER` is invalid SQL — the gate stays
+//! aggregate-only explicitly rather than lifting invalid shapes. Everything
 //! else aggregate-adjacent stays fenced: `OVER` (window `ROWS` framing with
 //! `ORDER BY` ties selects nondeterministically among peers, which is
-//! physical-order-dependent and volatile-like), `FILTER`/`WITHIN GROUP`
-//! (deliberately outside the proven set so one shared shape gate covers both
-//! tables), statistical siblings (`stddev`/`variance`/...) and
+//! physical-order-dependent and volatile-like), `WITHIN GROUP`
+//! (ordered-set, unproven — descent pinned but effects unproven, so still
+//! fenced), statistical siblings (`stddev`/`variance`/...) and
 //! ordered-set/inverse-distribution functions (not uniform core builtins —
 //! e.g. SQLite has neither `stddev` nor `percentile_cont` — so no uniform
 //! entry is sound; on an engine without the builtin the name would resolve
@@ -226,24 +238,25 @@ fn table_matches(
 
 /// Whether `function` is a pure-builtin call that lifts the routine fence.
 /// Unknown names, volatile/sequence-adjacent names, unlisted aggregates,
-/// qualified names, and window/filter/grouping call shapes all return `false`
-/// (fence). SQLite, PostgreSQL, and MySQL consult the scalar and aggregate
-/// tables; Generic consults only the keyword subset for unquoted spellings;
-/// every other dialect returns `false`.
+/// qualified names, and window/grouping call shapes all return `false`
+/// (fence). `FILTER` lifts on aggregates only; scalar `FILTER` fences.
+/// SQLite, PostgreSQL, and MySQL consult the scalar and aggregate tables;
+/// Generic consults only the keyword subset for unquoted spellings (and
+/// never lifts `FILTER`, since its table holds scalars only); every other
+/// dialect returns `false`.
 pub(super) fn is_pure_builtin(
     function: &Function,
     dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> bool {
-    // Window, filter, grouping, null-treatment, and parametric machinery is
+    // Window, grouping, null-treatment, and parametric machinery is
     // aggregate/session-adjacent: never pure, even under a builtin name.
     // ODBC escape syntax ({fn abs(x)}) names the same function and may lift.
     // Argument shapes (DISTINCT, ORDER BY, bare subqueries) need no gating:
     // arguments are values whose reads expression analysis extracts
     // independently; ordering and duplicate treatment affect values, not
-    // effects.
+    // effects. FILTER is gated per-table below (aggregates only).
     if function.over.is_some()
-        || function.filter.is_some()
         || !function.within_group.is_empty()
         || function.null_treatment.is_some()
         || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
@@ -257,16 +270,30 @@ pub(super) fn is_pure_builtin(
     };
     match dialect {
         DialectKind::SQLite | DialectKind::PostgreSql | DialectKind::MySql => {
-            table_matches(PURE_BUILTINS, ident, rules)
-                || table_matches(AGGREGATE_BUILTINS, ident, rules)
+            let is_scalar = table_matches(PURE_BUILTINS, ident, rules);
+            let is_aggregate = table_matches(AGGREGATE_BUILTINS, ident, rules);
+            // FILTER is aggregate-only on every covered engine (PG/SQLite
+            // document it under aggregates; MySQL rejects it entirely), so
+            // scalar FILTER — parseable only because sqlparser is
+            // syntax-only — stays fenced rather than lifting an invalid
+            // shape. Aggregate FILTER is a deterministic row-subset
+            // selector; its condition reads flow via the descent proof.
+            if function.filter.is_some() {
+                is_aggregate
+            } else {
+                is_scalar || is_aggregate
+            }
         }
         // The Generic claim rests on keyword status, and keywords are
         // unquoted by definition: a quoted spelling is an identifier, which
         // on an unknown engine may name a user routine. Case folds through
         // the shared matcher (Generic compares case-insensitively, as every
-        // engine does for keywords).
+        // engine does for keywords). FILTER never lifts here: the table
+        // holds scalars only, and FILTER is aggregate-only.
         DialectKind::Generic => {
-            ident.quote_style.is_none() && table_matches(GENERIC_PURE_BUILTINS, ident, rules)
+            function.filter.is_none()
+                && ident.quote_style.is_none()
+                && table_matches(GENERIC_PURE_BUILTINS, ident, rules)
         }
         _ => false,
     }

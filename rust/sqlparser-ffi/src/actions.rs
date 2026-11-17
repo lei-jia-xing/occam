@@ -1422,7 +1422,202 @@ fn merge_conflict_reads(
     conflict: &OnConflict,
     rules: &ir::IdentifierRules,
 ) {
-    let extra = conflict_read_columns(conflict, rules);
+    merge_target_reads(reads, target, conflict_read_columns(conflict, rules));
+}
+/// Whether `function` is the MySQL proposed-row marker `VALUES(col)` in an
+/// `ON DUPLICATE KEY UPDATE` assignment. Positional, never a name-table
+/// lookup: unqualified single-part unquoted `VALUES` (case-insensitive, like
+/// `EXCLUDED`) in the plain call shape. Quoted spellings may name a user
+/// routine and never match; exotic shapes (`OVER`/`FILTER`/...) are invalid
+/// and stay fenced. Shadowing (`CREATE FUNCTION values`) is handled by the
+/// caller via `pure_table_enabled` (no exclusion when shadowed).
+fn is_values_marker(function: &Function) -> bool {
+    if function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+    {
+        return false;
+    }
+    let [ObjectNamePart::Identifier(ident)] = function.name.0.as_slice() else {
+        return false;
+    };
+    ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("values")
+}
+/// Spans of `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` assignments,
+/// excluded from the routine fence (they name no routine). Collected only on
+/// MySQL when the pure table is enabled (unshadowed); elsewhere `VALUES`
+/// keeps fencing as an unmodeled call.
+struct ValuesMarkerCollector {
+    spans: Vec<Span>,
+}
+
+impl Visitor for ValuesMarkerCollector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let Expr::Function(function) = expr
+            && is_values_marker(function)
+        {
+            self.spans.push(expr.span());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn values_marker_spans(assignments: &[Assignment]) -> Vec<Span> {
+    let mut collector = ValuesMarkerCollector { spans: Vec::new() };
+    for assignment in assignments {
+        let _ = assignment.value.visit(&mut collector);
+    }
+    collector.spans
+}
+
+/// Column references in an `ON DUPLICATE KEY UPDATE` assignment value that
+/// read the stored target row. `VALUES(col)` args and row-alias-qualified
+/// references (`new.col`) name the proposed row, not stored data, so they
+/// contribute no read; anything else (bare or target-qualified) is a
+/// target-row read, mirroring `ON CONFLICT` (where `EXCLUDED` plays the
+/// proposed-row role) and plain `UPDATE` (where the target stays readable).
+/// Subquery columns over other tables are over-approximated onto the target
+/// (safe: visitor reads still attribute them correctly); row-alias matches
+/// are broad (case-insensitive, quoting ignored) since a miss only shrinks
+/// the over-approximation while the visitor covers other-table reads.
+struct DuplicateReadCollector<'a> {
+    rules: &'a ir::IdentifierRules,
+    row_alias: Option<&'a str>,
+    values_depth: usize,
+    stored: HashMap<ir::Ident, bool>,
+    order: Vec<ir::Ident>,
+}
+
+impl Visitor for DuplicateReadCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let Expr::Function(function) = expr
+            && is_values_marker(function)
+        {
+            self.values_depth += 1;
+            return std::ops::ControlFlow::Continue(());
+        }
+        let (ident, proposed) = match expr {
+            Expr::Identifier(ident) => (ident, self.values_depth > 0),
+            Expr::CompoundIdentifier(idents) => match idents.last() {
+                Some(last) => {
+                    let proposed = self.values_depth > 0
+                        || idents.first().is_some_and(|first| {
+                            self.row_alias
+                                .is_some_and(|alias| first.value.eq_ignore_ascii_case(alias))
+                        });
+                    (last, proposed)
+                }
+                None => return std::ops::ControlFlow::Continue(()),
+            },
+            _ => return std::ops::ControlFlow::Continue(()),
+        };
+        let column = canonical_ident(ident, self.rules, ir::IdentifierClass::Column);
+        match self.stored.get_mut(&column) {
+            Some(seen_stored) => *seen_stored |= !proposed,
+            None => {
+                self.stored.insert(column.clone(), !proposed);
+                self.order.push(column);
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let Expr::Function(function) = expr
+            && is_values_marker(function)
+        {
+            self.values_depth = self.values_depth.saturating_sub(1);
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn duplicate_expr_columns(
+    expr: &Expr,
+    row_alias: Option<&str>,
+    rules: &ir::IdentifierRules,
+) -> Vec<ir::Ident> {
+    let mut collector = DuplicateReadCollector {
+        rules,
+        row_alias,
+        values_depth: 0,
+        stored: HashMap::new(),
+        order: Vec::new(),
+    };
+    let _ = expr.visit(&mut collector);
+    let DuplicateReadCollector { stored, order, .. } = collector;
+    order
+        .into_iter()
+        .filter(|column| stored.get(column).copied().unwrap_or(false))
+        .collect()
+}
+
+/// Row alias naming the proposed row in `INSERT ... AS alias
+/// ON DUPLICATE KEY UPDATE` (MySQL 8.0.19+). Only single-part aliases
+/// resolve; anything else stays `None` (no exclusion, safe over-approx).
+fn duplicate_row_alias(insert: &Insert) -> Option<&str> {
+    let aliases = insert.insert_alias.as_ref()?;
+    let [ObjectNamePart::Identifier(ident)] = aliases.row_alias.0.as_slice() else {
+        return None;
+    };
+    Some(ident.value.as_str())
+}
+
+/// Target-row reads implied by `ON DUPLICATE KEY UPDATE`: the duplicate-key
+/// probe reads the provided key columns (explicit `INSERT` column list, or
+/// `SET` targets for the `INSERT ... SET` form), and the update re-reads
+/// the row through its `SET` values (excluding `VALUES()`/row-alias
+/// proposed-row refs). No explicit list (e.g. `INSERT ... VALUES` without
+/// columns, `INSERT ... SELECT` without a list) leaves the probe vacuous,
+/// mirroring `ON CONFLICT` without an arbiter: without a catalog the
+/// conflicting unique key(s) are unnameable, and the precedent stays
+/// vacuous rather than wildcarding. Residual: provided-list probes may miss
+/// default-valued keys (e.g. auto-increment PK omitted from the list);
+/// composite keys spanning provided plus default columns are likewise
+/// partial. Plain `INSERT` excludes its target from visitor reads, so
+/// without this the upsert under-models the stored-row re-read.
+fn duplicate_read_columns(insert: &Insert, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
+    let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |column: ir::Ident| {
+        if seen.insert(column.clone()) {
+            columns.push(column);
+        }
+    };
+    for column in &insert.columns {
+        if let Some(name) = name_from_object(column, rules, ir::IdentifierClass::Column)
+            && let Some(last) = last_ident(&name)
+        {
+            push(last);
+        }
+    }
+    for assignment in &insert.assignments {
+        for column in assignment_columns(&assignment.target, rules) {
+            push(column);
+        }
+    }
+    let row_alias = duplicate_row_alias(insert);
+    for assignment in assignments {
+        for column in duplicate_expr_columns(&assignment.value, row_alias, rules) {
+            push(column);
+        }
+    }
+    columns
+}
+
+/// Attach target-row reads to an upsert write's reads, extending the visitor
+/// read when the target is already read (e.g. an update-subquery over the
+/// target itself). Shared by `ON CONFLICT` and `ON DUPLICATE KEY UPDATE`.
+fn merge_target_reads(reads: &mut Vec<ir::ReadFact>, target: &ir::NameRef, extra: Vec<ir::Ident>) {
     if extra.is_empty() {
         return;
     }
@@ -1438,6 +1633,17 @@ fn merge_conflict_reads(
     } else {
         reads.push(read_fact(target.clone(), ir::ReadMode::Data, extra, false));
     }
+}
+
+/// Attach `ON DUPLICATE KEY UPDATE` target-row reads to an upsert write's
+/// reads (see [`duplicate_read_columns`]).
+fn merge_duplicate_reads(
+    reads: &mut Vec<ir::ReadFact>,
+    target: &ir::NameRef,
+    insert: &Insert,
+    rules: &ir::IdentifierRules,
+) {
+    merge_target_reads(reads, target, duplicate_read_columns(insert, rules));
 }
 
 /// A plain `VALUES` query source: positional rows with no `WITH` wrapper.
@@ -3420,6 +3626,19 @@ fn sequence_effects_for_statement<'a>(
     pure_table_enabled: bool,
 ) -> SequenceVisitor<'a> {
     let mut visitor = SequenceVisitor::new(dialect, rules, pure_table_enabled);
+    if pure_table_enabled
+        && matches!(dialect, DialectKind::MySql)
+        && let Statement::Insert(insert) = statement
+        && let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on
+    {
+        // `VALUES(col)` in this position is the proposed-row marker, not a
+        // routine call: exclude it from the fence. Shadowed scripts
+        // (`pure_table_enabled == false`) keep fencing, since `VALUES` may
+        // then name a user routine.
+        visitor
+            .ignored_function_roots
+            .extend(values_marker_spans(assignments));
+    }
     match statement {
         Statement::Query(_)
         | Statement::Insert(_)
@@ -4143,8 +4362,14 @@ pub(super) fn analyze_statement(
             match target {
                 Some(target) => {
                     let mut reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
-                    if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
-                        merge_conflict_reads(&mut reads, &target, conflict, rules);
+                    match &insert.on {
+                        Some(OnInsert::OnConflict(conflict)) => {
+                            merge_conflict_reads(&mut reads, &target, conflict, rules);
+                        }
+                        Some(OnInsert::DuplicateKeyUpdate(_)) => {
+                            merge_duplicate_reads(&mut reads, &target, insert, rules);
+                        }
+                        None | Some(_) => {}
                     }
                     facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
                         target,
