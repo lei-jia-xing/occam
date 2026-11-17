@@ -1481,7 +1481,7 @@ tests =
             assertBool
                 "a read of an unrelated column does not depend on the update"
                 (not (has (StatementId 3) (dependenciesFor (StatementId 5) graph)))
-        , testCase "pure builtin projections keep reads without a global fence" $ do
+        , testCase "sqlite abs projections fence with a global barrier" $ do
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE unrelated (id INT);"
@@ -1491,13 +1491,10 @@ tests =
             graph <- analyze SQLite sql
             let deps = dependenciesFor (StatementId 3) graph
             assertBool
-                "the pure-builtin projection depends on its table definition"
-                (has (StatementId 2) deps)
-            assertBool
-                "no global fence chains the unrelated table"
-                (not (has (StatementId 1) deps))
+                "the fenced projection still chains every prior statement"
+                (has (StatementId 1) deps && has (StatementId 2) deps)
             assertEqual
-                "argument reads survive the lifted fence"
+                "argument reads survive the restored fence"
                 ["a"]
                 [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
         , testCase "unknown function calls still fence with a global barrier" $ do
@@ -1512,17 +1509,17 @@ tests =
             assertBool
                 "the unknown call still chains every prior statement"
                 (has (StatementId 1) deps && has (StatementId 2) deps)
-        , testCase "pure aggregate projections keep reads without a global fence" $ do
+        , testCase "generic coalesce group projections keep reads without a global fence" $ do
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE unrelated (id INT);"
                         , "CREATE TABLE t (a INT, b INT);"
-                        , "SELECT a, sum(b) FROM t GROUP BY a;"
+                        , "SELECT a, coalesce(b, 0) FROM t GROUP BY a;"
                         ]
-            graph <- analyze SQLite sql
+            graph <- analyze GenericSQL sql
             let deps = dependenciesFor (StatementId 3) graph
             assertBool
-                "the aggregate projection depends on its table definition"
+                "the generic projection depends on its table definition"
                 (has (StatementId 2) deps)
             assertBool
                 "no global fence chains the unrelated table"
@@ -1531,7 +1528,7 @@ tests =
                 "grouping and argument reads survive the lifted fence"
                 ["a", "b"]
                 [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
-        , testCase "filtered aggregate projections keep reads without a global fence" $ do
+        , testCase "filtered aggregate projections fence with a global barrier" $ do
             let sql =
                     BSC.unlines
                         [ "CREATE TABLE unrelated (id INT);"
@@ -1541,13 +1538,10 @@ tests =
             graph <- analyze SQLite sql
             let deps = dependenciesFor (StatementId 3) graph
             assertBool
-                "the filtered projection depends on its table definition"
-                (has (StatementId 2) deps)
-            assertBool
-                "no global fence chains the unrelated table"
-                (not (has (StatementId 1) deps))
+                "the filtered projection still chains every prior statement"
+                (has (StatementId 1) deps && has (StatementId 2) deps)
             assertEqual
-                "argument and condition reads survive the lifted fence"
+                "argument and condition reads survive the restored fence"
                 ["a", "b"]
                 [identText column | readFact <- readsFor (StatementId 3) graph, column <- readColumns readFact]
         , testCase "scalar FILTER still fences with a global barrier" $ do

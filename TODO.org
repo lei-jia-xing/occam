@@ -130,6 +130,7 @@
 - 8-name allowlist (abs, coalesce, concat, length, lower, nullif, round, upper) lifts the routine fence in both the SequenceVisitor and has_function positions.
 - Scope: SQLite, PostgreSQL, and MySQL only; unqualified single-part names; script-wide disable on any routine DDL or parse error (shadowing rule).
 - Aggregates, volatile/sequence-adjacent names, qualified names, and window/filter/grouping call shapes stay fenced.
+- [Supersession note: per-dialect SQLite/PostgreSQL/MySQL scalar+aggregate tables cut back to Generic-only unquoted coalesce/nullif 2026-11-17; hand-maintained per-engine catalogs judged an unmaintainable trajectory — reserved-keyword-only Generic rule stands because it depends on no engine.]
 
 ** DONE Session-effect modeling for SET and PRAGMA [2026-11]
 - system_var_scope resolves foreign_keys/foreign_key_checks, autocommit, and search_path to session/global effects; @@global maps to global (ignored), @user vars and foreign qualifiers fence.

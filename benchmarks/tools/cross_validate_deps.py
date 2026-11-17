@@ -32,8 +32,8 @@ ALIGNMENT RULES (engine = authorizer callback stream per statement):
       TABLE, so those statements abstain anyway).
   F3 non-dep actions: drop SELECT, RECURSIVE, COPY, FUNCTION. They carry no
       table/column dependency; occam models routine effects via barriers,
-      not per-call (corpus routines are pure builtins; anything else
-      fences the statement into abstain).
+      not per-call (engine-dialect routines fence the statement into
+      abstain; only Generic keyword forms lift, and xval runs sqlite).
   F4 sourced expansion: events with source S (trigger/view/CTE name). If S
       is a schema trigger/view (collected from occam ddl + engine CREATEs)
       the access is trigger/view expansion firing at USE time while occam

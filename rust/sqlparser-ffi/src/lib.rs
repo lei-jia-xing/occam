@@ -2766,7 +2766,10 @@ mod tests {
     }
 
     #[test]
-    fn pure_builtins_lift_the_routine_fence() {
+    fn former_per_dialect_builtins_stay_fenced() {
+        // Cutback: the SQLite/PostgreSQL/MySQL scalar allowlist is gone, so
+        // these calls fence on every engine-specific dialect. Reads still
+        // flow through arguments independently of fencing.
         let calls = [
             ("abs(a)", vec!["a"]),
             ("coalesce(a, b)", vec!["a", "b"]),
@@ -2787,9 +2790,8 @@ mod tests {
                 let units = parse(&sql, dialect).unwrap();
                 let unit_facts = facts(&units[0]);
                 assert!(
-                    unit_facts.barriers.is_empty(),
-                    "{sql} on {dialect:?}: {:?}",
-                    unit_facts.barriers
+                    has_routine_barrier(unit_facts),
+                    "{sql} on {dialect:?}: expected a routine fence"
                 );
                 assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
                 assert_eq!(
@@ -2801,7 +2803,10 @@ mod tests {
         }
     }
     #[test]
-    fn pure_aggregates_lift_the_routine_fence() {
+    fn former_per_dialect_aggregates_stay_fenced() {
+        // Cutback: the SQLite/PostgreSQL/MySQL aggregate allowlist is gone,
+        // so these calls fence on every engine-specific dialect. Reads still
+        // flow through arguments independently of fencing.
         let calls = [
             ("avg(a)", vec!["a"]),
             ("count(*)", vec![]),
@@ -2827,9 +2832,8 @@ mod tests {
                 let units = parse(&sql, dialect).unwrap();
                 let unit_facts = facts(&units[0]);
                 assert!(
-                    unit_facts.barriers.is_empty(),
-                    "{sql} on {dialect:?}: {:?}",
-                    unit_facts.barriers
+                    has_routine_barrier(unit_facts),
+                    "{sql} on {dialect:?}: expected a routine fence"
                 );
                 assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
                 assert_eq!(
@@ -2838,14 +2842,13 @@ mod tests {
                     "{sql}"
                 );
             }
-            // Grouped projections lift with the grouping columns intact.
+            // Grouped projections fence with the grouping columns intact.
             let sql = "SELECT a, sum(b) FROM t GROUP BY a;";
             let units = parse(sql, dialect).unwrap();
             let unit_facts = facts(&units[0]);
             assert!(
-                unit_facts.barriers.is_empty(),
-                "{sql} on {dialect:?}: {:?}",
-                unit_facts.barriers
+                has_routine_barrier(unit_facts),
+                "{sql} on {dialect:?}: expected a routine fence"
             );
             assert_eq!(
                 read_column_names(unit_facts),
@@ -2853,9 +2856,9 @@ mod tests {
                 "{sql}"
             );
         }
-        // Quoted spellings follow the same folding rule as scalars.
+        // Quoted spellings fence like every other non-Generic call.
         let units = parse("SELECT \"sum\"(a) FROM t;", DialectKind::PostgreSql).unwrap();
-        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(has_routine_barrier(facts(&units[0])));
         let units = parse("SELECT \"Sum\"(a) FROM t;", DialectKind::PostgreSql).unwrap();
         assert!(has_routine_barrier(facts(&units[0])));
     }
@@ -2883,7 +2886,7 @@ mod tests {
         ] {
             for sql in [
                 "SELECT frobnicate(a) FROM t;",
-                // Window shapes fence even under a listed name.
+                // Window shapes fence even under formerly-listed names.
                 "SELECT abs(a) OVER (PARTITION BY b) FROM t;",
                 "SELECT sum(a) OVER (PARTITION BY b) FROM t;",
                 "SELECT sum(DISTINCT a) OVER (PARTITION BY b) FROM t;",
@@ -2925,7 +2928,7 @@ mod tests {
                 "SELECT row_number() OVER (ORDER BY a) FROM t;",
                 "SELECT rank() OVER (ORDER BY a) FROM t;",
                 "SELECT lag(a) OVER (ORDER BY b) FROM t;",
-                // Ordered-set shapes fence, even under a listed aggregate name.
+                // Ordered-set shapes fence, even under a formerly-listed aggregate name.
                 "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t;",
                 "SELECT sum(a) WITHIN GROUP (ORDER BY b) FROM t;",
             ] {
@@ -2937,17 +2940,18 @@ mod tests {
                 );
             }
         }
-        // FILTER on aggregates lifts (tested below); scalar FILTER and
-        // Generic FILTER still fence (tested with the descent proof and the
-        // Generic subset). MySQL rejects FILTER entirely (parse error), so
+        // FILTER fences on every name and dialect (tested below); scalar
+        // FILTER and Generic FILTER fence with the descent proof and the
+        // Generic subset. MySQL rejects FILTER entirely (parse error), so
         // no MySQL FILTER case exists.
     }
     #[test]
-    fn filter_lifts_on_aggregates_with_condition_reads() {
-        // Aggregate FILTER is a deterministic row-subset selector; the lift
-        // relies on the descent proof below (condition columns extracted
-        // independently). MySQL has no FILTER (parse error), so only
-        // PostgreSQL and SQLite are observable here.
+    fn filter_call_shapes_stay_fenced_with_condition_reads() {
+        // Cutback: FILTER fences on every name and dialect (the aggregate
+        // FILTER lift is gone with the per-dialect tables). Condition
+        // columns are still extracted independently of fencing. MySQL has
+        // no FILTER (parse error), so only PostgreSQL and SQLite are
+        // observable here.
         let calls = [
             ("avg(a) FILTER (WHERE b > 0)", vec!["a", "b"]),
             ("count(*) FILTER (WHERE b > 0)", vec!["b"]),
@@ -2965,9 +2969,8 @@ mod tests {
                 let units = parse(&sql, dialect).unwrap();
                 assert!(units[0].parse_error.is_none(), "{sql} on {dialect:?}");
                 assert!(
-                    facts(&units[0]).barriers.is_empty(),
-                    "{sql} on {dialect:?}: {:?}",
-                    facts(&units[0]).barriers
+                    has_routine_barrier(facts(&units[0])),
+                    "{sql} on {dialect:?}: expected a routine fence"
                 );
                 assert_eq!(
                     relation_reads(facts(&units[0])),
@@ -3002,7 +3005,7 @@ mod tests {
             assert!(units[0].parse_error.is_none(), "{sql}");
             assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
-        // Generic never lifts FILTER (keyword table holds scalars only).
+        // Generic never lifts FILTER (the keyword rule covers plain calls only).
         let units = parse(
             "SELECT coalesce(a, b) FILTER (WHERE c > 0) FROM t;",
             DialectKind::Generic,
@@ -3025,10 +3028,9 @@ mod tests {
         // into `Function.filter` and `Function.within_group` (upstream
         // `visits_function_clauses_in_source_order` test), so occam's
         // expression analysis extracts condition columns independently of
-        // fencing. Aggregate FILTER now lifts (tested above); this pins the
-        // descent on the shapes that stay fenced (scalar FILTER, WITHIN
-        // GROUP) plus one lifted shape, so read-completeness never regresses
-        // silently.
+        // fencing. Every shape here fences (cutback: no FILTER lift
+        // remains); this pins the descent on all of them, so
+        // read-completeness never regresses silently.
         for (dialect, sql, expected) in [
             (
                 DialectKind::PostgreSql,
@@ -3060,7 +3062,7 @@ mod tests {
             );
             assert_eq!(read_column_names(facts(&units[0])), expected, "{sql}");
         }
-        // Fenced shapes keep their barrier (aggregate FILTER does not).
+        // Every shape keeps its barrier.
         for (dialect, sql) in [
             (
                 DialectKind::PostgreSql,
@@ -3070,17 +3072,14 @@ mod tests {
                 DialectKind::PostgreSql,
                 "SELECT sum(a) WITHIN GROUP (ORDER BY b) FROM t;",
             ),
+            (
+                DialectKind::SQLite,
+                "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
+            ),
         ] {
             let units = parse(sql, dialect).unwrap();
             assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
-        // Aggregate FILTER lifts (no fence) — descent plus lift together.
-        let units = parse(
-            "SELECT count(*) FILTER (WHERE b > 0) FROM t;",
-            DialectKind::SQLite,
-        )
-        .unwrap();
-        assert!(facts(&units[0]).barriers.is_empty());
     }
 
     #[test]
@@ -3122,12 +3121,22 @@ mod tests {
             let units = parse(sql, DialectKind::Generic).unwrap();
             assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
-        // Unseeded dialects keep the blanket fence bit-identically.
+        // Every non-Generic dialect keeps the blanket fence bit-identically —
+        // cutback: SQLite, PostgreSQL, and MySQL join the always-fence set.
         for (dialect, sql) in [
             (DialectKind::Snowflake, "SELECT abs(a) FROM t;"),
             (DialectKind::Snowflake, "SELECT coalesce(a, b) FROM t;"),
             (DialectKind::DuckDB, "SELECT sum(a) FROM t;"),
             (DialectKind::DuckDB, "SELECT nullif(a, b) FROM t;"),
+            (DialectKind::SQLite, "SELECT coalesce(a, b) FROM t;"),
+            (DialectKind::SQLite, "SELECT nullif(a, b) FROM t;"),
+            (DialectKind::SQLite, "SELECT abs(a) FROM t;"),
+            (DialectKind::PostgreSql, "SELECT coalesce(a, b) FROM t;"),
+            (DialectKind::PostgreSql, "SELECT nullif(a, b) FROM t;"),
+            (DialectKind::PostgreSql, "SELECT sum(a) FROM t;"),
+            (DialectKind::MySql, "SELECT coalesce(a, b) FROM t;"),
+            (DialectKind::MySql, "SELECT nullif(a, b) FROM t;"),
+            (DialectKind::MySql, "SELECT abs(a) FROM t;"),
         ] {
             let units = parse(sql, dialect).unwrap();
             assert!(
@@ -3160,32 +3169,32 @@ mod tests {
     }
 
     #[test]
-    fn pure_builtin_matching_respects_case_folding() {
-        // PostgreSQL folds unquoted identifiers to lower case; quoted names
-        // are exact.
-        for sql in ["SELECT ABS(a) FROM t;", "SELECT \"abs\"(a) FROM t;"] {
-            let units = parse(sql, DialectKind::PostgreSql).unwrap();
-            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
-        }
-        for sql in ["SELECT \"Abs\"(a) FROM t;", "SELECT \"ABS\"(a) FROM t;"] {
+    fn former_per_dialect_case_folded_names_stay_fenced() {
+        // Cutback: no engine-specific dialect lifts any spelling, folded or
+        // not. (Generic keyword case-folding — COALESCE/Coalesce/NULLIF — is
+        // pinned by the Generic subset test above.)
+        for sql in [
+            "SELECT ABS(a) FROM t;",
+            "SELECT \"abs\"(a) FROM t;",
+            "SELECT \"Abs\"(a) FROM t;",
+            "SELECT \"ABS\"(a) FROM t;",
+        ] {
             let units = parse(sql, DialectKind::PostgreSql).unwrap();
             assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
-        // SQLite folds quoted identifiers too, so quoted spellings lift.
         for sql in ["SELECT \"ABS\"(a) FROM t;", "SELECT \"Abs\"(a) FROM t;"] {
             let units = parse(sql, DialectKind::SQLite).unwrap();
-            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
-        // MySQL backticks fold the same way.
         let units = parse("SELECT `ABS`(a) FROM t;", DialectKind::MySql).unwrap();
-        assert!(facts(&units[0]).barriers.is_empty());
+        assert!(has_routine_barrier(facts(&units[0])));
     }
 
     #[test]
     fn shadowed_pure_builtins_still_fence() {
         let create = "CREATE FUNCTION abs(x INT) RETURNS INT AS $$ BEGIN RETURN x; END; $$ LANGUAGE plpgsql;";
         let select = "SELECT abs(a) FROM t;";
-        // Shadowing disables the table regardless of definition position.
+        // Shadowing disables the rule regardless of definition position.
         for script in [format!("{create} {select}"), format!("{select} {create}")] {
             let units = parse(&script, DialectKind::PostgreSql).unwrap();
             assert_eq!(units.len(), 2);
@@ -3200,7 +3209,9 @@ mod tests {
         .unwrap();
         assert_eq!(units.len(), 2);
         assert!(has_routine_barrier(facts(&units[1])));
-        // The coarse disable covers the aggregate and Generic tables too.
+        // The coarse disable covers the Generic keyword rule too (the
+        // PostgreSQL `sum` case below fences unconditionally since the
+        // cutback; the Generic `coalesce` case is what pins the disable).
         let units = parse(
             "DROP FUNCTION sum; SELECT sum(a) FROM t;",
             DialectKind::PostgreSql,
@@ -3228,8 +3239,10 @@ mod tests {
         for unit in &units {
             assert!(has_routine_barrier(facts(unit)));
         }
-        // A parse error anywhere also disables the table: unparsed routine
-        // DDL cannot be ruled out.
+        // A parse error anywhere also disables the rule: unparsed routine
+        // DDL cannot be ruled out. (This SQLite `abs` case fences
+        // unconditionally since the cutback; the Generic cases above pin
+        // the disable itself.)
         let units = parse("SELECT abs(a) FROM t; SELECT FROM;", DialectKind::SQLite).unwrap();
         assert_eq!(units.len(), 2);
         assert!(has_routine_barrier(facts(&units[0])));
@@ -3237,7 +3250,20 @@ mod tests {
     }
 
     #[test]
-    fn stored_pure_expressions_lift_but_volatile_defaults_still_fence() {
+    fn stored_generic_keywords_lift_but_other_stored_calls_still_fence() {
+        // The Generic keyword rule lifts in stored positions too.
+        for sql in [
+            "CREATE TABLE t (x INT DEFAULT coalesce(1, 2));",
+            "CREATE VIEW v AS SELECT coalesce(a, b) FROM t;",
+        ] {
+            let units = parse(sql, DialectKind::Generic).unwrap();
+            assert!(
+                facts(&units[0]).barriers.is_empty(),
+                "{sql}: {:?}",
+                facts(&units[0]).barriers
+            );
+        }
+        // Cutback: the per-dialect stored lifts are gone, so these fence.
         for (dialect, sql) in [
             (
                 DialectKind::SQLite,
@@ -3258,7 +3284,7 @@ mod tests {
             ),
         ] {
             let units = parse(sql, dialect).unwrap();
-            assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
+            assert!(has_routine_barrier(facts(&units[0])), "{sql}");
         }
         for (dialect, sql) in [
             (
@@ -3293,7 +3319,6 @@ mod tests {
             "CREATE TABLE t (b BLOB, PRIMARY KEY (b(10)));",
             "CREATE INDEX sk ON t (b(1));",
             "CREATE INDEX sk ON t (`b`(1));",
-            "CREATE INDEX sk ON t ((lower(b)));",
             "ALTER TABLE t ADD INDEX sk (b(1));",
         ] {
             let units = parse(sql, DialectKind::MySql).unwrap();
@@ -3334,6 +3359,10 @@ mod tests {
         // Real calls in key position keep fencing: expression indexes lower
         // as Nested, and column or multi-argument calls match no prefix shape.
         for sql in [
+            // Cutback: `lower` is no longer a lifted builtin, so a
+            // functional key part calling it fences (name-based, not
+            // structural — the `b(1)` exclusion above is untouched).
+            "CREATE INDEX sk ON t ((lower(b)));",
             "CREATE INDEX sk ON t ((f(b)));",
             "CREATE INDEX sk ON t (f(b));",
             "CREATE INDEX sk ON t (f(1, 2));",

@@ -27,14 +27,13 @@
 //! - Opaque units (parse failures, global/session/transaction/schema
 //!   barriers, session effects, transaction effects) can affect any table
 //!   without naming it, so any opaque unit blocks every bundle.
-//!   Relation-scoped barriers fence only the named table. In particular the
 //!   pre-existing sequence/routine analysis marks every non-pure function
-//!   call as a global opaque barrier; only the per-dialect pure-builtin
-//!   table (`crate::pure`: `abs`, `coalesce`, `concat`, `length`, `lower`,
-//!   `nullif`, `round`, `upper` on SQLite/PostgreSQL/MySQL, unqualified and
-//!   without window/filter/grouping shapes) lifts that fence. Unknown and
-//!   volatile calls, aggregates (including `SUM`, `COUNT`), qualified
-//!   calls, and any call in a script containing routine DDL still fence,
+//!   call as a global opaque barrier; only the Generic reserved-keyword
+//!   rule (`crate::pure`: unquoted `coalesce`/`nullif` on GenericSQL)
+//!   lifts that fence. Unknown and volatile calls, aggregates (including
+//!   `SUM`, `COUNT`), engine-specific calls (including `abs` on
+//!   SQLite/PostgreSQL/MySQL), qualified calls, window/filter/grouping
+//!   shapes, and any call in a script containing routine DDL still fence,
 //!   so first-family proofs keep routine-free projections such as
 //!   `SELECT a FROM t ORDER BY a` whenever a fence-free unit is needed.
 //! - Generation account, per table (a single `CREATE TABLE` generation only;
@@ -1527,7 +1526,7 @@ mod tests {
 
     #[test]
     fn routine_call_keeps_global_opaque_fence() {
-        // `frobnicate` stays outside the pure-builtin tables, so it is
+        // `frobnicate` stays outside the pure-builtin rule, so it is
         // legitimately a global opaque barrier in native facts and every
         // bundle blocks as unknown.
         let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT frobnicate(a) FROM t;";

@@ -79,8 +79,8 @@ pub(super) struct AnalysisContext<'a> {
     pub(super) chunk_edits: bool,
     pub(super) column_ir: bool,
     pub(super) syntax_edits: bool,
-    /// Whether the per-dialect pure-builtin table ([`crate::pure`]) may lift
-    /// the routine fence. False whenever any routine DDL or parse error
+    /// Whether the Generic pure-builtin keyword rule ([`crate::pure`]) may
+    /// lift the routine fence. False whenever any routine DDL or parse error
     /// exists anywhere in the script (coarse shadowing rule), restoring the
     /// blanket fence for every unit.
     pub(super) pure_table_enabled: bool,
@@ -133,8 +133,8 @@ impl Visitor for SequenceVisitor<'_> {
             Some(SequenceEffect::Read(sequence)) => self.reads.push(sequence),
             Some(SequenceEffect::Unknown) => self.unknown = true,
             None if matches!(expr, Expr::Function(_)) => {
-                // Pure builtins lift the routine fence; unknown, volatile,
-                // sequence-adjacent, aggregate, and shadowed calls keep it.
+                // Only Generic keyword calls lift the routine fence; unknown,
+                // volatile, sequence-adjacent, and shadowed calls keep it.
                 // `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` never
                 // fence (ignored root, populated only when unshadowed).
                 let ignored = AnalysisVisitor::in_ignored_function_root(
