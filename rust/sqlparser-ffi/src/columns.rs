@@ -15,7 +15,7 @@
 //! zero fences. Otherwise the column target is emitted with `blocked` set (or
 //! omitted when it would duplicate a single), and is never partially applied.
 //!
-//! Fence boundary (first family, conservative — no generation solver):
+//! Fence boundary (first family + generation solver + namespace resolver):
 //! - Reads elsewhere (projections, `WHERE`, view sources, trigger
 //!   conditions/effects, `RETURNING`) fence by exact column match; any star
 //!   cover over the table fences regardless of what else the unit reads.
@@ -28,17 +28,59 @@
 //!   barriers, session effects, transaction effects) can affect any table
 //!   without naming it, so any opaque unit blocks every bundle.
 //!   Relation-scoped barriers fence only the named table. In particular the
-//!   pre-existing sequence/routine analysis marks ANY function call
-//!   (including `SUM`, `COUNT`) as a global opaque barrier; that fence is
-//!   preserved verbatim — there is deliberately no builtin or fixture
-//!   whitelist. First-family proofs use routine-free projections such as
-//!   `SELECT a FROM t ORDER BY a`.
-//! - Generation ambiguity (zero/non-unique definitions, `ALTER`, renames,
-//!   drops, `LIKE`, table sources, `ON COMMIT` actions, temporary tables,
-//!   inserts that precede the definition) fences the whole table.
-//! - Qualification ambiguity (same trailing name with distinct qualification,
-//!   e.g. `t` vs `main.t`, in any role) fences the table: the first family
-//!   has no namespace resolver and never assumes two spellings are distinct.
+//!   pre-existing sequence/routine analysis marks every non-pure function
+//!   call as a global opaque barrier; only the per-dialect pure-builtin
+//!   table (`crate::pure`: `abs`, `coalesce`, `concat`, `length`, `lower`,
+//!   `nullif`, `round`, `upper` on SQLite/PostgreSQL/MySQL, unqualified and
+//!   without window/filter/grouping shapes) lifts that fence. Unknown and
+//!   volatile calls, aggregates (including `SUM`, `COUNT`), qualified
+//!   calls, and any call in a script containing routine DDL still fence,
+//!   so first-family proofs keep routine-free projections such as
+//!   `SELECT a FROM t ORDER BY a` whenever a fence-free unit is needed.
+//! - Generation account, per table (a single `CREATE TABLE` generation only;
+//!   zero/non-unique definitions fence the whole table):
+//!   - Operations on other tables (alters, renames, drops) never fence this
+//!     table, even when they name an identical column.
+//!   - `ADD COLUMN other`, `DROP COLUMN other`, `RENAME COLUMN`
+//!     other-to-other, and `ADD CONSTRAINT` without the column lift for
+//!     that column: explicit column lists bind by name, so a change
+//!     elsewhere in the definition cannot move this column's items.
+//!     Anything naming the column fences it.
+//!   - `ADD`/`DROP COLUMN` still fence all when any positional (implicit
+//!     `VALUES`) insert binds: `FIRST`/`AFTER` placement is not in the IR,
+//!     so append is unprovable and ordinals may shift.
+//!   - `ALTER COLUMN` (including `CHANGE`/`MODIFY` rewrites, whose new
+//!     definition, `USING` expression, and placement hide in an opaque
+//!     detail string), generated `ADD COLUMN` expressions, opaque
+//!     constraints, and name-addressed changes (`DROP/RENAME CONSTRAINT`,
+//!     `DROP INDEX`, `VALIDATE`) fence the whole table: "other column" is
+//!     unprovable for them without frontend changes.
+//!   - Table renames are followed (sites before the rename bind the old
+//!     name, sites after bind the new name) only when unambiguous: one
+//!     outgoing rename per name, strictly ordered after the definition, no
+//!     cycle or self-rename, no second `CREATE` generation for any followed
+//!     name, no rename into the chain from outside, and no rename sharing
+//!     its unit with an alter of the generation. Anything else fences all.
+//!     Stale uses (a generation name outside its active segment) bind no
+//!     sites; fence checks still scan the whole chain.
+//!   - Drops are never followed across: any drop of a generation name
+//!     fences the whole table. `LIKE`, table sources, `ON COMMIT` actions,
+//!     temporary tables, and pre-definition inserts still fence the whole
+//!     table exactly as before.
+//! - Namespace resolver (no catalog; canonical spellings only):
+//!   - Identical canonical spellings (after `IdentifierRules` folding) are
+//!     the same table: case/quoting variants that fold together never fence
+//!     each other.
+//!   - Genuinely distinct spellings with the same trailing name (e.g. `t`
+//!     vs `main.t`) may alias, and neither same-nor-distinct is provable
+//!     without `search_path`/catalog reasoning (which this layer never
+//!     receives: [`assemble_columns`] sees units plus source only). A
+//!     sibling spelling in any DDL role (second definition, alter, drop,
+//!     rename, index/trigger host) keeps the whole-table fence. Sibling DML
+//!     uses narrow to the columns they can touch under the same-table
+//!     hypothesis: explicit lists touch their listed columns; implicit or
+//!     exotic shapes, stars, unknown sources, and implicit-column
+//!     foreign-key parents touch all.
 
 use crate::ir;
 use std::collections::{HashMap, HashSet};
@@ -283,40 +325,17 @@ fn collect_refs(facts: &ir::NativeFacts) -> UnitRefs<'_> {
     }
 }
 
-/// Generation fences (any `ALTER TABLE`, rename, or drop of the table),
-/// dependent fences (any trigger hosted on the table — `WHEN`/body effects
-/// are opaque), and relation-scoped barrier fences.
+/// Dependent fences (any trigger hosted on the table — `WHEN`/body effects
+/// are opaque) and relation-scoped barrier fences. Generation fences
+/// (`ALTER TABLE`, renames, drops) live in the per-table [`TableScope`].
 fn collect_table_fences(
     facts: &ir::NativeFacts,
-    generation: &mut HashSet<ir::Name>,
     dependent: &mut HashSet<ir::Name>,
     relation: &mut HashSet<ir::Name>,
 ) {
     for op in &facts.ops {
-        match op {
-            ir::CatalogOp::AlterTable(alter) => {
-                generation.insert(alter.table.name.clone());
-            }
-            ir::CatalogOp::Rename(rename) => match rename {
-                ir::RenameOp::Relation { from, to, .. } => {
-                    generation.insert(from.name.clone());
-                    generation.insert(to.clone());
-                }
-                ir::RenameOp::Column { table, .. } => {
-                    generation.insert(table.name.clone());
-                }
-            },
-            ir::CatalogOp::Drop(drop) => {
-                for object in &drop.objects {
-                    if let ir::DropObject::Relation { name, .. } = object {
-                        generation.insert(name.name.clone());
-                    }
-                }
-            }
-            ir::CatalogOp::DefineTrigger(trigger) => {
-                dependent.insert(trigger.table.name.clone());
-            }
-            _ => {}
+        if let ir::CatalogOp::DefineTrigger(trigger) = op {
+            dependent.insert(trigger.table.name.clone());
         }
     }
     for barrier in &facts.barriers {
@@ -354,8 +373,375 @@ fn constraint_is_opaque(constraint: &ir::Constraint) -> bool {
     )
 }
 
-fn name_in(names: &[ir::NameRef], table: &ir::Name) -> bool {
-    names.iter().any(|name| &name.name == table)
+/// One table-rename edge with its defining unit (0-based statement index).
+#[derive(Clone, Debug)]
+struct RelRename {
+    unit: usize,
+    from: ir::NameRef,
+    to: ir::Name,
+}
+
+/// A per-table fence with an all-columns flag plus per-column touches.
+#[derive(Debug, Default)]
+struct FenceSet {
+    all: bool,
+    touched: HashSet<ir::Ident>,
+}
+
+/// Per-table generation + namespace scope, computed ONCE per plan (never per
+/// column) from the assembly's precomputed material.
+struct TableScope {
+    /// Followed generation names: `[define, rename1, rename2, ...]`.
+    /// Longer than one entry only when every rename on the path is
+    /// unambiguous (see [`build_chain`]).
+    chain: Vec<ir::Name>,
+    /// Units of the followed rename edges, parallel to `chain[1..]`,
+    /// strictly increasing.
+    edge_units: Vec<usize>,
+    /// Generation fences ([`BLOCK_GENERATION`]).
+    generation: FenceSet,
+    /// Sibling-spelling fences ([`BLOCK_AMBIGUOUS`]).
+    amb: FenceSet,
+}
+
+impl TableScope {
+    /// Generation name active at `unit` (0-based): the last rename target
+    /// strictly before `unit`, else the define name. A rename in `unit`
+    /// itself never rebinds `unit`: single-statement units cannot observe
+    /// their own rename, and a rename sharing its unit with an alter of the
+    /// generation fences the whole table instead.
+    fn active(&self, unit: usize) -> &ir::Name {
+        let mut active = &self.chain[0];
+        for (edge, to) in self.edge_units.iter().zip(self.chain.iter().skip(1)) {
+            if *edge < unit {
+                active = to;
+            } else {
+                break;
+            }
+        }
+        active
+    }
+}
+
+/// Follow unambiguous table renames from `define` (defined in `define_unit`).
+/// Returns the generation chain with its edge units, or `None` when the
+/// generation is broken and every column must fence with
+/// [`BLOCK_GENERATION`]: a forked generation, a rename at or before the
+/// definition, a self-rename or cycle, a rename target colliding with any
+/// `CREATE TABLE` name (a second generation for that name), a rename into
+/// the chain from outside, a temporary-spelled rename touching the chain
+/// (never followed), any drop of a chain name (never followed across a
+/// drop), or a rename sharing its unit with an alter of the generation.
+fn build_chain(
+    assembly: &Assembly<'_>,
+    define: &ir::Name,
+    define_unit: usize,
+) -> Option<(Vec<ir::Name>, Vec<usize>)> {
+    let mut chain = vec![define.clone()];
+    let mut edge_units = Vec::new();
+    let mut visited = HashSet::new();
+    visited.insert(define.clone());
+    let mut previous = define_unit;
+    loop {
+        let current = chain.last().expect("non-empty chain").clone();
+        let outgoing: Vec<_> = assembly
+            .rel_renames
+            .iter()
+            .filter(|edge| !edge.from.temp && edge.from.name == current)
+            .collect();
+        if outgoing.is_empty() {
+            break;
+        }
+        if outgoing.len() > 1 {
+            return None;
+        }
+        let first = outgoing[0];
+        if first.unit <= previous {
+            return None;
+        }
+        if first.to == current || !visited.insert(first.to.clone()) {
+            return None;
+        }
+        if assembly.define_names.contains(&first.to) {
+            return None;
+        }
+        chain.push(first.to.clone());
+        edge_units.push(first.unit);
+        previous = first.unit;
+    }
+    let in_chain = |name: &ir::Name| chain.contains(name);
+    for edge in &assembly.rel_renames {
+        if edge.from.temp {
+            // Temporary renames are never followed; touching the chain
+            // fences exactly as the old whole-table rule did.
+            if in_chain(&edge.from.name) || in_chain(&edge.to) {
+                return None;
+            }
+            continue;
+        }
+        // A rename into the chain from outside produces a second generation
+        // for that name. (Renames out of the chain are all chain edges:
+        // every chain name's outgoing set was checked single above.)
+        if in_chain(&edge.to) && !in_chain(&edge.from.name) {
+            return None;
+        }
+    }
+    if assembly.drops.iter().any(in_chain) {
+        return None;
+    }
+    // A rename sharing its unit with an alter of the generation: the
+    // intra-unit order is unknowable, so the generation is ambiguous.
+    for unit in &edge_units {
+        let altered = assembly.views.get(*unit).is_some_and(|view| {
+            view.facts.is_some_and(|facts| {
+                facts.ops.iter().any(|op| {
+                    matches!(op, ir::CatalogOp::AlterTable(alter) if in_chain(&alter.table.name))
+                })
+            })
+        });
+        if altered {
+            return None;
+        }
+    }
+    Some((chain, edge_units))
+}
+
+/// Fold one `ALTER TABLE` change targeting the generation into `generation`:
+/// - `ADD COLUMN other` (non-generated, classified constraints) and
+///   `DROP COLUMN other` lift for that column when no positional (implicit
+///   `VALUES`) insert binds: explicit lists bind by name, so an
+///   order/arity change elsewhere cannot move this column's items. Any
+///   implicit insert fences all (`FIRST`/`AFTER` is not in the IR, so
+///   append is unprovable and ordinals may shift).
+/// - `ADD CONSTRAINT` lifts column-wise via its classified column lists;
+///   opaque constraints fence all, as do self-referencing foreign keys
+///   with implicit parent columns.
+/// - `ALTER COLUMN` (including `CHANGE`/`MODIFY` rewrites, whose new
+///   definition, `USING` expression, and placement hide in an opaque
+///   detail string), generated `ADD COLUMN` expressions, and
+///   name-addressed changes (`DROP/RENAME CONSTRAINT`, `DROP INDEX`,
+///   `VALIDATE`, `Other`) fence all: names do not map to columns here.
+fn fold_generation_change(
+    chain: &[ir::Name],
+    implicit: bool,
+    change: &ir::AlterChange,
+    generation: &mut FenceSet,
+) {
+    match change {
+        ir::AlterChange::AddColumn {
+            column,
+            constraints,
+        } => {
+            generation.touched.insert(column.name.clone());
+            if column.generated {
+                // A generated expression may read any column; the IR keeps
+                // only the flag, not the expression's columns.
+                generation.all = true;
+            }
+            if implicit {
+                generation.all = true;
+            }
+            for constraint in constraints {
+                fold_constraint(chain, constraint, generation);
+            }
+            for reference in &column.references {
+                if chain.contains(&reference.parent.name) {
+                    if reference.parent_columns.is_empty() {
+                        generation.all = true;
+                    } else {
+                        generation
+                            .touched
+                            .extend(reference.parent_columns.iter().cloned());
+                    }
+                }
+            }
+        }
+        ir::AlterChange::DropColumn { column, .. } => {
+            generation.touched.insert(column.clone());
+            if implicit {
+                generation.all = true;
+            }
+        }
+        ir::AlterChange::AddConstraint { constraint } => {
+            fold_constraint(chain, constraint, generation);
+        }
+        ir::AlterChange::AlterColumn { .. }
+        | ir::AlterChange::DropConstraint { .. }
+        | ir::AlterChange::DropIndex { .. }
+        | ir::AlterChange::RenameConstraint { .. }
+        | ir::AlterChange::ValidateConstraint { .. }
+        | ir::AlterChange::Other { .. } => {
+            generation.all = true;
+        }
+    }
+}
+
+/// Fold a classified constraint on the generation into `generation`. Opaque
+/// constraints and self-referencing foreign keys with implicit parent
+/// columns fence all; otherwise the named child (and, for self-references,
+/// parent) columns fence.
+fn fold_constraint(chain: &[ir::Name], constraint: &ir::Constraint, generation: &mut FenceSet) {
+    match constraint {
+        ir::Constraint::PrimaryKey { columns, .. }
+        | ir::Constraint::Unique { columns, .. }
+        | ir::Constraint::Check { columns, .. }
+        | ir::Constraint::Index { columns, .. } => {
+            generation.touched.extend(columns.iter().cloned());
+        }
+        ir::Constraint::ForeignKey(key) => {
+            generation.touched.extend(key.child_columns.iter().cloned());
+            if chain.contains(&key.parent.name) {
+                if key.parent_columns.is_empty() {
+                    generation.all = true;
+                } else {
+                    generation
+                        .touched
+                        .extend(key.parent_columns.iter().cloned());
+                }
+            }
+        }
+        ir::Constraint::UsingIndex { .. } | ir::Constraint::Other { .. } => {
+            generation.all = true;
+        }
+    }
+}
+
+/// Build the per-table scope for `define` (defined in `define_unit`).
+/// Generation ops on other tables are ignored; column renames on the chain
+/// fence their two endpoints; sibling-spelling ambiguity folds in last.
+fn build_scope(assembly: &Assembly<'_>, define: &ir::Name, define_unit: usize) -> TableScope {
+    let mut scope = TableScope {
+        chain: vec![define.clone()],
+        edge_units: Vec::new(),
+        generation: FenceSet::default(),
+        amb: FenceSet::default(),
+    };
+    let Some((chain, edge_units)) = build_chain(assembly, define, define_unit) else {
+        scope.generation.all = true;
+        build_sibling_scope(assembly, &scope.chain, &mut scope.amb);
+        return scope;
+    };
+    scope.chain = chain;
+    scope.edge_units = edge_units;
+    // Positional inserts bind every column by ordinal; any column-set/order
+    // change then fences all (see [`fold_generation_change`]).
+    let mut implicit = false;
+    for view in &assembly.views {
+        let Some(facts) = view.facts else { continue };
+        for insert in &facts.column.inserts {
+            let binds = insert
+                .target
+                .as_ref()
+                .is_some_and(|target| scope.chain.contains(&target.name));
+            if binds && insert.shape == InsertShape::PlainValues && insert.explicit.is_none() {
+                implicit = true;
+            }
+        }
+    }
+    for view in &assembly.views {
+        let Some(facts) = view.facts else { continue };
+        for op in &facts.ops {
+            match op {
+                ir::CatalogOp::AlterTable(alter) if scope.chain.contains(&alter.table.name) => {
+                    for change in &alter.changes {
+                        fold_generation_change(
+                            &scope.chain,
+                            implicit,
+                            change,
+                            &mut scope.generation,
+                        );
+                    }
+                }
+                ir::CatalogOp::Rename(ir::RenameOp::Column { table, from, to })
+                    if scope.chain.contains(&table.name) =>
+                {
+                    scope.generation.touched.insert(from.clone());
+                    scope.generation.touched.insert(to.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    build_sibling_scope(assembly, &scope.chain, &mut scope.amb);
+    scope
+}
+
+/// Fold sibling-spelling ambiguity (same trailing name, distinct canonical
+/// spelling, e.g. `t` vs `main.t`) into `amb`. Identical canonical
+/// spellings are the same table and never fence here. A sibling in any DDL
+/// role fences all; sibling DML uses fence only the columns they can touch
+/// under the same-table hypothesis: explicit lists touch their listed
+/// columns, while implicit or exotic shapes, stars, unknown sources, and
+/// implicit-column foreign-key parents touch all.
+fn build_sibling_scope(assembly: &Assembly<'_>, chain: &[ir::Name], amb: &mut FenceSet) {
+    let trailings: HashSet<&ir::Ident> = chain.iter().filter_map(|name| name.last()).collect();
+    let siblings: HashSet<&ir::Name> = assembly
+        .relation_names
+        .iter()
+        .filter(|name| {
+            !chain.contains(name) && name.last().is_some_and(|last| trailings.contains(last))
+        })
+        .collect();
+    if siblings.is_empty() {
+        return;
+    }
+    if assembly
+        .ddl_names
+        .iter()
+        .any(|name| siblings.contains(name))
+    {
+        amb.all = true;
+        return;
+    }
+    let is_sibling = |name: &ir::Name| siblings.contains(name);
+    for refs in assembly.refs.iter().flatten() {
+        if refs.stars.iter().any(|star| is_sibling(&star.name)) {
+            amb.all = true;
+        }
+        for read in &refs.reads {
+            if is_sibling(&read.source.name) {
+                amb.touched.extend(read.columns.iter().cloned());
+            }
+        }
+        for (target, columns) in &refs.writes {
+            if is_sibling(target) {
+                amb.touched.extend(columns.iter().cloned());
+            }
+        }
+        if refs.unknown_source && refs.touched.iter().any(&is_sibling) {
+            amb.all = true;
+        }
+    }
+    for view in &assembly.views {
+        let Some(facts) = view.facts else { continue };
+        for insert in &facts.column.inserts {
+            let Some(target) = &insert.target else {
+                continue;
+            };
+            if !is_sibling(&target.name) {
+                continue;
+            }
+            match insert.shape {
+                InsertShape::Exotic => amb.all = true,
+                InsertShape::Neutral => {}
+                InsertShape::SelectSource | InsertShape::PlainValues => match &insert.explicit {
+                    Some(list) => {
+                        amb.touched
+                            .extend(list.iter().map(|(name, _)| name.clone()));
+                    }
+                    None => amb.all = true,
+                },
+            }
+        }
+    }
+    for (parent, columns) in &assembly.parent_columns {
+        if is_sibling(parent) {
+            amb.touched.extend(columns.iter().cloned());
+        }
+    }
+    if assembly.parent_opaque.iter().any(is_sibling) {
+        amb.all = true;
+    }
 }
 
 fn has_duplicate_names(columns: &[ir::ColumnDef]) -> bool {
@@ -437,7 +823,6 @@ struct Assembly<'a> {
     /// Any parse failure, opaque unit, or resolution-changing effect blocks
     /// every bundle: never infer no-effect from no explicit names.
     opaque_all: bool,
-    generation_fenced: HashSet<ir::Name>,
     dependent_fenced: HashSet<ir::Name>,
     relation_fenced: HashSet<ir::Name>,
     index_columns: HashMap<ir::Name, Vec<ir::Ident>>,
@@ -447,42 +832,50 @@ struct Assembly<'a> {
     /// Parents referenced with implicit (unknown) columns: fence the whole
     /// parent table, including self-references.
     parent_opaque: HashSet<ir::Name>,
-    /// Tables with same-trailing-name, distinctly-qualified references
-    /// anywhere (e.g. `t` vs `main.t`): no namespace resolver exists, so any
-    /// such spelling fences the table as ambiguous.
-    ambiguous_tables: HashSet<ir::Name>,
+    /// Every relation name in any role (temp-blind, canonical). Membership
+    /// is exactly the old ambiguity input set.
+    relation_names: HashSet<ir::Name>,
+    /// Relation names in generation/DDL roles (definitions, alters, drops,
+    /// renames, index/trigger hosts). A subset of `relation_names`.
+    ddl_names: HashSet<ir::Name>,
+    /// Every `CREATE TABLE` name (rename-target collision checks).
+    define_names: HashSet<ir::Name>,
+    /// Table renames in unit order.
+    rel_renames: Vec<RelRename>,
+    /// Dropped relation names (temp-blind). Any drop of a generation name
+    /// breaks the generation.
+    drops: HashSet<ir::Name>,
 }
 
-/// Reference fences (reads, writes, stars, unknown sources) for one column.
-/// Returns the blocking cause, if any. Only exact column matches and actual
-/// star covers fence; plain projections that avoid the column never do.
+/// Reference fences (reads, writes, stars, unknown sources) for one column
+/// over its whole generation chain. Returns the blocking cause, if any.
+/// Only exact column matches and actual star covers fence; plain
+/// projections that avoid the column never do.
 fn reference_fence(
     assembly: &Assembly<'_>,
-    table: &ir::Name,
+    chain: &[ir::Name],
     column: &ir::Ident,
 ) -> Option<&'static str> {
+    let in_chain = |name: &ir::Name| chain.contains(name);
     for refs in assembly.refs.iter().flatten() {
         // Star cover fences independently of what else the unit reads: a
         // `SELECT *` mixed with explicit expressions still observes every
         // column. Empty-column reads without cover (`SELECT 1`, bare
         // `DELETE`) observe none and never fence.
-        if name_in(refs.stars, table) {
+        if refs.stars.iter().any(|star| in_chain(&star.name)) {
             return Some(BLOCK_STAR);
         }
         for read in &refs.reads {
-            if read.source.name != *table {
-                continue;
-            }
-            if read.columns.contains(column) {
+            if in_chain(&read.source.name) && read.columns.contains(column) {
                 return Some(BLOCK_READ);
             }
         }
         for (target, columns) in &refs.writes {
-            if *target == table && columns.contains(column) {
+            if in_chain(target) && columns.contains(column) {
                 return Some(BLOCK_READ);
             }
         }
-        if refs.unknown_source && refs.touched.contains(table) {
+        if refs.unknown_source && refs.touched.iter().any(&in_chain) {
             return Some(BLOCK_UNKNOWN);
         }
     }
@@ -603,6 +996,7 @@ fn column_target(
     define: &(usize, &ir::TableDef, Option<&CreateColumns>),
     ordinal: usize,
     create_dup_names: bool,
+    scope: &TableScope,
 ) -> Option<ColumnTarget> {
     let (unit_index, define, geometry) = *define;
     // Geometry and op columns are built from the same AST list; a pairing
@@ -641,19 +1035,20 @@ fn column_target(
     {
         blocked = blocked.or(Some(BLOCK_GENERATION));
     }
-    if assembly.ambiguous_tables.contains(table) {
-        blocked = blocked.or(Some(BLOCK_AMBIGUOUS));
-    }
-    if assembly.generation_fenced.contains(table) {
+    let in_chain = |name: &ir::Name| scope.chain.contains(name);
+    if scope.generation.all || scope.generation.touched.contains(&column) {
         blocked = blocked.or(Some(BLOCK_GENERATION));
     }
-    if assembly.relation_fenced.contains(table) {
+    if scope.amb.all || scope.amb.touched.contains(&column) {
+        blocked = blocked.or(Some(BLOCK_AMBIGUOUS));
+    }
+    if assembly.relation_fenced.iter().any(&in_chain) {
         blocked = blocked.or(Some(BLOCK_UNKNOWN));
     }
-    if assembly.dependent_fenced.contains(table) {
+    if assembly.dependent_fenced.iter().any(&in_chain) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
-    if assembly.index_opaque.contains(table) {
+    if assembly.index_opaque.iter().any(&in_chain) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
     if define.constraints.iter().any(constraint_is_opaque) {
@@ -670,28 +1065,31 @@ fn column_target(
     {
         blocked = blocked.or(Some(BLOCK_CONSTRAINT));
     }
-    if assembly
-        .index_columns
-        .get(table)
-        .is_some_and(|indexed| indexed.contains(&column))
-    {
+    if scope.chain.iter().any(|name| {
+        assembly
+            .index_columns
+            .get(name)
+            .is_some_and(|indexed| indexed.contains(&column))
+    }) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
-    if assembly.parent_opaque.contains(table) {
+    if assembly.parent_opaque.iter().any(in_chain) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
-    if assembly
-        .parent_columns
-        .get(table)
-        .is_some_and(|parents| parents.contains(&column))
-    {
+    if scope.chain.iter().any(|name| {
+        assembly
+            .parent_columns
+            .get(name)
+            .is_some_and(|parents| parents.contains(&column))
+    }) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
     if blocked.is_none() {
-        blocked = reference_fence(assembly, table, &column);
+        blocked = reference_fence(assembly, &scope.chain, &column);
     }
-    // Insert contributions, in unit order. The single definition must precede
-    // every matched insert; anything earlier cannot bind to it.
+    // Insert contributions, in unit order. Each insert binds the generation
+    // name active at its unit; the single definition must precede every
+    // matched insert, and anything earlier cannot bind to it.
     if blocked.is_none() {
         let create_arity = define.columns.len();
         for view in &assembly.views {
@@ -700,7 +1098,7 @@ fn column_target(
                 let Some(target) = &insert.target else {
                     continue;
                 };
-                if target.name != *table {
+                if target.name != *scope.active(view.index) {
                     continue;
                 }
                 if view.index < unit_index {
@@ -757,7 +1155,6 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
         .collect();
     let mut refs: Vec<Option<UnitRefs<'_>>> = Vec::with_capacity(views.len());
     let mut opaque_all = false;
-    let mut generation_fenced = HashSet::new();
     let mut dependent_fenced = HashSet::new();
     let mut relation_fenced = HashSet::new();
     let mut index_columns: HashMap<ir::Name, Vec<ir::Ident>> = HashMap::new();
@@ -765,6 +1162,10 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
     let mut parent_columns: HashMap<ir::Name, HashSet<ir::Ident>> = HashMap::new();
     let mut parent_opaque = HashSet::new();
     let mut relation_names: HashSet<ir::Name> = HashSet::new();
+    let mut ddl_names: HashSet<ir::Name> = HashSet::new();
+    let mut define_names: HashSet<ir::Name> = HashSet::new();
+    let mut rel_renames: Vec<RelRename> = Vec::new();
+    let mut drops: HashSet<ir::Name> = HashSet::new();
     for view in &views {
         let Some(facts) = view.facts else {
             refs.push(None);
@@ -786,16 +1187,12 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
             }
         }
         refs.push(Some(unit));
-        collect_table_fences(
-            facts,
-            &mut generation_fenced,
-            &mut dependent_fenced,
-            &mut relation_fenced,
-        );
+        collect_table_fences(facts, &mut dependent_fenced, &mut relation_fenced);
         for op in &facts.ops {
             match op {
                 ir::CatalogOp::DefineIndex(index) => {
                     relation_names.insert(index.table.name.clone());
+                    ddl_names.insert(index.table.name.clone());
                     if index.expression || index.predicate {
                         index_opaque.insert(index.table.name.clone());
                     } else {
@@ -807,6 +1204,8 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
                 }
                 ir::CatalogOp::DefineTable(table) => {
                     relation_names.insert(table.name.clone());
+                    ddl_names.insert(table.name.clone());
+                    define_names.insert(table.name.clone());
                     // Parent-side foreign keys live on OTHER tables (and
                     // self-references): fence the referenced column, or the
                     // whole parent when its columns are implicit.
@@ -833,14 +1232,18 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
                 }
                 ir::CatalogOp::DefineTrigger(trigger) => {
                     relation_names.insert(trigger.table.name.clone());
+                    ddl_names.insert(trigger.table.name.clone());
                 }
                 ir::CatalogOp::AlterTable(alter) => {
                     relation_names.insert(alter.table.name.clone());
+                    ddl_names.insert(alter.table.name.clone());
                 }
                 ir::CatalogOp::Drop(drop) => {
                     for object in &drop.objects {
                         if let ir::DropObject::Relation { name, .. } = object {
                             relation_names.insert(name.name.clone());
+                            ddl_names.insert(name.name.clone());
+                            drops.insert(name.name.clone());
                         }
                     }
                 }
@@ -848,23 +1251,20 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
                     ir::RenameOp::Relation { from, to, .. } => {
                         relation_names.insert(from.name.clone());
                         relation_names.insert(to.clone());
+                        ddl_names.insert(from.name.clone());
+                        ddl_names.insert(to.clone());
+                        rel_renames.push(RelRename {
+                            unit: view.index,
+                            from: from.clone(),
+                            to: to.clone(),
+                        });
                     }
                     ir::RenameOp::Column { table, .. } => {
                         relation_names.insert(table.name.clone());
+                        ddl_names.insert(table.name.clone());
                     }
                 },
                 _ => {}
-            }
-        }
-    }
-    // Same trailing name, distinct qualification, in any role: without a
-    // namespace resolver no spelling can be proven distinct, so every such
-    // table fences as ambiguous. Computed once per assembly.
-    let mut ambiguous_tables = HashSet::new();
-    for first in &relation_names {
-        for second in &relation_names {
-            if first != second && first.last() == second.last() {
-                ambiguous_tables.insert(first.clone());
             }
         }
     }
@@ -872,20 +1272,25 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
         views,
         refs,
         opaque_all,
-        generation_fenced,
         dependent_fenced,
         relation_fenced,
         index_columns,
         index_opaque,
         parent_columns,
         parent_opaque,
-        ambiguous_tables,
+        relation_names,
+        ddl_names,
+        define_names,
+        rel_renames,
+        drops,
     };
     let mut targets = Vec::new();
     for plan in plan_tables(&assembly.views) {
         // Exactly one plain definition binds every insert unambiguously;
-        // anything else fences the whole table.
+        // anything else fences the whole table. The per-table scope
+        // (generation chain plus sibling ambiguity) builds once per plan.
         let unique = plan.defines.len() == 1;
+        let scope = unique.then(|| build_scope(&assembly, &plan.name, plan.defines[0].0));
         for (unit_index, define, geometry) in &plan.defines {
             let arity = define.columns.len();
             let create_dup_names = has_duplicate_names(&define.columns);
@@ -920,6 +1325,7 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
                     &(*unit_index, *define, *geometry),
                     ordinal,
                     create_dup_names,
+                    scope.as_ref().expect("unique plan has scope"),
                 ) {
                     targets.push(target);
                 }
@@ -934,11 +1340,14 @@ mod tests {
     use super::*;
     use crate::{DialectKind, ir::ParseConfig, ir::ServerConfig};
 
-    fn parse_both(sql: &str) -> (Vec<crate::NativeUnit>, Vec<ColumnTarget>) {
+    fn parse_dialect(
+        sql: &str,
+        dialect: DialectKind,
+    ) -> (Vec<crate::NativeUnit>, Vec<ColumnTarget>) {
         let units = crate::parser::parse_units(
             sql,
             &ParseConfig {
-                dialect: DialectKind::SQLite,
+                dialect,
                 server: ServerConfig::default(),
                 chunk_edits: false,
                 column_ir: true,
@@ -949,6 +1358,10 @@ mod tests {
         .expect("parse");
         let targets = assemble_columns(&units, sql);
         (units, targets)
+    }
+
+    fn parse_both(sql: &str) -> (Vec<crate::NativeUnit>, Vec<ColumnTarget>) {
+        parse_dialect(sql, DialectKind::SQLite)
     }
 
     fn target<'a>(targets: &'a [ColumnTarget], column: &str) -> &'a ColumnTarget {
@@ -1059,8 +1472,9 @@ mod tests {
 
     #[test]
     fn routine_call_keeps_global_opaque_fence() {
-        // `SUM` is legitimately a global opaque barrier in native facts; no
-        // whitelist exists to enable it, so every bundle blocks as unknown.
+        // `SUM` stays outside the pure-builtin table, so it is legitimately a
+        // global opaque barrier in native facts and every bundle blocks as
+        // unknown.
         let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT SUM(a) FROM t;";
         let (_, targets) = parse_both(sql);
         assert_eq!(
@@ -1225,11 +1639,190 @@ mod tests {
     }
 
     #[test]
-    fn alter_fences_the_table() {
-        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN c INT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+    fn alter_other_table_never_fences() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT);\nALTER TABLE u ADD COLUMN y INT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(target(&targets, "a").blocked, None);
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn alter_other_table_same_column_name_never_fences() {
+        // Even a whole-table-fencing alter kind on `u` naming `t`'s column
+        // never fences `t`: per-table isolation is by table, not by name.
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(a INT);\nALTER TABLE u ALTER COLUMN a SET NOT NULL;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(target(&targets, "a").blocked, None);
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn add_column_other_lifts_with_explicit_inserts() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN c INT;\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+        assert_eq!(slices(sql, dropped), vec![", b INT", ", b", ", 2"]);
+        assert_eq!(
+            apply(sql, dropped),
+            "CREATE TABLE t(a INT);\nALTER TABLE t ADD COLUMN c INT;\nINSERT INTO t(a) VALUES (1);\nSELECT a FROM t ORDER BY a;"
+        );
+        assert_eq!(target(&targets, "a").blocked.as_deref(), Some(BLOCK_READ));
+    }
+
+    #[test]
+    fn add_column_other_still_fences_implicit_inserts() {
+        // `FIRST`/`AFTER` placement is not in the IR, so append is
+        // unprovable and positional binding may shift.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN c INT;\nINSERT INTO t VALUES (1, 2);";
         let (_, targets) = parse_both(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn add_column_touching_name_fences_only_it() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN b INT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
+    }
+
+    #[test]
+    fn add_column_generated_fences_all() {
+        // The generated expression may read any column; the IR keeps only
+        // the flag, not the expression's columns.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN c INT GENERATED ALWAYS AS (a + b);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn add_constraint_without_column_lifts() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD CHECK (a > 0);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn add_constraint_opaque_fences_all() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD PRIMARY KEY USING INDEX pk_t;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn drop_column_other_lifts_with_explicit_inserts() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t DROP COLUMN c;\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(target(&targets, "b").blocked, None);
+        assert_eq!(target(&targets, "a").blocked.as_deref(), Some(BLOCK_READ));
+    }
+
+    #[test]
+    fn drop_column_other_still_fences_implicit_inserts() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t DROP COLUMN c;\nINSERT INTO t VALUES (1, 2, 3);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn drop_column_self_fences_only_it() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t DROP COLUMN b;\nINSERT INTO t(a, c) VALUES (1, 3);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "c").blocked, None);
+    }
+
+    #[test]
+    fn rename_column_other_lifts() {
+        let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t RENAME COLUMN c TO d;\nINSERT INTO t(a, b, d) VALUES (1, 2, 3);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(slices(sql, dropped), vec![", b INT", ", b", ", 2"]);
+        assert_eq!(
+            target(&targets, "c").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_column_self_fences_only_it() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME COLUMN b TO b2;\nINSERT INTO t(a, b2) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
+    }
+
+    #[test]
+    fn alter_column_other_still_fences_all() {
+        // The `USING` expression hides in an opaque detail string, so
+        // "other column" is unprovable without frontend changes.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ALTER COLUMN a SET NOT NULL;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn drop_constraint_still_fences_all() {
+        // Constraint names do not map to columns here.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t DROP CONSTRAINT c;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
             Some(BLOCK_GENERATION)
         );
     }
@@ -1257,8 +1850,8 @@ mod tests {
 
     #[test]
     fn mixed_qualification_blocks_as_ambiguous() {
-        // `main.t` may alias `t`; without a namespace resolver the plan
-        // cannot prove the unqualified insert is the only writer.
+        // `main.t` may alias `t`, and the sibling insert lists both columns,
+        // so neither column's writer set is provable without a catalog.
         let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nINSERT INTO main.t(a, b) VALUES (3, 4);";
         let (_, targets) = parse_both(sql);
         assert_eq!(
@@ -1301,6 +1894,316 @@ mod tests {
     fn temporary_tables_are_outside_first_family() {
         let sql = "CREATE TEMP TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);";
         let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_table_followed() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a, b) VALUES (1, 2);\nSELECT a FROM u ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+        assert_eq!(
+            dropped
+                .sites
+                .iter()
+                .map(|site| site.stmt)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 3]
+        );
+        assert_eq!(slices(sql, dropped), vec![", b INT", ", b", ", 2"]);
+        assert_eq!(
+            apply(sql, dropped),
+            "CREATE TABLE t(a INT);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a) VALUES (1);\nSELECT a FROM u ORDER BY a;"
+        );
+        // The post-rename read binds the followed generation.
+        assert_eq!(target(&targets, "a").blocked.as_deref(), Some(BLOCK_READ));
+    }
+
+    #[test]
+    fn rename_chain_two_hops_binds_each_segment() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a, b) VALUES (3, 4);\nALTER TABLE u RENAME TO v;\nINSERT INTO v(a, b) VALUES (5, 6);";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 7);
+        assert_eq!(
+            dropped
+                .sites
+                .iter()
+                .map(|site| site.stmt)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 4, 4, 6, 6]
+        );
+        assert_eq!(
+            apply(sql, dropped),
+            "CREATE TABLE t(a INT);\nINSERT INTO t(a) VALUES (1);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a) VALUES (3);\nALTER TABLE u RENAME TO v;\nINSERT INTO v(a) VALUES (5);"
+        );
+    }
+
+    #[test]
+    fn rename_stale_insert_binds_no_sites() {
+        // The post-rename `INSERT INTO t` cannot name the generation (now
+        // `u`), so it contributes no sites and fences nothing.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a, b) VALUES (1, 2);\nINSERT INTO t(a, b) VALUES (3, 4);";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+        assert_eq!(slices(sql, dropped), vec![", b INT", ", b", ", 2"]);
+    }
+
+    #[test]
+    fn rename_fork_fences() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME TO u;\nALTER TABLE t RENAME TO v;\nINSERT INTO u(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_before_create_fences() {
+        let sql = "ALTER TABLE t RENAME TO u;\nCREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_onto_created_name_fences() {
+        // `u` already has its own `CREATE` generation; the rename target is
+        // a second generation for that name.
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT);\nALTER TABLE t RENAME TO u;\nINSERT INTO u(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_into_chain_fences() {
+        // Two tables renamed onto `u`: a second generation produces the name.
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE x(y INT);\nALTER TABLE t RENAME TO u;\nALTER TABLE x RENAME TO u;\nINSERT INTO u(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_with_drop_fences() {
+        // Drops are never followed across.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME TO u;\nDROP TABLE u;\nINSERT INTO u(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn rename_same_unit_alter_fences() {
+        // The rename shares its unit with an alter of the generation; the
+        // intra-unit order is unknowable. (PostgreSQL rejects this mix at
+        // runtime, but the parser accepts it, so the fence must hold.)
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t RENAME TO u, ADD COLUMN c INT;\nINSERT INTO u(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn alter_multi_add_other_lifts() {
+        // One unit, two `ADD COLUMN other` changes: neither touches `a`/`b`.
+        let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t ADD COLUMN c INT, ADD COLUMN d INT;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert_eq!(target(&targets, "a").blocked, None);
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn drop_recreate_fences() {
+        // Two `CREATE` generations for one name: the definition is not unique.
+        let sql = "CREATE TABLE t(a INT, b INT);\nDROP TABLE t;\nCREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn identical_spelling_case_variants_form() {
+        // SQLite folds unquoted identifiers to lower-case: one table.
+        let sql = "CREATE TABLE T(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT A FROM T ORDER BY A;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(target(&targets, "b").blocked, None);
+        assert_eq!(target(&targets, "a").blocked.as_deref(), Some(BLOCK_READ));
+    }
+
+    #[test]
+    fn identical_spelling_quoted_variants_form() {
+        // SQLite folds quoted identifiers to lower-case too: one table.
+        let sql = "CREATE TABLE \"T\"(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM \"t\" ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(target(&targets, "b").blocked, None);
+        assert_eq!(target(&targets, "a").blocked.as_deref(), Some(BLOCK_READ));
+    }
+
+    #[test]
+    fn ambiguous_read_fences_only_read_column() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT b FROM main.t;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
+    }
+
+    #[test]
+    fn ambiguous_insert_list_fences_listed_only() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nINSERT INTO main.t(a) VALUES (3);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn ambiguous_implicit_insert_fences_all() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nINSERT INTO main.t VALUES (3, 4);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+    }
+
+    #[test]
+    fn ambiguous_star_fences_all() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT * FROM main.t;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+    }
+
+    #[test]
+    fn ambiguous_ddl_keeps_whole_table() {
+        // A sibling spelling in a DDL role keeps the whole-table fence.
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nALTER TABLE main.t ADD COLUMN c INT;";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+    }
+
+    #[test]
+    fn ambiguous_fk_parent_fences_named_columns() {
+        let sql = "CREATE TABLE t(a INT, b INT);\nCREATE TABLE u(x INT, FOREIGN KEY (x) REFERENCES main.t(b));\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_AMBIGUOUS)
+        );
+        assert_eq!(target(&targets, "a").blocked, None);
+    }
+
+    #[test]
+    fn like_defines_no_bundles() {
+        // `LIKE` creates carry no column list under this parser, so the
+        // `LIKE` fence is vacuous: the table yields no targets at all while
+        // other tables are unaffected.
+        let sql = "CREATE TABLE t LIKE u;\nCREATE TABLE s(a INT, b INT);\nINSERT INTO s(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.table.0 != vec![ir::Ident("t".to_string())])
+        );
+        assert_eq!(target(&targets, "b").blocked, None);
+    }
+
+    #[test]
+    fn ctas_sources_still_fence() {
+        let sql = "CREATE TABLE u(x INT, y INT);\nCREATE TABLE t(a, b) AS SELECT x, y FROM u;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_both(sql);
+        assert_eq!(
+            target(&targets, "a").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_GENERATION)
+        );
+    }
+
+    #[test]
+    fn on_commit_still_fences() {
+        let sql =
+            "CREATE TEMP TABLE t(a INT, b INT) ON COMMIT DROP;\nINSERT INTO t(a, b) VALUES (1, 2);";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)

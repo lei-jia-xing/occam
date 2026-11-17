@@ -37,6 +37,9 @@ tests =
         , testCase "implicit order binds by definition order" testImplicit
         , testCase "quoted multibyte identifiers round-trip" testUtf8
         , testCase "atomic includes the single-only column" testSingleOnly
+        , testCase "atomic drops despite add-column on another column" testAtomicAlterAddOther
+        , testCase "atomic drops despite rename of another column" testAtomicRenameColumnOther
+        , testCase "atomic follows a table rename" testAtomicRenameFollow
         , testCase "syntax gate drops only edits" testSyntaxGate
         ]
 
@@ -73,14 +76,19 @@ sqliteOracle expected candidate = do
     (code, out) <- runSQLiteBytes (".bail on\n" <> candidate)
     pure (code == ExitSuccess && out == expected)
 
--- | Live schema of `t` after running a script, via the database itself.
-tableColumns :: ByteString -> IO [ByteString]
-tableColumns script = do
-    let probe = script <> "\nSELECT '---';\nSELECT name FROM pragma_table_info('t') ORDER BY cid;\n"
+-- | Live schema of a table after running a script, via the database itself.
+tableColumnsOn :: ByteString -> ByteString -> IO [ByteString]
+tableColumnsOn table script = do
+    let probe =
+            script <> "\nSELECT '---';\nSELECT name FROM pragma_table_info('" <> table <> "') ORDER BY cid;\n"
     (code, out) <- runSQLiteBytes probe
     assertEqual "probe script executes" ExitSuccess code
     let (_, after) = BS.breakSubstring "---\n" out
     pure (BSC.lines (BS.drop 4 after))
+
+-- | Live schema of `t` after running a script, via the database itself.
+tableColumns :: ByteString -> IO [ByteString]
+tableColumns = tableColumnsOn "t"
 
 testPoolWith :: (ByteString -> IO Bool) -> IO OraclePool
 testPoolWith predicate =
@@ -107,13 +115,16 @@ reduceWith mode =
         )
         nullLogger
 
-assertSchemaAndRows :: ByteString -> [ByteString] -> ByteString -> IO ()
-assertSchemaAndRows script expectedColumns expectedRows = do
-    columns <- tableColumns script
+assertSchemaAndRowsOn :: ByteString -> ByteString -> [ByteString] -> ByteString -> IO ()
+assertSchemaAndRowsOn table script expectedColumns expectedRows = do
+    columns <- tableColumnsOn table script
     assertEqual "live schema" expectedColumns columns
     (code, out) <- runSQLiteBytes script
     assertEqual "script executes" ExitSuccess code
     assertEqual "rowset preserved" expectedRows out
+
+assertSchemaAndRows :: ByteString -> [ByteString] -> ByteString -> IO ()
+assertSchemaAndRows = assertSchemaAndRowsOn "t"
 
 explicitScript :: ByteString
 explicitScript =
@@ -189,6 +200,55 @@ testSingleOnly = do
     atomicPool <- testPoolWith (sqliteOracle "1\n2\n")
     atomicReduced <- reduceWith ColumnAtomic atomicPool script
     assertSchemaAndRows atomicReduced ["a"] "1\n2\n"
+
+testAtomicAlterAddOther :: IO ()
+testAtomicAlterAddOther = do
+    -- `ADD COLUMN c` touches neither `a` nor `b`, so `b`'s bundle forms.
+    -- The `ALTER` itself may or may not survive statement-level reduction.
+    let script =
+            BSC.unlines
+                [ "CREATE TABLE t(a INT, b INT);"
+                , "ALTER TABLE t ADD COLUMN c INT;"
+                , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+                , "SELECT a FROM t ORDER BY a;"
+                ]
+    pool <- testPoolWith (sqliteOracle "1\n2\n")
+    reduced <- reduceWith ColumnAtomic pool script
+    columns <- tableColumns reduced
+    assertBool "b dropped" ("b" `notElem` columns)
+    assertBool "a kept" ("a" `elem` columns)
+    (code, out) <- runSQLiteBytes reduced
+    assertEqual "script executes" ExitSuccess code
+    assertEqual "rowset preserved" "1\n2\n" out
+
+testAtomicRenameColumnOther :: IO ()
+testAtomicRenameColumnOther = do
+    -- Renaming `c` to `d` touches neither `a` nor `b`, so `b`'s bundle forms.
+    let script =
+            BSC.unlines
+                [ "CREATE TABLE t(a INT, b INT, c INT);"
+                , "ALTER TABLE t RENAME COLUMN c TO d;"
+                , "INSERT INTO t(a, b, d) VALUES (1, 10, 100), (2, 20, 200);"
+                , "SELECT a FROM t ORDER BY a;"
+                ]
+    pool <- testPoolWith (sqliteOracle "1\n2\n")
+    reduced <- reduceWith ColumnAtomic pool script
+    assertSchemaAndRows reduced ["a", "d"] "1\n2\n"
+
+testAtomicRenameFollow :: IO ()
+testAtomicRenameFollow = do
+    -- The bundle follows `t` across the rename: `b` drops from the `t`
+    -- definition and the post-rename `u` inserts.
+    let script =
+            BSC.unlines
+                [ "CREATE TABLE t(a INT, b INT);"
+                , "ALTER TABLE t RENAME TO u;"
+                , "INSERT INTO u(a, b) VALUES (1, 10), (2, 20);"
+                , "SELECT a FROM u ORDER BY a;"
+                ]
+    pool <- testPoolWith (sqliteOracle "1\n2\n")
+    reduced <- reduceWith ColumnAtomic pool script
+    assertSchemaAndRowsOn "u" reduced ["a"] "1\n2\n"
 
 testSyntaxGate :: IO ()
 testSyntaxGate = do
