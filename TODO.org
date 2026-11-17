@@ -9,12 +9,12 @@
 - [Unix-Native Ergonomics] Pure reduced SQL on `stdout` when piped, diagnostics and dynamic progress on `stderr`, and native shell auto-completions via `usage`.
 
 * Active Tasks
-** IN_PROGRESS [#A] Compile reproducible reducer comparisons and evaluation evidence
-- Keep the primary evaluation on deterministic, self-contained SQLite predicates; no new crash harvesting or heavyweight DBMS deployment.
-- Compare Occam against independently implemented C-Reduce, SQLancer, and SQLreduce search using identical inputs, predicates, resource limits, and declared adapter modes.
-- Separate completed reductions from validated budget checkpoints; report output size, wall time, oracle observations, failures, and regressions without pooling internal controls with external tools.
-- Real-crash stack fingerprints, if needed later, belong in optional database-specific predicates rather than the reducer core.
-- Generic external-oracle adapter latency only: `oracle_exec.py` leader wait uses a dedicated blocking reaper under the same deadline/audit contract. One paired AB/BA probe showed -28.2ms/observation median (10/10 pairs negative, all accepted) — observed under host drift, not causal proof; see `benchmarks/benchmark_artifacts/external-comparison-eventwait-analysis-20261116-a/report.md`.
+** DONE [#A] Compile reproducible reducer comparisons and evaluation evidence
+- Primary scope stays Strategy 3A: deterministic self-contained SQLite predicates; no new crash harvesting or DBMS deployment.
+- Occam-vs-external coverage from frozen bundles only: 4-tool origin `benchmarks/benchmark_artifacts/external-comparison-20261115-a`, matched occam/sqlancer baseline (`external-comparison-baseline-20261116-a` + analysis report), newest rerun `external-comparison-rerun-20261117-a` (local-only), plus list-chunks and eventwait cohort analyses.
+- Internal coverage: column triad (`column-triad-20261116-a` + analysis), A2/B emission-gate pairing (`column-ab-paired-20261116-a/report.md`), jobs1-vs-jobs4 pairs (`concurrency-jobs1-vs-jobs4-20261116-a/{summary,pairs}.json`).
+- Completed/censored kept separate; no global-winner claims, no pooled censored speedups; counts live only in the linked reports, with the prose index in `benchmarks/README.md`.
+- Evidence: `benchmarks/benchmark_artifacts/{external-comparison-baseline-analysis-20261116-a,external-comparison-rerun-20261117-a,external-comparison-list-chunks-analysis-20261116-a,external-comparison-eventwait-analysis-20261116-a,column-triad-analysis-20261116-a,column-ab-paired-20261116-a}/report.md`.
 
 ** DONE [#A] Cost attribution per edit family/category (metrics only, no per-candidate SQL trace)
 - Count attempts/accepts/rejects per edit family and category, including cancels and unselected/passed-over candidates; attribute parse, candidate-build, oracle, and reset costs separately.
@@ -130,7 +130,9 @@
 - 8-name allowlist (abs, coalesce, concat, length, lower, nullif, round, upper) lifts the routine fence in both the SequenceVisitor and has_function positions.
 - Scope: SQLite, PostgreSQL, and MySQL only; unqualified single-part names; script-wide disable on any routine DDL or parse error (shadowing rule).
 - Aggregates, volatile/sequence-adjacent names, qualified names, and window/filter/grouping call shapes stay fenced.
-- [Supersession note: per-dialect SQLite/PostgreSQL/MySQL scalar+aggregate tables cut back to Generic-only unquoted coalesce/nullif 2026-11-17; hand-maintained per-engine catalogs judged an unmaintainable trajectory — reserved-keyword-only Generic rule stands because it depends on no engine.]
+- Intermediate step: 5-name plain-shape aggregate allowlist on 3 dialects (OVER/statistical/window kept fenced), Generic unquoted coalesce/nullif subset, MySQL b(N) key-position structural exclusion.
+- FILTER lifted on allowlisted aggregates only; OVER/within-group/scalar/Generic shapes stayed fenced.
+- [Supersession note: per-dialect SQLite/PostgreSQL/MySQL scalar+aggregate tables cut back to Generic-only unquoted coalesce/nullif 2026-11-17; hand-maintained per-engine catalogs judged an unmaintainable trajectory — reserved-keyword-only Generic rule stands because it depends on no engine. FILTER re-fenced on every name/dialect, b(1) exclusion kept; tests flipped to fence premises, xval 3 agree→abstain with gate green.]
 
 ** DONE Session-effect modeling for SET and PRAGMA [2026-11]
 - system_var_scope resolves foreign_keys/foreign_key_checks, autocommit, and search_path to session/global effects; @@global maps to global (ignored), @user vars and foreign qualifiers fence.
@@ -141,18 +143,23 @@
 - Per-table generation chains (TableScope/build_chain): other-table ops isolated; per-column ADD/DROP/RENAME lifting; unambiguous renames followed; drops never followed.
 - Namespace fallback on canonical spellings: sibling DDL fences the whole table, sibling DML narrows per column under the same-table hypothesis.
 - ALTER COLUMN/opaque shapes, implicit-positional inserts under ADD/DROP, LIKE/sources/temp, and zero/non-unique definitions stay fenced; fence-boundary module docs rewritten.
+- ALTER COLUMN carries referenced columns plus repositions flag in IR; USING/SET DEFAULT fence target plus referenced, FIRST/AFTER fences all, no-expression ops fence target only.
 
 ** DONE Partition/inheritance routing and OUTPUT INTO modeling [2026-11]
 - Parent/child routing facts with childrenOf fan-out in reads and writes (INSERT parent-only under plain INHERITS, ONLY skips children) plus attach/detach partition ops.
 - OUTPUT INTO a table adds a write edge; OUTPUT INTO a table variable fences at relation scope.
 - Barrier-count delta on the partition-heavy partprune corpus file: 20 to 1 (barrier census, not a speedup claim).
+- INHERIT/NO INHERIT via AttachInherit/DetachInherit ops in the inherit-parents set (PartitionLink shape, flipped direction); INSERT parent-only preserved, unresolvable shapes fence.
 
 ** DONE Engine cross-validation harness and dependency fixes [2026-11]
 - Hidden --dump-facts plus cross_validate_deps.py replays corpus statements in SQLite with a set_authorizer ground-truth callback.
 - Per-statement agree/abstain/engine-error/mismatch buckets with documented alignment rules; deterministic ordering and JSON output.
 - Found and fixed missing ON CONFLICT arbiter/SET target-row reads; fenced statements count as abstain, never mismatch.
+- ON DUPLICATE KEY duplicate-row SET/arbiter source reads with VALUES/row-alias proposed-row exclusion; xval deltas zero (SQLite-harness-blind, pinned by unit+e2e).
+- KNOWN_GAPS gate pins with PIN-DRIFT/STALE failure modes plus SET NULL/DEFAULT cascade and mid-file FK-toggle corpus files; nightly CI job, per-PR untouched.
 
 ** DONE CLI and build hygiene batch [2026-11]
 - Diagnostics moved to stderr (unbreaking --out -); text mode honors --log-level with new INFO default; --no-unrestricted help clarified.
 - Makefile rust-fresh content-stamp guard on build/build-check/test; CI gains fourmolu/hlint/fmt/clippy/-Werror parity with a rust-aware cache key.
 - Shell completions switched from the external usage-KDL chain to optparse-native generation (parser as single source; bash/zsh/fish from the binary; PowerShell/Nushell dropped).
+- Dual-mode Rust linkage: dynamic dev default via confHook rpath (bare cabal works, zero Haskell rebuild on Rust-only edits) plus static-rust flag for single-binary release; Makefile runs cargo first, rust-fresh guard deleted.
