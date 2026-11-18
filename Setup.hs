@@ -24,7 +24,7 @@ import Distribution.Types.CondTree (CondTree (..))
 import Distribution.Types.Flag (lookupFlagAssignment, mkFlagName)
 import Distribution.Types.HookedBuildInfo (HookedBuildInfo)
 #if MIN_VERSION_Cabal(3, 14, 0)
-import Distribution.Utils.Path (getSymbolicPath)
+import Distribution.Utils.Path (Dir, Lib, Pkg, SymbolicPath, getSymbolicPath, makeSymbolicPath)
 #endif
 import System.Directory (copyFile, createDirectoryIfMissing, getCurrentDirectory)
 import System.FilePath ((</>))
@@ -54,6 +54,15 @@ useStatic flags =
     os == "mingw32"
         || lookupFlagAssignment (mkFlagName "static-rust") (configConfigurationsFlags flags) == Just True
 
+-- Cabal 3.14 changed BuildInfo.extraLibDirs to a SymbolicPath.
+#if MIN_VERSION_Cabal(3, 14, 0)
+rustLibDir :: FilePath -> SymbolicPath Pkg (Dir Lib)
+rustLibDir = makeSymbolicPath
+#else
+rustLibDir :: FilePath -> FilePath
+rustLibDir = id
+#endif
+
 {- | In dynamic (dev) mode, point every component at the absolute cargo
 release dir and bake it as an rpath, so the loader finds the cdylib with
 no env vars. Static mode skips this untouched (byte-identical output).
@@ -78,7 +87,7 @@ addRustRpath dir package =
         }
     where
         rpath = "-Wl,-rpath," ++ dir
-        start info = info {extraLibDirs = dir : extraLibDirs info, ldOptions = rpath : ldOptions info}
+        start info = info {extraLibDirs = rustLibDir dir : extraLibDirs info, ldOptions = rpath : ldOptions info}
         addLib tree = tree {condTreeData = lib {libBuildInfo = start (libBuildInfo lib)}}
             where
                 lib = condTreeData tree
