@@ -27,7 +27,11 @@ import Data.Aeson (
     ToJSON (..),
     ToJSONKey (..),
     ToJSONKeyFunction (..),
+    object,
+    withObject,
     withText,
+    (.:),
+    (.=),
  )
 import Data.Aeson.Encoding qualified as Encoding
 import Data.Aeson.Key qualified as Key
@@ -37,7 +41,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
-import Occam.Facts (ParserEditCategory, editCategoryName, parseEditCategoryName)
+import Occam.Facts (ParserEditCategory)
 
 data MetricPolicy = MetricPolicy
     { metricSearchPolicy :: !Text
@@ -56,47 +60,30 @@ data FamilyTag
     | TagBundle !Text
     deriving (Eq, Ord, Show, Generic)
 
-familyTagKey :: FamilyTag -> Text
-familyTagKey TagUnknown = "unknown"
-familyTagKey TagStatement = "statement"
-familyTagKey (TagSyntax category label) = "syntax:" <> editCategoryName category <> ":" <> label
-familyTagKey (TagBundle label) = "bundle:" <> label
-
-parseFamilyTagKey :: Text -> Maybe FamilyTag
-parseFamilyTagKey "unknown" = Just TagUnknown
-parseFamilyTagKey "statement" = Just TagStatement
-parseFamilyTagKey key
-    | Just rest <- T.stripPrefix "syntax:" key =
-        case T.breakOn ":" rest of
-            (category, colonLabel)
-                | not (T.null category)
-                , Just label <- T.stripPrefix ":" colonLabel
-                , not (T.null label)
-                , Just parsed <- parseEditCategoryName category ->
-                    Just (TagSyntax parsed label)
-            _ -> Nothing
-    | Just label <- T.stripPrefix "bundle:" key =
-        if T.null label then Nothing else Just (TagBundle label)
-    | otherwise = Nothing
-
 instance ToJSON FamilyTag where
-    toJSON = toJSON . familyTagKey
+    toJSON TagUnknown = object ["kind" .= ("unknown" :: Text)]
+    toJSON TagStatement = object ["kind" .= ("statement" :: Text)]
+    toJSON (TagSyntax category label) =
+        object
+            [ "kind" .= ("syntax" :: Text)
+            , "category" .= category
+            , "label" .= label
+            ]
+    toJSON (TagBundle label) =
+        object
+            [ "kind" .= ("bundle" :: Text)
+            , "label" .= label
+            ]
 
 instance FromJSON FamilyTag where
-    parseJSON = withText "FamilyTag" \name ->
-        maybe (fail ("unknown metrics family tag: " <> T.unpack name)) pure (parseFamilyTagKey name)
-
-instance ToJSONKey FamilyTag where
-    toJSONKey :: ToJSONKeyFunction FamilyTag
-    toJSONKey =
-        ToJSONKeyText
-            (Key.fromText . familyTagKey)
-            (Encoding.text . familyTagKey)
-
-instance FromJSONKey FamilyTag where
-    fromJSONKey :: FromJSONKeyFunction FamilyTag
-    fromJSONKey = FromJSONKeyTextParser \name ->
-        maybe (fail ("unknown metrics family tag: " <> T.unpack name)) pure (parseFamilyTagKey name)
+    parseJSON = withObject "FamilyTag" \objectValue -> do
+        kind <- objectValue .: "kind"
+        case (kind :: Text) of
+            "unknown" -> pure TagUnknown
+            "statement" -> pure TagStatement
+            "syntax" -> TagSyntax <$> objectValue .: "category" <*> objectValue .: "label"
+            "bundle" -> TagBundle <$> objectValue .: "label"
+            _ -> fail ("unknown metrics family kind: " <> T.unpack kind)
 
 data ParseKind = ParseStatementOnly | ParseSyntaxChunks | ParseColumnIR
     deriving (Eq, Ord, Show, Generic)
@@ -155,6 +142,28 @@ data FamilyCounters = FamilyCounters
 instance ToJSON FamilyCounters
 instance FromJSON FamilyCounters
 
+{- | One family entry in the JSON wire format. The internal snapshot keeps a
+map for lookup; arrays are used on the wire so tags stay structured.
+-}
+data FamilyEntry = FamilyEntry
+    { familyEntryTag :: !FamilyTag
+    , familyEntryCounters :: !FamilyCounters
+    }
+    deriving (Eq, Show, Generic)
+
+instance ToJSON FamilyEntry where
+    toJSON FamilyEntry {familyEntryTag, familyEntryCounters} =
+        object
+            [ "tag" .= familyEntryTag
+            , "counters" .= familyEntryCounters
+            ]
+
+instance FromJSON FamilyEntry where
+    parseJSON = withObject "FamilyEntry" \objectValue ->
+        FamilyEntry
+            <$> objectValue .: "tag"
+            <*> objectValue .: "counters"
+
 data MetricsSnapshot = MetricsSnapshot
     { snapshotPolicy :: !MetricPolicy
     , snapshotFamilies :: !(Map FamilyTag FamilyCounters)
@@ -164,8 +173,29 @@ data MetricsSnapshot = MetricsSnapshot
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON MetricsSnapshot
-instance FromJSON MetricsSnapshot
+instance ToJSON MetricsSnapshot where
+    toJSON MetricsSnapshot {..} =
+        object
+            [ "snapshotPolicy" .= snapshotPolicy
+            , "snapshotFamilies"
+                .= [ FamilyEntry tag counters
+                   | (tag, counters) <- Map.toList snapshotFamilies
+                   ]
+            , "snapshotGeneratedSkipped" .= snapshotGeneratedSkipped
+            , "snapshotParseFfiMicros" .= snapshotParseFfiMicros
+            , "snapshotParseDecodeMicros" .= snapshotParseDecodeMicros
+            ]
+
+instance FromJSON MetricsSnapshot where
+    parseJSON = withObject "MetricsSnapshot" \objectValue ->
+        MetricsSnapshot
+            <$> objectValue .: "snapshotPolicy"
+            <*> (Map.fromList . map entryPair <$> objectValue .: "snapshotFamilies")
+            <*> objectValue .: "snapshotGeneratedSkipped"
+            <*> objectValue .: "snapshotParseFfiMicros"
+            <*> objectValue .: "snapshotParseDecodeMicros"
+        where
+            entryPair entry = (familyEntryTag entry, familyEntryCounters entry)
 
 {- | Mutable per-run cost store. One owner (Evaluation) creates it, threads it
 into the pool config, and snapshots it after the pool drains; record sites

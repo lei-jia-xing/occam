@@ -23,6 +23,7 @@ import Occam.Evaluation (
     runEvaluatedReduction,
     sqlDialectName,
  )
+import Occam.Facts (ParserEditCategory (..))
 import Occam.Logger (nullLogger)
 import Occam.Metrics (
     FamilyCounters (..),
@@ -593,6 +594,18 @@ tests =
                     Just counters -> do
                         assertEqual "ordered accept retired before the error" 1 (retiredAccept counters)
                         assertEqual "inconclusive retirement attributed" 1 (retiredInconclusive counters)
+        , testCase "family tags encode structurally and reject legacy string keys" $ do
+            let tags =
+                    [ TagUnknown
+                    , TagStatement
+                    , TagSyntax EditList "remove-values_row"
+                    , TagBundle "remove-column-bundle"
+                    ]
+            assertEqual "family tags round-trip" (Just tags) (decode (encode tags))
+            assertEqual
+                "legacy string tag is rejected"
+                (Nothing :: Maybe FamilyTag)
+                (decode "\"syntax:list:remove-values_row\"")
         ]
 
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig

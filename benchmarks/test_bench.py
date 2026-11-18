@@ -147,10 +147,16 @@ def stats_fixture():
             "evaluationCostAttribution": {
                 "snapshotParseFfiMicros": {"statement-only": 100, "syntax-chunks": 50},
                 "snapshotParseDecodeMicros": {"statement-only": 25},
-                "snapshotFamilies": {
-                    "statement": {"candidateBuildMicros": 75},
-                    "unknown": {"candidateBuildMicros": 0},
-                },
+                "snapshotFamilies": [
+                    {
+                        "tag": {"kind": "statement"},
+                        "counters": {"candidateBuildMicros": 75},
+                    },
+                    {
+                        "tag": {"kind": "unknown"},
+                        "counters": {"candidateBuildMicros": 0},
+                    },
+                ],
             },
         },
     }

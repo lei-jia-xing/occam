@@ -205,8 +205,9 @@ def engine_overhead_us(stats):
             .get("evaluationCostAttribution") or {})
     total = sum((cost.get("snapshotParseFfiMicros") or {}).values())
     total += sum((cost.get("snapshotParseDecodeMicros") or {}).values())
-    for fam in (cost.get("snapshotFamilies") or {}).values():
-        total += (fam or {}).get("candidateBuildMicros", 0) or 0
+    for fam in cost.get("snapshotFamilies") or []:
+        counters = (fam or {}).get("counters") or {}
+        total += counters.get("candidateBuildMicros", 0) or 0
     return total
 
 
