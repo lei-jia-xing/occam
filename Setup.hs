@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
 
 import Control.Monad (when)
 import Distribution.PackageDescription (
@@ -24,7 +25,7 @@ import Distribution.Types.CondTree (CondTree (..))
 import Distribution.Types.Flag (lookupFlagAssignment, mkFlagName)
 import Distribution.Types.HookedBuildInfo (HookedBuildInfo)
 #if MIN_VERSION_Cabal(3, 14, 0)
-import Distribution.Utils.Path (Dir, Lib, Pkg, SymbolicPath, getSymbolicPath, makeSymbolicPath)
+import Distribution.Utils.Path (FileOrDir (Dir), Lib, Pkg, SymbolicPath, getSymbolicPath, makeSymbolicPath)
 #endif
 import System.Directory (copyFile, createDirectoryIfMissing, getCurrentDirectory)
 import System.FilePath ((</>))
