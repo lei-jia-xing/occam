@@ -1,10 +1,9 @@
 module Main (main) where
 
-import Benchmark (BenchmarkMetric (..))
 import ColumnChecks qualified
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (when)
-import Data.Aeson (Value, eitherDecodeStrict')
+import Data.Aeson (FromJSON (..), Value, eitherDecodeStrict', withObject, (.:))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isSpace)
@@ -213,16 +212,6 @@ runOccamCLI cliArgs = do
         then readProcessWithExitCode "cabal" (["run", "-v0", "occam", "--"] ++ cliArgs) ""
         else readProcessWithExitCode bin cliArgs ""
 
-getOccamEvalBinary :: IO FilePath
-getOccamEvalBinary = resolveBinary "OCCAM_EVAL_BIN" "occam-eval"
-
-runOccamEvalCLI :: [String] -> IO (ExitCode, String, String)
-runOccamEvalCLI cliArgs = do
-    bin <- getOccamEvalBinary
-    if bin == "cabal"
-        then readProcessWithExitCode "cabal" (["run", "-v0", "occam-eval", "--"] ++ cliArgs) ""
-        else readProcessWithExitCode bin cliArgs ""
-
 withCLIInput :: BS.ByteString -> (FilePath -> FilePath -> IO a) -> IO a
 withCLIInput sql action =
     bracket create cleanup $ \input -> do
@@ -242,24 +231,42 @@ withCLIInput sql action =
 stripEnd :: String -> String
 stripEnd = reverse . dropWhile isSpace . reverse
 
+-- | Minimal probe into the CLI's stats.json (whose Stats type lives in app/).
+data CliStats = CliStats
+    { cliStatus :: !EvaluationStatus
+    , cliBudget :: !EvaluationConfig
+    , cliMetrics :: !EvaluationMetrics
+    , cliStrategy :: !T.Text
+    }
+
+instance FromJSON CliStats where
+    parseJSON = withObject "CliStats" $ \stats -> do
+        settings <- stats .: "reduction_settings"
+        strategy <- withObject "reduction_settings" (.: "strategy") settings
+        CliStats
+            <$> stats .: "status"
+            <*> stats .: "evaluation_budget"
+            <*> stats .: "evaluation_metrics"
+            <*> pure strategy
+
 phase5Tests :: TestTree
 phase5Tests =
     testGroup
         "CLI predicate contract"
-        [ testCase "CLI and evaluator refuse rejected or signaled initial predicates" $
+        [ testCase "CLI refuses rejected or signaled initial predicates" $
             mapM_
-                ( \(runner, extra) ->
+                ( \extra ->
                     mapM_
                         ( \command -> withCLIInput "SELECT 1;" $ \input outDir -> do
-                            (code, _, _) <- runner ([input, "--oracle", command, "--out", outDir, "--quiet"] ++ extra)
+                            (code, _, _) <- runOccamCLI ([input, "--oracle", command, "--out", outDir, "--quiet"] ++ extra)
                             assertBool ("Noninteresting input was accepted: " ++ command) (code /= ExitSuccess)
                             exists <- doesDirectoryExist outDir
                             assertBool "Reduction started before the initial predicate accepted" (not exists)
                         )
                         ["false", "exit 139", "kill -TERM $$"]
                 )
-                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
-        , testCase "CLI and evaluator shrink SQL while preserving the supplied predicate" $ do
+                [[], ["--strategy", "ddmin-only"]]
+        , testCase "CLI shrinks SQL while preserving the supplied predicate" $ do
             let initialSQL =
                     BSC.unlines
                         [ "CREATE TABLE t1 (a INT, b TEXT);"
@@ -271,76 +278,79 @@ phase5Tests =
                 predicate =
                     "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
             mapM_
-                ( \(runner, extra) -> withCLIInput initialSQL $ \input outDir -> do
-                    (code, _, err) <- runner ([input, "--oracle", predicate, "--out", outDir, "--quiet"] ++ extra)
+                ( \extra -> withCLIInput initialSQL $ \input outDir -> do
+                    (code, _, err) <- runOccamCLI ([input, "--oracle", predicate, "--out", outDir, "--quiet"] ++ extra)
                     assertEqual ("Reduction failed: " ++ err) ExitSuccess code
                     reduced <- BSC.readFile (outDir </> "minimal.sql")
                     (verified, _, _) <- readProcessWithExitCode "sh" ["-c", predicate] (BSC.unpack reduced)
                     assertEqual "Reduced SQL lost the target property" ExitSuccess verified
                     assertBool "No SQL reduction occurred" (BS.length reduced < BS.length initialSQL)
                 )
-                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
-        , testCase "selected internal profiles own their preflight and execution budget" $
+                [[], ["--strategy", "ddmin-only"]]
+        , testCase "selected strategies own their preflight and execution budget" $
             withCLIInput "SELECT 1; SELECT 2;" $ \input outRoot ->
                 withCLIInput "" $ \calls _ -> do
                     let predicate = "cat >/dev/null; printf x >> " ++ show calls
                     mapM_
-                        ( \profile -> do
-                            let outDir = outRoot </> profile
+                        ( \(extra, expectedStrategy) -> do
+                            let outDir = outRoot </> T.unpack expectedStrategy
                             (code, _, _) <-
-                                runOccamEvalCLI
-                                    [ input
-                                    , "--profile"
-                                    , profile
-                                    , "--oracle"
-                                    , predicate
-                                    , "--max-oracle-executions"
-                                    , "1"
-                                    , "--out"
-                                    , outDir
-                                    , "--quiet"
-                                    ]
+                                runOccamCLI
+                                    ( [ input
+                                      , "--oracle"
+                                      , predicate
+                                      , "--max-oracle-executions"
+                                      , "1"
+                                      , "--out"
+                                      , outDir
+                                      , "--quiet"
+                                      ]
+                                        ++ extra
+                                    )
                             assertBool "Execution-budget exhaustion must remain nonzero" (code /= ExitSuccess)
-                            encoded <- BS.readFile (outDir </> "benchmark.json")
-                            case eitherDecodeStrict' encoded :: Either String [BenchmarkMetric] of
-                                Right [metric] -> do
-                                    let evaluation = metricEvaluationMetrics metric
-                                    assertEqual "Wrong selected profile" (T.pack profile) (metricAlgorithm metric)
-                                    assertEqual "Not an external baseline" "internal" (metricExperimentLine metric)
+                            encoded <- BS.readFile (outDir </> "stats.json")
+                            case eitherDecodeStrict' encoded :: Either String CliStats of
+                                Right stats -> do
+                                    let evaluation = cliMetrics stats
+                                    assertEqual "Wrong selected strategy" expectedStrategy (cliStrategy stats)
                                     assertEqual
                                         "Own preflight consumes this run's cap"
                                         1
-                                        (evaluationPreflightAttempts (evaluationBudget evaluation))
+                                        (evaluationPreflightAttempts (cliBudget stats))
                                     assertEqual "Budget result was lost" EvaluationExecutionBudget (evaluationStatus evaluation)
+                                    assertEqual
+                                        "Top-level status was lost"
+                                        EvaluationExecutionBudget
+                                        (cliStatus stats)
                                     assertEqual
                                         "No reduction call remains after preflight"
                                         0
                                         (evaluationDatabaseObservations evaluation)
                                     assertBool "An unchecked checkpoint is not validated" (not (evaluationValidationPassed evaluation))
-                                other -> assertFailure ("Expected one profile result, got " ++ show other)
+                                Left err -> assertFailure ("stats.json did not decode: " ++ err)
                             checkpoint <- BS.readFile (outDir </> "minimal.sql")
                             assertEqual "Accepted input checkpoint was lost" "SELECT 1; SELECT 2;" checkpoint
                         )
-                        ["statement-ddmin", "graph-off"]
+                        [(["--strategy", "ddmin-only"], "ddmin-only"), (["--no-slicing", "--no-closure"], "full")]
                     observed <- BSC.readFile calls
-                    assertEqual "Each child must physically execute its own preflight" "xx" observed
-        , testCase "CLI and evaluator surface --jobs help and reject invalid counts" $ do
+                    assertEqual "Each run must physically execute its own preflight" "xx" observed
+        , testCase "CLI surfaces --jobs help and rejects invalid counts" $ do
             mapM_
-                ( \(runner, extra) -> do
-                    (helpCode, helpOut, _) <- runner ("--help" : extra)
+                ( \extra -> do
+                    (helpCode, helpOut, _) <- runOccamCLI ("--help" : extra)
                     assertEqual "help must exit zero" ExitSuccess helpCode
                     assertBool "help hides --jobs" ("--jobs" `elem` words helpOut)
                     mapM_
                         ( \jobs -> withCLIInput "SELECT 1;" $ \input outDir -> do
                             (code, _, _) <-
-                                runner ([input, "--oracle", "exit 0", "--out", outDir, "--jobs", jobs, "--quiet"] ++ extra)
+                                runOccamCLI ([input, "--oracle", "exit 0", "--out", outDir, "--jobs", jobs, "--quiet"] ++ extra)
                             assertBool ("invalid --jobs was accepted: " ++ jobs) (code /= ExitSuccess)
                             exists <- doesDirectoryExist outDir
                             assertBool "reduction started with invalid --jobs" (not exists)
                         )
                         ["0", "-1", "abc"]
                 )
-                [(runOccamCLI, []), (runOccamEvalCLI, ["--profile", "statement-ddmin"])]
+                [[], ["--strategy", "ddmin-only"]]
         , testCase "CLI rejects bad column modes before any oracle call" $
             withCLIInput "SELECT 1;" $ \input outDir -> do
                 (helpCode, helpOut, _) <- runOccamCLI ["--help"]
@@ -565,6 +575,7 @@ testPredicatePool predicate =
             , poolExecute = predicateDetails predicate
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
+            , poolReportCount = Nothing
             }
 
 testCountingPool :: Int -> (BS.ByteString -> IO OracleObservationDetails) -> IO OraclePool
@@ -579,6 +590,7 @@ testCountingPool jobs execute =
             , poolExecute = execute
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
+            , poolReportCount = Nothing
             }
 
 boolObservation :: Bool -> OracleObservation

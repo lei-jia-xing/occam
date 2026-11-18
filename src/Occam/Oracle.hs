@@ -2,6 +2,8 @@
 
 module Occam.Oracle (
     OracleConfig (..),
+    OracleContext (..),
+    resolveOracleContext,
     executeReset,
     runExternalOracle,
     OracleObservation (..),
@@ -10,6 +12,7 @@ module Occam.Oracle (
     observeExternalOracle,
     observeExternalOracleDetailed,
     observeExternalOracleDetailedWith,
+    observeExternalOracleDetailedWithContext,
     oracleObservationMatches,
     classifyOracleObservation,
     observationOutcome,
@@ -68,7 +71,7 @@ import System.IO (Handle, hClose, hFlush, hSetBinaryMode, openBinaryTempFile)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), proc, shell, terminateProcess, waitForProcess, withCreateProcess)
 #else
 import System.Directory (findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removePathForcibly)
-import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
+import System.IO (Handle, IOMode (WriteMode), hClose, hFlush, hSetBinaryMode, withFile)
 import System.Posix.Signals (nullSignal, sigKILL, sigTERM, signalProcessGroup)
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (ProcessID)
@@ -130,55 +133,63 @@ runProcessGroupWithStart ::
 runProcessGroupWithStart onStarted timeoutMicros command input
     | timeoutMicros <= 0 = pure (False, Nothing)
     | otherwise =
-        mask \restore ->
-            withCreateProcess process \mbIn mbOut mbErr ph ->
-                case (mbIn, mbOut, mbErr) of
-                    (Just hIn, Just hOut, Just hErr) -> do
-                        groupId <- getOwnedGroup ph
-                        let cleanup = cleanupOwnedGroup groupId ph
-                        result <-
-                            ( do
-                                onStarted
-                                hSetBinaryMode hIn True
-                                hSetBinaryMode hOut True
-                                hSetBinaryMode hErr True
-                                restore $
-                                    timeout
-                                        timeoutMicros
-                                        ( withWorker (drainOutput hOut) \readOut ->
-                                            withWorker (drainOutput hErr) \readErr ->
-                                                withWorker (writePipe hIn input) \writeInput ->
-                                                    ( do
-                                                        exitCode <- waitForProcess ph
-                                                        -- The leader is gone but group members may still hold
-                                                        -- pipes open; kill the owned group before joining the
-                                                        -- drains so a lingering grandchild cannot stall them.
-                                                        _ <- cleanup
-                                                        writeInput
-                                                        readOut
-                                                        readErr
-                                                        pure exitCode
-                                                    )
-                                                        -- On timeout the group must die BEFORE the helper
-                                                        -- joins unwind: a writer blocked on a full pipe
-                                                        -- that nobody reads cannot close until its readers
-                                                        -- are gone. This innermost handler runs first.
-                                                        `onException` cleanup
-                                        )
-                            )
-                                `onException` cleanup
-                        reaped <- cleanup
-                        unless reaped $ throwIO OracleReapFailed
-                        pure (True, result)
-                    _ -> ioError (userError "Missing oracle process pipes")
+        withNullOutput \nullOut nullErr ->
+            mask \restore ->
+                withCreateProcess (process nullOut nullErr) \mbIn _ _ ph ->
+                    case mbIn of
+                        Just hIn -> do
+                            groupId <- getOwnedGroup ph
+                            let cleanup = cleanupOwnedGroup groupId ph
+                            result <-
+                                ( do
+                                    onStarted
+                                    hSetBinaryMode hIn True
+                                    restore $
+                                        timeout
+                                            timeoutMicros
+                                            ( withWorker (writePipe hIn input) \writeInput -> do
+                                                exitCode <- waitForProcess ph
+                                                -- The leader is gone but group members may still hold
+                                                -- the stdin pipe open; kill the owned group before
+                                                -- joining the writer so a lingering grandchild that
+                                                -- inherited stdin cannot stall it.
+                                                _ <- cleanup
+                                                writeInput
+                                                pure exitCode
+                                            )
+                                            -- On timeout the group must die BEFORE the helper
+                                            -- join unwinds: a writer blocked on a full pipe
+                                            -- that nobody reads cannot close until its readers
+                                            -- are gone. This innermost handler runs first.
+                                            `onException` cleanup
+                                )
+                                    `onException` cleanup
+                            reaped <- cleanup
+                            unless reaped $ throwIO OracleReapFailed
+                            pure (True, result)
+                        _ -> ioError (userError "Missing oracle process pipes")
     where
-        process =
+        process nullOut nullErr =
             command
                 { std_in = CreatePipe
-                , std_out = CreatePipe
-                , std_err = CreatePipe
+                , std_out = nullOut
+                , std_err = nullErr
                 , create_group = createProcessGroup
                 }
+
+{- | Null device for the oracle's opaque output streams. The verdict is the
+exit code only, so children write to the bit bucket instead of pipes: no
+reader threads, no pipe deadlock, no output buffering. POSIX binds
+/dev/null explicitly ('NoStream' would close the streams and fail writing
+children); Windows uses 'NoStream'.
+-}
+#ifdef mingw32_HOST_OS
+withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
+withNullOutput use = use NoStream NoStream
+#else
+withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
+withNullOutput use = withFile "/dev/null" WriteMode \h -> use (UseHandle h) (UseHandle h)
+#endif
 #ifdef mingw32_HOST_OS
 createProcessGroup :: Bool
 createProcessGroup = False
@@ -259,11 +270,6 @@ withWorker action use =
 tryWorker :: IO a -> IO (Either SomeException a)
 tryWorker = try
 
-drainOutput :: Handle -> IO ()
-drainOutput h = do
-    chunk <- BS.hGetSome h 32768
-    unless (BS.null chunk) (drainOutput h)
-
 writePipe :: Handle -> ByteString -> IO ()
 writePipe h bytes =
     handle
@@ -304,19 +310,52 @@ resolveExecutable executable
         found <- findExecutable executable
         maybe (pure executable) makeAbsolute found
 
+candidateOverrideKeys :: [String]
+candidateOverrideKeys = ["OCCAM_WORKDIR", "OCCAM_ORIGINAL_CWD", "TMPDIR", "TMP", "TEMP"]
+
+candidateOverrides :: FilePath -> FilePath -> [(String, String)]
+candidateOverrides workDir originalDir =
+    [ ("OCCAM_WORKDIR", workDir)
+    , ("OCCAM_ORIGINAL_CWD", originalDir)
+    , ("TMPDIR", workDir)
+    , ("TMP", workDir)
+    , ("TEMP", workDir)
+    ]
+
 candidateEnvironment :: FilePath -> IO [(String, String)]
 candidateEnvironment workDir = do
     current <- getEnvironment
     originalDir <- getCurrentDirectory
-    let overrides =
-            [ ("OCCAM_WORKDIR", workDir)
-            , ("OCCAM_ORIGINAL_CWD", originalDir)
-            , ("TMPDIR", workDir)
-            , ("TMP", workDir)
-            , ("TEMP", workDir)
-            ]
-        keys = map fst overrides
-    pure (overrides ++ filter ((`notElem` keys) . fst) current)
+    pure
+        (candidateOverrides workDir originalDir ++ filter ((`notElem` candidateOverrideKeys) . fst) current)
+
+{- | Oracle launch context resolved once per reduction: the executable path
+plus the process environment minus the per-candidate overrides. Resolving
+once skips a PATH walk and an environment snapshot per candidate; the
+per-candidate workdirs still vary per probe.
+-}
+data OracleContext = OracleContext
+    { contextExecutable :: !FilePath
+    , contextBaseEnvironment :: ![(String, String)]
+    , contextOriginalDir :: !FilePath
+    }
+    deriving (Eq, Show)
+
+resolveOracleContext :: OracleConfig -> IO OracleContext
+resolveOracleContext OracleConfig {..} = do
+    executable <- resolveExecutable oracleCommand
+    current <- getEnvironment
+    originalDir <- getCurrentDirectory
+    pure
+        OracleContext
+            { contextExecutable = executable
+            , contextBaseEnvironment = filter ((`notElem` candidateOverrideKeys) . fst) current
+            , contextOriginalDir = originalDir
+            }
+
+candidateEnvironmentWith :: OracleContext -> FilePath -> [(String, String)]
+candidateEnvironmentWith OracleContext {..} workDir =
+    candidateOverrides workDir contextOriginalDir ++ contextBaseEnvironment
 
 elapsedMicros :: Word64 -> Word64 -> Int
 elapsedMicros start end = fromIntegral ((end - start) `div` 1000)
@@ -334,7 +373,18 @@ observeExternalOracleDetailedWith ::
     OracleConfig ->
     ByteString ->
     IO OracleObservationDetails
-observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
+observeExternalOracleDetailedWith onOracleStarted cfg sql = do
+    context <- resolveOracleContext cfg
+    observeExternalOracleDetailedWithContext onOracleStarted cfg context sql
+
+-- | One-shot observation against a pre-resolved 'OracleContext'.
+observeExternalOracleDetailedWithContext ::
+    IO () ->
+    OracleConfig ->
+    OracleContext ->
+    ByteString ->
+    IO OracleObservationDetails
+observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} context sql = do
     started <- getMonotonicTimeNSec
     let finish observation resetElapsed oracleElapsed = do
             ended <- getMonotonicTimeNSec
@@ -352,7 +402,7 @@ observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
         then finish OracleTimedOut 0 Nothing
         else do
             attempt <- tryIOException $ withCandidateWorkdir \workDir -> do
-                childEnv <- candidateEnvironment workDir
+                let childEnv = candidateEnvironmentWith context workDir
                 (resetResult, resetElapsed) <- case oracleResetCommand of
                     Nothing -> pure (Right (Just ExitSuccess), 0)
                     Just command -> do
@@ -376,7 +426,7 @@ observeExternalOracleDetailedWith onOracleStarted OracleConfig {..} sql = do
                     Right (Just code)
                         | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
                         | otherwise -> do
-                            oracleExecutable <- resolveExecutable oracleCommand
+                            let oracleExecutable = contextExecutable context
                             oracleStarted <- getMonotonicTimeNSec
                             remaining <- remainingMicros
                             if remaining <= 0

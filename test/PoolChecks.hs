@@ -248,6 +248,7 @@ testPool jobs permits execute bill retire =
             , poolExecute = execute
             , poolBill = bill
             , poolRetire = retire
+            , poolReportCount = Nothing
             }
 
 acceptDetails :: OracleObservationDetails

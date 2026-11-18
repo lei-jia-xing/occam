@@ -1,357 +1,311 @@
 module Main (main) where
 
-import Benchmark (
-    BenchmarkMetric (..),
-    Profile,
-    parseProfile,
-    profileCacheEnabled,
-    profileName,
-    runProfileBenchmark,
- )
-import Control.Monad (unless, when)
-import Data.Aeson (encode, toJSON)
+import Control.Monad (forM_, unless)
+import Data.Aeson (Value, encode, object, (.=))
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BSL
-import Data.Char (toLower)
-import Data.Text qualified as T
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
+import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam qualified
-import Occam.Evaluation (
-    EvaluationConfig (..),
-    EvaluationMetrics (..),
-    EvaluationStatus (..),
-    parseSQLDialect,
+import GHC.Stats (RTSStats (..), getRTSStats)
+import Occam.Core (SemanticFacts (..), Span (..), Statement (..), StatementId (..))
+import Occam.Dependency (DependencyGraph (..), analyzeStatements)
+import Occam.Facts (StatementFacts (..), StatementUnit (..))
+import Occam.Metrics (ParseKind (..))
+import Occam.Parser (
+    ParseOptions (..),
+    ParsedSQL (..),
+    SQLDialect (..),
+    defaultParseOptions,
+    parseSQLTimed,
  )
-import Occam.Logger (
-    LogConfig (..),
-    LogFormat (..),
-    LogLevel (..),
-    Logger,
-    logError,
-    logInfo',
-    withLogger,
- )
-import Occam.Oracle (
-    OracleConfig (..),
-    OracleObservationDetails (..),
-    prepareOracle,
- )
-import Occam.Parser (SQLDialect (..))
-import Options.Applicative (
-    Parser,
-    ParserInfo,
-    auto,
-    eitherReader,
-    execParser,
-    fullDesc,
-    header,
-    help,
-    helper,
-    info,
-    infoOption,
-    long,
-    metavar,
-    option,
-    optional,
-    progDesc,
-    short,
-    showDefault,
-    strArgument,
-    strOption,
-    switch,
-    value,
-    (<**>),
- )
-import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.Exit (exitFailure)
-import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
-import System.Timeout (timeout)
+import Occam.Reducer (closeSet, cutRemovedStatementIds, replaceSpan)
+import Occam.Slicer (backwardSlice)
+import System.Environment (getArgs)
+import System.Exit (die)
+import Text.Printf (printf)
 
-data Options = Options
-    { optInputFile :: !FilePath
-    , optOracleCmd :: !String
-    , optOutDir :: !FilePath
-    , optResetCmd :: !(Maybe String)
-    , optTimeoutSecs :: !Double
-    , optProfile :: !Profile
-    , optLogLevel :: !String
-    , optLogFormat :: !String
-    , optVerbose :: !Bool
-    , optQuiet :: !Bool
-    , optBudgetSecs :: !(Maybe Double)
-    , optMaxOracleExecutions :: !(Maybe Int)
-    , optJobs :: !Int
-    , optDialect :: !SQLDialect
+{- | One measured row: total wall time plus exact RTS-allocated bytes over
+'benchReps' iterations, with the live-bytes high-water mark observed after.
+-}
+data BenchResult = BenchResult
+    { benchName :: !String
+    , benchStatements :: !Int
+    , benchReps :: !Int
+    , benchWallMicros :: !Integer
+    , benchAllocBytes :: !Word64
+    , benchPeakLiveBytes :: !Word64
     }
     deriving (Eq, Show)
 
-optionsParser :: Parser Options
-optionsParser =
-    Options
-        <$> strArgument
-            ( metavar "INPUT.sql"
-                <> help "Path to fuzz SQL input, including schema and setup statements"
-            )
-        <*> strOption
-            ( long "oracle"
-                <> metavar "COMMAND"
-                <> help "Interestingness predicate command (SQL on stdin; exit 0 accepts)"
-            )
-        <*> strOption
-            ( long "out"
-                <> metavar "DIR"
-                <> value "occam-eval-out"
-                <> showDefault
-                <> help "Directory where benchmark artifacts will be written"
-            )
-        <*> optional
-            ( strOption
-                ( long "reset"
-                    <> metavar "COMMAND"
-                    <> help "Lightweight state reset command (e.g. dropdb/createdb)"
-                )
-            )
-        <*> option
-            auto
-            ( long "timeout"
-                <> metavar "SECONDS"
-                <> value 10.0
-                <> showDefault
-                <> help "Per-execution timeout in seconds"
-            )
-        <*> option
-            (eitherReader parseProfile)
-            ( long "profile"
-                <> metavar "PROFILE"
-                <> help "Run one internal profile (e.g. full, graph-off, statement-ddmin)"
-            )
-        <*> strOption
-            ( long "log-level"
-                <> metavar "LEVEL"
-                <> value "info"
-                <> showDefault
-                <> help "Log severity level (debug, info, warn, error)"
-            )
-        <*> strOption
-            ( long "log-format"
-                <> metavar "FORMAT"
-                <> value "text"
-                <> showDefault
-                <> help "Log output format (text or json)"
-            )
-        <*> switch
-            ( long "verbose"
-                <> help "Enable verbose debug output (equivalent to --log-level debug)"
-            )
-        <*> switch
-            ( long "quiet"
-                <> short 'q'
-                <> help "Suppress info logs and banners (equivalent to --log-level error)"
-            )
-        <*> optional
-            ( option
-                auto
-                ( long "budget"
-                    <> metavar "SECONDS"
-                    <> help "Shared wall-clock cap including initial verification, reduction, audit, and final validation"
-                )
-            )
-        <*> optional
-            ( option
-                auto
-                ( long "max-oracle-executions"
-                    <> metavar "N"
-                    <> help "Maximum uncached oracle attempts including the initial check and final validation"
-                )
-            )
-        <*> option
-            (eitherReader parseJobs)
-            ( long "jobs"
-                <> metavar "N"
-                <> value 1
-                <> showDefault
-                <> help
-                    "Maximum concurrent oracle/reset executions (default 1). Declares the predicate AND reset support N concurrent independent calls with independent database state; Occam enforces at most N in flight but provides no database isolation"
-            )
-        <*> option
-            (eitherReader parseSQLDialect)
-            ( long "dialect"
-                <> metavar "DIALECT"
-                <> value GenericSQL
-                <> showDefault
-                <> help
-                    "SQL dependency dialect: generic, postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
-            )
+benchResultJson :: BenchResult -> Value
+benchResultJson BenchResult {..} =
+    object
+        [ "name" .= benchName
+        , "statements" .= benchStatements
+        , "reps" .= benchReps
+        , "wall_micros" .= benchWallMicros
+        , "alloc_bytes" .= benchAllocBytes
+        , "peak_live_bytes" .= benchPeakLiveBytes
+        ]
 
-parseLogLevel :: String -> LogLevel
-parseLogLevel s = case map toLower s of
-    "debug" -> LevelDebug
-    "warn" -> LevelWarn
-    "warning" -> LevelWarn
-    "error" -> LevelError
-    _ -> LevelInfo
+data BenchOptions = BenchOptions
+    { benchQuick :: !Bool
+    , benchRepsOverride :: !(Maybe Int)
+    , benchJsonPath :: !(Maybe FilePath)
+    }
+    deriving (Eq, Show)
 
-parseLogFormat :: String -> LogFormat
-parseLogFormat s = case map toLower s of
-    "json" -> FormatJSON
-    _ -> FormatText
+defaultBenchOptions :: BenchOptions
+defaultBenchOptions = BenchOptions True Nothing Nothing
 
-{- | Positive job count parsed as 'Integer' first so huge inputs range-fail
-instead of overflowing 'Int'.
+parseBenchArgs :: [String] -> IO BenchOptions
+parseBenchArgs = go defaultBenchOptions
+    where
+        go opts [] = pure opts
+        go opts ("--quick" : rest) = go opts {benchQuick = True} rest
+        go opts ("--full" : rest) = go opts {benchQuick = False} rest
+        go opts ("--json" : path : rest) = go opts {benchJsonPath = Just path} rest
+        go opts ("--reps" : count : rest) = case reads count of
+            [(n, "")] | n > (0 :: Int) -> go opts {benchRepsOverride = Just n} rest
+            _ -> die ("occam-bench: expected a positive --reps count, got: " ++ count)
+        go _ (flag : _) = die ("occam-bench: unknown argument: " ++ flag ++ usage)
+        usage = "\nUsage: occam-bench [--quick|--full] [--reps N] [--json FILE]"
+
+repsFor :: BenchOptions -> Int -> Int
+repsFor opts stmts = case benchRepsOverride opts of
+    Just n -> n
+    Nothing
+        | benchQuick opts -> if stmts <= 64 then 10 else 3
+        | otherwise -> if stmts <= 64 then 200 else 50
+
+{- | Microsecond-scale slicer/surgery loops need more repetitions than the
+millisecond-scale parse/analyze stages to clear RTS counter granularity.
 -}
-parseJobs :: String -> Either String Int
-parseJobs s = case reads s of
-    [(n, "")]
-        | n >= (1 :: Integer)
-        , n <= toInteger (maxBound :: Int) ->
-            Right (fromInteger n)
-    _ -> Left "Expected a positive --jobs value"
+repsMany :: BenchOptions -> Int
+repsMany opts = case benchRepsOverride opts of
+    Just n -> n
+    Nothing
+        | benchQuick opts -> 300
+        | otherwise -> 3000
 
-versionOption :: Parser (a -> a)
-versionOption =
-    infoOption
-        ("Occam-Eval v" ++ Occam.version)
-        ( long "version"
-            <> short 'v'
-            <> help "Show version information"
-        )
+-- | Eight dependency-linked statements per table: DDL, writes, and reads.
+tableBlock :: Int -> [ByteString]
+tableBlock i =
+    map
+        BSC.pack
+        [ "CREATE TABLE t" ++ s ++ " (a INT PRIMARY KEY, b TEXT);"
+        , "INSERT INTO t" ++ s ++ " (a, b) VALUES (1, 'x');"
+        , "INSERT INTO t" ++ s ++ " (a, b) VALUES (2, 'y');"
+        , "SELECT a, b FROM t" ++ s ++ " WHERE a > 1 ORDER BY a;"
+        , "UPDATE t" ++ s ++ " SET b = 'z' WHERE a = 1;"
+        , "DELETE FROM t" ++ s ++ " WHERE a = 2;"
+        , "SELECT COUNT(*) FROM t" ++ s ++ ";"
+        , "INSERT INTO t" ++ s ++ " (a, b) VALUES (3, 'w');"
+        ]
+    where
+        s = show i
 
-optsInfo :: ParserInfo Options
-optsInfo =
-    info
-        (optionsParser <**> versionOption <**> helper)
-        ( fullDesc
-            <> progDesc "Occam-Eval: Run one internal reducer control or ablation"
-            <> header ("Occam-Eval v" ++ Occam.version ++ " - Isolated internal profile worker")
+syntheticSQL :: Int -> ByteString
+syntheticSQL tables = BSC.unlines (concatMap tableBlock [0 .. tables - 1])
+
+-- | Parser payload per tier, mirroring the reducer's own option sets.
+optionsForKind :: ParseKind -> ParseOptions
+optionsForKind ParseStatementOnly = defaultParseOptions GenericSQL
+optionsForKind ParseSyntaxChunks =
+    (defaultParseOptions GenericSQL) {parseChunkEdits = True, parseSyntaxEdits = True}
+optionsForKind ParseColumnIR =
+    (defaultParseOptions GenericSQL)
+        { parseChunkEdits = True
+        , parseSyntaxEdits = True
+        , parseColumnIR = True
+        , parseColumnBundles = True
+        }
+
+kindLabel :: ParseKind -> String
+kindLabel ParseStatementOnly = "stmt-only"
+kindLabel ParseSyntaxChunks = "syntax-chunks"
+kindLabel ParseColumnIR = "column-ir"
+
+parseUnitsOrDie :: ParseKind -> ByteString -> IO ParsedSQL
+parseUnitsOrDie kind sql = do
+    parsed <- parseSQLTimed Nothing kind (optionsForKind kind) sql
+    case parsed of
+        Left err -> die ("occam-bench: synthetic SQL failed to parse: " ++ show err)
+        Right ok -> pure ok
+
+-- | Spine-plus-payload checksum so laziness cannot hide decode work.
+parsedWorkload :: ParsedSQL -> Int
+parsedWorkload parsed = sum (map unitWork (parsedUnits parsed))
+    where
+        unitWork unit =
+            let Span start end = stmtSpan (unitStatement unit)
+             in (end - start) + case unitFacts unit of
+                    Nothing -> 0
+                    Just facts -> length (factOps (factSemantics facts)) + length (factEdits facts)
+
+graphWorkload :: DependencyGraph -> Int
+graphWorkload graph = Map.foldl' (\total deps -> total + Set.size deps) 0 (graphEdges graph)
+
+{- | Strict byte-sum checksum. Length alone lets GHC eliminate the very copy
+under test for statically shaped splices, so surgery rows fold every byte.
+-}
+byteChecksum :: ByteString -> Int
+byteChecksum = BS.foldl' (\total w -> total + fromIntegral w) 0
+
+-- | Eight-id window rotating with the iteration so every repetition re-slices.
+windowIds :: [StatementId] -> Int -> Set.Set StatementId
+windowIds ids i = Set.fromList (take 8 (drop ((i * 8) `mod` (length ids - 8)) ids))
+
+{- | Rebuild the unit spine per iteration so GHC cannot share one analysis
+across repetitions. The statements are identical; only the spine is fresh.
+-}
+freshUnits :: Int -> [StatementUnit] -> [StatementUnit]
+freshUnits i units = take (length units - (i `mod` 1)) units
+
+checkCount :: Int -> ParsedSQL -> IO ()
+checkCount expected parsed =
+    let actual = length (parsedUnits parsed)
+     in unless (actual == expected) $
+            die ("occam-bench: expected " ++ show expected ++ " statements, parsed " ++ show actual)
+
+{- | The iteration index reaches every action so loop-invariant pure work
+cannot be shared across repetitions and silently measured once.
+-}
+timeReps :: Int -> (Int -> IO Int) -> IO (Integer, Word64, Word64)
+timeReps reps action = do
+    beforeAlloc <- allocated_bytes <$> getRTSStats
+    before <- getMonotonicTimeNSec
+    _ <- loop 0 reps 0
+    after <- getMonotonicTimeNSec
+    stats <- getRTSStats
+    pure
+        ( fromIntegral (after - before) `div` 1000
+        , allocated_bytes stats - beforeAlloc
+        , max_live_bytes stats
         )
+    where
+        loop _ 0 !accumulated = pure accumulated
+        loop index remaining !accumulated = do
+            work <- action index
+            loop (index + 1) (remaining - 1) (accumulated + work)
+
+runBench :: String -> Int -> Int -> (Int -> IO Int) -> IO BenchResult
+runBench name stmts reps action = do
+    (wall, alloc, peak) <- timeReps reps action
+    pure (BenchResult name stmts reps wall alloc peak)
+
+printTable :: [BenchResult] -> IO ()
+printTable rows = do
+    putStrLn "occam-bench: Tier 1 in-process engine benchmark (no external processes)"
+    printf
+        ("%-24s %5s %5s %12s %10s %12s %10s %12s\n" :: String)
+        ("benchmark" :: String)
+        ("stmts" :: String)
+        ("reps" :: String)
+        ("wall_us" :: String)
+        ("us_iter" :: String)
+        ("alloc_B" :: String)
+        ("B_iter" :: String)
+        ("peak_live_B" :: String)
+    forM_ rows $ \BenchResult {..} -> do
+        let usPerIter = benchWallMicros `div` fromIntegral benchReps
+            bytesPerIter = benchAllocBytes `div` fromIntegral benchReps
+        printf
+            ("%-24s %5d %5d %12d %10d %12d %10d %12d\n" :: String)
+            benchName
+            benchStatements
+            benchReps
+            benchWallMicros
+            usPerIter
+            benchAllocBytes
+            bytesPerIter
+            benchPeakLiveBytes
 
 main :: IO ()
-main = execParser optsInfo >>= runEval
-
-runEval :: Options -> IO ()
-runEval opts@Options {..} = do
-    let effectiveLevel
-            | optQuiet = LevelError
-            | optVerbose = LevelDebug
-            | otherwise = parseLogLevel optLogLevel
-        effectiveFormat = parseLogFormat optLogFormat
-        logCfg =
-            LogConfig
-                { logMinLevel = effectiveLevel
-                , logFormat = effectiveFormat
-                , logUseColor = True
-                }
-        runWithLogger logger = runEvalWithLogger logger opts
-    withLogger logCfg runWithLogger
-
-runEvalWithLogger :: Logger -> Options -> IO ()
-runEvalWithLogger logger Options {..} = do
-    let finiteTimeout seconds =
-            seconds > 0
-                && not (isNaN seconds || isInfinite seconds)
-                && seconds <= fromIntegral (maxBound :: Int) / 1000000
-                && seconds * 1000000 >= 1
-        validLimits =
-            finiteTimeout optTimeoutSecs
-                && maybe True finiteTimeout optBudgetSecs
-                && maybe True (> 0) optMaxOracleExecutions
-                && optJobs > 0
-    unless validLimits $
-        failWith "Error: timeout, budget, execution, and job limits must be positive"
-
-    exists <- doesFileExist optInputFile
-    unless exists do
-        logError logger "occam::eval" ("Error: Input file does not exist: " <> T.pack optInputFile)
-        failWith $ "Error: Input file does not exist: " ++ optInputFile
-    initialSQL <- BS.readFile optInputFile
-    when (not optQuiet && parseLogFormat optLogFormat == FormatText) do
-        putStrLn ("occam-eval: profiling " ++ optInputFile ++ " -> " ++ optOutDir)
-
-    let baseOracleConfig =
-            OracleConfig
-                { oracleCommand = "sh"
-                , oracleArgs = ["-c", optOracleCmd]
-                , oracleTimeoutMicros = round (optTimeoutSecs * 1000000)
-                , oracleResetCommand = optResetCmd
-                }
-        totalBudgetMicros = round . (* 1000000) <$> optBudgetSecs :: Maybe Integer
-    preflightStart <- toInteger <$> getMonotonicTimeNSec
-    prepared <-
-        runWithinBudget
-            preflightStart
-            totalBudgetMicros
-            (prepareOracle baseOracleConfig initialSQL)
-    preflightDetails <- case prepared of
-        Nothing -> failWith "Error: Initial predicate check exceeded the total budget"
-        Just (Left err) -> failWith ("Error: " ++ T.unpack err)
-        Just (Right details) -> pure details
-    preflightEnd <- toInteger <$> getMonotonicTimeNSec
-    let preflightMicros =
-            fromInteger
-                (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
-        evaluationConfig =
-            EvaluationConfig
-                { evaluationCacheEnabled = profileCacheEnabled optProfile
-                , evaluationJobs = optJobs
-                , evaluationTotalTimeoutMicros = round . (* 1000000) <$> optBudgetSecs
-                , evaluationMaxOracleExecutions = optMaxOracleExecutions
-                , evaluationPreflightMicros = preflightMicros
-                , evaluationPreflightAttempts = 1
-                , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
-                , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
-                }
-
-    logInfo'
-        logger
-        "occam::eval"
-        "Initial predicate check passed"
-        [ ("input_file", toJSON optInputFile)
-        , ("oracle_cmd", toJSON optOracleCmd)
-        , ("timeout_secs", toJSON optTimeoutSecs)
-        , ("evaluation_budget", toJSON evaluationConfig)
-        ]
-    createDirectoryIfMissing True optOutDir
-
-    logInfo'
-        logger
-        "occam::eval"
-        "Running one internal profile"
-        [("profile", toJSON (profileName optProfile))]
-    metric <-
-        runProfileBenchmark
-            optProfile
-            optDialect
-            evaluationConfig
-            baseOracleConfig
-            logger
-            initialSQL
-            optOutDir
-    let jsonData = encode [metric]
-    BSL.writeFile (optOutDir </> "benchmark.json") jsonData
-    logInfo'
-        logger
-        "occam::eval"
-        "Internal profile result written"
-        [("out_file", toJSON (optOutDir </> "benchmark.json"))]
-
-    BSL.putStr jsonData
-    putStrLn ""
-    unless (completedAndValidated metric) $
-        failWith "Error: selected profile did not complete repeated target validation"
-
-completedAndValidated :: BenchmarkMetric -> Bool
-completedAndValidated metric =
-    evaluationStatus (metricEvaluationMetrics metric) == EvaluationCompleted
-        && evaluationValidationPassed (metricEvaluationMetrics metric)
-
-runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)
-runWithinBudget _ Nothing action = Just <$> action
-runWithinBudget started (Just totalMicros) action = do
-    now <- toInteger <$> getMonotonicTimeNSec
-    let remaining = max 0 (totalMicros - (now - started) `div` 1000)
-        timeoutMicros = fromInteger (min remaining (toInteger (maxBound :: Int)))
-    timeout timeoutMicros action
-
-failWith :: String -> IO a
-failWith message = hPutStrLn stderr message >> exitFailure
+main = do
+    opts <- parseBenchArgs =<< getArgs
+    let sql64 = syntheticSQL 8
+        sql512 = syntheticSQL 64
+    -- Pre-parse once for the DAG/surgery stages; parsing itself is timed below.
+    parsed64 <- parseUnitsOrDie ParseStatementOnly sql64
+    parsed512 <- parseUnitsOrDie ParseStatementOnly sql512
+    checkCount 64 parsed64
+    checkCount 512 parsed512
+    let units64 = parsedUnits parsed64
+        units512 = parsedUnits parsed512
+        sess64 = parsedInitialSession parsed64
+        sess512 = parsedInitialSession parsed512
+        graph64 = analyzeStatements sess64 units64
+        graph512 = analyzeStatements sess512 units512
+        ids64 = map (stmtId . unitStatement) units64
+        ids512 = map (stmtId . unitStatement) units512
+        targets64 = drop (length ids64 - 8) ids64
+        targets512 = drop (length ids512 - 8) ids512
+        stmts512 = map unitStatement units512
+        keptEven = Set.fromList [stmtId stmt | (i, stmt) <- zip [0 :: Int ..] stmts512, even i]
+        keptOdd = Set.fromList [stmtId stmt | (i, stmt) <- zip [0 :: Int ..] stmts512, odd i]
+        smallReps = repsFor opts 64
+        bigReps = repsFor opts 512
+        manyReps = repsMany opts
+    parseRows <-
+        sequence
+            [ runBench ("parse/" ++ kindLabel kind) stmts reps (\_ -> parsedWorkload <$> parseUnitsOrDie kind sql)
+            | (sql, stmts, reps) <- [(sql64, 64, smallReps), (sql512, 512, bigReps)]
+            , kind <- [ParseStatementOnly, ParseSyntaxChunks, ParseColumnIR]
+            ]
+    dagRows <-
+        sequence
+            [ runBench
+                "dag/analyze"
+                64
+                smallReps
+                (\i -> pure (graphWorkload (analyzeStatements sess64 (freshUnits i units64))))
+            , runBench
+                "dag/analyze"
+                512
+                bigReps
+                (\i -> pure (graphWorkload (analyzeStatements sess512 (freshUnits i units512))))
+            , runBench
+                "dag/backward-slice"
+                64
+                manyReps
+                (\i -> pure (Set.size (backwardSlice (targets64 !! (i `mod` 8)) graph64)))
+            , runBench
+                "dag/backward-slice"
+                512
+                manyReps
+                (\i -> pure (Set.size (backwardSlice (targets512 !! (i `mod` 8)) graph512)))
+            , runBench "dag/close-set" 64 manyReps (pure . Set.size . closeSet graph64 . windowIds ids64)
+            , runBench
+                "dag/close-set"
+                512
+                manyReps
+                (pure . Set.size . closeSet graph512 . windowIds ids512)
+            ]
+    surgeryRows <-
+        sequence
+            [ runBench
+                "surgery/cut-removed"
+                512
+                manyReps
+                ( \i ->
+                    pure (byteChecksum (cutRemovedStatementIds sql512 stmts512 (if even i then keptEven else keptOdd)))
+                )
+            , runBench
+                "surgery/replace-span"
+                512
+                manyReps
+                ( \i ->
+                    let start = 128 + (i `mod` 16) * 64
+                     in pure (byteChecksum (replaceSpan start (start + 896) ("/* trimmed */" :: ByteString) sql512))
+                )
+            ]
+    let rows = parseRows ++ dagRows ++ surgeryRows
+    printTable rows
+    case benchJsonPath opts of
+        Nothing -> pure ()
+        Just path -> BSL.writeFile path (encode (map benchResultJson rows))

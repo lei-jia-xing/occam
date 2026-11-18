@@ -9,10 +9,19 @@ module Occam.Reducer (
     closureDdmin,
     cutRemovedStatements,
     cutRemovedStatementIds,
+    replaceSpan,
     partitionChunks,
     reduceSQL,
     reduceSQLWithLogger,
     reduceSQLWithConfig,
+    reduceSQLWithEvidence,
+    ReductionResult (..),
+    ReductionEvidence (..),
+    ReductionStage (..),
+    reductionStageName,
+    StageEvent (..),
+    StageReporter,
+    nullStageReporter,
     statementDdmin,
     statementAudit,
     statementAuditWithLogger,
@@ -70,7 +79,14 @@ import Occam.Parser (
     defaultSQLDialect,
     parseSQLTimed,
  )
-import Occam.Pool (OraclePool, poolJobCount, poolMetricsStore, poolOracle, testOrderedTagged)
+import Occam.Pool (
+    OraclePool,
+    poolJobCount,
+    poolMetricsStore,
+    poolOracle,
+    reportCandidateCount,
+    testOrderedTagged,
+ )
 import Occam.Slicer (backwardSlice, backwardSliceMany)
 
 data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
@@ -116,6 +132,60 @@ defaultReductionConfig =
         , reductionColumnMode = ColumnOff
         }
 
+-- | Typed reduction stage, emitted at exact boundaries for progress and summaries.
+data ReductionStage
+    = StageSlicing
+    | StageClosureSearch
+    | StageGraphFreeSearch
+    | StageUnrestrictedFallback
+    | StageStatementAudit
+    | StageIntraStatementRewrites
+    deriving (Eq, Ord, Show, Enum, Bounded)
+
+reductionStageName :: ReductionStage -> T.Text
+reductionStageName StageSlicing = "slicing"
+reductionStageName StageClosureSearch = "closure-search"
+reductionStageName StageGraphFreeSearch = "graph-free-search"
+reductionStageName StageUnrestrictedFallback = "unrestricted-fallback"
+reductionStageName StageStatementAudit = "statement-audit"
+reductionStageName StageIntraStatementRewrites = "intra-statement-rewrites"
+
+-- | Legacy log-stage labels, kept stable for user-visible logs.
+stageLogName :: ReductionStage -> T.Text
+stageLogName StageSlicing = "backward-slicing"
+stageLogName StageClosureSearch = "closure-search"
+stageLogName StageGraphFreeSearch = "graph-free-statement-search"
+stageLogName StageUnrestrictedFallback = "unrestricted-fallback"
+stageLogName StageStatementAudit = "statement-audit"
+stageLogName StageIntraStatementRewrites = "intra-statement-rewrites"
+
+-- | Boundary event: enter names the stage; finish carries seconds and bytes.
+data StageEvent
+    = StageStarted !ReductionStage
+    | StageFinished !ReductionStage !Double !Int !Int
+    deriving (Eq, Show)
+
+type StageReporter = StageEvent -> IO ()
+
+nullStageReporter :: StageReporter
+nullStageReporter _ = pure ()
+
+{- | Proof returned alongside reduced SQL: these exact bytes need no further
+audit work. Every skip guarded by evidence rechecks byte-identity first;
+evidence never crosses a byte change.
+-}
+data ReductionEvidence = ReductionEvidence
+    { evidenceBytes :: !ByteString
+    , evidenceAuditMinimal :: !Bool
+    }
+    deriving (Eq, Show)
+
+data ReductionResult = ReductionResult
+    { reductionSQL :: !ByteString
+    , reductionEvidence :: !(Maybe ReductionEvidence)
+    }
+    deriving (Eq, Show)
+
 seconds :: Word64 -> Double
 seconds ns = fromIntegral ns / 1000000000
 
@@ -127,13 +197,18 @@ logStage logger stage elapsed =
         ("Finished " <> stage)
         [("stage", toJSON stage), ("duration_seconds", toJSON (seconds elapsed))]
 
-timedStage :: Logger -> T.Text -> IO a -> IO a
-timedStage logger stage action = do
+-- | Timed stage with typed boundary events. Keeps the legacy log line.
+timedReductionStage ::
+    StageReporter -> Logger -> ReductionStage -> ByteString -> IO (ByteString, a) -> IO (ByteString, a)
+timedReductionStage reporter logger stage input action = do
+    reporter (StageStarted stage)
     started <- getMonotonicTimeNSec
-    result <- action
+    (output, extra) <- action
     finished <- getMonotonicTimeNSec
-    logStage logger stage (finished - started)
-    pure result
+    let elapsed = finished - started
+    logStage logger (stageLogName stage) elapsed
+    reporter (StageFinished stage (seconds elapsed) (BS.length input) (BS.length output))
+    pure (output, extra)
 
 kindOfOptions :: ParseOptions -> ParseKind
 kindOfOptions options
@@ -424,6 +499,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
 
         testBatch [] = pure Nothing
         testBatch batch = do
+            mapM_ (\(kept, sql) -> reportCandidateCount pool sql (length kept)) batch
             outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- batch]
             let retired = zip batch outcomes
             mapM_ recordRetired retired
@@ -539,6 +615,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                                     mapM_ (const (recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking")) batch
                                     go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
                                 else do
+                                    mapM_ (\(_, sql) -> reportCandidateCount pool sql (Set.size currentKept - 1)) testables
                                     outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
                                     let retired = zip testables outcomes
                                         tested = length outcomes
@@ -601,6 +678,7 @@ findInterestingPrefix pool baseSQL statements
                 let mid = low + (high - low) `div` 2
                     prefix = take mid statements
                 candidate <- timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL statements prefix)
+                reportCandidateCount pool candidate (length prefix)
                 ok <- oracleAccepts (poolOracle pool) candidate
                 let tests' = tests + 1
                 if ok
@@ -682,7 +760,9 @@ sliceWithAnalysis logger pool analysis sql = do
             lastCandidate <- timeStatementBuild (poolMetricsStore pool) lastCandidateRaw
             lastAccepted <-
                 if BS.length lastCandidate < BS.length sql
-                    then oracleAccepts (poolOracle pool) lastCandidate
+                    then do
+                        reportCandidateCount pool lastCandidate (length lastRetained)
+                        oracleAccepts (poolOracle pool) lastCandidate
                     else pure False
             let tryPrefix bestCandidate = do
                     (maybeTarget, prefixTests) <- findInterestingPrefix pool sql statements
@@ -695,7 +775,12 @@ sliceWithAnalysis logger pool analysis sql = do
                                 then pure bestCandidate
                                 else do
                                     let reusedPrefixResult = candidate == prefixSQL
-                                    ok <- if reusedPrefixResult then pure True else oracleAccepts (poolOracle pool) candidate
+                                    ok <-
+                                        if reusedPrefixResult
+                                            then pure True
+                                            else do
+                                                reportCandidateCount pool candidate (length retained)
+                                                oracleAccepts (poolOracle pool) candidate
                                     logInfo'
                                         logger
                                         "occam::reducer"
@@ -742,17 +827,22 @@ reduceSQLWithLogger dialect =
     reduceSQLWithConfig (defaultReductionConfig {reductionDialect = dialect})
 
 reduceSQLWithConfig :: ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
-reduceSQLWithConfig config logger pool initialSQL = do
+reduceSQLWithConfig config logger pool initialSQL =
+    reductionSQL <$> reduceSQLWithEvidence nullStageReporter config logger pool initialSQL
+
+reduceSQLWithEvidence ::
+    StageReporter -> ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ReductionResult
+reduceSQLWithEvidence reporter config logger pool initialSQL = do
     when (reductionColumnMode config /= ColumnOff && not (reductionIntraStatement config)) $
         ioError (userError "reductionColumnMode requires reductionIntraStatement")
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then do
             logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
-            pure initialSQL
-        else loop (1 :: Int) initialSQL
+            pure (ReductionResult initialSQL Nothing)
+        else loop (1 :: Int) initialSQL Nothing
     where
-        loop iteration currentSQL = do
+        loop iteration currentSQL priorEvidence = do
             logInfo'
                 logger
                 "occam::reducer"
@@ -765,9 +855,10 @@ reduceSQLWithConfig config logger pool initialSQL = do
                 , ("intra_statement", toJSON (reductionIntraStatement config))
                 , ("dialect", toJSON (T.pack (show (reductionDialect config))))
                 ]
-            nextSQL <- reduceIterationWithConfig config logger pool currentSQL
+            (nextSQL, evidence) <-
+                reduceIterationWithEvidence reporter config logger pool currentSQL priorEvidence
             if BS.length nextSQL < BS.length currentSQL
-                then loop (iteration + 1) nextSQL
+                then loop (iteration + 1) nextSQL evidence
                 else do
                     logInfo'
                         logger
@@ -776,80 +867,96 @@ reduceSQLWithConfig config logger pool initialSQL = do
                         [ ("total_iterations", toJSON iteration)
                         , ("final_bytes", toJSON (BS.length currentSQL))
                         ]
-                    pure currentSQL
+                    -- The loop keeps the pre-iteration bytes on no shrink, so
+                    -- evidence only survives when it attests those exact bytes.
+                    let confirmed =
+                            if maybe False ((== currentSQL) . evidenceBytes) evidence then evidence else Nothing
+                    pure (ReductionResult currentSQL confirmed)
 
-reduceIterationWithConfig ::
-    ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
-reduceIterationWithConfig config logger pool initialSQL = do
+reduceIterationWithEvidence ::
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    Maybe ReductionEvidence ->
+    IO (ByteString, Maybe ReductionEvidence)
+reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
-            then timedStage logger "backward-slicing" do
+            then timedReductionStage reporter logger StageSlicing initialSQL do
                 analysis <- analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) initialSQL
                 sliceWithAnalysis logger pool analysis initialSQL
             else pure (initialSQL, Nothing)
-    searched <-
+    (searched, ()) <-
         if reductionClosure config
-            then timedStage logger "closure-search" do
+            then timedReductionStage reporter logger StageClosureSearch sliced do
                 analysis <-
                     case reusableAnalysis of
                         Just cached -> pure cached
                         Nothing -> analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) sliced
-                closureSearchWithAnalysis logger pool sliced analysis
-            else
-                timedStage
-                    logger
-                    "graph-free-statement-search"
-                    (statementDdmin (reductionDialect config) pool sliced)
+                out <- closureSearchWithAnalysis logger pool sliced analysis
+                pure (out, ())
+            else timedReductionStage reporter logger StageGraphFreeSearch sliced do
+                out <- statementDdmin (reductionDialect config) pool sliced
+                pure (out, ())
     fallback <-
         if reductionClosure config && reductionUnrestricted config
             then
-                timedStage
-                    logger
-                    "unrestricted-fallback"
-                    (statementDdmin (reductionDialect config) pool searched)
+                fst <$> timedReductionStage reporter logger StageUnrestrictedFallback searched do
+                    out <- statementDdmin (reductionDialect config) pool searched
+                    pure (out, ())
             else pure searched
     interleaveStages fallback
     where
-        interleaveStages base =
-            case (reductionUnrestricted config, reductionIntraStatement config) of
-                (True, True) -> interleaveFixedPoint (1 :: Int) base
+        interleaveStages base
+            | Just evidence <- priorEvidence
+            , evidenceBytes evidence == base =
+                -- The previous iteration already drove the interleave to a
+                -- fixed point on these exact bytes; re-running would only
+                -- replay cache hits.
+                pure (base, priorEvidence)
+            | otherwise = case (reductionUnrestricted config, reductionIntraStatement config) of
+                (True, True) -> do
+                    (out, minimal) <- interleaveFixedPoint (1 :: Int) base
+                    pure (out, Just (ReductionEvidence out minimal))
                 (True, False) -> do
-                    started <- getMonotonicTimeNSec
-                    (result, _) <- statementAuditWithLogger logger (reductionDialect config) pool base
-                    finished <- getMonotonicTimeNSec
-                    logStage logger "statement-audit" (finished - started)
-                    pure result
-                (False, True) ->
-                    timedStage
-                        logger
-                        "intra-statement-rewrites"
-                        ( reduceSyntaxWithDialect
+                    (result, stats) <-
+                        timedReductionStage reporter logger StageStatementAudit base do
+                            (r, s) <- statementAuditWithLogger logger (reductionDialect config) pool base
+                            pure (r, s)
+                    pure (result, Just (ReductionEvidence result (auditMinimalityConfirmed stats)))
+                (False, True) -> do
+                    (out, _) <-
+                        timedReductionStage reporter logger StageIntraStatementRewrites base do
+                            r <-
+                                reduceSyntaxWithDialect
+                                    logger
+                                    (columnParseOptions (reductionColumnMode config) (reductionDialect config))
+                                    pool
+                                    (const True)
+                                    (reductionColumnMode config)
+                                    base
+                            pure (r, ())
+                    pure (out, Just (ReductionEvidence out False))
+                (False, False) -> pure (base, Just (ReductionEvidence base False))
+
+        interleaveFixedPoint iter current = do
+            (afterAudit, auditStats) <-
+                timedReductionStage reporter logger StageStatementAudit current do
+                    (r, s) <- statementAuditWithLogger logger (reductionDialect config) pool current
+                    pure (r, s)
+            afterSyntax <-
+                fst <$> timedReductionStage reporter logger StageIntraStatementRewrites afterAudit do
+                    out <-
+                        reduceSyntaxWithDialect
                             logger
                             (columnParseOptions (reductionColumnMode config) (reductionDialect config))
                             pool
                             (const True)
                             (reductionColumnMode config)
-                            base
-                        )
-                (False, False) -> pure base
-
-        interleaveFixedPoint iter current = do
-            started <- getMonotonicTimeNSec
-            (afterAudit, _) <- statementAuditWithLogger logger (reductionDialect config) pool current
-            finished <- getMonotonicTimeNSec
-            logStage logger "statement-audit" (finished - started)
-            afterSyntax <-
-                timedStage
-                    logger
-                    "intra-statement-rewrites"
-                    ( reduceSyntaxWithDialect
-                        logger
-                        (columnParseOptions (reductionColumnMode config) (reductionDialect config))
-                        pool
-                        (const True)
-                        (reductionColumnMode config)
-                        afterAudit
-                    )
+                            afterAudit
+                    pure (out, ())
             if BS.length afterSyntax < BS.length current
                 then do
                     logInfo'
@@ -869,7 +976,7 @@ reduceIterationWithConfig config logger pool initialSQL = do
                         [ ("total_interleave_iterations", toJSON iter)
                         , ("final_bytes", toJSON (BS.length current))
                         ]
-                    pure afterSyntax
+                    pure (afterSyntax, auditMinimalityConfirmed auditStats)
 
 data SyntaxStats = SyntaxStats
     { syntaxAttempts :: !Int
@@ -930,25 +1037,27 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                 (maybe (pure ()) (recordGeneratedSkipped store) . targetBlocked)
                 columns
             -- Fold into ordered buckets once; category transitions reuse this snapshot.
-            pure (groupEdits edits, [target | target <- columns, isNothing (targetBlocked target)])
+            pure
+                (length units, groupEdits edits, [target | target <- columns, isNothing (targetBlocked target)])
 
         groupEdits edits =
             let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
              in [(cat, Map.findWithDefault [] cat buckets) | cat <- allEditCategories]
 
         go stats currentSQL = do
-            (phases, bundles) <- parseEdits currentSQL
-            visitPhases stats currentSQL phases bundles categoryOrder False
+            (startCount, phases, bundles) <- parseEdits currentSQL
+            visitPhases stats currentSQL startCount phases bundles categoryOrder False
 
-        visitPhases stats currentSQL phases bundles [] shrunk
-            | shrunk = visitPhases stats currentSQL phases bundles categoryOrder False
+        visitPhases stats currentSQL currentCount phases bundles [] shrunk
+            | shrunk = visitPhases stats currentSQL currentCount phases bundles categoryOrder False
             | otherwise = pure currentSQL
-        visitPhases stats currentSQL phases bundles (category : rest) shrunk = do
-            (nextSQL, nextPhases, nextBundles, categoryShrunk) <-
-                exhaustCategory stats currentSQL phases bundles category
+        visitPhases stats currentSQL currentCount phases bundles (category : rest) shrunk = do
+            (nextSQL, nextCount, nextPhases, nextBundles, categoryShrunk) <-
+                exhaustCategory stats currentSQL currentCount phases bundles category
             visitPhases
                 stats
                 nextSQL
+                nextCount
                 nextPhases
                 nextBundles
                 rest
@@ -965,16 +1074,17 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
             | category == EditColumn && mode == ColumnAtomic =
                 map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
             | otherwise = map SingleCandidate (phaseCandidates category phases)
-        exhaustCategory stats sourceSQL phases bundles category =
-            sweep False 0 sourceSQL phases bundles (initialStream phases bundles category)
+        exhaustCategory stats sourceSQL sourceCount phases bundles category =
+            sweep False 0 sourceSQL sourceCount phases bundles (initialStream phases bundles category)
             where
-                sweep changed _ currentSQL currentPhases currentBundles [] =
-                    pure (currentSQL, currentPhases, currentBundles, changed)
-                sweep changed ordinal currentSQL currentPhases currentBundles candidates = do
+                sweep changed _ currentSQL currentCount currentPhases currentBundles [] =
+                    pure (currentSQL, currentCount, currentPhases, currentBundles, changed)
+                sweep changed ordinal currentSQL currentCount currentPhases currentBundles candidates = do
                     (windowTasks, nextOrdinal, rest) <- fillWindow currentSQL ordinal candidates
                     if null windowTasks
-                        then sweep changed nextOrdinal currentSQL currentPhases currentBundles rest
+                        then sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
                         else do
+                            mapM_ (\(_, _, bytes) -> reportCandidateCount pool bytes currentCount) windowTasks
                             started <- getMonotonicTimeNSec
                             outcomes <-
                                 testOrderedTagged pool [(candidateTag candidate, bytes) | (_, candidate, bytes) <- windowTasks]
@@ -994,13 +1104,14 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                                                 }
                                         )
                                     logAccept candidate currentSQL acceptedBytes
-                                    (freshPhases, freshBundles) <- parseEdits acceptedBytes
+                                    (freshCount, freshPhases, freshBundles) <- parseEdits acceptedBytes
                                     let freshCandidates =
                                             drop acceptedOrdinal (initialStream freshPhases freshBundles category)
                                     sweep
                                         True
                                         acceptedOrdinal
                                         acceptedBytes
+                                        freshCount
                                         freshPhases
                                         freshBundles
                                         freshCandidates
@@ -1013,7 +1124,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                                                 , syntaxElapsed = syntaxElapsed s + elapsed
                                                 }
                                         )
-                                    sweep changed nextOrdinal currentSQL currentPhases currentBundles rest
+                                    sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
 
                 logAccept (SingleCandidate edit) currentSQL acceptedBytes =
                     let editStart = parserEditStart edit

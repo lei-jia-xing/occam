@@ -6,68 +6,22 @@ import Data.Aeson (FromJSON, ToJSON, Value, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Occam qualified
-import Occam.Core (
-    AlterChange (..),
-    AlterTable (..),
-    BarrierScope (..),
-    CatalogOp (..),
-    ConflictAction (..),
-    ConstraintRef (..),
-    DataWrite (..),
-    DmlEvent (..),
-    DropMode (..),
-    DropObject (..),
-    DropOp (..),
-    Ident (..),
-    IndexDef (..),
-    IndexRef (..),
-    NameRef (..),
-    ObjectRef (..),
-    PartitionLink (..),
-    ReadFact (..),
-    ReadMode (..),
-    RefreshOp (..),
-    RelationKind (..),
-    RenameOp (..),
-    SchemaDef (..),
-    ScopedBarrier (..),
-    SemanticFacts (..),
-    SequenceDef (..),
-    SequenceWrite (..),
-    SessionEffect (..),
-    Span (..),
-    Statement (..),
-    StatementId (..),
-    TableDef (..),
-    TriggerBody (..),
-    TriggerDef (..),
-    TriggerEffect (..),
-    TriggerRef (..),
-    TxEffect (..),
-    TypeDef (..),
-    ViewDef (..),
-    WriteKind (..),
-    nameText,
- )
-import Occam.Dependency (cascadeWrites)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
     EvaluationResult (..),
     EvaluationStatus (..),
+    ReductionActionResult (..),
     metricPolicyForReduction,
     parseSQLDialect,
     runEvaluatedReductionWithProgress,
     sqlDialectName,
  )
-import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Logger (
     LogConfig (..),
     LogFormat (..),
@@ -86,21 +40,27 @@ import Occam.Oracle (
  )
 import Occam.Parser (
     ParseOptions (..),
-    ParsedSQL (..),
     ParserError (..),
     SQLDialect (..),
     ServerConfig (..),
     countStatements,
     defaultParseOptions,
-    dialectName,
+    factDumpJson,
     parseSQL,
  )
 import Occam.Reducer (
+    AuditStats (..),
     ColumnMode (..),
     ReductionConfig (..),
+    ReductionEvidence (..),
+    ReductionResult (..),
+    ReductionStage (..),
+    StageEvent (..),
     columnModeName,
     defaultReductionConfig,
-    reduceSQLWithConfig,
+    reduceSQLWithEvidence,
+    statementAuditWithLogger,
+    statementDdmin,
  )
 import Occam.UI (
     UI (..),
@@ -164,6 +124,14 @@ data Options = Options
     }
     deriving (Eq, Show)
 
+data ReductionStrategy = StrategyFull | StrategyDdminOnly | StrategyAuditOnly
+    deriving (Eq, Show)
+
+strategyName :: ReductionStrategy -> T.Text
+strategyName StrategyFull = "full"
+strategyName StrategyDdminOnly = "ddmin-only"
+strategyName StrategyAuditOnly = "audit-only"
+
 data ReductionOptions = ReductionOptions
     { optSlicing :: !Bool
     , optClosure :: !Bool
@@ -172,6 +140,7 @@ data ReductionOptions = ReductionOptions
     , optUnrestricted :: !Bool
     , optCache :: !Bool
     , optDialect :: !SQLDialect
+    , optStrategy :: !ReductionStrategy
     }
     deriving (Eq, Show)
 
@@ -181,8 +150,6 @@ data Stats = Stats
     , reduction_ratio :: !Double
     , initial_statements :: !Int
     , reduced_statements :: !Int
-    , initial_tokens :: !(Maybe Int)
-    , reduced_tokens :: !(Maybe Int)
     , oracle_executions :: !Int
     , oracle_attempts :: !Int
     , initial_oracle_observations :: !Int
@@ -327,6 +294,13 @@ reductionOptionsParser =
                 <> help
                     "SQL dependency dialect: generic, postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
             )
+        <*> option
+            (eitherReader parseStrategy)
+            ( long "strategy"
+                <> metavar "STRATEGY"
+                <> value StrategyFull
+                <> help "Reduction strategy: full, ddmin-only, or audit-only (default: full)"
+            )
 
 toggle :: Bool -> String -> String -> String -> Parser Bool
 toggle defaultValue enableName disableName description =
@@ -366,6 +340,13 @@ parseColumnMode s = case map toLower s of
     "single" -> Right ColumnSingle
     "atomic" -> Right ColumnAtomic
     _ -> Left "Expected off, single, or atomic"
+
+parseStrategy :: String -> Either String ReductionStrategy
+parseStrategy s = case map toLower s of
+    "full" -> Right StrategyFull
+    "ddmin-only" -> Right StrategyDdminOnly
+    "audit-only" -> Right StrategyAuditOnly
+    _ -> Left "Expected full, ddmin-only, or audit-only"
 
 versionOption :: Parser (a -> a)
 versionOption =
@@ -486,6 +467,7 @@ runOccamWithLogger logger Options {..} = do
                 , evaluationPreflightAttempts = 0
                 , evaluationPreflightResetMicros = Nothing
                 , evaluationPreflightOracleMicros = Nothing
+                , evaluationInitialStatements = Just initialStmts
                 }
     logInfo'
         logger
@@ -496,7 +478,10 @@ runOccamWithLogger logger Options {..} = do
         , ("initial_statements", toJSON initialStmts)
         , ("oracle_cmd", toJSON oracleCmd)
         , ("evaluation_budget", toJSON configuredBudget)
-        , ("reduction_settings", reductionSettings (optCache optReductionOptions) reductionConfig)
+        ,
+            ( "reduction_settings"
+            , reductionSettings (optCache optReductionOptions) reductionConfig (optStrategy optReductionOptions)
+            )
         ]
 
     initialStart <- getCurrentTime
@@ -538,11 +523,30 @@ runOccamWithLogger logger Options {..} = do
     unless writeToStdout (createDirectoryIfMissing True optOutDir)
     logInfo logger "occam::reducer" "Running hierarchical reduction engine..."
 
-    metricsPolicy <- case metricPolicyForReduction reductionConfig optJobs of
-        Left err -> do
-            hPutStrLn stderr ("occam: error: " ++ T.unpack err)
-            exitFailure
-        Right policy -> pure (Just policy)
+    metricsPolicy <- case optStrategy optReductionOptions of
+        StrategyFull -> case metricPolicyForReduction reductionConfig optJobs of
+            Left err -> do
+                hPutStrLn stderr ("occam: error: " ++ T.unpack err)
+                exitFailure
+            Right policy -> pure (Just policy)
+        StrategyDdminOnly -> pure Nothing
+        StrategyAuditOnly -> pure Nothing
+    let reductionAction reporter reducerLogger pool = case optStrategy optReductionOptions of
+            StrategyFull -> do
+                ReductionResult sql evidence <-
+                    reduceSQLWithEvidence reporter reductionConfig reducerLogger pool initialSQL
+                pure (ReductionActionResult sql evidence)
+            StrategyDdminOnly -> do
+                sql <- statementDdmin dialect pool initialSQL
+                pure (ReductionActionResult sql Nothing)
+            StrategyAuditOnly -> do
+                auditStart <- toInteger <$> getMonotonicTimeNSec
+                reporter (StageStarted StageStatementAudit)
+                (sql, stats) <- statementAuditWithLogger reducerLogger dialect pool initialSQL
+                auditEnd <- toInteger <$> getMonotonicTimeNSec
+                let elapsed = fromIntegral (auditEnd - auditStart) / 1000000000 :: Double
+                reporter (StageFinished StageStatementAudit elapsed (BS.length initialSQL) (BS.length sql))
+                pure (ReductionActionResult sql (Just (ReductionEvidence sql (auditMinimalityConfirmed stats))))
     result <-
         withCheckpointPath writeToStdout minimalPath $ \checkpointPath ->
             runEvaluatedReductionWithProgress
@@ -555,7 +559,7 @@ runOccamWithLogger logger Options {..} = do
                 logger
                 initialSQL
                 checkpointPath
-                (\reducerLogger oracle -> reduceSQLWithConfig reductionConfig reducerLogger oracle initialSQL)
+                reductionAction
     let reducedSQL = evaluatedSQL result
         evaluation = evaluationMetrics result
         totalHits = evaluationCacheHits evaluation
@@ -587,8 +591,6 @@ runOccamWithLogger logger Options {..} = do
                 , reduction_ratio = ratio
                 , initial_statements = initialStmts
                 , reduced_statements = reducedStmts
-                , initial_tokens = Nothing
-                , reduced_tokens = Nothing
                 , oracle_executions = totalOracleExecutions
                 , oracle_attempts = totalOracleAttempts
                 , initial_oracle_observations = evaluationPreflightAttempts budgetConfig
@@ -598,7 +600,8 @@ runOccamWithLogger logger Options {..} = do
                 , cache_hit_ratio = hitRatio
                 , cancelled_observations = evaluationCancelledObservations evaluation
                 , status = evaluationStatus evaluation
-                , reduction_settings = reductionSettings (optCache optReductionOptions) reductionConfig
+                , reduction_settings =
+                    reductionSettings (optCache optReductionOptions) reductionConfig (optStrategy optReductionOptions)
                 , evaluation_budget = budgetConfig
                 , evaluation_metrics = evaluation
                 , initial_oracle_seconds = initialOracleSeconds
@@ -663,8 +666,8 @@ toReductionConfig ReductionOptions {..} =
         , reductionDialect = optDialect
         }
 
-reductionSettings :: Bool -> ReductionConfig -> Value
-reductionSettings cacheEnabled ReductionConfig {..} =
+reductionSettings :: Bool -> ReductionConfig -> ReductionStrategy -> Value
+reductionSettings cacheEnabled ReductionConfig {..} strategy =
     object
         [ "slicing" .= reductionSlicing
         , "closure" .= reductionClosure
@@ -673,6 +676,7 @@ reductionSettings cacheEnabled ReductionConfig {..} =
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled
         , "dialect" .= sqlDialectName reductionDialect
+        , "strategy" .= strategyName strategy
         ]
 
 {- | Hidden @--dump-facts@ handler: parse INPUT with the selected dialect and
@@ -703,269 +707,3 @@ dumpStatementFacts dialect fkOn inputFile = do
             hPutStrLn stderr ("occam: error: failed to parse input: " ++ T.unpack (parserErrorMessage err))
             exitFailure
         Right result -> BSL.putStr (encode (factDumpJson dialect result) <> "\n")
-
-factDumpJson :: SQLDialect -> ParsedSQL -> Value
-factDumpJson dialect parsed =
-    object
-        [ "dialect" .= dialectName dialect
-        , "statements" .= zipWith (statementFactsJson extras) [0 :: Int ..] (parsedUnits parsed)
-        ]
-    where
-        extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
-
-statementFactsJson :: Map StatementId [DataWrite] -> Int -> StatementUnit -> Value
-statementFactsJson extras idx unit =
-    object
-        [ "index" .= idx
-        , "start" .= startByte
-        , "end" .= endByte
-        , "parse_error" .= unitParseError unit
-        , "reads" .= readsJson
-        , "writes" .= writesJson
-        , "ddl" .= ddlJson
-        , "barriers" .= map barrierJson (factBarriers semantics)
-        , "session" .= map sessionEffectName (factSession semantics)
-        , "pre_tx" .= map txEffectName (factPreTx semantics)
-        , "post_tx" .= map txEffectName (factPostTx semantics)
-        , "trigger_effects" .= triggerEffectsJson ops
-        ]
-    where
-        Span startByte endByte = stmtSpan (unitStatement unit)
-        semantics = maybe (SemanticFacts [] [] [] [] []) factSemantics (unitFacts unit)
-        ops = factOps semantics
-        cascadeExtras = Map.findWithDefault [] (stmtId (unitStatement unit)) extras
-        readsJson = map readFactJson (concatMap opReads ops)
-        writesJson = concatMap opWrites ops ++ map dataWriteJson cascadeExtras
-        ddlJson = concatMap opDdl ops
-
-{- | Reads evaluated when the statement itself runs: direct reads, DML source
-reads, and CTAS/view definition sources. Trigger WHEN-clause reads fire
-with the trigger, so they are reported under @trigger_effects@ instead.
--}
-opReads :: CatalogOp -> [ReadFact]
-opReads (ReadOp r) = [r]
-opReads (WriteDataOp w) = dataWriteReads w
-opReads (DefineTableOp t) = tableSources t
-opReads (DefineViewOp v) = viewSources v
-opReads _ = []
-
-opWrites :: CatalogOp -> [Value]
-opWrites (WriteDataOp w) = [dataWriteJson w]
-opWrites (RefreshCatalogOp r) =
-    [ object
-        [ "target" .= nameText (nameRefName (refreshTarget r))
-        , "kind" .= ("refresh" :: T.Text)
-        , "columns" .= ([] :: [T.Text])
-        , "unqualified_columns" .= ([] :: [T.Text])
-        ]
-    ]
-opWrites _ = []
-
-opDdl :: CatalogOp -> [Value]
-opDdl (DefineTableOp t) = [ddlOpJson "create-table" (nameText (tableName t))]
-opDdl (DefineViewOp v) =
-    [ ddlOpJson
-        (if viewMaterialized v then "create-materialized-view" else "create-view")
-        (nameText (viewName v))
-    ]
-opDdl (DefineIndexOp i) =
-    [ object
-        [ "op" .= ("create-index" :: T.Text)
-        , "target" .= nameText (nameRefName (indexTable i))
-        , "name" .= indexRefName (indexRef i)
-        ]
-    ]
-opDdl (DefineTriggerOp t) =
-    [ object
-        [ "op" .= ("create-trigger" :: T.Text)
-        , "target" .= nameText (nameRefName (triggerTable t))
-        , "name" .= triggerRefName (triggerRef t)
-        ]
-    ]
-opDdl (DefineSequenceOp s) = [ddlOpJson "create-sequence" (nameText (sequenceName s))]
-opDdl (DefineTypeOp t) = [ddlOpJson "create-type" (nameText (typeName t))]
-opDdl (DefineSchemaOp s) = [ddlOpJson "create-schema" (nameText (schemaName s))]
-opDdl (AlterTableOp a) =
-    [ object
-        [ "op" .= ("alter-table" :: T.Text)
-        , "target" .= nameText (nameRefName (alterTableTarget a))
-        , "changes" .= map alterChangeName (alterTableChanges a)
-        ]
-    ]
-opDdl (AttachPartitionOp l) = [ddlOpJson "attach-partition" (nameText (nameRefName (linkChild l)))]
-opDdl (DetachPartitionOp l) = [ddlOpJson "detach-partition" (nameText (nameRefName (linkChild l)))]
-opDdl (DropCatalogOp d) = map (dropObjectJson (dropMode d)) (dropObjects d)
-opDdl (RenameOp r) = [renameJson r]
-opDdl (WriteSequenceOp s) = [ddlOpJson "sequence-write" (nameText (nameRefName (sequenceWriteTarget s)))]
-opDdl _ = []
-
-ddlOpJson :: T.Text -> T.Text -> Value
-ddlOpJson op target = object ["op" .= op, "target" .= target]
-
-readFactJson :: ReadFact -> Value
-readFactJson r =
-    object
-        [ "table" .= nameText (nameRefName (readSource r))
-        , "temp" .= nameRefTemp (readSource r)
-        , "columns" .= map identText (readColumns r)
-        , "mode" .= (case readMode r of ReadData -> ("data" :: T.Text); ReadSchema -> "schema")
-        ]
-
-dataWriteJson :: DataWrite -> Value
-dataWriteJson w =
-    object
-        [ "target" .= nameText (nameRefName (dataWriteTarget w))
-        , "kind" .= writeKindName (dataWriteKind w)
-        , "columns" .= map identText (dataWriteColumns w)
-        , "unqualified_columns" .= map identText (dataWriteUnqualifiedColumns w)
-        ]
-
-writeKindName :: WriteKind -> T.Text
-writeKindName (InsertWrite ConflictError) = "insert"
-writeKindName (InsertWrite ConflictIgnore) = "insert-or-ignore"
-writeKindName (InsertWrite ConflictReplace) = "insert-or-replace"
-writeKindName (InsertWrite ConflictUpdate) = "insert-or-update"
-writeKindName UpdateWrite = "update"
-writeKindName (DeleteWrite _) = "delete"
-writeKindName MergeWrite = "merge"
-writeKindName (TruncateWrite _ _) = "truncate"
-
-alterChangeName :: AlterChange -> T.Text
-alterChangeName (AddColumn _ _) = "add-column"
-alterChangeName (DropColumn _ _) = "drop-column"
-alterChangeName (AddConstraint _) = "add-constraint"
-alterChangeName (DropConstraint _ _) = "drop-constraint"
-alterChangeName (RenameConstraint _ _) = "rename-constraint"
-alterChangeName (ValidateConstraint _) = "validate-constraint"
-alterChangeName (DropIndexChange _) = "drop-index"
-alterChangeName (AlterColumn {}) = "alter-column"
-alterChangeName (OtherChange detail) = "other:" <> detail
-
-dropObjectJson :: DropMode -> DropObject -> Value
-dropObjectJson mode obj =
-    object
-        [ "op" .= opName
-        , "target" .= target
-        , "mode" .= (if mode == DropCascade then ("cascade" :: T.Text) else "restrict")
-        ]
-    where
-        (opName, target) = case obj of
-            DropRelation r kind -> (relKindName kind, nameText (nameRefName r))
-            DropIndex i -> ("drop-index" :: T.Text, indexRefName i)
-            DropTrigger t -> ("drop-trigger", triggerRefName t)
-            DropSequence s -> ("drop-sequence", nameText (nameRefName s))
-            DropType t -> ("drop-type", nameText t)
-            DropSchema s -> ("drop-schema", nameText s)
-        relKindName TableRelation = "drop-table"
-        relKindName ViewRelation = "drop-view"
-        relKindName MaterializedViewRelation = "drop-materialized-view"
-
-renameJson :: RenameOp -> Value
-renameJson (RenameRelation old new _) =
-    object
-        [ "op" .= ("rename-relation" :: T.Text)
-        , "target" .= nameText (nameRefName old)
-        , "name" .= nameText new
-        ]
-renameJson (RenameColumnOp t old new) =
-    object
-        [ "op" .= ("rename-column" :: T.Text)
-        , "target" .= nameText (nameRefName t)
-        , "name" .= identText new
-        , "detail" .= identText old
-        ]
-
-indexRefName :: IndexRef -> T.Text
-indexRefName (NamedIndex n) = nameText n
-indexRefName (TableIndex t i) = nameText (nameRefName t) <> "." <> identText i
-
-triggerRefName :: TriggerRef -> T.Text
-triggerRefName (NamedTrigger n) = nameText n
-triggerRefName (TableTrigger t i) = nameText (nameRefName t) <> "." <> identText i
-
-barrierJson :: ScopedBarrier -> Value
-barrierJson b =
-    object
-        [ "scope" .= barrierScopeName (barrierScope b)
-        , "reason" .= T.pack (show (barrierReason b))
-        , "detail" .= barrierDetail b
-        ]
-
-barrierScopeName :: BarrierScope -> T.Text
-barrierScopeName GlobalScope = "global"
-barrierScopeName (RelationScope r) = "relation:" <> nameText (nameRefName r)
-barrierScopeName (SchemaScope n) = "schema:" <> nameText n
-barrierScopeName (ObjectScope o) = "object:" <> objectRefName o
-barrierScopeName SessionStateScope = "session"
-barrierScopeName TransactionStateScope = "transaction"
-
-objectRefName :: ObjectRef -> T.Text
-objectRefName (ObjectRelation r) = "relation:" <> nameText (nameRefName r)
-objectRefName (ObjectIndex i) = "index:" <> indexRefName i
-objectRefName (ObjectTrigger t) = "trigger:" <> triggerRefName t
-objectRefName (ObjectSequence s) = "sequence:" <> nameText (nameRefName s)
-objectRefName (ObjectType t) = "type:" <> nameText t
-objectRefName (ObjectSchema s) = "schema:" <> nameText s
-objectRefName (ObjectConstraint (ConstraintRef t n)) = "constraint:" <> nameText (nameRefName t) <> "." <> identText n
-
-sessionEffectName :: SessionEffect -> T.Text
-sessionEffectName SetVariable {} = "SetVariable"
-sessionEffectName (SetSearchPath _ _) = "SetSearchPath"
-sessionEffectName (SetNamespace _ _) = "SetNamespace"
-sessionEffectName (SetSessionUser _ _) = "SetSessionUser"
-sessionEffectName (ResetSessionUser _) = "ResetSessionUser"
-sessionEffectName (SetCurrentUser _ _) = "SetCurrentUser"
-sessionEffectName (ResetCurrentUser _) = "ResetCurrentUser"
-sessionEffectName (SetAutocommit _ _) = "SetAutocommit"
-sessionEffectName (SetForeignKeyChecks _ _) = "SetForeignKeyChecks"
-sessionEffectName (ResetForeignKeyChecks _) = "ResetForeignKeyChecks"
-sessionEffectName (ResetVariable _ _) = "ResetVariable"
-sessionEffectName (ResetAll _) = "ResetAll"
-
-txEffectName :: TxEffect -> T.Text
-txEffectName (TxBegin _) = "TxBegin"
-txEffectName (TxCommit _) = "TxCommit"
-txEffectName TxRollbackAll = "TxRollbackAll"
-txEffectName (TxRollbackTo _) = "TxRollbackTo"
-txEffectName (TxSavepoint _) = "TxSavepoint"
-txEffectName (TxReleaseSavepoint _) = "TxReleaseSavepoint"
-txEffectName (TxSetReadOnly _) = "TxSetReadOnly"
-
-{- | Trigger body and WHEN-clause effects fire when the trigger fires, not at
-CREATE time, so they are reported separately from the statement's own reads.
--}
-triggerEffectsJson :: [CatalogOp] -> Value
-triggerEffectsJson ops =
-    object ["reads" .= readsJson, "writes" .= writesJson, "other" .= otherJson]
-    where
-        effects = concatMap triggerBodyEffects ops
-        whenReads = concatMap triggerWhenOf ops
-        readsJson = map readFactJson (whenReads ++ [r | TriggerRead r <- effects])
-        writesJson = [dmlEventJson e | TriggerDml e <- effects]
-        otherJson =
-            [T.pack (show b) | TriggerBarrier b <- effects]
-                ++ [sessionEffectName s | TriggerSession s <- effects]
-                ++ ["sequence-write" :: T.Text | TriggerWriteSequence _ <- effects]
-
-triggerWhenOf :: CatalogOp -> [ReadFact]
-triggerWhenOf (DefineTriggerOp t) = triggerWhenReads t
-triggerWhenOf _ = []
-
-triggerBodyEffects :: CatalogOp -> [TriggerEffect]
-triggerBodyEffects (DefineTriggerOp t) = case triggerBody t of
-    TriggerInline effs -> effs
-    TriggerFunction _ _ -> []
-    TriggerOpaque -> []
-triggerBodyEffects _ = []
-
-dmlEventJson :: DmlEvent -> Value
-dmlEventJson event = case event of
-    DmlInsert t cols -> trigWrite "insert" t cols
-    DmlUpdate t cols -> trigWrite "update" t cols
-    DmlMerge t cols -> trigWrite "merge" t cols
-    DmlDelete t _ -> trigWrite "delete" t []
-    DmlTruncate t _ -> trigWrite "truncate" t []
-    where
-        trigWrite kind t cols =
-            object
-                ["target" .= nameText (nameRefName t), "kind" .= (kind :: T.Text), "columns" .= map identText cols]

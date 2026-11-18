@@ -121,11 +121,17 @@ Each `.meta.json` file pairs with the raw `.sql` file to drive automated reducti
 
 ```bash
 # Example reduction run with Occam on PostgreSQL:
-cabal run occam -- \
-  --dialect postgres \
-  --input benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
-  --output benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.reduced.sql \
+occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
   --oracle "python3 harness/crash_oracle.py --dbms postgres --expected-signature 'clauses != NIL'" \
   --reset "./harness/reset_db.sh --dbms postgres" \
-  --verbose
+  --dialect postgres \
+  --out /tmp/occam_reduced/
+```
+
+Or generate the exact command from the case metadata:
+
+```bash
+python3 benchmarks/bench.py crash-cmd \
+  --meta benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.meta.json \
+  --out /tmp/occam_reduced/
 ```

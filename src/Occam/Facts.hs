@@ -117,8 +117,7 @@ instance FromJSON ColumnSite where
             <*> objectValue .: "kind"
 
 {- | One column's atomic co-reduction bundle. 'targetBlocked' carries the
-frontend's skip cause; blocked targets are never oracle-tested. 'FromJSON'
-lives in "Occam.Parser" beside the other name-keyed instances.
+frontend's skip cause; blocked targets are never oracle-tested.
 -}
 data ColumnTarget = ColumnTarget
     { targetTable :: !Name
@@ -128,3 +127,12 @@ data ColumnTarget = ColumnTarget
     , targetBlocked :: !(Maybe Text)
     }
     deriving (Eq, Show, Generic)
+
+instance FromJSON ColumnTarget where
+    parseJSON = withObject "ColumnTarget" \objectValue ->
+        ColumnTarget
+            <$> objectValue .: "table"
+            <*> objectValue .: "column"
+            <*> objectValue .: "ordinal"
+            <*> objectValue .: "sites"
+            <*> objectValue .: "blocked"

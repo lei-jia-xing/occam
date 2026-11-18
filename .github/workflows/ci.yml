@@ -125,7 +125,7 @@ jobs:
         run: cabal build exe:occam
 
       - name: Run XVAL harness (default mode)
-        run: python3 benchmarks/tools/cross_validate_deps.py
+        run: python3 scripts/cross_validate_deps.py
 
       - name: Run XVAL harness (--fk-on mode)
-        run: python3 benchmarks/tools/cross_validate_deps.py --fk-on --out /tmp/xval_fk_on.json
+        run: python3 scripts/cross_validate_deps.py --fk-on --out /tmp/xval_fk_on.json

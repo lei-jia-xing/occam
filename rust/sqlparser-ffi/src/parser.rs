@@ -22,7 +22,7 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
             chunk_edits: false,
             column_ir: false,
             column_bundles: false,
-            syntax_edits: true,
+            syntax_edits: false,
         },
         false,
         |_| {},

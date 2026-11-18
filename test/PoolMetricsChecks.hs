@@ -72,6 +72,7 @@ testPoolWith store jobs cacheEnabled execute retire =
             , poolExecute = execute
             , poolBill = const (pure ())
             , poolRetire = retire
+            , poolReportCount = Nothing
             }
 
 familyCounters :: MetricsSnapshot -> FamilyTag -> FamilyCounters

@@ -112,7 +112,7 @@ echo "Oracle result: $?"
 Run Occam reducing a multi-statement fuzz crash:
 
 ```bash
-cabal run occam -- /path/to/crash_repro.sql \
+occam /path/to/crash_repro.sql \
   --oracle "python3 harness/crash_oracle.py --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
   --reset "./harness/reset_db.sh --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
   --dialect postgres \
@@ -120,15 +120,12 @@ cabal run occam -- /path/to/crash_repro.sql \
   --out /tmp/occam_reduced/
 ```
 
-Or via `benchmarks/live_fuzz_pipeline.sh`:
+Or generate the exact command for any Tier 4 corpus case from its `.meta.json`:
 
 ```bash
-./benchmarks/live_fuzz_pipeline.sh \
-  --input /path/to/crash_repro.sql \
-  --oracle "python3 harness/crash_oracle.py --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
-  --reset "./harness/reset_db.sh --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
-  --dialect postgres \
-  --timeout 10
+python3 benchmarks/bench.py crash-cmd \
+  --meta benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.meta.json \
+  --out /tmp/occam_reduced/
 ```
 
 ---

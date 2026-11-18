@@ -55,7 +55,7 @@ import Occam.Core (
  )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
-{- | Temp flag plus lowercased last name component. -}
+-- | Temp flag plus lowercased last name component.
 data TableKey = TableKey !Bool !Text
     deriving (Eq, Ord, Show)
 
@@ -90,7 +90,7 @@ collectTable def =
                 ++ [foreignKey | column <- tableColumns def, foreignKey <- columnReferences column]
         }
 
-{- | Per-statement cascade expansion against accumulated flag and catalog. -}
+-- | Per-statement cascade expansion against accumulated flag and catalog.
 cascadeWrites :: SessionInit -> [StatementUnit] -> Map StatementId [DataWrite]
 cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
     where
@@ -108,7 +108,7 @@ cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
                 tailMap = go enforced' catalog' rest
              in if null extras then tailMap else Map.insert sid extras tailMap
 
-{- | Mirrors 'Occam.Dependency.Session.applySessionEffect'. -}
+-- | Mirrors 'Occam.Dependency.Session.applySessionEffect'.
 applySession :: Bool -> Bool -> SessionEffect -> Bool
 applySession initial current effect = case effect of
     SetForeignKeyChecks ScopeSession value -> value
@@ -210,7 +210,7 @@ expand :: Map TableKey TableInfo -> CatalogOp -> [DataWrite]
 expand catalog (WriteDataOp write) = expandWrite catalog write
 expand _ _ = []
 
-{- | Breadth-first fan-out; visited guard is per (table, write flavor). -}
+-- | Breadth-first fan-out; visited guard is per (table, write flavor).
 expandWrite :: Map TableKey TableInfo -> DataWrite -> [DataWrite]
 expandWrite catalog write = case dataWriteKind write of
     DeleteWrite _ -> bfs Set.empty [(keyOfTarget, True, [])]

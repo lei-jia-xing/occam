@@ -17,6 +17,7 @@ module Occam.Pool (
     poolCancelled,
     poolLiveWorkers,
     poolJobCount,
+    reportCandidateCount,
     observationDetails,
     predicateDetails,
 ) where
@@ -103,6 +104,7 @@ data PoolConfig = PoolConfig
     , poolExecute :: !(ByteString -> IO OracleObservationDetails)
     , poolBill :: !(OracleObservationDetails -> IO ())
     , poolRetire :: !(Int -> ByteString -> OracleOutcome -> Bool -> IO ())
+    , poolReportCount :: !(Maybe (ByteString -> Int -> IO ()))
     }
 
 -- | Retired decision in candidate order: outcome plus cache-hit flag.
@@ -123,6 +125,7 @@ data OraclePool = OraclePool
     , poolExecuteFn :: !(ByteString -> IO OracleObservationDetails)
     , poolBillFn :: !(OracleObservationDetails -> IO ())
     , poolRetireFn :: !(Int -> ByteString -> OracleOutcome -> Bool -> IO ())
+    , poolReportCountFn :: !(Maybe (ByteString -> Int -> IO ()))
     , poolRegistry :: !(MVar (Map ThreadId (MVar ())))
     , poolIndexRef :: !(IORef Int)
     , poolAttemptsRef :: !(IORef Int)
@@ -156,6 +159,7 @@ newOraclePool PoolConfig {..}
                 , poolExecuteFn = poolExecute
                 , poolBillFn = poolBill
                 , poolRetireFn = poolRetire
+                , poolReportCountFn = poolReportCount
                 , poolRegistry = registry
                 , poolIndexRef = index
                 , poolAttemptsRef = attempts
@@ -200,6 +204,7 @@ withPredicatePool jobs cacheEnabled predicate =
             , poolExecute = predicateDetails predicate
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
+            , poolReportCount = Nothing
             }
 
 -- | Window-1 callback through the same ordered path; throws like 'testOrdered'.
@@ -215,6 +220,14 @@ read it through the pool instead of carrying their own pointer.
 -}
 poolMetricsStore :: OraclePool -> Maybe MetricsStore
 poolMetricsStore = poolMetricsData
+
+{- | Report a candidate's known statement count before testing it, so
+retirement can attribute counts without re-parsing. Silent when unset.
+-}
+reportCandidateCount :: OraclePool -> ByteString -> Int -> IO ()
+reportCandidateCount pool bytes count = case poolReportCountFn pool of
+    Nothing -> pure ()
+    Just report -> report bytes count
 
 {- | Interaction wall from a worker start stamp to now, in microseconds. The
 caller guarantees measurement is on; unmeasured paths never clock.

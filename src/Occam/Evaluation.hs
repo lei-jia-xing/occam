@@ -6,6 +6,7 @@ module Occam.Evaluation (
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
+    ReductionActionResult (..),
     evaluationStatusName,
     metricPolicyForReduction,
     minimalityClaimName,
@@ -18,6 +19,7 @@ module Occam.Evaluation (
 import Control.Exception (
     AsyncException,
     IOException,
+    SomeException,
     displayException,
     finally,
     fromException,
@@ -29,11 +31,10 @@ import Control.Exception (
  )
 import Control.Monad (when)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withText, (.=))
-import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Char (toLower)
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -47,19 +48,22 @@ import Occam.Logger (Logger (..), logInfo')
 import Occam.Metrics (
     MetricPolicy (..),
     MetricsSnapshot,
+    MetricsStore,
     newMetricsStore,
     snapshotMetrics,
  )
 import Occam.Oracle (
     OracleConfig (..),
+    OracleContext (..),
     OracleObservation (..),
     OracleObservationDetails (..),
     OracleReapFailed (..),
     OracleStatus (..),
     classifyOracleObservation,
     observationOutcome,
-    observeExternalOracleDetailedWith,
+    observeExternalOracleDetailedWithContext,
     oracleObservationMatches,
+    resolveOracleContext,
  )
 import Occam.Parser (SQLDialect (..), countStatements, dialectName)
 import Occam.Pool (
@@ -77,8 +81,13 @@ import Occam.Reducer (
     AuditStats (..),
     ColumnMode (..),
     ReductionConfig (..),
+    ReductionEvidence (..),
+    ReductionStage (..),
+    StageEvent (..),
+    StageReporter,
     columnModeName,
     reductionSearchPolicy,
+    reductionStageName,
     statementAuditWithLogger,
  )
 import System.Directory (removeFile, renameFile)
@@ -93,6 +102,7 @@ data EvaluationConfig = EvaluationConfig
     , evaluationPreflightAttempts :: !Int
     , evaluationPreflightResetMicros :: !(Maybe Int)
     , evaluationPreflightOracleMicros :: !(Maybe Int)
+    , evaluationInitialStatements :: !(Maybe Int)
     }
     deriving (Eq, Show, Generic)
 
@@ -196,7 +206,6 @@ data EvaluationPoint = EvaluationPoint
     , pointCallIndex :: !Int
     , pointCandidateBytes :: !Int
     , pointCandidateStatements :: !(Maybe Int)
-    , pointCandidateTokens :: !(Maybe Int)
     , pointCacheHit :: !Bool
     , pointAccepted :: !Bool
     }
@@ -255,7 +264,16 @@ data EvaluationResult = EvaluationResult
     , evaluationMetrics :: !EvaluationMetrics
     }
 
-type ReductionAction = Logger -> OraclePool -> IO ByteString
+{- | Reducer result: reduced bytes plus fixed-point evidence, if the action
+confirmed 1-minimality on those exact bytes.
+-}
+data ReductionActionResult = ReductionActionResult
+    { actionSQL :: !ByteString
+    , actionEvidence :: !(Maybe ReductionEvidence)
+    }
+    deriving (Eq, Show)
+
+type ReductionAction = StageReporter -> Logger -> OraclePool -> IO ReductionActionResult
 
 type Ticks = Integer
 
@@ -315,35 +333,16 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
     startedAt <- ticks
     let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
         totalStart = startedAt - preflightMicros * 1000
-    acceptedRef <- newIORef initialSQL
-    databaseRef <- newIORef (0 :: Int)
-    completedRef <- newIORef (0 :: Int)
-    acceptedCountRef <- newIORef (0 :: Int)
-    rejectedCountRef <- newIORef (0 :: Int)
-    timedOutRef <- newIORef (0 :: Int)
-    resetFailureRef <- newIORef (0 :: Int)
-    errorsRef <- newIORef (0 :: Int)
-    outcomesRef <- newIORef (Map.empty :: Map OracleStatus Int)
-    oracleSecondsRef <- newIORef (0.0 :: Double)
-    resetSecondsRef <- newIORef (0.0 :: Double)
-    validationObsRef <- newIORef (0 :: Int)
-    validationDatabaseRef <- newIORef (0 :: Int)
-    validationErrorsRef <- newIORef (0 :: Int)
-    validationOutcomesRef <- newIORef (Map.empty :: Map OracleStatus Int)
-    validationRejectedRef <- newIORef False
-    validationOracleSecondsRef <- newIORef (0.0 :: Double)
-    validationResetSecondsRef <- newIORef (0.0 :: Double)
-    validationSecondsRef <- newIORef (0.0 :: Double)
-    curveRef <- newIORef ([] :: [EvaluationPoint])
-    stagesRef <- newIORef ([] :: [Value])
-    auditSecondsRef <- newIORef (0.0 :: Double)
-    auditChecksRef <- newIORef (0 :: Int)
-    auditInitialAcceptedRef <- newIORef False
-    auditCompletedRef <- newIORef False
-    auditUnchangedRef <- newIORef False
-    auditResultRef <- newIORef (Nothing :: Maybe ByteString)
-    writeCheckpoint initialSQL
-
+    seedCounts <- case evaluationInitialStatements config of
+        Just count -> pure (Map.singleton initialSQL count)
+        Nothing -> do
+            counted <- countStatements dialect initialSQL
+            pure $ case counted of
+                Left _ -> Map.empty
+                Right count -> Map.singleton initialSQL count
+    state <- newIORef (initialEvalState initialSQL seedCounts)
+    writeAtomicFile checkpoint initialSQL
+    oracleCtx <- resolveOracleContext oracleCfg
     let oracleTimeout = max 1 (toInteger (oracleTimeoutMicros oracleCfg))
         validationSlack = max 1000 (min 10000 (oracleTimeout `div` 100))
         perValidationReserve = oracleTimeout + validationSlack
@@ -369,73 +368,9 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
         reductionCallLimit =
             (\limit -> max 0 (limit - max 0 (evaluationPreflightAttempts config) - validationCallLimit))
                 <$> evaluationMaxOracleExecutions config
-        boundedTimeout micros =
-            fromInteger (max 0 (min micros (toInteger (maxBound :: Int))))
-        recordOutcome outcomes observation =
-            modifyIORef' outcomes $
-                Map.insertWith (+) (classifyOracleObservation observation) 1
-        -- Worker-side billing: every update is atomic. Cancelled speculative
-        -- work never reaches this path; it counts as cancelled, not here.
-        recordReductionObservation profile = do
-            let observation = detailedObservation profile
-                micros = fromIntegral
-            atomicModifyIORef'
-                resetSecondsRef
-                (\total -> (total + micros (resetElapsedMicros profile) / 1000000, ()))
-            case oracleElapsedMicros profile of
-                Just oracleMicros -> atomicModifyIORef' oracleSecondsRef (\total -> (total + micros oracleMicros / 1000000, ()))
-                Nothing -> pure ()
-            atomicModifyIORef'
-                outcomesRef
-                (\counts -> (Map.insertWith (+) (classifyOracleObservation observation) 1 counts, ()))
-            case observation of
-                OracleFinished _ -> do
-                    atomicModifyIORef' completedRef (\n -> (n + 1, ()))
-                    if oracleObservationMatches observation
-                        then atomicModifyIORef' acceptedCountRef (\n -> (n + 1, ()))
-                        else atomicModifyIORef' rejectedCountRef (\n -> (n + 1, ()))
-                OracleTimedOut -> do
-                    atomicModifyIORef' timedOutRef (\n -> (n + 1, ()))
-                    atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
-                OracleResetFailed -> do
-                    atomicModifyIORef' resetFailureRef (\n -> (n + 1, ()))
-                    atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
-                OracleIOFailed _ -> atomicModifyIORef' errorsRef (\n -> (n + 1, ()))
-    reductionStart <- ticks
-    let precomputedObservations =
+        precomputedObservations =
             maybe Map.empty (Map.singleton initialSQL) preflightObservation
-    -- Scheduler-side retirement: curve, progress, and checkpoint updates run
-    -- in decision order on the single reduction thread.
-    let retireCandidate callIndex candidate outcome hit = do
-            let accepted = outcome == OracleAccepted
-            -- Statement counts are diagnostic only. Parsing every candidate just
-            -- to fill the curve can cost more than the reduction search itself,
-            -- so only pay for the count on candidates that were accepted.
-            statements <-
-                if accepted
-                    then do
-                        statementsResult <- countStatements dialect candidate
-                        pure $ case statementsResult of
-                            Left _ -> Nothing
-                            Right count -> Just count
-                    else pure Nothing
-            onProgress (ProgressCandidateTested (callIndex + 1) hit accepted)
-            when accepted $ do
-                smaller <- checkpointIfSmaller acceptedRef checkpoint candidate
-                when smaller $
-                    onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
-            now <- ticks
-            modifyIORef' curveRef \points ->
-                EvaluationPoint
-                    { pointElapsedSeconds = seconds reductionStart now
-                    , pointCallIndex = callIndex + 1
-                    , pointCandidateBytes = BS.length candidate
-                    , pointCandidateStatements = statements
-                    , pointCandidateTokens = Nothing
-                    , pointCacheHit = hit
-                    , pointAccepted = accepted
-                    }
-                    : points
+    reductionStart <- ticks
     metricsStore <- traverse newMetricsStore metricsPolicy
     pool <-
         newOraclePool
@@ -446,85 +381,31 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
                 , poolPrecomputed = precomputedObservations
                 , poolMetrics = metricsStore
                 , poolExecute =
-                    observeExternalOracleDetailedWith
-                        (atomicModifyIORef' databaseRef (\n -> (n + 1, ())))
+                    observeExternalOracleDetailedWithContext
+                        (modifyEvalState state (\s -> s {evalDatabase = evalDatabase s + 1}))
                         oracleCfg
-                , poolBill = recordReductionObservation
-                , poolRetire = retireCandidate
+                        oracleCtx
+                , poolBill = recordReductionObservation state
+                , poolRetire = retireCandidate onProgress reductionStart checkpoint state
+                , poolReportCount =
+                    Just
+                        (\bytes count -> modifyEvalState state (\s -> s {evalCounts = Map.insert bytes count (evalCounts s)}))
                 }
-    let captureLogger =
-            parentLogger
-                { loggerAction = \level component message metadata -> do
-                    modifyIORef' stagesRef (event level component message metadata :)
-                    case message of
-                        "Starting reduction iteration" -> onProgress (ProgressStage "slicing")
-                        "Finished backward-slicing" -> onProgress (ProgressStage "closure")
-                        "Finished closure-search" -> onProgress (ProgressStage "ddmin")
-                        "Finished unrestricted-fallback" -> onProgress (ProgressStage "audit")
-                        "Statement deletion audit reached a fixed point" -> onProgress (ProgressStage "audit")
-                        _ -> pure ()
-                    loggerAction parentLogger level component message metadata
+    let env =
+            EvalEnv
+                { envDialect = dialect
+                , envOracleCfg = oracleCfg
+                , envOracleCtx = oracleCtx
+                , envLogger = parentLogger
+                , envReductionStart = reductionStart
+                , envTotalDeadline = totalDeadline
+                , envValidationCallLimit = validationCallLimit
+                , envValidationReserve = validationReserve
+                , envPerValidationReserve = perValidationReserve
                 }
-        runAction = do
-            reduced <- action captureLogger pool
-            auditInput <- readIORef acceptedRef
-            auditStart <- ticks
-            let auditPool =
-                    mapPoolRetire
-                        ( \retire index candidate outcome hit -> do
-                            priorChecks <- readIORef auditChecksRef
-                            modifyIORef' auditChecksRef (+ 1)
-                            when (priorChecks == 0) (writeIORef auditInitialAcceptedRef (outcome == OracleAccepted))
-                            retire index candidate outcome hit
-                        )
-                        pool
-                finishAudit = do
-                    auditEnd <- ticks
-                    let elapsed = seconds auditStart auditEnd
-                    writeIORef auditSecondsRef elapsed
-                    complete <- readIORef auditCompletedRef
-                    checks <- readIORef auditChecksRef
-                    unchanged <- readIORef auditUnchangedRef
-                    logInfo'
-                        captureLogger
-                        "occam::audit"
-                        "Shared statement audit finished"
-                        [ ("elapsed_seconds", toJSON elapsed)
-                        , ("candidate_checks", toJSON checks)
-                        , ("completed", toJSON complete)
-                        , ("candidate_unchanged", toJSON unchanged)
-                        , ("audit_minimality_confirmed", toJSON complete)
-                        ]
-            _ <-
-                ( do
-                    (result, stats) <-
-                        statementAuditWithLogger captureLogger dialect auditPool auditInput
-                    initialAccepted <- readIORef auditInitialAcceptedRef
-                    writeIORef auditCompletedRef (auditMinimalityConfirmed stats)
-                    writeIORef auditUnchangedRef (initialAccepted && result == auditInput)
-                    writeIORef auditResultRef (Just result)
-                    pure result
-                )
-                    `finally` finishAudit
-            pure reduced
-
-    reductionBudget <- case totalDeadline of
-        Nothing -> pure Nothing
-        Just deadline -> do
-            now <- ticks
-            let remaining = max 0 ((deadline - now) `div` 1000)
-                available = max 0 (remaining - validationReserve)
-            pure (Just available)
-    reductionOutcome <-
-        try $ case reductionBudget of
-            Nothing -> Just <$> (runAction `finally` closeOraclePool pool)
-            Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
-    reductionEnd <- ticks
-    let reductionSeconds = seconds reductionStart reductionEnd
-    -- The pool is closed (workers drained) on every path above, including
-    -- timeout: capture cost attribution after the drain so canceled and
-    -- unselected counters are retained on all end statuses.
-    costAttribution <- traverse snapshotMetrics metricsStore
+        reporter = evalStageReporter onProgress state
+    (reductionOutcome, reductionSeconds, costAttribution) <-
+        runReductionPhase env state pool metricsStore reporter action
     (status, failure, skipValidation) <- case reductionOutcome of
         Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
         Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
@@ -539,87 +420,42 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
                     )
             | Just asyncErr <- fromException err -> throwIO (asyncErr :: AsyncException)
             | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)), False)
-
-    acceptedFinal <- readIORef acceptedRef
-    auditResult <- readIORef auditResultRef
-    let finalSQL = fromMaybe acceptedFinal auditResult
+    preValidation <- readIORef state
+    let acceptedFinal = evalAccepted preValidation
+        auditResult = evalAuditResult preValidation
+        finalSQL = fromMaybe acceptedFinal auditResult
         auditResultIsFinal =
             case auditResult of
                 Just result -> result == finalSQL
                 Nothing -> False
-        validateOnce candidate = do
-            prior <- readIORef validationObsRef
-            if prior >= validationCallLimit
-                then pure Nothing
-                else do
-                    start <- ticks
-                    let remainingMicros = (`div` 1000) . subtract start <$> totalDeadline
-                    case remainingMicros of
-                        Just remaining | remaining < perValidationReserve -> pure Nothing
-                        _ -> do
-                            modifyIORef' validationObsRef (+ 1)
-                            result <-
-                                case remainingMicros of
-                                    Nothing ->
-                                        Just
-                                            <$> observeExternalOracleDetailedWith (modifyIORef' validationDatabaseRef (+ 1)) oracleCfg candidate
-                                    Just remaining ->
-                                        timeout
-                                            (boundedTimeout (max 0 remaining))
-                                            (observeExternalOracleDetailedWith (modifyIORef' validationDatabaseRef (+ 1)) oracleCfg candidate)
-                            end <- ticks
-                            modifyIORef' validationSecondsRef (+ seconds start end)
-                            case result of
-                                Nothing -> do
-                                    let observation = OracleTimedOut
-                                    modifyIORef' validationErrorsRef (+ 1)
-                                    recordOutcome validationOutcomesRef observation
-                                    pure (Just OracleInconclusive)
-                                Just profile -> do
-                                    let observation = detailedObservation profile
-                                        micros = fromIntegral
-                                    modifyIORef' validationResetSecondsRef (+ micros (resetElapsedMicros profile) / 1000000)
-                                    modifyIORef' validationOracleSecondsRef (+ maybe 0 micros (oracleElapsedMicros profile) / 1000000)
-                                    recordOutcome validationOutcomesRef observation
-                                    case observationOutcome observation of
-                                        OracleAccepted -> pure (Just OracleAccepted)
-                                        OracleRejected -> do
-                                            writeIORef validationRejectedRef True
-                                            pure (Just OracleRejected)
-                                        OracleInconclusive -> do
-                                            modifyIORef' validationErrorsRef (+ 1)
-                                            pure (Just OracleInconclusive)
-        validateTwice candidate = do
-            first <- validateOnce candidate
-            second <- validateOnce candidate
-            pure (first == Just OracleAccepted && second == Just OracleAccepted)
-    validationPassed <- if skipValidation then pure False else validateTwice finalSQL
+    validationPassed <- runValidationPhase env state finalSQL skipValidation
     cacheStats <- poolCacheStats pool
-    curve <- reverse <$> readIORef curveRef
-    stages <- reverse <$> readIORef stagesRef
     attempts <- poolAttempts pool
     cancelled <- poolCancelled pool
-    database <- readIORef databaseRef
-    completed <- readIORef completedRef
-    acceptedCount <- readIORef acceptedCountRef
-    rejectedCount <- readIORef rejectedCountRef
-    timedOut <- readIORef timedOutRef
-    resetFailures <- readIORef resetFailureRef
-    errors <- readIORef errorsRef
-    outcomes <- readIORef outcomesRef
-    validationObservations <- readIORef validationObsRef
-    validationDatabase <- readIORef validationDatabaseRef
-    validationErrors <- readIORef validationErrorsRef
-    validationRejected <- readIORef validationRejectedRef
-    validationOutcomes <- readIORef validationOutcomesRef
-    oracleSeconds <- readIORef oracleSecondsRef
-    resetSeconds <- readIORef resetSecondsRef
-    validationOracleSeconds <- readIORef validationOracleSecondsRef
-    validationResetSeconds <- readIORef validationResetSecondsRef
-    validationSeconds <- readIORef validationSecondsRef
-    auditSeconds <- readIORef auditSecondsRef
-    auditChecks <- readIORef auditChecksRef
-    auditCompleted <- readIORef auditCompletedRef
+    st <- readIORef state
+    let curve = reverse (evalCurve st)
+        stages = reverse (evalStages st)
+        database = evalDatabase st
+        completed = evalCompleted st
+        acceptedCount = evalAcceptedCount st
+        rejectedCount = evalRejectedCount st
+        timedOut = evalTimedOut st
+        resetFailures = evalResetFailures st
+        errors = evalErrors st
+        outcomes = evalOutcomes st
+        validationObservations = evalValidationObs st
+        validationDatabase = evalValidationDatabase st
+        validationErrors = evalValidationErrors st
+        validationRejected = evalValidationRejected st
+        validationOutcomes = evalValidationOutcomes st
+        oracleSeconds = evalOracleSeconds st
+        resetSeconds = evalResetSeconds st
+        validationOracleSeconds = evalValidationOracleSeconds st
+        validationResetSeconds = evalValidationResetSeconds st
+        validationSeconds = evalValidationSeconds st
+        auditSeconds = evalAuditSeconds st
+        auditChecks = evalAuditChecks st
+        auditCompleted = evalAuditCompleted st
     totalEnd <- ticks
     let finalStatus
             | status /= EvaluationCompleted = status
@@ -687,33 +523,422 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
                 , evaluationCostAttribution = costAttribution
                 }
     pure EvaluationResult {evaluatedSQL = finalSQL, evaluationMetrics = metrics}
+
+{- | Mutable reduction state shared by all phases. Every update goes through
+'modifyEvalState' (atomic): worker billing runs on pool threads while
+retirement, audit, and validation run on the reduction thread.
+-}
+data EvalState = EvalState
+    { evalAccepted :: !ByteString
+    , evalDatabase :: !Int
+    , evalCompleted :: !Int
+    , evalAcceptedCount :: !Int
+    , evalRejectedCount :: !Int
+    , evalTimedOut :: !Int
+    , evalResetFailures :: !Int
+    , evalErrors :: !Int
+    , evalOutcomes :: !(Map OracleStatus Int)
+    , evalOracleSeconds :: !Double
+    , evalResetSeconds :: !Double
+    , evalValidationObs :: !Int
+    , evalValidationDatabase :: !Int
+    , evalValidationErrors :: !Int
+    , evalValidationOutcomes :: !(Map OracleStatus Int)
+    , evalValidationRejected :: !Bool
+    , evalValidationOracleSeconds :: !Double
+    , evalValidationResetSeconds :: !Double
+    , evalValidationSeconds :: !Double
+    , evalCurve :: ![EvaluationPoint]
+    , evalStages :: ![Value]
+    , evalCounts :: !(Map ByteString Int)
+    , evalAuditSeconds :: !Double
+    , evalAuditChecks :: !Int
+    , evalAuditInitialAccepted :: !Bool
+    , evalAuditCompleted :: !Bool
+    , evalAuditUnchanged :: !Bool
+    , evalAuditResult :: !(Maybe ByteString)
+    }
+    deriving (Eq, Show)
+
+initialEvalState :: ByteString -> Map ByteString Int -> EvalState
+initialEvalState initialSQL seedCounts =
+    EvalState
+        { evalAccepted = initialSQL
+        , evalDatabase = 0
+        , evalCompleted = 0
+        , evalAcceptedCount = 0
+        , evalRejectedCount = 0
+        , evalTimedOut = 0
+        , evalResetFailures = 0
+        , evalErrors = 0
+        , evalOutcomes = Map.empty
+        , evalOracleSeconds = 0
+        , evalResetSeconds = 0
+        , evalValidationObs = 0
+        , evalValidationDatabase = 0
+        , evalValidationErrors = 0
+        , evalValidationOutcomes = Map.empty
+        , evalValidationRejected = False
+        , evalValidationOracleSeconds = 0
+        , evalValidationResetSeconds = 0
+        , evalValidationSeconds = 0
+        , evalCurve = []
+        , evalStages = []
+        , evalCounts = seedCounts
+        , evalAuditSeconds = 0
+        , evalAuditChecks = 0
+        , evalAuditInitialAccepted = False
+        , evalAuditCompleted = False
+        , evalAuditUnchanged = False
+        , evalAuditResult = Nothing
+        }
+
+modifyEvalState :: IORef EvalState -> (EvalState -> EvalState) -> IO ()
+modifyEvalState ref f = atomicModifyIORef' ref (\s -> (f s, ()))
+
+-- | Static phase environment: handles, clocks, and budgets fixed at setup.
+data EvalEnv = EvalEnv
+    { envDialect :: !SQLDialect
+    , envOracleCfg :: !OracleConfig
+    , envOracleCtx :: !OracleContext
+    , envLogger :: !Logger
+    , envReductionStart :: !Ticks
+    , envTotalDeadline :: !(Maybe Ticks)
+    , envValidationCallLimit :: !Int
+    , envValidationReserve :: !Integer
+    , envPerValidationReserve :: !Integer
+    }
+
+boundedTimeout :: Integer -> Int
+boundedTimeout micros =
+    fromInteger (max 0 (min micros (toInteger (maxBound :: Int))))
+
+{- | Reduction phase: run the action plus the shared audit under the shared
+budget, always draining and closing the pool, then snapshot cost
+attribution after the drain.
+-}
+runReductionPhase ::
+    EvalEnv ->
+    IORef EvalState ->
+    OraclePool ->
+    Maybe MetricsStore ->
+    StageReporter ->
+    ReductionAction ->
+    IO (Either SomeException (Maybe ReductionActionResult), Double, Maybe MetricsSnapshot)
+runReductionPhase env state pool metricsStore reporter action = do
+    reductionBudget <- case envTotalDeadline env of
+        Nothing -> pure Nothing
+        Just deadline -> do
+            now <- ticks
+            let remaining = max 0 ((deadline - now) `div` 1000)
+                available = max 0 (remaining - envValidationReserve env)
+            pure (Just available)
+    outcome <-
+        try $ case reductionBudget of
+            Nothing -> Just <$> (runAction `finally` closeOraclePool pool)
+            Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
+    reductionEnd <- ticks
+    let reductionSeconds = seconds (envReductionStart env) reductionEnd
+    -- The pool is closed (workers drained) on every path above, including
+    -- timeout: capture cost attribution after the drain so canceled and
+    -- unselected counters are retained on all end statuses.
+    costAttribution <- traverse snapshotMetrics metricsStore
+    pure (outcome, reductionSeconds, costAttribution)
     where
-        -- Single-committer critical section: tmp write, rename, and the
-        -- accepted-pointer transition happen masked, and any failure removes
-        -- the tmp file. Local file operations only; no unbounded waits.
-        writeAtomicFile path sql = mask_ $ do
-            let temporary = path ++ ".tmp"
-            (BS.writeFile temporary sql >> renameFile temporary path)
-                `onException` ignoreIOException (removeFile temporary)
+        runAction = do
+            result <- action reporter (envLogger env) pool
+            runAuditPhase env state pool reporter (actionEvidence result)
+            pure result
 
-        writeCheckpoint = writeAtomicFile checkpoint
+{- | Audit phase: confirm statement-deletion 1-minimality on the accepted
+bytes, skipping the re-run when the action's evidence already confirms
+these exact bytes (a re-run would only replay cache hits).
+-}
+runAuditPhase ::
+    EvalEnv -> IORef EvalState -> OraclePool -> StageReporter -> Maybe ReductionEvidence -> IO ()
+runAuditPhase env state pool reporter evidence = do
+    auditInput <- evalAccepted <$> readIORef state
+    case evidence of
+        Just ReductionEvidence {..}
+            | evidenceAuditMinimal && evidenceBytes == auditInput -> do
+                auditStart <- ticks
+                auditEnd <- ticks
+                let elapsed = seconds auditStart auditEnd
+                modifyEvalState state \s ->
+                    s
+                        { evalAuditSeconds = elapsed
+                        , evalAuditCompleted = True
+                        , evalAuditUnchanged = True
+                        , evalAuditInitialAccepted = True
+                        , evalAuditResult = Just auditInput
+                        }
+                logInfo'
+                    (envLogger env)
+                    "occam::audit"
+                    "Shared statement audit finished"
+                    [ ("elapsed_seconds", toJSON elapsed)
+                    , ("candidate_checks", toJSON (0 :: Int))
+                    , ("completed", toJSON True)
+                    , ("candidate_unchanged", toJSON True)
+                    , ("audit_minimality_confirmed", toJSON True)
+                    , ("skipped", toJSON True)
+                    ]
+        _ -> do
+            auditStart <- ticks
+            let auditPool =
+                    mapPoolRetire
+                        ( \retire index candidate outcome hit -> do
+                            priorChecks <- evalAuditChecks <$> readIORef state
+                            modifyEvalState state (\s -> s {evalAuditChecks = evalAuditChecks s + 1})
+                            when (priorChecks == 0) $
+                                modifyEvalState state (\s -> s {evalAuditInitialAccepted = outcome == OracleAccepted})
+                            retire index candidate outcome hit
+                        )
+                        pool
+                finishAudit = do
+                    auditEnd <- ticks
+                    let elapsed = seconds auditStart auditEnd
+                    st <- readIORef state
+                    let complete = evalAuditCompleted st
+                        checks = evalAuditChecks st
+                        unchanged = evalAuditUnchanged st
+                    modifyEvalState state (\s -> s {evalAuditSeconds = elapsed})
+                    logInfo'
+                        (envLogger env)
+                        "occam::audit"
+                        "Shared statement audit finished"
+                        [ ("elapsed_seconds", toJSON elapsed)
+                        , ("candidate_checks", toJSON checks)
+                        , ("completed", toJSON complete)
+                        , ("candidate_unchanged", toJSON unchanged)
+                        , ("audit_minimality_confirmed", toJSON complete)
+                        , ("skipped", toJSON False)
+                        ]
+            reporter (StageStarted StageStatementAudit)
+            result <-
+                ( do
+                    (audited, stats) <-
+                        statementAuditWithLogger (envLogger env) (envDialect env) auditPool auditInput
+                    initialAccepted <- evalAuditInitialAccepted <$> readIORef state
+                    modifyEvalState state \s ->
+                        s
+                            { evalAuditCompleted = auditMinimalityConfirmed stats
+                            , evalAuditUnchanged = initialAccepted && audited == auditInput
+                            , evalAuditResult = Just audited
+                            }
+                    pure audited
+                )
+                    `finally` finishAudit
+            auditEnd <- ticks
+            reporter
+                ( StageFinished
+                    StageStatementAudit
+                    (seconds auditStart auditEnd)
+                    (BS.length auditInput)
+                    (BS.length result)
+                )
 
-        checkpointIfSmaller acceptedRef path candidate = do
-            current <- readIORef acceptedRef
-            if BS.length candidate < BS.length current
-                then mask_ $ do
-                    writeAtomicFile path candidate
-                    writeIORef acceptedRef candidate
-                    pure True
-                else pure False
+-- | Validation phase: repeat the final check twice within the shared limits.
+runValidationPhase :: EvalEnv -> IORef EvalState -> ByteString -> Bool -> IO Bool
+runValidationPhase env state finalSQL skipValidation
+    | skipValidation = pure False
+    | otherwise = do
+        first <- validateOnce finalSQL
+        second <- validateOnce finalSQL
+        pure (first == Just OracleAccepted && second == Just OracleAccepted)
+    where
+        validateOnce candidate = do
+            prior <- evalValidationObs <$> readIORef state
+            if prior >= envValidationCallLimit env
+                then pure Nothing
+                else do
+                    start <- ticks
+                    let remainingMicros = (`div` 1000) . subtract start <$> envTotalDeadline env
+                    case remainingMicros of
+                        Just remaining | remaining < envPerValidationReserve env -> pure Nothing
+                        _ -> do
+                            modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
+                            result <-
+                                case remainingMicros of
+                                    Nothing ->
+                                        Just
+                                            <$> observeExternalOracleDetailedWithContext
+                                                (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
+                                                (envOracleCfg env)
+                                                (envOracleCtx env)
+                                                candidate
+                                    Just remaining ->
+                                        timeout
+                                            (boundedTimeout (max 0 remaining))
+                                            ( observeExternalOracleDetailedWithContext
+                                                (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
+                                                (envOracleCfg env)
+                                                (envOracleCtx env)
+                                                candidate
+                                            )
+                            end <- ticks
+                            modifyEvalState
+                                state
+                                (\s -> s {evalValidationSeconds = evalValidationSeconds s + seconds start end})
+                            case result of
+                                Nothing -> do
+                                    let observation = OracleTimedOut
+                                    modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
+                                    recordValidationOutcome state observation
+                                    pure (Just OracleInconclusive)
+                                Just profile -> do
+                                    let observation = detailedObservation profile
+                                        micros = fromIntegral
+                                    modifyEvalState
+                                        state
+                                        ( \s ->
+                                            s
+                                                { evalValidationResetSeconds =
+                                                    evalValidationResetSeconds s + micros (resetElapsedMicros profile) / 1000000
+                                                }
+                                        )
+                                    modifyEvalState
+                                        state
+                                        ( \s ->
+                                            s
+                                                { evalValidationOracleSeconds =
+                                                    evalValidationOracleSeconds s + maybe 0 micros (oracleElapsedMicros profile) / 1000000
+                                                }
+                                        )
+                                    recordValidationOutcome state observation
+                                    case observationOutcome observation of
+                                        OracleAccepted -> pure (Just OracleAccepted)
+                                        OracleRejected -> do
+                                            modifyEvalState state (\s -> s {evalValidationRejected = True})
+                                            pure (Just OracleRejected)
+                                        OracleInconclusive -> do
+                                            modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
+                                            pure (Just OracleInconclusive)
 
-        ignoreIOException = handle (\(_ :: IOException) -> pure ())
+-- Worker-side billing: every update is atomic. Cancelled speculative
+-- work never reaches this path; it counts as cancelled, not here.
+recordReductionObservation :: IORef EvalState -> OracleObservationDetails -> IO ()
+recordReductionObservation state profile = do
+    let observation = detailedObservation profile
+        micros = fromIntegral
+    modifyEvalState
+        state
+        (\s -> s {evalResetSeconds = evalResetSeconds s + micros (resetElapsedMicros profile) / 1000000})
+    case oracleElapsedMicros profile of
+        Just oracleMicros ->
+            modifyEvalState
+                state
+                (\s -> s {evalOracleSeconds = evalOracleSeconds s + micros oracleMicros / 1000000})
+        Nothing -> pure ()
+    modifyEvalState
+        state
+        ( \s -> s {evalOutcomes = Map.insertWith (+) (classifyOracleObservation observation) 1 (evalOutcomes s)}
+        )
+    case observation of
+        OracleFinished _ -> do
+            modifyEvalState state (\s -> s {evalCompleted = evalCompleted s + 1})
+            if oracleObservationMatches observation
+                then modifyEvalState state (\s -> s {evalAcceptedCount = evalAcceptedCount s + 1})
+                else modifyEvalState state (\s -> s {evalRejectedCount = evalRejectedCount s + 1})
+        OracleTimedOut -> do
+            modifyEvalState state (\s -> s {evalTimedOut = evalTimedOut s + 1})
+            modifyEvalState state (\s -> s {evalErrors = evalErrors s + 1})
+        OracleResetFailed -> do
+            modifyEvalState state (\s -> s {evalResetFailures = evalResetFailures s + 1})
+            modifyEvalState state (\s -> s {evalErrors = evalErrors s + 1})
+        OracleIOFailed _ -> modifyEvalState state (\s -> s {evalErrors = evalErrors s + 1})
 
-event :: (Show a) => a -> Text -> Text -> [(Text, Value)] -> Value
-event level component message metadata =
+recordValidationOutcome :: IORef EvalState -> OracleObservation -> IO ()
+recordValidationOutcome state observation =
+    modifyEvalState
+        state
+        ( \s ->
+            s
+                { evalValidationOutcomes =
+                    Map.insertWith (+) (classifyOracleObservation observation) 1 (evalValidationOutcomes s)
+                }
+        )
+
+-- Scheduler-side retirement: curve, progress, and checkpoint updates run
+-- in decision order on the single reduction thread.
+retireCandidate ::
+    (EvaluationProgress -> IO ()) ->
+    Ticks ->
+    FilePath ->
+    IORef EvalState ->
+    Int ->
+    ByteString ->
+    OracleOutcome ->
+    Bool ->
+    IO ()
+retireCandidate onProgress reductionStart checkpoint state callIndex candidate outcome hit = do
+    let accepted = outcome == OracleAccepted
+    -- Statement counts arrive with the candidates: the reducer reports every
+    -- tested candidate's known count up front, so retirement only looks up
+    -- and never re-parses.
+    statements <-
+        if accepted
+            then Map.lookup candidate . evalCounts <$> readIORef state
+            else pure Nothing
+    onProgress (ProgressCandidateTested (callIndex + 1) hit accepted)
+    when accepted $ do
+        smaller <- checkpointIfSmaller state checkpoint candidate
+        when smaller $
+            onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
+    now <- ticks
+    modifyEvalState state \s ->
+        s
+            { evalCurve =
+                EvaluationPoint
+                    { pointElapsedSeconds = seconds reductionStart now
+                    , pointCallIndex = callIndex + 1
+                    , pointCandidateBytes = BS.length candidate
+                    , pointCandidateStatements = statements
+                    , pointCacheHit = hit
+                    , pointAccepted = accepted
+                    }
+                    : evalCurve s
+            }
+
+{- | The single typed mapping from reducer stage events to UI progress and
+per-stage summaries. Starts drive the progress display; finishes append
+one summary each, so @evaluationStages@ stays small and truthful.
+-}
+evalStageReporter :: (EvaluationProgress -> IO ()) -> IORef EvalState -> StageReporter
+evalStageReporter onProgress state = \case
+    StageStarted stage -> onProgress (ProgressStage (reductionStageName stage))
+    StageFinished stage elapsed before after ->
+        modifyEvalState
+            state
+            (\s -> s {evalStages = stageSummary stage elapsed before after : evalStages s})
+
+stageSummary :: ReductionStage -> Double -> Int -> Int -> Value
+stageSummary stage elapsed before after =
     object
-        [ "level" .= show level
-        , "component" .= component
-        , "message" .= message
-        , "metadata" .= object [(Key.fromText key, value) | (key, value) <- metadata]
+        [ "stage" .= reductionStageName stage
+        , "seconds" .= elapsed
+        , "bytes_before" .= before
+        , "bytes_after" .= after
         ]
+
+-- Single-committer critical section: tmp write, rename, and the
+-- accepted-pointer transition happen masked, and any failure removes
+-- the tmp file. Local file operations only; no unbounded waits.
+writeAtomicFile :: FilePath -> ByteString -> IO ()
+writeAtomicFile path sql = mask_ $ do
+    let temporary = path ++ ".tmp"
+    (BS.writeFile temporary sql >> renameFile temporary path)
+        `onException` ignoreIOException (removeFile temporary)
+
+checkpointIfSmaller :: IORef EvalState -> FilePath -> ByteString -> IO Bool
+checkpointIfSmaller state path candidate = do
+    current <- evalAccepted <$> readIORef state
+    if BS.length candidate < BS.length current
+        then mask_ $ do
+            writeAtomicFile path candidate
+            modifyEvalState state (\s -> s {evalAccepted = candidate})
+            pure True
+        else pure False
+
+ignoreIOException :: IO () -> IO ()
+ignoreIOException = handle (\(_ :: IOException) -> pure ())

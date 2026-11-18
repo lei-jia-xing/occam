@@ -2,6 +2,7 @@
 
 import Control.Monad (when)
 import Distribution.PackageDescription (
+    Benchmark (benchmarkBuildInfo),
     BuildInfo (extraBundledLibs, extraLibDirs, ldOptions),
     Executable (buildInfo),
     GenericPackageDescription (..),
@@ -73,6 +74,7 @@ addRustRpath dir package =
         { condLibrary = fmap addLib (condLibrary package)
         , condExecutables = [(name, addExe tree) | (name, tree) <- condExecutables package]
         , condTestSuites = [(name, addTest tree) | (name, tree) <- condTestSuites package]
+        , condBenchmarks = [(name, addBench tree) | (name, tree) <- condBenchmarks package]
         }
     where
         rpath = "-Wl,-rpath," ++ dir
@@ -86,6 +88,9 @@ addRustRpath dir package =
         addTest tree = tree {condTreeData = suite {testBuildInfo = start (testBuildInfo suite)}}
             where
                 suite = condTreeData tree
+        addBench tree = tree {condTreeData = bench {benchmarkBuildInfo = start (benchmarkBuildInfo bench)}}
+            where
+                bench = condTreeData tree
 
 buildRust package localBuildInfo hooks flags = do
     callProcess

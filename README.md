@@ -87,22 +87,22 @@ cabal test
 
 `nix develop` provides GHC, Cabal, Rust/Cargo, rust-analyzer with matching standard-library sources, Rustfmt, Clippy, Fourmolu, HLint, HLS, and Python 3. Run `make hooks` once per checkout to enable the repository's pre-commit hook.
 
-The Cabal setup hook builds the locked Rust crate during ordinary builds; static (`-f static-rust`) builds additionally bundle it, so no manual Cargo pre-build is required. `Dockerfile.benchmark` uses a two-stage build and copies only the Occam binaries and benchmark entrypoint into runtime. `benchmarks/docker_run.sh` bind-mounts the checkout at `/workspace`.
+The Cabal setup hook builds the locked Rust crate during ordinary builds; static (`-f static-rust`) builds additionally bundle it, so no manual Cargo pre-build is required.
 
 Dev builds link the Rust frontend dynamically at load time: edit Rust, run `cargo build --locked --release --manifest-path rust/sqlparser-ffi/Cargo.toml --target-dir rust/sqlparser-ffi/target` (as `make build`, `make build-check`, and `make test` do first), then rerun the same binary with zero Haskell rebuild. The loader finds the cdylib via an absolute rpath to `rust/sqlparser-ffi/target/release` baked at configure time, so FFI signature changes still require a Haskell rebuild.
-Release builds pass `-f static-rust` for a single self-contained binary (used by `Dockerfile.benchmark` and the release workflow). Windows is static-only in v1.
+Release builds pass `-f static-rust` for a single self-contained binary (used by the release workflow). Windows is static-only in v1.
 Bare `cabal build` does not run Cargo when Cabal considers Haskell fresh — use a make target (or run Cargo manually) after Rust edits.
 
 The source distribution also includes the Rust crate and `Cargo.lock`; an extracted archive build and an installed-library consumer outside the checkout were verified.
 
-`make check` checks Haskell/Rust formatting, runs HLint, builds all Cabal components with GHC warnings treated as errors, runs the Cabal and Cargo test suites, runs Rust check/clippy with warnings as errors, and runs the Python benchmark test suite (`make benchmark-test`). The pre-commit hook runs `make fmt-check lint build-check rust-check`: it checks the working tree, including `bench/`, rather than a staged snapshot, and does not execute tests. The Python benchmark suite (`python3 -m unittest discover -s benchmarks`) exercises benchmark tooling, reset contracts, and native reducer wrappers; tests requiring `exe:occam` or `exe:occam-eval` skip automatically if the Cabal targets are not yet built. Missing formatter/linter commands fall back to `nix develop`; unavailable tools or failed checks stop the hook instead of being skipped.
+`make check` checks Haskell/Rust formatting, runs HLint, builds all Cabal components with GHC warnings treated as errors, runs the Cabal and Cargo test suites, runs Rust check/clippy with warnings as errors, and runs the Python benchmark test suite (`make benchmark-test`). The pre-commit hook runs `make fmt-check lint build-check rust-check`: it checks the working tree, including `bench/`, rather than a staged snapshot, and does not execute tests. The Python suites are `benchmarks/test_bench.py` (`python3 -m unittest discover -s benchmarks`: oracle, prepare, schedule, report, crash-cmd) and `harness/test_crash_oracle.py` (`python3 -m unittest discover -s harness -p "test_*.py"`: crash-oracle exit-code contract); neither needs a built occam binary. Missing formatter/linter commands fall back to `nix develop`; unavailable tools or failed checks stop the hook instead of being skipped.
 
 `--no-unrestricted` disables only the reducer's unrestricted fallback search pass.
 The final deletion audit is independent of that flag and always runs.
 
 The bounded generated properties check slicing and closure against independent `Data.Graph` reachability for every node and root subset on graphs of at most eight statements, and compare two-table SQLite generation/latest-write snapshots across drop/recreate, full rollback, savepoint rollback+release, and outer release. Catalog comparisons exclude transaction-control barrier IDs; they do not prove nested-savepoint, column/index/view, or general SQL semantics.
 
-See `benchmarks/README.md` for processing existing fuzz SQL and comparing reducers.
+See `benchmarks/README.md` for the 4-tier benchmark suite (SQLite oracle, deterministic corpus runs, real crash reproduction).
 
 ## License
 

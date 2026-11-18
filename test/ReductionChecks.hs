@@ -501,6 +501,7 @@ testPoolWith jobs decide =
             , poolExecute = fmap (observationDetails . toObservation) . decide
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
+            , poolReportCount = Nothing
             }
     where
         toObservation OracleAccepted = OracleFinished ExitSuccess

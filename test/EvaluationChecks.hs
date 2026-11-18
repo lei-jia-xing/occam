@@ -17,6 +17,7 @@ import Occam.Evaluation (
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
+    ReductionActionResult (..),
     metricPolicyForReduction,
     parseSQLDialect,
     runEvaluatedReduction,
@@ -55,10 +56,10 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = (predicateOracle 500000 "exit 0") {oracleResetCommand = Just "sleep 0.01"}
                 config = evaluationConfig False Nothing (Just 3)
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
                     _ <- poolOracle pool candidate
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
@@ -105,7 +106,8 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
+                action _ _ pool =
+                    ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -139,7 +141,8 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
+                action _ _ pool =
+                    ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -183,7 +186,8 @@ tests =
                         , reductionUnrestricted = False
                         , reductionDialect = SQLite
                         }
-                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
+                action _ _ pool =
+                    ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -213,7 +217,7 @@ tests =
                                 , evaluationPreflightResetMicros = Just (resetElapsedMicros details)
                                 , evaluationPreflightOracleMicros = oracleElapsedMicros details
                                 }
-                        action _ pool = poolOracle pool candidate >> pure candidate
+                        action _ _ pool = poolOracle pool candidate >> pure (ReductionActionResult candidate Nothing)
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
                             runEvaluatedReduction
@@ -247,10 +251,10 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 100000 "exit 0"
                 config = evaluationConfig True (Just 300000) Nothing
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
                     threadDelay 2000000
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
@@ -275,9 +279,9 @@ tests =
             let initial = "SELECT 1;\n"
                 oracleCfg = predicateOracle 100000 "sleep 2"
                 config = evaluationConfig False (Just 300000) Nothing
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool initial
-                    pure initial
+                    pure (ReductionActionResult initial Nothing)
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
@@ -301,9 +305,9 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig True Nothing Nothing
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction
@@ -333,9 +337,11 @@ tests =
                 invalidUtf8 = BS.pack [255]
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig False Nothing Nothing
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
-                    withPredicatePool 1 False (const (pure True)) (\inner -> reduceSQL SQLite inner invalidUtf8)
+                    bytes <-
+                        withPredicatePool 1 False (const (pure True)) (\inner -> reduceSQL SQLite inner invalidUtf8)
+                    pure (ReductionActionResult bytes Nothing)
             result <- withCheckpoint $ \checkpoint -> do
                 value <-
                     runEvaluatedReduction Nothing config SQLite oracleCfg Nothing nullLogger initial checkpoint action
@@ -406,10 +412,10 @@ tests =
                                 ++ ") & wait;; *) exit 0;; esac"
                             )
                     config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
-                    action _ pool = do
+                    action _ _ pool = do
                         outcomes <- testOrdered pool [acceptSQL, sleepSQL]
                         case outcomes of
-                            [(OracleAccepted, _)] -> pure acceptSQL
+                            [(OracleAccepted, _)] -> pure (ReductionActionResult acceptSQL Nothing)
                             _ -> assertFailure "ordered head accept was lost to speculation"
                 result <- withCheckpoint $ \checkpoint ->
                     runEvaluatedReduction
@@ -435,11 +441,11 @@ tests =
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
             liveAtEndRef <- newIORef (1 :: Int)
-            let action _ pool = do
+            let action _ _ pool = do
                     _ <- testOrdered pool [candidate, initial]
                     live <- poolLiveWorkers pool
                     writeIORef liveAtEndRef live
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
@@ -462,7 +468,8 @@ tests =
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
                 reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
-                action _ pool = reduceSQLWithConfig reducerConfig nullLogger pool initial
+                action _ _ pool =
+                    ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
@@ -484,10 +491,10 @@ tests =
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig False Nothing (Just 3)
                 reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
                     _ <- poolOracle pool candidate
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             policy <- case metricPolicyForReduction reducerConfig 1 of
                 Left err -> assertFailure ("test policy rejected: " ++ show err)
                 Right p -> pure p
@@ -519,10 +526,10 @@ tests =
                 oracleCfg = predicateOracle 5000000 "exit 0"
                 config = evaluationConfig True (Just 4000000) Nothing
                 reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
                     threadDelay 30000000
-                    pure candidate
+                    pure (ReductionActionResult candidate Nothing)
             policy <- case metricPolicyForReduction reducerConfig 1 of
                 Left err -> assertFailure ("test policy rejected: " ++ show err)
                 Right p -> pure p
@@ -557,10 +564,10 @@ tests =
                         "sql=$(cat); case \"$sql\" in *SLEEP*) sleep 10;; *) exit 0;; esac"
                 config = evaluationConfig True Nothing Nothing
                 reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
-                action _ pool = do
+                action _ _ pool = do
                     _ <- poolOracle pool candidate
                     _ <- poolOracle pool sleeping
-                    pure sleeping
+                    pure (ReductionActionResult sleeping Nothing)
             policy <- case metricPolicyForReduction reducerConfig 1 of
                 Left err -> assertFailure ("test policy rejected: " ++ show err)
                 Right p -> pure p
@@ -599,6 +606,7 @@ evaluationConfig cacheEnabled wallBudget callBudget =
         , evaluationPreflightAttempts = 0
         , evaluationPreflightResetMicros = Nothing
         , evaluationPreflightOracleMicros = Nothing
+        , evaluationInitialStatements = Nothing
         }
 
 predicateOracle :: Int -> String -> OracleConfig

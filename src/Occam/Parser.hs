@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wno-orphans #-}
-
 module Occam.Parser (
     SQLDialect (..),
     dialectName,
@@ -22,6 +20,7 @@ module Occam.Parser (
     parseSQL,
     parseSQLTimed,
     countStatements,
+    factDumpJson,
 ) where
 
 import Control.Exception (evaluate, finally, mask)
@@ -32,10 +31,7 @@ import Data.Aeson (
     eitherDecodeStrict',
     encode,
     object,
-    withArray,
-    withBool,
     withObject,
-    withText,
     (.!=),
     (.:),
     (.:?),
@@ -46,7 +42,6 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
-import Data.Foldable (toList)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -60,50 +55,33 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
     AlterChange (..),
     AlterTable (..),
-    BarrierReason (..),
     BarrierScope (..),
-    BeginPolicy (..),
     CatalogOp (..),
-    ColumnDef (..),
     ConflictAction (..),
-    Constraint (..),
     ConstraintRef (..),
-    ConstraintValidity (..),
     DataWrite (..),
-    DeleteScope (..),
     DmlEvent (..),
     DropMode (..),
     DropObject (..),
     DropOp (..),
-    ForeignKey (..),
     Ident (..),
     IndexDef (..),
     IndexRef (..),
-    IndexRole (..),
-    IndexSchemaPlacement (..),
-    IndexUniqueness (..),
-    Name (..),
     NameRef (..),
     ObjectRef (..),
-    OnCommitAction (..),
     PartitionLink (..),
     ReadFact (..),
     ReadMode (..),
-    ReferentialAction (..),
     RefreshOp (..),
     RelationKind (..),
     RenameOp (..),
     SchemaDef (..),
     ScopedBarrier (..),
-    SearchPathEntry (..),
-    SearchPathValue (..),
     SemanticFacts (..),
     SequenceDef (..),
     SequenceWrite (..),
     SessionEffect (..),
     SessionInit (..),
-    SessionScope (..),
-    SessionValue (..),
     Span (..),
     Statement (..),
     StatementId (..),
@@ -111,16 +89,14 @@ import Occam.Core (
     TriggerBody (..),
     TriggerDef (..),
     TriggerEffect (..),
-    TriggerEvent (..),
     TriggerRef (..),
-    TriggerTiming (..),
-    TruncateBehavior (..),
-    TruncateIdentity (..),
     TxEffect (..),
     TypeDef (..),
     ViewDef (..),
     WriteKind (..),
+    nameText,
  )
+import Occam.Dependency.Enforcement (cascadeWrites)
 import Occam.Facts (
     ColumnSite (..),
     ColumnSiteKind (..),
@@ -301,15 +277,6 @@ instance FromJSON NativeResponse where
             <*> objectValue .: "units"
             <*> objectValue .:? "columns" .!= []
 
-instance FromJSON ColumnTarget where
-    parseJSON = withObject "ColumnTarget" \objectValue ->
-        ColumnTarget
-            <$> objectValue .: "table"
-            <*> objectValue .: "column"
-            <*> objectValue .: "ordinal"
-            <*> objectValue .: "sites"
-            <*> objectValue .: "blocked"
-
 instance FromJSON NativeUnit where
     parseJSON = withObject "NativeUnit" \objectValue ->
         NativeUnit
@@ -323,607 +290,6 @@ instance FromJSON NativeFacts where
         NativeFacts
             <$> parseJSON (Object objectValue)
             <*> objectValue .: "edits"
-
-instance FromJSON SemanticFacts where
-    parseJSON = withObject "SemanticFacts" \objectValue ->
-        SemanticFacts
-            <$> objectValue .: "ops"
-            <*> objectValue .: "session"
-            <*> objectValue .: "pre_tx"
-            <*> objectValue .: "post_tx"
-            <*> objectValue .: "barriers"
-
-instance FromJSON SearchPathEntry where
-    parseJSON = withObject "SearchPathEntry" \objectValue -> do
-        tag <- objectValue .: "entry"
-        case tag of
-            "name" -> SearchPathName <$> objectValue .: "name"
-            "current_user" -> pure SearchPathCurrentUser
-            _ -> fail ("unknown search path entry: " <> T.unpack tag)
-
-instance FromJSON SearchPathValue where
-    parseJSON = withObject "SearchPathValue" \objectValue -> do
-        tag <- objectValue .: "path"
-        case tag of
-            "explicit" -> SearchPathExplicit <$> objectValue .: "entries"
-            "default" -> pure SearchPathDefault
-            _ -> fail ("unknown search path value: " <> T.unpack tag)
-
-instance FromJSON SessionInit where
-    parseJSON = withObject "SessionInit" \objectValue ->
-        SessionInit
-            <$> objectValue .: "namespace_prefix"
-            <*> objectValue .: "search_path"
-            <*> objectValue .: "current_user"
-            <*> objectValue .: "autocommit"
-            <*> objectValue .: "foreign_key_checks"
-            <*> objectValue .: "variables"
-
-instance FromJSON Ident where
-    parseJSON = withText "Ident" (pure . Ident)
-
-instance ToJSON Ident where
-    toJSON (Ident value) = String value
-
-instance FromJSON Name where
-    parseJSON = withArray "Name" (fmap Name . traverse parseJSON . toList)
-
-instance ToJSON Name where
-    toJSON (Name parts) = toJSON parts
-
-instance FromJSON NameRef where
-    parseJSON = withObject "NameRef" \objectValue ->
-        NameRef
-            <$> objectValue .: "name"
-            <*> objectValue .: "temp"
-
-instance FromJSON ReadMode where
-    parseJSON = withText "ReadMode" \name ->
-        case name of
-            "data" -> pure ReadData
-            "schema" -> pure ReadSchema
-            _ -> fail ("unknown read mode: " <> T.unpack name)
-
-instance FromJSON ReadFact where
-    parseJSON = withObject "ReadFact" \objectValue ->
-        ReadFact
-            <$> objectValue .: "source"
-            <*> objectValue .: "mode"
-            <*> objectValue .: "columns"
-            <*> objectValue .: "only"
-
-instance FromJSON RelationKind where
-    parseJSON = withText "RelationKind" \name ->
-        case name of
-            "table" -> pure TableRelation
-            "view" -> pure ViewRelation
-            "materialized_view" -> pure MaterializedViewRelation
-            _ -> fail ("unknown relation kind: " <> T.unpack name)
-
-instance FromJSON ReferentialAction where
-    parseJSON = withText "ReferentialAction" \name ->
-        case name of
-            "no_action" -> pure NoAction
-            "restrict" -> pure Restrict
-            "cascade" -> pure Cascade
-            "set_null" -> pure SetNull
-            "set_default" -> pure SetDefault
-            _ -> fail ("unknown referential action: " <> T.unpack name)
-
-instance FromJSON OnCommitAction where
-    parseJSON = withText "OnCommitAction" \name ->
-        case name of
-            "delete_rows" -> pure OnCommitDeleteRows
-            "drop" -> pure OnCommitDrop
-            _ -> fail ("unknown ON COMMIT action: " <> T.unpack name)
-
-instance FromJSON ConstraintValidity where
-    parseJSON = withBool "ConstraintValidity" \valid ->
-        pure (if valid then ConstraintValid else ConstraintNotValid)
-
-instance FromJSON IndexUniqueness where
-    parseJSON = withBool "IndexUniqueness" \unique ->
-        pure (if unique then IndexUnique else IndexNonUnique)
-
-instance FromJSON IndexRole where
-    parseJSON = withBool "IndexRole" \primary ->
-        pure (if primary then PrimaryIndex else SecondaryIndex)
-
-instance FromJSON DeleteScope where
-    parseJSON = withBool "DeleteScope" \allRows ->
-        pure (if allRows then DeleteAllRows else DeleteFilteredRows)
-
-instance FromJSON TruncateBehavior where
-    parseJSON = withBool "TruncateBehavior" \cascade ->
-        pure (if cascade then TruncateCascade else TruncateRestrict)
-
-instance FromJSON TruncateIdentity where
-    parseJSON = withBool "TruncateIdentity" \restart ->
-        pure (if restart then RestartIdentity else ContinueIdentity)
-
-instance FromJSON ColumnDef where
-    parseJSON = withObject "ColumnDef" \objectValue ->
-        ColumnDef
-            <$> objectValue .: "name"
-            <*> objectValue .: "not_null"
-            <*> objectValue .: "has_default"
-            <*> objectValue .: "generated"
-            <*> objectValue .: "references"
-
-instance FromJSON ForeignKey where
-    parseJSON = withObject "ForeignKey" \objectValue ->
-        ForeignKey
-            <$> objectValue .: "name"
-            <*> objectValue .: "child_columns"
-            <*> objectValue .: "parent"
-            <*> objectValue .: "parent_columns"
-            <*> objectValue .: "on_delete"
-            <*> objectValue .: "on_update"
-            <*> objectValue .: "not_valid"
-            <*> objectValue .: "deferrable"
-
-instance FromJSON Constraint where
-    parseJSON = withObject "Constraint" \objectValue -> do
-        tag <- objectValue .: "constraint"
-        case tag of
-            "primary_key" ->
-                PrimaryKeyConstraint
-                    <$> objectValue .: "name"
-                    <*> objectValue .: "columns"
-            "unique" ->
-                UniqueConstraint
-                    <$> objectValue .: "name"
-                    <*> objectValue .: "columns"
-            "foreign_key" -> ForeignKeyConstraint <$> parseJSON (Object objectValue)
-            "check" ->
-                CheckConstraint
-                    <$> objectValue .: "name"
-                    <*> objectValue .: "columns"
-                    <*> objectValue .: "not_valid"
-            "index" ->
-                IndexConstraint
-                    <$> objectValue .: "name"
-                    <*> objectValue .: "columns"
-                    <*> objectValue .: "unique"
-            "using_index" ->
-                UsingIndexConstraint
-                    <$> objectValue .: "name"
-                    <*> objectValue .: "index"
-                    <*> objectValue .: "primary"
-                    <*> objectValue .: "schema_placement"
-            "other" -> OtherConstraint <$> objectValue .: "name"
-            _ -> fail ("unknown constraint kind: " <> T.unpack tag)
-
-instance FromJSON TableDef where
-    parseJSON = withObject "TableDef" \objectValue ->
-        TableDef
-            <$> objectValue .: "name"
-            <*> objectValue .: "temporary"
-            <*> objectValue .: "transactional"
-            <*> objectValue .: "columns"
-            <*> objectValue .: "constraints"
-            <*> objectValue .: "sources"
-            <*> objectValue .: "like"
-            <*> objectValue .: "partition_parent"
-            <*> objectValue .: "inherit_parents"
-            <*> objectValue .: "on_commit"
-            <*> objectValue .: "if_not_exists"
-            <*> objectValue .: "or_replace"
-
-instance FromJSON ViewDef where
-    parseJSON = withObject "ViewDef" \objectValue ->
-        ViewDef
-            <$> objectValue .: "name"
-            <*> objectValue .: "temporary"
-            <*> objectValue .: "materialized"
-            <*> objectValue .: "columns"
-            <*> objectValue .: "sources"
-            <*> objectValue .: "if_not_exists"
-            <*> objectValue .: "or_replace"
-
-instance FromJSON IndexRef where
-    parseJSON = withObject "IndexRef" \objectValue -> do
-        tag <- objectValue .: "scope"
-        case tag of
-            "named" -> NamedIndex <$> objectValue .: "name"
-            "table" -> TableIndex <$> objectValue .: "table" <*> objectValue .: "name"
-            _ -> fail ("unknown index scope: " <> T.unpack tag)
-
-instance FromJSON IndexDef where
-    parseJSON = withObject "IndexDef" \objectValue ->
-        IndexDef
-            <$> objectValue .: "index"
-            <*> objectValue .: "table"
-            <*> objectValue .: "columns"
-            <*> objectValue .: "unique"
-            <*> objectValue .: "predicate"
-            <*> objectValue .: "expression"
-            <*> objectValue .: "if_not_exists"
-            <*> objectValue .: "schema_placement"
-
-instance FromJSON IndexSchemaPlacement where
-    parseJSON = withText "IndexSchemaPlacement" \name ->
-        case name of
-            "table_schema" -> pure IndexTableSchema
-            "current_schema" -> pure IndexCurrentSchema
-            _ -> fail ("unknown index schema placement: " <> T.unpack name)
-
-instance FromJSON TriggerRef where
-    parseJSON = withObject "TriggerRef" \objectValue -> do
-        tag <- objectValue .: "scope"
-        case tag of
-            "named" -> NamedTrigger <$> objectValue .: "name"
-            "table" -> TableTrigger <$> objectValue .: "table" <*> objectValue .: "name"
-            _ -> fail ("unknown trigger scope: " <> T.unpack tag)
-
-instance FromJSON ConstraintRef where
-    parseJSON = withObject "ConstraintRef" \objectValue ->
-        ConstraintRef
-            <$> objectValue .: "table"
-            <*> objectValue .: "name"
-
-instance FromJSON TriggerTiming where
-    parseJSON = withText "TriggerTiming" \name ->
-        case name of
-            "before" -> pure TriggerBefore
-            "after" -> pure TriggerAfter
-            "instead_of" -> pure TriggerInsteadOf
-            _ -> fail ("unknown trigger timing: " <> T.unpack name)
-
-instance FromJSON TriggerEvent where
-    parseJSON = withObject "TriggerEvent" \objectValue -> do
-        tag <- objectValue .: "event"
-        case tag of
-            "insert" -> pure TriggerInsert
-            "update" -> TriggerUpdate <$> objectValue .: "columns"
-            "delete" -> pure TriggerDelete
-            "truncate" -> pure TriggerTruncate
-            _ -> fail ("unknown trigger event: " <> T.unpack tag)
-
-instance FromJSON TriggerBody where
-    parseJSON = withObject "TriggerBody" \objectValue -> do
-        tag <- objectValue .: "body"
-        case tag of
-            "inline" -> TriggerInline <$> objectValue .: "effects"
-            "function" -> TriggerFunction <$> objectValue .: "name" <*> objectValue .: "args"
-            "opaque" -> pure TriggerOpaque
-            _ -> fail ("unknown trigger body: " <> T.unpack tag)
-
-instance FromJSON TriggerEffect where
-    parseJSON = withObject "TriggerEffect" \objectValue -> do
-        tag <- objectValue .: "kind"
-        case tag of
-            "dml" -> TriggerDml <$> objectValue .: "event"
-            "read" -> TriggerRead <$> objectValue .: "read"
-            "write_sequence" -> TriggerWriteSequence <$> objectValue .: "write"
-            "session" -> TriggerSession <$> objectValue .: "effect"
-            "barrier" -> TriggerBarrier <$> objectValue .: "barrier"
-            _ -> fail ("unknown trigger effect: " <> T.unpack tag)
-
-instance FromJSON DmlEvent where
-    parseJSON = withObject "DmlEvent" \objectValue -> do
-        tag <- objectValue .: "event"
-        case tag of
-            "insert" -> DmlInsert <$> objectValue .: "target" <*> objectValue .: "columns"
-            "update" -> DmlUpdate <$> objectValue .: "target" <*> objectValue .: "columns"
-            "merge" -> DmlMerge <$> objectValue .: "target" <*> objectValue .: "columns"
-            "delete" -> DmlDelete <$> objectValue .: "target" <*> objectValue .: "all"
-            "truncate" -> DmlTruncate <$> objectValue .: "target" <*> objectValue .: "cascade"
-            _ -> fail ("unknown DML event: " <> T.unpack tag)
-
-instance FromJSON TriggerDef where
-    parseJSON = withObject "TriggerDef" \objectValue ->
-        TriggerDef
-            <$> objectValue .: "trigger"
-            <*> objectValue .: "table"
-            <*> objectValue .: "timing"
-            <*> objectValue .: "events"
-            <*> objectValue .: "for_each_row"
-            <*> objectValue .: "when_reads"
-            <*> objectValue .: "body"
-            <*> objectValue .: "referenced_table"
-            <*> objectValue .: "temporary"
-            <*> objectValue .: "if_not_exists"
-            <*> objectValue .: "or_replace"
-
-instance FromJSON SequenceDef where
-    parseJSON = withObject "SequenceDef" \objectValue ->
-        SequenceDef
-            <$> objectValue .: "name"
-            <*> objectValue .: "temporary"
-            <*> objectValue .: "transactional"
-
-instance FromJSON TypeDef where
-    parseJSON = withObject "TypeDef" \objectValue -> TypeDef <$> objectValue .: "name"
-
-instance FromJSON SchemaDef where
-    parseJSON = withObject "SchemaDef" \objectValue -> SchemaDef <$> objectValue .: "name"
-
-instance FromJSON ConflictAction where
-    parseJSON = withText "ConflictAction" \name ->
-        case name of
-            "error" -> pure ConflictError
-            "ignore" -> pure ConflictIgnore
-            "replace" -> pure ConflictReplace
-            "update" -> pure ConflictUpdate
-            _ -> fail ("unknown conflict action: " <> T.unpack name)
-
-instance FromJSON WriteKind where
-    parseJSON = withObject "WriteKind" \objectValue -> do
-        tag <- objectValue .: "kind"
-        case tag of
-            "insert" -> InsertWrite <$> objectValue .: "conflict"
-            "update" -> pure UpdateWrite
-            "delete" -> DeleteWrite <$> objectValue .: "all"
-            "merge" -> pure MergeWrite
-            "truncate" ->
-                TruncateWrite
-                    <$> objectValue .: "cascade"
-                    <*> objectValue .: "restart_identity"
-            _ -> fail ("unknown write kind: " <> T.unpack tag)
-
-instance FromJSON DataWrite where
-    parseJSON = withObject "DataWrite" \objectValue ->
-        DataWrite
-            <$> objectValue .: "target"
-            <*> objectValue .: "kind"
-            <*> objectValue .: "columns"
-            <*> objectValue .: "unqualified_columns"
-            <*> objectValue .: "reads"
-            <*> objectValue .: "only"
-
-instance FromJSON SequenceWrite where
-    parseJSON = withObject "SequenceWrite" \objectValue ->
-        SequenceWrite
-            <$> objectValue .: "sequence"
-            <*> objectValue .: "transactional"
-
-instance FromJSON AlterChange where
-    parseJSON = withObject "AlterChange" \objectValue -> do
-        tag <- objectValue .: "change"
-        case tag of
-            "add_column" ->
-                AddColumn
-                    <$> objectValue .: "column"
-                    <*> objectValue .: "constraints"
-            "drop_column" -> DropColumn <$> objectValue .: "column" <*> objectValue .: "cascade"
-            "add_constraint" -> AddConstraint <$> objectValue .: "constraint"
-            "drop_constraint" -> DropConstraint <$> objectValue .: "name" <*> objectValue .: "cascade"
-            "rename_constraint" -> RenameConstraint <$> objectValue .: "from" <*> objectValue .: "to"
-            "validate_constraint" -> ValidateConstraint <$> objectValue .: "name"
-            "drop_index" -> DropIndexChange <$> objectValue .: "name"
-            "alter_column" ->
-                AlterColumn
-                    <$> objectValue .: "column"
-                    <*> objectValue .: "detail"
-                    <*> objectValue .: "referenced"
-                    <*> objectValue .: "repositions"
-            "other" -> OtherChange <$> objectValue .: "detail"
-            _ -> fail ("unknown ALTER TABLE change: " <> T.unpack tag)
-
-instance FromJSON AlterTable where
-    parseJSON = withObject "AlterTable" \objectValue ->
-        AlterTable
-            <$> objectValue .: "table"
-            <*> objectValue .: "changes"
-
-instance FromJSON PartitionLink where
-    parseJSON = withObject "PartitionLink" \objectValue ->
-        PartitionLink
-            <$> objectValue .: "parent"
-            <*> objectValue .: "child"
-
-instance FromJSON DropMode where
-    parseJSON = withText "DropMode" \name ->
-        case name of
-            "restrict" -> pure DropRestrict
-            "cascade" -> pure DropCascade
-            _ -> fail ("unknown drop mode: " <> T.unpack name)
-
-instance FromJSON DropObject where
-    parseJSON = withObject "DropObject" \objectValue -> do
-        tag <- objectValue .: "object"
-        case tag of
-            "relation" -> DropRelation <$> objectValue .: "name" <*> objectValue .: "kind"
-            "index" -> DropIndex <$> objectValue .: "index"
-            "trigger" -> DropTrigger <$> objectValue .: "trigger"
-            "sequence" -> DropSequence <$> objectValue .: "name"
-            "type" -> DropType <$> objectValue .: "name"
-            "schema" -> DropSchema <$> objectValue .: "name"
-            _ -> fail ("unknown drop object: " <> T.unpack tag)
-
-instance FromJSON DropOp where
-    parseJSON = withObject "DropOp" \objectValue ->
-        DropOp
-            <$> objectValue .: "objects"
-            <*> objectValue .: "mode"
-
-instance FromJSON RenameOp where
-    parseJSON = withObject "RenameOp" \objectValue -> do
-        tag <- objectValue .: "rename"
-        case tag of
-            "relation" ->
-                RenameRelation
-                    <$> objectValue .: "from"
-                    <*> objectValue .: "to"
-                    <*> objectValue .: "index_schema_placement"
-            "column" ->
-                RenameColumnOp
-                    <$> objectValue .: "table"
-                    <*> objectValue .: "from"
-                    <*> objectValue .: "to"
-            _ -> fail ("unknown rename kind: " <> T.unpack tag)
-
-instance FromJSON RefreshOp where
-    parseJSON = withObject "RefreshOp" \objectValue ->
-        RefreshOp <$> objectValue .: "target" <*> objectValue .: "source_mode"
-
-instance FromJSON CatalogOp where
-    parseJSON = withObject "CatalogOp" \objectValue -> do
-        tag <- objectValue .: "op"
-        case tag of
-            "define_table" -> DefineTableOp <$> parseJSON (Object objectValue)
-            "define_view" -> DefineViewOp <$> parseJSON (Object objectValue)
-            "define_index" -> DefineIndexOp <$> parseJSON (Object objectValue)
-            "define_trigger" -> DefineTriggerOp <$> parseJSON (Object objectValue)
-            "define_sequence" -> DefineSequenceOp <$> parseJSON (Object objectValue)
-            "define_type" -> DefineTypeOp <$> parseJSON (Object objectValue)
-            "define_schema" -> DefineSchemaOp <$> parseJSON (Object objectValue)
-            "read" -> ReadOp <$> parseJSON (Object objectValue)
-            "write_data" -> WriteDataOp <$> parseJSON (Object objectValue)
-            "write_sequence" -> WriteSequenceOp <$> parseJSON (Object objectValue)
-            "alter_table" -> AlterTableOp <$> parseJSON (Object objectValue)
-            "attach_partition" -> AttachPartitionOp <$> parseJSON (Object objectValue)
-            "detach_partition" -> DetachPartitionOp <$> parseJSON (Object objectValue)
-            "attach_inherit" -> AttachInheritOp <$> parseJSON (Object objectValue)
-            "detach_inherit" -> DetachInheritOp <$> parseJSON (Object objectValue)
-            "drop" -> DropCatalogOp <$> parseJSON (Object objectValue)
-            "rename" -> RenameOp <$> parseJSON (Object objectValue)
-            "refresh" -> RefreshCatalogOp <$> parseJSON (Object objectValue)
-            _ -> fail ("unknown catalog operation: " <> T.unpack tag)
-
-instance FromJSON SessionScope where
-    parseJSON = withText "SessionScope" \name ->
-        case name of
-            "session" -> pure ScopeSession
-            "transaction" -> pure ScopeTransaction
-            "local" -> pure ScopeLocal
-            "global" -> pure ScopeGlobal
-            _ -> fail ("unknown session scope: " <> T.unpack name)
-
-instance FromJSON SessionValue where
-    parseJSON = withObject "SessionValue" \objectValue -> do
-        tag <- objectValue .: "kind"
-        case tag of
-            "text" -> SessionText <$> objectValue .: "value"
-            "bool" -> SessionBool <$> objectValue .: "value"
-            "integer" -> SessionInteger <$> objectValue .: "value"
-            "names" -> SessionNames <$> objectValue .: "value"
-            "default" -> pure SessionDefault
-            _ -> fail ("unknown session value: " <> T.unpack tag)
-
-instance FromJSON SessionEffect where
-    parseJSON = withObject "SessionEffect" \objectValue -> do
-        tag <- objectValue .: "effect"
-        case tag of
-            "set_variable" ->
-                SetVariable
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "name"
-                    <*> objectValue .: "value"
-            "set_search_path" ->
-                SetSearchPath
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "path"
-            "set_namespace" ->
-                SetNamespace
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "namespace"
-            "set_session_user" ->
-                SetSessionUser
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "user"
-            "reset_session_user" -> ResetSessionUser <$> objectValue .: "scope"
-            "set_current_user" ->
-                SetCurrentUser
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "user"
-            "reset_current_user" -> ResetCurrentUser <$> objectValue .: "scope"
-            "set_autocommit" ->
-                SetAutocommit
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "value"
-            "set_foreign_key_checks" ->
-                SetForeignKeyChecks
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "value"
-            "reset_foreign_key_checks" ->
-                ResetForeignKeyChecks <$> objectValue .: "scope"
-            "reset_variable" ->
-                ResetVariable
-                    <$> objectValue .: "scope"
-                    <*> objectValue .: "name"
-            "reset_all" -> ResetAll <$> objectValue .: "scope"
-            _ -> fail ("unknown session effect: " <> T.unpack tag)
-
-instance FromJSON BeginPolicy where
-    parseJSON = withText "BeginPolicy" \name ->
-        case name of
-            "error" -> pure BeginError
-            "warn" -> pure BeginWarn
-            "commit_active" -> pure BeginCommitActive
-            "ignore" -> pure BeginIgnore
-            _ -> fail ("unknown BEGIN policy: " <> T.unpack name)
-
-instance FromJSON TxEffect where
-    parseJSON = withObject "TxEffect" \objectValue -> do
-        tag <- objectValue .: "effect"
-        case tag of
-            "begin" -> TxBegin <$> objectValue .: "if_active"
-            "commit" -> TxCommit <$> objectValue .: "chain"
-            "rollback_all" -> pure TxRollbackAll
-            "rollback_to" -> TxRollbackTo <$> objectValue .: "savepoint"
-            "savepoint" -> TxSavepoint <$> objectValue .: "name"
-            "release_savepoint" -> TxReleaseSavepoint <$> objectValue .: "name"
-            "set_read_only" -> TxSetReadOnly <$> objectValue .: "value"
-            _ -> fail ("unknown transaction effect: " <> T.unpack tag)
-
-instance FromJSON BarrierReason where
-    parseJSON = withText "BarrierReason" \name ->
-        case name of
-            "syntax_error" -> pure SyntaxErrorBarrier
-            "unknown_statement" -> pure UnknownStatementBarrier
-            "unknown_relation" -> pure UnknownRelationBarrier
-            "unknown_ddl" -> pure UnknownDDLBarrier
-            "unknown_dml" -> pure UnknownDMLBarrier
-            "unknown_drop" -> pure UnknownDropBarrier
-            "unknown_alter" -> pure UnknownAlterBarrier
-            "unknown_view" -> pure UnknownViewBarrier
-            "unknown_index" -> pure UnknownIndexBarrier
-            "unknown_trigger" -> pure UnknownTriggerBarrier
-            "unknown_truncate" -> pure UnknownTruncateBarrier
-            "unknown_session_effect" -> pure UnknownSessionEffectBarrier
-            "unsupported_expression" -> pure UnsupportedExpressionBarrier
-            "unsupported_conflict_clause" -> pure UnsupportedConflictClauseBarrier
-            "unsupported_trigger_body" -> pure UnsupportedTriggerBodyBarrier
-            "unsupported_transaction" -> pure UnsupportedTransactionBarrier
-            "unresolved_view_source" -> pure UnresolvedViewSourceBarrier
-            "write_through_view" -> pure WriteThroughViewBarrier
-            "opaque_trigger_body" -> pure OpaqueTriggerBodyBarrier
-            "unmodeled_relation_source" -> pure UnmodeledRelationSourceBarrier
-            _ -> fail ("unknown barrier reason: " <> T.unpack name)
-
-instance FromJSON ObjectRef where
-    parseJSON = withObject "ObjectRef" \objectValue -> do
-        tag <- objectValue .: "object"
-        case tag of
-            "relation" -> ObjectRelation <$> objectValue .: "relation"
-            "index" -> ObjectIndex <$> objectValue .: "index"
-            "trigger" -> ObjectTrigger <$> objectValue .: "trigger"
-            "sequence" -> ObjectSequence <$> objectValue .: "sequence"
-            "type" -> ObjectType <$> objectValue .: "name"
-            "schema" -> ObjectSchema <$> objectValue .: "name"
-            "constraint" -> ObjectConstraint <$> objectValue .: "constraint"
-            _ -> fail ("unknown object reference: " <> T.unpack tag)
-
-instance FromJSON BarrierScope where
-    parseJSON = withObject "BarrierScope" \objectValue -> do
-        tag <- objectValue .: "scope"
-        case tag of
-            "global" -> pure GlobalScope
-            "relation" -> RelationScope <$> objectValue .: "relation"
-            "schema" -> SchemaScope <$> objectValue .: "schema"
-            "object" -> ObjectScope <$> objectValue .: "object"
-            "session_state" -> pure SessionStateScope
-            "transaction_state" -> pure TransactionStateScope
-            _ -> fail ("unknown barrier scope: " <> T.unpack tag)
-
-instance FromJSON ScopedBarrier where
-    parseJSON = withObject "ScopedBarrier" \objectValue ->
-        ScopedBarrier
-            <$> objectValue .: "scope"
-            <*> objectValue .: "reason"
-            <*> objectValue .: "detail"
 
 foreign import ccall safe "occam_sql_parse"
     c_parseSQL :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt
@@ -1175,3 +541,273 @@ forceParsed :: Either ParserError ParsedSQL -> Either ParserError ParsedSQL
 forceParsed (Left err) = err `seq` Left err
 forceParsed (Right parsed) =
     length (parsedUnits parsed) `seq` length (parsedColumns parsed) `seq` Right parsed
+
+-- ----------------------------------------------------------------------------
+-- Fact dump (hidden --dump-facts CLI)
+-- ----------------------------------------------------------------------------
+
+factDumpJson :: SQLDialect -> ParsedSQL -> Value
+factDumpJson dialect parsed =
+    object
+        [ "dialect" .= dialectName dialect
+        , "statements" .= zipWith (statementFactsJson extras) [0 :: Int ..] (parsedUnits parsed)
+        ]
+    where
+        extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
+
+statementFactsJson :: Map StatementId [DataWrite] -> Int -> StatementUnit -> Value
+statementFactsJson extras idx unit =
+    object
+        [ "index" .= idx
+        , "start" .= startByte
+        , "end" .= endByte
+        , "parse_error" .= unitParseError unit
+        , "reads" .= readsJson
+        , "writes" .= writesJson
+        , "ddl" .= ddlJson
+        , "barriers" .= map barrierJson (factBarriers semantics)
+        , "session" .= map sessionEffectName (factSession semantics)
+        , "pre_tx" .= map txEffectName (factPreTx semantics)
+        , "post_tx" .= map txEffectName (factPostTx semantics)
+        , "trigger_effects" .= triggerEffectsJson ops
+        ]
+    where
+        Span startByte endByte = stmtSpan (unitStatement unit)
+        semantics = maybe (SemanticFacts [] [] [] [] []) factSemantics (unitFacts unit)
+        ops = factOps semantics
+        cascadeExtras = Map.findWithDefault [] (stmtId (unitStatement unit)) extras
+        readsJson = map readFactJson (concatMap opReads ops)
+        writesJson = concatMap opWrites ops ++ map dataWriteJson cascadeExtras
+        ddlJson = concatMap opDdl ops
+
+{- | Reads evaluated when the statement itself runs: direct reads, DML source
+reads, and CTAS/view definition sources. Trigger WHEN-clause reads fire
+with the trigger, so they are reported under @trigger_effects@ instead.
+-}
+opReads :: CatalogOp -> [ReadFact]
+opReads (ReadOp r) = [r]
+opReads (WriteDataOp w) = dataWriteReads w
+opReads (DefineTableOp t) = tableSources t
+opReads (DefineViewOp v) = viewSources v
+opReads _ = []
+
+opWrites :: CatalogOp -> [Value]
+opWrites (WriteDataOp w) = [dataWriteJson w]
+opWrites (RefreshCatalogOp r) =
+    [ object
+        [ "target" .= nameText (nameRefName (refreshTarget r))
+        , "kind" .= ("refresh" :: T.Text)
+        , "columns" .= ([] :: [T.Text])
+        , "unqualified_columns" .= ([] :: [T.Text])
+        ]
+    ]
+opWrites _ = []
+
+opDdl :: CatalogOp -> [Value]
+opDdl (DefineTableOp t) = [ddlOpJson "create-table" (nameText (tableName t))]
+opDdl (DefineViewOp v) =
+    [ ddlOpJson
+        (if viewMaterialized v then "create-materialized-view" else "create-view")
+        (nameText (viewName v))
+    ]
+opDdl (DefineIndexOp i) =
+    [ object
+        [ "op" .= ("create-index" :: T.Text)
+        , "target" .= nameText (nameRefName (indexTable i))
+        , "name" .= indexRefName (indexRef i)
+        ]
+    ]
+opDdl (DefineTriggerOp t) =
+    [ object
+        [ "op" .= ("create-trigger" :: T.Text)
+        , "target" .= nameText (nameRefName (triggerTable t))
+        , "name" .= triggerRefName (triggerRef t)
+        ]
+    ]
+opDdl (DefineSequenceOp s) = [ddlOpJson "create-sequence" (nameText (sequenceName s))]
+opDdl (DefineTypeOp t) = [ddlOpJson "create-type" (nameText (typeName t))]
+opDdl (DefineSchemaOp s) = [ddlOpJson "create-schema" (nameText (schemaName s))]
+opDdl (AlterTableOp a) =
+    [ object
+        [ "op" .= ("alter-table" :: T.Text)
+        , "target" .= nameText (nameRefName (alterTableTarget a))
+        , "changes" .= map alterChangeName (alterTableChanges a)
+        ]
+    ]
+opDdl (AttachPartitionOp l) = [ddlOpJson "attach-partition" (nameText (nameRefName (linkChild l)))]
+opDdl (DetachPartitionOp l) = [ddlOpJson "detach-partition" (nameText (nameRefName (linkChild l)))]
+opDdl (DropCatalogOp d) = map (dropObjectJson (dropMode d)) (dropObjects d)
+opDdl (RenameOp r) = [renameJson r]
+opDdl (WriteSequenceOp s) = [ddlOpJson "sequence-write" (nameText (nameRefName (sequenceWriteTarget s)))]
+opDdl _ = []
+
+ddlOpJson :: T.Text -> T.Text -> Value
+ddlOpJson op target = object ["op" .= op, "target" .= target]
+
+readFactJson :: ReadFact -> Value
+readFactJson r =
+    object
+        [ "table" .= nameText (nameRefName (readSource r))
+        , "temp" .= nameRefTemp (readSource r)
+        , "columns" .= map identText (readColumns r)
+        , "mode" .= (case readMode r of ReadData -> ("data" :: T.Text); ReadSchema -> "schema")
+        ]
+
+dataWriteJson :: DataWrite -> Value
+dataWriteJson w =
+    object
+        [ "target" .= nameText (nameRefName (dataWriteTarget w))
+        , "kind" .= writeKindName (dataWriteKind w)
+        , "columns" .= map identText (dataWriteColumns w)
+        , "unqualified_columns" .= map identText (dataWriteUnqualifiedColumns w)
+        ]
+
+writeKindName :: WriteKind -> T.Text
+writeKindName (InsertWrite ConflictError) = "insert"
+writeKindName (InsertWrite ConflictIgnore) = "insert-or-ignore"
+writeKindName (InsertWrite ConflictReplace) = "insert-or-replace"
+writeKindName (InsertWrite ConflictUpdate) = "insert-or-update"
+writeKindName UpdateWrite = "update"
+writeKindName (DeleteWrite _) = "delete"
+writeKindName MergeWrite = "merge"
+writeKindName (TruncateWrite _ _) = "truncate"
+
+alterChangeName :: AlterChange -> T.Text
+alterChangeName (AddColumn _ _) = "add-column"
+alterChangeName (DropColumn _ _) = "drop-column"
+alterChangeName (AddConstraint _) = "add-constraint"
+alterChangeName (DropConstraint _ _) = "drop-constraint"
+alterChangeName (RenameConstraint _ _) = "rename-constraint"
+alterChangeName (ValidateConstraint _) = "validate-constraint"
+alterChangeName (DropIndexChange _) = "drop-index"
+alterChangeName (AlterColumn {}) = "alter-column"
+alterChangeName (OtherChange detail) = "other:" <> detail
+
+dropObjectJson :: DropMode -> DropObject -> Value
+dropObjectJson mode obj =
+    object
+        [ "op" .= opName
+        , "target" .= target
+        , "mode" .= (if mode == DropCascade then ("cascade" :: T.Text) else "restrict")
+        ]
+    where
+        (opName, target) = case obj of
+            DropRelation r kind -> (relKindName kind, nameText (nameRefName r))
+            DropIndex i -> ("drop-index" :: T.Text, indexRefName i)
+            DropTrigger t -> ("drop-trigger", triggerRefName t)
+            DropSequence s -> ("drop-sequence", nameText (nameRefName s))
+            DropType t -> ("drop-type", nameText t)
+            DropSchema s -> ("drop-schema", nameText s)
+        relKindName TableRelation = "drop-table"
+        relKindName ViewRelation = "drop-view"
+        relKindName MaterializedViewRelation = "drop-materialized-view"
+
+renameJson :: RenameOp -> Value
+renameJson (RenameRelation old new _) =
+    object
+        [ "op" .= ("rename-relation" :: T.Text)
+        , "target" .= nameText (nameRefName old)
+        , "name" .= nameText new
+        ]
+renameJson (RenameColumnOp t old new) =
+    object
+        [ "op" .= ("rename-column" :: T.Text)
+        , "target" .= nameText (nameRefName t)
+        , "name" .= identText new
+        , "detail" .= identText old
+        ]
+
+indexRefName :: IndexRef -> T.Text
+indexRefName (NamedIndex n) = nameText n
+indexRefName (TableIndex t i) = nameText (nameRefName t) <> "." <> identText i
+
+triggerRefName :: TriggerRef -> T.Text
+triggerRefName (NamedTrigger n) = nameText n
+triggerRefName (TableTrigger t i) = nameText (nameRefName t) <> "." <> identText i
+
+barrierJson :: ScopedBarrier -> Value
+barrierJson b =
+    object
+        [ "scope" .= barrierScopeName (barrierScope b)
+        , "reason" .= T.pack (show (barrierReason b))
+        , "detail" .= barrierDetail b
+        ]
+
+barrierScopeName :: BarrierScope -> T.Text
+barrierScopeName GlobalScope = "global"
+barrierScopeName (RelationScope r) = "relation:" <> nameText (nameRefName r)
+barrierScopeName (SchemaScope n) = "schema:" <> nameText n
+barrierScopeName (ObjectScope o) = "object:" <> objectRefName o
+barrierScopeName SessionStateScope = "session"
+barrierScopeName TransactionStateScope = "transaction"
+
+objectRefName :: ObjectRef -> T.Text
+objectRefName (ObjectRelation r) = "relation:" <> nameText (nameRefName r)
+objectRefName (ObjectIndex i) = "index:" <> indexRefName i
+objectRefName (ObjectTrigger t) = "trigger:" <> triggerRefName t
+objectRefName (ObjectSequence s) = "sequence:" <> nameText (nameRefName s)
+objectRefName (ObjectType t) = "type:" <> nameText t
+objectRefName (ObjectSchema s) = "schema:" <> nameText s
+objectRefName (ObjectConstraint (ConstraintRef t n)) = "constraint:" <> nameText (nameRefName t) <> "." <> identText n
+
+sessionEffectName :: SessionEffect -> T.Text
+sessionEffectName SetVariable {} = "SetVariable"
+sessionEffectName (SetSearchPath _ _) = "SetSearchPath"
+sessionEffectName (SetNamespace _ _) = "SetNamespace"
+sessionEffectName (SetSessionUser _ _) = "SetSessionUser"
+sessionEffectName (ResetSessionUser _) = "ResetSessionUser"
+sessionEffectName (SetCurrentUser _ _) = "SetCurrentUser"
+sessionEffectName (ResetCurrentUser _) = "ResetCurrentUser"
+sessionEffectName (SetAutocommit _ _) = "SetAutocommit"
+sessionEffectName (SetForeignKeyChecks _ _) = "SetForeignKeyChecks"
+sessionEffectName (ResetForeignKeyChecks _) = "ResetForeignKeyChecks"
+sessionEffectName (ResetVariable _ _) = "ResetVariable"
+sessionEffectName (ResetAll _) = "ResetAll"
+
+txEffectName :: TxEffect -> T.Text
+txEffectName (TxBegin _) = "TxBegin"
+txEffectName (TxCommit _) = "TxCommit"
+txEffectName TxRollbackAll = "TxRollbackAll"
+txEffectName (TxRollbackTo _) = "TxRollbackTo"
+txEffectName (TxSavepoint _) = "TxSavepoint"
+txEffectName (TxReleaseSavepoint _) = "TxReleaseSavepoint"
+txEffectName (TxSetReadOnly _) = "TxSetReadOnly"
+
+{- | Trigger body and WHEN-clause effects fire when the trigger fires, not at
+CREATE time, so they are reported separately from the statement's own reads.
+-}
+triggerEffectsJson :: [CatalogOp] -> Value
+triggerEffectsJson ops =
+    object ["reads" .= readsJson, "writes" .= writesJson, "other" .= otherJson]
+    where
+        effects = concatMap triggerBodyEffects ops
+        whenReads = concatMap triggerWhenOf ops
+        readsJson = map readFactJson (whenReads ++ [r | TriggerRead r <- effects])
+        writesJson = [dmlEventJson e | TriggerDml e <- effects]
+        otherJson =
+            [T.pack (show b) | TriggerBarrier b <- effects]
+                ++ [sessionEffectName s | TriggerSession s <- effects]
+                ++ ["sequence-write" :: T.Text | TriggerWriteSequence _ <- effects]
+
+triggerWhenOf :: CatalogOp -> [ReadFact]
+triggerWhenOf (DefineTriggerOp t) = triggerWhenReads t
+triggerWhenOf _ = []
+
+triggerBodyEffects :: CatalogOp -> [TriggerEffect]
+triggerBodyEffects (DefineTriggerOp t) = case triggerBody t of
+    TriggerInline effs -> effs
+    TriggerFunction _ _ -> []
+    TriggerOpaque -> []
+triggerBodyEffects _ = []
+
+dmlEventJson :: DmlEvent -> Value
+dmlEventJson event = case event of
+    DmlInsert t cols -> trigWrite "insert" t cols
+    DmlUpdate t cols -> trigWrite "update" t cols
+    DmlMerge t cols -> trigWrite "merge" t cols
+    DmlDelete t _ -> trigWrite "delete" t []
+    DmlTruncate t _ -> trigWrite "truncate" t []
+    where
+        trigWrite kind t cols =
+            object
+                ["target" .= nameText (nameRefName t), "kind" .= (kind :: T.Text), "columns" .= map identText cols]

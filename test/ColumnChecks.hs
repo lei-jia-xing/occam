@@ -105,6 +105,7 @@ testPoolWith predicate =
             , poolExecute = predicateDetails predicate
             , poolBill = const (pure ())
             , poolRetire = \_ _ _ _ -> pure ()
+            , poolReportCount = Nothing
             }
 
 reduceWith :: ColumnMode -> OraclePool -> ByteString -> IO ByteString
