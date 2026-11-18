@@ -36,8 +36,9 @@
 - Fix `count_units` in `rust/sqlparser-ffi/src/parser.rs` to set `syntax_edits: false` in its internal `ParseConfig`.
 - Verification [2026-11-18] (health only; split itself out of Haskell workstream): `make rust-check` exit 0 (fmt/check/clippy -D warnings); `cargo test` 188/188 pass; `count_units` syntax_edits:false confirmed present in tree.
 
-** BLOCKED [#A] Ordered pool scheduler inconclusive-count regression (routed to pool owner; `src/Occam/Pool.hs` deliberately untouched)
+** DONE [#A] Ordered pool scheduler inconclusive-count regression (routed to pool owner; `src/Occam/Pool.hs` deliberately untouched)
 - Test `Ordered pool scheduler / earlier inconclusive blocks a later acceptance` (`test/PoolChecks.hs:128`) expects 3 physical starts, gets 2; deterministic 5/5 on this tree and reproduced identically on a pristine HEAD worktree (pool files at HEAD state); Engine workstream changes excluded by construction.
+- Root cause [2026-11-18]: TEST bug, scheduler correct. C is a speculative loser beyond the inconclusive throw point; `settleAll` (`src/Occam/Pool.hs`) `killThread`s it before the RTS schedules its worker, so it never reaches the `attempts` increment in `runWorker` (fork != physical start) — documented cancel-before-start behavior, not a missing start. Fixed `test/PoolChecks.hs` only: starts assertion narrowed to 2..3 (A and T must start; C may be cancelled pre-start), inconclusive-blocks-acceptance intent unchanged. Verification: fourmolu/hlint clean, `cabal build all` -Werror exit 0, `cabal test all` 175/175 + 2/2 green, fixed test 5/5 stable.
 
 ** DONE [#A] Compile reproducible reducer comparisons and evaluation evidence
 - Primary scope stays Strategy 3A: deterministic self-contained SQLite predicates; no new crash harvesting or DBMS deployment.

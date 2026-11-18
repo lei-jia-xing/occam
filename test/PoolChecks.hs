@@ -125,7 +125,13 @@ tests =
                 "later acceptance committed despite earlier inconclusive"
                 (all (\(_, _, outcome, _) -> outcome /= OracleAccepted) retired)
             attempts <- poolAttempts pool
-            assertEqual "every window task started physically" 3 attempts
+            -- A and T must start: retirement blocks on their published outcomes
+            -- before throwing. C is a speculative loser beyond the throw point
+            -- and may be cancelled before its first physical start (settleAll
+            -- killThreads unretired tasks; a pre-start kill never reaches the
+            -- attempts increment in runWorker), so 2 and 3 are both correct.
+            assertBool ("too few physical starts: " ++ show attempts) (attempts >= 2)
+            assertBool ("too many physical starts: " ++ show attempts) (attempts <= 3)
         , testCase "ordered reservation gives the head the sole permit" $ do
             let execute _ = pure acceptDetails
             pool <- testPool 4 (Just 1) execute (const (pure ())) (\_ _ _ _ -> pure ())

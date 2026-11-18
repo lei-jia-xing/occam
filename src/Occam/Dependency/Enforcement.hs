@@ -1,22 +1,10 @@
-{- | Cascade-write expansion for @--dump-facts@ cross-validation:
-@--dump-facts@ reports raw per-statement facts with no cross-statement
-state, so this module replays just enough scan state (flag + FK catalog)
-to expand the cascade writes each statement performs.
-
-Scan in file order against the accumulated flag and catalog (mirrors
-'applyParentActions'); own effects apply afterwards. OFF expands
-nothing. ON: @DELETE@ via @ON DELETE CASCADE@ plus @SET NULL@/@SET
-DEFAULT@ as child @UPDATE@s; @UPDATE@ via matching @ON UPDATE@ only on
-referenced-column overlap (explicit list, else parent primary key;
-empty write columns cascade conservatively). Multi-level recursion with
-a visited guard; @NoAction@/@Restrict@ skipped.
-
-Initial flag from 'SessionInit' with in-file @PRAGMA foreign_keys@ and
-@SET foreign_key_checks@ threading, so default mode stays byte-identical
-while @--fk-on@ gains the engine-reported cascade writes.
-
-Deliberately unmodeled: FK check reads (engine scan columns unpinnable)
-and @TRUNCATE@ (SQLite has none).
+{- | Cascade-write expansion for @--dump-facts@ cross-validation.
+Dumps carry no cross-statement state, so replay flag + FK catalog in file
+order (mirrors 'applyParentActions'); own effects apply afterwards.
+OFF: nothing. ON: @DELETE@ via @ON DELETE CASCADE@/@SET NULL@/@SET DEFAULT@
+(child @UPDATE@s); @UPDATE@ only on referenced-column overlap, visited-guarded,
+@NoAction@/@Restrict@ skipped. Default stays byte-identical; @--fk-on@ gains
+engine writes. Unmodeled: FK check reads, @TRUNCATE@.
 -}
 module Occam.Dependency.Enforcement (
     cascadeWrites,
