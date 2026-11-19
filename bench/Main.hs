@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Control.Monad (unless)
+import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -9,6 +9,7 @@ import Data.Set qualified as Set
 import Occam.Cache (
     CacheMode (..),
     cacheCompleteInflight,
+    cacheInstallInflight,
     cacheLookup,
     newCache,
  )
@@ -130,7 +131,13 @@ main = do
     let candidateKey = BSC.pack "SELECT * FROM t0 WHERE a = 1;"
         nonExistentKey = BSC.pack "SELECT * FROM non_existent WHERE x = 999;"
         obs = OracleFinished ExitSuccess
-    cacheCompleteInflight cache candidateKey 0 (Just obs)
+    -- Populate cache with diverse candidate entries so HAMT depth is realistic
+    forM_ [0 .. 511 :: Int] $ \i -> do
+        let key = BSC.pack ("SELECT a, b FROM t" ++ show i ++ " WHERE a > " ++ show i ++ ";")
+        cacheInstallInflight cache key i
+        cacheCompleteInflight cache key i (Just obs)
+    cacheInstallInflight cache candidateKey 512
+    cacheCompleteInflight cache candidateKey 512 (Just obs)
     defaultMain
         [ bgroup
             "parse"
@@ -182,7 +189,7 @@ main = do
         , bgroup
             "surgery"
             [ bench "cut-removed" $ whnf (byteChecksum . cutRemovedStatementIds sql512 stmts512) keptEven
-            , bcompare "cut-removed" $
+            , bcompare "$NF == \"cut-removed\" && $(NF-1) == \"surgery\"" $
                 bench "replace-span" $
                     whnf
                         (\start -> byteChecksum (replaceSpan start (start + 896) ("/* trimmed */" :: ByteString) sql512))
@@ -191,6 +198,8 @@ main = do
         , bgroup
             "cache"
             [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled Map.empty candidateKey)
-            , bcompare "hit" $ bench "miss" $ whnfIO (cacheLookup cache CacheEnabled Map.empty nonExistentKey)
+            , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
+                bench "miss" $
+                    whnfIO (cacheLookup cache CacheEnabled Map.empty nonExistentKey)
             ]
         ]

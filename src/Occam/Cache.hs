@@ -105,7 +105,8 @@ cacheLookup cache mode precomputed sql = case Map.lookup sql precomputed of
 
 cacheInstallInflight :: Cache -> ByteString -> Int -> IO ()
 cacheInstallInflight cache sql ordinal =
-    modifyMVar_ (cacheEntries cache) (pure . HashMap.insert sql (CacheInflight ordinal))
+    modifyMVar_ (cacheEntries cache) \entries ->
+        pure $! HashMap.insert sql (CacheInflight ordinal) entries
 
 {- | Publish a completed miss. Admitted observations are retained; rejected
 ones (timeouts, reset failures, I/O failures) are removed so a later window
@@ -115,9 +116,9 @@ cacheCompleteInflight :: Cache -> ByteString -> Int -> Maybe OracleObservation -
 cacheCompleteInflight cache sql ordinal admitted =
     modifyMVar_ (cacheEntries cache) \entries -> case HashMap.lookup sql entries of
         Just (CacheInflight owner)
-            | owner == ordinal -> pure $ case admitted of
-                Just res -> HashMap.insert sql (CacheDone res) entries
-                Nothing -> HashMap.delete sql entries
+            | owner == ordinal -> case admitted of
+                Just res -> pure $! HashMap.insert sql (CacheDone res) entries
+                Nothing -> pure $! HashMap.delete sql entries
         _ -> pure entries
 
 -- | Drop an in-flight entry owned by the given ordinal (worker cancellation).

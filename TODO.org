@@ -83,10 +83,15 @@
 - Acceptance: before/after joint-completion comparison on identical slots with no completion/quality regression.
 - Profiling inputs ready (`benchmarks/benchmark_artifacts/profile-inputs-20261116-a` + protocol README): deterministic exit-0 engine-mechanics microbenchmark; A profile recorded; A2/B paired, never vs 632.
 ** TODO [#A] Native Haskell benchmark suite & in-process SQLite oracle migration
-- [Native Engine Bench via `tasty-bench`] Upgrade `bench/Main.hs` from hand-rolled RTS/timer loops to modern, lightweight `tasty-bench` (GHC RTS allocated bytes + wall time + baseline CSV regression gating, zero heavy dependencies).
-- [In-Process Native SQLite Contract Oracle] Integrate `direct-sqlite` to execute candidate SQL directly in-process against `:memory:` with rowset/state digest verification (<0.05ms/call), eliminating the Python subprocess overhead and IPC pipe latency from `benchmarks/bench.py oracle`.
-- [Port Tier 3 AB/BA Corpus Runner to Haskell] Re-implement the AB/BA interleaved trial runner and Attempt-AUC integration (`evaluationCurve`) in a dedicated Haskell module (`Occam.Benchmark.Corpus` / `Occam.Benchmark.Metrics`), providing pure in-memory evaluation without temporary disk churn.
-- [Self-Contained `cabal bench`] Enable complete self-contained execution via `cabal bench` (`cabal bench --benchmark-options="+RTS -T -RTS --csv baseline.csv"`), removing external Python runtime and script dependencies.
+- [X] [Native Engine Bench via `tasty-bench`] Upgrade `bench/Main.hs` from hand-rolled RTS/timer loops to modern, lightweight `tasty-bench` (GHC RTS allocated bytes + wall time + baseline CSV regression gating, zero heavy dependencies) (Done in `e0c3a35`).
+- [X] [Cache HashMap Acceleration] Replace `Map ByteString CacheEntry` in `Occam.Cache` with `HashMap ByteString CacheEntry` via `unordered-containers` + `hashable`, achieving $O(1)$ amortized candidate deduplication (Done in `e0c3a35`).
+- [ ] [In-Process Native SQLite Contract Oracle] Integrate `direct-sqlite` to execute candidate SQL directly in-process against `:memory:` with rowset/state digest verification (<0.05ms/call), eliminating the Python subprocess overhead and IPC pipe latency from `benchmarks/bench.py oracle`.
+- [ ] [Port Tier 3 AB/BA Corpus Runner to Haskell] Re-implement the AB/BA interleaved trial runner and Attempt-AUC integration (`evaluationCurve`) in a dedicated Haskell module (`Occam.Benchmark.Corpus` / `Occam.Benchmark.Metrics`), providing pure in-memory evaluation without temporary disk churn.
+- [ ] [Self-Contained `cabal bench`] Enable complete self-contained execution via `cabal bench` (`cabal bench --benchmark-options="+RTS -T -RTS --csv baseline.csv"`), removing external Python runtime and script dependencies.
+
+** TODO [#B] Process & concurrency subsystem stability assessment
+- [X] [Investigate `typed-process` Suitability] Completed exhaustive architectural source audit of `typed-process-0.2.13.0`. Concluded that `typed-process` is INCOMPATIBLE with `Occam.Oracle`: it lacks POSIX process-group signaling (`unix`), terminates only the parent PID (orphaning DBMS child processes as zombies), lacks SIGKILL escalation (risking indefinite deadlock), and has unsafe handle closing ordering. Occam will retain `process + unix` two-stage group reaping (`typed_process_investigation.md`).
+- [ ] [Feedback HashMap in Reducer] Replace `Map ByteString CandidateVerdict` in `Occam.Reducer.Feedback` with `HashMap ByteString CandidateVerdict`.
 
 ** TODO [#B] Codebase ergonomics & maintainability enhancements (microlens & int-containers)
 - [Nested State & Catalog Lenses via `microlens`] Adopt lightweight `microlens` / `microlens-th` (or `optics-core`) across `Occam.Dependency.State` and `Occam.Dependency.Alter`, eliminating manual multi-layer record reconstruction boilerplate (`eval & evalCatalog . catRelations . at key ?~ relation`).

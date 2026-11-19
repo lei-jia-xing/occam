@@ -1,8 +1,9 @@
 module Main (main) where
 
 import ColumnChecks qualified
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (when)
+import Control.Monad (forM_, when)
 import Data.Aeson (FromJSON (..), Value, eitherDecodeStrict', withObject, (.:))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -18,7 +19,17 @@ import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Cache (
+    CacheAdmission (..),
+    CacheMode (..),
     CacheStats (..),
+    LookupResult (..),
+    cacheCompleteInflight,
+    cacheInstallInflight,
+    cacheLookup,
+    cacheRemoveInflight,
+    cacheStats,
+    newCache,
+    observationAdmission,
  )
 import Occam.Core (
     CatalogOp (..),
@@ -512,6 +523,107 @@ phase6Tests =
                 "every duplicate shared without re-executing"
                 3
                 (cacheHits stats + cacheJoins stats)
+        , testCase "direct cacheLookup and newCache behavior" $ do
+            let precompKey = BSC.pack "SELECT 42;"
+                precompObs = OracleFinished ExitSuccess
+                precomputed = Map.singleton precompKey precompObs
+            cache <- newCache precomputed
+
+            -- Hit on precomputed with CacheEnabled records a hit
+            r1 <- cacheLookup cache CacheEnabled precomputed precompKey
+            assertEqual "precomputed hit enabled" (LookupHit precompObs) r1
+            s1 <- cacheStats cache
+            assertEqual "one hit" 1 (cacheHits s1)
+            assertEqual "zero misses" 0 (cacheMisses s1)
+
+            -- Hit on precomputed with CacheDisabled does NOT record a hit
+            r2 <- cacheLookup cache CacheDisabled precomputed precompKey
+            assertEqual "precomputed hit disabled" (LookupHit precompObs) r2
+            s2 <- cacheStats cache
+            assertEqual "hits unchanged" 1 (cacheHits s2)
+
+            -- Fresh query with CacheDisabled records a miss
+            let freshKey = BSC.pack "SELECT 99;"
+            r3 <- cacheLookup cache CacheDisabled precomputed freshKey
+            assertEqual "fresh query disabled" LookupMiss r3
+            s3 <- cacheStats cache
+            assertEqual "one miss" 1 (cacheMisses s3)
+
+            -- Fresh query with CacheEnabled records a miss
+            r4 <- cacheLookup cache CacheEnabled precomputed freshKey
+            assertEqual "fresh query enabled" LookupMiss r4
+            s4 <- cacheStats cache
+            assertEqual "two misses" 2 (cacheMisses s4)
+        , testCase "direct in-flight lifecycle, join reservation, and completion" $ do
+            cache <- newCache Map.empty
+            let candidate = BSC.pack "SELECT candidate;"
+                obs = OracleFinished ExitSuccess
+
+            -- 1. Install candidate in-flight for worker ordinal 10
+            cacheInstallInflight cache candidate 10
+            r1 <- cacheLookup cache CacheEnabled Map.empty candidate
+            assertEqual "in-flight query returns join" (LookupJoin 10) r1
+            s1 <- cacheStats cache
+            assertEqual "joins incremented" 1 (cacheJoins s1)
+
+            -- 2. Wrong ordinal cannot complete the in-flight entry
+            cacheCompleteInflight cache candidate 99 (Just obs)
+            r2 <- cacheLookup cache CacheEnabled Map.empty candidate
+            assertEqual "still in-flight after mismatched owner complete" (LookupJoin 10) r2
+            s2 <- cacheStats cache
+            assertEqual "joins incremented again" 2 (cacheJoins s2)
+
+            -- 3. Correct ordinal completes the in-flight entry
+            cacheCompleteInflight cache candidate 10 (Just obs)
+            r3 <- cacheLookup cache CacheEnabled Map.empty candidate
+            assertEqual "completed entry returns hit" (LookupHit obs) r3
+            s3 <- cacheStats cache
+            assertEqual "hits incremented" 1 (cacheHits s3)
+
+            -- 4. Complete on non-inflight candidate does nothing
+            let nonInflight = BSC.pack "SELECT never_inflight;"
+            cacheCompleteInflight cache nonInflight 10 (Just obs)
+            r4 <- cacheLookup cache CacheEnabled Map.empty nonInflight
+            assertEqual "non-inflight complete leaves candidate as miss" LookupMiss r4
+        , testCase "direct cacheRemoveInflight cancels and evicts in-flight entry" $ do
+            cache <- newCache Map.empty
+            let candidate = BSC.pack "SELECT to_cancel;"
+            cacheInstallInflight cache candidate 5
+            r1 <- cacheLookup cache CacheEnabled Map.empty candidate
+            assertEqual "installed" (LookupJoin 5) r1
+            cacheRemoveInflight cache candidate 5
+            r2 <- cacheLookup cache CacheEnabled Map.empty candidate
+            assertEqual "evicted after cancellation" LookupMiss r2
+        , testCase "observationAdmission filters valid results" $ do
+            assertEqual "success is admitted" CacheAdmit (observationAdmission (OracleFinished ExitSuccess))
+            assertEqual
+                "exit failure is admitted"
+                CacheAdmit
+                (observationAdmission (OracleFinished (ExitFailure 1)))
+            assertEqual "timeout is rejected" CacheReject (observationAdmission OracleTimedOut)
+            assertEqual "reset failure is rejected" CacheReject (observationAdmission OracleResetFailed)
+            assertEqual
+                "io failure is rejected"
+                CacheReject
+                (observationAdmission (OracleIOFailed (T.pack "fail")))
+        , testCase "concurrent HAMT cache inserts and lookups" $ do
+            cache <- newCache Map.empty
+            let workerCount = 8
+                itemsPerWorker = 30
+                obs = OracleFinished ExitSuccess
+            doneVars <- sequence [newEmptyMVar | _ <- [1 .. workerCount]]
+            forM_ (zip [0 .. workerCount - 1] doneVars) $ \(wId, doneVar) ->
+                forkIO $ do
+                    forM_ [0 .. itemsPerWorker - 1] $ \i -> do
+                        let key = BSC.pack ("SELECT " ++ show wId ++ ", " ++ show i ++ ";")
+                        cacheInstallInflight cache key wId
+                        cacheCompleteInflight cache key wId (Just obs)
+                        res <- cacheLookup cache CacheEnabled Map.empty key
+                        assertEqual "concurrent lookup hit" (LookupHit obs) res
+                    putMVar doneVar ()
+            forM_ doneVars takeMVar
+            stats <- cacheStats cache
+            assertEqual "all completed lookups hit" (workerCount * itemsPerWorker) (cacheHits stats)
         ]
 
 -- ----------------------------------------------------------------------------
