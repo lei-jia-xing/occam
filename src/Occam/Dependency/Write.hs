@@ -92,17 +92,27 @@ applyWriteState :: StatementId -> WriteKind -> [Ident] -> RelationState -> Relat
 applyWriteState sid kind columns relation =
     case kind of
         InsertWrite _ ->
-            relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+            relation
+                { relDataWrites = Set.insert sid (relDataWrites relation)
+                , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
+                }
         MergeWrite ->
-            relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+            relation
+                { relDataWrites = Set.insert sid (relDataWrites relation)
+                , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
+                }
         DeleteWrite scope
             | scope == DeleteAllRows ->
                 relation
                     { relDataWrites = Set.singleton sid
+                    , relCardinalityWrites = Set.singleton sid
                     , relColumnWrites = Map.empty
                     }
             | otherwise ->
-                relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+                relation
+                    { relDataWrites = Set.insert sid (relDataWrites relation)
+                    , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
+                    }
         UpdateWrite scope
             | scope == UpdateAllRows ->
                 if null columns
@@ -128,6 +138,7 @@ applyWriteState sid kind columns relation =
         TruncateWrite {} ->
             relation
                 { relDataWrites = Set.singleton sid
+                , relCardinalityWrites = Set.singleton sid
                 , relColumnWrites = Map.empty
                 }
 
@@ -680,6 +691,7 @@ processRefresh sid eval refresh =
                 relation1 =
                     relation
                         { relDataWrites = Set.singleton sid
+                        , relCardinalityWrites = Set.singleton sid
                         , relColumnWrites = Map.empty
                         }
              in (addTouches (relationTouchKeys key) (addDeps deps evalReads))

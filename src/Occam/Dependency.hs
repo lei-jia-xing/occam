@@ -19,7 +19,7 @@ import Occam.Core (
     SemanticFacts (..),
     SessionInit,
     Statement (..),
-    StatementId,
+    StatementId (..),
  )
 import Occam.Dependency.Alter (
     processAlterTable,

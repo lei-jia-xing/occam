@@ -2118,6 +2118,81 @@ tests =
                 (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
             let slice = backwardSlice (StatementId 5) graph
             assertBool "backward slice retains S3" (has (StatementId 3) slice)
+        , testCase "SELECT COUNT(*) does not depend on prior UPDATE statements on the table" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2 WHERE id = 1;"
+                        , "SELECT COUNT(*) FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool "COUNT(*) read S5 does not depend on UPDATE S3" (not (has (StatementId 3) slice))
+            assertBool "COUNT(*) read S5 does not depend on UPDATE S4" (not (has (StatementId 4) slice))
+            assertBool "COUNT(*) read S5 preserves CREATE TABLE S1" (has (StatementId 1) slice)
+            assertBool "COUNT(*) read S5 preserves INSERT S2" (has (StatementId 2) slice)
+        , testCase "SELECT COUNT(*) does not depend on prior UPDATE even if subsequent INSERT exists" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "INSERT INTO t VALUES (2, 20);"
+                        , "SELECT COUNT(*) FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool "COUNT(*) read S5 does not depend on UPDATE S3" (not (has (StatementId 3) slice))
+            assertBool "COUNT(*) read S5 preserves INSERT S2" (has (StatementId 2) slice)
+            assertBool "COUNT(*) read S5 preserves INSERT S4" (has (StatementId 4) slice)
+        , testCase "SELECT COUNT(col) and COUNT(*) with WHERE preserve dependencies on prior UPDATE" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "SELECT COUNT(a) FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let slice = backwardSlice (StatementId 4) graph
+            assertBool "COUNT(col) depends on prior update on col" (has (StatementId 3) slice)
+
+            let sqlFiltered =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "SELECT COUNT(*) FROM t WHERE a > 0;"
+                        ]
+            graphFiltered <- analyze PostgreSQL sqlFiltered
+            let sliceFiltered = backwardSlice (StatementId 4) graphFiltered
+            assertBool "COUNT(*) with WHERE depends on prior update on col" (has (StatementId 3) sliceFiltered)
+        , testCase "Pure existence checks do not depend on prior UPDATE statements on the table" $ do
+            let sqlLimit =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "SELECT 1 FROM t LIMIT 1;"
+                        ]
+            graphLimit <- analyze PostgreSQL sqlLimit
+            let sliceLimit = backwardSlice (StatementId 4) graphLimit
+            assertBool "SELECT 1 LIMIT 1 does not depend on UPDATE S3" (not (has (StatementId 3) sliceLimit))
+            assertBool "SELECT 1 LIMIT 1 preserves INSERT S2" (has (StatementId 2) sliceLimit)
+
+            let sqlExists =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "SELECT EXISTS (SELECT 1 FROM t);"
+                        ]
+            graphExists <- analyze PostgreSQL sqlExists
+            let sliceExists = backwardSlice (StatementId 4) graphExists
+            assertBool "EXISTS check does not depend on UPDATE S3" (not (has (StatementId 3) sliceExists))
+            assertBool "EXISTS check preserves INSERT S2" (has (StatementId 2) sliceExists)
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

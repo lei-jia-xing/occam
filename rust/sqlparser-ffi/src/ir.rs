@@ -411,6 +411,8 @@ pub struct SchemaDef {
 pub enum ReadMode {
     Data,
     Schema,
+    RowCount,
+    RowExistence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

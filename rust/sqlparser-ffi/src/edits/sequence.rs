@@ -53,20 +53,22 @@ impl Visitor for SequenceVisitor<'_> {
             Some(SequenceEffect::Read(sequence)) => self.reads.push(sequence),
             Some(SequenceEffect::Unknown) => self.unknown = true,
             None if matches!(expr, Expr::Function(_)) => {
-                // Only Generic keyword calls lift the routine fence; unknown,
-                // volatile, sequence-adjacent, and shadowed calls keep it.
-                // `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` never
-                // fence (ignored root, populated only when unshadowed).
-                let ignored = AnalysisVisitor::in_ignored_function_root(
-                    &self.ignored_function_roots,
-                    expr.span(),
-                );
+                // Only Generic keyword calls and unconditional COUNT calls lift
+                // the routine fence; unknown, volatile, sequence-adjacent, and
+                // shadowed calls keep it. `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE`
+                // never fence (ignored root, populated only when unshadowed).
+                let is_unconditional_count = crate::actions::is_unconditional_count_expr(expr);
+                let ignored = is_unconditional_count
+                    || AnalysisVisitor::in_ignored_function_root(
+                        &self.ignored_function_roots,
+                        expr.span(),
+                    );
                 let pure = !ignored
                     && self.pure_table_enabled
                     && matches!(expr, Expr::Function(function)
                         if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
-                // Ignored markers are not routines at all (neither pure nor
-                // unknown); only non-ignored impure calls fence.
+                // Ignored markers and unconditional count calls are not unmodeled
+                // routines; only non-ignored impure calls fence.
                 if !ignored {
                     self.unknown |= !pure;
                 }

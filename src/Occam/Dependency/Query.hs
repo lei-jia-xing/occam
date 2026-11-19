@@ -223,9 +223,9 @@ childrenWith session catalog key parents =
 relationReadDeps ::
     SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Bool -> Set StatementId
 relationReadDeps session catalog key mode columns only =
-    go Set.empty key
+    go Set.empty key mode
     where
-        go seen current
+        go seen current currentMode
             | Set.member current seen = Set.empty
             | otherwise =
                 case lookupRelation catalog current of
@@ -236,17 +236,23 @@ relationReadDeps session catalog key mode columns only =
                                 relationDefinitionDeps catalog current
                                     `Set.union` relationIndexDeps catalog relation
                             dataDeps =
-                                case mode of
+                                case currentMode of
                                     ReadData ->
                                         relDataWrites relation
                                             `Set.union` relationColumnWriteDeps session catalog current relation columns
+                                    ReadRowCount ->
+                                        relCardinalityWrites relation
+                                    ReadRowExistence ->
+                                        relCardinalityWrites relation
                                     ReadSchema -> Set.empty
                             -- Tables populated by CTAS and materialized views
                             -- are snapshots. Their creation/refresh statement
                             -- already depends on the source data it evaluated.
+                            -- View sources are evaluated with ReadData as view definitions
+                            -- may filter or project expressions on source columns.
                             sourceDeps =
                                 Set.unions
-                                    [ go seen' source
+                                    [ go seen' source ReadData
                                     | relKind relation == ViewRelation
                                     , source <- Set.toList (relSources relation)
                                     ]
@@ -255,7 +261,7 @@ relationReadDeps session catalog key mode columns only =
                             -- later definition is still followed.
                             unresolvedDeps =
                                 Set.unions
-                                    [ go seen' sourceKey
+                                    [ go seen' sourceKey ReadData
                                     | relKind relation == ViewRelation
                                     , reference <- Set.toList (relUnresolvedSources relation)
                                     , sourceKey <- resolveRelationKeys session catalog reference
@@ -270,7 +276,7 @@ relationReadDeps session catalog key mode columns only =
                                     then Set.empty
                                     else
                                         Set.unions
-                                            [ go seen' child
+                                            [ go seen' child currentMode
                                             | child <- childrenOf session catalog current
                                             ]
                          in base
@@ -292,9 +298,22 @@ relationWriteDeps session catalog key kind columns =
                 writes =
                     case kind of
                         TruncateWrite {} -> Set.empty
-                        UpdateWrite UpdateAllRows ->
-                            relDataWrites relation
-                        _ ->
+                        InsertWrite _ ->
+                            relCardinalityWrites relation
+                        DeleteWrite DeleteAllRows ->
+                            relCardinalityWrites relation
+                        DeleteWrite DeleteFilteredRows ->
+                            relCardinalityWrites relation
+                                `Set.union` relationColumnWriteDeps session catalog key relation columns
+                        UpdateWrite UpdateAllRows
+                            | null columns ->
+                                relDataWrites relation
+                            | otherwise ->
+                                relCardinalityWrites relation
+                        UpdateWrite UpdateFilteredRows ->
+                            relCardinalityWrites relation
+                                `Set.union` relationColumnWriteDeps session catalog key relation columns
+                        MergeWrite ->
                             relDataWrites relation
                                 `Set.union` relationColumnWriteDeps session catalog key relation columns
                 sourceDeps =

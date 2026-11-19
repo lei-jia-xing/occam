@@ -141,7 +141,7 @@ data SessionInit = SessionInit
     }
     deriving (Eq, Show)
 
-data ReadMode = ReadData | ReadSchema
+data ReadMode = ReadData | ReadSchema | ReadRowCount | ReadRowExistence
     deriving (Eq, Ord, Show)
 
 data ReadFact = ReadFact
@@ -637,6 +637,8 @@ instance FromJSON ReadMode where
         case name of
             "data" -> pure ReadData
             "schema" -> pure ReadSchema
+            "row_count" -> pure ReadRowCount
+            "row_existence" -> pure ReadRowExistence
             _ -> fail ("unknown read mode: " <> T.unpack name)
 
 instance FromJSON ReadFact where

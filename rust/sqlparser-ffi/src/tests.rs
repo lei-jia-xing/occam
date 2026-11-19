@@ -2709,7 +2709,6 @@ fn former_per_dialect_aggregates_stay_fenced() {
     // flow through arguments independently of fencing.
     let calls = [
         ("avg(a)", vec!["a"]),
-        ("count(*)", vec![]),
         ("count(a)", vec!["a"]),
         ("count(DISTINCT a)", vec!["a"]),
         ("max(a)", vec!["a"]),
@@ -2717,7 +2716,6 @@ fn former_per_dialect_aggregates_stay_fenced() {
         ("sum(a)", vec!["a"]),
         ("sum(DISTINCT a)", vec!["a"]),
         ("AVG(a)", vec!["a"]),
-        ("COUNT(*)", vec![]),
         ("MAX(a)", vec!["a"]),
         ("MIN(a)", vec!["a"]),
         ("SUM(a)", vec!["a"]),
@@ -2741,6 +2739,17 @@ fn former_per_dialect_aggregates_stay_fenced() {
                 columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "{sql}"
             );
+        }
+        // Unconditional COUNT lifts the routine fence across dialects.
+        for sql in ["SELECT count(*) FROM t;", "SELECT COUNT(*) FROM t;"] {
+            let units = parse(sql, dialect).unwrap();
+            let unit_facts = facts(&units[0]);
+            assert!(
+                !has_routine_barrier(unit_facts),
+                "{sql} on {dialect:?}: unconditional count should lift routine fence"
+            );
+            assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
+            assert_eq!(read_column_names(unit_facts), Vec::<String>::new(), "{sql}");
         }
         // Grouped projections fence with the grouping columns intact.
         let sql = "SELECT a, sum(b) FROM t GROUP BY a;";
@@ -3012,7 +3021,7 @@ fn generic_keyword_subset_lifts_but_other_names_still_fence() {
         "SELECT abs(a) FROM t;",
         "SELECT concat(a, b) FROM t;",
         "SELECT sum(a) FROM t;",
-        "SELECT count(*) FROM t;",
+        "SELECT count(a) FROM t;",
         "SELECT frobnicate(a) FROM t;",
         // Quoted spellings are identifiers, not keywords.
         "SELECT \"coalesce\"(a, b) FROM t;",
@@ -3021,6 +3030,9 @@ fn generic_keyword_subset_lifts_but_other_names_still_fence() {
         let units = parse(sql, DialectKind::Generic).unwrap();
         assert!(has_routine_barrier(facts(&units[0])), "{sql}");
     }
+    // Unconditional count lifts the routine fence even on Generic.
+    let count_star_units = parse("SELECT count(*) FROM t;", DialectKind::Generic).unwrap();
+    assert!(!has_routine_barrier(facts(&count_star_units[0])));
     // Every non-Generic dialect keeps the blanket fence bit-identically —
     // cutback: SQLite, PostgreSQL, and MySQL join the always-fence set.
     for (dialect, sql) in [
@@ -4046,4 +4058,103 @@ fn unconditional_and_filtered_update_scope() {
     assert_eq!(write.len(), 1);
     assert_eq!(write[0].reads.len(), 1);
     assert_eq!(write[0].reads[0].columns, vec![Ident("a".to_string())]);
+}
+
+#[test]
+fn read_mode_classification_row_count_and_existence() {
+    let sql = "SELECT COUNT(*) FROM t;";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::RowCount);
+    assert_eq!(name_text(&read_facts[0].source.name), "t");
+    assert!(read_facts[0].columns.is_empty());
+
+    let sql = "SELECT COUNT(1) AS c FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::RowCount);
+
+    // COUNT(col) reads column data because nulls are filtered
+    let sql = "SELECT COUNT(col) FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    // COUNT(*) with WHERE reads column data
+    let sql = "SELECT COUNT(*) FROM t WHERE x > 1;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    // COUNT(*) with GROUP BY reads column data
+    let sql = "SELECT COUNT(*) FROM t GROUP BY x;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    // Pure existence check with LIMIT 1
+    let sql = "SELECT 1 FROM t LIMIT 1;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
+
+    // Pure existence check with EXISTS
+    let sql = "SELECT EXISTS (SELECT 1 FROM t);";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
+
+    let sql = "SELECT EXISTS (SELECT * FROM t);";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
+
+    // COUNT(*) OVER () window function must fall back to Data
+    let sql = "SELECT COUNT(*) OVER () FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    // COUNT(NULL) ignores nulls and does not count rows
+    let sql = "SELECT COUNT(NULL) FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    // Non-null constant literal in count position is RowCount
+    let sql = "SELECT COUNT('hello') FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::RowCount);
+
+    // Zero limit produces empty results, not pure existence check
+    for zero_limit in ["SELECT 1 FROM t LIMIT 0;", "SELECT 1 FROM t LIMIT 00;"] {
+        let units = parse(zero_limit, DialectKind::Generic).unwrap();
+        let read_facts = reads(facts(&units[0]));
+        assert_eq!(read_facts[0].mode, ReadMode::Data, "{zero_limit}");
+    }
+
+    // FOR UPDATE locks rows and must fall back to Data
+    let sql = "SELECT COUNT(*) FROM t FOR UPDATE;";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    let sql = "SELECT 1 FROM t LIMIT 1 FOR UPDATE;";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
+
+    let sql = "SELECT EXISTS (SELECT 1 FROM t FOR UPDATE);";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let read_facts = reads(facts(&units[0]));
+    assert_eq!(read_facts[0].mode, ReadMode::Data);
 }

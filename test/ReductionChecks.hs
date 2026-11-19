@@ -604,6 +604,25 @@ tests =
             assertBool
                 "both updates must be preserved"
                 (BSC.isInfixOf "a = 1" reduced && BSC.isInfixOf "b = 2" reduced)
+        , testCase "UPDATE on table is pruned during reduction when query only reads COUNT(*)" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "INSERT INTO t" candidate
+                            && BSC.isInfixOf "SELECT COUNT(*) FROM t;" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2;"
+                        , "SELECT COUNT(*) FROM t;"
+                        ]
+            reduced <- reduceSQL GenericSQL pool sql
+            assertBool "all updates must be eliminated" (not (BSC.isInfixOf "UPDATE t" reduced))
+            assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
+            assertBool "count query must be preserved" (BSC.isInfixOf "SELECT COUNT(*) FROM t;" reduced)
         , testCase "update with LIMIT does not eliminate earlier update in dependency slice" $ do
             pool <-
                 predicatePool

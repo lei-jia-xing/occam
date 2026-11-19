@@ -54,6 +54,278 @@ pub(crate) fn query_output_columns(
     set_expr_output_columns(&query.body, rules)
 }
 
+fn select_item_expr(item: &SelectItem) -> Option<&Expr> {
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+fn is_non_null_scalar_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(val) => matches!(
+            &val.value,
+            Value::Number(..)
+                | Value::SingleQuotedString(..)
+                | Value::DollarQuotedString(..)
+                | Value::EscapedStringLiteral(..)
+                | Value::NationalStringLiteral(..)
+                | Value::HexStringLiteral(..)
+                | Value::DoubleQuotedString(..)
+                | Value::Boolean(..)
+        ),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => is_non_null_scalar_literal(expr),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_unconditional_count_expr(expr: &Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    let is_count_ident = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case("count"),
+        [
+            ObjectNamePart::Identifier(schema),
+            ObjectNamePart::Identifier(ident),
+        ] if schema.value.eq_ignore_ascii_case("pg_catalog") => {
+            ident.value.eq_ignore_ascii_case("count")
+        }
+        _ => false,
+    };
+    if !is_count_ident {
+        return false;
+    }
+    if func.over.is_some()
+        || func.filter.is_some()
+        || !func.within_group.is_empty()
+        || func.null_treatment.is_some()
+    {
+        return false;
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return false;
+    }
+    let FunctionArguments::List(args) = &func.args else {
+        return false;
+    };
+    if matches!(args.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+        return false;
+    }
+    if args.args.len() != 1 {
+        return false;
+    }
+    match &args.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => true,
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+            is_non_null_scalar_literal(arg_expr)
+        }
+        _ => false,
+    }
+}
+
+fn is_empty_group_by(group_by: &GroupByExpr) -> bool {
+    match group_by {
+        GroupByExpr::Expressions(exprs, _) => exprs.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_plain_table_factor(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::Table {
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_directives,
+            ..
+        } => {
+            args.is_none()
+                && with_hints.is_empty()
+                && version.is_none()
+                && !*with_ordinality
+                && partitions.is_empty()
+                && json_path.is_none()
+                && sample.is_none()
+                && index_directives.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn is_unconditional_row_count_select(select: &Select) -> bool {
+    if select.top.is_some()
+        || select.into.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !select.named_window.is_empty()
+        || !is_empty_group_by(&select.group_by)
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || !is_plain_table_factor(&select.from[0].relation)
+        || select.projection.is_empty()
+    {
+        return false;
+    }
+    let mut has_count = false;
+    for item in &select.projection {
+        let Some(expr) = select_item_expr(item) else {
+            return false;
+        };
+        if is_unconditional_count_expr(expr) {
+            has_count = true;
+        } else if !is_non_null_scalar_literal(expr) {
+            return false;
+        }
+    }
+    has_count
+}
+
+fn is_positive_limit(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(val) => match &val.value {
+            Value::Number(n, _) => n.parse::<u64>().is_ok_and(|v| v > 0),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn query_has_positive_limit(query: &Query) -> bool {
+    match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => is_positive_limit(limit),
+        _ => false,
+    }
+}
+
+fn is_pure_existence_select_with_limit(query: &Query, select: &Select) -> bool {
+    if !query_has_positive_limit(query)
+        || select.top.is_some()
+        || select.into.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !select.named_window.is_empty()
+        || !is_empty_group_by(&select.group_by)
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || !is_plain_table_factor(&select.from[0].relation)
+        || select.projection.is_empty()
+    {
+        return false;
+    }
+    for item in &select.projection {
+        let Some(expr) = select_item_expr(item) else {
+            return false;
+        };
+        if !is_non_null_scalar_literal(expr) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_pure_existence_exists_query(select: &Select) -> bool {
+    if select.top.is_some()
+        || select.into.is_some()
+        || !select.from.is_empty()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !select.named_window.is_empty()
+        || !is_empty_group_by(&select.group_by)
+        || select.projection.len() != 1
+    {
+        return false;
+    }
+    let Some(expr) = select_item_expr(&select.projection[0]) else {
+        return false;
+    };
+    let Expr::Exists { subquery, .. } = expr else {
+        return false;
+    };
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.limit_clause.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+    {
+        return false;
+    }
+    let SetExpr::Select(inner) = subquery.body.as_ref() else {
+        return false;
+    };
+    if inner.top.is_some()
+        || inner.into.is_some()
+        || inner.selection.is_some()
+        || inner.having.is_some()
+        || inner.qualify.is_some()
+        || inner.distinct.is_some()
+        || inner.prewhere.is_some()
+        || !inner.connect_by.is_empty()
+        || !inner.named_window.is_empty()
+        || !is_empty_group_by(&inner.group_by)
+        || inner.from.len() != 1
+        || !inner.from[0].joins.is_empty()
+        || !is_plain_table_factor(&inner.from[0].relation)
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn classify_query_read_mode(
+    query: &Query,
+    visitor: &AnalysisVisitor<'_>,
+) -> ir::ReadMode {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || visitor.unmodeled_table_source
+        || !visitor.unmodeled_relation_spans.is_empty()
+        || visitor.relations.len() != 1
+    {
+        return ir::ReadMode::Data;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return ir::ReadMode::Data;
+    };
+    if query.limit_clause.is_none() && is_unconditional_row_count_select(select) {
+        return ir::ReadMode::RowCount;
+    }
+    if is_pure_existence_select_with_limit(query, select) || is_pure_existence_exists_query(select)
+    {
+        return ir::ReadMode::RowExistence;
+    }
+    ir::ReadMode::Data
+}
+
 pub(crate) fn select_into_definition(
     select: &Select,
     dialect: DialectKind,
@@ -407,13 +679,17 @@ pub(crate) fn visitor_reads(
     visitor_relations(collector, excluded)
         .into_iter()
         .map(|(reference, usage)| {
-            let columns = relation_columns(
-                reference,
-                usage,
-                &collector.columns,
-                &collector.whole_rows,
-                &collector.aliases,
-            );
+            let columns = if matches!(mode, ir::ReadMode::RowCount | ir::ReadMode::RowExistence) {
+                Vec::new()
+            } else {
+                relation_columns(
+                    reference,
+                    usage,
+                    &collector.columns,
+                    &collector.whole_rows,
+                    &collector.aliases,
+                )
+            };
             read_fact(reference.clone(), mode, columns, usage.only)
         })
         .collect()
@@ -3545,7 +3821,12 @@ pub(crate) fn analyze_statement(
     match statement {
         Statement::Query(query) => {
             let nested = collect_dml_in_query(query);
-            let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
+            let read_mode = if nested.is_empty() && visitor.select_into_count == 0 {
+                classify_query_read_mode(query, &visitor)
+            } else {
+                ir::ReadMode::Data
+            };
+            let reads = visitor_reads(&visitor, &[], read_mode);
             let into_table = match query.body.as_ref() {
                 SetExpr::Select(select) if visitor.select_into_count == 1 => {
                     select_into_definition(select, dialect, rules)

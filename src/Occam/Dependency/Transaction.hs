@@ -278,6 +278,7 @@ applyOnCommit sid transactionId session catalog =
                         Just OnCommitDeleteRows ->
                             relation
                                 { relDataWrites = Set.empty
+                                , relCardinalityWrites = Set.empty
                                 , relColumnWrites = Map.empty
                                 }
                         _ -> relation

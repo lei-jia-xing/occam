@@ -144,6 +144,7 @@ data RelationState = RelationState
     , relDefinition :: !(Maybe StatementId)
     , relColumns :: !(Set Ident)
     , relDataWrites :: !(Set StatementId)
+    , relCardinalityWrites :: !(Set StatementId)
     , relColumnWrites :: !(Map Ident (Set StatementId))
     , relSchemaWrites :: !(Set StatementId)
     , relRestoredBy :: !(Maybe StatementId)
@@ -246,6 +247,7 @@ newRelation kind =
         , relDefinition = Nothing
         , relColumns = Set.empty
         , relDataWrites = Set.empty
+        , relCardinalityWrites = Set.empty
         , relColumnWrites = Map.empty
         , relSchemaWrites = Set.empty
         , relRestoredBy = Nothing

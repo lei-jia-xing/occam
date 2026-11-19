@@ -650,7 +650,11 @@ readFactJson r =
         [ "table" .= nameText (nameRefName (readSource r))
         , "temp" .= nameRefTemp (readSource r)
         , "columns" .= map identText (readColumns r)
-        , "mode" .= (case readMode r of ReadData -> ("data" :: T.Text); ReadSchema -> "schema")
+        , "mode" .= case readMode r of
+            ReadData -> "data" :: T.Text
+            ReadSchema -> "schema"
+            ReadRowCount -> "row_count"
+            ReadRowExistence -> "row_existence"
         ]
 
 dataWriteJson :: DataWrite -> Value
