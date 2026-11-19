@@ -39,6 +39,7 @@ import Occam.Core (
     Statement (..),
     StatementId,
     TableDef (..),
+    UpdateScope (..),
     WriteKind (..),
  )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
@@ -202,7 +203,7 @@ expand _ _ = []
 expandWrite :: Map TableKey TableInfo -> DataWrite -> [DataWrite]
 expandWrite catalog write = case dataWriteKind write of
     DeleteWrite _ -> bfs Set.empty [(keyOfTarget, True, [])]
-    UpdateWrite -> bfs Set.empty [(keyOfTarget, False, writeColumns)]
+    UpdateWrite _ -> bfs Set.empty [(keyOfTarget, False, writeColumns)]
     _ -> []
     where
         keyOfTarget = tableKeyOf (dataWriteTarget write)
@@ -228,7 +229,7 @@ expandWrite catalog write = case dataWriteKind write of
 
         childWrite :: NameRef -> Bool -> [Ident] -> DataWrite
         childWrite ref True _ = DataWrite ref (DeleteWrite DeleteAllRows) [] [] [] False
-        childWrite ref False childColumns = DataWrite ref UpdateWrite childColumns [] [] False
+        childWrite ref False childColumns = DataWrite ref (UpdateWrite UpdateFilteredRows) childColumns [] [] False
 
         cascadeChildren :: TableKey -> Bool -> [Text] -> [(TableKey, NameRef, Bool, [Ident])]
         cascadeChildren parentKey isDelete columns =

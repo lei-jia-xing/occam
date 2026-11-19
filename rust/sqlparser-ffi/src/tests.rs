@@ -3980,3 +3980,70 @@ fn sqlite_create_virtual_table_scopes_barrier_to_relation() {
         other => panic!("expected RelationScope barrier, got {:?}", other),
     }
 }
+
+#[test]
+fn unconditional_and_filtered_update_scope() {
+    let sql = "UPDATE t SET a = 1;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert!(
+        matches!(write[0].kind, WriteKind::Update { all: true }),
+        "{:?}",
+        write[0].kind
+    );
+    assert!(
+        write[0].reads.is_empty(),
+        "unconditional update without target column references should have no spurious read on target: {:?}",
+        write[0].reads
+    );
+
+    let sql = "UPDATE t SET a = 1 WHERE b = 2;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert!(
+        matches!(write[0].kind, WriteKind::Update { all: false }),
+        "{:?}",
+        write[0].kind
+    );
+    assert_eq!(write[0].reads.len(), 1);
+    assert_eq!(write[0].reads[0].columns, vec![Ident("b".to_string())]);
+
+    let sql = "UPDATE t SET a = 1 FROM u WHERE t.id = u.id;";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert!(
+        matches!(write[0].kind, WriteKind::Update { all: false }),
+        "{:?}",
+        write[0].kind
+    );
+
+    let sql = "UPDATE t SET a = 1 LIMIT 1;";
+    let units = parse(sql, DialectKind::MySql).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert!(
+        matches!(write[0].kind, WriteKind::Update { all: false }),
+        "UPDATE with LIMIT must be filtered, got {:?}",
+        write[0].kind
+    );
+
+    let sql = "UPDATE t SET a = (SELECT 1 FROM t);";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert!(
+        !write[0].reads.is_empty(),
+        "UPDATE reading from t in a subquery must retain the read: {:?}",
+        write[0].reads
+    );
+
+    let sql = "UPDATE t SET a = 1 RETURNING a;";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let write = writes(facts(&units[0]));
+    assert_eq!(write.len(), 1);
+    assert_eq!(write[0].reads.len(), 1);
+    assert_eq!(write[0].reads[0].columns, vec![Ident("a".to_string())]);
+}

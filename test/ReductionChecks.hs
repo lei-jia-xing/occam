@@ -539,6 +539,95 @@ tests =
                 , ("statement ddmin", statementDdmin GenericSQL)
                 , ("syntax only", syntaxOnly GenericSQL)
                 ]
+        , testCase "dead earlier update on a column is pruned by dependency slice" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "SELECT a FROM t;" candidate
+                            && BSC.isInfixOf "a = 2" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2;"
+                        , "SELECT a FROM t;"
+                        ]
+            let config =
+                    defaultReductionConfig
+                        { reductionUnrestricted = False
+                        , reductionIntraStatement = False
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "dead earlier update (a = 1) must be eliminated" (not (BSC.isInfixOf "a = 1" reduced))
+            assertBool "effective update (a = 2) must be preserved" (BSC.isInfixOf "a = 2" reduced)
+            assertBool "insert must be preserved for row existence" (BSC.isInfixOf "INSERT INTO t" reduced)
+        , testCase "dead earlier update on a column is pruned during full reduction" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "INSERT INTO t" candidate
+                            && BSC.isInfixOf "SELECT a FROM t;" candidate
+                            && BSC.isInfixOf "a = 2" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2;"
+                        , "SELECT a FROM t;"
+                        ]
+            reduced <- reduceSQL GenericSQL pool sql
+            assertBool "dead earlier update (a = 1) must be eliminated" (not (BSC.isInfixOf "a = 1" reduced))
+            assertBool "effective update (a = 2) must be preserved" (BSC.isInfixOf "a = 2" reduced)
+            assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
+        , testCase "updates to distinct columns read by query are both preserved during reduction" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "SELECT a, b FROM t;" candidate
+                            && BSC.isInfixOf "a = 1" candidate
+                            && BSC.isInfixOf "b = 2" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT, b INT);"
+                        , "INSERT INTO t VALUES (1, 10, 20);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET b = 2;"
+                        , "SELECT a, b FROM t;"
+                        ]
+            reduced <- reduceSQL GenericSQL pool sql
+            assertBool
+                "both updates must be preserved"
+                (BSC.isInfixOf "a = 1" reduced && BSC.isInfixOf "b = 2" reduced)
+        , testCase "update with LIMIT does not eliminate earlier update in dependency slice" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "SELECT a FROM t;" candidate
+                            && BSC.isInfixOf "a = 2" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2 LIMIT 1;"
+                        , "SELECT a FROM t;"
+                        ]
+            let config =
+                    defaultReductionConfig
+                        { reductionDialect = MySQL
+                        , reductionUnrestricted = False
+                        , reductionIntraStatement = False
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "earlier update (a = 1) must be preserved" (BSC.isInfixOf "a = 1" reduced)
+            assertBool "effective update (a = 2) must be preserved" (BSC.isInfixOf "a = 2" reduced)
+            assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int

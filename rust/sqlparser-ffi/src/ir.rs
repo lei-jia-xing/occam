@@ -447,7 +447,9 @@ pub enum WriteKind {
     Insert {
         conflict: ConflictAction,
     },
-    Update,
+    Update {
+        all: bool,
+    },
     Delete {
         all: bool,
     },

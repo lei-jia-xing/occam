@@ -525,7 +525,7 @@ writeSignature :: WriteKind -> [Ident] -> WriteSignature
 writeSignature kind columns =
     case kind of
         InsertWrite _ -> InsertSignature
-        UpdateWrite -> UpdateSignature (Set.fromList columns)
+        UpdateWrite _ -> UpdateSignature (Set.fromList columns)
         DeleteWrite scope -> DeleteSignature scope
         MergeWrite -> MergeSignature
         TruncateWrite {} -> TruncateSignature

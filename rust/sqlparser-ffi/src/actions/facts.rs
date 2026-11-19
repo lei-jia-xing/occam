@@ -419,6 +419,34 @@ pub(crate) fn visitor_reads(
         .collect()
 }
 
+pub(crate) fn update_visitor_reads(
+    collector: &AnalysisVisitor<'_>,
+    excluded: &[Span],
+    target_spans: &[Span],
+    all: bool,
+    mode: ir::ReadMode,
+) -> Vec<ir::ReadFact> {
+    visitor_relations(collector, excluded)
+        .into_iter()
+        .filter_map(|(reference, usage)| {
+            let is_whole_row =
+                relation_whole_row(reference, usage, &collector.whole_rows, &collector.aliases);
+            let columns = relation_columns(
+                reference,
+                usage,
+                &collector.columns,
+                &collector.whole_rows,
+                &collector.aliases,
+            );
+            if all && target_spans.contains(&usage.span) && columns.is_empty() && !is_whole_row {
+                None
+            } else {
+                Some(read_fact(reference.clone(), mode, columns, usage.only))
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn add_reads(facts: &mut ir::NativeFacts, reads: Vec<ir::ReadFact>) {
     facts.ops.extend(reads.into_iter().map(ir::CatalogOp::Read));
 }
@@ -1882,7 +1910,7 @@ pub(crate) fn trigger_effects_from_facts(
                         target: write.target,
                         columns: write.columns,
                     },
-                    ir::WriteKind::Update => ir::DmlEvent::Update {
+                    ir::WriteKind::Update { .. } => ir::DmlEvent::Update {
                         target: write.target,
                         columns: write.columns,
                     },
@@ -4121,11 +4149,25 @@ pub(crate) fn analyze_statement(
                     Some(update.table.to_string()),
                 ));
             } else {
-                let reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
+                let target_spans: Vec<Span> = targets
+                    .iter()
+                    .map(|target| target.source.name.span())
+                    .collect();
+                let all = update.selection.is_none()
+                    && update.from.is_none()
+                    && update.table.joins.is_empty()
+                    && update.limit.is_none();
+                let reads = update_visitor_reads(
+                    &visitor,
+                    &excluded,
+                    &target_spans,
+                    all,
+                    ir::ReadMode::Data,
+                );
                 for (target, columns, unqualified_columns, only) in resolved {
                     facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
                         target,
-                        kind: ir::WriteKind::Update,
+                        kind: ir::WriteKind::Update { all },
                         columns,
                         unqualified_columns,
                         reads: reads.clone(),

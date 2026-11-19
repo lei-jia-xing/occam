@@ -36,6 +36,7 @@ import Occam.Core (
     TriggerRef (..),
     TriggerTiming (..),
     TxEffect (..),
+    UpdateScope (..),
     WriteKind (..),
     nameText,
  )
@@ -1015,7 +1016,10 @@ tests =
                 (targets (StatementId 7))
             case Map.findWithDefault [] (StatementId 7) enforcedExtras of
                 [write] -> do
-                    assertEqual "the cascaded update keeps its kind" UpdateWrite (dataWriteKind write)
+                    assertEqual
+                        "the cascaded update keeps its kind"
+                        (UpdateWrite UpdateFilteredRows)
+                        (dataWriteKind write)
                     assertEqual
                         "the cascaded update writes the child key"
                         ["did"]
@@ -1825,7 +1829,7 @@ tests =
                 [barrierScope barrier | barrier <- factBarriers (factsFor (StatementId 2) graph)]
             assertBool
                 "the host write is still recorded"
-                (hasWrite ["t"] UpdateWrite (opsFor (StatementId 2) graph))
+                (hasWrite ["t"] (UpdateWrite UpdateAllRows) (opsFor (StatementId 2) graph))
         , testCase "OUTPUT without INTO adds no edge and no fence" $ do
             let sql =
                     BSC.unlines
@@ -1992,6 +1996,128 @@ tests =
             assertBool
                 "the SET-source upsert carries no fence"
                 (null (factBarriers (factsFor (StatementId 4) graph)))
+        , testCase "unconditional UPDATE overwrites prior updates on the same column (DWE)" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT, b INT);"
+                        , "INSERT INTO t VALUES (1, 10, 20);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2;"
+                        , "SELECT a FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertEqual
+                "S3 is UpdateWrite UpdateAllRows"
+                (Just (UpdateWrite UpdateAllRows))
+                (listToMaybe [dataWriteKind w | WriteDataOp w <- opsFor (StatementId 3) graph])
+            assertEqual
+                "S4 is UpdateWrite UpdateAllRows"
+                (Just (UpdateWrite UpdateAllRows))
+                (listToMaybe [dataWriteKind w | WriteDataOp w <- opsFor (StatementId 4) graph])
+            assertBool
+                "S4 does not depend on S3"
+                (not (has (StatementId 3) (dependenciesFor (StatementId 4) graph)))
+            assertBool
+                "S4 strictly preserves S2 (INSERT) dependency"
+                (has (StatementId 2) (dependenciesFor (StatementId 4) graph))
+            assertBool
+                "S5 read does not depend on S3"
+                (not (has (StatementId 3) (dependenciesFor (StatementId 5) graph)))
+            assertBool
+                "S5 read depends on S4 (latest update)"
+                (has (StatementId 4) (dependenciesFor (StatementId 5) graph))
+            assertBool
+                "S5 read strictly preserves S2 (INSERT)"
+                (has (StatementId 2) (dependenciesFor (StatementId 5) graph))
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool "backward slice excludes dead update S3" (not (has (StatementId 3) slice))
+            assertBool
+                "backward slice includes S1, S2, S4, S5"
+                (Set.fromList [StatementId 1, StatementId 2, StatementId 4, StatementId 5] `Set.isSubsetOf` slice)
+        , testCase "unconditional UPDATE does not overwrite prior update on a distinct column" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT, b INT);"
+                        , "INSERT INTO t VALUES (1, 10, 20);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET b = 2;"
+                        , "SELECT a, b FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool
+                "reading both columns requires both updates"
+                (has (StatementId 3) slice && has (StatementId 4) slice)
+        , testCase "filtered UPDATE does not overwrite prior update (requires both)" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1 WHERE id = 1;"
+                        , "UPDATE t SET a = 2 WHERE id = 2;"
+                        , "SELECT a FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertEqual
+                "filtered S3 is UpdateWrite UpdateFilteredRows"
+                (Just (UpdateWrite UpdateFilteredRows))
+                (listToMaybe [dataWriteKind w | WriteDataOp w <- opsFor (StatementId 3) graph])
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool
+                "filtered updates both reach subsequent read"
+                (has (StatementId 3) slice && has (StatementId 4) slice)
+        , testCase "UPDATE reading the updated column retains dependency on prior write" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = a + 1;"
+                        , "SELECT a FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertBool
+                "self-referencing update S4 depends on S3"
+                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool "backward slice retains S3" (has (StatementId 3) slice)
+        , testCase "UPDATE with LIMIT is classified as UpdateFilteredRows and retains prior update" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = 2 LIMIT 1;"
+                        , "SELECT a FROM t;"
+                        ]
+            graph <- analyze MySQL sql
+            assertEqual
+                "S4 with LIMIT is UpdateFilteredRows"
+                (Just (UpdateWrite UpdateFilteredRows))
+                (listToMaybe [dataWriteKind w | WriteDataOp w <- opsFor (StatementId 4) graph])
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool
+                "backward slice retains prior update S3 when S4 has LIMIT"
+                (has (StatementId 3) slice)
+        , testCase "unconditional UPDATE with subquery reading target retains read dependency on prior writes" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (id INT, a INT);"
+                        , "INSERT INTO t VALUES (1, 10);"
+                        , "UPDATE t SET a = 1;"
+                        , "UPDATE t SET a = (SELECT 1 FROM t);"
+                        , "SELECT a FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            assertEqual
+                "S4 is UpdateWrite UpdateAllRows"
+                (Just (UpdateWrite UpdateAllRows))
+                (listToMaybe [dataWriteKind w | WriteDataOp w <- opsFor (StatementId 4) graph])
+            assertBool
+                "subquery reading target makes S4 depend on S3"
+                (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
+            let slice = backwardSlice (StatementId 5) graph
+            assertBool "backward slice retains S3" (has (StatementId 3) slice)
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

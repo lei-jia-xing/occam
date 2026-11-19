@@ -49,6 +49,7 @@ import Occam.Core (
     TriggerTiming (..),
     TruncateBehavior (..),
     TruncateIdentity (..),
+    UpdateScope (..),
     WriteKind (..),
     nameText,
  )
@@ -102,7 +103,18 @@ applyWriteState sid kind columns relation =
                     }
             | otherwise ->
                 relation {relDataWrites = Set.insert sid (relDataWrites relation)}
-        UpdateWrite
+        UpdateWrite scope
+            | scope == UpdateAllRows ->
+                if null columns
+                    then relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+                    else
+                        relation
+                            { relColumnWrites =
+                                foldl'
+                                    (\current column -> Map.insert column (Set.singleton sid) current)
+                                    (relColumnWrites relation)
+                                    columns
+                            }
             | null columns ->
                 relation {relDataWrites = Set.insert sid (relDataWrites relation)}
             | otherwise ->
@@ -202,7 +214,7 @@ dmlTagFor :: WriteKind -> [Ident] -> DmlTag
 dmlTagFor kind columns =
     case kind of
         InsertWrite _ -> TagInsert
-        UpdateWrite -> TagUpdate columns
+        UpdateWrite _ -> TagUpdate columns
         DeleteWrite _ -> TagDelete
         MergeWrite -> TagMerge
         TruncateWrite {} -> TagTruncate
@@ -413,7 +425,7 @@ processDmlEvent sid eval event =
                 DmlInsert target' columns' ->
                     (target', InsertWrite ConflictError, columns')
                 DmlUpdate target' columns' ->
-                    (target', UpdateWrite, columns')
+                    (target', UpdateWrite UpdateFilteredRows, columns')
                 DmlMerge target' columns' ->
                     (target', MergeWrite, columns')
                 DmlDelete target' scope ->
@@ -487,7 +499,7 @@ applyChildChecks :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -
 applyChildChecks _sid eval key kind _columns =
     case kind of
         InsertWrite _ -> checkParents
-        UpdateWrite -> checkParents
+        UpdateWrite _ -> checkParents
         MergeWrite -> checkParents
         _ -> eval
     where
@@ -522,9 +534,9 @@ applyParentActions sid eval key kind columns =
                 (\current item -> parentAction current key (DeleteWrite DeleteAllRows) [] item)
                 eval
                 (allForeignKeys catalog)
-        UpdateWrite ->
+        UpdateWrite scope ->
             foldl'
-                (\current item -> parentAction current key UpdateWrite columns item)
+                (\current item -> parentAction current key (UpdateWrite scope) columns item)
                 eval
                 (allForeignKeys catalog)
         TruncateWrite behavior _ ->
@@ -593,24 +605,24 @@ applyParentActions sid eval key kind columns =
                         case action of
                             DeleteWrite _ ->
                                 writeChild current (constraintStateTable state) (DeleteWrite DeleteAllRows) []
-                            UpdateWrite ->
+                            UpdateWrite _ ->
                                 writeChild
                                     current
                                     (constraintStateTable state)
-                                    UpdateWrite
+                                    (UpdateWrite UpdateFilteredRows)
                                     (foreignKeyChildColumns foreignKey)
                             _ -> current
                     SetNull ->
                         writeChild
                             current
                             (constraintStateTable state)
-                            UpdateWrite
+                            (UpdateWrite UpdateFilteredRows)
                             (foreignKeyChildColumns foreignKey)
                     SetDefault ->
                         writeChild
                             current
                             (constraintStateTable state)
-                            UpdateWrite
+                            (UpdateWrite UpdateFilteredRows)
                             (foreignKeyChildColumns foreignKey)
                     Restrict ->
                         addDeps
@@ -624,7 +636,7 @@ applyParentActions sid eval key kind columns =
         foreignKeyEventMatches action updatedParentColumns _parentKey _state foreignKey =
             case action of
                 DeleteWrite _ -> True
-                UpdateWrite ->
+                UpdateWrite _ ->
                     let relevant = referencedParentColumns session catalog foreignKey
                      in null updatedParentColumns
                             || null relevant
@@ -640,7 +652,7 @@ applyParentActions sid eval key kind columns =
         referentialAction action foreignKey =
             case action of
                 DeleteWrite _ -> foreignKeyOnDelete foreignKey
-                UpdateWrite -> foreignKeyOnUpdate foreignKey
+                UpdateWrite _ -> foreignKeyOnUpdate foreignKey
                 _ -> NoAction
 
         writeChild current childKey childKind childColumns =

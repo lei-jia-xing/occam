@@ -39,6 +39,7 @@ import Occam.Core (
     ReadMode (..),
     RelationKind (..),
     StatementId,
+    UpdateScope (..),
     WriteKind (..),
  )
 import Occam.Dependency.Resolve (resolveIndexKeys, resolveRelationKeys)
@@ -291,6 +292,8 @@ relationWriteDeps session catalog key kind columns =
                 writes =
                     case kind of
                         TruncateWrite {} -> Set.empty
+                        UpdateWrite UpdateAllRows ->
+                            relDataWrites relation
                         _ ->
                             relDataWrites relation
                                 `Set.union` relationColumnWriteDeps session catalog key relation columns

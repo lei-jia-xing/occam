@@ -37,6 +37,7 @@ module Occam.Core (
     TypeDef (..),
     SchemaDef (..),
     ConflictAction (..),
+    UpdateScope (..),
     DeleteScope (..),
     TruncateBehavior (..),
     TruncateIdentity (..),
@@ -288,6 +289,9 @@ data TriggerEffect
     | TriggerBarrier !ScopedBarrier
     deriving (Eq, Show)
 
+data UpdateScope = UpdateAllRows | UpdateFilteredRows
+    deriving (Eq, Ord, Show)
+
 data DeleteScope = DeleteAllRows | DeleteFilteredRows
     deriving (Eq, Ord, Show)
 
@@ -323,7 +327,7 @@ data ConflictAction = ConflictError | ConflictIgnore | ConflictReplace | Conflic
 
 data WriteKind
     = InsertWrite !ConflictAction
-    | UpdateWrite
+    | UpdateWrite !UpdateScope
     | DeleteWrite !DeleteScope
     | MergeWrite
     | TruncateWrite !TruncateBehavior !TruncateIdentity
@@ -680,6 +684,10 @@ instance FromJSON IndexRole where
     parseJSON = withBool "IndexRole" \primary ->
         pure (if primary then PrimaryIndex else SecondaryIndex)
 
+instance FromJSON UpdateScope where
+    parseJSON = withBool "UpdateScope" \allRows ->
+        pure (if allRows then UpdateAllRows else UpdateFilteredRows)
+
 instance FromJSON DeleteScope where
     parseJSON = withBool "DeleteScope" \allRows ->
         pure (if allRows then DeleteAllRows else DeleteFilteredRows)
@@ -904,7 +912,7 @@ instance FromJSON WriteKind where
         tag <- objectValue .: "kind"
         case tag of
             "insert" -> InsertWrite <$> objectValue .: "conflict"
-            "update" -> pure UpdateWrite
+            "update" -> UpdateWrite <$> objectValue .: "all"
             "delete" -> DeleteWrite <$> objectValue .: "all"
             "merge" -> pure MergeWrite
             "truncate" ->
