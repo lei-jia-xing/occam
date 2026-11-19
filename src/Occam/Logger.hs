@@ -206,8 +206,8 @@ formatBadge True lvl =
 
 plainBadge :: LogLevel -> BSC.ByteString
 plainBadge LevelDebug = "[DEBUG]"
-plainBadge LevelInfo = "[INFO ]"
-plainBadge LevelWarn = "[WARN ]"
+plainBadge LevelInfo = "[INFO] "
+plainBadge LevelWarn = "[WARN] "
 plainBadge LevelError = "[ERROR]"
 
 levelSGR :: LogLevel -> [SGR]
