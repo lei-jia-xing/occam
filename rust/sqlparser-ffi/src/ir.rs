@@ -283,6 +283,19 @@ pub enum OnCommitAction {
     Drop,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct SourceColumn {
+    pub source: NameRef,
+    pub column: Ident,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ViewColumnLineage {
+    pub column: Ident,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<SourceColumn>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewDef {
     pub name: Name,
@@ -292,6 +305,10 @@ pub struct ViewDef {
     pub sources: Vec<ReadFact>,
     pub if_not_exists: bool,
     pub or_replace: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_lineage: Vec<ViewColumnLineage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub condition_columns: Vec<SourceColumn>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

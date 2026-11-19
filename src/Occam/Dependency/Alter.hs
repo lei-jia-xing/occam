@@ -29,7 +29,6 @@ import Occam.Core (
     ForeignKey (..),
     Ident (..),
     PartitionLink (..),
-    ReadFact (..),
     ReadMode (..),
     RelationKind (..),
     StatementId,
@@ -43,6 +42,7 @@ import Occam.Dependency.Query (
     relationConstraintDeps,
     relationDefinitionDeps,
     relationReadDeps,
+    viewSourceRequirements,
  )
 import Occam.Dependency.Resolve (resolveRelationKeys)
 import Occam.Dependency.State (
@@ -89,10 +89,8 @@ introducedForeignKeysOf change =
                 ++ columnReferences column
         _ -> []
 
-{- | Views that read the dropped column, directly or through another view.
-The retained read columns make this precise for direct reads; transitive
-view dependencies are over-approximated because column lineage is not
-modelled.
+{- | Views that read the dropped column, directly or through another view,
+tracked precisely via column lineage across view layers.
 -}
 dropColumnDependentViews :: SessionState -> Catalog -> RelationKey -> Ident -> [RelationKey]
 dropColumnDependentViews session catalog tableKey column =
@@ -110,46 +108,41 @@ viewDependsOnColumn ::
     Ident ->
     RelationKey ->
     Bool
-viewDependsOnColumn session catalog visited tableKey column viewKey
-    | Set.member viewKey visited = False
+viewDependsOnColumn session catalog visited tableKey column viewKey =
+    viewTransitiveDependsOn session catalog visited tableKey column viewKey Nothing
+
+viewTransitiveDependsOn ::
+    SessionState ->
+    Catalog ->
+    Set RelationKey ->
+    RelationKey ->
+    Ident ->
+    RelationKey ->
+    Maybe (Set Ident) ->
+    Bool
+viewTransitiveDependsOn session catalog visited tableKey column currentKey requestedCols
+    | Set.member currentKey visited = False
     | otherwise =
-        case Map.lookup viewKey (catalogRelations catalog) of
+        case Map.lookup currentKey (catalogRelations catalog) of
             Just relation
                 | relKind relation `elem` [ViewRelation, MaterializedViewRelation] ->
-                    let seen = Set.insert viewKey visited
-                        sourceReads =
-                            [ (readFact, resolveRelationKeys session catalog (readSource readFact))
-                            | readFact <- relSourceReads relation
-                            ]
-                        direct =
-                            any
-                                ( \(readFact, keys) ->
-                                    tableKey `elem` keys
-                                        && (null (readColumns readFact) || column `elem` readColumns readFact)
-                                )
-                                sourceReads
-                        transitive =
-                            any
-                                ( \(_, keys) ->
-                                    any
-                                        ( \sourceKey ->
-                                            sourceKey /= tableKey
-                                                && viewDependsOnColumn session catalog seen tableKey column sourceKey
-                                        )
-                                        keys
-                                )
-                                sourceReads
-                        unresolved =
-                            any
-                                ( \reference ->
-                                    tableKey `elem` resolveRelationKeys session catalog reference
-                                )
-                                (Set.toList (relUnresolvedSources relation))
-                        noReadInfo =
-                            tableKey `Set.member` relSources relation
-                                && not (any (\(_, keys) -> tableKey `elem` keys) sourceReads)
-                     in direct || transitive || unresolved || noReadInfo
-            _ -> False
+                    let visited' = Set.insert currentKey visited
+                        reqs = viewSourceRequirements session catalog relation requestedCols
+                     in any (checkSource visited') (Map.toList reqs)
+                | otherwise ->
+                    currentKey == tableKey
+                        && case requestedCols of
+                            Nothing -> True
+                            Just cols -> Set.member column cols
+            Nothing -> False
+    where
+        checkSource visited' (sourceKey, neededCols)
+            | sourceKey == tableKey =
+                case neededCols of
+                    Nothing -> True
+                    Just cols -> Set.member column cols
+            | otherwise =
+                viewTransitiveDependsOn session catalog visited' tableKey column sourceKey neededCols
 
 processAlterTable :: StatementId -> Eval -> AlterTable -> Eval
 processAlterTable sid eval alter =

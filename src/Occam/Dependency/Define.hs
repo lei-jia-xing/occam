@@ -259,6 +259,8 @@ processDefineView sid eval definition =
                                 resolvedSourceKeys session catalog (viewSources definition)
                             , relUnresolvedSources = unresolved
                             , relSourceReads = viewSources definition
+                            , relColumnLineage = viewColumnLineage definition
+                            , relConditionColumns = viewConditionColumns definition
                             }
                     catalog1 = insertRelation key relation (clearRelationObjects key catalog)
                  in eval2 {evalCatalog = catalog1}

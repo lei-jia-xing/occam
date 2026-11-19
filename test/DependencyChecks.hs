@@ -754,6 +754,110 @@ tests =
             assertBool
                 "the dependent view is dropped with the column"
                 (not (has (StatementId 2) (dependenciesFor (StatementId 4) graph)))
+        , testCase
+            "transitive view column lineage distinguishes referenced from unreferenced base table columns on UPDATE"
+            $ do
+                let sql =
+                        BSC.unlines
+                            [ "CREATE TABLE t (a INT, b INT);"
+                            , "CREATE VIEW v1 AS SELECT a, b FROM t;"
+                            , "CREATE VIEW v2 AS SELECT a FROM v1;"
+                            , "UPDATE t SET b = 1;"
+                            , "UPDATE t SET a = 1;"
+                            , "SELECT a FROM v2;"
+                            ]
+                graph <- analyze PostgreSQL sql
+                let v2QueryDeps = dependenciesFor (StatementId 6) graph
+                assertBool
+                    "query on v2.a does not depend on UPDATE to unused column b"
+                    (not (has (StatementId 4) v2QueryDeps))
+                assertBool "query on v2.a depends on UPDATE to used column a" (has (StatementId 5) v2QueryDeps)
+        , testCase
+            "transitive view column lineage prevents false dependency on DROP COLUMN of unreferenced column"
+            $ do
+                let sql =
+                        BSC.unlines
+                            [ "CREATE TABLE t (a INT, b INT, c INT);"
+                            , "CREATE VIEW v1 AS SELECT a, b FROM t;"
+                            , "CREATE VIEW v2 AS SELECT a FROM v1;"
+                            , "ALTER TABLE t DROP COLUMN c CASCADE;"
+                            , "SELECT * FROM v2;"
+                            ]
+                graph <- analyze PostgreSQL sql
+                let alterDeps = dependenciesFor (StatementId 4) graph
+                    v2QueryDeps = dependenciesFor (StatementId 5) graph
+                assertBool "DROP COLUMN c does not depend on v1 definition" (not (has (StatementId 2) alterDeps))
+                assertBool "DROP COLUMN c does not depend on v2 definition" (not (has (StatementId 3) alterDeps))
+                assertBool "unaffected view v2 is not dropped by CASCADE" (has (StatementId 3) v2QueryDeps)
+        , testCase "transitive column aliasing across views correctly tracks source column" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT, b INT);"
+                        , "CREATE VIEW v1 AS SELECT a AS x, b AS y FROM t;"
+                        , "CREATE VIEW v2 AS SELECT x AS z FROM v1;"
+                        , "UPDATE t SET b = 10;"
+                        , "UPDATE t SET a = 20;"
+                        , "SELECT z FROM v2;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let v2QueryDeps = dependenciesFor (StatementId 6) graph
+            assertBool
+                "query on aliased column z does not depend on UPDATE to unaliased unused column b"
+                (not (has (StatementId 4) v2QueryDeps))
+            assertBool
+                "query on aliased column z depends on UPDATE to underlying column a"
+                (has (StatementId 5) v2QueryDeps)
+        , testCase "view condition column in WHERE clause creates dependency on filtered column" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT, b INT, c INT);"
+                        , "CREATE VIEW v1 AS SELECT a FROM t WHERE b > 0;"
+                        , "CREATE VIEW v2 AS SELECT a FROM v1;"
+                        , "UPDATE t SET c = 10;"
+                        , "UPDATE t SET b = 20;"
+                        , "SELECT a FROM v2;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let v2QueryDeps = dependenciesFor (StatementId 6) graph
+            assertBool
+                "query on v2 does not depend on unrelated column c"
+                (not (has (StatementId 4) v2QueryDeps))
+            assertBool
+                "query on v2 depends on condition column b in intermediate view"
+                (has (StatementId 5) v2QueryDeps)
+        , testCase "view with unexpanded SELECT * falls back to conservative dependencies" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT, b INT);"
+                        , "CREATE VIEW v1 AS SELECT * FROM t;"
+                        , "CREATE VIEW v2 AS SELECT a FROM v1;"
+                        , "UPDATE t SET b = 10;"
+                        , "SELECT a FROM v2;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let v2QueryDeps = dependenciesFor (StatementId 5) graph
+            assertBool
+                "query through SELECT * view conservatively depends on column b update"
+                (has (StatementId 4) v2QueryDeps)
+        , testCase "multi-table join in view isolates column updates by table source" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (id INT, a INT, b INT);"
+                        , "CREATE TABLE t2 (id INT, c INT, d INT);"
+                        , "CREATE VIEW v1 AS SELECT t1.a AS col_a, t2.c AS col_c FROM t1 JOIN t2 ON t1.id = t2.id;"
+                        , "CREATE VIEW v2 AS SELECT col_a FROM v1;"
+                        , "UPDATE t2 SET d = 1;"
+                        , "UPDATE t1 SET b = 1;"
+                        , "UPDATE t2 SET id = 1;"
+                        , "UPDATE t1 SET a = 1;"
+                        , "SELECT col_a FROM v2;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let v2QueryDeps = dependenciesFor (StatementId 9) graph
+            assertBool "v2 does not depend on t2.d update" (not (has (StatementId 5) v2QueryDeps))
+            assertBool "v2 does not depend on t1.b update" (not (has (StatementId 6) v2QueryDeps))
+            assertBool "v2 depends on join condition column t2.id update" (has (StatementId 7) v2QueryDeps)
+            assertBool "v2 depends on projected column t1.a update" (has (StatementId 8) v2QueryDeps)
         , testCase "DROP COLUMN drops indexes on that column but a rejected RESTRICT keeps them" $ do
             let cascadeSql =
                     BSC.unlines

@@ -647,6 +647,397 @@ pub(crate) fn visitor_relations<'a>(
     relations
 }
 
+fn collect_expr_col_parts(expr: &Expr, out: &mut Vec<Vec<String>>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            out.push(vec![ident.value.clone()]);
+            true
+        }
+        Expr::CompoundIdentifier(idents) => {
+            out.push(idents.iter().map(|i| i.value.clone()).collect());
+            true
+        }
+        Expr::Value(_) => true,
+        Expr::UnaryOp { expr, .. } => collect_expr_col_parts(expr, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_col_parts(left, out) && collect_expr_col_parts(right, out)
+        }
+        Expr::Nested(expr) => collect_expr_col_parts(expr, out),
+        Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Floor { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Extract { expr, .. } => collect_expr_col_parts(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_col_parts(expr, out)
+                && collect_expr_col_parts(low, out)
+                && collect_expr_col_parts(high, out)
+        }
+        Expr::In {
+            expr,
+            target: sqlparser::ast::InTarget::List(list),
+            ..
+        } => {
+            collect_expr_col_parts(expr, out) && list.iter().all(|e| collect_expr_col_parts(e, out))
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_none_or(|e| collect_expr_col_parts(e, out))
+                && conditions.iter().all(|cw| {
+                    collect_expr_col_parts(&cw.condition, out)
+                        && collect_expr_col_parts(&cw.result, out)
+                })
+                && else_result
+                    .as_ref()
+                    .is_none_or(|e| collect_expr_col_parts(e, out))
+        }
+        Expr::Function(func) => {
+            if func.over.is_some() || func.filter.is_some() {
+                return false;
+            }
+            match &func.args {
+                FunctionArguments::None => true,
+                FunctionArguments::Subquery(_) => false,
+                FunctionArguments::List(arg_list) => {
+                    for arg in &arg_list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } => {
+                                if !collect_expr_col_parts(e, out) {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    true
+                }
+            }
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_expr_col_parts(expr, out) && collect_expr_col_parts(pattern, out)
+        }
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            collect_expr_col_parts(expr, out)
+                && trim_what
+                    .as_ref()
+                    .is_none_or(|e| collect_expr_col_parts(e, out))
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_expr_col_parts(expr, out)
+                && substring_from
+                    .as_ref()
+                    .is_none_or(|e| collect_expr_col_parts(e, out))
+                && substring_for
+                    .as_ref()
+                    .is_none_or(|e| collect_expr_col_parts(e, out))
+        }
+        _ => false,
+    }
+}
+
+fn resolve_col_parts(
+    parts: &[String],
+    column_scope: usize,
+    relations: &[(&ir::NameRef, &crate::edits::RelationUse)],
+    aliases: &[crate::edits::AliasScope],
+    rules: &ir::IdentifierRules,
+    out: &mut Vec<ir::SourceColumn>,
+) -> bool {
+    let Some((col_name, qualifier)) = parts.split_last() else {
+        return false;
+    };
+    let mut matched = false;
+    for (reference, usage) in relations {
+        if relation_qualifier_matches(reference, usage, qualifier, column_scope, aliases) {
+            let sc = ir::SourceColumn {
+                source: (*reference).clone(),
+                column: canonical_ident(
+                    &sqlparser::ast::Ident::new(col_name),
+                    rules,
+                    ir::IdentifierClass::Column,
+                ),
+            };
+            if !out.contains(&sc) {
+                out.push(sc);
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+pub(crate) fn extract_view_lineage(
+    query: &Query,
+    explicit_columns: Option<&[ir::Ident]>,
+    visitor: &AnalysisVisitor<'_>,
+    excluded: &[Span],
+    rules: &ir::IdentifierRules,
+) -> (Vec<ir::ViewColumnLineage>, Vec<ir::SourceColumn>) {
+    if query.with.is_some() {
+        return (Vec::new(), Vec::new());
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    if select.from.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    for twj in &select.from {
+        if !is_plain_table_factor(&twj.relation) {
+            return (Vec::new(), Vec::new());
+        }
+        for join in &twj.joins {
+            if !is_plain_table_factor(&join.relation) {
+                return (Vec::new(), Vec::new());
+            }
+        }
+    }
+    if select.projection.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    for item in &select.projection {
+        if matches!(
+            item,
+            SelectItem::Wildcard(..) | SelectItem::QualifiedWildcard(..)
+        ) {
+            return (Vec::new(), Vec::new());
+        }
+    }
+
+    let output_names: Vec<ir::Ident> = match explicit_columns {
+        Some(names) if !names.is_empty() => names.to_vec(),
+        _ => match select_output_columns(select, rules) {
+            Some(names) => names,
+            None => return (Vec::new(), Vec::new()),
+        },
+    };
+    if output_names.len() != select.projection.len() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let relations = visitor_relations(visitor, excluded);
+    if relations.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let column_scope = relations[0].1.scope;
+
+    let mut column_lineage = Vec::new();
+    for (i, item) in select.projection.iter().enumerate() {
+        let Some(expr) = select_item_expr(item) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut parts = Vec::new();
+        if !collect_expr_col_parts(expr, &mut parts) {
+            column_lineage.push(ir::ViewColumnLineage {
+                column: output_names[i].clone(),
+                sources: None,
+            });
+        } else {
+            let mut col_sources = Vec::new();
+            let mut ok = true;
+            for part in &parts {
+                if !resolve_col_parts(
+                    part,
+                    column_scope,
+                    &relations,
+                    &visitor.aliases,
+                    rules,
+                    &mut col_sources,
+                ) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                column_lineage.push(ir::ViewColumnLineage {
+                    column: output_names[i].clone(),
+                    sources: Some(col_sources),
+                });
+            } else {
+                column_lineage.push(ir::ViewColumnLineage {
+                    column: output_names[i].clone(),
+                    sources: None,
+                });
+            }
+        }
+    }
+
+    let mut cond_parts = Vec::new();
+    let mut cond_ok = true;
+
+    if let Some(selection) = &select.selection
+        && !collect_expr_col_parts(selection, &mut cond_parts)
+    {
+        cond_ok = false;
+    }
+
+    if cond_ok {
+        for twj in &select.from {
+            for join in &twj.joins {
+                match &join.join_operator {
+                    sqlparser::ast::JoinOperator::Join(c)
+                    | sqlparser::ast::JoinOperator::Inner(c)
+                    | sqlparser::ast::JoinOperator::Left(c)
+                    | sqlparser::ast::JoinOperator::LeftOuter(c)
+                    | sqlparser::ast::JoinOperator::Right(c)
+                    | sqlparser::ast::JoinOperator::RightOuter(c)
+                    | sqlparser::ast::JoinOperator::FullOuter(c)
+                    | sqlparser::ast::JoinOperator::CrossJoin(c)
+                    | sqlparser::ast::JoinOperator::Semi(c)
+                    | sqlparser::ast::JoinOperator::LeftSemi(c)
+                    | sqlparser::ast::JoinOperator::RightSemi(c)
+                    | sqlparser::ast::JoinOperator::Anti(c)
+                    | sqlparser::ast::JoinOperator::LeftAnti(c)
+                    | sqlparser::ast::JoinOperator::RightAnti(c)
+                    | sqlparser::ast::JoinOperator::StraightJoin(c) => match c {
+                        sqlparser::ast::JoinConstraint::On(expr) => {
+                            if !collect_expr_col_parts(expr, &mut cond_parts) {
+                                cond_ok = false;
+                                break;
+                            }
+                        }
+                        sqlparser::ast::JoinConstraint::Using(columns) => {
+                            for col in columns {
+                                let parts: Vec<String> = col
+                                    .0
+                                    .iter()
+                                    .filter_map(|p| match p {
+                                        sqlparser::ast::ObjectNamePart::Identifier(i) => {
+                                            Some(i.value.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if !parts.is_empty() {
+                                    cond_parts.push(parts);
+                                }
+                            }
+                        }
+                        sqlparser::ast::JoinConstraint::UsingAlias(columns, _) => {
+                            for col in columns {
+                                let parts: Vec<String> = col
+                                    .0
+                                    .iter()
+                                    .filter_map(|p| match p {
+                                        sqlparser::ast::ObjectNamePart::Identifier(i) => {
+                                            Some(i.value.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if !parts.is_empty() {
+                                    cond_parts.push(parts);
+                                }
+                            }
+                        }
+                        sqlparser::ast::JoinConstraint::Natural
+                        | sqlparser::ast::JoinConstraint::None => {}
+                    },
+                    sqlparser::ast::JoinOperator::AsOf {
+                        match_condition,
+                        constraint,
+                    } => {
+                        if !collect_expr_col_parts(match_condition, &mut cond_parts) {
+                            cond_ok = false;
+                            break;
+                        }
+                        if let sqlparser::ast::JoinConstraint::On(expr) = constraint
+                            && !collect_expr_col_parts(expr, &mut cond_parts)
+                        {
+                            cond_ok = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if cond_ok {
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) => {
+                for expr in exprs {
+                    if !collect_expr_col_parts(expr, &mut cond_parts) {
+                        cond_ok = false;
+                        break;
+                    }
+                }
+            }
+            GroupByExpr::All(_) => {
+                cond_ok = false;
+            }
+        }
+    }
+
+    if cond_ok
+        && let Some(having) = &select.having
+        && !collect_expr_col_parts(having, &mut cond_parts)
+    {
+        cond_ok = false;
+    }
+
+    if cond_ok && let Some(order_by) = &query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind {
+            for item in expressions {
+                if !collect_expr_col_parts(&item.expr, &mut cond_parts) {
+                    cond_ok = false;
+                    break;
+                }
+            }
+        } else {
+            cond_ok = false;
+        }
+    }
+
+    if !cond_ok {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut condition_columns = Vec::new();
+    for part in &cond_parts {
+        if !resolve_col_parts(
+            part,
+            column_scope,
+            &relations,
+            &visitor.aliases,
+            rules,
+            &mut condition_columns,
+        ) {
+            return (Vec::new(), Vec::new());
+        }
+    }
+
+    (column_lineage, condition_columns)
+}
+
 pub(crate) fn has_unmodeled_relation(collector: &AnalysisVisitor<'_>, excluded: &[Span]) -> bool {
     collector.unmodeled_table_source
         || collector
@@ -4010,17 +4401,32 @@ pub(crate) fn analyze_statement(
             if let Some((name, temporary)) =
                 definition_name(&create.name, dialect, rules, create.temporary)
             {
-                let columns = if create.columns.is_empty() {
-                    query_output_columns(&create.query, rules).unwrap_or_default()
+                let explicit_columns = if create.columns.is_empty() {
+                    None
                 } else {
-                    create
-                        .columns
-                        .iter()
-                        .map(|column| {
-                            canonical_ident(&column.name, rules, ir::IdentifierClass::Column)
-                        })
-                        .collect()
+                    Some(
+                        create
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                canonical_ident(&column.name, rules, ir::IdentifierClass::Column)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 };
+                let columns = explicit_columns
+                    .as_deref()
+                    .map(|cols| cols.to_vec())
+                    .unwrap_or_else(|| {
+                        query_output_columns(&create.query, rules).unwrap_or_default()
+                    });
+                let (column_lineage, condition_columns) = extract_view_lineage(
+                    &create.query,
+                    explicit_columns.as_deref(),
+                    &visitor,
+                    &excluded,
+                    rules,
+                );
                 facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
                     name,
                     temporary,
@@ -4029,6 +4435,8 @@ pub(crate) fn analyze_statement(
                     sources,
                     if_not_exists: create.if_not_exists,
                     or_replace: create.or_replace || create.or_alter,
+                    column_lineage,
+                    condition_columns,
                 }));
                 if create.to.is_some() {
                     facts.barriers.push(global_barrier(
@@ -4234,16 +4642,31 @@ pub(crate) fn analyze_statement(
                     if let Some((name, temporary)) =
                         definition_name(view_name, dialect, rules, false)
                     {
-                        let columns = if columns.is_empty() {
-                            query_output_columns(query, rules).unwrap_or_default()
+                        let explicit_columns = if columns.is_empty() {
+                            None
                         } else {
-                            columns
-                                .iter()
-                                .map(|column| {
-                                    canonical_ident(column, rules, ir::IdentifierClass::Column)
-                                })
-                                .collect()
+                            Some(
+                                columns
+                                    .iter()
+                                    .map(|column| {
+                                        canonical_ident(column, rules, ir::IdentifierClass::Column)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
                         };
+                        let columns = explicit_columns
+                            .as_deref()
+                            .map(|cols| cols.to_vec())
+                            .unwrap_or_else(|| {
+                                query_output_columns(query, rules).unwrap_or_default()
+                            });
+                        let (column_lineage, condition_columns) = extract_view_lineage(
+                            query,
+                            explicit_columns.as_deref(),
+                            &visitor,
+                            &excluded,
+                            rules,
+                        );
                         facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
                             name,
                             temporary,
@@ -4252,6 +4675,8 @@ pub(crate) fn analyze_statement(
                             sources,
                             if_not_exists: false,
                             or_replace: true,
+                            column_lineage,
+                            condition_columns,
                         }));
                         add_unmodeled_barriers(&mut facts, &visitor, &excluded);
                     } else {

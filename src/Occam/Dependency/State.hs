@@ -78,10 +78,12 @@ import Occam.Core (
     SearchPathEntry (..),
     SessionInit (..),
     SessionValue (..),
+    SourceColumn (..),
     StatementId,
     TriggerBody,
     TriggerEvent,
     TriggerTiming,
+    ViewColumnLineage (..),
     WriteKind (..),
  )
 
@@ -167,6 +169,8 @@ data RelationState = RelationState
     , relIndexes :: !(Set IndexKey)
     , relTriggers :: !(Set TriggerKey)
     , relConstraints :: !(Set ConstraintKey)
+    , relColumnLineage :: ![ViewColumnLineage]
+    , relConditionColumns :: ![SourceColumn]
     }
     deriving (Eq, Show)
 
@@ -262,6 +266,8 @@ newRelation kind =
         , relIndexes = Set.empty
         , relTriggers = Set.empty
         , relConstraints = Set.empty
+        , relColumnLineage = []
+        , relConditionColumns = []
         }
 
 -- Session and transaction state

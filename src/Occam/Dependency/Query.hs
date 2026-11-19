@@ -10,6 +10,7 @@ module Occam.Dependency.Query (
     childrenOf,
     partitionChildrenOf,
     inheritChildrenOf,
+    viewSourceRequirements,
     relationReadDeps,
     relationWriteDeps,
     relationAllDeps,
@@ -23,7 +24,7 @@ module Occam.Dependency.Query (
 ) where
 
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isNothing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Occam.Core (
@@ -36,10 +37,13 @@ import Occam.Core (
     IndexSchemaPlacement (..),
     Name (..),
     NameRef (..),
+    ReadFact (..),
     ReadMode (..),
     RelationKind (..),
+    SourceColumn (..),
     StatementId,
     UpdateScope (..),
+    ViewColumnLineage (..),
     WriteKind (..),
  )
 import Occam.Dependency.Resolve (resolveIndexKeys, resolveRelationKeys)
@@ -220,12 +224,109 @@ childrenWith session catalog key parents =
             (Set.toList (parents relation))
     ]
 
+viewSourceRequirements ::
+    SessionState ->
+    Catalog ->
+    RelationState ->
+    Maybe (Set Ident) ->
+    Map.Map RelationKey (Maybe (Set Ident))
+viewSourceRequirements session catalog relation requestedCols =
+    if null (relColumnLineage relation)
+        then conservativeReqs
+        else case requestedCols of
+            Nothing ->
+                requirementsForColumns (map lineageColumn (relColumnLineage relation))
+            Just cols ->
+                requirementsForColumns (Set.toList cols)
+    where
+        lineageMap =
+            Map.fromList
+                [(lineageColumn l, l) | l <- relColumnLineage relation]
+
+        combineReq Nothing _ = Nothing
+        combineReq _ Nothing = Nothing
+        combineReq (Just a) (Just b) = Just (a `Set.union` b)
+
+        conservativeReqs =
+            let fromReads =
+                    Map.fromListWith
+                        combineReq
+                        [ ( sourceKey
+                          , if null (readColumns readFact)
+                                then Nothing
+                                else Just (Set.fromList (readColumns readFact))
+                          )
+                        | readFact <- relSourceReads relation
+                        , sourceKey <- resolveRelationKeys session catalog (readSource readFact)
+                        ]
+                allSourceKeys =
+                    relSources relation
+                        `Set.union` Set.fromList
+                            [ sourceKey
+                            | reference <- Set.toList (relUnresolvedSources relation)
+                            , sourceKey <- resolveRelationKeys session catalog reference
+                            , Map.member sourceKey (catalogRelations catalog)
+                            ]
+             in Set.foldl'
+                    (\m k -> if Map.member k m then m else Map.insert k Nothing m)
+                    fromReads
+                    allSourceKeys
+
+        requirementsForColumns cols =
+            let lookupCol col = Map.lookup col lineageMap
+                lineages = map lookupCol cols
+                hasUnknown = any isUnknown lineages
+                isUnknown Nothing = True
+                isUnknown (Just l) = isNothing (lineageSources l)
+             in if hasUnknown
+                    then conservativeReqs
+                    else
+                        let collectedSCs =
+                                concat
+                                    [ scs
+                                    | Just l <- lineages
+                                    , Just scs <- [lineageSources l]
+                                    ]
+                            allSCs = collectedSCs ++ relConditionColumns relation
+                            baseMap =
+                                Map.fromList
+                                    [ (sourceKey, Just Set.empty)
+                                    | sourceKey <- Set.toList (relSources relation)
+                                    ]
+                            unresolvedBase =
+                                Map.fromList
+                                    [ (sourceKey, Just Set.empty)
+                                    | reference <- Set.toList (relUnresolvedSources relation)
+                                    , sourceKey <- resolveRelationKeys session catalog reference
+                                    , Map.member sourceKey (catalogRelations catalog)
+                                    ]
+                            initMap = baseMap `Map.union` unresolvedBase
+                         in foldl' addSourceCol initMap allSCs
+
+        addSourceCol m sc =
+            let keys = resolveRelationKeys session catalog (sourceColumnRelation sc)
+                col = sourceColumnName sc
+             in foldl'
+                    ( \acc k ->
+                        Map.insertWith
+                            combineReq
+                            k
+                            (Just (Set.singleton col))
+                            acc
+                    )
+                    m
+                    keys
+
 relationReadDeps ::
     SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Bool -> Set StatementId
 relationReadDeps session catalog key mode columns only =
-    go Set.empty key mode
+    go Set.empty key mode initialCols
     where
-        go seen current currentMode
+        initialCols =
+            if null columns
+                then Nothing
+                else Just (Set.fromList columns)
+        go seen current currentMode currentCols
             | Set.member current seen = Set.empty
             | otherwise =
                 case lookupRelation catalog current of
@@ -238,8 +339,21 @@ relationReadDeps session catalog key mode columns only =
                             dataDeps =
                                 case currentMode of
                                     ReadData ->
-                                        relDataWrites relation
-                                            `Set.union` relationColumnWriteDeps session catalog current relation columns
+                                        case currentCols of
+                                            Nothing ->
+                                                relDataWrites relation
+                                                    `Set.union` Set.unions (Map.elems (relColumnWrites relation))
+                                            Just cols
+                                                | Set.null cols ->
+                                                    relDataWrites relation
+                                                | otherwise ->
+                                                    relDataWrites relation
+                                                        `Set.union` relationColumnWriteDeps
+                                                            session
+                                                            catalog
+                                                            current
+                                                            relation
+                                                            (Set.toList cols)
                                     ReadRowCount ->
                                         relCardinalityWrites relation
                                     ReadRowExistence ->
@@ -251,22 +365,15 @@ relationReadDeps session catalog key mode columns only =
                             -- View sources are evaluated with ReadData as view definitions
                             -- may filter or project expressions on source columns.
                             sourceDeps =
-                                Set.unions
-                                    [ go seen' source ReadData
-                                    | relKind relation == ViewRelation
-                                    , source <- Set.toList (relSources relation)
-                                    ]
-                            -- A source that did not exist when the view was defined
-                            -- is resolved against the catalog at read time, so a
-                            -- later definition is still followed.
-                            unresolvedDeps =
-                                Set.unions
-                                    [ go seen' sourceKey ReadData
-                                    | relKind relation == ViewRelation
-                                    , reference <- Set.toList (relUnresolvedSources relation)
-                                    , sourceKey <- resolveRelationKeys session catalog reference
-                                    , Map.member sourceKey (catalogRelations catalog)
-                                    ]
+                                if relKind relation == ViewRelation
+                                    then
+                                        let reqs = viewSourceRequirements session catalog relation currentCols
+                                         in Set.unions
+                                                [ go seen' sourceKey ReadData neededCols
+                                                | (sourceKey, neededCols) <- Map.toList reqs
+                                                , Map.member sourceKey (catalogRelations catalog)
+                                                ]
+                                    else Set.empty
                             -- Partition/inheritance children contribute their
                             -- rows to the parent read (definitions always,
                             -- writes in data mode), transitively through
@@ -276,13 +383,12 @@ relationReadDeps session catalog key mode columns only =
                                     then Set.empty
                                     else
                                         Set.unions
-                                            [ go seen' child currentMode
+                                            [ go seen' child currentMode currentCols
                                             | child <- childrenOf session catalog current
                                             ]
                          in base
                                 `Set.union` dataDeps
                                 `Set.union` sourceDeps
-                                `Set.union` unresolvedDeps
                                 `Set.union` childDeps
 
 relationWriteDeps ::

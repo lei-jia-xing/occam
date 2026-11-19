@@ -1946,6 +1946,92 @@ fn create_view_records_projection_columns_and_definition_reads() {
 }
 
 #[test]
+fn view_column_lineage_and_condition_columns() {
+    let units = parse(
+        "CREATE VIEW v AS SELECT t1.a AS col_a, t2.b AS col_b FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.active = 1;",
+        DialectKind::PostgreSql,
+    )
+    .unwrap();
+    let view = facts(&units[0])
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            CatalogOp::DefineView(view) => Some(view),
+            _ => None,
+        })
+        .expect("view definition");
+
+    assert_eq!(
+        view.columns,
+        vec![Ident("col_a".to_string()), Ident("col_b".to_string())]
+    );
+    assert_eq!(view.column_lineage.len(), 2);
+    assert_eq!(view.column_lineage[0].column, Ident("col_a".to_string()));
+    assert_eq!(
+        view.column_lineage[0].sources,
+        Some(vec![SourceColumn {
+            source: ir::NameRef {
+                name: ir::Name(vec![Ident("t1".to_string())]),
+                temp: false,
+            },
+            column: Ident("a".to_string()),
+        }])
+    );
+    assert_eq!(view.column_lineage[1].column, Ident("col_b".to_string()));
+    assert_eq!(
+        view.column_lineage[1].sources,
+        Some(vec![SourceColumn {
+            source: ir::NameRef {
+                name: ir::Name(vec![Ident("t2".to_string())]),
+                temp: false,
+            },
+            column: Ident("b".to_string()),
+        }])
+    );
+
+    // Condition columns: t1.id, t2.id, t1.active
+    assert_eq!(view.condition_columns.len(), 3);
+    assert!(view.condition_columns.contains(&SourceColumn {
+        source: ir::NameRef {
+            name: ir::Name(vec![Ident("t1".to_string())]),
+            temp: false,
+        },
+        column: Ident("id".to_string()),
+    }));
+    assert!(view.condition_columns.contains(&SourceColumn {
+        source: ir::NameRef {
+            name: ir::Name(vec![Ident("t2".to_string())]),
+            temp: false,
+        },
+        column: Ident("id".to_string()),
+    }));
+    assert!(view.condition_columns.contains(&SourceColumn {
+        source: ir::NameRef {
+            name: ir::Name(vec![Ident("t1".to_string())]),
+            temp: false,
+        },
+        column: Ident("active".to_string()),
+    }));
+
+    // Wildcard view falls back to empty lineage
+    let wildcard_units = parse(
+        "CREATE VIEW v_star AS SELECT * FROM t;",
+        DialectKind::PostgreSql,
+    )
+    .unwrap();
+    let star_view = facts(&wildcard_units[0])
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            CatalogOp::DefineView(view) => Some(view),
+            _ => None,
+        })
+        .expect("star view definition");
+    assert!(star_view.column_lineage.is_empty());
+    assert!(star_view.condition_columns.is_empty());
+}
+
+#[test]
 fn sibling_subquery_aliases_do_not_leak_columns() {
     let units = parse(
         "SELECT (SELECT x.id FROM a AS x), (SELECT x.name FROM b AS x) FROM c;",

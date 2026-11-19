@@ -22,6 +22,8 @@ module Occam.Core (
     OnCommitAction (..),
     ColumnDef (..),
     TableDef (..),
+    SourceColumn (..),
+    ViewColumnLineage (..),
     ViewDef (..),
     IndexRef (..),
     IndexDef (..),
@@ -79,7 +81,9 @@ import Data.Aeson (
     withBool,
     withObject,
     withText,
+    (.!=),
     (.:),
+    (.:?),
  )
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
@@ -223,6 +227,18 @@ data TableDef = TableDef
     }
     deriving (Eq, Show)
 
+data SourceColumn = SourceColumn
+    { sourceColumnRelation :: !NameRef
+    , sourceColumnName :: !Ident
+    }
+    deriving (Eq, Ord, Show)
+
+data ViewColumnLineage = ViewColumnLineage
+    { lineageColumn :: !Ident
+    , lineageSources :: !(Maybe [SourceColumn])
+    }
+    deriving (Eq, Show)
+
 data ViewDef = ViewDef
     { viewName :: !Name
     , viewTemporary :: !Bool
@@ -231,6 +247,8 @@ data ViewDef = ViewDef
     , viewSources :: ![ReadFact]
     , viewIfNotExists :: !Bool
     , viewOrReplace :: !Bool
+    , viewColumnLineage :: ![ViewColumnLineage]
+    , viewConditionColumns :: ![SourceColumn]
     }
     deriving (Eq, Show)
 
@@ -771,6 +789,18 @@ instance FromJSON TableDef where
             <*> objectValue .: "if_not_exists"
             <*> objectValue .: "or_replace"
 
+instance FromJSON SourceColumn where
+    parseJSON = withObject "SourceColumn" \objectValue ->
+        SourceColumn
+            <$> objectValue .: "source"
+            <*> objectValue .: "column"
+
+instance FromJSON ViewColumnLineage where
+    parseJSON = withObject "ViewColumnLineage" \objectValue ->
+        ViewColumnLineage
+            <$> objectValue .: "column"
+            <*> objectValue .:? "sources"
+
 instance FromJSON ViewDef where
     parseJSON = withObject "ViewDef" \objectValue ->
         ViewDef
@@ -781,6 +811,8 @@ instance FromJSON ViewDef where
             <*> objectValue .: "sources"
             <*> objectValue .: "if_not_exists"
             <*> objectValue .: "or_replace"
+            <*> (objectValue .:? "column_lineage" .!= [])
+            <*> (objectValue .:? "condition_columns" .!= [])
 
 instance FromJSON IndexRef where
     parseJSON = withObject "IndexRef" \objectValue -> do

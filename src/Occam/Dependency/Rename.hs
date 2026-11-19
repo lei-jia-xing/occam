@@ -27,9 +27,11 @@ import Occam.Core (
     ReadFact (..),
     RelationKind (..),
     RenameOp (..),
+    SourceColumn (..),
     StatementId,
     TriggerBody (..),
     TriggerEffect (..),
+    ViewColumnLineage (..),
  )
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Query (relationAllDeps, relationConstraintDeps, schemaPrefixDeps)
@@ -163,6 +165,14 @@ processRename sid eval renameOp =
                                                 writes
                                                 (Map.delete from (relColumnWrites relation))
                                 , relSchemaWrites = Set.insert sid (relSchemaWrites relation)
+                                , relColumnLineage =
+                                    map
+                                        ( \lineage ->
+                                            if lineageColumn lineage == from
+                                                then lineage {lineageColumn = to}
+                                                else lineage
+                                        )
+                                        (relColumnLineage relation)
                                 }
                         catalog1 =
                             currentCatalog
@@ -304,18 +314,32 @@ updateViewSources session resolutionCatalog oldKey newKey catalog =
                             Set.map updateUnresolved (relUnresolvedSources relation)
                         , relSourceReads =
                             map updateRead (relSourceReads relation)
+                        , relColumnLineage =
+                            map updateLineage (relColumnLineage relation)
+                        , relConditionColumns =
+                            map updateSourceCol (relConditionColumns relation)
                         }
                 )
                 (catalogRelations catalog)
         }
     where
         newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+        resolvesToOldKey ref =
+            oldKey `elem` resolveRelationKeys session resolutionCatalog ref
+        updateSourceCol sc
+            | resolvesToOldKey (sourceColumnRelation sc) =
+                sc {sourceColumnRelation = newReference}
+            | otherwise = sc
+        updateLineage lineage =
+            lineage
+                { lineageSources = fmap (map updateSourceCol) (lineageSources lineage)
+                }
         updateUnresolved reference
             | resolveRelationKeys session resolutionCatalog reference == [oldKey] =
                 newReference
             | otherwise = reference
         updateRead readFact
-            | oldKey `elem` resolveRelationKeys session resolutionCatalog (readSource readFact) =
+            | resolvesToOldKey (readSource readFact) =
                 readFact {readSource = newReference}
             | otherwise = readFact
 
@@ -383,10 +407,21 @@ renameSourceReadColumns ::
 renameSourceReadColumns session catalog key rename relation =
     relation
         { relSourceReads = map renameRead (relSourceReads relation)
+        , relColumnLineage = map renameLineage (relColumnLineage relation)
+        , relConditionColumns = map renameSourceCol (relConditionColumns relation)
         }
     where
+        resolvesToKey ref = key `elem` resolveRelationKeys session catalog ref
+        renameSourceCol sc
+            | resolvesToKey (sourceColumnRelation sc) =
+                sc {sourceColumnName = rename (sourceColumnName sc)}
+            | otherwise = sc
+        renameLineage lineage =
+            lineage
+                { lineageSources = fmap (map renameSourceCol) (lineageSources lineage)
+                }
         renameRead readFact
-            | key `elem` resolveRelationKeys session catalog (readSource readFact) =
+            | resolvesToKey (readSource readFact) =
                 readFact {readColumns = map rename (readColumns readFact)}
             | otherwise = readFact
 
