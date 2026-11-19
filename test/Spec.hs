@@ -396,7 +396,7 @@ phase5Tests =
                 assertEqual ("reduction failed: " ++ err) ExitSuccess code
                 assertBool
                     "stdout polluted with log output"
-                    (not (any (`isInfixOf` out) ["[DEBUG]", "[INFO ", "[WARN ", "[ERROR]"]))
+                    (not (any (`isInfixOf` out) ["DEBUG ", "INFO ", "WARN ", "ERROR "]))
                 assertBool "stdout missing reduced SQL" ("INSERT" `isInfixOf` out)
                 assertBool "expected logs on stderr" (not (null err))
         , testCase "--log-level debug emits logs in text mode" $
@@ -406,7 +406,7 @@ phase5Tests =
                 assertEqual ("reduction failed: " ++ err) ExitSuccess code
                 -- No component emits debug-level messages yet, so INFO visibility is the
                 -- observable proof the flag took effect (text mode used to force WARN).
-                assertBool "text mode ignored --log-level debug" ("[INFO " `isInfixOf` err)
+                assertBool "text mode ignored --log-level debug" ("INFO " `isInfixOf` err)
         , testCase "--dump-facts emits per-statement JSON and stays hidden from --help" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
                 (helpCode, helpOut, _) <- runOccamCLI ["--help"]

@@ -4,6 +4,7 @@ module Occam.Logger (
     LogConfig (..),
     Logger (..),
     defaultLogConfig,
+    resolveLogConfig,
     logDebug,
     logInfo,
     logWarn,
@@ -17,18 +18,15 @@ module Occam.Logger (
     newFastLogger,
 ) where
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, finally)
 import Control.Monad (when)
-import Data.Aeson (FromJSON, ToJSON (..), Value (..), encode, object, (.=))
+import Data.Aeson (FromJSON, ToJSON (..), Value (String), encode, object, (.=))
 import Data.Aeson.Key qualified as Key
-import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BSL
 import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time.Clock (getCurrentTime)
-import Data.Time.Format (defaultTimeLocale, formatTime)
 import GHC.Generics (Generic)
 import System.Console.ANSI (
     Color (..),
@@ -42,24 +40,22 @@ import System.Console.ANSI (
 import System.Environment (lookupEnv)
 import System.IO (stderr)
 import System.Log.FastLogger (
+    FormattedTime,
+    LogStr,
     LoggerSet,
     defaultBufSize,
     flushLogStr,
     newStderrLoggerSet,
-    pushLogStr,
+    newTimeCache,
+    pushLogStrLn,
     rmLoggerSet,
     toLogStr,
  )
 
-data LogLevel
-    = LevelDebug
-    | LevelInfo
-    | LevelWarn
-    | LevelError
+data LogLevel = LevelDebug | LevelInfo | LevelWarn | LevelError
     deriving (Eq, Ord, Show, Read, Generic)
 
 instance ToJSON LogLevel where
-    toJSON :: LogLevel -> Value
     toJSON LevelDebug = "debug"
     toJSON LevelInfo = "info"
     toJSON LevelWarn = "warn"
@@ -67,9 +63,7 @@ instance ToJSON LogLevel where
 
 instance FromJSON LogLevel
 
-data LogFormat
-    = FormatText
-    | FormatJSON
+data LogFormat = FormatText | FormatJSON
     deriving (Eq, Show, Read, Generic, ToJSON, FromJSON)
 
 data LogConfig = LogConfig
@@ -80,12 +74,7 @@ data LogConfig = LogConfig
     deriving (Eq, Show)
 
 defaultLogConfig :: LogConfig
-defaultLogConfig =
-    LogConfig
-        { logMinLevel = LevelInfo
-        , logFormat = FormatText
-        , logUseColor = True
-        }
+defaultLogConfig = LogConfig LevelInfo FormatText True
 
 data Logger = Logger
     { loggerConfig :: !LogConfig
@@ -94,124 +83,94 @@ data Logger = Logger
     }
 
 nullLogger :: Logger
-nullLogger =
+nullLogger = Logger defaultLogConfig (\_ _ _ _ -> pure ()) (pure ())
+
+data LogRecord = LogRecord
+    { timestamp :: !Text
+    , level :: !LogLevel
+    , component :: !Text
+    , message :: !Text
+    , metadata :: !Value
+    }
+    deriving (Generic, ToJSON)
+
+logDebug, logInfo, logWarn, logError :: Logger -> Text -> Text -> IO ()
+logDebug l c m = logDebug' l c m []
+logInfo l c m = logInfo' l c m []
+logWarn l c m = logWarn' l c m []
+logError l c m = logError' l c m []
+
+logDebug', logInfo', logWarn', logError' :: Logger -> Text -> Text -> [(Text, Value)] -> IO ()
+logDebug' l = logAt l LevelDebug
+logInfo' l = logAt l LevelInfo
+logWarn' l = logAt l LevelWarn
+logError' l = logAt l LevelError
+
+logAt :: Logger -> LogLevel -> Text -> Text -> [(Text, Value)] -> IO ()
+logAt Logger {..} lvl comp msg meta =
+    when (logMinLevel loggerConfig <= lvl) $ loggerAction lvl comp msg meta
+
+resolveLogConfig :: LogConfig -> IO LogConfig
+resolveLogConfig cfg = do
+    supportsColor <- (&&) <$> hSupportsANSI stderr <*> (isNothing <$> lookupEnv "NO_COLOR")
+    pure cfg {logUseColor = logUseColor cfg && supportsColor}
+
+withLogger :: LogConfig -> (Logger -> IO a) -> IO a
+withLogger rawCfg action = do
+    cfg <- resolveLogConfig rawCfg
+    timeCache <- newTimeCache "%Y-%m-%d %H:%M:%S"
+    bracket (newStderrLoggerSet defaultBufSize) rmLoggerSet \lset -> do
+        let logger = newFastLogger cfg timeCache lset
+        action logger `finally` loggerFlush logger
+
+newFastLogger :: LogConfig -> IO FormattedTime -> LoggerSet -> Logger
+newFastLogger cfg@LogConfig {..} getTime lset =
     Logger
-        { loggerConfig = defaultLogConfig
-        , loggerAction = \_ _ _ _ -> pure ()
-        , loggerFlush = pure ()
+        { loggerConfig = cfg
+        , loggerAction = \lvl comp msg meta -> do
+            now <- getTime
+            pushLogStrLn lset $ case logFormat of
+                FormatJSON -> formatJson now lvl comp msg meta
+                FormatText -> formatText logUseColor now lvl comp msg meta
+        , loggerFlush = flushLogStr lset
         }
 
-logDebug :: Logger -> Text -> Text -> IO ()
-logDebug l comp msg = logDebug' l comp msg []
+formatJson :: FormattedTime -> LogLevel -> Text -> Text -> [(Text, Value)] -> LogStr
+formatJson now lvl comp msg meta =
+    toLogStr $
+        encode $
+            LogRecord (TE.decodeUtf8Lenient now) lvl comp msg (object [Key.fromText k .= v | (k, v) <- meta])
 
-logInfo :: Logger -> Text -> Text -> IO ()
-logInfo l comp msg = logInfo' l comp msg []
+formatText :: Bool -> FormattedTime -> LogLevel -> Text -> Text -> [(Text, Value)] -> LogStr
+formatText useColor now lvl comp msg meta =
+    toLogStr now
+        <> " "
+        <> formatBadge useColor lvl
+        <> " "
+        <> toLogStr (if T.null comp then "" else "[" <> comp <> "] ")
+        <> toLogStr msg
+        <> toLogStr (renderMeta meta)
 
-logWarn :: Logger -> Text -> Text -> IO ()
-logWarn l comp msg = logWarn' l comp msg []
-
-logError :: Logger -> Text -> Text -> IO ()
-logError l comp msg = logError' l comp msg []
-
-logDebug' :: Logger -> Text -> Text -> [(Text, Value)] -> IO ()
-logDebug' Logger {..} comp msg meta =
-    when (logMinLevel loggerConfig <= LevelDebug) $
-        loggerAction LevelDebug comp msg meta
-
-logInfo' :: Logger -> Text -> Text -> [(Text, Value)] -> IO ()
-logInfo' Logger {..} comp msg meta =
-    when (logMinLevel loggerConfig <= LevelInfo) $
-        loggerAction LevelInfo comp msg meta
-
-logWarn' :: Logger -> Text -> Text -> [(Text, Value)] -> IO ()
-logWarn' Logger {..} comp msg meta =
-    when (logMinLevel loggerConfig <= LevelWarn) $
-        loggerAction LevelWarn comp msg meta
-
-logError' :: Logger -> Text -> Text -> [(Text, Value)] -> IO ()
-logError' Logger {..} comp msg meta =
-    when (logMinLevel loggerConfig <= LevelError) $
-        loggerAction LevelError comp msg meta
-
--- | Bracket-managed high-performance logger using fast-logger.
-withLogger :: LogConfig -> (Logger -> IO a) -> IO a
-withLogger cfg action = do
-    supportsANSI <- hSupportsANSI stderr
-    noColor <- lookupEnv "NO_COLOR"
-    let colorSupported = supportsANSI && isNothing noColor && logUseColor cfg
-        resolvedCfg = cfg {logUseColor = colorSupported}
-    bracket (newStderrLoggerSet defaultBufSize) rmLoggerSet \lset -> do
-        logger <- newFastLogger resolvedCfg lset
-        res <- action logger
-        loggerFlush logger
-        pure res
-
-newFastLogger :: LogConfig -> LoggerSet -> IO Logger
-newFastLogger cfg@LogConfig {..} lset = do
-    pure
-        Logger
-            { loggerConfig = cfg
-            , loggerAction = \lvl comp msg meta -> do
-                now <- getCurrentTime
-                let timeStr = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" now
-                case logFormat of
-                    FormatJSON -> do
-                        let jsonPayload =
-                                object
-                                    [ "timestamp" .= timeStr
-                                    , "level" .= lvl
-                                    , "component" .= comp
-                                    , "message" .= msg
-                                    , "metadata" .= object [Key.fromText k .= v | (k, v) <- meta]
-                                    ]
-                            bs = BSL.toStrict (encode jsonPayload) <> "\n"
-                        pushLogStr lset (toLogStr bs)
-                    FormatText -> do
-                        let badge = formatBadge logUseColor lvl
-                            compBadge =
-                                if T.null comp
-                                    then ""
-                                    else "[" <> comp <> "] "
-                            metaStr =
-                                if null meta
-                                    then ""
-                                    else
-                                        " ("
-                                            <> T.intercalate ", " [k <> "=" <> renderValue v | (k, v) <- meta]
-                                            <> ")"
-                            line =
-                                BSC.pack timeStr
-                                    <> " "
-                                    <> badge
-                                    <> " "
-                                    <> TE.encodeUtf8 compBadge
-                                    <> TE.encodeUtf8 msg
-                                    <> TE.encodeUtf8 metaStr
-                                    <> "\n"
-                        pushLogStr lset (toLogStr line)
-            , loggerFlush = flushLogStr lset
-            }
-
-renderValue :: Value -> Text
-renderValue (String s) = s
-renderValue (Number n) = T.pack (show n)
-renderValue (Bool b) = if b then "true" else "false"
-renderValue Null = "null"
-renderValue other = TE.decodeUtf8Lenient (BSL.toStrict (encode other))
-
-formatBadge :: Bool -> LogLevel -> BSC.ByteString
+formatBadge :: Bool -> LogLevel -> LogStr
 formatBadge False lvl = plainBadge lvl
-formatBadge True lvl =
-    BSC.pack (setSGRCode (levelSGR lvl)) <> plainBadge lvl <> BSC.pack (setSGRCode [Reset])
+formatBadge True lvl = toLogStr (setSGRCode (levelSGR lvl)) <> plainBadge lvl <> toLogStr (setSGRCode [Reset])
 
-plainBadge :: LogLevel -> BSC.ByteString
-plainBadge LevelDebug = "[DEBUG]"
-plainBadge LevelInfo = "[INFO] "
-plainBadge LevelWarn = "[WARN] "
-plainBadge LevelError = "[ERROR]"
+plainBadge :: LogLevel -> LogStr
+plainBadge LevelDebug = "DEBUG"
+plainBadge LevelInfo = "INFO"
+plainBadge LevelWarn = "WARN"
+plainBadge LevelError = "ERROR"
 
 levelSGR :: LogLevel -> [SGR]
 levelSGR LevelDebug = [SetColor Foreground Vivid Cyan]
 levelSGR LevelInfo = [SetColor Foreground Vivid Green]
 levelSGR LevelWarn = [SetColor Foreground Vivid Yellow]
 levelSGR LevelError = [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Red]
+
+renderMeta :: [(Text, Value)] -> Text
+renderMeta [] = ""
+renderMeta ms = " (" <> T.intercalate ", " [k <> "=" <> renderValue v | (k, v) <- ms] <> ")"
+
+renderValue :: Value -> Text
+renderValue (String s) = s
+renderValue v = TE.decodeUtf8Lenient (BSL.toStrict (encode v))
