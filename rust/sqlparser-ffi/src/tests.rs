@@ -3242,8 +3242,9 @@ fn mysql_index_prefix_lifts_but_real_index_calls_fence() {
             constraint,
             Constraint::Index {
                 name: Some(name),
+                columns,
                 ..
-            } if name.0 == "sk"
+            } if name.0 == "sk" && columns.as_slice() == [ir::Ident("b".to_string())]
         )),
         "{:?}",
         table.constraints
@@ -3252,7 +3253,10 @@ fn mysql_index_prefix_lifts_but_real_index_calls_fence() {
     assert!(
         facts(&units[0]).ops.iter().any(|op| matches!(
             op,
-            CatalogOp::DefineIndex(index) if name_text(&index.table.name) == "t"
+            CatalogOp::DefineIndex(index)
+                if name_text(&index.table.name) == "t"
+                    && index.columns.as_slice() == [ir::Ident("b".to_string())]
+                    && !index.expression
         )),
         "{:?}",
         facts(&units[0]).ops

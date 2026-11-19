@@ -831,6 +831,11 @@ tests =
             assertBool
                 "the table is gone with the schema"
                 (not (has (StatementId 1) (dependenciesFor (StatementId 3) graph)))
+        , testCase "MySQL prefix index does not trip unknown statement barrier" $ do
+            let sql = "CREATE TEMPORARY TABLE t1(i INT, b BLOB, PRIMARY KEY pk(i), INDEX sk(b(1)));"
+            graph <- analyze MySQL sql
+            let barriers = factBarriers (factsFor (StatementId 1) graph)
+            assertEqual "MySQL index prefix has no barriers" [] barriers
         , testCase "DROP CONSTRAINT CASCADE removes foreign keys that depend on it" $ do
             let sql =
                     BSC.unlines

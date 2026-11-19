@@ -48,7 +48,7 @@ Each in-flight execution holds one scheduler slot from reset spawn through oracl
 
 ## Dialect semantic coverage
 
-The frontend pins `sqlparser-rs` 0.64.0 and selects one of the 16 dialects below. **Syntax accepted**, **modeled dependency effects**, and **opaque effects** are different outcomes: parser acceptance is not evidence that an engine accepts the SQL or that every effect is modeled. Statement-local syntax errors retain their source units; FFI/transport failures remain separate.
+The frontend pins `sqlparser-rs` 0.64.0 and selects one of the 16 dialects below. **Syntax accepted**, **modeled dependency effects**, and **opaque effects** are different outcomes: parser acceptance is not evidence that an engine accepts the SQL or that every effect is modeled. Statement-local syntax errors retain their source units; FFI/transport failures remain separate. Dialect discrepancies, upstream AST limitations, and patching workflows are tracked in [`docs/UPSTREAM_TRACKER.md`](docs/UPSTREAM_TRACKER.md).
 
 Recognized AST paths share named table/view/index/trigger/sequence/type/schema definitions, drops, selected column/constraint alterations and renames, DML targets, query sources, lexical CTE/alias scopes, and transaction/session facts. These are dependency models, not a SQL interpreter. Dialect-specific paths are grouped here:
 

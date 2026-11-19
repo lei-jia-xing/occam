@@ -419,6 +419,49 @@ tests =
             assertBool
                 "the earlier same-category candidates were rejected"
                 (rejectionCount >= length earlier)
+        , testCase "safe clauses (ORDER BY / LIMIT) are prioritized before WHERE removal" $ do
+            let sql = "SELECT * FROM t WHERE a = 1 ORDER BY id LIMIT 5;\r\n"
+            probes <- newIORef ([] :: [ByteString])
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' probes (candidate :)
+                if BSC.isInfixOf "WHERE a = 1" candidate
+                    then pure OracleAccepted
+                    else pure OracleRejected
+            reduced <- syntaxOnly SQLite pool sql
+            assertEqual
+                "ORDER BY and LIMIT are removed while WHERE is preserved"
+                "SELECT * FROM t WHERE a = 1;\r\n"
+                reduced
+            seen <- reverse <$> readIORef probes
+            let withoutWhere = "SELECT * FROM t ORDER BY id LIMIT 5;\r\n"
+                withoutLimit = "SELECT * FROM t WHERE a = 1 ORDER BY id;\r\n"
+                withoutOrder = "SELECT * FROM t WHERE a = 1 LIMIT 5;\r\n"
+            let whereIdx = elemIndex withoutWhere seen
+                limitIdx = elemIndex withoutLimit seen
+                orderIdx = elemIndex withoutOrder seen
+            assertBool "safe clause candidate is tested before WHERE removal" $
+                case (whereIdx, limitIdx, orderIdx) of
+                    (Just w, Just l, _) -> l < w
+                    (Just w, _, Just o) -> o < w
+                    (Nothing, Just _, _) -> True
+                    (Nothing, _, Just _) -> True
+                    _ -> False
+        , testCase "expression unwrapping is prioritized before destructive constant replacements" $ do
+            let sql = "SELECT * FROM t WHERE (a = 1);\r\n"
+            probes <- newIORef ([] :: [ByteString])
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' probes (candidate :)
+                if BSC.isInfixOf "a = 1" candidate
+                    then pure OracleAccepted
+                    else pure OracleRejected
+            reduced <- syntaxOnly SQLite pool sql
+            assertEqual
+                "parentheses are unwrapped"
+                "SELECT * FROM t WHERE a = 1;\r\n"
+                reduced
+            seen <- reverse <$> readIORef probes
+            let unwrapCandidate = "SELECT * FROM t WHERE a = 1;\r\n"
+            assertBool "unwrap candidate was tested" (unwrapCandidate `elem` seen)
         , testCase "statement ddmin re-tests a removal enabled by a later shrink (jobs 1 and 4)" $ do
             -- Statement-ID-keyed rejection memo is unsound: dropping the
             -- second A is rejected while B is present, then becomes valid

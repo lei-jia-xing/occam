@@ -2478,6 +2478,18 @@ impl Visitor for AnalysisVisitor<'_> {
                 )],
                 scope,
             )),
+            _ if record_columns && matches!(self.dialect, DialectKind::MySql) => {
+                if let Some(ident) = crate::actions::index_length_prefix_ident(expr) {
+                    self.columns.push((
+                        vec![canonical_ident_string(
+                            ident,
+                            self.rules,
+                            crate::ir::IdentifierClass::Column,
+                        )],
+                        scope,
+                    ));
+                }
+            }
             Expr::CompoundIdentifier(idents) if record_columns => {
                 let last = idents.len().saturating_sub(1);
                 let parts = idents

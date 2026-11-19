@@ -34,6 +34,7 @@ import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Set (Set)
@@ -988,6 +989,38 @@ data SyntaxStats = SyntaxStats
 allEditCategories :: [ParserEditCategory]
 allEditCategories = [EditClause, EditList, EditColumn, EditConstraint, EditType, EditExpression, EditLiteral]
 
+isSafeClauseLabel :: T.Text -> Bool
+isSafeClauseLabel label =
+    label
+        `elem` [ "remove-order_by"
+               , "remove-limit"
+               , "remove-offset"
+               , "remove-fetch"
+               ]
+
+isUnwrapExpression :: ParserEdit -> Bool
+isUnwrapExpression edit =
+    case parserEditLabel edit of
+        "simplify-parenthesized_expression" -> True
+        "simplify-scalar-subquery" -> True
+        label
+            | "unwrap-" `T.isPrefixOf` label -> True
+            | label `elem` ["simplify-unary_expression", "simplify-binary_expression", "simplify-in_list"] ->
+                parserEditReplacement edit `notElem` ["0", "1", "'0'"]
+        _ -> False
+
+clauseEditRank :: ParserEdit -> Int
+clauseEditRank edit =
+    case parserEditLabel edit of
+        label
+            | isSafeClauseLabel label -> 0
+        "remove-where" -> 2
+        _ -> 1
+
+expressionEditRank :: ParserEdit -> Int
+expressionEditRank edit =
+    if isUnwrapExpression edit then 0 else 1
+
 reduceSyntaxWithDialect ::
     Logger ->
     ParseOptions ->
@@ -1042,7 +1075,17 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
 
         groupEdits edits =
             let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
-             in [(cat, Map.findWithDefault [] cat buckets) | cat <- allEditCategories]
+             in [(cat, sortCategoryEdits cat (Map.findWithDefault [] cat buckets)) | cat <- allEditCategories]
+
+        sortCategoryEdits EditClause edits =
+            -- Prioritize high-probability/safe clause edits (ORDER BY, LIMIT, OFFSET, FETCH)
+            -- before structural clauses (GROUP BY, HAVING, WITH), and fragile WHERE last.
+            sortOn clauseEditRank edits
+        sortCategoryEdits EditExpression edits =
+            -- Prioritize expression unwrapping (parens, subquery collapse, operand unwrap)
+            -- before destructive constant replacements (0, 1, '0', exists).
+            sortOn expressionEditRank edits
+        sortCategoryEdits _ edits = edits
 
         go stats currentSQL = do
             (startCount, phases, bundles) <- parseEdits currentSQL

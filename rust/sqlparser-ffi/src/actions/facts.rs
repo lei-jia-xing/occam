@@ -480,12 +480,54 @@ pub(crate) fn foreign_key(
     })
 }
 
+pub(crate) fn index_length_prefix_ident(expr: &Expr) -> Option<&Ident> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    if function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+    let [ObjectNamePart::Identifier(ident)] = function.name.0.as_slice() else {
+        return None;
+    };
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+        || arguments.args.len() != 1
+    {
+        return None;
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(length)))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    match &length.value {
+        Value::Number(text, _)
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(ident)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn index_column_ident(
     column: &IndexColumn,
+    dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> Option<ir::Ident> {
     match &column.column.expr {
         Expr::Identifier(ident) => Some(canonical_ident(ident, rules, ir::IdentifierClass::Column)),
+        expr if matches!(dialect, DialectKind::MySql) => index_length_prefix_ident(expr)
+            .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Column)),
         _ => None,
     }
 }
@@ -511,40 +553,7 @@ pub(crate) fn index_constraint_columns(constraint: &TableConstraint) -> &[IndexC
 /// bare `name(N)` in key position is the length-prefix production, a
 /// positional marker rather than a call.
 pub(crate) fn is_index_length_prefix(expr: &Expr) -> bool {
-    let Expr::Function(function) = expr else {
-        return false;
-    };
-    if function.over.is_some()
-        || function.filter.is_some()
-        || !function.within_group.is_empty()
-        || function.null_treatment.is_some()
-        || !matches!(function.parameters, FunctionArguments::None)
-    {
-        return false;
-    }
-    if !matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(_)]) {
-        return false;
-    }
-    let FunctionArguments::List(arguments) = &function.args else {
-        return false;
-    };
-    if arguments.duplicate_treatment.is_some()
-        || !arguments.clauses.is_empty()
-        || arguments.args.len() != 1
-    {
-        return false;
-    }
-    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(length)))] =
-        arguments.args.as_slice()
-    else {
-        return false;
-    };
-    match &length.value {
-        Value::Number(text, _) => {
-            !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-        }
-        _ => false,
-    }
+    index_length_prefix_ident(expr).is_some()
 }
 
 /// Exclude MySQL index length prefixes in `columns` from the deferred routine
@@ -572,7 +581,7 @@ pub(crate) fn constraint_from_table(
             columns: primary
                 .columns
                 .iter()
-                .filter_map(|column| index_column_ident(column, rules))
+                .filter_map(|column| index_column_ident(column, dialect, rules))
                 .collect(),
         }),
         TableConstraint::Unique(unique) => Some(ir::Constraint::Unique {
@@ -583,7 +592,7 @@ pub(crate) fn constraint_from_table(
             columns: unique
                 .columns
                 .iter()
-                .filter_map(|column| index_column_ident(column, rules))
+                .filter_map(|column| index_column_ident(column, dialect, rules))
                 .collect(),
         }),
         TableConstraint::ForeignKey(reference) => {
@@ -610,7 +619,7 @@ pub(crate) fn constraint_from_table(
             columns: index
                 .columns
                 .iter()
-                .filter_map(|column| index_column_ident(column, rules))
+                .filter_map(|column| index_column_ident(column, dialect, rules))
                 .collect(),
             unique: false,
         }),
@@ -3741,7 +3750,7 @@ pub(crate) fn analyze_statement(
                     let columns: Vec<ir::Ident> = create
                         .columns
                         .iter()
-                        .filter_map(|column| index_column_ident(column, rules))
+                        .filter_map(|column| index_column_ident(column, dialect, rules))
                         .collect();
                     facts.ops.push(ir::CatalogOp::DefineIndex(ir::IndexDef {
                         index: index_ref(&index_name, Some(&table), dialect),
@@ -3752,7 +3761,7 @@ pub(crate) fn analyze_statement(
                         expression: create
                             .columns
                             .iter()
-                            .any(|column| index_column_ident(column, rules).is_none()),
+                            .any(|column| index_column_ident(column, dialect, rules).is_none()),
                         if_not_exists: create.if_not_exists,
                         schema_placement: index_schema_placement(dialect),
                     }));
