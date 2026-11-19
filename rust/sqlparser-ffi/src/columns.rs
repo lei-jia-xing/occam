@@ -265,8 +265,8 @@ fn collect_writes(facts: &ir::NativeFacts) -> Vec<(&ir::Name, &[ir::Ident])> {
     refs
 }
 
-/// Tables touched by one unit: used to scope the unknown-source fence to units
-/// that can actually observe the table.
+/// Tables touched by one unit: used to scope the unknown-source, opaque, and
+/// transactional fences to units that can actually observe the table.
 fn collect_touched(facts: &ir::NativeFacts, reads: &[&ir::ReadFact]) -> HashSet<ir::Name> {
     let mut touched = HashSet::new();
     for read in reads {
@@ -292,6 +292,54 @@ fn collect_touched(facts: &ir::NativeFacts, reads: &[&ir::ReadFact]) -> HashSet<
             ir::CatalogOp::DefineTrigger(trigger) => {
                 touched.insert(trigger.table.name.clone());
             }
+            ir::CatalogOp::Rename(rename) => match rename {
+                ir::RenameOp::Relation { from, to, .. } => {
+                    touched.insert(from.name.clone());
+                    touched.insert(to.clone());
+                }
+                ir::RenameOp::Column { table, .. } => {
+                    touched.insert(table.name.clone());
+                }
+            },
+            ir::CatalogOp::Drop(drop) => {
+                for object in &drop.objects {
+                    if let ir::DropObject::Relation { name, .. } = object {
+                        touched.insert(name.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for insert in &facts.column.inserts {
+        if let Some(target) = &insert.target {
+            touched.insert(target.name.clone());
+        }
+    }
+    for barrier in &facts.barriers {
+        match &barrier.scope {
+            ir::BarrierScope::Relation { relation: named } => {
+                touched.insert(named.name.clone());
+            }
+            ir::BarrierScope::Object { object } => match object {
+                ir::ObjectRef::Relation { relation: named } => {
+                    touched.insert(named.name.clone());
+                }
+                ir::ObjectRef::Constraint { constraint } => {
+                    touched.insert(constraint.table.name.clone());
+                }
+                ir::ObjectRef::Index {
+                    index: ir::IndexRef::Table { table, .. },
+                } => {
+                    touched.insert(table.name.clone());
+                }
+                ir::ObjectRef::Trigger {
+                    trigger: ir::TriggerRef::Table { table, .. },
+                } => {
+                    touched.insert(table.name.clone());
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -302,20 +350,17 @@ fn collect_refs(facts: &ir::NativeFacts) -> UnitRefs<'_> {
     let reads = collect_reads(facts);
     let writes = collect_writes(facts);
     let touched = collect_touched(facts, &reads);
-    // Global, session, transaction, and schema barriers — like session and
-    // transaction effects, which can change name resolution and snapshots —
-    // make the unit opaque: it may affect any table without naming it.
-    // `BEGIN`/`ROLLBACK` may carry no separate barrier, so any transaction
-    // effect counts; the first family does not model tx snapshots.
-    let opaque = !facts.session.is_empty()
-        || !facts.pre_tx.is_empty()
+    // A unit is opaque when its effects on touched tables cannot be resolved
+    // through modeled column references alone (e.g. routine calls, volatile
+    // expressions, transaction state, or unmodeled triggers/DML).
+    let opaque = !facts.pre_tx.is_empty()
         || !facts.post_tx.is_empty()
         || facts.barriers.iter().any(|barrier| {
             matches!(
                 barrier.scope,
                 ir::BarrierScope::Global
-                    | ir::BarrierScope::SessionState
                     | ir::BarrierScope::TransactionState
+                    | ir::BarrierScope::SessionState
                     | ir::BarrierScope::Schema { .. }
             )
         });
@@ -329,13 +374,77 @@ fn collect_refs(facts: &ir::NativeFacts) -> UnitRefs<'_> {
     }
 }
 
+/// Unmodeled global DDL/statement barriers that can alter arbitrary schemas
+/// without naming specific tables.
+fn barrier_is_global_schema_mutation(facts: &ir::NativeFacts) -> bool {
+    facts.barriers.iter().any(|barrier| {
+        matches!(barrier.scope, ir::BarrierScope::Global)
+            && match barrier.reason {
+                ir::BarrierReason::SyntaxError
+                | ir::BarrierReason::UnknownDdl
+                | ir::BarrierReason::UnknownAlter
+                | ir::BarrierReason::UnknownDrop
+                | ir::BarrierReason::UnknownRelation
+                | ir::BarrierReason::UnknownTruncate
+                | ir::BarrierReason::UnknownSessionEffect
+                | ir::BarrierReason::UnsupportedTransaction => true,
+                ir::BarrierReason::UnknownStatement => {
+                    // Routine, sequence, or deferred expression effects are expression-level;
+                    // their relation impact is tracked via unit.touched / opaque_fenced.
+                    // Only whole-statement unmodeled fallbacks mutate unknown global schema.
+                    barrier.detail.as_deref()
+                        != Some("unmodeled routine or deferred expression effects")
+                }
+                ir::BarrierReason::UnknownDml | ir::BarrierReason::UnknownView => {
+                    facts.ops.is_empty()
+                }
+                _ => false,
+            }
+    })
+}
+
+/// Session effects that alter namespace prefix or search paths across the script.
+fn session_changes_name_resolution(facts: &ir::NativeFacts) -> bool {
+    facts.session.iter().any(|effect| {
+        matches!(
+            effect,
+            ir::SessionEffect::SetSearchPath { .. }
+                | ir::SessionEffect::SetNamespace { .. }
+                | ir::SessionEffect::ResetAll { .. }
+        )
+    })
+}
+
+/// Tests whether a relation name resides in a given schema.
+fn table_in_schema(name: &ir::Name, schema: &ir::Name) -> bool {
+    if schema.0.is_empty() || name.0.is_empty() {
+        return false;
+    }
+    if name.0.len() > 1 {
+        if schema.0.len() == name.0.len() - 1 {
+            &name.0[..schema.0.len()] == schema.0.as_slice()
+        } else if schema.0.len() == 1 {
+            name.0[name.0.len() - 2]
+                .0
+                .eq_ignore_ascii_case(&schema.0[0].0)
+        } else {
+            false
+        }
+    } else {
+        schema.0.len() == 1
+            && (schema.0[0].0.eq_ignore_ascii_case("public")
+                || schema.0[0].0.eq_ignore_ascii_case("main")
+                || schema.0[0].0.eq_ignore_ascii_case("dbo"))
+    }
+}
+
 /// Dependent fences (any trigger hosted on the table — `WHEN`/body effects
-/// are opaque) and relation-scoped barrier fences. Generation fences
-/// (`ALTER TABLE`, renames, drops) live in the per-table [`TableScope`].
+/// are opaque), relation-scoped barrier fences, and schema-scoped fences.
 fn collect_table_fences(
     facts: &ir::NativeFacts,
     dependent: &mut HashSet<ir::Name>,
     relation: &mut HashSet<ir::Name>,
+    schema: &mut HashSet<ir::Name>,
 ) {
     for op in &facts.ops {
         if let ir::CatalogOp::DefineTrigger(trigger) = op {
@@ -347,10 +456,30 @@ fn collect_table_fences(
             ir::BarrierScope::Relation { relation: named } => {
                 relation.insert(named.name.clone());
             }
-            ir::BarrierScope::Object {
-                object: ir::ObjectRef::Relation { relation: named },
-            } => {
-                relation.insert(named.name.clone());
+            ir::BarrierScope::Object { object } => match object {
+                ir::ObjectRef::Relation { relation: named } => {
+                    relation.insert(named.name.clone());
+                }
+                ir::ObjectRef::Constraint { constraint } => {
+                    relation.insert(constraint.table.name.clone());
+                }
+                ir::ObjectRef::Index {
+                    index: ir::IndexRef::Table { table, .. },
+                } => {
+                    relation.insert(table.name.clone());
+                }
+                ir::ObjectRef::Trigger {
+                    trigger: ir::TriggerRef::Table { table, .. },
+                } => {
+                    relation.insert(table.name.clone());
+                }
+                ir::ObjectRef::Schema { name: named } => {
+                    schema.insert(named.clone());
+                }
+                _ => {}
+            },
+            ir::BarrierScope::Schema { schema: named } => {
+                schema.insert(named.clone());
             }
             _ => {}
         }
@@ -728,6 +857,9 @@ fn build_sibling_scope(assembly: &Assembly<'_>, chain: &[ir::Name], amb: &mut Fe
         if refs.unknown_source && refs.touched.iter().any(&is_sibling) {
             amb.all = true;
         }
+        if refs.opaque && refs.touched.iter().any(&is_sibling) {
+            amb.all = true;
+        }
     }
     for view in &assembly.views {
         let Some(facts) = view.facts else { continue };
@@ -837,11 +969,13 @@ fn validate_sites(views: &[UnitView<'_>], source: &str, sites: &mut [ColumnSite]
 struct Assembly<'a> {
     views: Vec<UnitView<'a>>,
     refs: Vec<Option<UnitRefs<'a>>>,
-    /// Any parse failure, opaque unit, or resolution-changing effect blocks
+    /// Any parse failure or unmodeled global schema-altering effect blocks
     /// every bundle: never infer no-effect from no explicit names.
     opaque_all: bool,
     dependent_fenced: HashSet<ir::Name>,
     relation_fenced: HashSet<ir::Name>,
+    opaque_fenced: HashSet<ir::Name>,
+    schema_fenced: HashSet<ir::Name>,
     index_columns: HashMap<ir::Name, Vec<ir::Ident>>,
     index_opaque: HashSet<ir::Name>,
     /// Parent-side foreign-key targets: referenced columns per parent table.
@@ -893,6 +1027,9 @@ fn reference_fence(
             }
         }
         if refs.unknown_source && refs.touched.iter().any(&in_chain) {
+            return Some(BLOCK_UNKNOWN);
+        }
+        if refs.opaque && refs.touched.iter().any(&in_chain) {
             return Some(BLOCK_UNKNOWN);
         }
     }
@@ -1062,6 +1199,16 @@ fn column_target(
     if assembly.relation_fenced.iter().any(&in_chain) {
         blocked = blocked.or(Some(BLOCK_UNKNOWN));
     }
+    if assembly.opaque_fenced.iter().any(&in_chain) {
+        blocked = blocked.or(Some(BLOCK_UNKNOWN));
+    }
+    if assembly
+        .schema_fenced
+        .iter()
+        .any(|schema| scope.chain.iter().any(|name| table_in_schema(name, schema)))
+    {
+        blocked = blocked.or(Some(BLOCK_UNKNOWN));
+    }
     if assembly.dependent_fenced.iter().any(&in_chain) {
         blocked = blocked.or(Some(BLOCK_DEPENDENT));
     }
@@ -1172,8 +1319,11 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
         .collect();
     let mut refs: Vec<Option<UnitRefs<'_>>> = Vec::with_capacity(views.len());
     let mut opaque_all = false;
+    let mut in_transaction = false;
     let mut dependent_fenced = HashSet::new();
     let mut relation_fenced = HashSet::new();
+    let mut opaque_fenced = HashSet::new();
+    let mut schema_fenced = HashSet::new();
     let mut index_columns: HashMap<ir::Name, Vec<ir::Ident>> = HashMap::new();
     let mut index_opaque = HashSet::new();
     let mut parent_columns: HashMap<ir::Name, HashSet<ir::Ident>> = HashMap::new();
@@ -1191,7 +1341,49 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
             continue;
         };
         let unit = collect_refs(facts);
-        opaque_all |= unit.opaque;
+        if barrier_is_global_schema_mutation(facts) || session_changes_name_resolution(facts) {
+            opaque_all = true;
+        }
+        if facts.pre_tx.iter().any(|tx| {
+            matches!(
+                tx,
+                ir::TxEffect::Commit { chain: false } | ir::TxEffect::RollbackAll
+            )
+        }) {
+            in_transaction = false;
+        }
+        if facts
+            .pre_tx
+            .iter()
+            .any(|tx| matches!(tx, ir::TxEffect::Begin { .. }))
+        {
+            in_transaction = true;
+        }
+        let unit_in_tx = in_transaction
+            || !facts.pre_tx.is_empty()
+            || !facts.post_tx.is_empty()
+            || facts
+                .barriers
+                .iter()
+                .any(|b| matches!(b.scope, ir::BarrierScope::TransactionState));
+        if unit.opaque || unit_in_tx {
+            opaque_fenced.extend(unit.touched.iter().cloned());
+        }
+        if facts.post_tx.iter().any(|tx| {
+            matches!(
+                tx,
+                ir::TxEffect::Commit { chain: false } | ir::TxEffect::RollbackAll
+            )
+        }) {
+            in_transaction = false;
+        }
+        if facts
+            .post_tx
+            .iter()
+            .any(|tx| matches!(tx, ir::TxEffect::Begin { .. }))
+        {
+            in_transaction = true;
+        }
         for read in &unit.reads {
             relation_names.insert(read.source.name.clone());
         }
@@ -1204,7 +1396,12 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
             }
         }
         refs.push(Some(unit));
-        collect_table_fences(facts, &mut dependent_fenced, &mut relation_fenced);
+        collect_table_fences(
+            facts,
+            &mut dependent_fenced,
+            &mut relation_fenced,
+            &mut schema_fenced,
+        );
         for op in &facts.ops {
             match op {
                 ir::CatalogOp::DefineIndex(index) => {
@@ -1328,6 +1525,8 @@ pub fn assemble_columns(units: &[crate::NativeUnit], source: &str) -> Vec<Column
         opaque_all,
         dependent_fenced,
         relation_fenced,
+        opaque_fenced,
+        schema_fenced,
         index_columns,
         index_opaque,
         parent_columns,
@@ -2147,6 +2346,75 @@ mod tests {
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_UNKNOWN)
         );
+        assert_eq!(
+            target(&targets, "b").blocked.as_deref(),
+            Some(BLOCK_UNKNOWN)
+        );
+    }
+
+    #[test]
+    fn transaction_on_unrelated_table_does_not_block_clean_table() {
+        // Transactions isolated to other tables never block independent clean tables.
+        let sql = "BEGIN;\nCREATE TABLE other(x INT);\nINSERT INTO other VALUES (1);\nCOMMIT;\nCREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn transaction_after_clean_table_does_not_block_clean_table() {
+        // A trailing transaction block on another table does not block preceding clean tables.
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;\nBEGIN;\nINSERT INTO other VALUES (1);\nCOMMIT;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn empty_transaction_does_not_block_clean_table() {
+        let sql = "BEGIN;\nCOMMIT;\nCREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn scoped_barrier_does_not_block_unaffected_table() {
+        // A routine call / scoped barrier on `other` does not block clean table `t`.
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;\nCREATE TABLE other(x INT);\nSELECT frobnicate(x) FROM other;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn pragma_foreign_keys_does_not_block_clean_table() {
+        let sql = "PRAGMA foreign_keys = 1;\nCREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn standalone_scalar_routine_does_not_block_clean_table() {
+        // A scalar function call without table references does not block clean tables.
+        let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2);\nSELECT a FROM t ORDER BY a;\nSELECT frobnicate(1);";
+        let (_, targets) = parse_both(sql);
+        let dropped = target(&targets, "b");
+        assert_eq!(dropped.blocked, None);
+        assert_eq!(dropped.sites.len(), 3);
+    }
+
+    #[test]
+    fn rollback_and_chain_keeps_in_transaction_fenced() {
+        // ROLLBACK AND CHAIN continues the transaction, keeping subsequent tables fenced.
+        let sql = "CREATE TABLE t(a INT, b INT);\nBEGIN;\nROLLBACK AND CHAIN;\nINSERT INTO t(a, b) VALUES (1, 2);\nCOMMIT;\nSELECT a FROM t ORDER BY a;";
+        let (_, targets) = parse_dialect(sql, DialectKind::PostgreSql);
         assert_eq!(
             target(&targets, "b").blocked.as_deref(),
             Some(BLOCK_UNKNOWN)

@@ -44,6 +44,8 @@ tests =
         , testCase "atomic follows a table rename" testAtomicRenameFollow
         , testCase "syntax gate drops only edits" testSyntaxGate
         , testCase "alter-column on another column keeps the bundle" testAlterColumnOtherKeepsBundle
+        , testCase "atomic drops despite transaction block on another table" testAtomicTransactionOther
+        , testCase "atomic drops despite scoped barrier on another table" testAtomicScopedBarrierOther
         ]
 
 -- ----------------------------------------------------------------------------
@@ -298,3 +300,34 @@ testAlterColumnOtherKeepsBundle = do
                 (lookup (Ident "a") byColumn)
     where
         base = defaultParseOptions PostgreSQL
+
+testAtomicTransactionOther :: IO ()
+testAtomicTransactionOther = do
+    -- A transaction block on an unrelated table does not block atomic column reduction on `t`.
+    let script =
+            BSC.unlines
+                [ "BEGIN;"
+                , "CREATE TABLE other(x INT);"
+                , "INSERT INTO other VALUES (1);"
+                , "COMMIT;"
+                , "CREATE TABLE t(a INT, b INT);"
+                , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+                , "SELECT a FROM t ORDER BY a;"
+                ]
+    pool <- testPoolWith (sqliteOracle "1\n2\n")
+    reduced <- reduceWith ColumnAtomic pool script
+    assertSchemaAndRows reduced ["a"] "1\n2\n"
+
+testAtomicScopedBarrierOther :: IO ()
+testAtomicScopedBarrierOther = do
+    -- A scoped relation barrier (e.g. SQLite virtual table) on an unrelated table does not block atomic column reduction on `t`.
+    let script =
+            BSC.unlines
+                [ "CREATE TABLE t(a INT, b INT);"
+                , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+                , "SELECT a FROM t ORDER BY a;"
+                , "CREATE VIRTUAL TABLE vt USING fts5(content);"
+                ]
+    pool <- testPoolWith (sqliteOracle "1\n2\n")
+    reduced <- reduceWith ColumnAtomic pool script
+    assertSchemaAndRows reduced ["a"] "1\n2\n"

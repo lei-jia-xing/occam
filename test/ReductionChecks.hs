@@ -31,6 +31,7 @@ import Occam.Pool (
     observationDetails,
  )
 import Occam.Reducer (
+    ColumnMode (..),
     ReductionConfig (..),
     defaultReductionConfig,
     findInterestingPrefix,
@@ -628,6 +629,69 @@ tests =
             assertBool "earlier update (a = 1) must be preserved" (BSC.isInfixOf "a = 1" reduced)
             assertBool "effective update (a = 2) must be preserved" (BSC.isInfixOf "a = 2" reduced)
             assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
+        , testCase
+            "atomic column reduction succeeds on clean table despite transaction block on another table"
+            $ do
+                pool <-
+                    predicatePool
+                        ( \candidate ->
+                            BSC.isInfixOf "CREATE TABLE t" candidate
+                                && BSC.isInfixOf "a INT" candidate
+                                && BSC.isInfixOf "SELECT a FROM t" candidate
+                                && BSC.isInfixOf "10" candidate
+                                && BSC.isInfixOf "other" candidate
+                        )
+                let sql =
+                        BSC.unlines
+                            [ "BEGIN;"
+                            , "CREATE TABLE other (x INT);"
+                            , "INSERT INTO other VALUES (1);"
+                            , "COMMIT;"
+                            , "CREATE TABLE t (a INT, b INT);"
+                            , "INSERT INTO t (a, b) VALUES (1, 10);"
+                            , "SELECT a FROM t;"
+                            ]
+                let config =
+                        defaultReductionConfig
+                            { reductionDialect = SQLite
+                            , reductionSlicing = False
+                            , reductionClosure = False
+                            , reductionIntraStatement = True
+                            , reductionColumnMode = ColumnAtomic
+                            }
+                reduced <- reduceSQLWithConfig config nullLogger pool sql
+                assertBool "keeps required table t with column a" (BSC.isInfixOf "a INT" reduced)
+                assertBool "unneeded column b is dropped" (not (BSC.isInfixOf "b INT" reduced))
+                assertBool "keeps other table in transaction" (BSC.isInfixOf "other" reduced)
+        , testCase "atomic column reduction succeeds on clean table despite scoped barrier on another table" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "CREATE TABLE t" candidate
+                            && BSC.isInfixOf "a INT" candidate
+                            && BSC.isInfixOf "SELECT a FROM t" candidate
+                            && BSC.isInfixOf "10" candidate
+                            && BSC.isInfixOf "CREATE VIRTUAL TABLE vt" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT, b INT);"
+                        , "INSERT INTO t (a, b) VALUES (1, 10);"
+                        , "SELECT a FROM t;"
+                        , "CREATE VIRTUAL TABLE vt USING fts5(content);"
+                        ]
+            let config =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionIntraStatement = True
+                        , reductionColumnMode = ColumnAtomic
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "keeps required table t with column a" (BSC.isInfixOf "a INT" reduced)
+            assertBool "unneeded column b is dropped" (not (BSC.isInfixOf "b INT" reduced))
+            assertBool "keeps scoped barrier" (BSC.isInfixOf "CREATE VIRTUAL TABLE vt" reduced)
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int
