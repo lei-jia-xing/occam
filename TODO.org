@@ -82,6 +82,17 @@
 - Verify: A2/B paired micro alloc/timing + matched 8-case protocol (`benchmarks/benchmark_artifacts/column-ab-paired-20261116-a/report.md`), joint-completed only; behavior identical, no completion/quality regression. 48 POLICY triad never re-run (f56 A, candidate-build scope syntax-only).
 - Acceptance: before/after joint-completion comparison on identical slots with no completion/quality regression.
 - Profiling inputs ready (`benchmarks/benchmark_artifacts/profile-inputs-20261116-a` + protocol README): deterministic exit-0 engine-mechanics microbenchmark; A profile recorded; A2/B paired, never vs 632.
+** TODO [#A] Native Haskell benchmark suite & in-process SQLite oracle migration
+- [Native Engine Bench via `tasty-bench`] Upgrade `bench/Main.hs` from hand-rolled RTS/timer loops to modern, lightweight `tasty-bench` (GHC RTS allocated bytes + wall time + baseline CSV regression gating, zero heavy dependencies).
+- [In-Process Native SQLite Contract Oracle] Integrate `direct-sqlite` to execute candidate SQL directly in-process against `:memory:` with rowset/state digest verification (<0.05ms/call), eliminating the Python subprocess overhead and IPC pipe latency from `benchmarks/bench.py oracle`.
+- [Port Tier 3 AB/BA Corpus Runner to Haskell] Re-implement the AB/BA interleaved trial runner and Attempt-AUC integration (`evaluationCurve`) in a dedicated Haskell module (`Occam.Benchmark.Corpus` / `Occam.Benchmark.Metrics`), providing pure in-memory evaluation without temporary disk churn.
+- [Self-Contained `cabal bench`] Enable complete self-contained execution via `cabal bench` (`cabal bench --benchmark-options="+RTS -T -RTS --csv baseline.csv"`), removing external Python runtime and script dependencies.
+
+** TODO [#B] Codebase ergonomics & maintainability enhancements (microlens & int-containers)
+- [Nested State & Catalog Lenses via `microlens`] Adopt lightweight `microlens` / `microlens-th` (or `optics-core`) across `Occam.Dependency.State` and `Occam.Dependency.Alter`, eliminating manual multi-layer record reconstruction boilerplate (`eval & evalCatalog . catRelations . at key ?~ relation`).
+- [StatementId Set/Map Specialization via `IntSet`/`IntMap`] Evaluate specializing dense `StatementId`-keyed maps and sets (`Map StatementId ...` / `Set StatementId ...`) to `IntMap` / `IntSet` (or `int-containers`), cutting memory overhead by ~50% and accelerating transitive closure and slicing operations by 2-3x.
+- [Algebraic Graph Formal Alignment] Evaluate `algebraic-graphs` (Alga) for DAG representation and transitive reachability, creating a 1:1 structural correspondence with Occam's Lean 4 formal acyclicity and reachability proofs.
+
 ** TODO [#B] Candidate proposals (UNSELECTED, not implementation)
 - Pair-aware search and certificate proposals remain candidates until evidence explicitly selects them; neither implemented nor claimed.
 
@@ -99,9 +110,18 @@
 - DuckDB direct file queries (`SELECT * FROM 'file.parquet'`) + `CREATE MACRO` -- TODO(upstream-sqlparser) catch-all in analyze_statement (DuckDB file-query/macro item)
 - MSSQL T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`) -- TODO(upstream-sqlparser) catch-all in analyze_statement (T-SQL batch item)
 - Incomplete `Spanned` impls (window, NULL-treatment, ODBC, unknown) block whole-node byte edits -- README.md:35
-- QUESTION (not defect): `PARTITION BY RANGE` as Function('range')? MySQL index prefix `b(1)` as Expr::Function? -- verify whether intended representation; any Expr::Function trips the routine fence (SequenceVisitor pre_visit_expr Expr::Function arm, AnalysisVisitor has_function arm, routine-barrier site in analyze_statement); cf. mysql_bug_91975.sql:3, benchmarks/fuzz_corpus/fuzz_pg_100_02.sql:51
+- RESOLVED: MySQL index prefix `b(1)` as Expr::Function handled via structural recognition `index_length_prefix_ident` (`docs/UPSTREAM_TRACKER.md` UP-01; `mysql_bug_91975.sql` false barrier eliminated).
 
 * Completed Milestones
+** DONE Semantic refinement & barrier de-fencing (6-dimensional overhaul) [2026-11]
+- [Intra-Statement Rewrite Scheduling] In `Occam.Reducer`, prioritized high-probability safe clauses (`ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`) and expression unwrapping (parens, subquery collapse) before fragile `WHERE` clauses and destructive constant replacements (`fbb500a`).
+- [MySQL Prefix Index Barrier Relief] Added structural length prefix recognition `index_length_prefix_ident` for `col(N)` in key parts, preventing false `deferred_function` global barriers on MySQL `INDEX sk(b(1))` and eliminating the barrier in `benchmarks/real_fuzz_corpus/mysql_bug_91975.sql` (`fbb500a`).
+- [SQLite Virtual Table De-fencing] Lowered `CREATE VIRTUAL TABLE ... USING module(...)` from global persistent fence to `BarrierScope::Relation(name)` and registered table definitions in DDL facts, unfreezing 10 subsequent DML statements in `sqlite_fuzz_fts5_savepoint.sql` (`6f8e657`).
+- [Dead Write Elimination (DWE) for Unconditional UPDATE] Added `UpdateScope` (`UpdateAllRows` vs `UpdateFilteredRows`) to `WriteKind`. When `UPDATE` has no `WHERE`, `FROM`, `JOIN`, or `LIMIT`, it overwrites prior column write dependencies, pruning dead updates while strictly preserving `InsertWrite` row existence dependencies for black-box Oracle soundness (`2d25c84`).
+- [Atomic Column Bundling `opaque_all` Decoupling] Replaced coarse script-wide `opaque_all` blocking with table-scoped `opaque_fenced` and `schema_fenced` sets in `rust/sqlparser-ffi/src/columns.rs`, allowing clean independent tables to undergo atomic column reduction despite unrelated transaction blocks or scoped barriers (`effacd1`).
+- [ReadMode Diversification] Extended `ReadMode` with `ReadRowCount` and `ReadRowExistence`, backed by `relCardinalityWrites` in `RelationState`. Queries like `SELECT COUNT(*)` and `EXISTS` depend strictly on row cardinality operations (`INSERT`/`DELETE`/`TRUNCATE`), eliminating false dependencies and transitive contamination from column value `UPDATE`s (`f10d35f`).
+- [Transitive View Column Lineage Tracking] Modeled `SourceColumn` and `ViewColumnLineage` across Rust AST extraction and Haskell `ViewDef`, replacing conservative whole-table view dependencies in `Occam.Dependency.Alter` with precise projected-column tracing. Dropping or updating unreferenced base table columns no longer triggers false dependencies or cascade drops on unaffected higher-level views (`b09fa24`).
+- [Verification & Quality Gates] Verified across all 14 authentic DBMS crash cases in `benchmarks/real_fuzz_corpus/` and 11 Tier 3 benchmark cases (up to 57.1% reduction ratio and 0.5085 Attempt-AUC); 206 Haskell unit/integration tests + 199 Rust tests + 6 Lean 4 formal convergence theorems passing with zero warnings.
 ** DONE Comprehensive multi-shell completions for `occam` via `usage` [2026-11]
 - Authored `occam.usage.kdl` with context-aware file filtering (`file:sql`), directory completion, and full dialect descriptions.
 - Added `--usage-spec` introspection flag to `occam` CLI.
