@@ -3849,3 +3849,134 @@ fn sqlite_pure_pragma_reads_lift_without_fence() {
         assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
     }
 }
+
+#[test]
+fn sqlite_create_virtual_table_scopes_barrier_to_relation() {
+    let sql = "CREATE VIRTUAL TABLE vt0 USING fts5(c0);";
+    let units = parse(sql, DialectKind::SQLite).unwrap();
+    assert!(units[0].parse_error.is_none(), "{sql}");
+    let f0 = facts(&units[0]);
+    assert_eq!(f0.ops.len(), 1);
+    match &f0.ops[0] {
+        CatalogOp::DefineTable(table) => {
+            assert_eq!(name_text(&table.name), "vt0");
+            assert!(!table.temporary);
+            assert!(table.transactional);
+            assert!(!table.if_not_exists);
+        }
+        other => panic!("expected DefineTable, got {:?}", other),
+    }
+    assert_eq!(f0.barriers.len(), 1);
+    match &f0.barriers[0] {
+        ScopedBarrier {
+            scope: BarrierScope::Relation { relation },
+            reason: BarrierReason::UnknownStatement,
+            ..
+        } => {
+            assert_eq!(name_text(&relation.name), "vt0");
+            assert!(!relation.temp);
+        }
+        other => panic!("expected RelationScope barrier, got {:?}", other),
+    }
+
+    let temp_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS temp.vt1 USING fts4(c0, c1);";
+    let units = parse(temp_sql, DialectKind::SQLite).unwrap();
+    assert!(units[0].parse_error.is_none(), "{temp_sql}");
+    let f1 = facts(&units[0]);
+    assert_eq!(f1.ops.len(), 1);
+    match &f1.ops[0] {
+        CatalogOp::DefineTable(table) => {
+            assert_eq!(name_text(&table.name), "vt1");
+            assert!(table.temporary);
+            assert!(table.if_not_exists);
+        }
+        other => panic!("expected DefineTable, got {:?}", other),
+    }
+    assert_eq!(f1.barriers.len(), 1);
+    match &f1.barriers[0] {
+        ScopedBarrier {
+            scope: BarrierScope::Relation { relation },
+            reason: BarrierReason::UnknownStatement,
+            ..
+        } => {
+            assert_eq!(name_text(&relation.name), "vt1");
+            assert!(relation.temp);
+        }
+        other => panic!("expected RelationScope barrier, got {:?}", other),
+    }
+
+    let no_args_sql = "CREATE VIRTUAL TABLE vt_no_args USING dbstat;";
+    let units = parse(no_args_sql, DialectKind::SQLite).unwrap();
+    assert!(units[0].parse_error.is_none(), "{no_args_sql}");
+    let f2 = facts(&units[0]);
+    assert_eq!(f2.ops.len(), 1);
+    match &f2.ops[0] {
+        CatalogOp::DefineTable(table) => {
+            assert_eq!(name_text(&table.name), "vt_no_args");
+            assert!(!table.temporary);
+        }
+        other => panic!("expected DefineTable, got {:?}", other),
+    }
+    assert_eq!(f2.barriers.len(), 1);
+    match &f2.barriers[0] {
+        ScopedBarrier {
+            scope: BarrierScope::Relation { relation },
+            reason: BarrierReason::UnknownStatement,
+            ..
+        } => {
+            assert_eq!(name_text(&relation.name), "vt_no_args");
+            assert!(!relation.temp);
+        }
+        other => panic!("expected RelationScope barrier, got {:?}", other),
+    }
+
+    let main_sql = "CREATE VIRTUAL TABLE main.vt_main USING fts5(c0);";
+    let units = parse(main_sql, DialectKind::SQLite).unwrap();
+    assert!(units[0].parse_error.is_none(), "{main_sql}");
+    let f3 = facts(&units[0]);
+    assert_eq!(f3.ops.len(), 1);
+    match &f3.ops[0] {
+        CatalogOp::DefineTable(table) => {
+            assert_eq!(name_text(&table.name), "main.vt_main");
+            assert!(!table.temporary);
+        }
+        other => panic!("expected DefineTable, got {:?}", other),
+    }
+    assert_eq!(f3.barriers.len(), 1);
+    match &f3.barriers[0] {
+        ScopedBarrier {
+            scope: BarrierScope::Relation { relation },
+            reason: BarrierReason::UnknownStatement,
+            ..
+        } => {
+            assert_eq!(name_text(&relation.name), "main.vt_main");
+            assert!(!relation.temp);
+        }
+        other => panic!("expected RelationScope barrier, got {:?}", other),
+    }
+
+    let quoted_sql = r#"CREATE VIRTUAL TABLE "vt spaced" USING fts5("c 0");"#;
+    let units = parse(quoted_sql, DialectKind::SQLite).unwrap();
+    assert!(units[0].parse_error.is_none(), "{quoted_sql}");
+    let f4 = facts(&units[0]);
+    assert_eq!(f4.ops.len(), 1);
+    match &f4.ops[0] {
+        CatalogOp::DefineTable(table) => {
+            assert_eq!(name_text(&table.name), "vt spaced");
+            assert!(!table.temporary);
+        }
+        other => panic!("expected DefineTable, got {:?}", other),
+    }
+    assert_eq!(f4.barriers.len(), 1);
+    match &f4.barriers[0] {
+        ScopedBarrier {
+            scope: BarrierScope::Relation { relation },
+            reason: BarrierReason::UnknownStatement,
+            ..
+        } => {
+            assert_eq!(name_text(&relation.name), "vt spaced");
+            assert!(!relation.temp);
+        }
+        other => panic!("expected RelationScope barrier, got {:?}", other),
+    }
+}

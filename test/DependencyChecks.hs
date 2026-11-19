@@ -1414,6 +1414,59 @@ tests =
                 , (Snowflake, "INSERT ALL INTO src VALUES (1) INTO sink VALUES (2) SELECT 1;")
                 , (MsSql, "UPDATE src SET a = 2 OUTPUT inserted.a INTO sink;")
                 ]
+        , testCase "SQLite virtual table barrier lowering isolates unrelated virtual tables" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE VIRTUAL TABLE vt0 USING fts5(c0);"
+                        , "CREATE VIRTUAL TABLE vt1 USING fts4(c0);"
+                        , "INSERT INTO vt1(c0) VALUES(0);"
+                        , "BEGIN;"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "INSERT INTO vt1(c0) VALUES (0), (0);"
+                        , "UPDATE vt0 SET c0 = 0;"
+                        , "INSERT INTO vt1(c0) VALUES (0);"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "INSERT INTO vt1(vt1) VALUES('automerge=1');"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "DROP TABLE vt1;"
+                        ]
+            graph <- analyzeParsed SQLite sql
+            -- Statement 1: CREATE VIRTUAL TABLE vt0
+            let facts1 = factsFor (StatementId 1) graph
+            assertBool "statement 1 defines table vt0" (isJust (tableDefinition ["vt0"] (factOps facts1)))
+            assertBool
+                "statement 1 scopes barrier to relation vt0 instead of global"
+                (any (\b -> barrierScope b == RelationScope (ref ["vt0"])) (factBarriers facts1))
+            assertBool
+                "statement 1 has no global barrier"
+                (not (any (\b -> barrierScope b == GlobalScope) (factBarriers facts1)))
+
+            -- Statement 2: CREATE VIRTUAL TABLE vt1
+            let facts2 = factsFor (StatementId 2) graph
+            assertBool "statement 2 defines table vt1" (isJust (tableDefinition ["vt1"] (factOps facts2)))
+            assertBool
+                "statement 2 scopes barrier to relation vt1 instead of global"
+                (any (\b -> barrierScope b == RelationScope (ref ["vt1"])) (factBarriers facts2))
+
+            -- Slicing Statement 12 (DROP TABLE vt1) should retain vt1 operations and exclude vt0 (statements 1 and 7)
+            let deps12 = backwardSlice (StatementId 12) graph
+            assertBool "vt1 drop reaches vt1 creation" (has (StatementId 2) deps12)
+            assertBool "vt1 drop reaches vt1 initial insert" (has (StatementId 3) deps12)
+            assertBool
+                "vt1 drop does not depend on unrelated vt0 virtual table creation"
+                (not (has (StatementId 1) deps12))
+            assertBool "vt1 drop does not depend on unrelated vt0 update" (not (has (StatementId 7) deps12))
+
+            -- Slicing Statement 7 (UPDATE vt0) should reach vt0 creation and not reach vt1 operations
+            let deps7 = backwardSlice (StatementId 7) graph
+            assertBool "vt0 update reaches vt0 creation" (has (StatementId 1) deps7)
+            assertBool "vt0 update does not depend on vt1 creation" (not (has (StatementId 2) deps7))
+            assertBool "vt0 update does not depend on vt1 initial write" (not (has (StatementId 3) deps7))
+            assertBool "vt0 update does not depend on preceding vt1 update" (not (has (StatementId 5) deps7))
+            assertBool "vt0 update does not depend on preceding vt1 insert" (not (has (StatementId 6) deps7))
+            assertBool
+                "vt0 update does not depend on any vt1 operations"
+                (not (any (\s -> has (StatementId s) deps7) [2, 3, 5, 6, 8, 9, 10, 11, 12]))
         , testCase "plain view definitions bind schema while later reads follow data" $ do
             let sql =
                     BSC.unlines

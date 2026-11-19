@@ -103,6 +103,39 @@ tests =
             assertBool "keeps crash table" (BSC.isInfixOf "crash_tbl" reduced)
             assertBool "keeps crash value" (BSC.isInfixOf "42" reduced)
             assertBool "eliminates unneeded subgraph" (not (BSC.isInfixOf "unneeded_tbl" reduced))
+        , testCase "SQLite virtual table lowering enables reduction of unrelated tables" $ do
+            pool <- predicatePool (BSC.isInfixOf "DROP TABLE vt1")
+            let sql =
+                    BSC.unlines
+                        [ "CREATE VIRTUAL TABLE vt0 USING fts5(c0);"
+                        , "CREATE VIRTUAL TABLE vt1 USING fts4(c0);"
+                        , "INSERT INTO vt1(c0) VALUES(0);"
+                        , "BEGIN;"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "INSERT INTO vt1(c0) VALUES (0), (0);"
+                        , "UPDATE vt0 SET c0 = 0;"
+                        , "INSERT INTO vt1(c0) VALUES (0);"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "INSERT INTO vt1(vt1) VALUES('automerge=1');"
+                        , "UPDATE vt1 SET c0 = 0;"
+                        , "DROP TABLE vt1;"
+                        ]
+                config =
+                    defaultReductionConfig
+                        { reductionIntraStatement = False
+                        , reductionUnrestricted = False
+                        , reductionDialect = SQLite
+                        }
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "keeps target vt1 drop" (BSC.isInfixOf "DROP TABLE vt1" reduced)
+            assertBool "keeps vt1 definition" (BSC.isInfixOf "CREATE VIRTUAL TABLE vt1" reduced)
+            assertBool "prunes unrelated vt0 virtual table completely" (not (BSC.isInfixOf "vt0" reduced))
+
+            pool0 <- predicatePool (BSC.isInfixOf "UPDATE vt0")
+            reduced0 <- reduceSQLWithConfig config nullLogger pool0 sql
+            assertBool "keeps target vt0 update" (BSC.isInfixOf "UPDATE vt0" reduced0)
+            assertBool "keeps vt0 definition" (BSC.isInfixOf "CREATE VIRTUAL TABLE vt0" reduced0)
+            assertBool "prunes unrelated vt1 virtual table completely" (not (BSC.isInfixOf "vt1" reduced0))
         , testCase "Constraint stripping and deeper branch pruning simplify table definitions and expressions" $ do
             pool <-
                 predicatePool

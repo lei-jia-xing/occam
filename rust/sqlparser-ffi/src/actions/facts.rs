@@ -2781,6 +2781,7 @@ pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bo
     let ddl = matches!(
         statement,
         Statement::CreateTable(_)
+            | Statement::CreateVirtualTable { .. }
             | Statement::CreateView(_)
             | Statement::CreateIndex(_)
             | Statement::CreateTrigger(_)
@@ -4642,15 +4643,55 @@ pub(crate) fn analyze_statement(
                 )),
             }
         }
+        Statement::CreateVirtualTable {
+            name,
+            if_not_exists,
+            module_name: _,
+            module_args: _,
+        } => {
+            let excluded: Vec<Span> = vec![name.span()];
+            let def_name = definition_name(name, dialect, rules, false);
+            let target_ref = relation_ref(name, dialect, rules);
+            match (def_name, target_ref) {
+                (Some((table_name, temporary)), Some(target)) => {
+                    let table = ir::TableDef {
+                        name: table_name,
+                        temporary,
+                        transactional: table_transactional(dialect, temporary),
+                        columns: Vec::new(),
+                        constraints: Vec::new(),
+                        sources: Vec::new(),
+                        like: None,
+                        partition_parent: None,
+                        inherit_parents: Vec::new(),
+                        on_commit: None,
+                        if_not_exists: *if_not_exists,
+                        or_replace: false,
+                    };
+                    facts.ops.push(ir::CatalogOp::DefineTable(table));
+                    facts.barriers.push(barrier(
+                        ir::BarrierScope::Relation { relation: target },
+                        ir::BarrierReason::UnknownStatement,
+                        Some(statement.to_string()),
+                    ));
+                }
+                _ => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownStatement,
+                        Some(statement.to_string()),
+                    ));
+                }
+            }
+            add_unmodeled_barriers(&mut facts, &visitor, &excluded);
+        }
         // TODO(upstream-sqlparser): Procedural statements, client commands, and dialect extensions
         // currently hit this fallback barrier:
         // 1. PL/pgSQL & PL/SQL: `CREATE FUNCTION/PROCEDURE ... AS $$ ... $$` procedural blocks
         //    (sqlparser stores function bodies as unparsed strings; inner DML dependencies are opaque).
         // 2. MySQL: `DELIMITER //` client command is outside ANSI/ISO SQL lexical grammar.
         // 3. MySQL: User session variables (`@var := expr`) and dynamic `PREPARE .. FROM @var`.
-        // 4. SQLite: `CREATE VIRTUAL TABLE ... USING module(...)` and hidden shadow tables (t_data, t_idx).
-        // 5. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`) and `CREATE MACRO`.
-        // 6. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`). (`OUTPUT ... INTO`
+        // 4. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`) and `CREATE MACRO`.
+        // 5. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`). (`OUTPUT ... INTO`
         //    is modeled, not a fallback: real table -> second write edge, `@var` -> relation-
         //    scoped fence, anything else -> global `UnknownDml` fence.)
         _ => facts.barriers.push(global_barrier(

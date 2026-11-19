@@ -66,9 +66,9 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
   ```
   The column definitions are swallowed into unstructured identifier lists or string tokens.
 - **Occam Workaround / Plan**:
-  Extract the target `name` and attribute effects to `RelationScope(name)` instead of `BarrierScope::Global`.
+  Extract the target `name`, register the table in the DDL catalog via `CatalogOp::DefineTable`, and lower the barrier scope to `RelationScope(name)` in [`facts.rs`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/src/actions/facts.rs#L4646).
 - **Corpus Evidence**:
-  [`benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql`](file:///home/hunter/Workspace/occam/benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql) triggers an `UnknownStatementBarrier` at statement 1, locking slicing across all remaining 10 statements.
+  Resolved in [`benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql`](file:///home/hunter/Workspace/occam/benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql), allowing independent virtual tables (e.g. `vt0` vs `vt1`) to be cleanly isolated and sliced away without whole-script global fencing.
 
 ---
 
