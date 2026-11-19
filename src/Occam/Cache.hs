@@ -17,6 +17,8 @@ module Occam.Cache (
 import Control.Concurrent (MVar, modifyMVar_, newMVar, readMVar)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -49,7 +51,7 @@ data CacheEntry
     deriving (Eq, Show)
 
 data Cache = Cache
-    { cacheEntries :: !(MVar (Map ByteString CacheEntry))
+    { cacheEntries :: !(MVar (HashMap ByteString CacheEntry))
     , cacheHitsRef :: !(IORef Int)
     , cacheMissesRef :: !(IORef Int)
     , cacheJoinsRef :: !(IORef Int)
@@ -63,7 +65,7 @@ data LookupResult
 
 newCache :: Map ByteString OracleObservation -> IO Cache
 newCache precomputed = do
-    entries <- newMVar (Map.map CacheDone precomputed)
+    entries <- newMVar (HashMap.fromList [(k, CacheDone v) | (k, v) <- Map.toList precomputed])
     hits <- newIORef 0
     misses <- newIORef 0
     joins <- newIORef 0
@@ -90,7 +92,7 @@ cacheLookup cache mode precomputed sql = case Map.lookup sql precomputed of
             pure LookupMiss
         CacheEnabled -> do
             entries <- readMVar (cacheEntries cache)
-            case Map.lookup sql entries of
+            case HashMap.lookup sql entries of
                 Just (CacheDone res) -> do
                     atomicModifyIORef' (cacheHitsRef cache) (\n -> (n + 1, ()))
                     pure (LookupHit res)
@@ -103,7 +105,7 @@ cacheLookup cache mode precomputed sql = case Map.lookup sql precomputed of
 
 cacheInstallInflight :: Cache -> ByteString -> Int -> IO ()
 cacheInstallInflight cache sql ordinal =
-    modifyMVar_ (cacheEntries cache) (pure . Map.insert sql (CacheInflight ordinal))
+    modifyMVar_ (cacheEntries cache) (pure . HashMap.insert sql (CacheInflight ordinal))
 
 {- | Publish a completed miss. Admitted observations are retained; rejected
 ones (timeouts, reset failures, I/O failures) are removed so a later window
@@ -111,11 +113,11 @@ re-observes them physically. Only the owning ordinal may complete its entry.
 -}
 cacheCompleteInflight :: Cache -> ByteString -> Int -> Maybe OracleObservation -> IO ()
 cacheCompleteInflight cache sql ordinal admitted =
-    modifyMVar_ (cacheEntries cache) \entries -> case Map.lookup sql entries of
+    modifyMVar_ (cacheEntries cache) \entries -> case HashMap.lookup sql entries of
         Just (CacheInflight owner)
             | owner == ordinal -> pure $ case admitted of
-                Just res -> Map.insert sql (CacheDone res) entries
-                Nothing -> Map.delete sql entries
+                Just res -> HashMap.insert sql (CacheDone res) entries
+                Nothing -> HashMap.delete sql entries
         _ -> pure entries
 
 -- | Drop an in-flight entry owned by the given ordinal (worker cancellation).
