@@ -216,7 +216,6 @@ optionsParser =
             )
         <*> switch
             ( long "verbose"
-                <> short 'v'
                 <> help "Enable verbose debug output (equivalent to --log-level debug)"
             )
         <*> switch
@@ -361,6 +360,7 @@ versionOption =
     infoOption
         ("Occam v" ++ Occam.version)
         ( long "version"
+            <> short 'v'
             <> help "Show version information"
         )
 
