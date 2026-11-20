@@ -20,6 +20,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Lens.Micro ((%~), (&), (.~), (?~))
 import Occam.Core (
     BarrierReason (..),
     BarrierScope (..),
@@ -78,7 +79,6 @@ import Occam.Dependency.State (
     IndexKey (..),
     IndexState (..),
     RelationKey (..),
-    RelationState (..),
     SequenceKey (..),
     SequenceState (..),
     SessionState,
@@ -88,11 +88,33 @@ import Occam.Dependency.State (
     addDeps,
     addTouches,
     ambiguousMutation,
+    catalogIndexesL,
+    catalogSchemasL,
+    catalogSequencesL,
+    catalogTriggersL,
+    catalogTypesL,
     clearRelationObjects,
+    evalCatalogL,
     insertRelation,
     lookupRelation,
+    modifyRelation,
     mutateResolved,
     newRelation,
+    relColumnLineageL,
+    relColumnsL,
+    relConditionColumnsL,
+    relConstraintsL,
+    relDefinitionL,
+    relIndexesL,
+    relInheritParentsL,
+    relOnCommitFrameIdL,
+    relOnCommitL,
+    relPartitionParentsL,
+    relSourceReadsL,
+    relSourcesL,
+    relTransactionalL,
+    relTriggersL,
+    relUnresolvedSourcesL,
  )
 import Occam.Dependency.Write (processRead)
 
@@ -188,32 +210,24 @@ processDefineTable sid eval definition =
                     (catalog2, constraintKeys) =
                         installConstraints session sid key constraintValues catalog1
                     relation =
-                        (newRelation TableRelation)
-                            { relDefinition = Just sid
-                            , relColumns =
-                                Set.fromList (map columnName (tableColumns definition))
-                            , relSources =
-                                resolvedSourceKeys session catalog (tableSources definition)
-                            , relUnresolvedSources = unresolved
-                            , relSourceReads = tableSources definition
-                            , -- Stored unresolved and resolved at use, like
-                              -- foreign-key parents. Partition and inheritance
-                              -- parents stay distinct for `INSERT` routing.
-                              relPartitionParents =
-                                Set.fromList
-                                    (maybeToList (tablePartitionParent definition))
-                            , relInheritParents =
-                                Set.fromList (tableInheritParents definition)
-                            , relOnCommit = tableOnCommit definition
-                            , relOnCommitFrameId =
-                                case tableOnCommit definition of
-                                    Just OnCommitDrop -> evalFrameId eval
-                                    _ -> Nothing
-                            , relTransactional = tableTransactional definition
-                            , relConstraints = constraintKeys
-                            }
+                        newRelation TableRelation
+                            & relDefinitionL ?~ sid
+                            & relColumnsL .~ Set.fromList (map columnName (tableColumns definition))
+                            & relSourcesL .~ resolvedSourceKeys session catalog (tableSources definition)
+                            & relUnresolvedSourcesL .~ unresolved
+                            & relSourceReadsL .~ tableSources definition
+                            & relPartitionParentsL .~ Set.fromList (maybeToList (tablePartitionParent definition))
+                            & relInheritParentsL .~ Set.fromList (tableInheritParents definition)
+                            & relOnCommitL .~ tableOnCommit definition
+                            & relOnCommitFrameIdL
+                                .~ ( case tableOnCommit definition of
+                                        Just OnCommitDrop -> evalFrameId eval
+                                        _ -> Nothing
+                                   )
+                            & relTransactionalL .~ tableTransactional definition
+                            & relConstraintsL .~ constraintKeys
                     catalog3 = insertRelation key relation catalog2
-                 in eval2 {evalCatalog = catalog3}
+                 in eval2 & evalCatalogL .~ catalog3
 
 processDefineView :: StatementId -> Eval -> ViewDef -> Eval
 processDefineView sid eval definition =
@@ -252,18 +266,16 @@ processDefineView sid eval definition =
                             then MaterializedViewRelation
                             else ViewRelation
                     relation =
-                        (newRelation kind)
-                            { relDefinition = Just sid
-                            , relColumns = Set.fromList (viewColumns definition)
-                            , relSources =
-                                resolvedSourceKeys session catalog (viewSources definition)
-                            , relUnresolvedSources = unresolved
-                            , relSourceReads = viewSources definition
-                            , relColumnLineage = viewColumnLineage definition
-                            , relConditionColumns = viewConditionColumns definition
-                            }
+                        newRelation kind
+                            & relDefinitionL ?~ sid
+                            & relColumnsL .~ Set.fromList (viewColumns definition)
+                            & relSourcesL .~ resolvedSourceKeys session catalog (viewSources definition)
+                            & relUnresolvedSourcesL .~ unresolved
+                            & relSourceReadsL .~ viewSources definition
+                            & relColumnLineageL .~ viewColumnLineage definition
+                            & relConditionColumnsL .~ viewConditionColumns definition
                     catalog1 = insertRelation key relation (clearRelationObjects key catalog)
-                 in eval2 {evalCatalog = catalog1}
+                 in eval2 & evalCatalogL .~ catalog1
 
 processDefineIndex :: StatementId -> Eval -> IndexDef -> Eval
 processDefineIndex sid eval definition =
@@ -313,39 +325,21 @@ processDefineIndex sid eval definition =
                                     Just oldTableKey -> [oldTableKey]
                             catalog0 =
                                 foldl'
-                                    ( \catalog' oldTableKey ->
-                                        catalog'
-                                            { catalogRelations =
-                                                Map.adjust
-                                                    (\relation -> relation {relIndexes = Set.delete indexKey (relIndexes relation)})
-                                                    oldTableKey
-                                                    (catalogRelations catalog')
-                                            }
-                                    )
+                                    (\cat' oldTableKey -> modifyRelation oldTableKey (relIndexesL %~ Set.delete indexKey) cat')
                                     (evalCatalog current1)
                                     oldTableKeys
                             catalog1 =
                                 catalog0
-                                    { catalogIndexes =
-                                        Map.insert
+                                    & catalogIndexesL
+                                        %~ Map.insert
                                             indexKey
                                             (IndexState (Just sid) (listToMaybe tableKeys) (indexColumns definition) Nothing)
-                                            (catalogIndexes catalog0)
-                                    }
                             catalog2 =
                                 foldl'
-                                    ( \catalog' tableKey ->
-                                        catalog'
-                                            { catalogRelations =
-                                                Map.adjust
-                                                    (\relation -> relation {relIndexes = Set.insert indexKey (relIndexes relation)})
-                                                    tableKey
-                                                    (catalogRelations catalog')
-                                            }
-                                    )
+                                    (\cat' tableKey -> modifyRelation tableKey (relIndexesL %~ Set.insert indexKey) cat')
                                     catalog1
                                     tableKeys
-                         in current1 {evalCatalog = catalog2}
+                         in current1 & evalCatalogL .~ catalog2
      in case tableKeys of
             _ : _ : _ -> ambiguousMutation eval
             _ -> mutateResolved stepKey eval indexKeys
@@ -466,21 +460,13 @@ processDefineTrigger sid eval definition =
                                     Just oldTableKey -> [oldTableKey]
                             catalog0 =
                                 foldl'
-                                    ( \catalog' oldTableKey ->
-                                        catalog'
-                                            { catalogRelations =
-                                                Map.adjust
-                                                    (\relation -> relation {relTriggers = Set.delete triggerKey (relTriggers relation)})
-                                                    oldTableKey
-                                                    (catalogRelations catalog')
-                                            }
-                                    )
+                                    (\cat' oldTableKey -> modifyRelation oldTableKey (relTriggersL %~ Set.delete triggerKey) cat')
                                     (evalCatalog current1)
                                     oldTableKeys
                             catalog1 =
                                 catalog0
-                                    { catalogTriggers =
-                                        Map.insert
+                                    & catalogTriggersL
+                                        %~ Map.insert
                                             triggerKey
                                             ( TriggerState
                                                 (Just sid)
@@ -491,22 +477,12 @@ processDefineTrigger sid eval definition =
                                                 (triggerBody definition)
                                                 Nothing
                                             )
-                                            (catalogTriggers catalog0)
-                                    }
                             catalog2 =
                                 foldl'
-                                    ( \catalog' tableKey ->
-                                        catalog'
-                                            { catalogRelations =
-                                                Map.adjust
-                                                    (\relation -> relation {relTriggers = Set.insert triggerKey (relTriggers relation)})
-                                                    tableKey
-                                                    (catalogRelations catalog')
-                                            }
-                                    )
+                                    (\cat' tableKey -> modifyRelation tableKey (relTriggersL %~ Set.insert triggerKey) cat')
                                     catalog1
                                     tableKeys
-                         in current1 {evalCatalog = catalog2}
+                         in current1 & evalCatalogL .~ catalog2
      in case tableKeys of
             _ : _ : _ -> ambiguousMutation eval
             _ -> mutateResolved stepKey eval1 triggerKeys
@@ -534,16 +510,10 @@ processDefineSequence sid eval definition =
                 Set.empty
                 Nothing
                 (sequenceTransactional definition)
-        catalog1 =
-            catalog
-                { catalogSequences = Map.insert key state (catalogSequences catalog)
-                }
-     in ( addTouches
-            (sequenceTouchKeys key)
-            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (sequenceKeyName key)) eval)
-        )
-            { evalCatalog = catalog1
-            }
+     in eval
+            & addTouches (sequenceTouchKeys key)
+            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (sequenceKeyName key))
+            & evalCatalogL . catalogSequencesL %~ Map.insert key state
 
 processDefineType :: StatementId -> Eval -> TypeDef -> Eval
 processDefineType sid eval definition =
@@ -555,17 +525,10 @@ processDefineType sid eval definition =
                 Set.empty
                 (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
                 existing
-        catalog1 =
-            catalog
-                { catalogTypes =
-                    Map.insert name (DefinitionState (Just sid) Nothing) (catalogTypes catalog)
-                }
-     in ( addTouches
-            (typeTouchKeys name)
-            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name) eval)
-        )
-            { evalCatalog = catalog1
-            }
+     in eval
+            & addTouches (typeTouchKeys name)
+            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
+            & evalCatalogL . catalogTypesL %~ Map.insert name (DefinitionState (Just sid) Nothing)
 
 processDefineSchema :: StatementId -> Eval -> SchemaDef -> Eval
 processDefineSchema sid eval definition =
@@ -580,14 +543,8 @@ processDefineSchema sid eval definition =
         catalog1 =
             if isJust existing
                 then catalog
-                else
-                    catalog
-                        { catalogSchemas =
-                            Map.insert name (DefinitionState (Just sid) Nothing) (catalogSchemas catalog)
-                        }
-     in ( addTouches
-            (schemaTouchKeys name)
-            (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name) eval)
-        )
-            { evalCatalog = catalog1
-            }
+                else catalog & catalogSchemasL %~ Map.insert name (DefinitionState (Just sid) Nothing)
+     in eval
+            & addTouches (schemaTouchKeys name)
+            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
+            & evalCatalogL .~ catalog1

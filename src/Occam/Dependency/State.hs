@@ -63,7 +63,12 @@ module Occam.Dependency.State (
     catalogConstraintsL,
     catalogTypesL,
     catalogSchemasL,
+    catalogNextUnnamedConstraintL,
     relColumnsL,
+    relDefinitionL,
+    relTransactionalL,
+    relOnCommitL,
+    relOnCommitFrameIdL,
     relDataWritesL,
     relCardinalityWritesL,
     relColumnWritesL,
@@ -78,6 +83,7 @@ module Occam.Dependency.State (
     relInheritParentsL,
     relColumnLineageL,
     relConditionColumnsL,
+    sequenceWritesL,
     modifyCatalog,
     modifySession,
     modifyRelation,
@@ -533,9 +539,29 @@ catalogTypesL = lens catalogTypes (\c t -> c {catalogTypes = t})
 catalogSchemasL :: Lens' Catalog (Map Name DefinitionState)
 catalogSchemasL = lens catalogSchemas (\c s -> c {catalogSchemas = s})
 
+-- | Lens for catalog next unnamed constraint counter.
+catalogNextUnnamedConstraintL :: Lens' Catalog Int
+catalogNextUnnamedConstraintL = lens catalogNextUnnamedConstraint (\c n -> c {catalogNextUnnamedConstraint = n})
+
 -- | Lens for columns in a relation state.
 relColumnsL :: Lens' RelationState (Set Ident)
 relColumnsL = lens relColumns (\r c -> r {relColumns = c})
+
+-- | Lens for definition statement in a relation state.
+relDefinitionL :: Lens' RelationState (Maybe StatementId)
+relDefinitionL = lens relDefinition (\r d -> r {relDefinition = d})
+
+-- | Lens for transactional flag in a relation state.
+relTransactionalL :: Lens' RelationState Bool
+relTransactionalL = lens relTransactional (\r t -> r {relTransactional = t})
+
+-- | Lens for on-commit action in a relation state.
+relOnCommitL :: Lens' RelationState (Maybe OnCommitAction)
+relOnCommitL = lens relOnCommit (\r a -> r {relOnCommit = a})
+
+-- | Lens for on-commit frame id in a relation state.
+relOnCommitFrameIdL :: Lens' RelationState (Maybe Int)
+relOnCommitFrameIdL = lens relOnCommitFrameId (\r f -> r {relOnCommitFrameId = f})
 
 -- | Lens for data writes in a relation state.
 relDataWritesL :: Lens' RelationState (Set StatementId)
@@ -592,6 +618,10 @@ relColumnLineageL = lens relColumnLineage (\r l -> r {relColumnLineage = l})
 -- | Lens for condition columns in a relation state.
 relConditionColumnsL :: Lens' RelationState [SourceColumn]
 relConditionColumnsL = lens relConditionColumns (\r c -> r {relConditionColumns = c})
+
+-- | Lens for sequence writes in a sequence state.
+sequenceWritesL :: Lens' SequenceState (Set StatementId)
+sequenceWritesL = lens sequenceWrites (\s w -> s {sequenceWrites = w})
 
 -- | Modify the catalog component of an evaluation accumulator.
 modifyCatalog :: (Catalog -> Catalog) -> Eval -> Eval

@@ -25,6 +25,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Lens.Micro ((%~), (&), (.~))
 import Occam.Core (
     BarrierReason (..),
     BarrierScope (..),
@@ -80,10 +81,16 @@ import Occam.Dependency.State (
     addDeps,
     addTouch,
     addTouches,
+    catalogSequencesL,
+    evalCatalogL,
     insertRelation,
     lookupRelation,
     mutateResolved,
     newRelation,
+    relCardinalityWritesL,
+    relColumnWritesL,
+    relDataWritesL,
+    sequenceWritesL,
     writeSignature,
  )
 
@@ -93,54 +100,51 @@ applyWriteState sid kind columns relation =
     case kind of
         InsertWrite _ ->
             relation
-                { relDataWrites = Set.insert sid (relDataWrites relation)
-                , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
-                }
+                & relDataWritesL %~ Set.insert sid
+                & relCardinalityWritesL %~ Set.insert sid
         MergeWrite ->
             relation
-                { relDataWrites = Set.insert sid (relDataWrites relation)
-                , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
-                }
+                & relDataWritesL %~ Set.insert sid
+                & relCardinalityWritesL %~ Set.insert sid
         DeleteWrite scope
             | scope == DeleteAllRows ->
                 relation
-                    { relDataWrites = Set.singleton sid
-                    , relCardinalityWrites = Set.singleton sid
-                    , relColumnWrites = Map.empty
-                    }
+                    & relDataWritesL .~ Set.singleton sid
+                    & relCardinalityWritesL .~ Set.singleton sid
+                    & relColumnWritesL .~ Map.empty
             | otherwise ->
                 relation
-                    { relDataWrites = Set.insert sid (relDataWrites relation)
-                    , relCardinalityWrites = Set.insert sid (relCardinalityWrites relation)
-                    }
+                    & relDataWritesL %~ Set.insert sid
+                    & relCardinalityWritesL %~ Set.insert sid
         UpdateWrite scope
             | scope == UpdateAllRows ->
                 if null columns
-                    then relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+                    then relation & relDataWritesL %~ Set.insert sid
                     else
                         relation
-                            { relColumnWrites =
-                                foldl'
-                                    (\current column -> Map.insert column (Set.singleton sid) current)
-                                    (relColumnWrites relation)
-                                    columns
-                            }
+                            & relColumnWritesL
+                                %~ ( \current ->
+                                        foldl'
+                                            (\m column -> Map.insert column (Set.singleton sid) m)
+                                            current
+                                            columns
+                                   )
             | null columns ->
-                relation {relDataWrites = Set.insert sid (relDataWrites relation)}
+                relation & relDataWritesL %~ Set.insert sid
             | otherwise ->
                 relation
-                    { relColumnWrites =
-                        foldl'
-                            (\current column -> Map.insertWith Set.union column (Set.singleton sid) current)
-                            (relColumnWrites relation)
-                            columns
-                    }
+                    & relColumnWritesL
+                        %~ ( \current ->
+                                foldl'
+                                    (\m column -> Map.insertWith Set.union column (Set.singleton sid) m)
+                                    current
+                                    columns
+                           )
         TruncateWrite {} ->
             relation
-                { relDataWrites = Set.singleton sid
-                , relCardinalityWrites = Set.singleton sid
-                , relColumnWrites = Map.empty
-                }
+                & relDataWritesL .~ Set.singleton sid
+                & relCardinalityWritesL .~ Set.singleton sid
+                & relColumnWritesL .~ Map.empty
 
 -- Reads
 processRead :: StatementId -> Eval -> ReadFact -> Eval
@@ -307,11 +311,7 @@ writeRelation sid eval key kind columns only =
         evalWrite =
             if suppressOriginal
                 then evalDeps
-                else
-                    evalDeps
-                        { evalCatalog =
-                            insertRelation key (applyWriteState sid kind columns relation) (evalCatalog evalDeps)
-                        }
+                else evalDeps & evalCatalogL %~ insertRelation key (applyWriteState sid kind columns relation)
         evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
         evalCascades = applyForeignKeys sid evalTriggers key kind columns
         -- A parent write also lands on partition/inheritance children.
@@ -473,15 +473,10 @@ processSequenceWrite sid eval write =
                             ]
                         )
                         `Set.union` sequenceWrites state
-                state' = state {sequenceWrites = Set.insert sid (sequenceWrites state)}
-                catalog1 =
-                    (evalCatalog current)
-                        { catalogSequences =
-                            Map.insert key state' (catalogSequences (evalCatalog current))
-                        }
-             in (addTouches (sequenceTouchKeys key) (addDeps deps current))
-                    { evalCatalog = catalog1
-                    }
+             in current
+                    & addTouches (sequenceTouchKeys key)
+                    & addDeps deps
+                    & evalCatalogL . catalogSequencesL %~ Map.insert key (state & sequenceWritesL %~ Set.insert sid)
         evalWrites = mutateResolved stepKey eval keys
      in if not transactional && evalTransactionActive eval
             then
@@ -690,11 +685,11 @@ processRefresh sid eval refresh =
                 evalReads = foldl' (processRead sid) current sourceReads
                 relation1 =
                     relation
-                        { relDataWrites = Set.singleton sid
-                        , relCardinalityWrites = Set.singleton sid
-                        , relColumnWrites = Map.empty
-                        }
-             in (addTouches (relationTouchKeys key) (addDeps deps evalReads))
-                    { evalCatalog = insertRelation key relation1 currentCatalog
-                    }
+                        & relDataWritesL .~ Set.singleton sid
+                        & relCardinalityWritesL .~ Set.singleton sid
+                        & relColumnWritesL .~ Map.empty
+             in evalReads
+                    & addTouches (relationTouchKeys key)
+                    & addDeps deps
+                    & evalCatalogL .~ insertRelation key relation1 currentCatalog
      in mutateResolved stepKey eval keys
