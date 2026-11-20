@@ -671,7 +671,7 @@ runAuditPhase env state pool reporter evidence = do
                         }
                 logInfo'
                     (envLogger env)
-                    "occam::audit"
+                    "audit"
                     "Shared statement audit finished"
                     [ ("elapsed_seconds", toJSON elapsed)
                     , ("candidate_checks", toJSON (0 :: Int))
@@ -702,7 +702,7 @@ runAuditPhase env state pool reporter evidence = do
                     modifyEvalState state (\s -> s {evalAuditSeconds = elapsed})
                     logInfo'
                         (envLogger env)
-                        "occam::audit"
+                        "audit"
                         "Shared statement audit finished"
                         [ ("elapsed_seconds", toJSON elapsed)
                         , ("candidate_checks", toJSON checks)

@@ -208,7 +208,7 @@ logStage :: Logger -> T.Text -> Word64 -> IO ()
 logStage logger stage elapsed =
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         ("Finished " <> stage)
         [("stage", toJSON stage), ("duration_seconds", toJSON (seconds elapsed))]
 
@@ -411,7 +411,7 @@ closureDdminWithLogger logger pool baseSQL initialStatements graph = do
     stats <- readIORef closureStats
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         "Closure search summary"
         [ ("closure_requests", toJSON (closureRequests stats))
         , ("closure_cache_hits", toJSON (closureCacheHits stats))
@@ -700,7 +700,7 @@ logAuditStats :: Logger -> AuditStats -> IO ()
 logAuditStats logger stats =
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         "Statement deletion audit reached a fixed point"
         [ ("audit_passes", toJSON (auditPasses stats))
         , ("audit_attempts", toJSON (auditAttempts stats))
@@ -756,7 +756,7 @@ analyzeSQL store logger dialect sql = do
         barrierEdges = graphBarrierEdges graph
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         "Dependency analysis completed"
         [ ("analysis_seconds", toJSON (seconds elapsed))
         , ("statements", toJSON statementCount)
@@ -790,7 +790,7 @@ sliceWithAnalysis logger pool analysis sql = do
                     let StatementId targetId = stmtId target
                     logInfo'
                         logger
-                        "occam::reducer"
+                        "reducer"
                         "Backward slicing accepted"
                         [ ("seed_strategy", toJSON (strategy :: String))
                         , ("target_statement_id", toJSON targetId)
@@ -828,7 +828,7 @@ sliceWithAnalysis logger pool analysis sql = do
                                                 oracleAccepts (poolOracle pool) candidate
                                     logInfo'
                                         logger
-                                        "occam::reducer"
+                                        "reducer"
                                         "Prefix oracle result considered for backward slice"
                                         [ ("prefix_tests", toJSON prefixTests)
                                         , ("prefix_length", toJSON prefixLength)
@@ -883,14 +883,14 @@ reduceSQLWithEvidence reporter config logger pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then do
-            logWarn logger "occam::reducer" "Initial SQL candidate failed oracle check"
+            logWarn logger "reducer" "Initial SQL candidate failed oracle check"
             pure (ReductionResult initialSQL Nothing)
         else loop (1 :: Int) initialSQL Nothing
     where
         loop iteration currentSQL priorEvidence = do
             logInfo'
                 logger
-                "occam::reducer"
+                "reducer"
                 "Starting reduction iteration"
                 [ ("iteration", toJSON iteration)
                 , ("bytes", toJSON (BS.length currentSQL))
@@ -907,7 +907,7 @@ reduceSQLWithEvidence reporter config logger pool initialSQL = do
                 else do
                     logInfo'
                         logger
-                        "occam::reducer"
+                        "reducer"
                         "Rewrite fixed point reached"
                         [ ("total_iterations", toJSON iteration)
                         , ("final_bytes", toJSON (BS.length currentSQL))
@@ -1006,7 +1006,7 @@ reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence
                 then do
                     logInfo'
                         logger
-                        "occam::reducer"
+                        "reducer"
                         "Interleaved reduction step accepted"
                         [ ("interleave_iteration", toJSON iter)
                         , ("bytes_before", toJSON (BS.length current))
@@ -1016,7 +1016,7 @@ reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence
                 else do
                     logInfo'
                         logger
-                        "occam::reducer"
+                        "reducer"
                         "Interleaved audit and syntax global fixed point reached"
                         [ ("total_interleave_iterations", toJSON iter)
                         , ("final_bytes", toJSON (BS.length current))
@@ -1076,7 +1076,7 @@ reduceSyntaxWithDialect ::
 reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         "Using ordinal-forward syntax candidate schedule"
         [ ("search_policy", toJSON (syntaxPolicyName mode))
         , ("category_order", toJSON categoryOrderName)
@@ -1086,7 +1086,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
     finalStats <- readIORef stats
     logInfo'
         logger
-        "occam::reducer"
+        "reducer"
         "Syntax replacement summary"
         [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
         , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
@@ -1219,7 +1219,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                         replacement = parserEditReplacement edit
                      in logInfo'
                             logger
-                            "occam::reducer"
+                            "reducer"
                             "Accepted byte-preserving syntax rewrite"
                             [ ("rewrite_kind", toJSON (parserEditLabel edit))
                             , ("rewrite_category", toJSON (parserEditCategory edit))
@@ -1232,7 +1232,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                 logAccept (BundleCandidate target) currentSQL acceptedBytes =
                     logInfo'
                         logger
-                        "occam::reducer"
+                        "reducer"
                         "Accepted atomic column co-reduction"
                         [ ("rewrite_kind", toJSON ("remove-column-bundle" :: T.Text))
                         , ("rewrite_category", toJSON EditColumn)

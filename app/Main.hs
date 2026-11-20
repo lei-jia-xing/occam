@@ -6,6 +6,7 @@ import Data.Aeson (Value, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -100,15 +101,17 @@ import System.Directory (
     createDirectoryIfMissing,
     doesFileExist,
  )
-import System.Exit (exitFailure, exitSuccess)
-import System.FilePath ((</>))
+import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
+import System.FilePath (dropExtension, takeDirectory, takeExtension, (</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
 data Options = Options
     { optInputFile :: !FilePath
     , optOracleCmd :: !(Maybe String)
-    , optOutDir :: !FilePath
+    , optOut :: !(Maybe FilePath)
+    , optInPlace :: !Bool
+    , optStatsFile :: !(Maybe FilePath)
     , optResetCmd :: !(Maybe String)
     , optTimeoutSecs :: !Double
     , optLogLevel :: !LogLevel
@@ -155,18 +158,32 @@ optionsParser =
         <*> optional
             ( strOption
                 ( long "oracle"
+                    <> short 'c'
                     <> metavar "COMMAND"
                     <> help "Interestingness predicate command (SQL on stdin; exit 0 accepts)"
                 )
             )
-        <*> strOption
-            ( long "out"
-                <> short 'o'
-                <> metavar "DIR"
-                <> value "occam-out"
-                <> showDefault
-                <> help "Directory where reduced artifacts will be written, or '-' for stdout"
-                <> completer (bashCompleter "directory")
+        <*> optional
+            ( strOption
+                ( long "out"
+                    <> short 'o'
+                    <> metavar "PATH"
+                    <> help "Output file or directory, or '-' for stdout (default: <input>.min.sql or stdout)"
+                    <> completer (bashCompleter "file")
+                )
+            )
+        <*> switch
+            ( long "in-place"
+                <> short 'i'
+                <> help "Modify input SQL file in place (creates backup <input>.bak)"
+            )
+        <*> optional
+            ( strOption
+                ( long "stats"
+                    <> metavar "FILE"
+                    <> help "Write JSON reduction statistics to FILE"
+                    <> completer (bashCompleter "file")
+                )
             )
         <*> optional
             ( strOption
@@ -199,6 +216,7 @@ optionsParser =
             )
         <*> switch
             ( long "verbose"
+                <> short 'v'
                 <> help "Enable verbose debug output (equivalent to --log-level debug)"
             )
         <*> switch
@@ -210,6 +228,7 @@ optionsParser =
             ( option
                 auto
                 ( long "budget"
+                    <> long "time-limit"
                     <> metavar "SECONDS"
                     <> help
                         "Shared wall-clock cap including the initial predicate check, reduction, audit, and repeated final validation"
@@ -219,18 +238,26 @@ optionsParser =
             ( option
                 auto
                 ( long "max-oracle-executions"
+                    <> long "max-evals"
                     <> metavar "N"
                     <> help "Maximum uncached oracle attempts including the initial check and final validation"
                 )
             )
-        <*> option
-            (eitherReader parseJobs)
-            ( long "jobs"
-                <> metavar "N"
-                <> value 1
-                <> showDefault
-                <> help
-                    "Maximum concurrent oracle/reset executions (default 1). Declares the predicate AND reset support N concurrent independent calls with independent database state; Occam enforces at most N in flight but provides no database isolation"
+        <*> ( option
+                (eitherReader parseJobs)
+                ( short 'j'
+                    <> internal
+                    <> metavar "N"
+                )
+                <|> option
+                    (eitherReader parseJobs)
+                    ( long "jobs"
+                        <> metavar "N"
+                        <> value 1
+                        <> showDefault
+                        <> help
+                            "Maximum concurrent oracle/reset executions (default 1). Declares the predicate AND reset support N concurrent independent calls with independent database state; Occam enforces at most N in flight but provides no database isolation"
+                    )
             )
         <*> reductionOptionsParser
         <*> switch
@@ -245,9 +272,9 @@ optionsParser =
 reductionOptionsParser :: Parser ReductionOptions
 reductionOptionsParser =
     ReductionOptions
-        <$> toggle True "slicing" "no-slicing" "dependency slicing"
-        <*> toggle True "closure" "no-closure" "dependency closure"
-        <*> toggle False "intra-statement" "no-intra-statement" "intra-statement reductions"
+        <$> toggle True "slicing" "no-slicing" "dependency slicing" True
+        <*> toggle True "closure" "no-closure" "dependency closure" True
+        <*> toggle False "intra-statement" "no-intra-statement" "intra-statement reductions" False
         <*> option
             (eitherReader parseColumnMode)
             ( long "column-mode"
@@ -261,10 +288,12 @@ reductionOptionsParser =
             "unrestricted"
             "no-unrestricted"
             "unrestricted fallback search (final deletion audit always runs)"
-        <*> toggle True "cache" "no-cache" "candidate caching"
+            True
+        <*> toggle True "cache" "no-cache" "candidate caching" True
         <*> option
             (eitherReader parseSQLDialect)
             ( long "dialect"
+                <> short 'd'
                 <> metavar "DIALECT"
                 <> value GenericSQL
                 <> showDefault
@@ -276,14 +305,16 @@ reductionOptionsParser =
             ( long "strategy"
                 <> metavar "STRATEGY"
                 <> value StrategyFull
+                <> internal
                 <> help "Reduction strategy: full, ddmin-only, or audit-only (default: full)"
             )
 
-toggle :: Bool -> String -> String -> String -> Parser Bool
-toggle defaultValue enableName disableName description =
-    flag' True (long enableName <> help ("Enable " ++ description))
-        <|> flag' False (long disableName <> help ("Disable " ++ description))
-        <|> pure defaultValue
+toggle :: Bool -> String -> String -> String -> Bool -> Parser Bool
+toggle defaultValue enableName disableName description isInternal =
+    let internalMod = if isInternal then internal else mempty
+     in flag' True (long enableName <> internalMod <> help ("Enable " ++ description))
+            <|> flag' False (long disableName <> internalMod <> help ("Disable " ++ description))
+            <|> pure defaultValue
 
 parseLogLevel :: String -> Either String LogLevel
 parseLogLevel s = case map toLower s of
@@ -330,7 +361,6 @@ versionOption =
     infoOption
         ("Occam v" ++ Occam.version)
         ( long "version"
-            <> short 'v'
             <> help "Show version information"
         )
 
@@ -343,15 +373,32 @@ optsInfo =
             <> header ("Occam v" ++ Occam.version ++ " - Multi-statement SQL reducer")
         )
 
+exitCliError :: IO a
+exitCliError = exitWith (ExitFailure 2)
+
+exitTimeout :: IO a
+exitTimeout = exitWith (ExitFailure 124)
+
+defaultMinPath :: FilePath -> FilePath
+defaultMinPath "-" = "minimal.sql"
+defaultMinPath fp
+    | takeExtension fp == ".sql" = dropExtension fp ++ ".min.sql"
+    | otherwise = fp ++ ".min.sql"
+
 main :: IO ()
 main = execParser optsInfo >>= runOccam
 
 runOccam :: Options -> IO ()
 runOccam opts@Options {..} = do
-    let effectiveLevel
-            | optQuiet = LevelError
-            | optVerbose = LevelDebug
+    isStderrTTY <- hIsTerminalDevice stderr
+    let isVerboseMode = optVerbose || optLogLevel == LevelDebug
+        defaultLevel
+            | isStderrTTY && not isVerboseMode && optLogFormat == FormatText = LevelWarn
             | otherwise = optLogLevel
+        effectiveLevel
+            | optQuiet = LevelError
+            | isVerboseMode = LevelDebug
+            | otherwise = defaultLevel
         effectiveFormat = optLogFormat
         logCfg =
             LogConfig
@@ -379,8 +426,9 @@ runOccamWithLogger logger Options {..} = do
     oracleCmd <- case optOracleCmd of
         Just cmd -> pure cmd
         Nothing -> do
-            hPutStrLn stderr "occam: error: --oracle COMMAND is required (unless --dump-facts is given)"
-            exitFailure
+            hPutStrLn stderr "error: --oracle COMMAND is required (unless --dump-facts is given)"
+            hPutStrLn stderr " note: specify predicate with -c or --oracle (e.g. -c './check.sh')"
+            exitCliError
     let finitePositive seconds = seconds > 0 && not (isNaN seconds || isInfinite seconds)
         maxSeconds = fromIntegral (maxBound :: Int) / 1000000
         finiteTimeout seconds =
@@ -391,13 +439,14 @@ runOccamWithLogger logger Options {..} = do
                 && maybe True (> 0) optMaxOracleExecutions
                 && optJobs > 0
     unless validBudget do
-        hPutStrLn stderr "Error: timeout, budget, execution, and job limits must be positive"
-        exitFailure
+        hPutStrLn stderr "error: timeout, budget, execution, and job limits must be positive"
+        exitCliError
 
     let columnMode = optColumnMode optReductionOptions
     when (columnMode /= ColumnOff && not (optIntraStatement optReductionOptions)) do
-        hPutStrLn stderr "Error: --column-mode single|atomic requires --intra-statement"
-        exitFailure
+        hPutStrLn stderr "error: --column-mode single|atomic requires --intra-statement to be enabled"
+        hPutStrLn stderr " note: add '--intra-statement' to your command to enable column-level reduction"
+        exitCliError
 
     initialSQL <-
         if optInputFile == "-"
@@ -406,9 +455,9 @@ runOccamWithLogger logger Options {..} = do
                 fileExists <- doesFileExist optInputFile
                 unless fileExists do
                     let msg = "cannot open '" ++ optInputFile ++ "': No such file or directory"
-                    logError logger "occam::cli" (T.pack msg)
-                    hPutStrLn stderr ("occam: error: " ++ msg)
-                    exitFailure
+                    logError logger "cli" (T.pack msg)
+                    hPutStrLn stderr ("error: " ++ msg)
+                    exitCliError
                 BS.readFile optInputFile
 
     initialStmts <- countStatementsForCLI logger dialect initialSQL
@@ -448,7 +497,7 @@ runOccamWithLogger logger Options {..} = do
                 }
     logInfo'
         logger
-        "occam::cli"
+        "cli"
         "Starting reduction session"
         [ ("input_file", toJSON optInputFile)
         , ("initial_bytes", toJSON initialBytes)
@@ -471,11 +520,11 @@ runOccamWithLogger logger Options {..} = do
             (prepareOracle baseOracleConfig initialSQL)
     preflightDetails <- case prepared of
         Nothing -> do
-            hPutStrLn stderr "occam: error: initial predicate check exceeded the total budget"
-            exitFailure
+            hPutStrLn stderr "error: initial predicate check exceeded the total budget"
+            exitTimeout
         Just (Left err) -> do
-            hPutStrLn stderr ("occam: error: initial predicate check failed: " ++ T.unpack err)
-            hPutStrLn stderr "occam: note: oracle command rejected the original unreduced SQL input"
+            hPutStrLn stderr ("error: initial predicate check failed: " ++ T.unpack err)
+            hPutStrLn stderr " note: oracle command rejected the original unreduced SQL input"
             exitFailure
         Just (Right details) -> pure details
     preflightEnd <- toInteger <$> getMonotonicTimeNSec
@@ -491,20 +540,51 @@ runOccamWithLogger logger Options {..} = do
                 , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
                 , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
-    logInfo logger "occam::oracle" "Initial predicate check passed"
+    logInfo logger "oracle" "Initial predicate check passed"
 
-    let writeToStdout = optOutDir == "-"
-        minimalPath = if writeToStdout then "" else optOutDir </> "minimal.sql"
-        statsPath = if writeToStdout then "" else optOutDir </> "stats.json"
+    when (optJobs > 1 && isNothing optResetCmd) do
+        hPutStrLn
+            stderr
+            "warning: running with --jobs > 1 without --reset may lead to shared database state contamination"
 
-    unless writeToStdout (createDirectoryIfMissing True optOutDir)
-    logInfo logger "occam::reducer" "Running hierarchical reduction engine..."
+    isStdoutTTY <- hIsTerminalDevice stdout
+    let isStdoutTarget =
+            optOut == Just "-"
+                || (isNothing optOut && not optInPlace && (not isStdoutTTY || optInputFile == "-"))
+        writeToStdout = isStdoutTarget
+
+    (minimalPath, statsPath) <-
+        if writeToStdout
+            then pure ("", fromMaybe "" optStatsFile)
+            else case optOut of
+                Just outPath
+                    | takeExtension outPath == ".sql" -> do
+                        let dir = takeDirectory outPath
+                        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+                        pure (outPath, fromMaybe "" optStatsFile)
+                    | otherwise -> do
+                        createDirectoryIfMissing True outPath
+                        let minFile = outPath </> "minimal.sql"
+                            stFile = fromMaybe (outPath </> "stats.json") optStatsFile
+                        pure (minFile, stFile)
+                Nothing
+                    | optInPlace -> do
+                        when (optInputFile /= "-") do
+                            BS.writeFile (optInputFile ++ ".bak") initialSQL
+                        pure (optInputFile, fromMaybe "" optStatsFile)
+                    | otherwise -> do
+                        let defaultTarget = defaultMinPath optInputFile
+                            dir = takeDirectory defaultTarget
+                        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+                        pure (defaultTarget, fromMaybe "" optStatsFile)
+
+    logInfo logger "reducer" "Running hierarchical reduction engine..."
 
     metricsPolicy <- case optStrategy optReductionOptions of
         StrategyFull -> case metricPolicyForReduction reductionConfig optJobs of
             Left err -> do
-                hPutStrLn stderr ("occam: error: " ++ T.unpack err)
-                exitFailure
+                hPutStrLn stderr ("error: " ++ T.unpack err)
+                exitCliError
             Right policy -> pure (Just policy)
         StrategyDdminOnly -> pure Nothing
         StrategyAuditOnly -> pure Nothing
@@ -586,16 +666,15 @@ runOccamWithLogger logger Options {..} = do
                 }
     unless writeToStdout do
         BS.writeFile minimalPath reducedSQL
-        BSL.writeFile statsPath (encode stats)
+        unless (null statsPath) (BSL.writeFile statsPath (encode stats))
 
-    isStdoutTTY <- hIsTerminalDevice stdout
     when (writeToStdout || not isStdoutTTY) do
         BS.putStr reducedSQL
         hFlush stdout
 
     logInfo'
         logger
-        "occam::cli"
+        "cli"
         "Reduction session finished"
         [ ("status", toJSON (evaluationStatus evaluation))
         , ("initial_statements", toJSON initialStmts)
@@ -609,9 +688,13 @@ runOccamWithLogger logger Options {..} = do
         ]
 
     uiFinish ui evaluation initialBytes reducedBytes initialStmts reducedStmts minimalPath statsPath
-    unless
-        (evaluationStatus evaluation == EvaluationCompleted && evaluationValidationPassed evaluation)
-        exitFailure
+    case evaluationStatus evaluation of
+        EvaluationCompleted
+            | evaluationValidationPassed evaluation -> exitSuccess
+            | otherwise -> exitFailure
+        EvaluationTimeout -> exitTimeout
+        EvaluationExecutionBudget -> exitTimeout
+        _ -> exitFailure
 
 runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)
 runWithinBudget _ Nothing action = Just <$> action
@@ -627,9 +710,9 @@ countStatementsForCLI logger dialect sql = do
     case result of
         Left err -> do
             let message = "SQL parser failed while counting statements: " <> T.pack (show err)
-            logError logger "occam::parser" message
-            hPutStrLn stderr ("occam: error: " ++ T.unpack message)
-            exitFailure
+            logError logger "parser" message
+            hPutStrLn stderr ("error: " ++ T.unpack message)
+            exitCliError
         Right count -> pure count
 
 toReductionConfig :: ReductionOptions -> ReductionConfig
@@ -667,8 +750,8 @@ dumpStatementFacts dialect fkOn inputFile = do
             else do
                 fileExists <- doesFileExist inputFile
                 unless fileExists do
-                    hPutStrLn stderr ("occam: error: cannot open '" ++ inputFile ++ "': No such file or directory")
-                    exitFailure
+                    hPutStrLn stderr ("error: cannot open '" ++ inputFile ++ "': No such file or directory")
+                    exitCliError
                 BS.readFile inputFile
     let baseOptions = defaultParseOptions dialect
         parseOptions
@@ -681,6 +764,6 @@ dumpStatementFacts dialect fkOn inputFile = do
     parsed <- parseSQL parseOptions sql
     case parsed of
         Left err -> do
-            hPutStrLn stderr ("occam: error: failed to parse input: " ++ T.unpack (parserErrorMessage err))
-            exitFailure
+            hPutStrLn stderr ("error: failed to parse input: " ++ T.unpack (parserErrorMessage err))
+            exitCliError
         Right result -> BSL.putStr (encode (factDumpJson dialect result) <> "\n")

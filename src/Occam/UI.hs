@@ -4,9 +4,11 @@ module Occam.UI (
     newUI,
     formatSize,
     formatRatio,
+    formatInt,
 ) where
 
-import Control.Monad (unless, when)
+import Control.Monad (when)
+import Data.Char (toUpper)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
@@ -25,12 +27,11 @@ import System.Console.ANSI (
     ConsoleIntensity (..),
     ConsoleLayer (..),
     SGR (..),
-    hSetSGR,
     hSupportsANSI,
     setSGRCode,
  )
 import System.Environment (lookupEnv)
-import System.IO (hFlush, hPutStr, hPutStrLn, stderr)
+import System.IO (hFlush, hPutStrLn, stderr)
 import System.ProgressBar (
     Label (..),
     OnComplete (..),
@@ -89,6 +90,44 @@ formatSize bytes
 formatRatio :: Double -> String
 formatRatio r = showFFloat (Just 1) r "%"
 
+-- | Format an integer with thousands commas (e.g. 1420 -> "1,420").
+formatInt :: Int -> String
+formatInt n
+    | n < 0 = '-' : formatInt (negate n)
+    | n < 1000 = show n
+    | otherwise =
+        let (rest, last3) = n `quotRem` 1000
+            last3Str = case show last3 of
+                [d] -> "00" ++ [d]
+                [d1, d2] -> '0' : [d1, d2]
+                s -> s
+         in formatInt rest ++ "," ++ last3Str
+
+-- | Right-aligned, fixed-width bold action verb in Cargo / uv CLI style.
+renderAction :: Bool -> Color -> String -> String
+renderAction useColor color verb =
+    let padded = replicate (max 0 (10 - length verb)) ' ' ++ verb
+     in if useColor
+            then
+                setSGRCode [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid color]
+                    ++ padded
+                    ++ setSGRCode [Reset]
+                    ++ " "
+            else padded ++ " "
+
+-- | Map internal stage identifiers to human-readable action verbs.
+stageVerb :: Text -> String
+stageVerb t = case t of
+    "slicing" -> "Slicing"
+    "closure-search" -> "Closure"
+    "graph-free-search" -> "Ddmin"
+    "unrestricted-fallback" -> "Fallback"
+    "statement-audit" -> "Audit"
+    "intra-statement-rewrites" -> "Rewriting"
+    other -> case T.unpack other of
+        [] -> "Working"
+        (c : cs) -> toUpper c : cs
+
 -- | Initialize the UI, detecting TTY capabilities and using library progress rendering.
 newUI :: UIConfig -> IO UI
 newUI UIConfig {..} = do
@@ -107,18 +146,15 @@ newUI UIConfig {..} = do
         else
             if isTTY
                 then do
-                    when useColor (hSetSGR stderr [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Cyan])
-                    hPutStr stderr "occam: "
-                    when useColor (hSetSGR stderr [Reset])
                     hPutStrLn
                         stderr
-                        ( "reducing "
+                        ( renderAction useColor Cyan "Reducing"
                             ++ targetDesc
                             ++ " ("
-                            ++ show uiInitialStmts
-                            ++ " stmts, "
+                            ++ formatInt uiInitialStmts
+                            ++ " stmts · "
                             ++ formatSize uiInitialBytes
-                            ++ ", "
+                            ++ " · "
                             ++ T.unpack uiDialect
                             ++ ")"
                         )
@@ -138,9 +174,14 @@ newUI UIConfig {..} = do
                             defStyle
                                 { styleWidth = TerminalWidth 80
                                 , styleOnComplete = Clear
-                                , styleTodo = ' '
+                                , styleOpen = ""
+                                , styleClose = ""
+                                , styleDone = '━'
+                                , styleCurrent = '╺'
+                                , styleTodo = '─'
                                 , stylePrefix = Label $ \p _ ->
-                                    TL.fromStrict ("occam: [" <> piPhase (progressCustom p) <> "]")
+                                    let verb = stageVerb (piPhase (progressCustom p))
+                                     in TL.pack (renderAction useColor Cyan verb)
                                 , stylePostfix = Label $ \p timing ->
                                     let inf = progressCustom p
                                         stmts = piCurrentStmts inf
@@ -154,30 +195,30 @@ newUI UIConfig {..} = do
                                                 then (fromIntegral hits / fromIntegral runs :: Double) * 100.0
                                                 else 0.0
                                         elapsedStr = showFFloat (Just 1) elapsed "s"
-                                        hitStr = showFFloat (Just 0) hitPct "% hits"
+                                        hitStr = showFFloat (Just 0) hitPct "% hit"
+                                        metaColor = if useColor then setSGRCode [SetColor Foreground Dull White] else ""
+                                        resetCode = if useColor then setSGRCode [Reset] else ""
                                      in TL.pack
-                                            ( show stmts
+                                            ( "  "
+                                                ++ formatInt stmts
                                                 ++ "/"
-                                                ++ show initS
+                                                ++ formatInt initS
                                                 ++ " stmts ("
                                                 ++ formatSize bytes
-                                                ++ ") | #"
-                                                ++ show runs
-                                                ++ " ("
-                                                ++ elapsedStr
-                                                ++ ", "
-                                                ++ hitStr
                                                 ++ ")"
+                                                ++ metaColor
+                                                ++ " · "
+                                                ++ formatInt runs
+                                                ++ " runs · "
+                                                ++ hitStr
+                                                ++ " · "
+                                                ++ elapsedStr
+                                                ++ resetCode
                                             )
-                                , styleEscapePrefix =
-                                    if useColor
-                                        then
-                                            const (TL.pack (setSGRCode [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Cyan]))
-                                        else const TL.empty
-                                , styleEscapeOpen =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [Reset, SetColor Foreground Dull White]))
-                                        else const TL.empty
+                                , styleEscapePrefix = const TL.empty
+                                , styleEscapeOpen = const TL.empty
+                                , styleEscapeClose = const TL.empty
+                                , styleEscapePostfix = const TL.empty
                                 , styleEscapeDone =
                                     if useColor
                                         then const (TL.pack (setSGRCode [SetColor Foreground Vivid Green]))
@@ -188,18 +229,10 @@ newUI UIConfig {..} = do
                                         else const TL.empty
                                 , styleEscapeTodo =
                                     if useColor
-                                        then const (TL.pack (setSGRCode [Reset]))
-                                        else const TL.empty
-                                , styleEscapeClose =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [Reset, SetColor Foreground Dull White]))
-                                        else const TL.empty
-                                , styleEscapePostfix =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [Reset]))
+                                        then const (TL.pack (setSGRCode [SetColor Foreground Dull Black]))
                                         else const TL.empty
                                 }
-                    pb <- hNewProgressBar stderr pbStyle 20.0 (Progress 0 pbTodo initInfo)
+                    pb <- hNewProgressBar stderr pbStyle 10.0 (Progress 0 pbTodo initInfo)
 
                     let handleProgress = \case
                             ProgressStage newStage ->
@@ -239,13 +272,13 @@ newUI UIConfig {..} = do
                     -- Non-TTY fallback
                     hPutStrLn
                         stderr
-                        ( "occam: reducing "
+                        ( renderAction False Cyan "Reducing"
                             ++ targetDesc
                             ++ " ("
-                            ++ show uiInitialStmts
-                            ++ " stmts, "
+                            ++ formatInt uiInitialStmts
+                            ++ " stmts · "
                             ++ formatSize uiInitialBytes
-                            ++ ", "
+                            ++ " · "
                             ++ T.unpack uiDialect
                             ++ ")"
                         )
@@ -273,10 +306,10 @@ newUI UIConfig {..} = do
                                     phase <- ntPhase <$> readIORef stateRef
                                     hPutStrLn
                                         stderr
-                                        ( "occam: "
-                                            ++ T.unpack phase
-                                            ++ ": -> "
-                                            ++ show newStmts
+                                        ( renderAction False Cyan (stageVerb phase)
+                                            ++ formatInt newStmts
+                                            ++ "/"
+                                            ++ formatInt uiInitialStmts
                                             ++ " stmts ("
                                             ++ formatSize newBytes
                                             ++ ")"
@@ -311,56 +344,67 @@ printSummary useColor metrics initBytes redBytes initStmts redStmts minimalPath 
         statusTag = case evaluationStatus metrics of
             EvaluationCompleted
                 | evaluationValidationPassed metrics -> ""
-                | otherwise -> "[ValidationFailed] "
-            EvaluationTimeout -> "[Timeout] "
-            EvaluationExecutionBudget -> "[BudgetExceeded] "
-            EvaluationError -> "[Error] "
-            EvaluationValidationFailed -> "[ValidationFailed] "
-            EvaluationValidationIncomplete -> "[ValidationIncomplete] "
+                | otherwise -> " (validation failed)"
+            EvaluationTimeout -> " (timeout)"
+            EvaluationExecutionBudget -> " (budget exceeded)"
+            EvaluationError -> " (runtime error)"
+            EvaluationValidationFailed -> " (validation failed)"
+            EvaluationValidationIncomplete -> " (validation incomplete)"
 
-    when useColor (hSetSGR stderr [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Cyan])
-    hPutStr stderr "occam: "
+    let greenBold =
+            if useColor
+                then setSGRCode [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Green]
+                else ""
+        dullWhite = if useColor then setSGRCode [SetColor Foreground Dull White] else ""
+        resetCode = if useColor then setSGRCode [Reset] else ""
+
     if isSuccess
         then do
-            when
-                useColor
-                (hSetSGR stderr [Reset, SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Green])
-            hPutStr stderr "✓ "
+            -- Line 1: Results
+            hPutStrLn
+                stderr
+                ( renderAction useColor Green "Reduced"
+                    ++ formatInt initStmts
+                    ++ " → "
+                    ++ formatInt redStmts
+                    ++ " stmts ("
+                    ++ greenBold
+                    ++ "-"
+                    ++ formatRatio stmtPct
+                    ++ resetCode
+                    ++ ") · "
+                    ++ formatSize initBytes
+                    ++ " → "
+                    ++ formatSize redBytes
+                    ++ " ("
+                    ++ greenBold
+                    ++ "-"
+                    ++ formatRatio bytePct
+                    ++ resetCode
+                    ++ ")"
+                )
+            -- Line 2: Details and output target
+            let statsInfo = if null statsPath then "" else dullWhite ++ " (stats: " ++ statsPath ++ ")" ++ resetCode
+                destInfo = if null minimalPath then "" else " → " ++ minimalPath ++ statsInfo
+            hPutStrLn
+                stderr
+                ( renderAction useColor Green "Finished"
+                    ++ "in "
+                    ++ showFFloat (Just 1) elapsed "s ("
+                    ++ formatInt totalRuns
+                    ++ " runs · "
+                    ++ formatRatio hitRate
+                    ++ " cache hit)"
+                    ++ destInfo
+                )
         else do
-            when
-                useColor
-                (hSetSGR stderr [Reset, SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Red])
-            hPutStr stderr ("✗ " ++ statusTag)
-    when useColor (hSetSGR stderr [Reset])
-    hPutStrLn
-        stderr
-        ( "reduced "
-            ++ show initStmts
-            ++ " -> "
-            ++ show redStmts
-            ++ " stmts (-"
-            ++ formatRatio stmtPct
-            ++ "), "
-            ++ formatSize initBytes
-            ++ " -> "
-            ++ formatSize redBytes
-            ++ " (-"
-            ++ formatRatio bytePct
-            ++ ") in "
-            ++ showFFloat (Just 1) elapsed "s ["
-            ++ show totalRuns
-            ++ " runs, "
-            ++ formatRatio hitRate
-            ++ " cache hits]"
-        )
-    unless (null minimalPath) do
-        when useColor (hSetSGR stderr [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid Cyan])
-        hPutStr stderr "occam: "
-        when useColor (hSetSGR stderr [Reset])
-        hPutStrLn
-            stderr
-            ( "output: "
-                ++ minimalPath
-                ++ (if null statsPath then "" else " (stats: " ++ statsPath ++ ")")
-            )
+            hPutStrLn
+                stderr
+                ( renderAction useColor Red "Failed"
+                    ++ formatInt initStmts
+                    ++ " stmts ("
+                    ++ formatSize initBytes
+                    ++ ")"
+                    ++ statusTag
+                )
     hFlush stderr
