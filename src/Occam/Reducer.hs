@@ -333,25 +333,25 @@ closureDdmin = closureDdminWithLogger nullLogger
 closureDdminWithLogger ::
     Logger -> OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
 closureDdminWithLogger logger pool baseSQL initialStatements graph = do
-    closureCache <- newIORef Map.empty
+    closureCache <- newIORef HashMap.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
-    let weights = Map.fromList [(stmtId s, statementSpanBytes s) | s <- initialStatements]
+    let weights = HashMap.fromList [(stmtId s, statementSpanBytes s) | s <- initialStatements]
         buildCandidate current seedIds = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
             cached <- readIORef closureCache
             closedIds <-
-                case Map.lookup seedIds cached of
+                case HashMap.lookup seedIds cached of
                     Just result -> do
                         modifyIORef' closureStats (\stats -> stats {closureCacheHits = closureCacheHits stats + 1})
                         pure result
                     Nothing -> do
                         let result = closeSet graph seedIds
-                        modifyIORef' closureCache (Map.insert seedIds result)
+                        modifyIORef' closureCache (HashMap.insert seedIds result)
                         pure result
             let currentIds = statementIds current
                 keptIds = closedIds `Set.intersection` currentIds
                 added = keptIds `Set.difference` seedIds
-                gainedBytes = sum [Map.findWithDefault 0 sid weights | sid <- Set.toList added]
+                gainedBytes = sum [HashMap.lookupDefault 0 sid weights | sid <- Set.toList added]
             modifyIORef'
                 closureStats
                 ( \stats ->

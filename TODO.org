@@ -92,7 +92,8 @@
 
 ** TODO [#B] Process & concurrency subsystem stability assessment
 - [X] [Investigate `typed-process` Suitability] Completed exhaustive architectural source audit of `typed-process-0.2.13.0`. Concluded that `typed-process` is INCOMPATIBLE with `Occam.Oracle`: it lacks POSIX process-group signaling (`unix`), terminates only the parent PID (orphaning DBMS child processes as zombies), lacks SIGKILL escalation (risking indefinite deadlock), and has unsafe handle closing ordering. Occam will retain `process + unix` two-stage group reaping (`typed_process_investigation.md`).
-- [ ] [Feedback HashMap in Reducer] Replace `Map ByteString CandidateVerdict` in `Occam.Reducer.Feedback` with `HashMap ByteString CandidateVerdict`.
+- [X] [Feedback HashMap in Reducer] Replaced `Map ByteString CandidateVerdict` in `Occam.Reducer.Feedback` and seen candidates set with `HashMap ByteString CandidateVerdict` and `HashSet ByteString` for $O(1)$ candidate feedback lookup and pull deduplication.
+- [X] [StatementId Hashable & Closure Cache HashMap Acceleration] Added `Hashable` and `unStatementId` selector to `StatementId` in `Occam.Core`, and migrated `closureCache` and `weights` in `closureDdmin` from balanced `Map` to `HashMap`, cutting heap allocations across all corpus benchmarks.
 
 ** TODO [#B] Codebase ergonomics & maintainability enhancements (microlens & int-containers)
 - [Nested State & Catalog Lenses via `microlens`] Adopt lightweight `microlens` / `microlens-th` (or `optics-core`) across `Occam.Dependency.State` and `Occam.Dependency.Alter`, eliminating manual multi-layer record reconstruction boilerplate (`eval & evalCatalog . catRelations . at key ?~ relation`).

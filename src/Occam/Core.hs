@@ -87,12 +87,15 @@ import Data.Aeson (
  )
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
+import Data.Hashable (Hashable)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
+import GHC.Generics (Generic)
 
-newtype StatementId = StatementId Int
-    deriving (Eq, Ord, Show)
+newtype StatementId = StatementId {unStatementId :: Int}
+    deriving stock (Eq, Ord, Show, Generic)
+    deriving newtype (Hashable)
 
 data Span = Span
     { spanStartByte :: !Int
