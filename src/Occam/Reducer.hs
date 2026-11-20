@@ -33,6 +33,9 @@ import Control.Monad (when)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HashMap
+import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
@@ -397,11 +400,11 @@ one snapshot can become valid after the current SQL shrinks, so IDs must
 never skip re-testing a changed candidate. Same exact bytes stay valid.
 -}
 newtype Feedback = Feedback
-    { fbEvaluated :: IORef (Map.Map ByteString CandidateVerdict)
+    { fbEvaluated :: IORef (HashMap ByteString CandidateVerdict)
     }
 
 newFeedback :: IO Feedback
-newFeedback = Feedback <$> newIORef Map.empty
+newFeedback = Feedback <$> newIORef HashMap.empty
 searchStatements ::
     CandidateBuilder ->
     OraclePool ->
@@ -479,7 +482,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                 -- bounded too: at most one window of classify work is pulled
                 -- before testing, never a full duplicate-list scan.
                 pull [] = pure Nothing
-                pull seeds = collect jobs [] Set.empty seeds
+                pull seeds = collect jobs [] HashSet.empty seeds
                 collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
                 collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
                 collect n acc seen (seedIds : rest) = do
@@ -488,8 +491,8 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                         Nothing -> collect (n - 1) acc seen rest
                         Just (SeedAccepted kept) -> testAndContinue (reverse acc) rest (Just kept)
                         Just (SeedFresh kept sql)
-                            | Set.member sql seen -> collect (n - 1) acc seen rest
-                            | otherwise -> collect (n - 1) ((kept, sql) : acc) (Set.insert sql seen) rest
+                            | HashSet.member sql seen -> collect (n - 1) acc seen rest
+                            | otherwise -> collect (n - 1) ((kept, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
                     accepted <- testBatch batch
                     case accepted of
@@ -508,7 +511,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
 
         recordRetired ((_, sql), (outcome, _)) =
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
-             in modifyIORef' (fbEvaluated feedback) (Map.insert sql verdict)
+             in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
         classifySeed current currentIds currentLen seedIds
             | seedIds == currentIds = pure Nothing
@@ -522,7 +525,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                             then pure Nothing
                             else do
                                 evaluated <- readIORef (fbEvaluated feedback)
-                                case Map.lookup candidateSQL evaluated of
+                                case HashMap.lookup candidateSQL evaluated of
                                     Just CandidateAccepted -> pure (Just (SeedAccepted kept))
                                     Just CandidateRejected -> do
                                         recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
