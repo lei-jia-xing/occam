@@ -168,7 +168,7 @@ optionsParser =
                 ( long "out"
                     <> short 'o'
                     <> metavar "PATH"
-                    <> help "Output file or directory, or '-' for stdout (default: <input>.min.sql or stdout)"
+                    <> help "Output SQL file path, or '-' for stdout (default: <input>.min.sql or stdout)"
                     <> completer (bashCompleter "file")
                 )
             )
@@ -553,30 +553,26 @@ runOccamWithLogger logger Options {..} = do
                 || (isNothing optOut && not optInPlace && (not isStdoutTTY || optInputFile == "-"))
         writeToStdout = isStdoutTarget
 
-    (minimalPath, statsPath) <-
+    minimalPath <-
         if writeToStdout
-            then pure ("", fromMaybe "" optStatsFile)
+            then pure ""
             else case optOut of
-                Just outPath
-                    | takeExtension outPath == ".sql" -> do
-                        let dir = takeDirectory outPath
-                        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-                        pure (outPath, fromMaybe "" optStatsFile)
-                    | otherwise -> do
-                        createDirectoryIfMissing True outPath
-                        let minFile = outPath </> "minimal.sql"
-                            stFile = fromMaybe (outPath </> "stats.json") optStatsFile
-                        pure (minFile, stFile)
+                Just outPath -> do
+                    let dir = takeDirectory outPath
+                    unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+                    pure outPath
                 Nothing
                     | optInPlace -> do
                         when (optInputFile /= "-") do
                             BS.writeFile (optInputFile ++ ".bak") initialSQL
-                        pure (optInputFile, fromMaybe "" optStatsFile)
+                        pure optInputFile
                     | otherwise -> do
                         let defaultTarget = defaultMinPath optInputFile
                             dir = takeDirectory defaultTarget
                         unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-                        pure (defaultTarget, fromMaybe "" optStatsFile)
+                        pure defaultTarget
+
+    let statsPath = fromMaybe "" optStatsFile
 
     logInfo logger "reducer" "Running hierarchical reduction engine..."
 
@@ -666,9 +662,13 @@ runOccamWithLogger logger Options {..} = do
                 }
     unless writeToStdout do
         BS.writeFile minimalPath reducedSQL
-        unless (null statsPath) (BSL.writeFile statsPath (encode stats))
 
-    when (writeToStdout || not isStdoutTTY) do
+    unless (null statsPath) do
+        let dir = takeDirectory statsPath
+        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+        BSL.writeFile statsPath (encode stats)
+
+    when writeToStdout do
         BS.putStr reducedSQL
         hFlush stdout
 

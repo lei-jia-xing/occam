@@ -104,7 +104,6 @@ import PoolMetricsChecks qualified
 import ReductionChecks qualified
 import System.Directory (
     createDirectoryIfMissing,
-    doesDirectoryExist,
     doesFileExist,
     findExecutable,
     getTemporaryDirectory,
@@ -261,7 +260,7 @@ withCLIInput :: BS.ByteString -> (FilePath -> FilePath -> IO a) -> IO a
 withCLIInput sql action =
     bracket create cleanup $ \input -> do
         BS.writeFile input sql
-        action input (input ++ ".out")
+        action input (input ++ ".min.sql")
     where
         create = do
             directory <- getTemporaryDirectory
@@ -270,8 +269,8 @@ withCLIInput sql action =
             pure path
         cleanup path = do
             removeFile path
-            exists <- doesDirectoryExist (path ++ ".out")
-            when exists (removeDirectoryRecursive (path ++ ".out"))
+            exists <- doesFileExist (path ++ ".min.sql")
+            when exists (removeFile (path ++ ".min.sql"))
 
 stripEnd :: String -> String
 stripEnd = reverse . dropWhile isSpace . reverse
@@ -302,10 +301,10 @@ phase5Tests =
             mapM_
                 ( \extra ->
                     mapM_
-                        ( \command -> withCLIInput "SELECT 1;" $ \input outDir -> do
-                            (code, _, _) <- runOccamCLI ([input, "--oracle", command, "--out", outDir, "--quiet"] ++ extra)
+                        ( \command -> withCLIInput "SELECT 1;" $ \input outFile -> do
+                            (code, _, _) <- runOccamCLI ([input, "--oracle", command, "--out", outFile, "--quiet"] ++ extra)
                             assertBool ("Noninteresting input was accepted: " ++ command) (code /= ExitSuccess)
-                            exists <- doesDirectoryExist outDir
+                            exists <- doesFileExist outFile
                             assertBool "Reduction started before the initial predicate accepted" (not exists)
                         )
                         ["false", "exit 139", "kill -TERM $$"]
@@ -323,10 +322,10 @@ phase5Tests =
                 predicate =
                     "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
             mapM_
-                ( \extra -> withCLIInput initialSQL $ \input outDir -> do
-                    (code, _, err) <- runOccamCLI ([input, "--oracle", predicate, "--out", outDir, "--quiet"] ++ extra)
+                ( \extra -> withCLIInput initialSQL $ \input outFile -> do
+                    (code, _, err) <- runOccamCLI ([input, "--oracle", predicate, "--out", outFile, "--quiet"] ++ extra)
                     assertEqual ("Reduction failed: " ++ err) ExitSuccess code
-                    reduced <- BSC.readFile (outDir </> "minimal.sql")
+                    reduced <- BSC.readFile outFile
                     (verified, _, _) <- readProcessWithExitCode "sh" ["-c", predicate] (BSC.unpack reduced)
                     assertEqual "Reduced SQL lost the target property" ExitSuccess verified
                     assertBool "No SQL reduction occurred" (BS.length reduced < BS.length initialSQL)
@@ -338,7 +337,8 @@ phase5Tests =
                     let predicate = "cat >/dev/null; printf x >> " ++ show calls
                     mapM_
                         ( \(extra, expectedStrategy) -> do
-                            let outDir = outRoot </> T.unpack expectedStrategy
+                            let outFile = outRoot ++ "-" ++ T.unpack expectedStrategy ++ ".sql"
+                                statsFile = outRoot ++ "-" ++ T.unpack expectedStrategy ++ ".json"
                             (code, _, _) <-
                                 runOccamCLI
                                     ( [ input
@@ -347,13 +347,15 @@ phase5Tests =
                                       , "--max-oracle-executions"
                                       , "1"
                                       , "--out"
-                                      , outDir
+                                      , outFile
+                                      , "--stats"
+                                      , statsFile
                                       , "--quiet"
                                       ]
                                         ++ extra
                                     )
                             assertBool "Execution-budget exhaustion must remain nonzero" (code /= ExitSuccess)
-                            encoded <- BS.readFile (outDir </> "stats.json")
+                            encoded <- BS.readFile statsFile
                             case eitherDecodeStrict' encoded :: Either String CliStats of
                                 Right stats -> do
                                     let evaluation = cliMetrics stats
@@ -373,8 +375,12 @@ phase5Tests =
                                         (evaluationDatabaseObservations evaluation)
                                     assertBool "An unchecked checkpoint is not validated" (not (evaluationValidationPassed evaluation))
                                 Left err -> assertFailure ("stats.json did not decode: " ++ err)
-                            checkpoint <- BS.readFile (outDir </> "minimal.sql")
+                            checkpoint <- BS.readFile outFile
                             assertEqual "Accepted input checkpoint was lost" "SELECT 1; SELECT 2;" checkpoint
+                            outExists <- doesFileExist outFile
+                            when outExists (removeFile outFile)
+                            statsExists <- doesFileExist statsFile
+                            when statsExists (removeFile statsFile)
                         )
                         [(["--strategy", "ddmin-only"], "ddmin-only"), (["--no-slicing", "--no-closure"], "full")]
                     observed <- BSC.readFile calls
@@ -386,41 +392,41 @@ phase5Tests =
                     assertEqual "help must exit zero" ExitSuccess helpCode
                     assertBool "help hides --jobs" ("--jobs" `elem` words helpOut)
                     mapM_
-                        ( \jobs -> withCLIInput "SELECT 1;" $ \input outDir -> do
+                        ( \jobs -> withCLIInput "SELECT 1;" $ \input outFile -> do
                             (code, _, _) <-
-                                runOccamCLI ([input, "--oracle", "exit 0", "--out", outDir, "--jobs", jobs, "--quiet"] ++ extra)
+                                runOccamCLI ([input, "--oracle", "exit 0", "--out", outFile, "--jobs", jobs, "--quiet"] ++ extra)
                             assertBool ("invalid --jobs was accepted: " ++ jobs) (code /= ExitSuccess)
-                            exists <- doesDirectoryExist outDir
+                            exists <- doesFileExist outFile
                             assertBool "reduction started with invalid --jobs" (not exists)
                         )
                         ["0", "-1", "abc"]
                 )
                 [[], ["--strategy", "ddmin-only"]]
         , testCase "CLI rejects bad column modes before any oracle call" $
-            withCLIInput "SELECT 1;" $ \input outDir -> do
+            withCLIInput "SELECT 1;" $ \input outFile -> do
                 (helpCode, helpOut, _) <- runOccamCLI ["--help"]
                 assertEqual "help must exit zero" ExitSuccess helpCode
                 assertBool "help hides --column-mode" ("--column-mode" `elem` words helpOut)
                 mapM_
                     ( \mode -> do
                         (code, _, _) <-
-                            runOccamCLI [input, "--oracle", "exit 0", "--out", outDir, "--column-mode", mode, "--quiet"]
+                            runOccamCLI [input, "--oracle", "exit 0", "--out", outFile, "--column-mode", mode, "--quiet"]
                         assertBool ("bad --column-mode was accepted: " ++ mode) (code /= ExitSuccess)
-                        exists <- doesDirectoryExist outDir
+                        exists <- doesFileExist outFile
                         assertBool "reduction started with bad --column-mode" (not exists)
                     )
                     ["bogus", "single-atomic"]
         , testCase "CLI requires --intra-statement for column modes and starts no oracle" $
-            withCLIInput "SELECT 1;" $ \input outDir ->
+            withCLIInput "SELECT 1;" $ \input outFile ->
                 withCLIInput "" $ \calls _ -> do
                     let oracle = "cat >/dev/null; printf x >> " ++ show calls
                     mapM_
                         ( \mode -> do
                             (code, _, err) <-
-                                runOccamCLI [input, "--oracle", oracle, "--out", outDir, "--column-mode", mode, "--quiet"]
+                                runOccamCLI [input, "--oracle", oracle, "--out", outFile, "--column-mode", mode, "--quiet"]
                             assertBool ("column mode without intra-statement was accepted: " ++ mode) (code /= ExitSuccess)
                             assertBool "wrong rejection reason" ("--intra-statement" `elem` words err)
-                            exists <- doesDirectoryExist outDir
+                            exists <- doesFileExist outFile
                             assertBool "reduction started without --intra-statement" (not exists)
                         )
                         ["single", "atomic"]
