@@ -87,6 +87,7 @@
 - [X] [Cache HashMap Acceleration] Replace `Map ByteString CacheEntry` in `Occam.Cache` with `HashMap ByteString CacheEntry` via `unordered-containers` + `hashable`, achieving $O(1)$ amortized candidate deduplication (Done in `e0c3a35`).
 - [X] [In-Process Native SQLite Contract Oracle] Integrate `direct-sqlite` to execute candidate SQL directly in-process against `:memory:` with rowset verification (<0.05ms/call), eliminating the Python subprocess overhead and IPC pipe latency from `benchmarks/bench.py oracle` (`src/Occam/Oracle/Sqlite.hs`).
 - [X] [Self-Contained `cabal bench` with Full Corpus] Integrated native in-process reduction benchmarks directly into `bench/Main.hs`, running authentic corpus cases (02-09 + scale-064) in 2.55s total with exact allocated bytes and memory reporting without any Python runtime dependency.
+- [X] [Retire Legacy Python Benchmark Suite] Removed obsolete `benchmarks/bench.py` and `benchmarks/test_bench.py` along with `make benchmark-test` now that `Occam.Oracle.Sqlite` and `tasty-bench` provide native in-process benchmark execution.
 - [ ] [Port Tier 3 AB/BA 4D Metrics Summary to Haskell] Re-implement Attempt-AUC integration (`evaluationCurve`) in a dedicated report formatter (`Occam.Benchmark.Metrics`), outputting markdown summary tables directly from Haskell.
 
 ** TODO [#B] Process & concurrency subsystem stability assessment

@@ -120,14 +120,6 @@ occam /path/to/crash_repro.sql \
   --out /tmp/occam_reduced/
 ```
 
-Or generate the exact command for any Tier 4 corpus case from its `.meta.json`:
-
-```bash
-python3 benchmarks/bench.py crash-cmd \
-  --meta benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.meta.json \
-  --out /tmp/occam_reduced/
-```
-
 ---
 
 ## 6. Unit Tests

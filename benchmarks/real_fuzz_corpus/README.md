@@ -127,11 +127,3 @@ occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
   --dialect postgres \
   --out /tmp/occam_reduced/
 ```
-
-Or generate the exact command from the case metadata:
-
-```bash
-python3 benchmarks/bench.py crash-cmd \
-  --meta benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.meta.json \
-  --out /tmp/occam_reduced/
-```

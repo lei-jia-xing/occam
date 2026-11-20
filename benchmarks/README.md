@@ -1,71 +1,56 @@
-# Occam Benchmarks (4 Tiers)
+# Occam Benchmarks
+
+Occam benchmark architecture spans four distinct tiers:
 
 | Tier | What | Where |
 | :--- | :--- | :--- |
-| 1 | In-process engine microbench, zero subprocesses (`benchmark occam-bench` via `cabal bench`, GHC RTS allocated-bytes gate) | `bench/Main.hs` |
-| 2 | Fast single-process SQLite oracle (no wrapper, no disk) | `bench.py oracle` |
-| 3 | Deterministic corpus + scale study + AB/BA runner | `bench.py prepare/run/report` |
-| 4 | Real DBMS crash reproduction | `real_fuzz_corpus/` + `harness/` |
+| 1 | In-process engine microbenchmarks (parse, DAG analysis, backward slice, span surgery, HAMT cache) | `bench/Main.hs` via `cabal bench` |
+| 2 | In-process native SQLite contract oracle (<0.05ms/probe, `:memory:`, rowset equality) | `Occam.Oracle.Sqlite` |
+| 3 | Native corpus & scale reduction benchmarks (AB/BA comparative evaluation of reduction passes) | `bench/Main.hs` (`reduction/scale-064`, `reduction/corpus/*`) |
+| 4 | Real DBMS crash reproduction (PostgreSQL/MySQL/SQLite authentic bugs) | `benchmarks/real_fuzz_corpus/` + `harness/` |
 
-## Tier 2: SQLite oracle
+## Tiers 1–3: Native Haskell Benchmarks (`occam-bench`)
 
-Reads candidate SQL from stdin, replays it in `:memory:` with
-`PRAGMA foreign_keys=ON`, and exits `0` iff the final rowset matches
-`contract.json` (plus the `iterdump` state digest when `check_state` is set):
+All engine microbenchmarks and corpus reduction runs execute natively in Haskell via `tasty-bench` and `direct-sqlite`:
 
 ```bash
-echo "SELECT 1;" | python3 benchmarks/bench.py oracle case.contract.json
+# Run all benchmarks (microbenchmarks + full reduction corpus):
+cabal bench
+
+# Run only the SQLite reduction corpus benchmarks:
+cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
+
+# Run with GHC RTS allocation memory statistics:
+cabal bench --benchmark-options="+RTS -T -RTS"
 ```
 
-## Tier 3: corpus runs
+### In-Process SQLite Evaluation (`Occam.Oracle.Sqlite`)
+
+Tiers 2 and 3 evaluate candidate SQL directly against an in-memory SQLite instance via `direct-sqlite`, verifying:
+1. SQL statement completion via `sqlite3_complete`.
+2. Execution termination bounded by `Database.SQLite3.interruptibly` (100ms timeout guarding against runaway recursive CTEs).
+3. Exact rowset equality and column name alignment against expected contracts without any disk I/O or external subprocess invocation.
+
+## Tier 4: Real DBMS Crash Reproduction
+
+Authentic multi-statement PostgreSQL/MySQL/SQLite fuzz crashes with `.meta.json` provenance and crash signatures (see [real_fuzz_corpus/README.md](real_fuzz_corpus/README.md)).
+
+Run Occam against a target crash:
 
 ```bash
-# Stage the 9 deterministic cases + noise scale cases with contracts.
-python3 benchmarks/bench.py prepare --out /tmp/occam-bench --scales 64,256
-# AB/BA interleaved reductions (default vs --intra-statement arms).
-python3 benchmarks/bench.py run --manifest /tmp/occam-bench/manifest.json \
-  --out /tmp/occam-bench-runs --occam occam
-# 4-dimension report: quality, search, engine overhead, throughput.
-python3 benchmarks/bench.py report /tmp/occam-bench-runs
-```
-
-`prepare` qualifies every case with 3 controls (original accepts, empty and
-`SYNTAX ERROR;` reject). `run` alternates arm order per repetition to cancel
-host drift, and invokes:
-
-```text
-occam <sql> --oracle "python3 bench.py oracle <contract>" --dialect sqlite \
-  --timeout 2 --budget 30 --out <run_dir> --quiet [arm flags...]
-```
-
-`corpus/` holds the 9 curated SQLite cases (CTE analytics, savepoint churn,
-deep expressions, diamond DAG, upsert, views, 3 column fixtures). Report
-metrics: `reduced_bytes`/`reduced_statements`/`reduction_ratio` (quality),
-`oracle_attempts`/`accepted`/`cache_hits`/Attempt-AUC (search),
-parse FFI + decode + candidate-build micros (overhead),
-`evaluationReductionSeconds`/`status` (throughput). Attempt-AUC is the
-normalized area of `best_bytes / initial_bytes` over all attempts (lower is
-faster). Extra arms: repeat `--arm NAME=FLAGS`.
-
-## Tier 4: real crashes
-
-Authentic multi-statement PostgreSQL/MySQL/SQLite fuzz crashes with
-`.meta.json` provenance + crash signatures (see `real_fuzz_corpus/README.md`).
-Generate the exact reduction command from metadata:
-
-```bash
-python3 benchmarks/bench.py crash-cmd \
-  --meta benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.meta.json \
+occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
+  --oracle "python3 harness/crash_oracle.py --dbms postgres --expected-signature 'clauses != NIL'" \
+  --reset "./harness/reset_db.sh --dbms postgres" \
+  --dialect postgres \
   --out /tmp/occam_reduced/
 ```
 
-This wires `harness/crash_oracle.py` (exit 0 on matching crash signature) and
-`harness/reset_db.sh` (clean `occam_test` per candidate) into occam's
-`--oracle`/`--reset` contract. Needs a debug/assertion-built target DBMS.
-
-## Tests
+## Unit & Contract Tests
 
 ```bash
-python3 -m unittest discover -s benchmarks
-python3 -m unittest discover -s harness -p "test_*.py"
+# Haskell & Rust test suites + verification checks:
+make check
+
+# Crash oracle contract test:
+python3 harness/test_crash_oracle.py
 ```

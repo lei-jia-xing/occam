@@ -97,8 +97,8 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 
-      - name: Run Python benchmark tests
-        run: make benchmark-test
+      - name: Run benchmarks
+        run: cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 
 # proof-check (cd proofs && lake build) stays nightly/manual: elan + Lean dependency setup is too heavy to cache cheaply here.
 

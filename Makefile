@@ -1,4 +1,4 @@
-.PHONY: all build build-check test fmt fmt-check lint rust-check benchmark-test proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test bench fmt fmt-check lint rust-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -18,8 +18,8 @@ test:
 # Cargo runs first (its fingerprinting is the freshness mechanism); stale
 # -DOCCAM_RUST_STAMP lines in gitignored cabal.project.local are a harmless unused -D.
 
-benchmark-test:
-	python3 -m unittest discover -s benchmarks
+bench:
+	cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
@@ -59,7 +59,7 @@ proof-check:
 		nix develop --command bash -c "cd proofs && lake build"; \
 	fi
 
-check: fmt-check lint build-check test rust-check benchmark-test proof-check
+check: fmt-check lint build-check test rust-check proof-check
 
 
 hooks:
