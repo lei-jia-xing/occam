@@ -1,4 +1,4 @@
-.PHONY: all build build-check test bench fmt fmt-check lint rust-check proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test bench microbench bench-product fmt fmt-check lint rust-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -20,6 +20,12 @@ test:
 
 bench:
 	cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
+
+microbench:
+	cabal bench --benchmark-options="-p 'parse || dag || surgery || cache' --stdev 20 --timeout 5s"
+
+bench-product:
+	cabal bench --benchmark-options="-p product-path --stdev 20 --timeout 5s"
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
@@ -75,9 +81,9 @@ completions:
 	@mkdir -p completions
 	cabal build exe:occam
 	BIN=$$(cabal list-bin exe:occam); \
-	$$BIN --bash-completion-script occam > completions/occam.bash && \
-	$$BIN --zsh-completion-script occam > completions/_occam && \
-	$$BIN --fish-completion-script occam > completions/occam.fish
+	$$BIN --completion=bash > completions/occam.bash && \
+	$$BIN --completion=zsh > completions/_occam && \
+	$$BIN --completion=fish > completions/occam.fish
 
 install-completions: completions
 	install -D -m 644 completions/occam.bash ~/.local/share/bash-completion/completions/occam

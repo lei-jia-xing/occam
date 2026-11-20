@@ -82,6 +82,7 @@ addRustRpath :: FilePath -> GenericPackageDescription -> GenericPackageDescripti
 addRustRpath dir package =
     package
         { condLibrary = fmap addLib (condLibrary package)
+        , condSubLibraries = [(name, addLib tree) | (name, tree) <- condSubLibraries package]
         , condExecutables = [(name, addExe tree) | (name, tree) <- condExecutables package]
         , condTestSuites = [(name, addTest tree) | (name, tree) <- condTestSuites package]
         , condBenchmarks = [(name, addBench tree) | (name, tree) <- condBenchmarks package]

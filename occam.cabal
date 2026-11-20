@@ -10,6 +10,7 @@ maintainer:         leij49456@gmail.com
 category:           Development, Database, Testing
 build-type:         Custom
 extra-doc-files:    README.md
+data-files:         benchmarks/corpus/*.sql
 extra-source-files:
     Setup.hs
     rust/sqlparser-ffi/Cargo.toml
@@ -47,7 +48,6 @@ common language
 library
     import:           warnings, language
     exposed-modules:  Occam
-                    , Occam.Benchmark.Metrics
                     , Occam.Cache
                     , Occam.Core
                     , Occam.Facts
@@ -56,7 +56,6 @@ library
                     , Occam.Logger
                     , Occam.Metrics
                     , Occam.Oracle
-                    , Occam.Oracle.Sqlite
                     , Occam.Reducer
                     , Occam.Slicer
                     , Occam.Parser
@@ -90,7 +89,6 @@ library
                     , fast-logger >= 3.1 && < 3.3
                     , ansi-terminal >= 1.0 && < 1.2
                     , terminal-progress-bar >= 0.4 && < 0.5
-                    , direct-sqlite >= 2.3 && < 2.4
                     , base16-bytestring >= 1.0 && < 1.1
                     , microlens >= 0.4 && < 0.5
                     , safe-exceptions >= 0.1 && < 0.2
@@ -108,6 +106,7 @@ library
 executable occam
     import:           warnings, language
     main-is:          Main.hs
+    other-modules:    Completion
     build-depends:    base >= 4.18 && < 5
                     , occam
                     , bytestring
@@ -141,7 +140,7 @@ test-suite occam-fuzz
 test-suite occam-test
     import:           warnings, language
     type:             exitcode-stdio-1.0
-    hs-source-dirs:   test
+    hs-source-dirs:   test eval-lib
     other-modules:    Fuzz
                     , MutationalFuzz
                     , ColumnChecks
@@ -151,6 +150,8 @@ test-suite occam-test
                     , PoolChecks
                     , PoolMetricsChecks
                     , ReductionChecks
+                    , Occam.Oracle.Sqlite
+                    , Occam.Benchmark.Metrics
     main-is:          Spec.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
@@ -167,19 +168,28 @@ test-suite occam-test
                     , QuickCheck
                     , time
                     , aeson
+                    , direct-sqlite >= 2.3 && < 2.4
+                    , safe-exceptions >= 0.1 && < 0.2
     ghc-options:      -threaded -rtsopts
 
 benchmark occam-bench
     import:           warnings, language
     type:             exitcode-stdio-1.0
-    hs-source-dirs:   bench
+    hs-source-dirs:   bench eval-lib
+    other-modules:    Occam.Oracle.Sqlite
+                    , Occam.Benchmark.Metrics
+                    , Paths_occam
+    autogen-modules:  Paths_occam
     main-is:          Main.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
                     , bytestring
                     , containers
                     , tasty-bench >= 0.3 && < 0.6
-                    , direct-sqlite >= 2.3
                     , directory >= 1.3 && < 1.4
                     , filepath >= 1.4 && < 1.6
+                    , direct-sqlite >= 2.3 && < 2.4
+                    , safe-exceptions >= 0.1 && < 0.2
+                    , text
+                    , aeson
     ghc-options:      -threaded -rtsopts -with-rtsopts=-T

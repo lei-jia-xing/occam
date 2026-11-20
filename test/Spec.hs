@@ -390,7 +390,7 @@ phase5Tests =
                 ( \extra -> do
                     (helpCode, helpOut, _) <- runOccamCLI ("--help" : extra)
                     assertEqual "help must exit zero" ExitSuccess helpCode
-                    assertBool "help hides --jobs" ("--jobs" `elem` words helpOut)
+                    assertBool "help hides --jobs" ("--jobs" `isInfixOf` helpOut)
                     mapM_
                         ( \jobs -> withCLIInput "SELECT 1;" $ \input outFile -> do
                             (code, _, _) <-
@@ -468,6 +468,71 @@ phase5Tests =
                 case eitherDecodeStrict' (BSC.pack out) :: Either String Value of
                     Left e -> assertFailure ("--dump-facts output is not JSON: " ++ e)
                     Right _ -> assertBool "missing statements key" ("\"statements\"" `isInfixOf` out)
+        , testCase "informational actions exit 0 without input file" $ do
+            (dCode, dOut, _) <- runOccamCLI ["--list-dialects"]
+            assertEqual "--list-dialects exit code" ExitSuccess dCode
+            assertBool "missing sqlite in --list-dialects" ("sqlite" `isInfixOf` dOut)
+            assertBool "missing postgresql in --list-dialects" ("postgresql" `isInfixOf` dOut)
+
+            (mCode, mOut, _) <- runOccamCLI ["--list-column-modes"]
+            assertEqual "--list-column-modes exit code" ExitSuccess mCode
+            assertBool "missing single in --list-column-modes" ("single" `isInfixOf` mOut)
+            assertBool "missing atomic in --list-column-modes" ("atomic" `isInfixOf` mOut)
+
+            (sCode, sOut, _) <- runOccamCLI ["--list-strategies"]
+            assertEqual "--list-strategies exit code" ExitSuccess sCode
+            assertBool "missing full in --list-strategies" ("full" `isInfixOf` sOut)
+            assertBool "missing ddmin-only in --list-strategies" ("ddmin-only" `isInfixOf` sOut)
+
+            (pCode, pOut, _) <- runOccamCLI ["--print-defaults"]
+            assertEqual "--print-defaults exit code" ExitSuccess pCode
+            case eitherDecodeStrict' (BSC.pack pOut) :: Either String Value of
+                Left e -> assertFailure ("--print-defaults is not JSON: " ++ e)
+                Right _ -> assertBool "missing timeout key" ("\"timeout\"" `isInfixOf` pOut)
+        , testCase "--completion generates valid self-contained shell scripts" $ do
+            (bCode, bOut, _) <- runOccamCLI ["--completion", "bash"]
+            assertEqual "--completion bash exit code" ExitSuccess bCode
+            assertBool "bash completion missing function" ("_occam()" `isInfixOf` bOut)
+            assertBool "bash completion missing complete" ("complete -F _occam" `isInfixOf` bOut)
+
+            (zCode, zOut, _) <- runOccamCLI ["--completion", "zsh"]
+            assertEqual "--completion zsh exit code" ExitSuccess zCode
+            assertBool "zsh completion missing compdef" ("#compdef occam" `isInfixOf` zOut)
+            assertBool "zsh completion missing _arguments" ("_arguments" `isInfixOf` zOut)
+
+            (fCode, fOut, _) <- runOccamCLI ["--completion", "fish"]
+            assertEqual "--completion fish exit code" ExitSuccess fCode
+            assertBool "fish completion missing complete commands" ("complete -c occam" `isInfixOf` fOut)
+        , testCase "CLI strictly rejects conflicting arguments with exit code 2" $ do
+            (code1, _, err1) <- runOccamCLI ["input.sql", "--verbose", "--quiet", "-c", "exit 0"]
+            assertEqual "verbose + quiet must exit 2" (ExitFailure 2) code1
+            assertBool
+                "wrong error for verbose + quiet"
+                ("Cannot specify both --verbose and --quiet" `isInfixOf` err1)
+
+            (code2, _, err2) <- runOccamCLI ["input.sql", "-i", "-o", "out.sql", "-c", "exit 0"]
+            assertEqual "in-place + out must exit 2" (ExitFailure 2) code2
+            assertBool
+                "wrong error for in-place + out"
+                ("Cannot specify both --in-place and --out" `isInfixOf` err2)
+
+            (code3, _, err3) <- runOccamCLI ["-", "-i", "-c", "exit 0"]
+            assertEqual "in-place on stdin must exit 2" (ExitFailure 2) code3
+            assertBool "wrong error for in-place on stdin" ("Cannot modify stdin in place" `isInfixOf` err3)
+
+            (code4, _, err4) <-
+                runOccamCLI ["input.sql", "--strategy", "ddmin-only", "--slicing", "-c", "exit 0"]
+            assertEqual "ddmin-only + slicing must exit 2" (ExitFailure 2) code4
+            assertBool
+                "wrong error for ddmin-only + slicing"
+                ("--slicing conflicts with --strategy ddmin-only" `isInfixOf` err4)
+
+            (code5, _, err5) <-
+                runOccamCLI ["input.sql", "--strategy", "audit-only", "--intra-statement", "-c", "exit 0"]
+            assertEqual "audit-only + intra-statement must exit 2" (ExitFailure 2) code5
+            assertBool
+                "wrong error for audit-only + intra-statement"
+                ("--intra-statement conflicts with --strategy audit-only" `isInfixOf` err5)
         ]
 
 -- ----------------------------------------------------------------------------

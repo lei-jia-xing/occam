@@ -7,6 +7,7 @@ module Occam.Evaluation (
     EvaluationStatus (..),
     MinimalityClaim (..),
     ReductionActionResult (..),
+    Stats (..),
     evaluationStatusName,
     metricPolicyForReduction,
     minimalityClaimName,
@@ -261,6 +262,32 @@ data EvaluationResult = EvaluationResult
     { evaluatedSQL :: !ByteString
     , evaluationMetrics :: !EvaluationMetrics
     }
+    deriving (Eq, Show)
+
+-- | Deterministic reduction run statistics persisted to @stats.json@.
+data Stats = Stats
+    { initial_bytes :: !Int
+    , reduced_bytes :: !Int
+    , reduction_ratio :: !Double
+    , initial_statements :: !Int
+    , reduced_statements :: !Int
+    , oracle_executions :: !Int
+    , oracle_attempts :: !Int
+    , initial_oracle_observations :: !Int
+    , cache_hits :: !Int
+    , cache_misses :: !Int
+    , cache_joins :: !Int
+    , cache_hit_ratio :: !Double
+    , cancelled_observations :: !Int
+    , status :: !EvaluationStatus
+    , reduction_settings :: !Value
+    , evaluation_budget :: !EvaluationConfig
+    , evaluation_metrics :: !EvaluationMetrics
+    , initial_oracle_seconds :: !Double
+    , elapsed_seconds :: !Double
+    }
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (ToJSON, FromJSON)
 
 {- | Reducer result: reduced bytes plus fixed-point evidence, if the action
 confirmed 1-minimality on those exact bytes.

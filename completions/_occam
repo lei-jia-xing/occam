@@ -1,32 +1,45 @@
 #compdef occam
 
-local request
-local completions
-local word
-local index=$((CURRENT - 1))
+_occam() {
+  local -a args
+  args=(
+    '(-c --oracle)'{-c,--oracle}'[Interestingness predicate command]:COMMAND:_command_args'
+    '(-o --out)'{-o,--out}'[Output SQL file path, or - for stdout]:OUTPUT FILE:_files'
+    '(-i --in-place)'{-i,--in-place}'[Modify input SQL file in place]'
+    '--stats[Write JSON reduction statistics to FILE]:FILE:_files'
+    '--reset[Lightweight state reset command]:RESET COMMAND:_command_args'
+    '--timeout[Per-execution timeout in seconds]:SECONDS:'
+    '--log-level[Log severity level]:LEVEL:(debug info warn error)'
+    '--log-format[Log output format]:FORMAT:(text json)'
+    '--verbose[Enable verbose debug output]'
+    '(-q --quiet)'{-q,--quiet}'[Suppress info logs and banners]'
+    '--color[Colorized terminal output]:MODE:(auto always never)'
+    '(--budget --time-limit)'{--budget,--time-limit}'[Shared wall-clock cap]:SECONDS:'
+    '(--max-oracle-executions --max-evals)'{--max-oracle-executions,--max-evals}'[Maximum oracle attempts]:N:'
+    '(-j --jobs)'{-j,--jobs}'[Maximum concurrent oracle executions]:N:'
+    '--strategy[Reduction strategy]:STRATEGY:(full ddmin-only audit-only)'
+    '--column-mode[Column co-reduction mode]:MODE:(off single atomic)'
+    '(-d --dialect)'{-d,--dialect}'[SQL dependency dialect]:DIALECT:(generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata)'
+    '--slicing[Enable dependency slicing]'
+    '--no-slicing[Disable dependency slicing]'
+    '--closure[Enable dependency closure]'
+    '--no-closure[Disable dependency closure]'
+    '--intra-statement[Enable intra-statement reductions]'
+    '--no-intra-statement[Disable intra-statement reductions]'
+    '--unrestricted[Enable unrestricted fallback search]'
+    '--no-unrestricted[Disable unrestricted fallback search]'
+    '--cache[Enable candidate caching]'
+    '--no-cache[Disable candidate caching]'
+    '--list-dialects[List supported SQL dialects]'
+    '--list-column-modes[List supported column modes]'
+    '--list-strategies[List supported reduction strategies]'
+    '--print-defaults[Print default settings in JSON format]'
+    '--completion[Generate shell autocompletion script]:SHELL:(bash zsh fish)'
+    '(-v --version)'{-v,--version}'[Show version information]'
+    '(-h --help)'{-h,--help}'[Show this help text]'
+    '1:INPUT.sql:_files'
+  )
+  _arguments -s -S $args
+}
 
-request=(--bash-completion-enriched --bash-completion-index $index)
-for arg in ${words[@]}; do
-  request=(${request[@]} --bash-completion-word $arg)
-done
-
-IFS=$'\n' completions=($( occam "${request[@]}" ))
-
-for word in $completions; do
-  local -a parts
-
-  # Split the line at a tab if there is one.
-  IFS=$'\t' parts=($( echo $word ))
-
-  if [[ -n $parts[2] ]]; then
-     if [[ $word[1] == "-" ]]; then
-       local desc=("$parts[1] ($parts[2])")
-       compadd -d desc -- $parts[1]
-     else
-       local desc=($(print -f  "%-019s -- %s" $parts[1] $parts[2]))
-       compadd -l -d desc -- $parts[1]
-     fi
-  else
-    compadd -f -- $word
-  fi
-done
+_occam "$@"

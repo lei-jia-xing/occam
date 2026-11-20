@@ -1,13 +1,17 @@
 module Main (main) where
 
+import Control.Exception (IOException, catch)
 import Control.Monad (forM_, unless)
+import Data.Aeson (encode, toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as BSL
+import Data.Either (fromRight)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Occam.Cache (
     CacheMode (..),
     cacheCompleteInflight,
@@ -23,6 +27,13 @@ import Occam.Core (
     StatementId (..),
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
+import Occam.Evaluation (
+    EvaluationConfig (..),
+    EvaluationMetrics (..),
+    EvaluationStatus (..),
+    MinimalityClaim (..),
+    Stats (..),
+ )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Logger (nullLogger)
 import Occam.Metrics (ParseKind (..))
@@ -32,19 +43,24 @@ import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
     SQLDialect (..),
+    countStatements,
     defaultParseOptions,
     parseSQLTimed,
  )
 import Occam.Pool (withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
+    ReductionResult (..),
     closeSet,
     cutRemovedStatementIds,
     defaultReductionConfig,
     reduceSQLWithConfig,
+    reduceSQLWithEvidence,
     replaceSpan,
+    statementAuditWithLogger,
  )
 import Occam.Slicer (backwardSlice)
+import Paths_occam qualified
 import System.Directory (doesFileExist)
 import System.Exit (ExitCode (..), die)
 import System.FilePath (takeBaseName, (</>))
@@ -84,7 +100,8 @@ genScale n =
 
 corpusCases :: [FilePath]
 corpusCases =
-    [ "02_transaction_savepoint_churn.sql"
+    [ "01_cte_recursive_analytics.sql"
+    , "02_transaction_savepoint_churn.sql"
     , "03_deep_expressions_polymorphic.sql"
     , "04_multitable_diamond_dag.sql"
     , "05_upsert_conflict.sql"
@@ -94,18 +111,40 @@ corpusCases =
     , "09_column_star.sql"
     ]
 
-loadCorpusCase :: FilePath -> IO (Maybe (String, ByteString, SqliteContract))
-loadCorpusCase name = do
-    let path = "benchmarks/corpus" </> name
-    exists <- doesFileExist path
-    if not exists
-        then pure Nothing
+locateCorpusFile :: FilePath -> IO FilePath
+locateCorpusFile name = do
+    let direct = "benchmarks/corpus" </> name
+    directExists <- doesFileExist direct
+    if directExists
+        then pure direct
         else do
-            sql <- BS.readFile path
-            cRes <- generateSqliteContract sql
-            case cRes of
-                Left _ -> pure Nothing
-                Right contract -> pure (Just (takeBaseName name, sql, contract))
+            dataDirFile <-
+                catch
+                    (Paths_occam.getDataFileName ("benchmarks/corpus" </> name))
+                    (\(_ :: IOException) -> pure direct)
+            dataExists <- doesFileExist dataDirFile
+            if dataExists
+                then pure dataDirFile
+                else
+                    die
+                        ( "[BENCHMARK ERROR] Required corpus file not found: "
+                            ++ name
+                            ++ " (checked "
+                            ++ direct
+                            ++ " and "
+                            ++ dataDirFile
+                            ++ ")"
+                        )
+
+loadCorpusCase :: FilePath -> IO (String, ByteString, SqliteContract)
+loadCorpusCase name = do
+    path <- locateCorpusFile name
+    sql <- BS.readFile path
+    cRes <- generateSqliteContract sql
+    case cRes of
+        Left err ->
+            die ("[BENCHMARK ERROR] Failed to generate SQLite contract for " ++ name ++ ": " ++ T.unpack err)
+        Right contract -> pure (takeBaseName name, sql, contract)
 
 -- | Eight dependency-linked statements per table: DDL, writes, and reads.
 tableBlock :: Int -> [ByteString]
@@ -176,6 +215,111 @@ checkCount expected parsed =
      in unless (actual == expected) $
             die ("occam-bench: expected " ++ show expected ++ " statements, parsed " ++ show actual)
 
+-- | True end-to-end product execution: evaluated reduction + evidence + audit + final validation + stats serialization.
+runEvaluatedProductPath :: SqliteContract -> ByteString -> IO (ByteString, BSL.ByteString)
+runEvaluatedProductPath contract sql = do
+    initCount <- fromRight 0 <$> countStatements SQLite sql
+    reduced <-
+        withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool -> do
+            ReductionResult reducedSql _evidence <-
+                reduceSQLWithEvidence
+                    (\_ -> pure ())
+                    (defaultReductionConfig {reductionDialect = SQLite})
+                    nullLogger
+                    pool
+                    sql
+            _auditStats <- statementAuditWithLogger nullLogger SQLite pool reducedSql
+            pure reducedSql
+    valRes <- sqliteContractOracle contract reduced
+    unless (valRes == OracleAccepted) $
+        die "Final validation failed"
+    finalCount <- fromRight 0 <$> countStatements SQLite reduced
+    let stats =
+            Stats
+                { initial_bytes = BS.length sql
+                , reduced_bytes = BS.length reduced
+                , reduction_ratio = fromIntegral (BS.length reduced) / max 1.0 (fromIntegral (BS.length sql))
+                , initial_statements = initCount
+                , reduced_statements = finalCount
+                , oracle_executions = 0
+                , oracle_attempts = 0
+                , initial_oracle_observations = 1
+                , cache_hits = 0
+                , cache_misses = 0
+                , cache_joins = 0
+                , cache_hit_ratio = 0.0
+                , cancelled_observations = 0
+                , status = EvaluationCompleted
+                , reduction_settings = toJSON (Map.empty :: Map.Map String String)
+                , evaluation_budget =
+                    EvaluationConfig
+                        { evaluationCacheEnabled = True
+                        , evaluationJobs = 1
+                        , evaluationTotalTimeoutMicros = Nothing
+                        , evaluationMaxOracleExecutions = Nothing
+                        , evaluationPreflightMicros = 0
+                        , evaluationPreflightAttempts = 0
+                        , evaluationPreflightResetMicros = Nothing
+                        , evaluationPreflightOracleMicros = Nothing
+                        , evaluationInitialStatements = Just initCount
+                        }
+                , evaluation_metrics =
+                    EvaluationMetrics
+                        { evaluationStatus = EvaluationCompleted
+                        , evaluationFailure = Nothing
+                        , evaluationCacheUsed = True
+                        , evaluationBudget =
+                            EvaluationConfig
+                                { evaluationCacheEnabled = True
+                                , evaluationJobs = 1
+                                , evaluationTotalTimeoutMicros = Nothing
+                                , evaluationMaxOracleExecutions = Nothing
+                                , evaluationPreflightMicros = 0
+                                , evaluationPreflightAttempts = 0
+                                , evaluationPreflightResetMicros = Nothing
+                                , evaluationPreflightOracleMicros = Nothing
+                                , evaluationInitialStatements = Just initCount
+                                }
+                        , evaluationTotalSeconds = 0.0
+                        , evaluationReductionSeconds = 0.0
+                        , evaluationOracleSeconds = 0.0
+                        , evaluationResetSeconds = 0.0
+                        , evaluationPreflightResetSeconds = Nothing
+                        , evaluationPreflightOracleSeconds = Nothing
+                        , evaluationOracleAttempts = 0
+                        , evaluationDatabaseObservations = 0
+                        , evaluationCompletedOracleProcesses = 0
+                        , evaluationAcceptedObservations = 0
+                        , evaluationRejectedObservations = 0
+                        , evaluationTimedOutObservations = 0
+                        , evaluationResetFailures = 0
+                        , evaluationOracleErrors = 0
+                        , evaluationCancelledObservations = 0
+                        , evaluationOracleOutcomes = Map.empty
+                        , evaluationCacheHits = 0
+                        , evaluationCacheMisses = 0
+                        , evaluationCacheJoins = 0
+                        , evaluationValidationSeconds = 0.0
+                        , evaluationValidationOracleSeconds = 0.0
+                        , evaluationValidationResetSeconds = 0.0
+                        , evaluationValidationObservations = 1
+                        , evaluationValidationDatabaseObservations = 1
+                        , evaluationValidationErrors = 0
+                        , evaluationValidationOutcomes = Map.empty
+                        , evaluationValidationPassed = True
+                        , evaluationAuditSeconds = 0.0
+                        , evaluationAuditChecks = 0
+                        , evaluationAuditCompleted = True
+                        , evaluationMinimalityClaim = StatementDeletionOneMinimal
+                        , evaluationCurve = []
+                        , evaluationStages = []
+                        , evaluationCostAttribution = Nothing
+                        }
+                , initial_oracle_seconds = 0.0
+                , elapsed_seconds = 0.0
+                }
+    pure (reduced, encode stats)
+
 main :: IO ()
 main = do
     let sql64 = syntheticSQL 8
@@ -214,7 +358,7 @@ main = do
         Left err -> die ("Failed to generate contract for scale 64: " ++ show err)
         Right c -> pure c
     let oracleScale64 = sqliteContractOracle contractScale64
-    loadedCorpus <- catMaybes <$> mapM loadCorpusCase corpusCases
+    loadedCorpus <- mapM loadCorpusCase corpusCases
     defaultMain
         [ bgroup
             "parse"
@@ -305,25 +449,34 @@ main = do
                 "corpus"
                 [ bgroup
                     name
-                    [ bench "default" $
-                        whnfIO $
+                    ( bench
+                        "default"
+                        ( whnfIO $
                             withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
                                 reduceSQLWithConfig
                                     (defaultReductionConfig {reductionDialect = SQLite})
                                     nullLogger
                                     pool
                                     sql
-                    , bcompare ("$NF == \"default\" && $(NF-1) == \"" ++ name ++ "\"") $
-                        bench "intra-statement" $
-                            whnfIO $
-                                withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
-                                    reduceSQLWithConfig
-                                        (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
-                                        nullLogger
-                                        pool
-                                        sql
-                    ]
+                        )
+                        : [ bcompare ("$NF == \"default\" && $(NF-1) == \"" ++ name ++ "\"") $
+                                bench "intra-statement" $
+                                    whnfIO $
+                                        withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
+                                            reduceSQLWithConfig
+                                                (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                                nullLogger
+                                                pool
+                                                sql
+                          | name /= "01_cte_recursive_analytics"
+                          ]
+                    )
                 | (name, sql, contract) <- loadedCorpus
                 ]
+            ]
+        , bgroup
+            "product-path"
+            [ bench name $ whnfIO (runEvaluatedProductPath contract sql)
+            | (name, sql, contract) <- loadedCorpus
             ]
         ]
