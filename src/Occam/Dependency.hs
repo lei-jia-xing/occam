@@ -6,6 +6,10 @@ module Occam.Dependency (
     cascadeWrites,
 ) where
 
+import Data.IntMap.Strict (IntMap)
+import Data.IntMap.Strict qualified as IntMap
+import Data.IntSet (IntSet)
+import Data.IntSet qualified as IntSet
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
@@ -69,6 +73,7 @@ data DependencyGraph = DependencyGraph
     { graphStmts :: !(Set StatementId)
     , graphFacts :: !(Map StatementId SemanticFacts)
     , graphEdges :: !(Map StatementId (Set StatementId))
+    , graphFastEdges :: !(IntMap IntSet)
     , graphBarrierActions :: !Int
     , graphBarrierStatements :: !Int
     , graphBarrierEdges :: !Int
@@ -82,6 +87,7 @@ emptyGraph =
         { graphStmts = Set.empty
         , graphFacts = Map.empty
         , graphEdges = Map.empty
+        , graphFastEdges = IntMap.empty
         , graphBarrierActions = 0
         , graphBarrierStatements = 0
         , graphBarrierEdges = 0
@@ -122,10 +128,16 @@ buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
     let (_, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
             foldl' step (initialScanState initialSession, Map.empty, 0, 0, 0) stmtFacts
+        fastEdges =
+            IntMap.fromList
+                [ (unStatementId sid, IntSet.fromList (map unStatementId (Set.toList deps)))
+                | (sid, deps) <- Map.toList edges
+                ]
      in DependencyGraph
             { graphStmts = Set.fromList (map fst stmtFacts)
             , graphFacts = Map.fromList stmtFacts
             , graphEdges = edges
+            , graphFastEdges = fastEdges
             , graphBarrierActions = barrierActionCount
             , graphBarrierStatements = barrierStmtCount
             , graphBarrierEdges = barrierEdgeCount

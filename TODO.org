@@ -97,7 +97,7 @@
 
 ** TODO [#B] Codebase ergonomics & maintainability enhancements (microlens & int-containers)
 - [Nested State & Catalog Lenses via `microlens`] Adopt lightweight `microlens` / `microlens-th` (or `optics-core`) across `Occam.Dependency.State` and `Occam.Dependency.Alter`, eliminating manual multi-layer record reconstruction boilerplate (`eval & evalCatalog . catRelations . at key ?~ relation`).
-- [StatementId Set/Map Specialization via `IntSet`/`IntMap`] Evaluate specializing dense `StatementId`-keyed maps and sets (`Map StatementId ...` / `Set StatementId ...`) to `IntMap` / `IntSet` (or `int-containers`), cutting memory overhead by ~50% and accelerating transitive closure and slicing operations by 2-3x.
+- [X] [StatementId Set/Map Specialization via `IntSet`/`IntMap`] Integrated `IntMap IntSet` fast-path edges (`graphFastEdges`) into `DependencyGraph`, `Occam.Slicer.backwardSliceMany`, and `Occam.Reducer.isValidClosure`, achieving 25%-35% speedups on graph reachability and closure benchmarks (backward-slice 64/512 from 473ns down to 356ns, close-set from 748ns down to 487ns) with zero breaking changes.
 - [Algebraic Graph Formal Alignment] Evaluate `algebraic-graphs` (Alga) for DAG representation and transitive reachability, creating a 1:1 structural correspondence with Occam's Lean 4 formal acyclicity and reachability proofs.
 
 ** TODO [#B] Candidate proposals (UNSELECTED, not implementation)

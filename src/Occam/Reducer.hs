@@ -37,6 +37,8 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IntMap.Strict qualified as IntMap
+import Data.IntSet qualified as IntSet
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isNothing, listToMaybe)
@@ -254,12 +256,19 @@ columnParseOptions ColumnAtomic = columnAtomicParseOptions
 predecessors are also retained.
 -}
 isValidClosure :: DependencyGraph -> Set StatementId -> Bool
-isValidClosure DependencyGraph {..} kept =
-    all isClosureOk (Set.toList kept)
+isValidClosure DependencyGraph {..} kept
+    | IntMap.null graphFastEdges = all isClosureOk (Set.toList kept)
+    | otherwise =
+        let !keptInts = IntSet.fromList (map unStatementId (Set.toList kept))
+         in all (isClosureOkFast keptInts) (IntSet.toList keptInts)
     where
         isClosureOk sid =
             let predecessors = Map.findWithDefault Set.empty sid graphEdges
              in predecessors `Set.isSubsetOf` kept
+
+        isClosureOkFast keptInts sid =
+            let predecessors = IntMap.findWithDefault IntSet.empty sid graphFastEdges
+             in predecessors `IntSet.isSubsetOf` keptInts
 
 -- | Transitive backward closure of a set of statement IDs.
 closeSet :: DependencyGraph -> Set StatementId -> Set StatementId

@@ -3,10 +3,12 @@ module Occam.Slicer (
     backwardSliceMany,
 ) where
 
+import Data.IntMap.Strict qualified as IntMap
+import Data.IntSet qualified as IntSet
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (StatementId)
+import Occam.Core (StatementId (..))
 import Occam.Dependency (DependencyGraph (..))
 
 -- | Computes the backward slice reachable from a target statement.
@@ -17,7 +19,12 @@ backwardSlice target = backwardSliceMany (Set.singleton target)
 traversal, visiting each statement at most once.
 -}
 backwardSliceMany :: Set StatementId -> DependencyGraph -> Set StatementId
-backwardSliceMany roots DependencyGraph {..} = go roots (Set.toList roots)
+backwardSliceMany roots DependencyGraph {..}
+    | IntMap.null graphFastEdges = go roots (Set.toList roots)
+    | otherwise =
+        let !rootInts = IntSet.fromList (map unStatementId (Set.toList roots))
+            !visitedInts = goFast rootInts (IntSet.toList rootInts)
+         in Set.fromList (map StatementId (IntSet.toList visitedInts))
     where
         go !visited [] = visited
         go !visited (curr : rest) =
@@ -26,3 +33,11 @@ backwardSliceMany roots DependencyGraph {..} = go roots (Set.toList roots)
              in if Set.null newNodes
                     then go visited rest
                     else go (visited `Set.union` newNodes) (Set.foldl' (flip (:)) rest newNodes)
+
+        goFast !visited [] = visited
+        goFast !visited (curr : rest) =
+            let deps = IntMap.findWithDefault IntSet.empty curr graphFastEdges
+                newNodes = deps `IntSet.difference` visited
+             in if IntSet.null newNodes
+                    then goFast visited rest
+                    else goFast (visited `IntSet.union` newNodes) (IntSet.foldl' (flip (:)) rest newNodes)
