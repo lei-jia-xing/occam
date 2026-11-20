@@ -50,6 +50,28 @@ module Occam.Dependency.State (
     deleteSequence,
     deleteConstraint,
     clearRelationObjects,
+    -- Lenses and state modification combinators
+    evalCatalogL,
+    evalSessionL,
+    evalDepsL,
+    evalTouchesL,
+    evalBarriersL,
+    catalogRelationsL,
+    catalogIndexesL,
+    catalogTriggersL,
+    catalogSequencesL,
+    catalogConstraintsL,
+    relColumnsL,
+    relDataWritesL,
+    relCardinalityWritesL,
+    relColumnWritesL,
+    relSchemaWritesL,
+    relConstraintsL,
+    relIndexesL,
+    modifyCatalog,
+    modifySession,
+    modifyRelation,
+    modifyEvalRelation,
     -- Write signatures and name utilities
     WriteSignature (..),
     writeSignature,
@@ -63,6 +85,7 @@ import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Lens.Micro (Lens', lens, (%~), (&))
 import Occam.Core (
     BarrierReason (..),
     BarrierScope (..),
@@ -441,16 +464,100 @@ initialEval _ state =
         }
 
 addDeps :: Set StatementId -> Eval -> Eval
-addDeps deps eval = eval {evalDeps = Set.union deps (evalDeps eval)}
+addDeps deps eval = eval & evalDepsL %~ Set.union deps
 
 addTouch :: BarrierKey -> Eval -> Eval
-addTouch key eval = eval {evalTouches = Set.insert key (evalTouches eval)}
+addTouch key eval = eval & evalTouchesL %~ Set.insert key
 
 addTouches :: [BarrierKey] -> Eval -> Eval
-addTouches keys eval = eval {evalTouches = Set.union (Set.fromList keys) (evalTouches eval)}
+addTouches keys eval = eval & evalTouchesL %~ Set.union (Set.fromList keys)
 
 addBarrier :: ScopedBarrier -> Eval -> Eval
-addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
+addBarrier scoped eval = eval & evalBarriersL %~ (scoped :)
+
+-- | Lens for the catalog inside an evaluation state.
+evalCatalogL :: Lens' Eval Catalog
+evalCatalogL = lens evalCatalog (\e c -> e {evalCatalog = c})
+
+-- | Lens for session state inside an evaluation state.
+evalSessionL :: Lens' Eval SessionState
+evalSessionL = lens evalSession (\e s -> e {evalSession = s})
+
+-- | Lens for dependencies inside an evaluation state.
+evalDepsL :: Lens' Eval (Set StatementId)
+evalDepsL = lens evalDeps (\e d -> e {evalDeps = d})
+
+-- | Lens for barrier touches inside an evaluation state.
+evalTouchesL :: Lens' Eval (Set BarrierKey)
+evalTouchesL = lens evalTouches (\e t -> e {evalTouches = t})
+
+-- | Lens for scoped barriers inside an evaluation state.
+evalBarriersL :: Lens' Eval [ScopedBarrier]
+evalBarriersL = lens evalBarriers (\e b -> e {evalBarriers = b})
+
+-- | Lens for relations inside a catalog.
+catalogRelationsL :: Lens' Catalog (Map RelationKey RelationState)
+catalogRelationsL = lens catalogRelations (\c r -> c {catalogRelations = r})
+
+-- | Lens for indexes inside a catalog.
+catalogIndexesL :: Lens' Catalog (Map IndexKey IndexState)
+catalogIndexesL = lens catalogIndexes (\c i -> c {catalogIndexes = i})
+
+-- | Lens for triggers inside a catalog.
+catalogTriggersL :: Lens' Catalog (Map TriggerKey TriggerState)
+catalogTriggersL = lens catalogTriggers (\c t -> c {catalogTriggers = t})
+
+-- | Lens for sequences inside a catalog.
+catalogSequencesL :: Lens' Catalog (Map SequenceKey SequenceState)
+catalogSequencesL = lens catalogSequences (\c s -> c {catalogSequences = s})
+
+-- | Lens for constraints inside a catalog.
+catalogConstraintsL :: Lens' Catalog (Map ConstraintKey ConstraintState)
+catalogConstraintsL = lens catalogConstraints (\c k -> c {catalogConstraints = k})
+
+-- | Lens for columns in a relation state.
+relColumnsL :: Lens' RelationState (Set Ident)
+relColumnsL = lens relColumns (\r c -> r {relColumns = c})
+
+-- | Lens for data writes in a relation state.
+relDataWritesL :: Lens' RelationState (Set StatementId)
+relDataWritesL = lens relDataWrites (\r w -> r {relDataWrites = w})
+
+-- | Lens for cardinality writes in a relation state.
+relCardinalityWritesL :: Lens' RelationState (Set StatementId)
+relCardinalityWritesL = lens relCardinalityWrites (\r w -> r {relCardinalityWrites = w})
+
+-- | Lens for column writes in a relation state.
+relColumnWritesL :: Lens' RelationState (Map Ident (Set StatementId))
+relColumnWritesL = lens relColumnWrites (\r w -> r {relColumnWrites = w})
+
+-- | Lens for schema writes in a relation state.
+relSchemaWritesL :: Lens' RelationState (Set StatementId)
+relSchemaWritesL = lens relSchemaWrites (\r w -> r {relSchemaWrites = w})
+
+-- | Lens for constraints in a relation state.
+relConstraintsL :: Lens' RelationState (Set ConstraintKey)
+relConstraintsL = lens relConstraints (\r k -> r {relConstraints = k})
+
+-- | Lens for indexes in a relation state.
+relIndexesL :: Lens' RelationState (Set IndexKey)
+relIndexesL = lens relIndexes (\r i -> r {relIndexes = i})
+
+-- | Modify the catalog component of an evaluation accumulator.
+modifyCatalog :: (Catalog -> Catalog) -> Eval -> Eval
+modifyCatalog f eval = eval & evalCatalogL %~ f
+
+-- | Modify the session component of an evaluation accumulator.
+modifySession :: (SessionState -> SessionState) -> Eval -> Eval
+modifySession f eval = eval & evalSessionL %~ f
+
+-- | Modify a relation state within a catalog if present.
+modifyRelation :: RelationKey -> (RelationState -> RelationState) -> Catalog -> Catalog
+modifyRelation key f cat = cat & catalogRelationsL %~ Map.adjust f key
+
+-- | Modify a relation state within an evaluation state if present.
+modifyEvalRelation :: RelationKey -> (RelationState -> RelationState) -> Eval -> Eval
+modifyEvalRelation key f = modifyCatalog (modifyRelation key f)
 
 ambiguousMutation :: Eval -> Eval
 ambiguousMutation =

@@ -19,6 +19,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Lens.Micro ((%~), (&), (.~))
 import Occam.Core (
     AlterChange (..),
     AlterTable (..),
@@ -60,11 +61,17 @@ import Occam.Dependency.State (
     addTouches,
     deleteConstraint,
     deleteIndex,
+    evalCatalogL,
     insertRelation,
     lookupRelation,
     mutateResolved,
     nameLast,
     newRelation,
+    relColumnWritesL,
+    relColumnsL,
+    relConstraintsL,
+    relIndexesL,
+    relSchemaWritesL,
  )
 
 -- Constraint columns
@@ -210,8 +217,8 @@ processAlterTable sid eval alter =
                         (currentCatalog, relation)
                         changes
                 relation2 =
-                    relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
-             in current1 {evalCatalog = insertRelation key relation2 catalog1}
+                    relation1 & relSchemaWritesL %~ Set.insert sid
+             in current1 & evalCatalogL .~ insertRelation key relation2 catalog1
      in mutateResolved stepKey eval keys
 
 {- | `ALTER TABLE parent ATTACH PARTITION child`: route the child's rows
@@ -265,10 +272,10 @@ attachDetachPartition sid eval link isAttach =
                                         )
                                         (relPartitionParents child)
                         }
-                parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
+                parent1 = parent & relSchemaWritesL %~ Set.insert sid
                 catalog1 =
                     insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
-             in current1 {evalCatalog = catalog1}
+             in current1 & evalCatalogL .~ catalog1
      in mutateResolved step eval pairs
 
 {- | `ALTER TABLE child INHERIT parent`: add `parent` to the child's
@@ -327,10 +334,10 @@ attachDetachInherit sid eval link isAttach =
                                         )
                                         (relInheritParents child)
                         }
-                parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
+                parent1 = parent & relSchemaWritesL %~ Set.insert sid
                 catalog1 =
                     insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
-             in current1 {evalCatalog = catalog1}
+             in current1 & evalCatalogL .~ catalog1
      in mutateResolved step eval pairs
 
 applyAlterChange ::
@@ -349,9 +356,8 @@ applyAlterChange session sid key (catalog, relation) change =
                 (catalog1, keys) = installConstraints session sid key allConstraints catalog
              in ( catalog1
                 , relation
-                    { relColumns = Set.insert (columnName column) (relColumns relation)
-                    , relConstraints = Set.union keys (relConstraints relation)
-                    }
+                    & relColumnsL %~ Set.insert (columnName column)
+                    & relConstraintsL %~ Set.union keys
                 )
         DropColumn column cascade ->
             let isParentColumn foreignKey =
@@ -431,18 +437,15 @@ applyAlterChange session sid key (catalog, relation) change =
                             (foldl' (flip deleteConstraint) catalog1 removedKeys)
                             sameTableIndexes
                         , relation
-                            { relColumns = Set.delete column (relColumns relation)
-                            , relColumnWrites = Map.delete column (relColumnWrites relation)
-                            , relConstraints =
-                                Set.difference (relConstraints relation) (Set.fromList removedKeys)
-                            , relIndexes =
-                                Set.difference (relIndexes relation) (Set.fromList sameTableIndexes)
-                            }
+                            & relColumnsL %~ Set.delete column
+                            & relColumnWritesL %~ Map.delete column
+                            & relConstraintsL %~ (`Set.difference` Set.fromList removedKeys)
+                            & relIndexesL %~ (`Set.difference` Set.fromList sameTableIndexes)
                         )
         AddConstraint constraint ->
             let (catalog1, keys) = installConstraints session sid key [constraint] catalog
              in ( catalog1
-                , relation {relConstraints = Set.union keys (relConstraints relation)}
+                , relation & relConstraintsL %~ Set.union keys
                 )
         DropConstraint name cascade ->
             let matching =
