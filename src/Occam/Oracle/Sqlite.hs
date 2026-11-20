@@ -14,7 +14,7 @@ module Occam.Oracle.Sqlite (
     sqlDataToValue,
 ) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception.Safe (SomeException, try)
 import Control.Monad (forM_, unless)
 import Data.Aeson (
     FromJSON (..),

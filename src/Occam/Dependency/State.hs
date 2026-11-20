@@ -61,6 +61,8 @@ module Occam.Dependency.State (
     catalogTriggersL,
     catalogSequencesL,
     catalogConstraintsL,
+    catalogTypesL,
+    catalogSchemasL,
     relColumnsL,
     relDataWritesL,
     relCardinalityWritesL,
@@ -68,6 +70,14 @@ module Occam.Dependency.State (
     relSchemaWritesL,
     relConstraintsL,
     relIndexesL,
+    relTriggersL,
+    relSourcesL,
+    relUnresolvedSourcesL,
+    relSourceReadsL,
+    relPartitionParentsL,
+    relInheritParentsL,
+    relColumnLineageL,
+    relConditionColumnsL,
     modifyCatalog,
     modifySession,
     modifyRelation,
@@ -515,6 +525,14 @@ catalogSequencesL = lens catalogSequences (\c s -> c {catalogSequences = s})
 catalogConstraintsL :: Lens' Catalog (Map ConstraintKey ConstraintState)
 catalogConstraintsL = lens catalogConstraints (\c k -> c {catalogConstraints = k})
 
+-- | Lens for types inside a catalog.
+catalogTypesL :: Lens' Catalog (Map Name DefinitionState)
+catalogTypesL = lens catalogTypes (\c t -> c {catalogTypes = t})
+
+-- | Lens for schemas inside a catalog.
+catalogSchemasL :: Lens' Catalog (Map Name DefinitionState)
+catalogSchemasL = lens catalogSchemas (\c s -> c {catalogSchemas = s})
+
 -- | Lens for columns in a relation state.
 relColumnsL :: Lens' RelationState (Set Ident)
 relColumnsL = lens relColumns (\r c -> r {relColumns = c})
@@ -542,6 +560,38 @@ relConstraintsL = lens relConstraints (\r k -> r {relConstraints = k})
 -- | Lens for indexes in a relation state.
 relIndexesL :: Lens' RelationState (Set IndexKey)
 relIndexesL = lens relIndexes (\r i -> r {relIndexes = i})
+
+-- | Lens for triggers in a relation state.
+relTriggersL :: Lens' RelationState (Set TriggerKey)
+relTriggersL = lens relTriggers (\r t -> r {relTriggers = t})
+
+-- | Lens for sources in a relation state.
+relSourcesL :: Lens' RelationState (Set RelationKey)
+relSourcesL = lens relSources (\r s -> r {relSources = s})
+
+-- | Lens for unresolved sources in a relation state.
+relUnresolvedSourcesL :: Lens' RelationState (Set NameRef)
+relUnresolvedSourcesL = lens relUnresolvedSources (\r s -> r {relUnresolvedSources = s})
+
+-- | Lens for source reads in a relation state.
+relSourceReadsL :: Lens' RelationState [ReadFact]
+relSourceReadsL = lens relSourceReads (\r s -> r {relSourceReads = s})
+
+-- | Lens for partition parents in a relation state.
+relPartitionParentsL :: Lens' RelationState (Set NameRef)
+relPartitionParentsL = lens relPartitionParents (\r p -> r {relPartitionParents = p})
+
+-- | Lens for inheritance parents in a relation state.
+relInheritParentsL :: Lens' RelationState (Set NameRef)
+relInheritParentsL = lens relInheritParents (\r p -> r {relInheritParents = p})
+
+-- | Lens for column lineage in a relation state.
+relColumnLineageL :: Lens' RelationState [ViewColumnLineage]
+relColumnLineageL = lens relColumnLineage (\r l -> r {relColumnLineage = l})
+
+-- | Lens for condition columns in a relation state.
+relConditionColumnsL :: Lens' RelationState [SourceColumn]
+relConditionColumnsL = lens relConditionColumns (\r c -> r {relConditionColumns = c})
 
 -- | Modify the catalog component of an evaluation accumulator.
 modifyCatalog :: (Catalog -> Catalog) -> Eval -> Eval

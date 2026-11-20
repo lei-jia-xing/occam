@@ -18,6 +18,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Lens.Micro ((%~), (&), (.~))
 import Occam.Core (
     DropMode (..),
     DropObject (..),
@@ -62,16 +63,24 @@ import Occam.Dependency.State (
     addDeps,
     addTouch,
     addTouches,
+    catalogRelationsL,
+    catalogSchemasL,
+    catalogTypesL,
     clearRelationObjects,
     deleteConstraint,
     deleteIndex,
     deleteSequence,
     deleteTrigger,
+    evalCatalogL,
     lookupRelation,
+    modifyRelation,
     mutateResolved,
     nameLast,
     nameSuffix,
     newRelation,
+    relIndexesL,
+    relSchemaWritesL,
+    relTriggersL,
  )
 
 processDrop :: StatementId -> Eval -> DropOp -> Eval
@@ -89,10 +98,7 @@ of the same name in another schema.
 -}
 markResolutionChange :: StatementId -> RelationKey -> Catalog -> Catalog
 markResolutionChange sid dropped catalog =
-    catalog
-        { catalogRelations =
-            Map.mapWithKey adjust (catalogRelations catalog)
-        }
+    catalog & catalogRelationsL %~ Map.mapWithKey adjust
     where
         droppedName = relationKeyName dropped
         adjust key relation
@@ -100,7 +106,7 @@ markResolutionChange sid dropped catalog =
             , nameLast droppedName == nameLast (relationKeyName key)
                 || nameSuffix droppedName (relationKeyName key)
                 || nameSuffix (relationKeyName key) droppedName =
-                relation {relSchemaWrites = Set.insert sid (relSchemaWrites relation)}
+                relation & relSchemaWritesL %~ Set.insert sid
             | otherwise = relation
 
 dropOne :: StatementId -> DropMode -> Eval -> DropObject -> Eval
@@ -121,19 +127,10 @@ dropOne sid mode eval object =
                                     deps =
                                         relationAllDeps session currentCatalog key
                                             `Set.union` relationConstraintDeps currentCatalog relation
-                                    current1 =
-                                        addTouches
-                                            (relationTouchKeys key)
-                                            (addDeps deps current)
-                                 in current1
-                                        { evalCatalog =
-                                            removeRelationCascade
-                                                session
-                                                sid
-                                                mode
-                                                key
-                                                (markResolutionChange sid key (evalCatalog current1))
-                                        }
+                                 in current
+                                        & addTouches (relationTouchKeys key)
+                                        & addDeps deps
+                                        & evalCatalogL %~ (removeRelationCascade session sid mode key . markResolutionChange sid key)
                             )
                             eval
                             existing
@@ -161,16 +158,11 @@ dropOne sid mode eval object =
                                     case indexStateTable state of
                                         Nothing -> catalog1
                                         Just tableKey ->
-                                            catalog1
-                                                { catalogRelations =
-                                                    Map.adjust
-                                                        (\relation -> relation {relIndexes = Set.delete key (relIndexes relation)})
-                                                        tableKey
-                                                        (catalogRelations catalog1)
-                                                }
-                             in (addTouches (indexTouchKeys key (indexStateTable state)) (addDeps deps current))
-                                    { evalCatalog = catalog2
-                                    }
+                                            modifyRelation tableKey (relIndexesL %~ Set.delete key) catalog1
+                             in current
+                                    & addTouches (indexTouchKeys key (indexStateTable state))
+                                    & addDeps deps
+                                    & evalCatalogL .~ catalog2
              in mutateResolved stepKey eval keys
         DropTrigger reference ->
             let session = evalSession eval
@@ -195,16 +187,11 @@ dropOne sid mode eval object =
                                     case triggerStateTable state of
                                         Nothing -> catalog1
                                         Just tableKey ->
-                                            catalog1
-                                                { catalogRelations =
-                                                    Map.adjust
-                                                        (\relation -> relation {relTriggers = Set.delete key (relTriggers relation)})
-                                                        tableKey
-                                                        (catalogRelations catalog1)
-                                                }
-                             in (addTouches (triggerTouchKeys key (triggerStateTable state)) (addDeps deps current))
-                                    { evalCatalog = catalog2
-                                    }
+                                            modifyRelation tableKey (relTriggersL %~ Set.delete key) catalog1
+                             in current
+                                    & addTouches (triggerTouchKeys key (triggerStateTable state))
+                                    & addDeps deps
+                                    & evalCatalogL .~ catalog2
              in mutateResolved stepKey eval keys
         DropSequence reference ->
             let session = evalSession eval
@@ -222,9 +209,10 @@ dropOne sid mode eval object =
                                             ]
                                         )
                                         `Set.union` sequenceWrites state
-                             in (addTouches (sequenceTouchKeys key) (addDeps deps current))
-                                    { evalCatalog = deleteSequence key (evalCatalog current)
-                                    }
+                             in current
+                                    & addTouches (sequenceTouchKeys key)
+                                    & addDeps deps
+                                    & evalCatalogL %~ deleteSequence key
              in mutateResolved stepKey eval keys
         DropType name ->
             let catalog = evalCatalog eval
@@ -234,10 +222,10 @@ dropOne sid mode eval object =
                         Set.empty
                         (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
                         (Map.lookup key (catalogTypes catalog))
-             in (addTouches (typeTouchKeys key) (addDeps deps eval))
-                    { evalCatalog =
-                        catalog {catalogTypes = Map.delete key (catalogTypes catalog)}
-                    }
+             in eval
+                    & addTouches (typeTouchKeys key)
+                    & addDeps deps
+                    & evalCatalogL . catalogTypesL %~ Map.delete key
         DropSchema name ->
             let catalog = evalCatalog eval
                 session = evalSession eval
@@ -261,11 +249,12 @@ dropOne sid mode eval object =
                             -- A non-empty schema makes the server reject the
                             -- drop, so the catalog must stay unchanged.
                             | schemaContentsEmpty contents ->
-                                catalog {catalogSchemas = Map.delete key (catalogSchemas catalog)}
+                                catalog & catalogSchemasL %~ Map.delete key
                             | otherwise -> catalog
-             in (addTouches (schemaTouchKeys key) (addDeps deps eval))
-                    { evalCatalog = catalog1
-                    }
+             in eval
+                    & addTouches (schemaTouchKeys key)
+                    & addDeps deps
+                    & evalCatalogL .~ catalog1
 
 removeRelationCascade ::
     SessionState -> StatementId -> DropMode -> RelationKey -> Catalog -> Catalog
@@ -441,11 +430,8 @@ removeSchemaCascade session sid schema catalog =
         catalog3 = foldl' (flip deleteIndex) catalog2 (contentsIndexes contents)
         catalog4 = foldl' (flip deleteTrigger) catalog3 (contentsTriggers contents)
      in catalog4
-            { catalogTypes =
-                foldl' (flip Map.delete) (catalogTypes catalog4) (contentsTypes contents)
-            , catalogSchemas =
-                foldl' (flip Map.delete) (catalogSchemas catalog4) (contentsSchemas contents)
-            }
+            & catalogTypesL %~ (\types -> foldl' (flip Map.delete) types (contentsTypes contents))
+            & catalogSchemasL %~ (\schemas -> foldl' (flip Map.delete) schemas (contentsSchemas contents))
 
 indexKeyInSchema :: Name -> IndexKey -> Bool
 indexKeyInSchema schema key =
