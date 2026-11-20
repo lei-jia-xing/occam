@@ -78,7 +78,6 @@ import Options.Applicative (
     execParser,
     flag',
     fullDesc,
-    header,
     help,
     helper,
     info,
@@ -88,7 +87,6 @@ import Options.Applicative (
     metavar,
     option,
     optional,
-    progDesc,
     short,
     showDefault,
     strArgument,
@@ -368,10 +366,7 @@ optsInfo :: ParserInfo Options
 optsInfo =
     info
         (optionsParser <**> versionOption <**> helper)
-        ( fullDesc
-            <> progDesc "Occam: Dependency-Aware SQL Test Case Minimizer"
-            <> header ("Occam v" ++ Occam.version ++ " - Multi-statement SQL reducer")
-        )
+        fullDesc
 
 exitCliError :: IO a
 exitCliError = exitWith (ExitFailure 2)
