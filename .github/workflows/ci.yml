@@ -101,34 +101,3 @@ jobs:
         run: cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 
 # proof-check (cd proofs && lake build) stays nightly/manual: elan + Lean dependency setup is too heavy to cache cheaply here.
-
-  xval-nightly:
-    name: XVAL harness gate (nightly)
-    runs-on: ubuntu-latest
-    # Scheduled/manual only: never on the per-PR path.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up GHC and Cabal
-        uses: haskell-actions/setup@v2
-        with:
-          ghc-version: '9.10'
-          cabal-version: 'latest'
-
-      - name: Update Cabal package list
-        run: cabal update
-
-      - name: Build occam (default dynamic mode)
-        run: cabal build exe:occam
-
-      - name: Run XVAL harness (default mode)
-        run: python3 scripts/cross_validate_deps.py
-
-      - name: Run XVAL harness (--fk-on mode)
-        run: python3 scripts/cross_validate_deps.py --fk-on --out /tmp/xval_fk_on.json

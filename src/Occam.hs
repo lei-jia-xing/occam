@@ -1,10 +1,24 @@
+-- | Occam: Dependency-Aware Multi-Statement SQL Test Case Minimizer.
 module Occam (
-    version,
+    module Occam.Version,
+    module Occam.Reducer,
+    module Occam.Slicer,
+    module Occam.Dependency,
+    module Occam.Evaluation,
+    module Occam.Core,
+    module Occam.Oracle,
+    module Occam.Parser,
+    module Occam.Pool,
+    module Occam.Cache,
 ) where
 
-import Data.Version (showVersion)
-import Paths_occam qualified as Paths
-
--- | Package version, single-sourced from the @.cabal@ file.
-version :: String
-version = showVersion Paths.version
+import Occam.Cache
+import Occam.Core
+import Occam.Dependency
+import Occam.Evaluation
+import Occam.Oracle
+import Occam.Parser
+import Occam.Pool
+import Occam.Reducer
+import Occam.Slicer
+import Occam.Version
