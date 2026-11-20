@@ -5,10 +5,15 @@ module Occam.Reducer (
     reductionSearchPolicy,
     defaultReductionConfig,
     isValidClosure,
+    isValidClosureFast,
     closeSet,
+    closeSetFast,
     closureDdmin,
     cutRemovedStatements,
     cutRemovedStatementIds,
+    cutRemovedStatementInts,
+    statementIds,
+    statementIdsInt,
     replaceSpan,
     partitionChunks,
     reduceSQL,
@@ -93,7 +98,11 @@ import Occam.Pool (
     reportCandidateCount,
     testOrderedTagged,
  )
-import Occam.Slicer (backwardSlice, backwardSliceMany)
+import Occam.Slicer (
+    backwardSliceFast,
+    backwardSliceMany,
+    backwardSliceManyFast,
+ )
 
 data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
     deriving (Eq, Show)
@@ -256,23 +265,33 @@ columnParseOptions ColumnAtomic = columnAtomicParseOptions
 predecessors are also retained.
 -}
 isValidClosure :: DependencyGraph -> Set StatementId -> Bool
-isValidClosure DependencyGraph {..} kept
-    | IntMap.null graphFastEdges = all isClosureOk (Set.toList kept)
-    | otherwise =
-        let !keptInts = IntSet.fromList (map unStatementId (Set.toList kept))
-         in all (isClosureOkFast keptInts) (IntSet.toList keptInts)
-    where
-        isClosureOk sid =
-            let predecessors = Map.findWithDefault Set.empty sid graphEdges
-             in predecessors `Set.isSubsetOf` kept
+isValidClosure graph kept =
+    let !keptInts = IntSet.fromList (map unStatementId (Set.toList kept))
+     in isValidClosureFast graph keptInts
 
-        isClosureOkFast keptInts sid =
+-- | Fast bitwise closure check directly over statement integers.
+isValidClosureFast :: DependencyGraph -> IntSet.IntSet -> Bool
+isValidClosureFast DependencyGraph {..} keptInts
+    | IntMap.null graphFastEdges =
+        let keptSet = Set.fromList (map StatementId (IntSet.toList keptInts))
+         in all (isClosureOk keptSet) (Set.toList keptSet)
+    | otherwise = all isClosureOkFast (IntSet.toList keptInts)
+    where
+        isClosureOk keptSet sid =
+            let predecessors = Map.findWithDefault Set.empty sid graphEdges
+             in predecessors `Set.isSubsetOf` keptSet
+
+        isClosureOkFast sid =
             let predecessors = IntMap.findWithDefault IntSet.empty sid graphFastEdges
              in predecessors `IntSet.isSubsetOf` keptInts
 
 -- | Transitive backward closure of a set of statement IDs.
 closeSet :: DependencyGraph -> Set StatementId -> Set StatementId
 closeSet graph roots = backwardSliceMany roots graph
+
+-- | Transitive backward closure of a set of statement integers.
+closeSetFast :: DependencyGraph -> IntSet.IntSet -> IntSet.IntSet
+closeSetFast graph roots = backwardSliceManyFast roots graph
 
 {- | Cut removed statements without unparsing or changing retained bytes.
 
@@ -284,6 +303,12 @@ partition is exact: it never inspects or rewrites the bytes it keeps.
 -}
 cutRemovedStatementIds :: ByteString -> [Statement] -> Set StatementId -> ByteString
 cutRemovedStatementIds baseSQL allStatements keptIds =
+    let !keptInts = IntSet.fromList (map unStatementId (Set.toList keptIds))
+     in cutRemovedStatementInts baseSQL allStatements keptInts
+
+-- | Fast statement byte surgery directly driven by an 'IntSet' of retained statement IDs.
+cutRemovedStatementInts :: ByteString -> [Statement] -> IntSet.IntSet -> ByteString
+cutRemovedStatementInts baseSQL allStatements keptInts =
     case chunks 0 allStatements of
         [] -> BS.empty
         [single] -> single
@@ -295,7 +320,7 @@ cutRemovedStatementIds baseSQL allStatements keptIds =
             | cursor < sourceLength = [BS.drop cursor baseSQL]
             | otherwise = []
         chunks !cursor (stmt : rest)
-            | Set.member (stmtId stmt) keptIds = chunks cursor rest
+            | IntSet.member (unStatementId (stmtId stmt)) keptInts = chunks cursor rest
             | otherwise =
                 let Span start _ = stmtSpan stmt
                     nextStart = case rest of
@@ -309,7 +334,7 @@ cutRemovedStatementIds baseSQL allStatements keptIds =
 
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
-    cutRemovedStatementIds baseSQL allStatements (statementIds keptStatements)
+    cutRemovedStatementInts baseSQL allStatements (statementIdsInt keptStatements)
 
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]
@@ -332,6 +357,10 @@ statementSpanBytes statement =
 statementIds :: [Statement] -> Set StatementId
 statementIds = Set.fromList . map stmtId
 
+-- | Collect statement IDs as a bitwise 'IntSet'.
+statementIdsInt :: [Statement] -> IntSet.IntSet
+statementIdsInt = IntSet.fromList . map (unStatementId . stmtId)
+
 statementSQL :: ByteString -> [Statement] -> [Statement] -> ByteString
 statementSQL = cutRemovedStatements
 
@@ -344,33 +373,33 @@ closureDdminWithLogger ::
 closureDdminWithLogger logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
-    let weights = HashMap.fromList [(stmtId s, statementSpanBytes s) | s <- initialStatements]
-        buildCandidate current seedIds = do
+    let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
+        buildCandidate current seedInts = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
             cached <- readIORef closureCache
-            closedIds <-
-                case HashMap.lookup seedIds cached of
+            closedInts <-
+                case HashMap.lookup seedInts cached of
                     Just result -> do
                         modifyIORef' closureStats (\stats -> stats {closureCacheHits = closureCacheHits stats + 1})
                         pure result
                     Nothing -> do
-                        let result = closeSet graph seedIds
-                        modifyIORef' closureCache (HashMap.insert seedIds result)
+                        let result = closeSetFast graph seedInts
+                        modifyIORef' closureCache (HashMap.insert seedInts result)
                         pure result
-            let currentIds = statementIds current
-                keptIds = closedIds `Set.intersection` currentIds
-                added = keptIds `Set.difference` seedIds
-                gainedBytes = sum [HashMap.lookupDefault 0 sid weights | sid <- Set.toList added]
+            let currentInts = statementIdsInt current
+                keptInts = closedInts `IntSet.intersection` currentInts
+                added = keptInts `IntSet.difference` seedInts
+                gainedBytes = sum [IntMap.findWithDefault 0 sid weights | sid <- IntSet.toList added]
             modifyIORef'
                 closureStats
                 ( \stats ->
                     stats
-                        { closureGainStatements = closureGainStatements stats + Set.size added
+                        { closureGainStatements = closureGainStatements stats + IntSet.size added
                         , closureGainBytes = closureGainBytes stats + gainedBytes
                         }
                 )
-            if isValidClosure graph keptIds
-                then pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
+            if isValidClosureFast graph keptInts
+                then pure (Just (filter (\s -> IntSet.member (unStatementId (stmtId s)) keptInts) current))
                 else pure Nothing
     result <-
         searchStatements
@@ -431,11 +460,11 @@ searchStatements buildCandidate pool baseSQL allStatements initialStatements = d
         allStatements
         initialStatements
 
-type CandidateBuilder = [Statement] -> Set StatementId -> IO (Maybe [Statement])
+type CandidateBuilder = [Statement] -> IntSet.IntSet -> IO (Maybe [Statement])
 
 plainCandidate :: CandidateBuilder
-plainCandidate current keptIds =
-    pure (Just (filter (\s -> Set.member (stmtId s) keptIds) current))
+plainCandidate current keptInts =
+    pure (Just (filter (\s -> IntSet.member (unStatementId (stmtId s)) keptInts) current))
 
 -- | Classified seeds: previously accepted seeds commit; fresh seeds test in order.
 data SeedToken
@@ -457,30 +486,30 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
         go granularity current = do
             let n = min (length current) (max 1 granularity)
                 chunks = partitionChunks n current
-                currentIds = statementIds current
-                currentSQL = cutRemovedStatementIds baseSQL allStatements currentIds
+                currentInts = statementIdsInt current
+                currentSQL = cutRemovedStatementInts baseSQL allStatements currentInts
                 currentLen = BS.length currentSQL
-            subset <- trySubsets current currentIds currentLen chunks
+            subset <- trySubsets current currentInts currentLen chunks
             case subset of
                 Just reduced -> go 2 reduced
                 Nothing -> do
-                    complement <- tryComplements current currentIds currentLen chunks
+                    complement <- tryComplements current currentInts currentLen chunks
                     case complement of
                         Just reduced -> go (max 2 (n - 1)) reduced
                         Nothing
                             | n < length current -> go (min (length current) (2 * n)) current
                             | otherwise -> pure current
 
-        trySubsets current currentIds currentLen chunks =
-            trySeeds current currentIds currentLen (map statementIds chunks)
-        tryComplements current currentIds currentLen chunks =
+        trySubsets current currentInts currentLen chunks =
+            trySeeds current currentInts currentLen (map statementIdsInt chunks)
+        tryComplements current currentInts currentLen chunks =
             trySeeds
                 current
-                currentIds
+                currentInts
                 currentLen
-                [currentIds `Set.difference` statementIds chunk | chunk <- chunks]
+                [currentInts `IntSet.difference` statementIdsInt chunk | chunk <- chunks]
 
-        trySeeds current currentIds currentLen = pull
+        trySeeds current currentInts currentLen = pull
             where
                 -- Pull only the next window of eligible candidates, test and
                 -- record them, then classify further seeds with updated
@@ -494,8 +523,8 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                 pull seeds = collect jobs [] HashSet.empty seeds
                 collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
                 collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
-                collect n acc seen (seedIds : rest) = do
-                    token <- classifySeed current currentIds currentLen seedIds
+                collect n acc seen (seedInts : rest) = do
+                    token <- classifySeed current currentInts currentLen seedInts
                     case token of
                         Nothing -> collect (n - 1) acc seen rest
                         Just (SeedAccepted kept) -> testAndContinue (reverse acc) rest (Just kept)
@@ -522,14 +551,17 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
              in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
-        classifySeed current currentIds currentLen seedIds
-            | seedIds == currentIds = pure Nothing
+        classifySeed current currentInts currentLen seedInts
+            | seedInts == currentInts = pure Nothing
             | otherwise = do
-                maybeKept <- buildCandidate current seedIds
+                maybeKept <- buildCandidate current seedInts
                 case maybeKept of
                     Nothing -> pure Nothing
                     Just kept -> do
-                        candidateSQL <- timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL allStatements kept)
+                        candidateSQL <-
+                            timeStatementBuild
+                                (poolMetricsStore pool)
+                                (cutRemovedStatementInts baseSQL allStatements (statementIdsInt kept))
                         if BS.length candidateSQL >= currentLen
                             then pure Nothing
                             else do
@@ -570,7 +602,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
             then do
                 (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
                 let statements = map unitStatement units
-                loop initialSQL statements (statementIds statements) 0 0 0
+                loop initialSQL statements (statementIdsInt statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
     logAuditStats logger (snd outcome)
     pure outcome
@@ -579,7 +611,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
         -- The audit only removes whole statements, and those statements keep
         -- their original byte spans. Parse once, then track the retained set.
         loop baseSQL allStatements kept passCount attemptCount removalCount
-            | Set.null kept =
+            | IntSet.null kept =
                 pure
                     ( renderKept baseSQL allStatements kept
                     , AuditStats passCount attemptCount removalCount True
@@ -606,7 +638,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
             where
                 go _ currentKept [] attempts removals = pure (currentKept, attempts, removals)
                 go currentSQL currentKept statements attempts removals = do
-                    let batch = take jobs [s | s <- statements, Set.member (stmtId s) currentKept]
+                    let batch = take jobs [s | s <- statements, IntSet.member (unStatementId (stmtId s)) currentKept]
                     case batch of
                         [] -> pure (currentKept, attempts, removals)
                         _ -> do
@@ -617,7 +649,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                                         bytes <-
                                             timeStatementBuild
                                                 (poolMetricsStore pool)
-                                                (renderKept baseSQL allStatements (Set.delete (stmtId statement) currentKept))
+                                                (renderKept baseSQL allStatements (IntSet.delete (unStatementId (stmtId statement)) currentKept))
                                         pure (statement, bytes)
                                     )
                                     batch
@@ -628,7 +660,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                                     mapM_ (const (recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking")) batch
                                     go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
                                 else do
-                                    mapM_ (\(_, sql) -> reportCandidateCount pool sql (Set.size currentKept - 1)) testables
+                                    mapM_ (\(_, sql) -> reportCandidateCount pool sql (IntSet.size currentKept - 1)) testables
                                     outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
                                     let retired = zip testables outcomes
                                         tested = length outcomes
@@ -636,7 +668,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                                         Just (acceptedStatement, acceptedSQL) ->
                                             go
                                                 acceptedSQL
-                                                (Set.delete (stmtId acceptedStatement) currentKept)
+                                                (IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept)
                                                 (afterStatement acceptedStatement statements)
                                                 (attempts + tested)
                                                 (removals + 1)
@@ -655,7 +687,7 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                             | stmtId s == stmtId target = ss
                             | otherwise = goAfter ss
 
-        renderKept = cutRemovedStatementIds
+        renderKept = cutRemovedStatementInts
 
 data AuditStats = AuditStats
     { auditPasses :: !Int
@@ -751,9 +783,9 @@ sliceWithAnalysis logger pool analysis sql = do
         then keep sql
         else do
             let sliceFor target =
-                    let slice = backwardSlice (stmtId target) graph
-                        retained = filter (\s -> Set.member (stmtId s) slice) statements
-                     in (retained, cutRemovedStatementIds sql statements slice)
+                    let sliceInts = backwardSliceFast (unStatementId (stmtId target)) graph
+                        retained = filter (\s -> IntSet.member (unStatementId (stmtId s)) sliceInts) statements
+                     in (retained, cutRemovedStatementInts sql statements sliceInts)
                 acceptSlice strategy target retained candidate = do
                     let StatementId targetId = stmtId target
                     logInfo'
