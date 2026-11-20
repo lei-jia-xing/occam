@@ -2,15 +2,15 @@ module Main (main) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
-import Data.Aeson (FromJSON, ToJSON, Value, encode, object, toJSON, (.=))
+import Data.Aeson (Value, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
 import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
-import GHC.Generics (Generic)
 import Occam qualified
+import Occam.Benchmark.Metrics (Stats (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -143,29 +143,6 @@ data ReductionOptions = ReductionOptions
     , optStrategy :: !ReductionStrategy
     }
     deriving (Eq, Show)
-
-data Stats = Stats
-    { initial_bytes :: !Int
-    , reduced_bytes :: !Int
-    , reduction_ratio :: !Double
-    , initial_statements :: !Int
-    , reduced_statements :: !Int
-    , oracle_executions :: !Int
-    , oracle_attempts :: !Int
-    , initial_oracle_observations :: !Int
-    , cache_hits :: !Int
-    , cache_misses :: !Int
-    , cache_joins :: !Int
-    , cache_hit_ratio :: !Double
-    , cancelled_observations :: !Int
-    , status :: !EvaluationStatus
-    , reduction_settings :: !Value
-    , evaluation_budget :: !EvaluationConfig
-    , evaluation_metrics :: !EvaluationMetrics
-    , initial_oracle_seconds :: !Double
-    , elapsed_seconds :: !Double
-    }
-    deriving (Eq, Show, Generic, ToJSON, FromJSON)
 
 optionsParser :: Parser Options
 optionsParser =

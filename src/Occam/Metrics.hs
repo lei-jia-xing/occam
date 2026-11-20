@@ -6,6 +6,7 @@ module Occam.Metrics (
     MetricsStore,
     MetricsSnapshot (..),
     FamilyCounters (..),
+    emptyFamilyCounters,
     newMetricsStore,
     snapshotMetrics,
     recordPhysicalStart,

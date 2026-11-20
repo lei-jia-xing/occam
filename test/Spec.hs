@@ -4,9 +4,10 @@ import ColumnChecks qualified
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forM_, when)
-import Data.Aeson (FromJSON (..), Value (..), eitherDecodeStrict', withObject, (.:))
+import Data.Aeson (FromJSON (..), Value (..), eitherDecodeStrict', encode, withObject, (.:))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as BSL
 import Data.Char (isSpace)
 import Data.Graph qualified as Graph
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -18,6 +19,15 @@ import DependencyChecks qualified
 import EvaluationChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
+import Occam.Benchmark.Metrics (
+    RunSummary (..),
+    Stats (..),
+    computeAttemptAuc,
+    engineOverheadMicros,
+    generateReportForDirectory,
+    missingStatsSummary,
+    renderMarkdownReport,
+ )
 import Occam.Cache (
     CacheAdmission (..),
     CacheMode (..),
@@ -51,8 +61,22 @@ import Occam.Core (
     oracleAccepts,
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
-import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
+import Occam.Evaluation (
+    EvaluationConfig (..),
+    EvaluationMetrics (..),
+    EvaluationPoint (..),
+    EvaluationStatus (..),
+    MinimalityClaim (..),
+ )
 import Occam.Logger (nullLogger)
+import Occam.Metrics (
+    FamilyCounters (..),
+    FamilyTag (..),
+    MetricPolicy (..),
+    MetricsSnapshot (..),
+    ParseKind (..),
+    emptyFamilyCounters,
+ )
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
 import Occam.Oracle.Sqlite (
     executeSqliteCandidate,
@@ -79,6 +103,7 @@ import PoolChecks qualified
 import PoolMetricsChecks qualified
 import ReductionChecks qualified
 import System.Directory (
+    createDirectoryIfMissing,
     doesDirectoryExist,
     doesFileExist,
     findExecutable,
@@ -128,6 +153,7 @@ tests =
         , ReductionChecks.tests
         , ColumnChecks.tests
         , sqliteOracleTests
+        , benchmarkMetricsTests
         , propertyTests
         , generativeFuzzTests
         , mutationalFuzzTests
@@ -800,6 +826,162 @@ sqliteOracleTests =
                     assertBool "table t retained" (BSC.isInfixOf "t" reduced)
                     oReduced <- oracle reduced
                     assertEqual "reduced SQL satisfies oracle" OracleAccepted oReduced
+        ]
+
+-- ----------------------------------------------------------------------------
+-- Benchmark Metrics & Reporting
+-- ----------------------------------------------------------------------------
+
+benchmarkMetricsTests :: TestTree
+benchmarkMetricsTests =
+    testGroup
+        "Benchmark Metrics & Reporting"
+        [ testCase "computeAttemptAuc returns 1.0 for empty or invalid inputs" do
+            assertEqual "zero initial bytes" 1.0 (computeAttemptAuc 0 [] 10)
+            assertEqual "negative attempts" 1.0 (computeAttemptAuc 1000 [] 0)
+        , testCase "computeAttemptAuc integrates discrete AUC correctly" do
+            let curve =
+                    [ EvaluationPoint 1.0 1 1000 Nothing False True
+                    , EvaluationPoint 2.0 2 500 Nothing False True
+                    , EvaluationPoint 3.0 3 100 Nothing False False
+                    , EvaluationPoint 4.0 4 200 Nothing False True
+                    ]
+                auc = computeAttemptAuc 1000 curve 4
+            assertBool "AUC matches (1 + 0.5 + 0.5 + 0.2) / 4 = 0.55" (abs (auc - 0.55) < 1e-6)
+        , testCase "engineOverheadMicros aggregates FFI, decode, and candidateBuild" do
+            let snapshot =
+                    MetricsSnapshot
+                        { snapshotPolicy = MetricPolicy "ddmin" "none" 1
+                        , snapshotFamilies =
+                            Map.fromList
+                                [ (TagStatement, emptyFamilyCounters {candidateBuildMicros = 75})
+                                ]
+                        , snapshotGeneratedSkipped = Map.empty
+                        , snapshotParseFfiMicros =
+                            Map.fromList [(ParseStatementOnly, 100), (ParseSyntaxChunks, 50)]
+                        , snapshotParseDecodeMicros =
+                            Map.fromList [(ParseStatementOnly, 25)]
+                        }
+            assertEqual "engine overhead sum" 250 (engineOverheadMicros (Just snapshot))
+        , testCase "renderMarkdownReport outputs 4D schema columns and rows" do
+            let run1 =
+                    RunSummary
+                        { runName = "caseA__default__r1"
+                        , runCase = Just "caseA"
+                        , runArm = Just "default"
+                        , runRep = Just "r1"
+                        , runReducedBytes = Just 200
+                        , runReducedStatements = Just 2
+                        , runReductionRatio = Just 0.2
+                        , runOracleAttempts = Just 4
+                        , runAccepted = Just 2
+                        , runCacheHits = Just 3
+                        , runAttemptAuc = Just 0.55
+                        , runEngineOverheadUs = Just 250
+                        , runElapsedSeconds = Just 7.25
+                        , runStatus = "completed"
+                        }
+                run2 = missingStatsSummary "caseA__intra__r1"
+                md = renderMarkdownReport [run1, run2]
+            assertBool "has header" (T.isInfixOf "| run | reduced_bytes |" md)
+            assertBool "has run1" (T.isInfixOf "caseA__default__r1" md)
+            assertBool "has missing-stats" (T.isInfixOf "missing-stats" md)
+        , testCase "generateReportForDirectory scans run directories and writes reports" do
+            tempDir <- getTemporaryDirectory
+            let testDir = tempDir </> "occam-test-benchmark-metrics"
+                runDir1 = testDir </> "caseA__default__r1"
+                runDir2 = testDir </> "caseA__intra__r1"
+            createDirectoryIfMissing True runDir1
+            createDirectoryIfMissing True runDir2
+            let curve =
+                    [ EvaluationPoint 1.0 1 1000 Nothing False True
+                    , EvaluationPoint 2.0 2 500 Nothing False True
+                    , EvaluationPoint 3.0 3 100 Nothing False False
+                    , EvaluationPoint 4.0 4 200 Nothing False True
+                    ]
+                budget =
+                    EvaluationConfig
+                        { evaluationCacheEnabled = True
+                        , evaluationJobs = 1
+                        , evaluationTotalTimeoutMicros = Nothing
+                        , evaluationMaxOracleExecutions = Nothing
+                        , evaluationPreflightMicros = 0
+                        , evaluationPreflightAttempts = 0
+                        , evaluationPreflightResetMicros = Nothing
+                        , evaluationPreflightOracleMicros = Nothing
+                        , evaluationInitialStatements = Just 10
+                        }
+                metrics =
+                    EvaluationMetrics
+                        { evaluationStatus = EvaluationCompleted
+                        , evaluationFailure = Nothing
+                        , evaluationCacheUsed = True
+                        , evaluationBudget = budget
+                        , evaluationTotalSeconds = 7.25
+                        , evaluationReductionSeconds = 7.25
+                        , evaluationOracleSeconds = 5.0
+                        , evaluationResetSeconds = 0.0
+                        , evaluationPreflightResetSeconds = Nothing
+                        , evaluationPreflightOracleSeconds = Nothing
+                        , evaluationOracleAttempts = 4
+                        , evaluationDatabaseObservations = 4
+                        , evaluationCompletedOracleProcesses = 4
+                        , evaluationAcceptedObservations = 2
+                        , evaluationRejectedObservations = 2
+                        , evaluationTimedOutObservations = 0
+                        , evaluationResetFailures = 0
+                        , evaluationOracleErrors = 0
+                        , evaluationCancelledObservations = 0
+                        , evaluationOracleOutcomes = Map.empty
+                        , evaluationCacheHits = 3
+                        , evaluationCacheMisses = 1
+                        , evaluationCacheJoins = 0
+                        , evaluationValidationSeconds = 0.0
+                        , evaluationValidationOracleSeconds = 0.0
+                        , evaluationValidationResetSeconds = 0.0
+                        , evaluationValidationObservations = 0
+                        , evaluationValidationDatabaseObservations = 0
+                        , evaluationValidationErrors = 0
+                        , evaluationValidationOutcomes = Map.empty
+                        , evaluationValidationPassed = True
+                        , evaluationAuditSeconds = 0.0
+                        , evaluationAuditChecks = 0
+                        , evaluationAuditCompleted = True
+                        , evaluationMinimalityClaim = MinimalityNotEstablished
+                        , evaluationCurve = curve
+                        , evaluationStages = []
+                        , evaluationCostAttribution = Nothing
+                        }
+                stats =
+                    Stats
+                        { initial_bytes = 1000
+                        , reduced_bytes = 200
+                        , reduction_ratio = 80.0
+                        , initial_statements = 10
+                        , reduced_statements = 2
+                        , oracle_executions = 4
+                        , oracle_attempts = 4
+                        , initial_oracle_observations = 0
+                        , cache_hits = 3
+                        , cache_misses = 1
+                        , cache_joins = 0
+                        , cache_hit_ratio = 0.75
+                        , cancelled_observations = 0
+                        , status = EvaluationCompleted
+                        , reduction_settings = Null
+                        , evaluation_budget = budget
+                        , evaluation_metrics = metrics
+                        , initial_oracle_seconds = 0.01
+                        , elapsed_seconds = 7.25
+                        }
+            BSL.writeFile (runDir1 </> "stats.json") (encode stats)
+            runs <- generateReportForDirectory testDir
+            assertEqual "scanned 2 runs" 2 (length runs)
+            summaryExists <- doesFileExist (testDir </> "summary.json")
+            reportExists <- doesFileExist (testDir </> "report.md")
+            assertBool "summary.json created" summaryExists
+            assertBool "report.md created" reportExists
+            removeDirectoryRecursive testDir
         ]
 
 -- ----------------------------------------------------------------------------
