@@ -10,12 +10,16 @@ module Occam (
     module Occam.Parser,
     module Occam.Pool,
     module Occam.Cache,
+    module Occam.Benchmark.Metrics,
+    module Occam.Logger,
 ) where
 
+import Occam.Benchmark.Metrics
 import Occam.Cache
 import Occam.Core
 import Occam.Dependency
 import Occam.Evaluation
+import Occam.Logger
 import Occam.Oracle
 import Occam.Parser
 import Occam.Pool
