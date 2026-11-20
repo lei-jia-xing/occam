@@ -16,9 +16,8 @@ module Occam.Evaluation (
     sqlDialectName,
 ) where
 
-import Control.Exception (
-    AsyncException,
-    IOException,
+import Control.Exception (IOException)
+import Control.Exception.Safe (
     SomeException,
     displayException,
     finally,
@@ -26,7 +25,6 @@ import Control.Exception (
     handle,
     mask_,
     onException,
-    throwIO,
     try,
  )
 import Control.Monad (when)
@@ -418,7 +416,6 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
                     , Just "Oracle process group could not be reaped; refusing further oracle executions"
                     , True
                     )
-            | Just asyncErr <- fromException err -> throwIO (asyncErr :: AsyncException)
             | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)), False)
     preValidation <- readIORef state
     let acceptedFinal = evalAccepted preValidation
