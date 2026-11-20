@@ -4,7 +4,7 @@ import ColumnChecks qualified
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forM_, when)
-import Data.Aeson (FromJSON (..), Value, eitherDecodeStrict', withObject, (.:))
+import Data.Aeson (FromJSON (..), Value (..), eitherDecodeStrict', withObject, (.:))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isSpace)
@@ -54,6 +54,12 @@ import Occam.Dependency (DependencyGraph (..), analyzeStatements, buildGraph)
 import Occam.Evaluation (EvaluationConfig (..), EvaluationMetrics (..), EvaluationStatus (..))
 import Occam.Logger (nullLogger)
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
+import Occam.Oracle.Sqlite (
+    executeSqliteCandidate,
+    generateSqliteContract,
+    splitStatements,
+    sqliteContractOracle,
+ )
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, dialectName, parseSQL)
 import Occam.Pool (
     OraclePool,
@@ -64,6 +70,7 @@ import Occam.Pool (
     poolOracle,
     predicateDetails,
     testOrdered,
+    withPredicatePool,
  )
 import Occam.Reducer
 import Occam.Slicer
@@ -120,6 +127,7 @@ tests =
         , PoolMetricsChecks.tests
         , ReductionChecks.tests
         , ColumnChecks.tests
+        , sqliteOracleTests
         , propertyTests
         , generativeFuzzTests
         , mutationalFuzzTests
@@ -745,6 +753,53 @@ phase8Tests =
                 [ ("statement audit", statementAudit)
                 , ("statement ddmin", statementDdmin)
                 ]
+        ]
+
+-- ----------------------------------------------------------------------------
+-- In-process SQLite Oracle Tests
+-- ----------------------------------------------------------------------------
+
+sqliteOracleTests :: TestTree
+sqliteOracleTests =
+    testGroup
+        "In-process SQLite Oracle"
+        [ testCase "splitStatements splits statements with sqlite3_complete" $ do
+            let sql = "CREATE TABLE t (id INT);\n-- comment\nINSERT INTO t VALUES (1);\nSELECT * FROM t;"
+            stmts <- splitStatements sql
+            assertEqual "three statements" 3 (length stmts)
+        , testCase "executeSqliteCandidate executes query and returns rowset" $ do
+            let sql = "CREATE TABLE t (a INT, b TEXT);\nINSERT INTO t VALUES (1, 'hello');\nSELECT * FROM t;"
+            res <- executeSqliteCandidate sql
+            assertEqual "rowset matches" (Right [[Number 1, String "hello"]]) res
+        , testCase "sqliteContractOracle accepts matching and rejects invalid SQL" $ do
+            let sql = "CREATE TABLE t (a INT, b TEXT);\nINSERT INTO t VALUES (1, 'hello');\nSELECT * FROM t;"
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    let oracle = sqliteContractOracle contract
+                    o1 <- oracle sql
+                    assertEqual "original accepts" OracleAccepted o1
+                    o2 <- oracle "SYNTAX ERROR;"
+                    assertEqual "syntax error rejects" OracleRejected o2
+                    o3 <- oracle "SELECT 42;"
+                    assertEqual "mismatched query rejects" OracleRejected o3
+                    o4 <- oracle ""
+                    assertEqual "empty candidate rejects" OracleRejected o4
+        , testCase "in-process reduction removes dead noise table" $ do
+            let sql =
+                    "CREATE TABLE noise (x INT);\nINSERT INTO noise VALUES (99);\nCREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nSELECT count(*) FROM t;"
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    let oracle = sqliteContractOracle contract
+                    reduced <- withPredicatePool 1 True (fmap (== OracleAccepted) . oracle) $ \pool ->
+                        statementAudit SQLite pool sql
+                    assertBool "noise removed" (not (BSC.isInfixOf "noise" reduced))
+                    assertBool "table t retained" (BSC.isInfixOf "t" reduced)
+                    oReduced <- oracle reduced
+                    assertEqual "reduced SQL satisfies oracle" OracleAccepted oReduced
         ]
 
 -- ----------------------------------------------------------------------------

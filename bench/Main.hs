@@ -4,7 +4,9 @@ import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.List (intercalate)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
 import Occam.Cache (
     CacheMode (..),
@@ -13,11 +15,19 @@ import Occam.Cache (
     cacheLookup,
     newCache,
  )
-import Occam.Core (SemanticFacts (..), Span (..), Statement (..), StatementId (..))
+import Occam.Core (
+    OracleOutcome (..),
+    SemanticFacts (..),
+    Span (..),
+    Statement (..),
+    StatementId (..),
+ )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
+import Occam.Logger (nullLogger)
 import Occam.Metrics (ParseKind (..))
 import Occam.Oracle (OracleObservation (..))
+import Occam.Oracle.Sqlite (SqliteContract, generateSqliteContract, sqliteContractOracle)
 import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
@@ -25,9 +35,19 @@ import Occam.Parser (
     defaultParseOptions,
     parseSQLTimed,
  )
-import Occam.Reducer (closeSet, cutRemovedStatementIds, replaceSpan)
+import Occam.Pool (withPredicatePool)
+import Occam.Reducer (
+    ReductionConfig (..),
+    closeSet,
+    cutRemovedStatementIds,
+    defaultReductionConfig,
+    reduceSQLWithConfig,
+    replaceSpan,
+ )
 import Occam.Slicer (backwardSlice)
+import System.Directory (doesFileExist)
 import System.Exit (ExitCode (..), die)
+import System.FilePath (takeBaseName, (</>))
 import Test.Tasty.Bench (
     bcompare,
     bench,
@@ -36,6 +56,56 @@ import Test.Tasty.Bench (
     whnf,
     whnfIO,
  )
+
+genScale :: Int -> ByteString
+genScale n =
+    BSC.pack $
+        "CREATE TABLE noise_a(id INTEGER PRIMARY KEY, grp INT, val TEXT);\n"
+            ++ "INSERT INTO noise_a(id, grp, val) VALUES "
+            ++ rowsA
+            ++ ";\n"
+            ++ "CREATE TABLE noise_b(id INTEGER PRIMARY KEY, a_id INT REFERENCES noise_a(id), tag TEXT);\n"
+            ++ "INSERT INTO noise_b(id, a_id, tag) VALUES "
+            ++ rowsB
+            ++ ";\n"
+            ++ "CREATE INDEX idx_noise_b_tag ON noise_b(tag);\n"
+            ++ "SELECT count(*), sum(id) FROM noise_a;\n"
+    where
+        rowsA =
+            intercalate
+                ", "
+                ["(" ++ show i ++ ", " ++ show (i `mod` 8) ++ ", 'v" ++ show (i `mod` 13) ++ "')" | i <- [1 .. n]]
+        rowsB =
+            intercalate
+                ", "
+                [ "(" ++ show i ++ ", " ++ show ((i * 7) `mod` n + 1) ++ ", 't" ++ show (i `mod` 5) ++ "')"
+                | i <- [1 .. n]
+                ]
+
+corpusCases :: [FilePath]
+corpusCases =
+    [ "02_transaction_savepoint_churn.sql"
+    , "03_deep_expressions_polymorphic.sql"
+    , "04_multitable_diamond_dag.sql"
+    , "05_upsert_conflict.sql"
+    , "06_views_and_aggregates.sql"
+    , "07_column_explicit.sql"
+    , "08_column_implicit.sql"
+    , "09_column_star.sql"
+    ]
+
+loadCorpusCase :: FilePath -> IO (Maybe (String, ByteString, SqliteContract))
+loadCorpusCase name = do
+    let path = "benchmarks/corpus" </> name
+    exists <- doesFileExist path
+    if not exists
+        then pure Nothing
+        else do
+            sql <- BS.readFile path
+            cRes <- generateSqliteContract sql
+            case cRes of
+                Left _ -> pure Nothing
+                Right contract -> pure (Just (takeBaseName name, sql, contract))
 
 -- | Eight dependency-linked statements per table: DDL, writes, and reads.
 tableBlock :: Int -> [ByteString]
@@ -138,6 +208,13 @@ main = do
         cacheCompleteInflight cache key i (Just obs)
     cacheInstallInflight cache candidateKey 512
     cacheCompleteInflight cache candidateKey 512 (Just obs)
+    let sqlScale64 = genScale 64
+    contractRes <- generateSqliteContract sqlScale64
+    contractScale64 <- case contractRes of
+        Left err -> die ("Failed to generate contract for scale 64: " ++ show err)
+        Right c -> pure c
+    let oracleScale64 = sqliteContractOracle contractScale64
+    loadedCorpus <- catMaybes <$> mapM loadCorpusCase corpusCases
     defaultMain
         [ bgroup
             "parse"
@@ -201,5 +278,52 @@ main = do
             , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
                 bench "miss" $
                     whnfIO (cacheLookup cache CacheEnabled Map.empty nonExistentKey)
+            ]
+        , bgroup
+            "reduction"
+            [ bgroup
+                "scale-064"
+                [ bench "default" $
+                    whnfIO $
+                        withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
+                            reduceSQLWithConfig
+                                (defaultReductionConfig {reductionDialect = SQLite})
+                                nullLogger
+                                pool
+                                sqlScale64
+                , bcompare "$NF == \"default\" && $(NF-1) == \"scale-064\"" $
+                    bench "intra-statement" $
+                        whnfIO $
+                            withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
+                                reduceSQLWithConfig
+                                    (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                    nullLogger
+                                    pool
+                                    sqlScale64
+                ]
+            , bgroup
+                "corpus"
+                [ bgroup
+                    name
+                    [ bench "default" $
+                        whnfIO $
+                            withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
+                                reduceSQLWithConfig
+                                    (defaultReductionConfig {reductionDialect = SQLite})
+                                    nullLogger
+                                    pool
+                                    sql
+                    , bcompare ("$NF == \"default\" && $(NF-1) == \"" ++ name ++ "\"") $
+                        bench "intra-statement" $
+                            whnfIO $
+                                withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
+                                    reduceSQLWithConfig
+                                        (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                        nullLogger
+                                        pool
+                                        sql
+                    ]
+                | (name, sql, contract) <- loadedCorpus
+                ]
             ]
         ]
