@@ -248,13 +248,10 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
                 (\current key -> Map.insert key sid current)
                 (scanLastBarriers priorState)
                 registrationKeys
-        allTouched =
-            Set.union (evalTouches eval) (Set.fromList registrationKeys)
-        touchers =
-            foldl'
-                (\current key -> Map.insertWith Set.union key (Set.singleton sid) current)
-                (scanTouchers priorState)
-                (Set.toList allTouched)
+        !sidSet = Set.singleton sid
+        addToucher !acc key = Map.insertWith (\_ old -> Set.insert sid old) key sidSet acc
+        touchers1 = Set.foldl' addToucher (scanTouchers priorState) (evalTouches eval)
+        touchers = foldl' addToucher touchers1 registrationKeys
         state' =
             resolutionState
                 { scanLastBarriers = lastBarriers

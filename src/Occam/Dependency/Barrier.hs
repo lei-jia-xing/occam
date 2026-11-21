@@ -95,17 +95,19 @@ barrierKeysForScope session catalog scope =
             map ObjectBarrierKey (resolveObjectKeys session catalog objectRef)
 
 lastBarrierDeps :: ScanState -> [BarrierKey] -> Set StatementId
-lastBarrierDeps state keys =
-    Set.fromList
-        [ sid
-        | key <- keys
-        , Just sid <- [Map.lookup key (scanLastBarriers state)]
-        ]
+lastBarrierDeps state = foldl' addLast Set.empty
+    where
+        barriers = scanLastBarriers state
+        addLast !acc key = case Map.lookup key barriers of
+            Nothing -> acc
+            Just sid -> Set.insert sid acc
 
 touchersForBarrier :: ScanState -> BarrierKey -> Set StatementId
-touchersForBarrier state key =
-    Set.unions
-        [ touchers
-        | (candidate, touchers) <- Map.toList (scanTouchers state)
-        , barrierKeyMatches key candidate
-        ]
+touchersForBarrier state = \case
+    SchemaBarrierKey left ->
+        Set.unions
+            [ touchers
+            | (SchemaBarrierKey right, touchers) <- Map.toList (scanTouchers state)
+            , nameSuffix left right || nameSuffix right left
+            ]
+    key -> Map.findWithDefault Set.empty key (scanTouchers state)

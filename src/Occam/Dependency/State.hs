@@ -469,16 +469,20 @@ initialEval _ state =
         }
 
 addDeps :: Set StatementId -> Eval -> Eval
-addDeps deps eval = eval & evalDepsL %~ Set.union deps
+addDeps deps eval
+    | Set.null deps = eval
+    | Set.null (evalDeps eval) = eval {evalDeps = deps}
+    | otherwise = eval {evalDeps = Set.union deps (evalDeps eval)}
 
 addTouch :: BarrierKey -> Eval -> Eval
-addTouch key eval = eval & evalTouchesL %~ Set.insert key
+addTouch key eval = eval {evalTouches = Set.insert key (evalTouches eval)}
 
 addTouches :: [BarrierKey] -> Eval -> Eval
-addTouches keys eval = eval & evalTouchesL %~ Set.union (Set.fromList keys)
+addTouches keys eval =
+    eval {evalTouches = foldl' (flip Set.insert) (evalTouches eval) keys}
 
 addBarrier :: ScopedBarrier -> Eval -> Eval
-addBarrier scoped eval = eval & evalBarriersL %~ (scoped :)
+addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
 
 -- | Lens for the catalog inside an evaluation state.
 evalCatalogL :: Lens' Eval Catalog

@@ -1577,8 +1577,17 @@ logSyntaxStats logger finalStats =
                     ]
 
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
-replaceSpan start end replacement source =
-    BS.concat [BS.take start source, replacement, BS.drop end source]
+replaceSpan start end replacement source
+    | BS.null replacement =
+        let !prefix = BS.take start source
+            !suffix = BS.drop end source
+         in BS.append prefix suffix
+    | start == 0 =
+        BS.append replacement (BS.drop end source)
+    | end == BS.length source =
+        BS.append (BS.take start source) replacement
+    | otherwise =
+        BS.concat [BS.take start source, replacement, BS.drop end source]
 
 candidateTag :: SyntaxCandidate -> FamilyTag
 candidateTag (SingleCandidate edit) = TagSyntax (parserEditCategory edit) (parserEditLabel edit)

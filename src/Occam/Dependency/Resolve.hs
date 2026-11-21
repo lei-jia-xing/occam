@@ -106,9 +106,11 @@ resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temp
     | Map.member temporaryKey entries = [temporaryKey]
     | not (null prefixKeys) = prefixKeys
     | null (effectiveSearchPath session) =
-        case wildcardMatches of
-            [] -> [fallbackKey]
-            matches -> matches
+        if Map.member directKey entries
+            then [directKey]
+            else case wildcardMatches of
+                [] -> [fallbackKey]
+                matches -> matches
     | otherwise =
         case firstExisting searchKeys of
             Just key -> [key]
@@ -116,6 +118,7 @@ resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temp
     where
         entries = entriesOf catalog
         temporaryKey = scopedKey True name
+        directKey = scopedKey False name
         fallbackKey = fallbackKeyOf session (NameRef name temporary)
         prefixKeys =
             case effectiveNamespacePrefix session of
@@ -126,14 +129,17 @@ resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temp
                 ++ [ scopedKey False (Name (nameParts entry ++ nameParts name))
                    | entry <- effectiveSearchPath session
                    ]
-                ++ [scopedKey False name]
+                ++ [directKey]
         firstExisting = find (`Map.member` entries)
         wildcardMatches =
-            [ key
-            | key <- Map.keys entries
-            , Just (False, stored) <- [scopedKeyParts key]
-            , nameSuffix name stored
-            ]
+            Map.foldrWithKey
+                ( \key _ acc ->
+                    case scopedKeyParts key of
+                        Just (False, stored) | nameSuffix name stored -> key : acc
+                        _ -> acc
+                )
+                []
+                entries
 
 resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
 resolveRelationKeys = resolveNamespacedKeys catalogRelations relationFallbackKey
