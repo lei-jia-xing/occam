@@ -3,7 +3,7 @@ module Occam.Dependency.Query (
     relationDefinitionDeps,
     relationColumnWriteDeps,
     coupledWriteColumns,
-    constraintCouplingColumns,
+    constraintColumnsOf,
     referencedParentColumns,
     relationIndexDeps,
     relationTriggerDeps,
@@ -98,7 +98,7 @@ coupledWriteColumns session catalog key columns
         let written = Set.fromList columns
             relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
             localSets =
-                [ constraintCouplingColumns (constraintValue state)
+                [ constraintColumnsOf (constraintValue state)
                 | constraintKey <- Set.toList (relConstraints relation)
                 , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
                 ]
@@ -137,8 +137,8 @@ coupledWriteColumns session catalog key columns
                  in if expanded == current then current else expand expanded
          in expand written
 
-constraintCouplingColumns :: Constraint -> [Ident]
-constraintCouplingColumns constraint =
+constraintColumnsOf :: Constraint -> [Ident]
+constraintColumnsOf constraint =
     case constraint of
         PrimaryKeyConstraint _ columns -> columns
         UniqueConstraint _ columns -> columns

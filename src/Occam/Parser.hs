@@ -55,6 +55,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
     AlterChange (..),
     AlterTable (..),
+    BarrierReason (..),
     BarrierScope (..),
     CatalogOp (..),
     ConflictAction (..),
@@ -410,13 +411,26 @@ simpleNativeError status =
     let kind = parserErrorKindFromStatus status
      in pure (ParserError kind (parserErrorMessageFor kind))
 
+-- Native status codes shared with rust/sqlparser-ffi.
+nativeStatusInvalidArguments
+    , nativeStatusInvalidConfig
+    , nativeStatusInvalidUtf8
+    , nativeStatusNativeFailure
+    , nativeStatusNativePanic ::
+        CInt
+nativeStatusInvalidArguments = 1
+nativeStatusInvalidConfig = 2
+nativeStatusInvalidUtf8 = 3
+nativeStatusNativeFailure = 4
+nativeStatusNativePanic = 5
+
 parserErrorKindFromStatus :: CInt -> ParserErrorKind
 parserErrorKindFromStatus status = case status of
-    1 -> ParserInvalidArguments
-    2 -> ParserInvalidConfig
-    3 -> ParserInvalidUtf8
-    4 -> ParserNativeFailure
-    5 -> ParserNativePanic
+    _ | status == nativeStatusInvalidArguments -> ParserInvalidArguments
+    _ | status == nativeStatusInvalidConfig -> ParserInvalidConfig
+    _ | status == nativeStatusInvalidUtf8 -> ParserInvalidUtf8
+    _ | status == nativeStatusNativeFailure -> ParserNativeFailure
+    _ | status == nativeStatusNativePanic -> ParserNativePanic
     _ -> ParserUnknownFailure (fromIntegral status)
 
 parserErrorMessageFor :: ParserErrorKind -> Text
@@ -468,18 +482,23 @@ dialectCode Snowflake = 13
 dialectCode Spark = 14
 dialectCode Teradata = 15
 
+-- | True when the byte offset is zero, end-of-input, or a UTF-8 lead byte.
+isUtf8Boundary :: ByteString -> Int -> Bool
+isUtf8Boundary source offset =
+    offset == 0 || offset == sourceLength || BS.index source offset .&. 0xc0 /= 0x80
+    where
+        sourceLength = BS.length source
+
 makeUnits :: ByteString -> [NativeUnit] -> Either ParserError [StatementUnit]
 makeUnits source = go 0 1
     where
         sourceLength = BS.length source
-        isBoundary offset =
-            offset == 0 || offset == sourceLength || BS.index source offset .&. 0xc0 /= 0x80
 
         go _ _ [] = Right []
         go previousEnd index (native : rest)
             | start < 0 || start >= end || end > sourceLength || start < previousEnd =
                 Left (ParserError ParserInvalidSourceRange "sqlparser returned an invalid source byte range")
-            | not (isBoundary start && isBoundary end) =
+            | not (isUtf8Boundary source start && isUtf8Boundary source end) =
                 Left (ParserError ParserInvalidSourceRange "sqlparser returned a source range splitting UTF-8")
             | maybe False (not . all (validEdit start end) . nativeEdits) (nativeFacts native) =
                 Left (ParserError ParserInvalidEditRange "sqlparser returned an invalid edit range")
@@ -495,8 +514,8 @@ makeUnits source = go 0 1
                     parserEditStart edit >= unitStart
                         && parserEditStart edit < parserEditEnd edit
                         && parserEditEnd edit <= unitEnd
-                        && isBoundary (parserEditStart edit)
-                        && isBoundary (parserEditEnd edit)
+                        && isUtf8Boundary source (parserEditStart edit)
+                        && isUtf8Boundary source (parserEditEnd edit)
 
         makeFacts native = StatementFacts (nativeSemantics native) (nativeEdits native)
 
@@ -519,17 +538,14 @@ validateColumns source units targets = do
     mapM_ (mapM_ checkSite . targetSites) targets
     pure targets
     where
-        sourceLength = BS.length source
-        isBoundary offset =
-            offset == 0 || offset == sourceLength || BS.index source offset .&. 0xc0 /= 0x80
         statementBounds statement =
             let Span start end = stmtSpan statement in (start, end)
         validSite (unitStart, unitEnd) site =
             siteStart site >= unitStart
                 && siteStart site < siteEnd site
                 && siteEnd site <= unitEnd
-                && isBoundary (siteStart site)
-                && isBoundary (siteEnd site)
+                && isUtf8Boundary source (siteStart site)
+                && isUtf8Boundary source (siteEnd site)
 
 microsBetween :: Word64 -> Word64 -> Int
 microsBetween start end = fromIntegral ((end - start) `div` 1000)
@@ -733,9 +749,35 @@ barrierJson :: ScopedBarrier -> Value
 barrierJson b =
     object
         [ "scope" .= barrierScopeName (barrierScope b)
-        , "reason" .= T.pack (show (barrierReason b))
+        , "reason" .= barrierReasonName (barrierReason b)
         , "detail" .= barrierDetail b
         ]
+
+{- | Stable wire names for barrier reasons. Kept explicit so renaming a
+constructor cannot silently change the diagnostic JSON.
+-}
+barrierReasonName :: BarrierReason -> Text
+barrierReasonName reason = case reason of
+    SyntaxErrorBarrier -> "SyntaxErrorBarrier"
+    UnknownStatementBarrier -> "UnknownStatementBarrier"
+    UnknownRelationBarrier -> "UnknownRelationBarrier"
+    UnknownDDLBarrier -> "UnknownDDLBarrier"
+    UnknownDMLBarrier -> "UnknownDMLBarrier"
+    UnknownDropBarrier -> "UnknownDropBarrier"
+    UnknownAlterBarrier -> "UnknownAlterBarrier"
+    UnknownViewBarrier -> "UnknownViewBarrier"
+    UnknownIndexBarrier -> "UnknownIndexBarrier"
+    UnknownTriggerBarrier -> "UnknownTriggerBarrier"
+    UnknownTruncateBarrier -> "UnknownTruncateBarrier"
+    UnknownSessionEffectBarrier -> "UnknownSessionEffectBarrier"
+    UnsupportedExpressionBarrier -> "UnsupportedExpressionBarrier"
+    UnsupportedConflictClauseBarrier -> "UnsupportedConflictClauseBarrier"
+    UnsupportedTriggerBodyBarrier -> "UnsupportedTriggerBodyBarrier"
+    UnsupportedTransactionBarrier -> "UnsupportedTransactionBarrier"
+    UnresolvedViewSourceBarrier -> "UnresolvedViewSourceBarrier"
+    WriteThroughViewBarrier -> "WriteThroughViewBarrier"
+    OpaqueTriggerBodyBarrier -> "OpaqueTriggerBodyBarrier"
+    UnmodeledRelationSourceBarrier -> "UnmodeledRelationSourceBarrier"
 
 barrierScopeName :: BarrierScope -> T.Text
 barrierScopeName GlobalScope = "global"

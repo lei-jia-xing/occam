@@ -82,6 +82,7 @@ import Occam.Oracle.Sqlite (
     executeSqliteCandidate,
     generateSqliteContract,
     splitStatements,
+    sqliteContractObservation,
     sqliteContractOracle,
  )
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, dialectName, parseSQL)
@@ -114,7 +115,7 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
-import System.Process (readProcess, readProcessWithExitCode)
+import System.Process (readCreateProcessWithExitCode, readProcess, readProcessWithExitCode, shell)
 import Test.QuickCheck (
     Arbitrary (..),
     Property,
@@ -128,9 +129,7 @@ import Test.QuickCheck (
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
-
-emptySemanticFacts :: SemanticFacts
-emptySemanticFacts = SemanticFacts [] [] [] [] []
+import TestSupport (emptySemanticFacts)
 
 main :: IO ()
 main = defaultMain tests
@@ -293,6 +292,17 @@ instance FromJSON CliStats where
             <*> stats .: "evaluation_metrics"
             <*> pure strategy
 
+findPythonExecutable :: IO String
+findPythonExecutable = do
+    mPy3 <- findExecutable "python3"
+    case mPy3 of
+        Just _ -> pure "python3"
+        Nothing -> do
+            mPy <- findExecutable "python"
+            case mPy of
+                Just _ -> pure "python"
+                Nothing -> pure "python3"
+
 phase5Tests :: TestTree
 phase5Tests =
     testGroup
@@ -311,6 +321,7 @@ phase5Tests =
                 )
                 [[], ["--strategy", "ddmin-only"]]
         , testCase "CLI shrinks SQL while preserving the supplied predicate" $ do
+            py <- findPythonExecutable
             let initialSQL =
                     BSC.unlines
                         [ "CREATE TABLE t1 (a INT, b TEXT);"
@@ -320,13 +331,14 @@ phase5Tests =
                         , "SELECT * FROM t1 WHERE a > 0 AND 1 = 1 ORDER BY a LIMIT 1;"
                         ]
                 predicate =
-                    "python3 -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
+                    py
+                        ++ " -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
             mapM_
                 ( \extra -> withCLIInput initialSQL $ \input outFile -> do
                     (code, _, err) <- runOccamCLI ([input, "--oracle", predicate, "--out", outFile, "--quiet"] ++ extra)
                     assertEqual ("Reduction failed: " ++ err) ExitSuccess code
                     reduced <- BSC.readFile outFile
-                    (verified, _, _) <- readProcessWithExitCode "sh" ["-c", predicate] (BSC.unpack reduced)
+                    (verified, _, _) <- readCreateProcessWithExitCode (shell predicate) (BSC.unpack reduced)
                     assertEqual "Reduced SQL lost the target property" ExitSuccess verified
                     assertBool "No SQL reduction occurred" (BS.length reduced < BS.length initialSQL)
                 )
@@ -474,23 +486,50 @@ phase5Tests =
 
             (pCode, pOut, _) <- runOccamCLI ["--print-defaults"]
             assertEqual "--print-defaults exit code" ExitSuccess pCode
-            case eitherDecodeStrict' (BSC.pack pOut) :: Either String Value of
+            case eitherDecodeStrict' (BSC.pack pOut) :: Either String (Map.Map String Value) of
                 Left e -> assertFailure ("--print-defaults is not JSON: " ++ e)
-                Right _ -> assertBool "missing timeout key" ("\"timeout\"" `isInfixOf` pOut)
+                Right defaults -> do
+                    assertEqual "default timeout" (Just (Number 10)) (Map.lookup "timeout" defaults)
+                    assertEqual "default jobs" (Just (Number 1)) (Map.lookup "jobs" defaults)
+                    assertEqual "default dialect" (Just (String "generic")) (Map.lookup "dialect" defaults)
+                    assertEqual "default strategy" (Just (String "full")) (Map.lookup "strategy" defaults)
+                    assertEqual "default log level" (Just (String "warn")) (Map.lookup "log_level" defaults)
+                    assertEqual "json log level" (Just (String "info")) (Map.lookup "log_level_json" defaults)
         , testCase "--completion generates valid self-contained shell scripts" $ do
             (bCode, bOut, _) <- runOccamCLI ["--completion", "bash"]
             assertEqual "--completion bash exit code" ExitSuccess bCode
             assertBool "bash completion missing function" ("_occam()" `isInfixOf` bOut)
             assertBool "bash completion missing complete" ("complete -F _occam" `isInfixOf` bOut)
+            assertBool "bash completion missing --print-defaults" ("--print-defaults" `isInfixOf` bOut)
 
             (zCode, zOut, _) <- runOccamCLI ["--completion", "zsh"]
             assertEqual "--completion zsh exit code" ExitSuccess zCode
             assertBool "zsh completion missing compdef" ("#compdef occam" `isInfixOf` zOut)
             assertBool "zsh completion missing _arguments" ("_arguments" `isInfixOf` zOut)
+            assertBool "zsh completion missing --print-defaults" ("--print-defaults" `isInfixOf` zOut)
 
             (fCode, fOut, _) <- runOccamCLI ["--completion", "fish"]
             assertEqual "--completion fish exit code" ExitSuccess fCode
             assertBool "fish completion missing complete commands" ("complete -c occam" `isInfixOf` fOut)
+            assertBool "fish completion missing print-defaults" ("print-defaults" `isInfixOf` fOut)
+        , testCase "CLI rejects --stats paths that collide with input or output" $
+            withCLIInput "SELECT 1;" $ \input outFile -> do
+                (inputCode, _, inputErr) <-
+                    runOccamCLI [input, "-c", "exit 0", "--stats", input]
+                assertEqual ("--stats input must exit 2: " ++ inputErr) (ExitFailure 2) inputCode
+                inputAfter <- BS.readFile input
+                assertEqual "input was overwritten by stats" "SELECT 1;" inputAfter
+
+                (outputCode, _, outputErr) <-
+                    runOccamCLI [input, "-c", "exit 0", "--out", outFile, "--stats", outFile]
+                assertEqual ("--stats output must exit 2: " ++ outputErr) (ExitFailure 2) outputCode
+
+                let backup = input ++ ".bak"
+                (backupCode, _, backupErr) <-
+                    runOccamCLI [input, "-i", "-c", "exit 0", "--stats", backup]
+                assertEqual ("--stats backup must exit 2: " ++ backupErr) (ExitFailure 2) backupCode
+                backupExists <- doesFileExist backup
+                when backupExists (removeFile backup)
         , testCase "CLI strictly rejects conflicting arguments with exit code 2" $ do
             (code1, _, err1) <- runOccamCLI ["input.sql", "--verbose", "--quiet", "-c", "exit 0"]
             assertEqual "verbose + quiet must exit 2" (ExitFailure 2) code1
@@ -646,27 +685,27 @@ phase6Tests =
             cache <- newCache precomputed
 
             -- Hit on precomputed with CacheEnabled records a hit
-            r1 <- cacheLookup cache CacheEnabled precomputed precompKey
+            r1 <- cacheLookup cache CacheEnabled precompKey
             assertEqual "precomputed hit enabled" (LookupHit precompObs) r1
             s1 <- cacheStats cache
             assertEqual "one hit" 1 (cacheHits s1)
             assertEqual "zero misses" 0 (cacheMisses s1)
 
             -- Hit on precomputed with CacheDisabled does NOT record a hit
-            r2 <- cacheLookup cache CacheDisabled precomputed precompKey
+            r2 <- cacheLookup cache CacheDisabled precompKey
             assertEqual "precomputed hit disabled" (LookupHit precompObs) r2
             s2 <- cacheStats cache
             assertEqual "hits unchanged" 1 (cacheHits s2)
 
             -- Fresh query with CacheDisabled records a miss
             let freshKey = BSC.pack "SELECT 99;"
-            r3 <- cacheLookup cache CacheDisabled precomputed freshKey
+            r3 <- cacheLookup cache CacheDisabled freshKey
             assertEqual "fresh query disabled" LookupMiss r3
             s3 <- cacheStats cache
             assertEqual "one miss" 1 (cacheMisses s3)
 
             -- Fresh query with CacheEnabled records a miss
-            r4 <- cacheLookup cache CacheEnabled precomputed freshKey
+            r4 <- cacheLookup cache CacheEnabled freshKey
             assertEqual "fresh query enabled" LookupMiss r4
             s4 <- cacheStats cache
             assertEqual "two misses" 2 (cacheMisses s4)
@@ -677,21 +716,21 @@ phase6Tests =
 
             -- 1. Install candidate in-flight for worker ordinal 10
             cacheInstallInflight cache candidate 10
-            r1 <- cacheLookup cache CacheEnabled Map.empty candidate
+            r1 <- cacheLookup cache CacheEnabled candidate
             assertEqual "in-flight query returns join" (LookupJoin 10) r1
             s1 <- cacheStats cache
             assertEqual "joins incremented" 1 (cacheJoins s1)
 
             -- 2. Wrong ordinal cannot complete the in-flight entry
             cacheCompleteInflight cache candidate 99 (Just obs)
-            r2 <- cacheLookup cache CacheEnabled Map.empty candidate
+            r2 <- cacheLookup cache CacheEnabled candidate
             assertEqual "still in-flight after mismatched owner complete" (LookupJoin 10) r2
             s2 <- cacheStats cache
             assertEqual "joins incremented again" 2 (cacheJoins s2)
 
             -- 3. Correct ordinal completes the in-flight entry
             cacheCompleteInflight cache candidate 10 (Just obs)
-            r3 <- cacheLookup cache CacheEnabled Map.empty candidate
+            r3 <- cacheLookup cache CacheEnabled candidate
             assertEqual "completed entry returns hit" (LookupHit obs) r3
             s3 <- cacheStats cache
             assertEqual "hits incremented" 1 (cacheHits s3)
@@ -699,16 +738,16 @@ phase6Tests =
             -- 4. Complete on non-inflight candidate does nothing
             let nonInflight = BSC.pack "SELECT never_inflight;"
             cacheCompleteInflight cache nonInflight 10 (Just obs)
-            r4 <- cacheLookup cache CacheEnabled Map.empty nonInflight
+            r4 <- cacheLookup cache CacheEnabled nonInflight
             assertEqual "non-inflight complete leaves candidate as miss" LookupMiss r4
         , testCase "direct cacheRemoveInflight cancels and evicts in-flight entry" $ do
             cache <- newCache Map.empty
             let candidate = BSC.pack "SELECT to_cancel;"
             cacheInstallInflight cache candidate 5
-            r1 <- cacheLookup cache CacheEnabled Map.empty candidate
+            r1 <- cacheLookup cache CacheEnabled candidate
             assertEqual "installed" (LookupJoin 5) r1
             cacheRemoveInflight cache candidate 5
-            r2 <- cacheLookup cache CacheEnabled Map.empty candidate
+            r2 <- cacheLookup cache CacheEnabled candidate
             assertEqual "evicted after cancellation" LookupMiss r2
         , testCase "observationAdmission filters valid results" $ do
             assertEqual "success is admitted" CacheAdmit (observationAdmission (OracleFinished ExitSuccess))
@@ -734,7 +773,7 @@ phase6Tests =
                         let key = BSC.pack ("SELECT " ++ show wId ++ ", " ++ show i ++ ";")
                         cacheInstallInflight cache key wId
                         cacheCompleteInflight cache key wId (Just obs)
-                        res <- cacheLookup cache CacheEnabled Map.empty key
+                        res <- cacheLookup cache CacheEnabled key
                         assertEqual "concurrent lookup hit" (LookupHit obs) res
                     putMVar doneVar ()
             forM_ doneVars takeMVar
@@ -894,6 +933,18 @@ sqliteOracleTests =
                     assertEqual "mismatched query rejects" OracleRejected o3
                     o4 <- oracle ""
                     assertEqual "empty candidate rejects" OracleRejected o4
+        , testCase "sqliteContractObservation keeps execution errors distinct from rejection" $ do
+            let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    observation <- sqliteContractObservation contract "SYNTAX ERROR;"
+                    case observation of
+                        OracleIOFailed err ->
+                            assertBool "error detail is preserved" (not (T.null err))
+                        other ->
+                            assertFailure ("expected OracleIOFailed, got " ++ show other)
         , testCase "in-process reduction removes dead noise table" $ do
             let sql =
                     "CREATE TABLE noise (x INT);\nINSERT INTO noise VALUES (99);\nCREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nSELECT count(*) FROM t;"
@@ -944,7 +995,7 @@ benchmarkMetricsTests =
                         , snapshotParseDecodeMicros =
                             Map.fromList [(ParseStatementOnly, 25)]
                         }
-            assertEqual "engine overhead sum" 250 (engineOverheadMicros (Just snapshot))
+            assertEqual "engine overhead sum" (Just 250) (engineOverheadMicros (Just snapshot))
         , testCase "renderMarkdownReport outputs 4D schema columns and rows" do
             let run1 =
                     RunSummary
@@ -1029,6 +1080,7 @@ benchmarkMetricsTests =
                         , evaluationAuditSeconds = 0.0
                         , evaluationAuditChecks = 0
                         , evaluationAuditCompleted = True
+                        , evaluationAuditSkipped = False
                         , evaluationMinimalityClaim = MinimalityNotEstablished
                         , evaluationCurve = curve
                         , evaluationStages = []

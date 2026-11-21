@@ -127,13 +127,13 @@ computeAttemptAuc initialBytes curve totalAttempts
          in totalArea / fromIntegral totalAttempts
 
 -- | Parse FFI + decode + candidate-build micros from cost attribution.
-engineOverheadMicros :: Maybe MetricsSnapshot -> Int
-engineOverheadMicros Nothing = 0
+engineOverheadMicros :: Maybe MetricsSnapshot -> Maybe Int
+engineOverheadMicros Nothing = Nothing
 engineOverheadMicros (Just MetricsSnapshot {..}) =
     let ffi = sum (Map.elems snapshotParseFfiMicros)
         decode = sum (Map.elems snapshotParseDecodeMicros)
         candidateBuild = sum [candidateBuildMicros c | c <- Map.elems snapshotFamilies]
-     in ffi + decode + candidateBuild
+     in Just (ffi + decode + candidateBuild)
 
 parseRunParts :: Text -> (Maybe Text, Maybe Text, Maybe Text)
 parseRunParts name =
@@ -166,7 +166,7 @@ summarizeStats name stats =
             , runAccepted = Just (evaluationAcceptedObservations m)
             , runCacheHits = Just (cache_hits stats)
             , runAttemptAuc = Just auc
-            , runEngineOverheadUs = Just overhead
+            , runEngineOverheadUs = overhead
             , runElapsedSeconds = Just elapsed
             , runStatus = evaluationStatusName (status stats)
             }

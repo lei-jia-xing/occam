@@ -79,13 +79,33 @@ sequenceFallbackKey session (NameRef name temporary)
     | length (nameParts name) > 1 = SequenceKey False name
     | otherwise = SequenceKey False (qualifyReferenceName session name)
 
-resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
-resolveRelationKeys session catalog (NameRef name temporary)
-    | temporary = [RelationKey True name]
-    | length (nameParts name) > 1 = [RelationKey False name]
-    | Map.member temporaryKey relations = [temporaryKey]
-    -- A namespace prefix is an exact current database, not an open search
-    -- path: unqualified names must not leak into other databases.
+class ScopedKey k where
+    scopedKey :: Bool -> Name -> k
+    scopedKeyParts :: k -> Maybe (Bool, Name)
+
+instance ScopedKey RelationKey where
+    scopedKey = RelationKey
+    scopedKeyParts (RelationKey temporary name) = Just (temporary, name)
+
+instance ScopedKey SequenceKey where
+    scopedKey = SequenceKey
+    scopedKeyParts (SequenceKey temporary name) = Just (temporary, name)
+
+{- | Shared resolution for catalog namespaces whose keys differ only by a
+phantom wrapper (relations and sequences).
+-}
+resolveNamespacedKeys ::
+    (Ord k, ScopedKey k) =>
+    (Catalog -> Map.Map k v) ->
+    (SessionState -> NameRef -> k) ->
+    SessionState ->
+    Catalog ->
+    NameRef ->
+    [k]
+resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temporary)
+    | temporary = [temporaryKey]
+    | length (nameParts name) > 1 = [scopedKey False name]
+    | Map.member temporaryKey entries = [temporaryKey]
     | not (null prefixKeys) = prefixKeys
     | null (effectiveSearchPath session) =
         case wildcardMatches of
@@ -96,60 +116,32 @@ resolveRelationKeys session catalog (NameRef name temporary)
             Just key -> [key]
             Nothing -> [fallbackKey]
     where
-        relations = catalogRelations catalog
-        temporaryKey = RelationKey True name
-        fallbackKey = relationFallbackKey session (NameRef name temporary)
+        entries = entriesOf catalog
+        temporaryKey = scopedKey True name
+        fallbackKey = fallbackKeyOf session (NameRef name temporary)
         prefixKeys =
             case effectiveNamespacePrefix session of
                 [] -> []
-                prefix -> [RelationKey False (Name (prefix ++ nameParts name))]
+                prefix -> [scopedKey False (Name (prefix ++ nameParts name))]
         searchKeys =
             prefixKeys
-                ++ [ RelationKey False (Name (nameParts entry ++ nameParts name))
+                ++ [ scopedKey False (Name (nameParts entry ++ nameParts name))
                    | entry <- effectiveSearchPath session
                    ]
-                ++ [RelationKey False name]
-        firstExisting = find (`Map.member` relations)
+                ++ [scopedKey False name]
+        firstExisting = find (`Map.member` entries)
         wildcardMatches =
             [ key
-            | key@(RelationKey False stored) <- Map.keys relations
+            | key <- Map.keys entries
+            , Just (False, stored) <- [scopedKeyParts key]
             , nameSuffix name stored
             ]
 
+resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
+resolveRelationKeys = resolveNamespacedKeys catalogRelations relationFallbackKey
+
 resolveSequenceKeys :: SessionState -> Catalog -> NameRef -> [SequenceKey]
-resolveSequenceKeys session catalog (NameRef name temporary)
-    | temporary = [SequenceKey True name]
-    | length (nameParts name) > 1 = [SequenceKey False name]
-    | Map.member temporaryKey sequences = [temporaryKey]
-    | not (null prefixKeys) = prefixKeys
-    | null (effectiveSearchPath session) =
-        case wildcardMatches of
-            [] -> [fallbackKey]
-            matches -> matches
-    | otherwise =
-        case firstExisting searchKeys of
-            Just key -> [key]
-            Nothing -> [fallbackKey]
-    where
-        sequences = catalogSequences catalog
-        temporaryKey = SequenceKey True name
-        fallbackKey = sequenceFallbackKey session (NameRef name temporary)
-        prefixKeys =
-            case effectiveNamespacePrefix session of
-                [] -> []
-                prefix -> [SequenceKey False (Name (prefix ++ nameParts name))]
-        searchKeys =
-            prefixKeys
-                ++ [ SequenceKey False (Name (nameParts entry ++ nameParts name))
-                   | entry <- effectiveSearchPath session
-                   ]
-                ++ [SequenceKey False name]
-        firstExisting = find (`Map.member` sequences)
-        wildcardMatches =
-            [ key
-            | key@(SequenceKey False stored) <- Map.keys sequences
-            , nameSuffix name stored
-            ]
+resolveSequenceKeys = resolveNamespacedKeys catalogSequences sequenceFallbackKey
 
 resolveIndexKeys :: SessionState -> Catalog -> IndexRef -> [IndexKey]
 resolveIndexKeys session catalog indexRef =

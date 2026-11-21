@@ -13,6 +13,7 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
+import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -36,9 +37,9 @@ import Occam.Logger (
     withLogger,
  )
 import Occam.Oracle (
-    OracleConfig (..),
     OracleObservationDetails (..),
     prepareOracle,
+    shellOracleConfig,
     withCandidateWorkdir,
  )
 import Occam.Parser (
@@ -67,6 +68,7 @@ import Occam.Reducer (
     statementDdmin,
  )
 import Occam.UI (
+    FinishSummary (..),
     UI (..),
     UIConfig (..),
     newUI,
@@ -100,13 +102,12 @@ import Options.Applicative (
     (<**>),
  )
 import System.Directory (
-    createDirectoryIfMissing,
     doesFileExist,
-    renameFile,
+    makeAbsolute,
  )
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath (dropExtension, takeDirectory, takeExtension, takeFileName, (</>))
+import System.FilePath (dropExtension, normalise, takeExtension, (</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
@@ -147,6 +148,15 @@ resolveColor ColorNever _ = pure False
 resolveColor ColorAuto isTTY = do
     noColor <- isJust <$> lookupEnv "NO_COLOR"
     pure (isTTY && not noColor)
+
+colorModeName :: ColorMode -> Text
+colorModeName ColorAuto = "auto"
+colorModeName ColorAlways = "always"
+colorModeName ColorNever = "never"
+
+logFormatName :: LogFormat -> Text
+logFormatName FormatText = "text"
+logFormatName FormatJSON = "json"
 
 -- ----------------------------------------------------------------------------
 -- Actions and Options ADTs
@@ -196,6 +206,45 @@ data RawOptions = RawOptions
     , rawDumpFactsFkOn :: !Bool
     }
     deriving (Eq, Show)
+
+{- | Single source of truth for CLI defaults. 'rawInputFile' is only a
+placeholder; every other field is the value used by the parser and printed by
+@--print-defaults@.
+-}
+defaultRawOptions :: RawOptions
+defaultRawOptions =
+    RawOptions
+        { rawInputFile = "INPUT.sql"
+        , rawOracleCmd = Nothing
+        , rawOut = Nothing
+        , rawInPlace = False
+        , rawStatsFile = Nothing
+        , rawResetCmd = Nothing
+        , rawTimeoutSecs = 10.0
+        , rawLogLevel = Default LevelWarn
+        , rawLogFormat = FormatText
+        , rawVerbose = False
+        , rawQuiet = False
+        , rawColor = ColorAuto
+        , rawBudgetSecs = Nothing
+        , rawMaxOracleExecutions = Nothing
+        , rawJobs = 1
+        , rawSlicing = Default True
+        , rawClosure = Default True
+        , rawIntraStatement = Default False
+        , rawColumnMode = Default ColumnOff
+        , rawUnrestricted = Default True
+        , rawCache = Default True
+        , rawDialect = GenericSQL
+        , rawStrategy = Default StrategyFull
+        , rawDumpFacts = False
+        , rawDumpFactsFkOn = False
+        }
+
+-- | Log level used when the format is not explicitly configured as JSON.
+defaultLogLevelForFormat :: LogFormat -> LogLevel
+defaultLogLevelForFormat FormatJSON = LevelInfo
+defaultLogLevelForFormat FormatText = getSpecified (rawLogLevel defaultRawOptions)
 
 data ValidatedOptions = ValidatedOptions
     { valInputFile :: !FilePath
@@ -426,7 +475,7 @@ rawOptionsParser =
             auto
             ( long "timeout"
                 <> metavar "SECONDS"
-                <> value 10.0
+                <> value (rawTimeoutSecs defaultRawOptions)
                 <> help "Per-execution timeout in seconds (default: 10.0)"
             )
         <*> ( ( Explicit
@@ -437,13 +486,13 @@ rawOptionsParser =
                             <> help "Log severity level: debug, info, warn, or error (default: warn)"
                         )
               )
-                <|> pure (Default LevelWarn)
+                <|> pure (rawLogLevel defaultRawOptions)
             )
         <*> option
             (eitherReader parseLogFormat)
             ( long "log-format"
                 <> metavar "FORMAT"
-                <> value FormatText
+                <> value (rawLogFormat defaultRawOptions)
                 <> help "Log output format: text or json (default: text)"
             )
         <*> switch
@@ -459,7 +508,7 @@ rawOptionsParser =
             (eitherReader parseColorMode)
             ( long "color"
                 <> metavar "WHEN"
-                <> value ColorAuto
+                <> value (rawColor defaultRawOptions)
                 <> help "Colorize terminal output: auto, always, or never (default: auto; honors NO_COLOR)"
             )
         <*> optional
@@ -485,21 +534,37 @@ rawOptionsParser =
             ( short 'j'
                 <> long "jobs"
                 <> metavar "N"
-                <> value 1
+                <> value (rawJobs defaultRawOptions)
                 <> help "Maximum concurrent oracle executions (default: 1)"
             )
-        <*> toggleSpecified "slicing" "no-slicing" "dependency slicing" True
-        <*> toggleSpecified "closure" "no-closure" "dependency closure" True
-        <*> toggleSpecified "intra-statement" "no-intra-statement" "intra-statement reductions" False
+        <*> toggleSpecified
+            "slicing"
+            "no-slicing"
+            "dependency slicing"
+            (getSpecified (rawSlicing defaultRawOptions))
+        <*> toggleSpecified
+            "closure"
+            "no-closure"
+            "dependency closure"
+            (getSpecified (rawClosure defaultRawOptions))
+        <*> toggleSpecified
+            "intra-statement"
+            "no-intra-statement"
+            "intra-statement reductions"
+            (getSpecified (rawIntraStatement defaultRawOptions))
         <*> columnModeParser
-        <*> toggleSpecified "unrestricted" "no-unrestricted" "unrestricted fallback search" True
-        <*> toggleSpecified "cache" "no-cache" "candidate caching" True
+        <*> toggleSpecified
+            "unrestricted"
+            "no-unrestricted"
+            "unrestricted fallback search"
+            (getSpecified (rawUnrestricted defaultRawOptions))
+        <*> toggleSpecified "cache" "no-cache" "candidate caching" (getSpecified (rawCache defaultRawOptions))
         <*> option
             (eitherReader parseSQLDialect)
             ( long "dialect"
                 <> short 'd'
                 <> metavar "DIALECT"
-                <> value GenericSQL
+                <> value (rawDialect defaultRawOptions)
                 <> help
                     "SQL dependency dialect: generic (default), postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
             )
@@ -527,7 +592,7 @@ strategyParser =
             <> metavar "STRATEGY"
             <> help "Reduction strategy: full (default), ddmin-only, or audit-only"
         )
-        <|> pure (Default StrategyFull)
+        <|> pure (rawStrategy defaultRawOptions)
 
 columnModeParser :: Parser (Specified ColumnMode)
 columnModeParser =
@@ -537,7 +602,7 @@ columnModeParser =
             <> metavar "MODE"
             <> help "Column co-reduction mode: off (default), single, or atomic (requires --intra-statement)"
         )
-        <|> pure (Default ColumnOff)
+        <|> pure (rawColumnMode defaultRawOptions)
 
 parseLogLevel :: String -> Either String LogLevel
 parseLogLevel s = case map toLower s of
@@ -622,31 +687,42 @@ writeAtomicFile :: FilePath -> BS.ByteString -> IO ()
 writeAtomicFile "-" content = do
     BS.putStr content
     hFlush stdout
-writeAtomicFile path content
-    | isSpecialDevice path = BS.writeFile path content
-    | otherwise = do
-        now <- getMonotonicTimeNSec
-        let dir = takeDirectory path
-            filename = takeFileName path
-            tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
-        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-        BS.writeFile tmpPath content
-        renameFile tmpPath path
+writeAtomicFile path content = writeAtomicBytes path content
 
 writeAtomicLazy :: FilePath -> BSL.ByteString -> IO ()
-writeAtomicLazy path content
-    | isSpecialDevice path = BSL.writeFile path content
-    | otherwise = do
-        now <- getMonotonicTimeNSec
-        let dir = takeDirectory path
-            filename = takeFileName path
-            tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
-        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-        BSL.writeFile tmpPath content
-        renameFile tmpPath path
+writeAtomicLazy "-" content = do
+    BSL.putStr content
+    hFlush stdout
+writeAtomicLazy path content = writeAtomicLazyBytes path content
 
-isSpecialDevice :: FilePath -> Bool
-isSpecialDevice path = path `elem` ["/dev/null", "/dev/stdout", "/dev/stderr"]
+{- | Refuse output paths that would overwrite each other, the input, or the
+in-place backup.
+-}
+validateOutputPaths :: FilePath -> FilePath -> Bool -> Bool -> Maybe FilePath -> IO ()
+validateOutputPaths input target writesStdout inPlace statsFile =
+    forM_ statsFile \stats -> do
+        when (stats == "-" && writesStdout) $ do
+            hPutStrLn stderr "error: --stats - cannot be combined with writing reduced SQL to stdout"
+            exitCliError
+        unless (stats == "-") $ do
+            statsAbs <- absoluteNormalized stats
+            when (input /= "-") $ do
+                inputAbs <- absoluteNormalized input
+                when (statsAbs == inputAbs) $ do
+                    hPutStrLn stderr "error: --stats path must differ from the input path"
+                    exitCliError
+                when inPlace $ do
+                    backupAbs <- absoluteNormalized (input ++ ".bak")
+                    when (statsAbs == backupAbs) $ do
+                        hPutStrLn stderr "error: --stats path must differ from the in-place backup path"
+                        exitCliError
+            unless (null target) $ do
+                targetAbs <- absoluteNormalized target
+                when (statsAbs == targetAbs) $ do
+                    hPutStrLn stderr "error: --stats path must differ from the output path"
+                    exitCliError
+    where
+        absoluteNormalized path = normalise <$> makeAbsolute path
 
 -- ----------------------------------------------------------------------------
 -- Main
@@ -678,21 +754,23 @@ runAction ActionListStrategies = do
     putStrLn "  audit-only    Statement deletion audit only"
     exitSuccess
 runAction ActionPrintDefaults = do
-    let defaults =
+    let opts = defaultRawOptions
+        defaults =
             object
-                [ "timeout" .= (10.0 :: Double)
-                , "jobs" .= (1 :: Int)
-                , "dialect" .= ("generic" :: Text)
-                , "strategy" .= ("full" :: Text)
-                , "column_mode" .= ("off" :: Text)
-                , "slicing" .= True
-                , "closure" .= True
-                , "intra_statement" .= False
-                , "unrestricted" .= True
-                , "cache" .= True
-                , "log_level" .= ("warn" :: Text)
-                , "log_format" .= ("text" :: Text)
-                , "color" .= ("auto" :: Text)
+                [ "timeout" .= rawTimeoutSecs opts
+                , "jobs" .= rawJobs opts
+                , "dialect" .= dialectName (rawDialect opts)
+                , "strategy" .= strategyName (getSpecified (rawStrategy opts))
+                , "column_mode" .= columnModeName (getSpecified (rawColumnMode opts))
+                , "slicing" .= getSpecified (rawSlicing opts)
+                , "closure" .= getSpecified (rawClosure opts)
+                , "intra_statement" .= getSpecified (rawIntraStatement opts)
+                , "unrestricted" .= getSpecified (rawUnrestricted opts)
+                , "cache" .= getSpecified (rawCache opts)
+                , "log_level" .= getSpecified (rawLogLevel opts)
+                , "log_level_json" .= defaultLogLevelForFormat FormatJSON
+                , "log_format" .= logFormatName (rawLogFormat opts)
+                , "color" .= colorModeName (rawColor opts)
                 ]
     BSL.putStr (encode defaults <> "\n")
     exitSuccess
@@ -768,12 +846,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 }
 
     let baseOracleConfig =
-            OracleConfig
-                { oracleCommand = "sh"
-                , oracleArgs = ["-c", oracleCmd]
-                , oracleTimeoutMicros = round (valTimeoutSecs * 1000000)
-                , oracleResetCommand = valResetCmd
-                }
+            shellOracleConfig oracleCmd (round (valTimeoutSecs * 1000000)) valResetCmd
         reductionConfig =
             defaultReductionConfig
                 { reductionSlicing = valSlicing
@@ -868,6 +941,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                     | otherwise -> pure (defaultMinPath valInputFile)
 
     let statsPath = fromMaybe "" valStatsFile
+
+    validateOutputPaths valInputFile targetMinimalPath writeToStdout valInPlace valStatsFile
 
     metricsPolicy <- case valStrategy of
         StrategyFull -> case metricPolicyForReduction reductionConfig valJobs of
@@ -996,13 +1071,15 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
 
     uiFinish
         ui
-        evaluation
-        initialBytes
-        reducedBytes
-        initialStmts
-        reducedStmts
-        targetMinimalPath
-        statsPath
+        FinishSummary
+            { finishMetrics = evaluation
+            , finishInitialBytes = initialBytes
+            , finishReducedBytes = reducedBytes
+            , finishInitialStmts = initialStmts
+            , finishReducedStmts = reducedStmts
+            , finishMinimalPath = targetMinimalPath
+            , finishStatsPath = statsPath
+            }
     case evaluationStatus evaluation of
         EvaluationCompleted
             | evaluationValidationPassed evaluation -> exitSuccess

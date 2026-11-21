@@ -25,7 +25,7 @@ microbench:
 	cabal bench --benchmark-options="-p 'parse || dag || surgery || cache' --stdev 20 --timeout 5s"
 
 bench-product:
-	cabal bench --benchmark-options="-p product-path --stdev 20 --timeout 5s"
+	cabal bench --benchmark-options="-p reduction-audit-validation --stdev 20 --timeout 5s"
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \

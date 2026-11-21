@@ -2,12 +2,9 @@ module Main (main) where
 
 import Control.Exception (IOException, catch)
 import Control.Monad (forM_, unless)
-import Data.Aeson (encode, toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.ByteString.Lazy qualified as BSL
-import Data.Either (fromRight)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -27,13 +24,6 @@ import Occam.Core (
     StatementId (..),
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
-import Occam.Evaluation (
-    EvaluationConfig (..),
-    EvaluationMetrics (..),
-    EvaluationStatus (..),
-    MinimalityClaim (..),
-    Stats (..),
- )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Logger (nullLogger)
 import Occam.Metrics (ParseKind (..))
@@ -43,7 +33,6 @@ import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
     SQLDialect (..),
-    countStatements,
     defaultParseOptions,
     parseSQLTimed,
  )
@@ -215,10 +204,13 @@ checkCount expected parsed =
      in unless (actual == expected) $
             die ("occam-bench: expected " ++ show expected ++ " statements, parsed " ++ show actual)
 
--- | True end-to-end product execution: evaluated reduction + evidence + audit + final validation + stats serialization.
-runEvaluatedProductPath :: SqliteContract -> ByteString -> IO (ByteString, BSL.ByteString)
-runEvaluatedProductPath contract sql = do
-    initCount <- fromRight 0 <$> countStatements SQLite sql
+{- | In-process reduction path: evidence reduction, statement audit, and final
+validation against the SQLite contract. This deliberately bypasses the external
+oracle/evaluation wrapper, so it is not a full product-path benchmark; the name
+and result type make that boundary explicit.
+-}
+runInProcessReductionPath :: SqliteContract -> ByteString -> IO ByteString
+runInProcessReductionPath contract sql = do
     reduced <-
         withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool -> do
             ReductionResult reducedSql _evidence <-
@@ -233,92 +225,7 @@ runEvaluatedProductPath contract sql = do
     valRes <- sqliteContractOracle contract reduced
     unless (valRes == OracleAccepted) $
         die "Final validation failed"
-    finalCount <- fromRight 0 <$> countStatements SQLite reduced
-    let stats =
-            Stats
-                { initial_bytes = BS.length sql
-                , reduced_bytes = BS.length reduced
-                , reduction_ratio = fromIntegral (BS.length reduced) / max 1.0 (fromIntegral (BS.length sql))
-                , initial_statements = initCount
-                , reduced_statements = finalCount
-                , oracle_executions = 0
-                , oracle_attempts = 0
-                , initial_oracle_observations = 1
-                , cache_hits = 0
-                , cache_misses = 0
-                , cache_joins = 0
-                , cache_hit_ratio = 0.0
-                , cancelled_observations = 0
-                , status = EvaluationCompleted
-                , reduction_settings = toJSON (Map.empty :: Map.Map String String)
-                , evaluation_budget =
-                    EvaluationConfig
-                        { evaluationCacheEnabled = True
-                        , evaluationJobs = 1
-                        , evaluationTotalTimeoutMicros = Nothing
-                        , evaluationMaxOracleExecutions = Nothing
-                        , evaluationPreflightMicros = 0
-                        , evaluationPreflightAttempts = 0
-                        , evaluationPreflightResetMicros = Nothing
-                        , evaluationPreflightOracleMicros = Nothing
-                        , evaluationInitialStatements = Just initCount
-                        }
-                , evaluation_metrics =
-                    EvaluationMetrics
-                        { evaluationStatus = EvaluationCompleted
-                        , evaluationFailure = Nothing
-                        , evaluationCacheUsed = True
-                        , evaluationBudget =
-                            EvaluationConfig
-                                { evaluationCacheEnabled = True
-                                , evaluationJobs = 1
-                                , evaluationTotalTimeoutMicros = Nothing
-                                , evaluationMaxOracleExecutions = Nothing
-                                , evaluationPreflightMicros = 0
-                                , evaluationPreflightAttempts = 0
-                                , evaluationPreflightResetMicros = Nothing
-                                , evaluationPreflightOracleMicros = Nothing
-                                , evaluationInitialStatements = Just initCount
-                                }
-                        , evaluationTotalSeconds = 0.0
-                        , evaluationReductionSeconds = 0.0
-                        , evaluationOracleSeconds = 0.0
-                        , evaluationResetSeconds = 0.0
-                        , evaluationPreflightResetSeconds = Nothing
-                        , evaluationPreflightOracleSeconds = Nothing
-                        , evaluationOracleAttempts = 0
-                        , evaluationDatabaseObservations = 0
-                        , evaluationCompletedOracleProcesses = 0
-                        , evaluationAcceptedObservations = 0
-                        , evaluationRejectedObservations = 0
-                        , evaluationTimedOutObservations = 0
-                        , evaluationResetFailures = 0
-                        , evaluationOracleErrors = 0
-                        , evaluationCancelledObservations = 0
-                        , evaluationOracleOutcomes = Map.empty
-                        , evaluationCacheHits = 0
-                        , evaluationCacheMisses = 0
-                        , evaluationCacheJoins = 0
-                        , evaluationValidationSeconds = 0.0
-                        , evaluationValidationOracleSeconds = 0.0
-                        , evaluationValidationResetSeconds = 0.0
-                        , evaluationValidationObservations = 1
-                        , evaluationValidationDatabaseObservations = 1
-                        , evaluationValidationErrors = 0
-                        , evaluationValidationOutcomes = Map.empty
-                        , evaluationValidationPassed = True
-                        , evaluationAuditSeconds = 0.0
-                        , evaluationAuditChecks = 0
-                        , evaluationAuditCompleted = True
-                        , evaluationMinimalityClaim = StatementDeletionOneMinimal
-                        , evaluationCurve = []
-                        , evaluationStages = []
-                        , evaluationCostAttribution = Nothing
-                        }
-                , initial_oracle_seconds = 0.0
-                , elapsed_seconds = 0.0
-                }
-    pure (reduced, encode stats)
+    pure reduced
 
 main :: IO ()
 main = do
@@ -418,10 +325,10 @@ main = do
             ]
         , bgroup
             "cache"
-            [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled Map.empty candidateKey)
+            [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled candidateKey)
             , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
                 bench "miss" $
-                    whnfIO (cacheLookup cache CacheEnabled Map.empty nonExistentKey)
+                    whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
             ]
         , bgroup
             "reduction"
@@ -475,8 +382,8 @@ main = do
                 ]
             ]
         , bgroup
-            "product-path"
-            [ bench name $ whnfIO (runEvaluatedProductPath contract sql)
+            "reduction-audit-validation"
+            [ bench name $ whnfIO (runInProcessReductionPath contract sql)
             | (name, sql, contract) <- loadedCorpus
             ]
         ]

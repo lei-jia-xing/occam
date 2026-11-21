@@ -1,6 +1,7 @@
 module Occam.UI (
     UIConfig (..),
     UI (..),
+    FinishSummary (..),
     newUI,
     formatSize,
     formatRatio,
@@ -66,12 +67,25 @@ data ProgressInfo = ProgressInfo
 data NonTTYState = NonTTYState
     { ntPhase :: !Text
     , ntStmts :: !Int
-    , _ntBytes :: !Int
+    , ntBytes :: !Int
+    }
+
+{- | Everything the final summary needs. Keeping this a record avoids a
+seven-positional-argument call at the CLI boundary.
+-}
+data FinishSummary = FinishSummary
+    { finishMetrics :: !EvaluationMetrics
+    , finishInitialBytes :: !Int
+    , finishReducedBytes :: !Int
+    , finishInitialStmts :: !Int
+    , finishReducedStmts :: !Int
+    , finishMinimalPath :: !FilePath
+    , finishStatsPath :: !FilePath
     }
 
 data UI = UI
     { uiOnProgress :: !(EvaluationProgress -> IO ())
-    , uiFinish :: !(EvaluationMetrics -> Int -> Int -> Int -> Int -> FilePath -> FilePath -> IO ())
+    , uiFinish :: !(FinishSummary -> IO ())
     }
 
 -- | Format byte counts into human-readable units (e.g. "271 B", "1.3 KB", "4.2 MB").
@@ -139,7 +153,7 @@ newUI UIConfig {..} = do
             pure
                 UI
                     { uiOnProgress = const (pure ())
-                    , uiFinish = \_ _ _ _ _ _ _ -> pure ()
+                    , uiFinish = const (pure ())
                     }
         else
             if isTTY
@@ -261,9 +275,9 @@ newUI UIConfig {..} = do
                                                 }
                                     )
 
-                        finish metrics initBytes redBytes initStmts redStmts minPath stPath = do
+                        finish summary = do
                             updateProgress pb (\p -> p {progressDone = progressTodo p})
-                            printSummary useColor metrics initBytes redBytes initStmts redStmts minPath stPath
+                            printSummary useColor summary
 
                     pure UI {uiOnProgress = handleProgress, uiFinish = finish}
                 else do
@@ -287,7 +301,7 @@ newUI UIConfig {..} = do
                             NonTTYState
                                 { ntPhase = "slicing"
                                 , ntStmts = uiInitialStmts
-                                , _ntBytes = uiInitialBytes
+                                , ntBytes = uiInitialBytes
                                 }
 
                     let handleProgress = \case
@@ -296,11 +310,11 @@ newUI UIConfig {..} = do
                             ProgressCandidateTested {} ->
                                 pure ()
                             ProgressCandidateAccepted newBytes mNewStmts -> do
-                                oldBytes <- _ntBytes <$> readIORef stateRef
+                                oldBytes <- ntBytes <$> readIORef stateRef
                                 when (newBytes < oldBytes) do
                                     oldStmts <- ntStmts <$> readIORef stateRef
                                     let newStmts = fromMaybe oldStmts mNewStmts
-                                    modifyIORef' stateRef (\s -> s {ntStmts = newStmts, _ntBytes = newBytes})
+                                    modifyIORef' stateRef (\s -> s {ntStmts = newStmts, ntBytes = newBytes})
                                     phase <- ntPhase <$> readIORef stateRef
                                     hPutStrLn
                                         stderr
@@ -318,10 +332,16 @@ newUI UIConfig {..} = do
 
                     pure UI {uiOnProgress = handleProgress, uiFinish = finish}
 
-printSummary ::
-    Bool -> EvaluationMetrics -> Int -> Int -> Int -> Int -> FilePath -> FilePath -> IO ()
-printSummary useColor metrics initBytes redBytes initStmts redStmts minimalPath statsPath = do
-    let stmtPct =
+printSummary :: Bool -> FinishSummary -> IO ()
+printSummary useColor summary = do
+    let metrics = finishMetrics summary
+        initBytes = finishInitialBytes summary
+        redBytes = finishReducedBytes summary
+        initStmts = finishInitialStmts summary
+        redStmts = finishReducedStmts summary
+        minimalPath = finishMinimalPath summary
+        statsPath = finishStatsPath summary
+        stmtPct =
             if initStmts > 0
                 then (1.0 - (fromIntegral redStmts / fromIntegral initStmts :: Double)) * 100.0
                 else 0.0

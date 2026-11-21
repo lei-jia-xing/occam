@@ -10,8 +10,10 @@ module Occam.Dependency.Enforcement (
     cascadeWrites,
 ) where
 
+import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -32,6 +34,7 @@ import Occam.Core (
     NameRef (..),
     ReferentialAction (..),
     RenameOp (..),
+    SearchPathEntry (..),
     SemanticFacts (..),
     SessionEffect (..),
     SessionInit (..),
@@ -44,16 +47,56 @@ import Occam.Core (
  )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
--- | Temp flag plus lowercased last name component.
-data TableKey = TableKey !Bool !Text
+-- | Temp flag plus lowercased qualified name components.
+data TableKey = TableKey !Bool ![Text]
     deriving (Eq, Ord, Show)
 
 tableKeyOf :: NameRef -> TableKey
-tableKeyOf ref = TableKey (nameRefTemp ref) (lastComponent (nameRefName ref))
+tableKeyOf (NameRef (Name parts) temporary) =
+    TableKey temporary (map lowerPart parts)
     where
-        lastComponent (Name parts) = case parts of
-            [] -> T.empty
-            _ -> T.toLower (identText (last parts))
+        lowerPart = T.toLower . identText
+
+{- | Resolve a reference against the accumulated catalog. Qualified names are
+exact; unqualified names follow the namespace prefix, search path, and finally
+a unique suffix match. This keeps schema-qualified tables distinct while still
+matching the common unqualified FK references.
+-}
+resolveTableKey :: SessionInit -> Map TableKey TableInfo -> NameRef -> Maybe TableKey
+resolveTableKey initial catalog ref
+    | Map.member direct catalog = Just direct
+    | nameRefTemp ref = Nothing
+    | length parts > 1 = Nothing
+    | otherwise = firstExisting `orElse` uniqueSuffix
+    where
+        direct = tableKeyOf ref
+        parts = nameParts (nameRefName ref)
+        lowerParts = map (T.toLower . identText) parts
+        namespaceKeys =
+            [ TableKey False (map (T.toLower . identText) (sessionNamespacePrefix initial) ++ lowerParts)
+            | not (null (sessionNamespacePrefix initial))
+            ]
+        searchPathKeys =
+            [ TableKey False (pathParts ++ lowerParts)
+            | entry <- sessionSearchPath initial
+            , pathParts <- case entry of
+                SearchPathName (Name prefix) -> [map (T.toLower . identText) prefix]
+                SearchPathCurrentUser -> maybe [] (\user -> [[T.toLower (identText user)]]) (sessionCurrentUser initial)
+            ]
+        searchKeys = namespaceKeys ++ searchPathKeys ++ [direct]
+        firstExisting = find (`Map.member` catalog) searchKeys
+        uniqueSuffix
+            | null lowerParts = Nothing
+            | otherwise =
+                case [ key
+                     | key@(TableKey False stored) <- Map.keys catalog
+                     , not (null stored)
+                     , last stored == last lowerParts
+                     ] of
+                    [key] -> Just key
+                    _ -> Nothing
+        orElse (Just key) _ = Just key
+        orElse Nothing fallback = fallback
 
 lowerIdent :: Ident -> Text
 lowerIdent = T.toLower . identText
@@ -90,9 +133,9 @@ cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
                     Nothing -> ([], [])
                     Just facts -> let semantics = factSemantics facts in (factOps semantics, factSession semantics)
                 extras
-                    | enforced = concatMap (expand catalog) ops
+                    | enforced = concatMap (expand initial catalog) ops
                     | otherwise = []
-                catalog' = foldl' applyOp catalog ops
+                catalog' = foldl' (applyOp initial) catalog ops
                 enforced' = foldl' (applySession (sessionForeignKeyChecks initial)) enforced effects
                 tailMap = go enforced' catalog' rest
              in if null extras then tailMap else Map.insert sid extras tailMap
@@ -105,34 +148,35 @@ applySession initial current effect = case effect of
     ResetAll ScopeSession -> initial
     _ -> current
 
-applyOp :: Map TableKey TableInfo -> CatalogOp -> Map TableKey TableInfo
-applyOp catalog op = case op of
+applyOp :: SessionInit -> Map TableKey TableInfo -> CatalogOp -> Map TableKey TableInfo
+applyOp initial catalog op = case op of
     DefineTableOp def ->
         let info = collectTable def
          in Map.insert (tableKeyOf (infoRef info)) info catalog
     AlterTableOp alter ->
-        foldl' (applyChange (alterTableTarget alter)) catalog (alterTableChanges alter)
-    DropCatalogOp dropOp -> foldl' applyDrop catalog (dropObjects dropOp)
-    RenameOp rename -> applyRename rename catalog
+        foldl' (applyChange initial (alterTableTarget alter)) catalog (alterTableChanges alter)
+    DropCatalogOp dropOp -> foldl' (applyDrop initial) catalog (dropObjects dropOp)
+    RenameOp rename -> applyRename initial rename catalog
     _ -> catalog
 
-ensureTable :: NameRef -> Map TableKey TableInfo -> Map TableKey TableInfo
-ensureTable ref catalog =
-    let key = tableKeyOf ref
+ensureTable :: SessionInit -> NameRef -> Map TableKey TableInfo -> Map TableKey TableInfo
+ensureTable initial ref catalog =
+    let key = fromMaybe (tableKeyOf ref) (resolveTableKey initial catalog ref)
      in if Map.member key catalog then catalog else Map.insert key (TableInfo ref [] []) catalog
 
-applyChange :: NameRef -> Map TableKey TableInfo -> AlterChange -> Map TableKey TableInfo
-applyChange target catalog change = case change of
+applyChange ::
+    SessionInit -> NameRef -> Map TableKey TableInfo -> AlterChange -> Map TableKey TableInfo
+applyChange initial target catalog change = case change of
     AddConstraint (ForeignKeyConstraint foreignKey) ->
-        Map.adjust appendFK key (ensureTable target catalog)
+        Map.adjust appendFK key (ensureTable initial target catalog)
         where
             appendFK info = info {infoFKs = infoFKs info ++ [foreignKey]}
     AddConstraint (PrimaryKeyConstraint _ columns) ->
-        Map.adjust appendPK key (ensureTable target catalog)
+        Map.adjust appendPK key (ensureTable initial target catalog)
         where
             appendPK info = info {infoPK = infoPK info ++ map lowerIdent columns}
     AddColumn column extras ->
-        Map.adjust appendBoth key (ensureTable target catalog)
+        Map.adjust appendBoth key (ensureTable initial target catalog)
         where
             appendBoth info =
                 info
@@ -153,26 +197,34 @@ applyChange target catalog change = case change of
                 info {infoFKs = [foreignKey | foreignKey <- infoFKs info, foreignKeyName foreignKey /= Just name]}
     _ -> catalog
     where
-        key = tableKeyOf target
+        key = fromMaybe (tableKeyOf target) (resolveTableKey initial catalog target)
 
-applyDrop :: Map TableKey TableInfo -> DropObject -> Map TableKey TableInfo
-applyDrop catalog (DropRelation ref _) = Map.delete (tableKeyOf ref) catalog
-applyDrop catalog _ = catalog
-
-applyRename :: RenameOp -> Map TableKey TableInfo -> Map TableKey TableInfo
-applyRename (RenameRelation old new _) catalog =
-    case Map.lookup oldKey catalog of
+applyDrop :: SessionInit -> Map TableKey TableInfo -> DropObject -> Map TableKey TableInfo
+applyDrop initial catalog (DropRelation ref _) =
+    case resolveTableKey initial catalog ref of
+        Just key -> Map.delete key catalog
         Nothing -> catalog
-        Just info ->
-            Map.insert newKey (info {infoRef = NameRef new (nameRefTemp old)}) (Map.delete oldKey catalog)
-    where
-        oldKey = tableKeyOf old
-        newKey = tableKeyOf (NameRef new (nameRefTemp old))
-applyRename (RenameColumnOp target old new) catalog = renameColumn (tableKeyOf target) old new catalog
+applyDrop _ catalog _ = catalog
 
-renameColumn :: TableKey -> Ident -> Ident -> Map TableKey TableInfo -> Map TableKey TableInfo
-renameColumn target old new = Map.mapWithKey fix
+applyRename :: SessionInit -> RenameOp -> Map TableKey TableInfo -> Map TableKey TableInfo
+applyRename initial (RenameRelation old new _) catalog =
+    case resolveTableKey initial catalog old of
+        Nothing -> catalog
+        Just oldKey ->
+            case Map.lookup oldKey catalog of
+                Nothing -> catalog
+                Just info ->
+                    Map.insert newKey (info {infoRef = NameRef new (nameRefTemp old)}) (Map.delete oldKey catalog)
     where
+        newKey = tableKeyOf (NameRef new (nameRefTemp old))
+applyRename initial (RenameColumnOp target old new) catalog =
+    renameColumn initial target old new catalog
+
+renameColumn ::
+    SessionInit -> NameRef -> Ident -> Ident -> Map TableKey TableInfo -> Map TableKey TableInfo
+renameColumn initial targetRef old new catalog = Map.mapWithKey fix catalog
+    where
+        target = fromMaybe (tableKeyOf targetRef) (resolveTableKey initial catalog targetRef)
         oldLower = lowerIdent old
         fix key info
             | key == target =
@@ -186,7 +238,7 @@ renameColumn target old new = Map.mapWithKey fix
             | otherwise =
                 info
                     { infoFKs =
-                        [ if tableKeyOf (foreignKeyParent foreignKey) == target
+                        [ if resolveTableKey initial catalog (foreignKeyParent foreignKey) == Just target
                             then foreignKey {foreignKeyParentColumns = renameIdents (foreignKeyParentColumns foreignKey)}
                             else foreignKey
                         | foreignKey <- infoFKs info
@@ -195,21 +247,24 @@ renameColumn target old new = Map.mapWithKey fix
         renameLowered = map (\column -> if column == oldLower then lowerIdent new else column)
         renameIdents = map (\column -> if lowerIdent column == oldLower then new else column)
 
-expand :: Map TableKey TableInfo -> CatalogOp -> [DataWrite]
-expand catalog (WriteDataOp write) = expandWrite catalog write
-expand _ _ = []
+expand :: SessionInit -> Map TableKey TableInfo -> CatalogOp -> [DataWrite]
+expand initial catalog (WriteDataOp write) = expandWrite initial catalog write
+expand _ _ _ = []
 
--- | Breadth-first fan-out; visited guard is per (table, write flavor).
-expandWrite :: Map TableKey TableInfo -> DataWrite -> [DataWrite]
-expandWrite catalog write = case dataWriteKind write of
+-- | Breadth-first fan-out; visited guard is per (table, write flavor, columns).
+expandWrite :: SessionInit -> Map TableKey TableInfo -> DataWrite -> [DataWrite]
+expandWrite initial catalog write = case dataWriteKind write of
     DeleteWrite _ -> bfs Set.empty [(keyOfTarget, True, [])]
     UpdateWrite _ -> bfs Set.empty [(keyOfTarget, False, writeColumns)]
     _ -> []
     where
-        keyOfTarget = tableKeyOf (dataWriteTarget write)
+        keyOfTarget =
+            fromMaybe
+                (tableKeyOf (dataWriteTarget write))
+                (resolveTableKey initial catalog (dataWriteTarget write))
         writeColumns = map lowerIdent (dataWriteColumns write ++ dataWriteUnqualifiedColumns write)
 
-        bfs :: Set (TableKey, Bool) -> [(TableKey, Bool, [Text])] -> [DataWrite]
+        bfs :: Set (TableKey, Bool, Set Text) -> [(TableKey, Bool, [Text])] -> [DataWrite]
         bfs _ [] = []
         bfs visited ((key, isDelete, columns) : rest)
             | Set.member guard visited = bfs visited rest
@@ -225,7 +280,7 @@ expandWrite catalog write = case dataWriteKind write of
                         ]
                  in writes ++ bfs (Set.insert guard visited) (rest ++ queued)
             where
-                guard = (key, isDelete)
+                guard = (key, isDelete, Set.fromList columns)
 
         childWrite :: NameRef -> Bool -> [Ident] -> DataWrite
         childWrite ref True _ = DataWrite ref (DeleteWrite DeleteAllRows) [] [] [] False
@@ -236,7 +291,7 @@ expandWrite catalog write = case dataWriteKind write of
             [ (childKey, infoRef info, childIsDelete, foreignKeyChildColumns foreignKey)
             | (childKey, info) <- Map.toList catalog
             , foreignKey <- infoFKs info
-            , tableKeyOf (foreignKeyParent foreignKey) == parentKey
+            , resolveTableKey initial catalog (foreignKeyParent foreignKey) == Just parentKey
             , Just childIsDelete <- [matchAction foreignKey]
             ]
             where

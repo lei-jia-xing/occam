@@ -29,6 +29,7 @@ import Occam.Core (
     DropMode (..),
     ForeignKey (..),
     Ident (..),
+    NameRef (..),
     PartitionLink (..),
     ReadMode (..),
     RelationKind (..),
@@ -37,6 +38,7 @@ import Occam.Core (
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Drop (removeRelationCascade)
 import Occam.Dependency.Query (
+    constraintColumnsOf,
     installConstraints,
     referencedParentColumns,
     relationAllDeps,
@@ -75,16 +77,6 @@ import Occam.Dependency.State (
  )
 
 -- Constraint columns
-constraintColumnsOf :: Constraint -> [Ident]
-constraintColumnsOf constraint =
-    case constraint of
-        PrimaryKeyConstraint _ columns -> columns
-        UniqueConstraint _ columns -> columns
-        ForeignKeyConstraint foreignKey -> foreignKeyChildColumns foreignKey
-        CheckConstraint _ columns _ -> columns
-        IndexConstraint _ columns _ -> columns
-        UsingIndexConstraint {} -> []
-        OtherConstraint _ -> []
 
 -- ALTER TABLE
 introducedForeignKeysOf :: AlterChange -> [ForeignKey]
@@ -236,69 +228,34 @@ processDetachPartition :: StatementId -> Eval -> PartitionLink -> Eval
 processDetachPartition sid eval link = attachDetachPartition sid eval link False
 
 attachDetachPartition :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
-attachDetachPartition sid eval link isAttach =
-    let session = evalSession eval
-        catalog = evalCatalog eval
-        existing reference =
-            filter
-                (`Map.member` catalogRelations catalog)
-                (resolveRelationKeys session catalog reference)
-        pairs =
-            [ (parentKey, childKey)
-            | parentKey <- existing (linkParent link)
-            , childKey <- existing (linkChild link)
-            ]
-        step current (parentKey, childKey) =
-            let currentCatalog = evalCatalog current
-                child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
-                parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
-                deps =
-                    relationDefinitionDeps currentCatalog parentKey
-                        `Set.union` relationDefinitionDeps currentCatalog childKey
-                current1 =
-                    addTouches
-                        (relationTouchKeys parentKey ++ relationTouchKeys childKey)
-                        (addDeps deps current)
-                child1 =
-                    child
-                        { relPartitionParents =
-                            if isAttach
-                                then Set.insert (linkParent link) (relPartitionParents child)
-                                else
-                                    Set.filter
-                                        ( \reference ->
-                                            parentKey
-                                                `notElem` resolveRelationKeys session currentCatalog reference
-                                        )
-                                        (relPartitionParents child)
-                        }
-                parent1 = parent & relSchemaWritesL %~ Set.insert sid
-                catalog1 =
-                    insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
-             in current1 & evalCatalogL .~ catalog1
-     in mutateResolved step eval pairs
+attachDetachPartition =
+    attachDetachLink relPartitionParents (\relation links -> relation {relPartitionParents = links})
 
-{- | `ALTER TABLE child INHERIT parent`: add `parent` to the child's
-inheritance set. Mirror of `attachDetachPartition` with the set swapped:
-the link lands in `relInheritParents`, so parent reads and non-`INSERT`
-parent writes fan out to the child while `INSERT` stays parent-only,
-exactly like `INHERITS`. Filing it as a partition link would route
-`INSERT` by key into the child (over-approx).
+{- | `ALTER TABLE child INHERIT parent` and `NO INHERIT`: the inheritance
+link set mirrors partition routing but keeps `INSERT` parent-only.
 -}
 processAttachInherit :: StatementId -> Eval -> PartitionLink -> Eval
 processAttachInherit sid eval link = attachDetachInherit sid eval link True
 
-{- | `ALTER TABLE child NO INHERIT parent`: remove `parent` from the child's
-inheritance set. `INHERITS`-origin links live in the same set, so they are
-removed too; a partition detach would filter the other set and no-op.
-Earlier statements keep their snapshot edges; later parent reads exclude
-the child but depend on the detach through the parent schema write.
--}
 processDetachInherit :: StatementId -> Eval -> PartitionLink -> Eval
 processDetachInherit sid eval link = attachDetachInherit sid eval link False
 
 attachDetachInherit :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
-attachDetachInherit sid eval link isAttach =
+attachDetachInherit =
+    attachDetachLink relInheritParents (\relation links -> relation {relInheritParents = links})
+
+{- | Shared attach/detach engine for partition and inheritance links. The two
+callers differ only in which link set they read and write.
+-}
+attachDetachLink ::
+    (RelationState -> Set NameRef) ->
+    (RelationState -> Set NameRef -> RelationState) ->
+    StatementId ->
+    Eval ->
+    PartitionLink ->
+    Bool ->
+    Eval
+attachDetachLink getLinks setLinks sid eval link isAttach =
     let session = evalSession eval
         catalog = evalCatalog eval
         existing reference =
@@ -321,22 +278,22 @@ attachDetachInherit sid eval link isAttach =
                     addTouches
                         (relationTouchKeys parentKey ++ relationTouchKeys childKey)
                         (addDeps deps current)
-                child1 =
-                    child
-                        { relInheritParents =
-                            if isAttach
-                                then Set.insert (linkParent link) (relInheritParents child)
-                                else
-                                    Set.filter
-                                        ( \reference ->
-                                            parentKey
-                                                `notElem` resolveRelationKeys session currentCatalog reference
-                                        )
-                                        (relInheritParents child)
-                        }
+                updatedLinks =
+                    if isAttach
+                        then Set.insert (linkParent link) (getLinks child)
+                        else
+                            Set.filter
+                                ( \reference ->
+                                    parentKey
+                                        `notElem` resolveRelationKeys session currentCatalog reference
+                                )
+                                (getLinks child)
                 parent1 = parent & relSchemaWritesL %~ Set.insert sid
                 catalog1 =
-                    insertRelation childKey child1 (insertRelation parentKey parent1 currentCatalog)
+                    insertRelation
+                        childKey
+                        (setLinks child updatedLinks)
+                        (insertRelation parentKey parent1 currentCatalog)
              in current1 & evalCatalogL .~ catalog1
      in mutateResolved step eval pairs
 
@@ -559,7 +516,7 @@ applyAlterChange session sid key (catalog, relation) change =
             let indexKeys =
                     [ indexKey
                     | indexKey <- Set.toList (relIndexes relation)
-                    , indexKeyName indexKey == name
+                    , indexKeyName indexKey == Just name
                     ]
                 catalog1 = foldl' (flip deleteIndex) catalog indexKeys
              in ( catalog1
@@ -599,9 +556,8 @@ validateConstraintValue constraint =
             CheckConstraint name columns ConstraintValid
         other -> other
 
-indexKeyName :: IndexKey -> Ident
+indexKeyName :: IndexKey -> Maybe Ident
 indexKeyName indexKey =
     case indexKey of
-        NamedIndexKey name ->
-            fromMaybe (Ident "") (nameLast name)
-        TableIndexKey _ name -> name
+        NamedIndexKey name -> nameLast name
+        TableIndexKey _ name -> Just name

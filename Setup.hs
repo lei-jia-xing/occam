@@ -27,7 +27,7 @@ import Distribution.Types.HookedBuildInfo (HookedBuildInfo)
 #if MIN_VERSION_Cabal(3, 14, 0)
 import Distribution.Utils.Path (FileOrDir (Dir), Lib, Pkg, SymbolicPath, getSymbolicPath, makeSymbolicPath)
 #endif
-import System.Directory (copyFile, createDirectoryIfMissing, getCurrentDirectory)
+import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.FilePath ((</>))
 import System.Info (os)
 import System.Process (callProcess)
@@ -117,7 +117,10 @@ buildRust package localBuildInfo hooks flags = do
     when (isStatic package) $
         withLibLBI package localBuildInfo $ \_ component -> do
             let dir = buildDirectory localBuildInfo component
-                archive = "rust/sqlparser-ffi/target/release/liboccam_sqlparser.a"
+                archiveGnu = "rust/sqlparser-ffi/target/release/liboccam_sqlparser.a"
+                archiveMsvc = "rust/sqlparser-ffi/target/release/occam_sqlparser.lib"
+            gnuExists <- doesFileExist archiveGnu
+            let archive = if gnuExists then archiveGnu else archiveMsvc
             createDirectoryIfMissing True dir
             copyFile archive (dir </> "libCoccam_sqlparser.a")
             when (withProfLib localBuildInfo) $

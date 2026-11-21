@@ -34,11 +34,13 @@ import Occam.Oracle (
     OracleConfig (..),
     OracleObservationDetails (..),
     prepareOracle,
+    shellOracleConfig,
  )
 import Occam.Parser (SQLDialect (..), countStatements, dialectCode, dialectName)
 import Occam.Pool (poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
+    ReductionEvidence (..),
     defaultReductionConfig,
     reduceSQL,
     reduceSQLWithConfig,
@@ -47,6 +49,7 @@ import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
+import TestSupport (withSentinelPath)
 
 tests :: TestTree
 tests =
@@ -332,6 +335,34 @@ tests =
                 StatementDeletionOneMinimal
                 (evaluationMinimalityClaim metrics)
             assertBool "audit result passed independent final validation" (evaluationValidationPassed metrics)
+        , testCase "shared audit evidence marks the audit as skipped, not zero-duration" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = evaluationConfig True Nothing Nothing
+                action _ _ pool = do
+                    _ <- poolOracle pool candidate
+                    pure (ReductionActionResult candidate (Just (ReductionEvidence candidate True)))
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluatedReduction
+                    Nothing
+                    config
+                    GenericSQL
+                    oracleCfg
+                    Nothing
+                    nullLogger
+                    initial
+                    checkpoint
+                    action
+            let metrics = evaluationMetrics result
+            assertBool "shared evidence audit is skipped" (evaluationAuditSkipped metrics)
+            assertBool "skipped audit still counts as completed" (evaluationAuditCompleted metrics)
+            assertEqual "skipped audit performs no checks" 0 (evaluationAuditChecks metrics)
+            assertEqual "skipped audit reports zero duration" 0.0 (evaluationAuditSeconds metrics)
+            assertEqual
+                "shared evidence preserves the 1-minimal claim"
+                StatementDeletionOneMinimal
+                (evaluationMinimalityClaim metrics)
         , testCase "parser transport failures preserve the last accepted checkpoint" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -624,12 +655,7 @@ evaluationConfig cacheEnabled wallBudget callBudget =
 
 predicateOracle :: Int -> String -> OracleConfig
 predicateOracle timeoutMicros command =
-    OracleConfig
-        { oracleCommand = "/bin/sh"
-        , oracleArgs = ["-c", command]
-        , oracleTimeoutMicros = timeoutMicros
-        , oracleResetCommand = Nothing
-        }
+    shellOracleConfig command timeoutMicros Nothing
 
 withCheckpoint :: (FilePath -> IO a) -> IO a
 withCheckpoint action = do
@@ -642,18 +668,6 @@ withCheckpoint action = do
         removeIfExists path = do
             exists <- doesFileExist path
             when exists (removeFile path)
-
-withSentinelPath :: (FilePath -> IO a) -> IO a
-withSentinelPath action = do
-    directory <- getTemporaryDirectory
-    (path, handle) <- openTempFile directory "occam-cancel-sentinel"
-    hClose handle
-    removeFile path
-    action path `finally` mapM_ removeIfExists [path]
-    where
-        removeIfExists sentinel = do
-            exists <- doesFileExist sentinel
-            when exists (removeFile sentinel)
 
 shellQuotePath :: String -> String
 shellQuotePath value = "'" ++ concatMap quote value ++ "'"

@@ -29,7 +29,6 @@ module Occam.Dependency.Transaction (
     restoreSequenceMap,
     stripSequenceRestored,
     restoreConstraintMap,
-    emptyConstraint,
     nonTransactionalConstraint,
     constraintTransactionalIn,
     stripConstraintRestored,
@@ -42,7 +41,6 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Occam.Core (
     BeginPolicy (..),
-    Constraint (..),
     DropMode (..),
     Ident,
     Name (..),
@@ -527,10 +525,10 @@ restoreConstraintMap sid snapshot current =
                     | nonTransactionalConstraint snapshot current old new -> [(key, new)]
                     | otherwise -> [(key, mark old (Just new))]
                 (Just old, Nothing)
-                    | nonTransactionalConstraint snapshot current old emptyConstraint -> []
+                    | not (constraintTransactionalIn snapshot old) -> []
                     | otherwise -> [(key, mark old Nothing)]
                 (Nothing, Just new)
-                    | nonTransactionalConstraint snapshot current emptyConstraint new -> [(key, new)]
+                    | not (constraintTransactionalIn current new) -> [(key, new)]
                     | otherwise -> []
                 (Nothing, Nothing) -> []
         mark old currentState =
@@ -542,10 +540,6 @@ restoreConstraintMap sid snapshot current =
              in if changed
                     then old {constraintRestoredBy = Just sid}
                     else old
-
-emptyConstraint :: ConstraintState
-emptyConstraint =
-    ConstraintState (RelationKey False (Name [])) Nothing (OtherConstraint Nothing) Nothing
 
 nonTransactionalConstraint :: Catalog -> Catalog -> ConstraintState -> ConstraintState -> Bool
 nonTransactionalConstraint snapshot current left right =

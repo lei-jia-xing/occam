@@ -25,13 +25,7 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.Char (toUpper)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Parser (
-    ParsedSQL (..),
-    SQLDialect (..),
-    StatementUnit (..),
-    defaultParseOptions,
-    parseSQL,
- )
+import Occam.Parser (SQLDialect (..))
 import Occam.Pool (withPredicatePool)
 import Occam.Reducer (reduceSQL)
 import Test.QuickCheck (
@@ -48,6 +42,7 @@ import Test.QuickCheck (
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, defaultMain, localOption, testGroup)
 import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
+import TestSupport (checkParserValidity)
 
 -- ----------------------------------------------------------------------------
 -- Seed Scenarios
@@ -460,18 +455,6 @@ compositeMutate initialSQL = do
 -- ----------------------------------------------------------------------------
 -- QuickCheck Invariant Properties
 -- ----------------------------------------------------------------------------
-
-checkParserValidity :: SQLDialect -> ByteString -> IO Bool
-checkParserValidity dialect sql = do
-    result <- parseSQL (defaultParseOptions dialect) sql
-    pure $ case result of
-        Left _ -> False
-        Right parsed -> all validUnit (parsedUnits parsed)
-    where
-        validUnit unit =
-            case unitParseError unit of
-                Nothing -> True
-                Just _ -> False
 
 {- | Core mutational invariant: recovery preserves the predicate and syntax,
 never grows the script, and removes injected dead statements.

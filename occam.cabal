@@ -48,6 +48,7 @@ common language
 library
     import:           warnings, language
     exposed-modules:  Occam
+                    , Occam.AtomicFile
                     , Occam.Cache
                     , Occam.Core
                     , Occam.Facts
@@ -92,6 +93,7 @@ library
                     , base16-bytestring >= 1.0 && < 1.1
                     , microlens >= 0.4 && < 0.5
                     , safe-exceptions >= 0.1 && < 0.2
+                    , temporary >= 1.3 && < 1.4
 
     if !os(windows)
         build-depends: unix >= 2.7 && < 2.9
@@ -102,6 +104,9 @@ library
         extra-bundled-libraries: Coccam_sqlparser
     else
         extra-libraries: occam_sqlparser
+
+    if os(windows)
+        extra-libraries: advapi32, ws2_32, userenv, bcrypt, ntdll
 
 executable occam
     import:           warnings, language
@@ -126,12 +131,14 @@ test-suite occam-fuzz
     hs-source-dirs:   test
     other-modules:    Fuzz
                     , MutationalFuzz
+                    , TestSupport
     main-is:          FuzzMain.hs
     build-depends:    base >= 4.18 && < 5
                     , occam
                     , bytestring
                     , text
                     , containers
+                    , directory
                     , tasty
                     , tasty-quickcheck
                     , QuickCheck >= 2.14
@@ -143,6 +150,7 @@ test-suite occam-test
     hs-source-dirs:   test eval-lib
     other-modules:    Fuzz
                     , MutationalFuzz
+                    , TestSupport
                     , ColumnChecks
                     , DependencyChecks
                     , EvaluationChecks

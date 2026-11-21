@@ -56,13 +56,11 @@ import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
+import TestSupport (emptySemanticFacts)
 
 -- ----------------------------------------------------------------------------
 -- Fact helpers
 -- ----------------------------------------------------------------------------
-
-emptySemanticFacts :: SemanticFacts
-emptySemanticFacts = SemanticFacts [] [] [] [] []
 
 factsFor :: StatementId -> DependencyGraph -> SemanticFacts
 factsFor sid graph = Map.findWithDefault emptySemanticFacts sid (graphFacts graph)
@@ -1139,6 +1137,62 @@ tests =
                     (\write -> dataWriteKind write == DeleteWrite DeleteAllRows)
                     (Map.findWithDefault [] (StatementId 10) enforcedExtras)
                 )
+        , testCase "schema-qualified tables with the same base name cascade independently" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA a;"
+                        , "CREATE SCHEMA b;"
+                        , "CREATE TABLE a.p (id INT PRIMARY KEY);"
+                        , "CREATE TABLE b.p (id INT PRIMARY KEY);"
+                        , "CREATE TABLE a.c (pid INT REFERENCES a.p(id) ON UPDATE CASCADE);"
+                        , "CREATE TABLE b.c (pid INT REFERENCES b.p(id) ON UPDATE CASCADE);"
+                        , "UPDATE a.p SET id = 7 WHERE id = 1;"
+                        , "UPDATE b.p SET id = 8 WHERE id = 1;"
+                        ]
+                options =
+                    (defaultParseOptions PostgreSQL)
+                        { parseServerConfig =
+                            (parseServerConfig (defaultParseOptions PostgreSQL))
+                                { serverForeignKeyChecks = Just True
+                                }
+                        }
+            parseRes <- parseSQL options sql
+            parsed <- case parseRes of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right value -> pure value
+            let extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
+                targets sid =
+                    [ nameText (nameRefName (dataWriteTarget write))
+                    | write <- Map.findWithDefault [] sid extras
+                    ]
+            assertEqual "a.p cascades only to a.c" ["a.c"] (targets (StatementId 7))
+            assertEqual "b.p cascades only to b.c" ["b.c"] (targets (StatementId 8))
+        , testCase "cascade visits the same child table for distinct update column sets" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p (id INT PRIMARY KEY, alt INT UNIQUE);"
+                        , "CREATE TABLE c (a INT REFERENCES p(id) ON UPDATE CASCADE, b INT REFERENCES p(alt) ON UPDATE CASCADE);"
+                        , "CREATE TABLE g (x INT REFERENCES c(b) ON UPDATE CASCADE);"
+                        , "UPDATE p SET id = 7, alt = 8 WHERE id = 1;"
+                        ]
+                options =
+                    (defaultParseOptions PostgreSQL)
+                        { parseServerConfig =
+                            (parseServerConfig (defaultParseOptions PostgreSQL))
+                                { serverForeignKeyChecks = Just True
+                                }
+                        }
+            parseRes <- parseSQL options sql
+            parsed <- case parseRes of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right value -> pure value
+            let extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
+                targets =
+                    [ nameText (nameRefName (dataWriteTarget write))
+                    | write <- Map.findWithDefault [] (StatementId 4) extras
+                    ]
+            assertBool "the first FK path reaches c" ("c" `elem` targets)
+            assertBool "the second FK path reaches g through c(b)" ("g" `elem` targets)
         , testCase "MySQL SET foreign_key_checks dynamically controls foreign key cascading" $ do
             let baseSql =
                     BSC.unlines

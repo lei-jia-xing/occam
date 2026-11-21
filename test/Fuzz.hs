@@ -8,13 +8,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Core (oracleAccepts)
-import Occam.Parser (
-    ParsedSQL (..),
-    SQLDialect (..),
-    StatementUnit (..),
-    defaultParseOptions,
-    parseSQL,
- )
+import Occam.Parser (SQLDialect (..))
 import Occam.Pool (OraclePool, poolOracle, withPredicatePool)
 import Occam.Reducer (reduceSQL)
 import Test.QuickCheck (
@@ -33,6 +27,7 @@ import Test.QuickCheck (
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
 import Test.Tasty (TestTree, defaultMain, localOption, testGroup)
 import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
+import TestSupport (checkParserValidity)
 
 -- ----------------------------------------------------------------------------
 -- SQL Schema Representation
@@ -507,18 +502,6 @@ withScriptPool script = withPredicatePool 1 False (makeScriptPredicate script)
 -- ----------------------------------------------------------------------------
 -- QuickCheck Properties
 -- ----------------------------------------------------------------------------
-
-checkParserValidity :: SQLDialect -> ByteString -> IO Bool
-checkParserValidity dialect sql = do
-    result <- parseSQL (defaultParseOptions dialect) sql
-    pure $ case result of
-        Left _ -> False
-        Right parsed -> all validUnit (parsedUnits parsed)
-    where
-        validUnit unit =
-            case unitParseError unit of
-                Nothing -> True
-                Just _ -> False
 
 {- | Core reduction invariant: the reduced script is valid, still satisfies the
 predicate, never grows, and is already a fixed point.

@@ -120,7 +120,6 @@ data OraclePool = OraclePool
     , poolPermitsVar :: !(MVar (Maybe Int))
     , poolCacheData :: !Cache
     , poolCacheModeData :: !CacheMode
-    , poolPrecomputedData :: !(Map ByteString OracleObservation)
     , poolMetricsData :: !(Maybe MetricsStore)
     , poolExecuteFn :: !(ByteString -> IO OracleObservationDetails)
     , poolBillFn :: !(OracleObservationDetails -> IO ())
@@ -154,7 +153,6 @@ newOraclePool PoolConfig {..}
                 , poolPermitsVar = permits
                 , poolCacheData = cache
                 , poolCacheModeData = if poolCacheEnabled then CacheEnabled else CacheDisabled
-                , poolPrecomputedData = poolPrecomputed
                 , poolMetricsData = poolMetrics
                 , poolExecuteFn = poolExecute
                 , poolBillFn = poolBill
@@ -366,7 +364,7 @@ launchWindow pool window = mask_ (go 0 [] window)
 launchTask :: OraclePool -> Int -> FamilyTag -> ByteString -> IO WindowTask
 launchTask pool ordinal tag candidate = do
     look <-
-        cacheLookup (poolCacheData pool) (poolCacheModeData pool) (poolPrecomputedData pool) candidate
+        cacheLookup (poolCacheData pool) (poolCacheModeData pool) candidate
     case look of
         LookupHit observation -> pure (TaskImmediate observation True)
         LookupJoin owner -> pure (TaskJoined owner)

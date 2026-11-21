@@ -7,13 +7,11 @@ import Occam.Oracle
 import System.Exit (ExitCode (..))
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
+import TestSupport (withSentinelPath)
 #ifndef mingw32_HOST_OS
 import Control.Concurrent (threadDelay)
-import Control.Exception (finally)
-import Control.Monad (when)
 import Data.Maybe (isJust)
-import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
-import System.IO (hClose, openTempFile)
+import System.Directory (doesFileExist)
 import System.Timeout (timeout)
 #endif
 
@@ -22,7 +20,7 @@ tests =
     testGroup
         "Oracle checks"
         $ [ testCase "only an explicit zero predicate exit accepts SQL" $ do
-                let cfg command = OracleConfig "sh" ["-c", command] 2000000 Nothing
+                let cfg command = shellOracleConfig command 2000000 Nothing
                 mapM_
                     ( \(command, expected) -> do
                         accepted <- runExternalOracle (cfg command) "SELECT 1;"
@@ -35,7 +33,7 @@ tests =
                     , ("kill -TERM $$", False)
                     ]
           , testCase "initial SQL must satisfy the same predicate before reduction" $ do
-                let cfg = OracleConfig "sh" ["-c", "grep -q 'SELECT 42;'"] 2000000 Nothing
+                let cfg = shellOracleConfig "grep -q 'SELECT 42;'" 2000000 Nothing
                 accepted <- prepareOracle cfg "SELECT 42;"
                 assertBool
                     "accepted original input was refused"
@@ -48,12 +46,13 @@ tests =
                     "noninteresting original input was accepted"
                     (case rejected of Left _ -> True; Right _ -> False)
           , testCase "reset, timeout, and launch failures remain distinct observations" $ do
-                let cfg = OracleConfig "sh" ["-c", "sleep 2"] 100000 Nothing
+                let cfg = shellOracleConfig "sleep 2" 100000 Nothing
                 timed <- observeExternalOracle cfg BS.empty
                 assertEqual "expected oracle timeout" OracleTimedOut timed
                 reset <- observeExternalOracle (cfg {oracleResetCommand = Just "false"}) BS.empty
                 assertEqual "failed reset must prevent oracle execution" OracleResetFailed reset
-                missing <- observeExternalOracle (cfg {oracleCommand = "/no/such/occam-oracle"}) BS.empty
+                missing <-
+                    observeExternalOracle (rawOracleConfig "/no/such/occam-oracle" [] 2000000 Nothing) BS.empty
                 assertBool "missing executable was not an infrastructure failure" (isInfrastructure missing)
           ]
             ++ posixTests
@@ -67,7 +66,7 @@ posixTests =
             mapM_
                 ( \(exitStatus, expected) -> do
                     let command = "exec 0<&-; sleep 0.05; exit " ++ exitStatus
-                        cfg = OracleConfig "sh" ["-c", command] 2000000 Nothing
+                        cfg = shellOracleConfig command 2000000 Nothing
                         input = BS.replicate (4 * 1024 * 1024) 120
                     observation <- observeExternalOracle cfg input
                     assertEqual "early stdin closure must preserve the predicate exit" expected observation
@@ -78,7 +77,7 @@ posixTests =
         , testCase "large binary output is drained and bounded while stdin is written" $ do
             let command =
                     "import sys; sys.stdout.buffer.write(b'{'*3145728); sys.stdout.flush(); sys.stderr.buffer.write(b'x'*3145728); sys.stderr.flush(); data=sys.stdin.buffer.read(); sys.exit(0 if data == bytes(range(256))*4096 else 1)"
-                cfg = OracleConfig "python3" ["-c", command] 5000000 Nothing
+                cfg = rawOracleConfig "python3" ["-c", command] 5000000 Nothing
                 input = BS.concat (replicate 4096 (BS.pack [0 .. 255]))
             details <- observeExternalOracleDetailed cfg input
             assertEqual "output parsing, pipe deadlock, or input corruption changed the predicate" (OracleFinished ExitSuccess) (detailedObservation details)
@@ -88,14 +87,14 @@ posixTests =
                 command =
                     "test \"$PWD\" = \"$OCCAM_ORIGINAL_CWD\" && test -f \"$OCCAM_WORKDIR/reset.ready\""
                         ++ " && test ! -f \"$OCCAM_WORKDIR/seen\" && : > \"$OCCAM_WORKDIR/seen\""
-                cfg = OracleConfig "sh" ["-c", command] 2000000 (Just reset)
+                cfg = shellOracleConfig command 2000000 (Just reset)
             mapM_
                 (\_ -> runExternalOracle cfg BS.empty >>= assertBool "relative commands or fresh candidate state failed")
                 [1 :: Int, 2]
         , testCase "timeout cleanup kills ordinary process-group descendants" $
             withSentinelPath $ \sentinel -> do
                 let command = "(sleep 1; printf leaked > " ++ shellQuote sentinel ++ ") & wait"
-                    cfg = OracleConfig "sh" ["-c", command] 100000 Nothing
+                    cfg = shellOracleConfig command 100000 Nothing
                 details <- observeExternalOracleDetailed cfg BS.empty
                 assertEqual "expected timeout" OracleTimedOut (detailedObservation details)
                 assertBool "timed-out oracle duration was omitted" (isJust (oracleElapsedMicros details))
@@ -109,7 +108,7 @@ posixTests =
                         "(sleep 2; printf leaked > "
                             ++ shellQuote sentinel
                             ++ ") & yes flooding-output | head -c 20000000 >&2; wait"
-                    cfg = OracleConfig "sh" ["-c", command] 500000 Nothing
+                    cfg = shellOracleConfig command 500000 Nothing
                 -- The oracle never reads stdin while its 2MiB payload fills
                 -- the pipe and stderr floods; the group must die before the
                 -- blocked writer is joined. Generous outer guard proves
@@ -128,19 +127,6 @@ posixTests =
 isInfrastructure :: OracleObservation -> Bool
 isInfrastructure (OracleIOFailed _) = True
 isInfrastructure _ = False
-
-#ifndef mingw32_HOST_OS
-withSentinelPath :: (FilePath -> IO a) -> IO a
-withSentinelPath action = do
-    tempDir <- getTemporaryDirectory
-    (path, handle) <- openTempFile tempDir "occam-oracle-child-"
-    hClose handle
-    removeFile path
-    let cleanup = do
-            exists <- doesFileExist path
-            when exists (removeFile path)
-    action path `finally` cleanup
-#endif
 
 #ifndef mingw32_HOST_OS
 shellQuote :: String -> String

@@ -2,6 +2,8 @@
 
 module Occam.Oracle (
     OracleConfig (..),
+    shellOracleConfig,
+    rawOracleConfig,
     OracleContext (..),
     resolveOracleContext,
     executeReset,
@@ -62,20 +64,40 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import System.Directory (findExecutable, getCurrentDirectory, makeAbsolute)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
-import System.FilePath (isAbsolute, isPathSeparator, (</>))
-#ifdef mingw32_HOST_OS
-import System.Directory (createDirectory, findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removeFile, removePathForcibly)
-import System.IO (Handle, hClose, hFlush, hSetBinaryMode, openBinaryTempFile)
-import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), proc, shell, terminateProcess, waitForProcess, withCreateProcess)
-#else
-import System.Directory (findExecutable, getCurrentDirectory, getTemporaryDirectory, makeAbsolute, removePathForcibly)
+import System.FilePath (isAbsolute, isPathSeparator)
 import System.IO (Handle, IOMode (WriteMode), hClose, hFlush, hSetBinaryMode, withFile)
+import System.IO.Temp (withSystemTempDirectory)
+#ifdef mingw32_HOST_OS
+import Data.Char (toUpper)
+import System.Process (
+    CmdSpec (..),
+    CreateProcess (..),
+    ProcessHandle,
+    StdStream (..),
+    proc,
+    shell,
+    terminateProcess,
+    waitForProcess,
+    withCreateProcess,
+ )
+#else
 import System.Posix.Signals (nullSignal, sigKILL, sigTERM, signalProcessGroup)
-import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (ProcessID)
-import System.Process (CreateProcess (..), ProcessHandle, StdStream (..), getPid, getProcessExitCode, proc, shell, waitForProcess, withCreateProcess)
+import System.Process (
+    CmdSpec (..),
+    CreateProcess (..),
+    ProcessHandle,
+    StdStream (..),
+    getPid,
+    getProcessExitCode,
+    proc,
+    shell,
+    waitForProcess,
+    withCreateProcess,
+ )
 #endif
 import Occam.Core (OracleOutcome (..))
 import System.IO.Error (isResourceVanishedError)
@@ -181,11 +203,11 @@ runProcessGroupWithStart onStarted timeoutMicros command input
 exit code only, so children write to the bit bucket instead of pipes: no
 reader threads, no pipe deadlock, no output buffering. POSIX binds
 /dev/null explicitly ('NoStream' would close the streams and fail writing
-children); Windows uses 'NoStream'.
+children); Windows binds the system NUL device for the same reason.
 -}
 #ifdef mingw32_HOST_OS
 withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
-withNullOutput use = use NoStream NoStream
+withNullOutput use = withFile "NUL" WriteMode \h -> use (UseHandle h) (UseHandle h)
 #else
 withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
 withNullOutput use = withFile "/dev/null" WriteMode \h -> use (UseHandle h) (UseHandle h)
@@ -287,21 +309,7 @@ ignoreIOException :: IO () -> IO ()
 ignoreIOException = handle (\(_ :: IOException) -> pure ())
 
 withCandidateWorkdir :: (FilePath -> IO a) -> IO a
-withCandidateWorkdir = bracket createWorkdir (ignoreIOException . removePathForcibly)
-    where
-#ifdef mingw32_HOST_OS
-    createWorkdir = do
-        tempDir <- getTemporaryDirectory
-        (path, h) <- openBinaryTempFile tempDir "occam-candidate-"
-        hClose h
-        removeFile path
-        createDirectory path
-        pure path
-#else
-    createWorkdir = do
-        tempDir <- getTemporaryDirectory
-        mkdtemp (tempDir </> "occam-candidate-XXXXXX")
-#endif
+withCandidateWorkdir = withSystemTempDirectory "occam-candidate-"
 
 resolveExecutable :: FilePath -> IO FilePath
 resolveExecutable executable
@@ -312,6 +320,13 @@ resolveExecutable executable
 
 candidateOverrideKeys :: [String]
 candidateOverrideKeys = ["OCCAM_WORKDIR", "OCCAM_ORIGINAL_CWD", "TMPDIR", "TMP", "TEMP"]
+
+isCandidateOverrideKey :: String -> Bool
+#ifdef mingw32_HOST_OS
+isCandidateOverrideKey k = map toUpper k `elem` candidateOverrideKeys
+#else
+isCandidateOverrideKey k = k `elem` candidateOverrideKeys
+#endif
 
 candidateOverrides :: FilePath -> FilePath -> [(String, String)]
 candidateOverrides workDir originalDir =
@@ -327,7 +342,7 @@ candidateEnvironment workDir = do
     current <- getEnvironment
     originalDir <- getCurrentDirectory
     pure
-        (candidateOverrides workDir originalDir ++ filter ((`notElem` candidateOverrideKeys) . fst) current)
+        (candidateOverrides workDir originalDir ++ filter (not . isCandidateOverrideKey . fst) current)
 
 {- | Oracle launch context resolved once per reduction: the executable path
 plus the process environment minus the per-candidate overrides. Resolving
@@ -335,7 +350,7 @@ once skips a PATH walk and an environment snapshot per candidate; the
 per-candidate workdirs still vary per probe.
 -}
 data OracleContext = OracleContext
-    { contextExecutable :: !FilePath
+    { contextCmdSpec :: !CmdSpec
     , contextBaseEnvironment :: ![(String, String)]
     , contextOriginalDir :: !FilePath
     }
@@ -343,13 +358,17 @@ data OracleContext = OracleContext
 
 resolveOracleContext :: OracleConfig -> IO OracleContext
 resolveOracleContext OracleConfig {..} = do
-    executable <- resolveExecutable oracleCommand
+    spec <- case oracleSpec of
+        RawCommand bin args -> do
+            resolvedBin <- resolveExecutable bin
+            pure (RawCommand resolvedBin args)
+        ShellCommand cmd -> pure (ShellCommand cmd)
     current <- getEnvironment
     originalDir <- getCurrentDirectory
     pure
         OracleContext
-            { contextExecutable = executable
-            , contextBaseEnvironment = filter ((`notElem` candidateOverrideKeys) . fst) current
+            { contextCmdSpec = spec
+            , contextBaseEnvironment = filter (not . isCandidateOverrideKey . fst) current
             , contextOriginalDir = originalDir
             }
 
@@ -426,7 +445,9 @@ observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} conte
                     Right (Just code)
                         | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
                         | otherwise -> do
-                            let oracleExecutable = contextExecutable context
+                            let cmdProcess = case contextCmdSpec context of
+                                    ShellCommand cmd -> shell cmd
+                                    RawCommand bin args -> proc bin args
                             oracleStarted <- getMonotonicTimeNSec
                             remaining <- remainingMicros
                             if remaining <= 0
@@ -437,7 +458,7 @@ observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} conte
                                             runProcessGroupWithStart
                                                 onOracleStarted
                                                 remaining
-                                                ((proc oracleExecutable oracleArgs) {env = Just childEnv})
+                                                (cmdProcess {env = Just childEnv})
                                                 sql
                                     oracleEnded <- getMonotonicTimeNSec
                                     let oracleElapsed = elapsedMicros oracleStarted oracleEnded
@@ -525,12 +546,29 @@ observationOutcome observation = case classifyOracleObservation observation of
 -- ----------------------------------------------------------------------------
 
 data OracleConfig = OracleConfig
-    { oracleCommand :: !FilePath
-    , oracleArgs :: ![String]
+    { oracleSpec :: !CmdSpec
     , oracleTimeoutMicros :: !Int
     , oracleResetCommand :: !(Maybe String)
     }
     deriving (Eq, Show)
+
+-- | Construct a shell-based oracle command (portable across POSIX and Windows).
+shellOracleConfig :: String -> Int -> Maybe String -> OracleConfig
+shellOracleConfig cmd timeoutMicros reset =
+    OracleConfig
+        { oracleSpec = ShellCommand cmd
+        , oracleTimeoutMicros = timeoutMicros
+        , oracleResetCommand = reset
+        }
+
+-- | Construct a raw binary-based oracle command.
+rawOracleConfig :: FilePath -> [String] -> Int -> Maybe String -> OracleConfig
+rawOracleConfig bin args timeoutMicros reset =
+    OracleConfig
+        { oracleSpec = RawCommand bin args
+        , oracleTimeoutMicros = timeoutMicros
+        , oracleResetCommand = reset
+        }
 
 -- | An observation retains execution failures instead of conflating them with rejection.
 data OracleObservation

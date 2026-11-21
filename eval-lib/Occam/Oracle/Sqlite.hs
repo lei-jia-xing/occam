@@ -3,10 +3,12 @@
 
 module Occam.Oracle.Sqlite (
     SqliteContract (..),
+    SqliteError (..),
     loadSqliteContract,
     generateSqliteContract,
     executeSqliteCandidate,
     executeSqliteCandidateTimeout,
+    executeSqliteCandidateDetailedTimeout,
     sqliteContractOracle,
     sqliteContractOracleTimeout,
     sqliteContractObservation,
@@ -137,12 +139,21 @@ stepAll stmt = go []
 defaultCandidateTimeoutMicros :: Int
 defaultCandidateTimeoutMicros = 100000
 
+{- | Failure classes for in-process SQLite execution. Keeping timeout distinct
+from parse/runtime failures prevents infrastructure problems from being
+reported as ordinary predicate rejections.
+-}
+data SqliteError
+    = SqliteTimeout
+    | SqliteExecutionError !Text
+    deriving (Eq, Show)
+
 {- | Execute candidate SQL against a fresh in-memory SQLite database with
 foreign key enforcement enabled. Automatically interrupts runaway queries
 (e.g., infinite recursive CTEs) via sqlite3_interrupt and System.Timeout.
 -}
-executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
-executeSqliteCandidateTimeout micros sql = do
+executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteError [[Value]])
+executeSqliteCandidateDetailedTimeout micros sql = do
     stmts <- splitStatements sql
     res <-
         try $
@@ -162,11 +173,19 @@ executeSqliteCandidateTimeout micros sql = do
                                             writeIORef lastRowsRef cols
                             readIORef lastRowsRef
                     pure $ case mRes of
-                        Nothing -> Left "timeout"
+                        Nothing -> Left SqliteTimeout
                         Just rows -> Right rows
     pure $ case res of
-        Left (err :: SomeException) -> Left (T.pack (show err))
+        Left (err :: SomeException) -> Left (SqliteExecutionError (T.pack (show err)))
         Right inner -> inner
+
+executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
+executeSqliteCandidateTimeout micros sql = do
+    res <- executeSqliteCandidateDetailedTimeout micros sql
+    pure $ case res of
+        Left SqliteTimeout -> Left "timeout"
+        Left (SqliteExecutionError err) -> Left err
+        Right rows -> Right rows
 
 executeSqliteCandidate :: ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidate = executeSqliteCandidateTimeout defaultCandidateTimeoutMicros
@@ -187,13 +206,15 @@ generateSqliteContract sql = do
 
 {- | In-process contract Oracle for candidate reduction. Returns OracleAccepted
 iff the candidate executes cleanly against SQLite :memory: and produces the
-exact expected rowset.
+exact expected rowset. Timeouts are inconclusive; execution errors (syntax
+errors, constraint violations) are rejections.
 -}
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate = do
-    res <- executeSqliteCandidateTimeout micros candidate
+    res <- executeSqliteCandidateDetailedTimeout micros candidate
     case res of
-        Left _err -> pure OracleRejected
+        Left SqliteTimeout -> pure OracleInconclusive
+        Left (SqliteExecutionError _) -> pure OracleRejected
         Right rows
             | rows == contractExpectedRows contract -> pure OracleAccepted
             | otherwise -> pure OracleRejected
@@ -201,10 +222,13 @@ sqliteContractOracleTimeout micros contract candidate = do
 sqliteContractOracle :: SqliteContract -> Oracle
 sqliteContractOracle = sqliteContractOracleTimeout defaultCandidateTimeoutMicros
 
+-- | Observation adapter that preserves timeout and execution-error semantics.
 sqliteContractObservation :: SqliteContract -> ByteString -> IO OracleObservation
 sqliteContractObservation contract candidate = do
-    outcome <- sqliteContractOracle contract candidate
-    pure $ case outcome of
-        OracleAccepted -> OracleFinished ExitSuccess
-        OracleRejected -> OracleFinished (ExitFailure 1)
-        OracleInconclusive -> OracleTimedOut
+    res <- executeSqliteCandidateDetailedTimeout defaultCandidateTimeoutMicros candidate
+    pure $ case res of
+        Left SqliteTimeout -> OracleTimedOut
+        Left (SqliteExecutionError err) -> OracleIOFailed err
+        Right rows
+            | rows == contractExpectedRows contract -> OracleFinished ExitSuccess
+            | otherwise -> OracleFinished (ExitFailure 1)
