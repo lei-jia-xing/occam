@@ -10,7 +10,7 @@ import Data.Char (toLower)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time.Clock (diffUTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
 import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
@@ -38,6 +38,7 @@ import Occam.Logger (
     withLogger,
  )
 import Occam.Oracle (
+    OracleConfig (..),
     OracleObservationDetails (..),
     prepareOracle,
     shellOracleConfig,
@@ -247,6 +248,10 @@ defaultLogLevelForFormat :: LogFormat -> LogLevel
 defaultLogLevelForFormat FormatJSON = LevelInfo
 defaultLogLevelForFormat FormatText = getSpecified (rawLogLevel defaultRawOptions)
 
+{- | Validated, strategy-resolved view of 'RawOptions'. The field mirror is
+intentional: downstream code receives only resolved values, never a
+'Specified' wrapper or an unvalidated default.
+-}
 data ValidatedOptions = ValidatedOptions
     { valInputFile :: !FilePath
     , valOracleCmd :: !(Maybe String)
@@ -812,27 +817,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         dumpStatementFacts valDialect valDumpFactsFkOn valInputFile
         exitSuccess
 
-    oracleCmd <- case valOracleCmd of
-        Just cmd -> pure cmd
-        Nothing -> do
-            hPutStrLn stderr "error: --oracle COMMAND is required (unless --dump-facts is given)"
-            hPutStrLn stderr " note: specify predicate with -c or --oracle (e.g. -c './check.sh')"
-            exitCliError
-
-    initialSQL <-
-        if valInputFile == "-"
-            then BS.getContents
-            else do
-                fileExists <- doesFileExist valInputFile
-                unless fileExists do
-                    let msg = "cannot open '" ++ valInputFile ++ "': No such file or directory"
-                    logError logger "cli" (T.pack msg)
-                    hPutStrLn stderr ("error: " ++ msg)
-                    exitFailure
-                BS.readFile valInputFile
-
-    initialStmts <- countStatementsForCLI logger valDialect initialSQL
-    let initialBytes = BS.length initialSQL
+    oracleCmd <- requireOracleCommand valOracleCmd
+    (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
 
     ui <-
         newUI
@@ -849,26 +835,14 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     let baseOracleConfig =
             shellOracleConfig oracleCmd (round (valTimeoutSecs * 1000000)) valResetCmd
         reductionConfig =
-            defaultReductionConfig
-                { reductionSlicing = valSlicing
-                , reductionClosure = valClosure
-                , reductionIntraStatement = valIntraStatement
-                , reductionColumnMode = valColumnMode
-                , reductionUnrestricted = valUnrestricted
-                , reductionDialect = valDialect
-                }
-        configuredBudget =
-            EvaluationConfig
-                { evaluationCacheEnabled = valCache
-                , evaluationJobs = valJobs
-                , evaluationTotalTimeoutMicros = round . (* 1000000) <$> valBudgetSecs
-                , evaluationMaxOracleExecutions = valMaxOracleExecutions
-                , evaluationPreflightMicros = 0
-                , evaluationPreflightAttempts = 0
-                , evaluationPreflightResetMicros = Nothing
-                , evaluationPreflightOracleMicros = Nothing
-                , evaluationInitialStatements = Just initialStmts
-                }
+            buildReductionConfig
+                valSlicing
+                valClosure
+                valIntraStatement
+                valColumnMode
+                valUnrestricted
+                valDialect
+        configuredBudget = buildBudgetConfig valCache valJobs valBudgetSecs valMaxOracleExecutions initialStmts
 
     logInfo'
         logger
@@ -882,29 +856,10 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("strategy", toJSON (strategyName valStrategy))
         ]
 
-    initialStart <- getCurrentTime
-    preflightStart <- toInteger <$> getMonotonicTimeNSec
     let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
-    prepared <-
-        runWithinBudget
-            preflightStart
-            totalBudgetMicros
-            (prepareOracle baseOracleConfig initialSQL)
-    preflightDetails <- case prepared of
-        Nothing -> do
-            hPutStrLn stderr "error: initial predicate check exceeded the total budget"
-            exitTimeout
-        Just (Left err) -> do
-            hPutStrLn stderr ("error: initial predicate check failed: " ++ T.unpack err)
-            hPutStrLn stderr " note: oracle command rejected the original unreduced SQL input"
-            exitFailure
-        Just (Right details) -> pure details
-    preflightEnd <- toInteger <$> getMonotonicTimeNSec
-    initialEnd <- getCurrentTime
+    (initialStart, initialEnd, preflightDetails, preflightMicros) <-
+        runPreflight baseOracleConfig initialSQL totalBudgetMicros
     let oracleCfg = baseOracleConfig
-        preflightMicros =
-            fromInteger
-                (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
         budgetConfig =
             configuredBudget
                 { evaluationPreflightMicros = preflightMicros
@@ -926,24 +881,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             "cli"
             "running with --jobs > 1 without --reset may lead to shared database state contamination"
 
-    isStdoutTTY <- hIsTerminalDevice stdout
-    let isStdoutTarget =
-            valOut == Just "-"
-                || (isNothing valOut && not valInPlace && (not isStdoutTTY || valInputFile == "-"))
-        writeToStdout = isStdoutTarget
-
-    targetMinimalPath <-
-        if writeToStdout
-            then pure ""
-            else case valOut of
-                Just outPath -> pure outPath
-                Nothing
-                    | valInPlace -> pure valInputFile
-                    | otherwise -> pure (defaultMinPath valInputFile)
-
-    let statsPath = fromMaybe "" valStatsFile
-
-    validateOutputPaths valInputFile targetMinimalPath writeToStdout valInPlace valStatsFile
+    (writeToStdout, targetMinimalPath, statsPath) <-
+        resolveOutputTargets valInputFile valOut valInPlace valStatsFile
 
     metricsPolicy <- case valStrategy of
         StrategyFull -> case metricPolicyForReduction reductionConfig valJobs of
@@ -1037,25 +976,17 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 , elapsed_seconds = evaluationTotalSeconds evaluation
                 }
 
-    -- Output file handling
-    let canWriteOutput =
-            not (valInPlace && not (evaluationValidationPassed evaluation))
-    unless canWriteOutput do
-        let msg = "refusing in-place modification because final candidate failed target validation"
-        logError logger "cli" (T.pack msg)
-        hPutStrLn stderr ("error: " ++ msg)
-
-    unless (writeToStdout || not canWriteOutput) do
-        when (valInPlace && valInputFile /= "-") do
-            writeAtomicFile (valInputFile ++ ".bak") initialSQL
-        writeAtomicFile targetMinimalPath reducedSQL
-
-    unless (null statsPath) do
-        writeAtomicLazy statsPath (encode stats)
-
-    when (writeToStdout && canWriteOutput) do
-        BS.putStr reducedSQL
-        hFlush stdout
+    writeReductionOutputs
+        logger
+        valInputFile
+        valInPlace
+        writeToStdout
+        targetMinimalPath
+        statsPath
+        initialSQL
+        reducedSQL
+        stats
+        evaluation
 
     logInfo'
         logger
@@ -1090,6 +1021,140 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         EvaluationTimeout -> exitTimeout
         EvaluationExecutionBudget -> exitTimeout
         _ -> exitFailure
+
+requireOracleCommand :: Maybe String -> IO String
+requireOracleCommand (Just command) = pure command
+requireOracleCommand Nothing = do
+    hPutStrLn stderr "error: --oracle COMMAND is required (unless --dump-facts is given)"
+    hPutStrLn stderr " note: specify predicate with -c or --oracle (e.g. -c './check.sh')"
+    exitCliError
+
+loadInitialInput :: Logger -> SQLDialect -> FilePath -> IO (BS.ByteString, Int, Int)
+loadInitialInput logger dialect inputFile = do
+    sql <-
+        if inputFile == "-"
+            then BS.getContents
+            else do
+                fileExists <- doesFileExist inputFile
+                unless fileExists do
+                    let msg = "cannot open '" ++ inputFile ++ "': No such file or directory"
+                    logError logger "cli" (T.pack msg)
+                    hPutStrLn stderr ("error: " ++ msg)
+                    exitFailure
+                BS.readFile inputFile
+    statements <- countStatementsForCLI logger dialect sql
+    pure (sql, statements, BS.length sql)
+
+buildReductionConfig ::
+    Bool -> Bool -> Bool -> ColumnMode -> Bool -> SQLDialect -> ReductionConfig
+buildReductionConfig slicing closure intra columnMode unrestricted dialect =
+    defaultReductionConfig
+        { reductionSlicing = slicing
+        , reductionClosure = closure
+        , reductionIntraStatement = intra
+        , reductionColumnMode = columnMode
+        , reductionUnrestricted = unrestricted
+        , reductionDialect = dialect
+        }
+
+buildBudgetConfig ::
+    Bool -> Int -> Maybe Double -> Maybe Int -> Int -> EvaluationConfig
+buildBudgetConfig cacheEnabled jobs budgetSecs maxExecutions initialStmts =
+    EvaluationConfig
+        { evaluationCacheEnabled = cacheEnabled
+        , evaluationJobs = jobs
+        , evaluationTotalTimeoutMicros = round . (* 1000000) <$> budgetSecs
+        , evaluationMaxOracleExecutions = maxExecutions
+        , evaluationPreflightMicros = 0
+        , evaluationPreflightAttempts = 0
+        , evaluationPreflightResetMicros = Nothing
+        , evaluationPreflightOracleMicros = Nothing
+        , evaluationInitialStatements = Just initialStmts
+        }
+
+runPreflight ::
+    OracleConfig ->
+    BS.ByteString ->
+    Maybe Integer ->
+    IO (UTCTime, UTCTime, OracleObservationDetails, Int)
+runPreflight oracleCfg initialSQL totalBudgetMicros = do
+    initialStart <- getCurrentTime
+    preflightStart <- toInteger <$> getMonotonicTimeNSec
+    prepared <-
+        runWithinBudget
+            preflightStart
+            totalBudgetMicros
+            (prepareOracle oracleCfg initialSQL)
+    details <- case prepared of
+        Nothing -> do
+            hPutStrLn stderr "error: initial predicate check exceeded the total budget"
+            exitTimeout
+        Just (Left err) -> do
+            hPutStrLn stderr ("error: initial predicate check failed: " ++ T.unpack err)
+            hPutStrLn stderr " note: oracle command rejected the original unreduced SQL input"
+            exitFailure
+        Just (Right checked) -> pure checked
+    preflightEnd <- toInteger <$> getMonotonicTimeNSec
+    initialEnd <- getCurrentTime
+    let micros =
+            fromInteger
+                (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
+    pure (initialStart, initialEnd, details, micros)
+
+resolveOutputTargets ::
+    FilePath ->
+    Maybe FilePath ->
+    Bool ->
+    Maybe FilePath ->
+    IO (Bool, FilePath, FilePath)
+resolveOutputTargets inputFile outputFile inPlace statsFile = do
+    isStdoutTTY <- hIsTerminalDevice stdout
+    let writeToStdout =
+            outputFile == Just "-"
+                || (isNothing outputFile && not inPlace && (not isStdoutTTY || inputFile == "-"))
+    targetMinimalPath <-
+        if writeToStdout
+            then pure ""
+            else case outputFile of
+                Just path -> pure path
+                Nothing
+                    | inPlace -> pure inputFile
+                    | otherwise -> pure (defaultMinPath inputFile)
+    let statsPath = fromMaybe "" statsFile
+    validateOutputPaths inputFile targetMinimalPath writeToStdout inPlace statsFile
+    pure (writeToStdout, targetMinimalPath, statsPath)
+
+writeReductionOutputs ::
+    Logger ->
+    FilePath ->
+    Bool ->
+    Bool ->
+    FilePath ->
+    FilePath ->
+    BS.ByteString ->
+    BS.ByteString ->
+    Stats ->
+    EvaluationMetrics ->
+    IO ()
+writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath statsPath initialSQL reducedSQL stats evaluation = do
+    let canWriteOutput =
+            not (inPlace && not (evaluationValidationPassed evaluation))
+    unless canWriteOutput do
+        let msg = "refusing in-place modification because final candidate failed target validation"
+        logError logger "cli" (T.pack msg)
+        hPutStrLn stderr ("error: " ++ msg)
+
+    unless (writeToStdout || not canWriteOutput) do
+        when (inPlace && inputFile /= "-") do
+            writeAtomicFile (inputFile ++ ".bak") initialSQL
+        writeAtomicFile targetMinimalPath reducedSQL
+
+    unless (null statsPath) do
+        writeAtomicLazy statsPath (encode stats)
+
+    when (writeToStdout && canWriteOutput) do
+        BS.putStr reducedSQL
+        hFlush stdout
 
 runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)
 runWithinBudget _ Nothing action = Just <$> action
