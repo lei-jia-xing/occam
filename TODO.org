@@ -116,16 +116,17 @@
 
 * Upstream Gaps (recorded, not scheduled)
 # Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.
-- `CREATE STATISTICS` unsupported by grammar -- 10 units: benchmarks/real_fuzz_corpus/pg_stack_overflow_27stmts.sql (s0-s7), pg_fuzzer_mcv_clauses.sql:3, pg_fuzzer_mcv_enhanced.sql:30
-- MySQL BINARY/charset column syntax unparsed -- benchmarks/real_fuzz_corpus/mysql_bug88355.sql:1,3
-- `PRAGMA recursive_triggers = true` boolean literal unparsed -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
-- `CREATE VIRTUAL TABLE ... USING fts5/fts4` exposes no module/shadow-table structure -- lowered to RelationScope in analyze_statement (sqlite_fuzz_fts5_savepoint.sql de-fenced)
+# Detailed tracking and upstream PR proposals live in docs/UPSTREAM_TRACKER.md.
+- [UP-05] `CREATE STATISTICS` unsupported by grammar -- 10 units: benchmarks/real_fuzz_corpus/pg_stack_overflow_27stmts.sql (s0-s7), pg_fuzzer_mcv_clauses.sql:3, pg_fuzzer_mcv_enhanced.sql:30
+- [UP-06] `PRAGMA recursive_triggers = true` / `PRAGMA foreign_keys = ON` boolean word literals unparsed -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
+- [UP-07] MySQL `BINARY` column attribute unparsed (`col CHAR(1) BINARY`) -- benchmarks/real_fuzz_corpus/mysql_bug88355.sql:1,3
+- [UP-08] ClickHouse `CREATE MATERIALIZED VIEW mv ENGINE = ... AS SELECT` unparsed -- rejects table engine on materialized view
+- [UP-02] `CREATE VIRTUAL TABLE ... USING fts5/fts4` exposes no module/shadow-table structure -- lowered to RelationScope in analyze_statement (sqlite_fuzz_fts5_savepoint.sql de-fenced)
 - Standalone `TABLE t` rejected -- README.md:77 ("Parser limits" paragraph)
 - CTAS `WITH NO DATA` rejected under Snowflake -- README.md:77
 - PL/pgSQL & PL/SQL bodies stored as unparsed strings -- TODO(upstream-sqlparser) catch-all in analyze_statement (procedural-body item)
 - MySQL `DELIMITER` client command outside grammar -- TODO(upstream-sqlparser) catch-all in analyze_statement (DELIMITER item)
 - MySQL `@var := expr` + dynamic `PREPARE .. FROM @var` -- TODO(upstream-sqlparser) catch-all in analyze_statement (@var/PREPARE item)
-- DuckDB direct file queries (`SELECT * FROM 'file.parquet'`) + `CREATE MACRO` -- TODO(upstream-sqlparser) catch-all in analyze_statement (DuckDB file-query/macro item)
 - MSSQL T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`) -- TODO(upstream-sqlparser) catch-all in analyze_statement (T-SQL batch item)
 - Incomplete `Spanned` impls (window, NULL-treatment, ODBC, unknown) block whole-node byte edits -- README.md:35
 - RESOLVED: MySQL index prefix `b(1)` as Expr::Function handled via structural recognition `index_length_prefix_ident` (`docs/UPSTREAM_TRACKER.md` UP-01; `mysql_bug_91975.sql` false barrier eliminated).
