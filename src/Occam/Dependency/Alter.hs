@@ -304,230 +304,298 @@ applyAlterChange ::
     (Catalog, RelationState) ->
     AlterChange ->
     (Catalog, RelationState)
-applyAlterChange session sid key (catalog, relation) change =
+applyAlterChange session sid key current change =
     case change of
         AddColumn column constraints ->
-            let allConstraints =
-                    constraints
-                        ++ [ForeignKeyConstraint foreignKey | foreignKey <- columnReferences column]
-                (catalog1, keys) = installConstraints session sid key allConstraints catalog
-             in ( catalog1
-                , relation
-                    & relColumnsL %~ Set.insert (columnName column)
-                    & relConstraintsL %~ Set.union keys
-                )
+            applyAddColumn session sid key current column constraints
         DropColumn column cascade ->
-            let isParentColumn foreignKey =
-                    column `elem` referencedParentColumns session catalog foreignKey
-                        && key
-                            `elem` resolveRelationKeys
-                                session
-                                catalog
-                                (foreignKeyParent foreignKey)
-                -- Indexes and constraints inside this table are always dropped
-                -- with the column, even without CASCADE.
-                sameTableKeys =
-                    [ constraintKey
-                    | constraintKey <- Set.toList (relConstraints relation)
-                    , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
-                    , let constraint = constraintValue state
-                    , column `elem` constraintColumnsOf constraint
-                        || case constraint of
-                            ForeignKeyConstraint foreignKey -> isParentColumn foreignKey
-                            _ -> False
-                    ]
-                sameTableIndexes =
-                    [ indexKey
-                    | indexKey <- Set.toList (relIndexes relation)
-                    , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
-                    , indexStateTable state == Just key
-                    , column `elem` indexStateColumns state
-                    ]
-                -- Foreign keys in other tables that reference this column as
-                -- a parent column are external dependents. Without CASCADE the
-                -- server rejects the drop, so the whole catalog must stay
-                -- unchanged; with CASCADE the constraints are removed.
-                crossTableKeys =
-                    [ constraintKey
-                    | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
-                    , constraintStateTable state /= key
-                    , ForeignKeyConstraint foreignKey <- [constraintValue state]
-                    , isParentColumn foreignKey
-                    ]
-                -- A self-referential foreign key still makes the dropped
-                -- column a referenced parent column. It must block a RESTRICT
-                -- drop just like a foreign key from another table.
-                selfParentKeys =
-                    [ constraintKey
-                    | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
-                    , constraintStateTable state == key
-                    , ForeignKeyConstraint foreignKey <- [constraintValue state]
-                    , isParentColumn foreignKey
-                    ]
-                -- Views retain the columns they read from each source, so a
-                -- view that only uses other columns does not block the drop.
-                -- A source with no retained read information is treated as
-                -- dependent, which is the sound over-approximation.
-                dependentViews = dropColumnDependentViews session catalog key column
-                hasExternalDependents =
-                    not (null crossTableKeys)
-                        || not (null selfParentKeys)
-                        || not (null dependentViews)
-                removedKeys =
-                    sameTableKeys
-                        ++ if cascade
-                            then crossTableKeys ++ selfParentKeys
-                            else []
-                catalog1 =
-                    if cascade
-                        then
-                            foldl'
-                                (flip (removeRelationCascade session sid DropCascade))
-                                catalog
-                                dependentViews
-                        else catalog
-             in if not cascade && hasExternalDependents
-                    then (catalog, relation)
-                    else
-                        ( foldl'
-                            (flip deleteIndex)
-                            (foldl' (flip deleteConstraint) catalog1 removedKeys)
-                            sameTableIndexes
-                        , relation
-                            & relColumnsL %~ Set.delete column
-                            & relColumnWritesL %~ Map.delete column
-                            & relConstraintsL %~ (`Set.difference` Set.fromList removedKeys)
-                            & relIndexesL %~ (`Set.difference` Set.fromList sameTableIndexes)
-                        )
+            applyDropColumn session key current column cascade
         AddConstraint constraint ->
-            let (catalog1, keys) = installConstraints session sid key [constraint] catalog
-             in ( catalog1
-                , relation & relConstraintsL %~ Set.union keys
-                )
+            applyAddConstraint session sid key current constraint
         DropConstraint name cascade ->
-            let matching =
-                    [ constraintKey
-                    | constraintKey <- Set.toList (relConstraints relation)
-                    , constraintKeyIdentity constraintKey == NamedConstraint name
-                    ]
-                -- Only primary-key and unique constraints can be referenced by
-                -- a foreign key. The referenced column set decides whether a
-                -- given foreign key depends on the dropped constraint; an
-                -- omitted parent column list means the parent primary key.
-                dropTarget droppedState =
-                    case constraintValue droppedState of
-                        PrimaryKeyConstraint _ columns ->
-                            Just (True, Set.fromList columns)
-                        UniqueConstraint _ columns ->
-                            Just (False, Set.fromList columns)
-                        _ -> Nothing
-                dependsOn (primary, targetColumns) keyValue =
-                    let parentColumns = Set.fromList (foreignKeyParentColumns keyValue)
-                     in key
-                            `elem` resolveRelationKeys
-                                session
-                                catalog
-                                (foreignKeyParent keyValue)
-                            && if Set.null parentColumns
-                                then primary
-                                else parentColumns == targetColumns
-                dependentKeys =
-                    Set.toList . Set.fromList $
-                        [ foreignKey
-                        | droppedKey <- matching
-                        , Just droppedState <- [Map.lookup droppedKey (catalogConstraints catalog)]
-                        , Just target <- [dropTarget droppedState]
-                        , not (Set.null (snd target))
-                        , (foreignKey, state) <- Map.toList (catalogConstraints catalog)
-                        , foreignKey `notElem` matching
-                        , ForeignKeyConstraint keyValue <- [constraintValue state]
-                        , dependsOn target keyValue
-                        ]
-                removedKeys = matching ++ dependentKeys
-                catalog1 = foldl' (flip deleteConstraint) catalog removedKeys
-             in if not cascade && not (null dependentKeys)
-                    then (catalog, relation)
-                    else
-                        ( catalog1
-                        , relation
-                            { relConstraints =
-                                Set.difference (relConstraints relation) (Set.fromList removedKeys)
-                            }
-                        )
+            applyDropConstraint session key current name cascade
         RenameConstraint from to ->
-            let matching =
-                    [ constraintKey
-                    | constraintKey <- Set.toList (relConstraints relation)
-                    , constraintKeyIdentity constraintKey == NamedConstraint from
-                    ]
-                renameOne catalog' constraintKey =
-                    case Map.lookup constraintKey (catalogConstraints catalog') of
-                        Nothing -> catalog'
-                        Just state ->
-                            let newKey = ConstraintKey key (NamedConstraint to)
-                                newState =
-                                    state
-                                        { constraintStateTable = key
-                                        , constraintValue = renameConstraintName to (constraintValue state)
-                                        }
-                             in catalog'
-                                    { catalogConstraints =
-                                        Map.insert
-                                            newKey
-                                            newState
-                                            (Map.delete constraintKey (catalogConstraints catalog'))
-                                    }
-                catalog1 = foldl' renameOne catalog matching
-                newKeys = Set.fromList [ConstraintKey key (NamedConstraint to) | _ <- matching]
-             in ( catalog1
+            applyRenameConstraint key current from to
+        ValidateConstraint name ->
+            applyValidateConstraint current name
+        DropIndexChange name ->
+            applyDropIndexChange current name
+        AlterColumn column _ _ _ ->
+            applyAlterColumn current column
+        OtherChange _ -> current
+
+applyAddColumn ::
+    SessionState ->
+    StatementId ->
+    RelationKey ->
+    (Catalog, RelationState) ->
+    ColumnDef ->
+    [Constraint] ->
+    (Catalog, RelationState)
+applyAddColumn session sid key (catalog, relation) column constraints =
+    let allConstraints =
+            constraints
+                ++ [ForeignKeyConstraint foreignKey | foreignKey <- columnReferences column]
+        (catalog1, keys) = installConstraints session sid key allConstraints catalog
+     in ( catalog1
+        , relation
+            & relColumnsL %~ Set.insert (columnName column)
+            & relConstraintsL %~ Set.union keys
+        )
+
+applyDropColumn ::
+    SessionState ->
+    RelationKey ->
+    (Catalog, RelationState) ->
+    Ident ->
+    Bool ->
+    (Catalog, RelationState)
+applyDropColumn session key (catalog, relation) column cascade =
+    let isParentColumn foreignKey =
+            column `elem` referencedParentColumns session catalog foreignKey
+                && key
+                    `elem` resolveRelationKeys
+                        session
+                        catalog
+                        (foreignKeyParent foreignKey)
+        -- Indexes and constraints inside this table are always dropped
+        -- with the column, even without CASCADE.
+        sameTableKeys =
+            [ constraintKey
+            | constraintKey <- Set.toList (relConstraints relation)
+            , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
+            , let constraint = constraintValue state
+            , column `elem` constraintColumnsOf constraint
+                || case constraint of
+                    ForeignKeyConstraint foreignKey -> isParentColumn foreignKey
+                    _ -> False
+            ]
+        sameTableIndexes =
+            [ indexKey
+            | indexKey <- Set.toList (relIndexes relation)
+            , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
+            , indexStateTable state == Just key
+            , column `elem` indexStateColumns state
+            ]
+        -- Foreign keys in other tables that reference this column as
+        -- a parent column are external dependents. Without CASCADE the
+        -- server rejects the drop, so the whole catalog must stay
+        -- unchanged; with CASCADE the constraints are removed.
+        crossTableKeys =
+            [ constraintKey
+            | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+            , constraintStateTable state /= key
+            , ForeignKeyConstraint foreignKey <- [constraintValue state]
+            , isParentColumn foreignKey
+            ]
+        -- A self-referential foreign key still makes the dropped
+        -- column a referenced parent column. It must block a RESTRICT
+        -- drop just like a foreign key from another table.
+        selfParentKeys =
+            [ constraintKey
+            | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+            , constraintStateTable state == key
+            , ForeignKeyConstraint foreignKey <- [constraintValue state]
+            , isParentColumn foreignKey
+            ]
+        -- Views retain the columns they read from each source, so a
+        -- view that only uses other columns does not block the drop.
+        -- A source with no retained read information is treated as
+        -- dependent, which is the sound over-approximation.
+        dependentViews = dropColumnDependentViews session catalog key column
+        hasExternalDependents =
+            not (null crossTableKeys)
+                || not (null selfParentKeys)
+                || not (null dependentViews)
+        removedKeys =
+            sameTableKeys
+                ++ if cascade
+                    then crossTableKeys ++ selfParentKeys
+                    else []
+        catalog1 =
+            if cascade
+                then
+                    foldl'
+                        (flip (removeRelationCascade session DropCascade))
+                        catalog
+                        dependentViews
+                else catalog
+     in if not cascade && hasExternalDependents
+            then (catalog, relation)
+            else
+                ( foldl'
+                    (flip deleteIndex)
+                    (foldl' (flip deleteConstraint) catalog1 removedKeys)
+                    sameTableIndexes
+                , relation
+                    & relColumnsL %~ Set.delete column
+                    & relColumnWritesL %~ Map.delete column
+                    & relConstraintsL %~ (`Set.difference` Set.fromList removedKeys)
+                    & relIndexesL %~ (`Set.difference` Set.fromList sameTableIndexes)
+                )
+
+applyAddConstraint ::
+    SessionState ->
+    StatementId ->
+    RelationKey ->
+    (Catalog, RelationState) ->
+    Constraint ->
+    (Catalog, RelationState)
+applyAddConstraint session sid key (catalog, relation) constraint =
+    let (catalog1, keys) = installConstraints session sid key [constraint] catalog
+     in ( catalog1
+        , relation & relConstraintsL %~ Set.union keys
+        )
+
+applyDropConstraint ::
+    SessionState ->
+    RelationKey ->
+    (Catalog, RelationState) ->
+    Ident ->
+    Bool ->
+    (Catalog, RelationState)
+applyDropConstraint session key (catalog, relation) name cascade =
+    let matching =
+            [ constraintKey
+            | constraintKey <- Set.toList (relConstraints relation)
+            , constraintKeyIdentity constraintKey == NamedConstraint name
+            ]
+        -- Only primary-key and unique constraints can be referenced by
+        -- a foreign key. The referenced column set decides whether a
+        -- given foreign key depends on the dropped constraint; an
+        -- omitted parent column list means the parent primary key.
+        dropTarget droppedState =
+            case constraintValue droppedState of
+                PrimaryKeyConstraint _ columns ->
+                    Just (True, Set.fromList columns)
+                UniqueConstraint _ columns ->
+                    Just (False, Set.fromList columns)
+                _ -> Nothing
+        dependsOn (primary, targetColumns) keyValue =
+            let parentColumns = Set.fromList (foreignKeyParentColumns keyValue)
+             in key
+                    `elem` resolveRelationKeys
+                        session
+                        catalog
+                        (foreignKeyParent keyValue)
+                    && if Set.null parentColumns
+                        then primary
+                        else parentColumns == targetColumns
+        dependentKeys =
+            Set.toList . Set.fromList $
+                [ foreignKey
+                | droppedKey <- matching
+                , Just droppedState <- [Map.lookup droppedKey (catalogConstraints catalog)]
+                , Just target <- [dropTarget droppedState]
+                , not (Set.null (snd target))
+                , (foreignKey, state) <- Map.toList (catalogConstraints catalog)
+                , foreignKey `notElem` matching
+                , ForeignKeyConstraint keyValue <- [constraintValue state]
+                , dependsOn target keyValue
+                ]
+        removedKeys = matching ++ dependentKeys
+        catalog1 = foldl' (flip deleteConstraint) catalog removedKeys
+     in if not cascade && not (null dependentKeys)
+            then (catalog, relation)
+            else
+                ( catalog1
                 , relation
                     { relConstraints =
-                        Set.union
-                            newKeys
-                            (Set.difference (relConstraints relation) (Set.fromList matching))
+                        Set.difference (relConstraints relation) (Set.fromList removedKeys)
                     }
                 )
-        ValidateConstraint name ->
-            let matching =
-                    [ constraintKey
-                    | constraintKey <- Set.toList (relConstraints relation)
-                    , constraintKeyIdentity constraintKey == NamedConstraint name
-                    ]
-                catalog1 =
-                    foldl'
-                        ( \current constraintKey ->
-                            current
-                                { catalogConstraints =
-                                    Map.adjust
-                                        ( \state ->
-                                            state
-                                                { constraintValue =
-                                                    validateConstraintValue (constraintValue state)
-                                                }
-                                        )
-                                        constraintKey
-                                        (catalogConstraints current)
+
+applyRenameConstraint ::
+    RelationKey ->
+    (Catalog, RelationState) ->
+    Ident ->
+    Ident ->
+    (Catalog, RelationState)
+applyRenameConstraint key (catalog, relation) from to =
+    let matching =
+            [ constraintKey
+            | constraintKey <- Set.toList (relConstraints relation)
+            , constraintKeyIdentity constraintKey == NamedConstraint from
+            ]
+        renameOne catalog' constraintKey =
+            case Map.lookup constraintKey (catalogConstraints catalog') of
+                Nothing -> catalog'
+                Just state ->
+                    let newKey = ConstraintKey key (NamedConstraint to)
+                        newState =
+                            state
+                                { constraintStateTable = key
+                                , constraintValue = renameConstraintName to (constraintValue state)
                                 }
-                        )
-                        catalog
-                        matching
-             in (catalog1, relation)
-        DropIndexChange name ->
-            let indexKeys =
-                    [ indexKey
-                    | indexKey <- Set.toList (relIndexes relation)
-                    , indexKeyName indexKey == Just name
-                    ]
-                catalog1 = foldl' (flip deleteIndex) catalog indexKeys
-             in ( catalog1
-                , relation
-                    { relIndexes =
-                        Set.difference (relIndexes relation) (Set.fromList indexKeys)
-                    }
+                     in catalog'
+                            { catalogConstraints =
+                                Map.insert
+                                    newKey
+                                    newState
+                                    (Map.delete constraintKey (catalogConstraints catalog'))
+                            }
+        catalog1 = foldl' renameOne catalog matching
+        newKeys = Set.fromList [ConstraintKey key (NamedConstraint to) | _ <- matching]
+     in ( catalog1
+        , relation
+            { relConstraints =
+                Set.union
+                    newKeys
+                    (Set.difference (relConstraints relation) (Set.fromList matching))
+            }
+        )
+
+applyValidateConstraint ::
+    (Catalog, RelationState) ->
+    Ident ->
+    (Catalog, RelationState)
+applyValidateConstraint (catalog, relation) name =
+    let matching =
+            [ constraintKey
+            | constraintKey <- Set.toList (relConstraints relation)
+            , constraintKeyIdentity constraintKey == NamedConstraint name
+            ]
+        catalog1 =
+            foldl'
+                ( \current constraintKey ->
+                    current
+                        { catalogConstraints =
+                            Map.adjust
+                                ( \state ->
+                                    state
+                                        { constraintValue =
+                                            validateConstraintValue (constraintValue state)
+                                        }
+                                )
+                                constraintKey
+                                (catalogConstraints current)
+                        }
                 )
-        AlterColumn column _Detail _Referenced _Repositions ->
-            (catalog, relation {relColumns = Set.insert column (relColumns relation)})
-        OtherChange _ -> (catalog, relation)
+                catalog
+                matching
+     in (catalog1, relation)
+
+applyDropIndexChange ::
+    (Catalog, RelationState) ->
+    Ident ->
+    (Catalog, RelationState)
+applyDropIndexChange (catalog, relation) name =
+    let indexKeys =
+            [ indexKey
+            | indexKey <- Set.toList (relIndexes relation)
+            , indexKeyName indexKey == Just name
+            ]
+        catalog1 = foldl' (flip deleteIndex) catalog indexKeys
+     in ( catalog1
+        , relation
+            { relIndexes =
+                Set.difference (relIndexes relation) (Set.fromList indexKeys)
+            }
+        )
+
+applyAlterColumn :: (Catalog, RelationState) -> Ident -> (Catalog, RelationState)
+applyAlterColumn (catalog, relation) column =
+    (catalog, relation {relColumns = Set.insert column (relColumns relation)})
 
 renameConstraintName :: Ident -> Constraint -> Constraint
 renameConstraintName name constraint =

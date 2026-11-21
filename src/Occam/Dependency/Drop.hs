@@ -87,6 +87,15 @@ processDrop :: StatementId -> Eval -> DropOp -> Eval
 processDrop sid eval dropOp =
     foldl' (dropOne sid (dropMode dropOp)) eval (dropObjects dropOp)
 
+-- | Statement dependencies recorded by a definition and its last rollback.
+definitionDeps :: Maybe StatementId -> Maybe StatementId -> Set StatementId
+definitionDeps definition restoredBy =
+    Set.fromList (catMaybes [definition, restoredBy])
+
+definitionStateDeps :: DefinitionState -> Set StatementId
+definitionStateDeps state =
+    definitionDeps (definitionStatement state) (definitionRestoredBy state)
+
 {- | Dropping a relation can change how unqualified names resolve, because a
 temporary or schema-qualified relation may have been shadowing another one.
 Record the drop as a schema write on every relation whose name could have been
@@ -130,7 +139,7 @@ dropOne sid mode eval object =
                                  in current
                                         & addTouches (relationTouchKeys key)
                                         & addDeps deps
-                                        & evalCatalogL %~ (removeRelationCascade session sid mode key . markResolutionChange sid key)
+                                        & evalCatalogL %~ (removeRelationCascade session mode key . markResolutionChange sid key)
                             )
                             eval
                             existing
@@ -145,12 +154,7 @@ dropOne sid mode eval object =
                             let tableDeps =
                                     maybe Set.empty (relationAllDeps session (evalCatalog current)) (indexStateTable state)
                                 deps =
-                                    Set.fromList
-                                        ( catMaybes
-                                            [ indexDefinition state
-                                            , indexRestoredBy state
-                                            ]
-                                        )
+                                    definitionDeps (indexDefinition state) (indexRestoredBy state)
                                         `Set.union` tableDeps
                                 catalog1 =
                                     deleteIndex key (evalCatalog current)
@@ -175,12 +179,7 @@ dropOne sid mode eval object =
                             let tableDeps =
                                     maybe Set.empty (relationAllDeps session (evalCatalog current)) (triggerStateTable state)
                                 deps =
-                                    Set.fromList
-                                        ( catMaybes
-                                            [ triggerDefinition state
-                                            , triggerRestoredBy state
-                                            ]
-                                        )
+                                    definitionDeps (triggerDefinition state) (triggerRestoredBy state)
                                         `Set.union` tableDeps
                                 catalog1 = deleteTrigger key (evalCatalog current)
                                 catalog2 =
@@ -202,12 +201,7 @@ dropOne sid mode eval object =
                         Nothing -> current
                         Just state ->
                             let deps =
-                                    Set.fromList
-                                        ( catMaybes
-                                            [ sequenceDefinition state
-                                            , sequenceRestoredBy state
-                                            ]
-                                        )
+                                    definitionDeps (sequenceDefinition state) (sequenceRestoredBy state)
                                         `Set.union` sequenceWrites state
                              in current
                                     & addTouches (sequenceTouchKeys key)
@@ -220,7 +214,7 @@ dropOne sid mode eval object =
                 deps =
                     maybe
                         Set.empty
-                        (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                        definitionStateDeps
                         (Map.lookup key (catalogTypes catalog))
              in eval
                     & addTouches (typeTouchKeys key)
@@ -235,7 +229,7 @@ dropOne sid mode eval object =
                 schemaDeps =
                     maybe
                         Set.empty
-                        (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                        definitionStateDeps
                         (Map.lookup key (catalogSchemas catalog))
                 deps = schemaDeps `Set.union` schemaContentsDeps session catalog contents
                 catalog1 =
@@ -243,7 +237,7 @@ dropOne sid mode eval object =
                         DropCascade ->
                             foldl'
                                 (flip (markResolutionChange sid))
-                                (removeSchemaCascade session sid key catalog)
+                                (removeSchemaCascade session key catalog)
                                 (contentsRelations contents)
                         DropRestrict
                             -- A non-empty schema makes the server reject the
@@ -256,9 +250,8 @@ dropOne sid mode eval object =
                     & addDeps deps
                     & evalCatalogL .~ catalog1
 
-removeRelationCascade ::
-    SessionState -> StatementId -> DropMode -> RelationKey -> Catalog -> Catalog
-removeRelationCascade session _sid mode = go Set.empty
+removeRelationCascade :: SessionState -> DropMode -> RelationKey -> Catalog -> Catalog
+removeRelationCascade session mode = go Set.empty
     where
         go seen currentKey catalog
             | Set.member currentKey seen = catalog
@@ -359,23 +352,13 @@ schemaContentsDeps session catalog contents =
         , Just relation <- [lookupRelation catalog relationKey]
         ]
         `Set.union` Set.unions
-            [ Set.fromList
-                ( catMaybes
-                    [ sequenceDefinition state
-                    , sequenceRestoredBy state
-                    ]
-                )
+            [ definitionDeps (sequenceDefinition state) (sequenceRestoredBy state)
                 `Set.union` sequenceWrites state
             | sequenceKey <- contentsSequences contents
             , Just state <- [Map.lookup sequenceKey (catalogSequences catalog)]
             ]
         `Set.union` Set.unions
-            [ Set.fromList
-                ( catMaybes
-                    [ indexDefinition state
-                    , indexRestoredBy state
-                    ]
-                )
+            [ definitionDeps (indexDefinition state) (indexRestoredBy state)
                 `Set.union` maybe
                     Set.empty
                     (relationAllDeps session catalog)
@@ -384,12 +367,7 @@ schemaContentsDeps session catalog contents =
             , Just state <- [Map.lookup indexKey (catalogIndexes catalog)]
             ]
         `Set.union` Set.unions
-            [ Set.fromList
-                ( catMaybes
-                    [ triggerDefinition state
-                    , triggerRestoredBy state
-                    ]
-                )
+            [ definitionDeps (triggerDefinition state) (triggerRestoredBy state)
                 `Set.union` maybe
                     Set.empty
                     (relationAllDeps session catalog)
@@ -398,32 +376,22 @@ schemaContentsDeps session catalog contents =
             , Just state <- [Map.lookup triggerKey (catalogTriggers catalog)]
             ]
         `Set.union` Set.unions
-            [ Set.fromList
-                ( catMaybes
-                    [ definitionStatement state
-                    , definitionRestoredBy state
-                    ]
-                )
+            [ definitionStateDeps state
             | typeName <- contentsTypes contents
             , Just state <- [Map.lookup typeName (catalogTypes catalog)]
             ]
         `Set.union` Set.unions
-            [ Set.fromList
-                ( catMaybes
-                    [ definitionStatement state
-                    , definitionRestoredBy state
-                    ]
-                )
+            [ definitionStateDeps state
             | schemaName <- contentsSchemas contents
             , Just state <- [Map.lookup schemaName (catalogSchemas catalog)]
             ]
 
-removeSchemaCascade :: SessionState -> StatementId -> Name -> Catalog -> Catalog
-removeSchemaCascade session sid schema catalog =
+removeSchemaCascade :: SessionState -> Name -> Catalog -> Catalog
+removeSchemaCascade session schema catalog =
     let contents = schemaContents catalog schema
         catalog1 =
             foldl'
-                (flip (removeRelationCascade session sid DropCascade))
+                (flip (removeRelationCascade session DropCascade))
                 catalog
                 (contentsRelations contents)
         catalog2 = foldl' (flip deleteSequence) catalog1 (contentsSequences contents)

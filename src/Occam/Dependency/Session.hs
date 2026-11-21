@@ -70,6 +70,7 @@ applySessionEffect effect session =
         SetNamespace scope prefix ->
             case scope of
                 ScopeSession -> session {sessNamespacePrefix = prefix}
+                -- Global namespace changes are intentionally unsupported.
                 ScopeGlobal -> session
                 _ -> session {sessTxNamespacePrefix = Just prefix}
         SetSessionUser scope user ->
@@ -101,6 +102,7 @@ applySessionEffect effect session =
              in case scope of
                     ScopeSession ->
                         session {sessVariables = Map.delete key (sessVariables session)}
+                    -- Global variable resets are intentionally unsupported.
                     ScopeGlobal -> session
                     _ ->
                         session {sessTxVariables = Map.delete key (sessTxVariables session)}
@@ -113,6 +115,7 @@ applySessionEffect effect session =
                         , sessForeignKeyChecks =
                             sessInitialForeignKeyChecks session
                         }
+                -- RESET ALL with global scope is intentionally unsupported.
                 ScopeGlobal -> session
                 _ ->
                     session
@@ -126,6 +129,7 @@ setSearchPath :: SessionScope -> SearchPathValue -> SessionState -> SessionState
 setSearchPath scope path session =
     case scope of
         ScopeSession -> session {sessSearchPath = entries}
+        -- Global search paths are intentionally unsupported.
         ScopeGlobal -> session
         _ -> session {sessTxSearchPath = Just entries}
     where
@@ -143,6 +147,7 @@ setSessionUser scope user session =
                 { sessSessionUser = user
                 , sessCurrentUser = user
                 }
+        -- Global role changes are intentionally unsupported.
         ScopeGlobal -> session
         _ ->
             session
@@ -154,6 +159,7 @@ setCurrentUser :: SessionScope -> Maybe Ident -> SessionState -> SessionState
 setCurrentUser scope user session =
     case scope of
         ScopeSession -> session {sessCurrentUser = user}
+        -- Global current-user changes are intentionally unsupported.
         ScopeGlobal -> session
         _ -> session {sessTxCurrentUser = Just user}
 
@@ -165,5 +171,6 @@ setVariable scope key value session =
                 _ -> Map.insert key value current
      in case scope of
             ScopeSession -> session {sessVariables = update (sessVariables session)}
+            -- Global variables are intentionally unsupported.
             ScopeGlobal -> session
             _ -> session {sessTxVariables = update (sessTxVariables session)}

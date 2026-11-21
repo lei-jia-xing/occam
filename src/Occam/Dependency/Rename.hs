@@ -129,30 +129,11 @@ processRename sid eval renameOp =
                                 { relSchemaWrites = Set.insert sid (relSchemaWrites relation1)
                                 }
                         catalog2 =
-                            updatePartitionParents
-                                session
-                                currentCatalog
-                                oldKey
-                                newKey
-                                ( updateForeignKeyParents
-                                    session
-                                    currentCatalog
-                                    oldKey
-                                    newKey
-                                    ( updateTriggerRelations
-                                        session
-                                        currentCatalog
-                                        oldKey
-                                        newKey
-                                        ( updateViewSources
-                                            session
-                                            currentCatalog
-                                            oldKey
-                                            newKey
-                                            (insertRelation newKey relation2 (deleteRelation oldKey catalog1))
-                                        )
-                                    )
-                                )
+                            insertRelation newKey relation2 (deleteRelation oldKey catalog1)
+                                & updateTriggerRelations session currentCatalog oldKey newKey
+                                & updateViewSources session currentCatalog oldKey newKey
+                                & updateForeignKeyParents session currentCatalog oldKey newKey
+                                & updatePartitionParents session currentCatalog oldKey newKey
                      in current
                             & addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey)
                             & addDeps deps
@@ -413,6 +394,31 @@ renameSourceReadColumns session catalog key rename relation =
                 readFact {readColumns = map rename (readColumns readFact)}
             | otherwise = readFact
 
+{- | Rewrite the read facts and inline DML events carried by a trigger. The
+two rename paths share this traversal and differ only in how a matching read
+or event target is rewritten.
+-}
+renameTriggerReadsAndBody ::
+    (ReadFact -> ReadFact) ->
+    (DmlEvent -> DmlEvent) ->
+    TriggerState ->
+    TriggerState
+renameTriggerReadsAndBody renameRead renameEvent state =
+    state
+        { triggerStateWhenReads = map renameRead (triggerStateWhenReads state)
+        , triggerStateBody = renameBody (triggerStateBody state)
+        }
+    where
+        renameEffect effect =
+            case effect of
+                TriggerDml event -> TriggerDml (renameEvent event)
+                TriggerRead readFact -> TriggerRead (renameRead readFact)
+                other -> other
+        renameBody body =
+            case body of
+                TriggerInline effects -> TriggerInline (map renameEffect effects)
+                other -> other
+
 renameTriggerColumns ::
     SessionState ->
     Catalog ->
@@ -420,11 +426,8 @@ renameTriggerColumns ::
     (Ident -> Ident) ->
     TriggerState ->
     TriggerState
-renameTriggerColumns session catalog key rename state =
-    state
-        { triggerStateWhenReads = map renameRead (triggerStateWhenReads state)
-        , triggerStateBody = renameBody (triggerStateBody state)
-        }
+renameTriggerColumns session catalog key rename =
+    renameTriggerReadsAndBody renameRead renameEvent
     where
         resolvesToKey reference =
             resolveRelationKeys session catalog reference == [key]
@@ -441,15 +444,6 @@ renameTriggerColumns session catalog key rename state =
                 DmlMerge target columns
                     | resolvesToKey target -> DmlMerge target (map rename columns)
                 other -> other
-        renameEffect effect =
-            case effect of
-                TriggerDml event -> TriggerDml (renameEvent event)
-                TriggerRead readFact -> TriggerRead (renameRead readFact)
-                other -> other
-        renameBody body =
-            case body of
-                TriggerInline effects -> TriggerInline (map renameEffect effects)
-                other -> other
 
 renameTriggerRelations ::
     SessionState ->
@@ -458,11 +452,8 @@ renameTriggerRelations ::
     RelationKey ->
     TriggerState ->
     TriggerState
-renameTriggerRelations session resolutionCatalog oldKey newKey state =
-    state
-        { triggerStateWhenReads = map renameRead (triggerStateWhenReads state)
-        , triggerStateBody = renameBody (triggerStateBody state)
-        }
+renameTriggerRelations session resolutionCatalog oldKey newKey =
+    renameTriggerReadsAndBody renameRead renameEvent
     where
         newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
         resolvesToOld reference =
@@ -482,15 +473,6 @@ renameTriggerRelations session resolutionCatalog oldKey newKey state =
                     | resolvesToOld target -> DmlDelete newReference allRows
                 DmlTruncate target cascade
                     | resolvesToOld target -> DmlTruncate newReference cascade
-                other -> other
-        renameEffect effect =
-            case effect of
-                TriggerDml event -> TriggerDml (renameEvent event)
-                TriggerRead readFact -> TriggerRead (renameRead readFact)
-                other -> other
-        renameBody body =
-            case body of
-                TriggerInline effects -> TriggerInline (map renameEffect effects)
                 other -> other
 
 updateTriggerRelations ::

@@ -166,7 +166,7 @@ processDefineTable sid eval definition =
                 (tableTemporary definition)
                 (qualifyDefinitionName session (tableName definition) (tableTemporary definition))
         existing = lookupRelation catalog key
-        evalReads = foldl' (processRead sid) eval (tableSources definition)
+        evalReads = foldl' processRead eval (tableSources definition)
         likeDeps =
             case tableLike definition of
                 Nothing -> Set.empty
@@ -238,7 +238,7 @@ processDefineView sid eval definition =
                 (viewTemporary definition)
                 (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
         existing = lookupRelation catalog key
-        evalReads = foldl' (processRead sid) eval (viewSources definition)
+        evalReads = foldl' processRead eval (viewSources definition)
         existingDeps =
             if isJust existing
                 then relationAllDeps session catalog key

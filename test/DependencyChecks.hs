@@ -1167,6 +1167,36 @@ tests =
                     ]
             assertEqual "a.p cascades only to a.c" ["a.c"] (targets (StatementId 7))
             assertEqual "b.p cascades only to b.c" ["b.c"] (targets (StatementId 8))
+        , testCase "DROP SCHEMA CASCADE removes the dropped schema's cascade edges" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA s;"
+                        , "CREATE TABLE s.parent (id INT PRIMARY KEY);"
+                        , "CREATE TABLE s.child (pid INT REFERENCES s.parent(id) ON UPDATE CASCADE);"
+                        , "DROP SCHEMA s CASCADE;"
+                        , "CREATE TABLE s.parent (id INT PRIMARY KEY);"
+                        , "UPDATE s.parent SET id = 7 WHERE id = 1;"
+                        ]
+                options =
+                    (defaultParseOptions PostgreSQL)
+                        { parseServerConfig =
+                            (parseServerConfig (defaultParseOptions PostgreSQL))
+                                { serverForeignKeyChecks = Just True
+                                }
+                        }
+            parseRes <- parseSQL options sql
+            parsed <- case parseRes of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right value -> pure value
+            let extras = cascadeWrites (parsedInitialSession parsed) (parsedUnits parsed)
+                targets =
+                    [ nameText (nameRefName (dataWriteTarget write))
+                    | write <- Map.findWithDefault [] (StatementId 6) extras
+                    ]
+            assertEqual
+                "the recreated table does not cascade into tables from the dropped schema"
+                []
+                targets
         , testCase "cascade visits the same child table for distinct update column sets" $ do
             let sql =
                     BSC.unlines

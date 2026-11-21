@@ -191,7 +191,7 @@ processOp sid eval op =
         DefineSequenceOp definition -> processDefineSequence sid eval definition
         DefineTypeOp definition -> processDefineType sid eval definition
         DefineSchemaOp definition -> processDefineSchema sid eval definition
-        ReadOp readFact -> processRead sid eval readFact
+        ReadOp readFact -> processRead eval readFact
         WriteDataOp write -> processDataWrite sid eval write
         WriteSequenceOp write -> processSequenceWrite sid eval write
         AlterTableOp alter -> processAlterTable sid eval alter

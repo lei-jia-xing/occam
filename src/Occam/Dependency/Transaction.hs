@@ -242,11 +242,11 @@ releaseSavepoint sid name state =
                             else state1
 
 commitFrame :: StatementId -> ScanState -> ScanState
-commitFrame sid state =
+commitFrame _sid state =
     case scanTransactions state of
         [] -> state
         frame : rest ->
-            let catalog1 = applyOnCommit sid (frameId frame) (scanSession state) (scanCatalog state)
+            let catalog1 = applyOnCommit (frameId frame) (scanSession state) (scanCatalog state)
                 session1 = clearTransactionSession (scanSession state)
              in state
                     { scanCatalog = catalog1
@@ -267,8 +267,8 @@ rollbackFrame sid state =
                     , scanTransactions = rest
                     }
 
-applyOnCommit :: StatementId -> Int -> SessionState -> Catalog -> Catalog
-applyOnCommit sid transactionId session catalog =
+applyOnCommit :: Int -> SessionState -> Catalog -> Catalog
+applyOnCommit transactionId session catalog =
     let relations =
             Map.map
                 ( \relation ->
@@ -290,7 +290,7 @@ applyOnCommit sid transactionId session catalog =
             ]
         catalog1 = catalog {catalogRelations = relations}
      in foldl'
-            (flip (removeRelationCascade session sid DropCascade))
+            (flip (removeRelationCascade session DropCascade))
             catalog1
             dropKeys
 
@@ -321,39 +321,76 @@ restoreCatalog sid snapshot current =
                 (catalogNextUnnamedConstraint current)
         }
 
+{- | How one catalog map participates in rollback: how to stamp a restored
+entry, how to compare entries without the stamp, and which entries survive
+rollback because they are not transactional.
+-}
+data RestorePolicy state = RestorePolicy
+    { policyMark :: StatementId -> state -> state
+    , policyStrip :: state -> state
+    , policyKeepsBoth :: state -> state -> Bool
+    , policyKeepsSnapshot :: state -> Bool
+    , policyKeepsCurrent :: state -> Bool
+    }
+
+{- | Roll back one catalog map. A key present in both maps is restored to its
+snapshot value unless the object is nontransactional; a snapshot-only key is
+restored unless the object was nontransactional; a current-only key is dropped
+unless it is nontransactional. The restored value is stamped with the rollback
+statement when it differs from the current value.
+-}
+restoreMap ::
+    (Ord key, Eq state) =>
+    RestorePolicy state ->
+    StatementId ->
+    Map key state ->
+    Map key state ->
+    Map key state
+restoreMap policy sid snapshot current =
+    Map.fromList
+        [ entry
+        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
+        , entry <- restoreKey key
+        ]
+    where
+        restoreKey key =
+            case (Map.lookup key snapshot, Map.lookup key current) of
+                (Just old, Just new)
+                    | policyKeepsBoth policy old new -> [(key, new)]
+                    | otherwise -> [(key, markRestored old (Just new))]
+                (Just old, Nothing)
+                    | policyKeepsSnapshot policy old -> []
+                    | otherwise -> [(key, markRestored old Nothing)]
+                (Nothing, Just new)
+                    | policyKeepsCurrent policy new -> [(key, new)]
+                    | otherwise -> []
+                (Nothing, Nothing) -> []
+        markRestored old currentState =
+            let changed =
+                    case currentState of
+                        Nothing -> True
+                        Just new ->
+                            policyStrip policy new /= policyStrip policy old
+             in if changed
+                    then policyMark policy sid old
+                    else old
+
+relationRestorePolicy :: RestorePolicy RelationState
+relationRestorePolicy =
+    RestorePolicy
+        { policyMark = \sid state -> state {relRestoredBy = Just sid}
+        , policyStrip = stripRelationRestored
+        , policyKeepsBoth = nonTransactionalRelation
+        , policyKeepsSnapshot = \old -> nonTransactionalRelation old (newRelation (relKind old))
+        , policyKeepsCurrent = \new -> nonTransactionalRelation (newRelation (relKind new)) new
+        }
+
 restoreRelationMap ::
     StatementId ->
     Map RelationKey RelationState ->
     Map RelationKey RelationState ->
     Map RelationKey RelationState
-restoreRelationMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
-        , entry <- restoreRelationKey key
-        ]
-    where
-        restoreRelationKey key =
-            case (Map.lookup key snapshot, Map.lookup key current) of
-                (Just old, Just new)
-                    | nonTransactionalRelation old new -> [(key, new)]
-                    | otherwise -> [(key, mark old (Just new))]
-                (Just old, Nothing)
-                    | nonTransactionalRelation old (newRelation (relKind old)) -> []
-                    | otherwise -> [(key, mark old Nothing)]
-                (Nothing, Just new)
-                    | nonTransactionalRelation (newRelation (relKind new)) new -> [(key, new)]
-                    | otherwise -> []
-                (Nothing, Nothing) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripRelationRestored new /= stripRelationRestored old
-             in if changed
-                    then old {relRestoredBy = Just sid}
-                    else old
+restoreRelationMap = restoreMap relationRestorePolicy
 
 nonTransactionalRelation :: RelationState -> RelationState -> Bool
 nonTransactionalRelation left right =
@@ -362,41 +399,27 @@ nonTransactionalRelation left right =
 stripRelationRestored :: RelationState -> RelationState
 stripRelationRestored relation = relation {relRestoredBy = Nothing}
 
+indexRestorePolicy :: Catalog -> Catalog -> RestorePolicy IndexState
+indexRestorePolicy snapshot current =
+    RestorePolicy
+        { policyMark = \sid state -> state {indexRestoredBy = Just sid}
+        , policyStrip = stripIndexRestored
+        , policyKeepsBoth = nonTransactionalIndex snapshot current
+        , policyKeepsSnapshot = not . indexTransactionalIn snapshot
+        , policyKeepsCurrent = not . indexTransactionalIn current
+        }
+
 restoreIndexMap ::
     StatementId ->
     Catalog ->
     Catalog ->
     Map IndexKey IndexState
 restoreIndexMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
-        , entry <- restoreIndexKey key
-        ]
-    where
-        oldMap = catalogIndexes snapshot
-        newMap = catalogIndexes current
-        restoreIndexKey key =
-            case (Map.lookup key oldMap, Map.lookup key newMap) of
-                (Just old, Just new)
-                    | nonTransactionalIndex snapshot current old new -> [(key, new)]
-                    | otherwise -> [(key, mark old (Just new))]
-                (Just old, Nothing)
-                    | nonTransactionalIndex snapshot current old (IndexState Nothing Nothing [] Nothing) -> []
-                    | otherwise -> [(key, mark old Nothing)]
-                (Nothing, Just new)
-                    | nonTransactionalIndex snapshot current (IndexState Nothing Nothing [] Nothing) new -> [(key, new)]
-                    | otherwise -> []
-                (Nothing, Nothing) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripIndexRestored new /= stripIndexRestored old
-             in if changed
-                    then old {indexRestoredBy = Just sid}
-                    else old
+    restoreMap
+        (indexRestorePolicy snapshot current)
+        sid
+        (catalogIndexes snapshot)
+        (catalogIndexes current)
 
 nonTransactionalIndex :: Catalog -> Catalog -> IndexState -> IndexState -> Bool
 nonTransactionalIndex snapshot current left right =
@@ -412,41 +435,27 @@ indexTransactionalIn catalog state =
 stripIndexRestored :: IndexState -> IndexState
 stripIndexRestored state = state {indexRestoredBy = Nothing}
 
+triggerRestorePolicy :: Catalog -> Catalog -> RestorePolicy TriggerState
+triggerRestorePolicy snapshot current =
+    RestorePolicy
+        { policyMark = \sid state -> state {triggerRestoredBy = Just sid}
+        , policyStrip = stripTriggerRestored
+        , policyKeepsBoth = nonTransactionalTrigger snapshot current
+        , policyKeepsSnapshot = not . triggerTransactionalIn snapshot
+        , policyKeepsCurrent = not . triggerTransactionalIn current
+        }
+
 restoreTriggerMap ::
     StatementId ->
     Catalog ->
     Catalog ->
     Map TriggerKey TriggerState
 restoreTriggerMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
-        , entry <- restoreTriggerKey key
-        ]
-    where
-        oldMap = catalogTriggers snapshot
-        newMap = catalogTriggers current
-        restoreTriggerKey key =
-            case (Map.lookup key oldMap, Map.lookup key newMap) of
-                (Just old, Just new)
-                    | nonTransactionalTrigger snapshot current old new -> [(key, new)]
-                    | otherwise -> [(key, mark old (Just new))]
-                (Just old, Nothing)
-                    | nonTransactionalTrigger snapshot current old emptyTrigger -> []
-                    | otherwise -> [(key, mark old Nothing)]
-                (Nothing, Just new)
-                    | nonTransactionalTrigger snapshot current emptyTrigger new -> [(key, new)]
-                    | otherwise -> []
-                (Nothing, Nothing) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripTriggerRestored new /= stripTriggerRestored old
-             in if changed
-                    then old {triggerRestoredBy = Just sid}
-                    else old
+    restoreMap
+        (triggerRestorePolicy snapshot current)
+        sid
+        (catalogTriggers snapshot)
+        (catalogTriggers current)
 
 emptyTrigger :: TriggerState
 emptyTrigger =
@@ -466,44 +475,37 @@ triggerTransactionalIn catalog state =
 stripTriggerRestored :: TriggerState -> TriggerState
 stripTriggerRestored state = state {triggerRestoredBy = Nothing}
 
+sequenceRestorePolicy :: RestorePolicy SequenceState
+sequenceRestorePolicy =
+    RestorePolicy
+        { policyMark = \sid state -> state {sequenceRestoredBy = Just sid}
+        , policyStrip = stripSequenceRestored
+        , policyKeepsBoth = \old new ->
+            not (sequenceStateTransactional old)
+                || not (sequenceStateTransactional new)
+        , policyKeepsSnapshot = not . sequenceStateTransactional
+        , policyKeepsCurrent = not . sequenceStateTransactional
+        }
+
 restoreSequenceMap ::
     StatementId ->
     Map SequenceKey SequenceState ->
     Map SequenceKey SequenceState ->
     Map SequenceKey SequenceState
-restoreSequenceMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
-        , entry <- restoreSequenceKey key
-        ]
-    where
-        restoreSequenceKey key =
-            case (Map.lookup key snapshot, Map.lookup key current) of
-                (Just old, Just new)
-                    | not (sequenceStateTransactional old)
-                        || not (sequenceStateTransactional new) ->
-                        [(key, new)]
-                    | otherwise -> [(key, mark old (Just new))]
-                (Just old, Nothing)
-                    | not (sequenceStateTransactional old) -> []
-                    | otherwise -> [(key, mark old Nothing)]
-                (Nothing, Just new)
-                    | not (sequenceStateTransactional new) -> [(key, new)]
-                    | otherwise -> []
-                (Nothing, Nothing) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripSequenceRestored new /= stripSequenceRestored old
-             in if changed
-                    then old {sequenceRestoredBy = Just sid}
-                    else old
+restoreSequenceMap = restoreMap sequenceRestorePolicy
 
 stripSequenceRestored :: SequenceState -> SequenceState
 stripSequenceRestored state = state {sequenceRestoredBy = Nothing}
+
+constraintRestorePolicy :: Catalog -> Catalog -> RestorePolicy ConstraintState
+constraintRestorePolicy snapshot current =
+    RestorePolicy
+        { policyMark = \sid state -> state {constraintRestoredBy = Just sid}
+        , policyStrip = stripConstraintRestored
+        , policyKeepsBoth = nonTransactionalConstraint snapshot current
+        , policyKeepsSnapshot = not . constraintTransactionalIn snapshot
+        , policyKeepsCurrent = not . constraintTransactionalIn current
+        }
 
 restoreConstraintMap ::
     StatementId ->
@@ -511,35 +513,11 @@ restoreConstraintMap ::
     Catalog ->
     Map ConstraintKey ConstraintState
 restoreConstraintMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet oldMap) (Map.keysSet newMap))
-        , entry <- restoreConstraintKey key
-        ]
-    where
-        oldMap = catalogConstraints snapshot
-        newMap = catalogConstraints current
-        restoreConstraintKey key =
-            case (Map.lookup key oldMap, Map.lookup key newMap) of
-                (Just old, Just new)
-                    | nonTransactionalConstraint snapshot current old new -> [(key, new)]
-                    | otherwise -> [(key, mark old (Just new))]
-                (Just old, Nothing)
-                    | not (constraintTransactionalIn snapshot old) -> []
-                    | otherwise -> [(key, mark old Nothing)]
-                (Nothing, Just new)
-                    | not (constraintTransactionalIn current new) -> [(key, new)]
-                    | otherwise -> []
-                (Nothing, Nothing) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripConstraintRestored new /= stripConstraintRestored old
-             in if changed
-                    then old {constraintRestoredBy = Just sid}
-                    else old
+    restoreMap
+        (constraintRestorePolicy snapshot current)
+        sid
+        (catalogConstraints snapshot)
+        (catalogConstraints current)
 
 nonTransactionalConstraint :: Catalog -> Catalog -> ConstraintState -> ConstraintState -> Bool
 nonTransactionalConstraint snapshot current left right =
@@ -553,32 +531,22 @@ constraintTransactionalIn catalog state =
 stripConstraintRestored :: ConstraintState -> ConstraintState
 stripConstraintRestored state = state {constraintRestoredBy = Nothing}
 
+definitionRestorePolicy :: RestorePolicy DefinitionState
+definitionRestorePolicy =
+    RestorePolicy
+        { policyMark = \sid state -> state {definitionRestoredBy = Just sid}
+        , policyStrip = stripDefinitionRestored
+        , policyKeepsBoth = \_ _ -> False
+        , policyKeepsSnapshot = const False
+        , policyKeepsCurrent = const False
+        }
+
 restoreDefinitionMap ::
     StatementId ->
     Map Name DefinitionState ->
     Map Name DefinitionState ->
     Map Name DefinitionState
-restoreDefinitionMap sid snapshot current =
-    Map.fromList
-        [ entry
-        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
-        , entry <- restoreDefinitionKey key
-        ]
-    where
-        restoreDefinitionKey key =
-            case (Map.lookup key snapshot, Map.lookup key current) of
-                (Just old, Just new) -> [(key, mark old (Just new))]
-                (Just old, Nothing) -> [(key, mark old Nothing)]
-                (Nothing, _) -> []
-        mark old currentState =
-            let changed =
-                    case currentState of
-                        Nothing -> True
-                        Just new ->
-                            stripDefinitionRestored new /= stripDefinitionRestored old
-             in if changed
-                    then old {definitionRestoredBy = Just sid}
-                    else old
+restoreDefinitionMap = restoreMap definitionRestorePolicy
 
 stripDefinitionRestored :: DefinitionState -> DefinitionState
 stripDefinitionRestored state = state {definitionRestoredBy = Nothing}

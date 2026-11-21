@@ -147,8 +147,8 @@ applyWriteState sid kind columns relation =
                 & relColumnWritesL .~ Map.empty
 
 -- Reads
-processRead :: StatementId -> Eval -> ReadFact -> Eval
-processRead _ eval readFact =
+processRead :: Eval -> ReadFact -> Eval
+processRead eval readFact =
     let session = evalSession eval
         catalog = evalCatalog eval
         relationKeys =
@@ -267,7 +267,7 @@ matchingTriggers catalog key tag =
 -- Data writes
 processDataWrite :: StatementId -> Eval -> DataWrite -> Eval
 processDataWrite sid eval write =
-    let evalReads = foldl' (processRead sid) eval (dataWriteReads write)
+    let evalReads = foldl' processRead eval (dataWriteReads write)
         session = evalSession evalReads
         catalog = evalCatalog evalReads
         targetKeys = resolveRelationKeys session catalog (dataWriteTarget write)
@@ -397,7 +397,7 @@ expandTrigger sid eval triggerKey
                             (addDeps definitionDeps eval1)
                     eval3 =
                         foldl'
-                            (processRead sid)
+                            processRead
                             eval2
                             (triggerStateWhenReads trigger)
                  in case triggerStateBody trigger of
@@ -420,7 +420,7 @@ processTriggerEffect :: StatementId -> Eval -> TriggerEffect -> Eval
 processTriggerEffect sid eval effect =
     case effect of
         TriggerDml event -> processDmlEvent sid eval event
-        TriggerRead readFact -> processRead sid eval readFact
+        TriggerRead readFact -> processRead eval readFact
         TriggerWriteSequence write -> processSequenceWrite sid eval write
         TriggerSession sessionEffect ->
             let (eval', _) = applySessionEffects sid [sessionEffect] eval
@@ -497,12 +497,12 @@ applyForeignKeys :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -
 applyForeignKeys sid eval key kind columns
     | not (sessForeignKeyChecks (evalSession eval)) = eval
     | otherwise =
-        let evalChecks = applyChildChecks sid eval key kind columns
+        let evalChecks = applyChildChecks eval key kind columns
             evalActions = applyParentActions sid evalChecks key kind columns
          in evalActions
 
-applyChildChecks :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-applyChildChecks _sid eval key kind _columns =
+applyChildChecks :: Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
+applyChildChecks eval key kind _columns =
     case kind of
         InsertWrite _ -> checkParents
         UpdateWrite _ -> checkParents
@@ -618,26 +618,18 @@ applyParentActions sid eval key kind columns =
                                     (UpdateWrite UpdateFilteredRows)
                                     (foreignKeyChildColumns foreignKey)
                             _ -> current
-                    SetNull ->
-                        writeChild
-                            current
-                            (constraintStateTable state)
-                            (UpdateWrite UpdateFilteredRows)
-                            (foreignKeyChildColumns foreignKey)
-                    SetDefault ->
-                        writeChild
-                            current
-                            (constraintStateTable state)
-                            (UpdateWrite UpdateFilteredRows)
-                            (foreignKeyChildColumns foreignKey)
-                    Restrict ->
-                        addDeps
-                            (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
-                            current
-                    NoAction ->
-                        addDeps
-                            (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
-                            current
+                    referential
+                        | referential `elem` [SetNull, SetDefault] ->
+                            writeChild
+                                current
+                                (constraintStateTable state)
+                                (UpdateWrite UpdateFilteredRows)
+                                (foreignKeyChildColumns foreignKey)
+                        | referential `elem` [Restrict, NoAction] ->
+                            addDeps
+                                (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
+                                current
+                        | otherwise -> current
 
         foreignKeyEventMatches action updatedParentColumns _parentKey _state foreignKey =
             case action of
@@ -682,7 +674,7 @@ processRefresh sid eval refresh =
                 mode = refreshSourceMode refresh
                 deps = relationReadDeps session currentCatalog key ReadSchema [] False
                 sourceReads = [readFact {readMode = mode} | readFact <- relSourceReads relation]
-                evalReads = foldl' (processRead sid) current sourceReads
+                evalReads = foldl' processRead current sourceReads
                 relation1 =
                     relation
                         & relDataWritesL .~ Set.singleton sid

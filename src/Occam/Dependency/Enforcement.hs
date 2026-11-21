@@ -204,6 +204,16 @@ applyDrop initial catalog (DropRelation ref _) =
     case resolveTableKey initial catalog ref of
         Just key -> Map.delete key catalog
         Nothing -> catalog
+applyDrop _ catalog (DropSchema schema) =
+    Map.filterWithKey (\key _ -> notInSchema key) catalog
+    where
+        schemaParts = map lowerIdent (nameParts schema)
+        -- Schema-qualified tables carry the schema as their name prefix.
+        notInSchema (TableKey False parts) =
+            null schemaParts
+                || length parts <= length schemaParts
+                || take (length schemaParts) parts /= schemaParts
+        notInSchema _ = True
 applyDrop _ catalog _ = catalog
 
 applyRename :: SessionInit -> RenameOp -> Map TableKey TableInfo -> Map TableKey TableInfo
