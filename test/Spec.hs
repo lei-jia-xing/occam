@@ -26,7 +26,7 @@ import Occam.Benchmark.Metrics (
     engineOverheadMicros,
     generateReportForDirectory,
     missingStatsSummary,
-    renderMarkdownReport,
+    renderSummaryJson,
  )
 import Occam.Cache (
     CacheAdmission (..),
@@ -1011,7 +1011,7 @@ benchmarkMetricsTests =
                             Map.fromList [(ParseStatementOnly, 25)]
                         }
             assertEqual "engine overhead sum" (Just 250) (engineOverheadMicros (Just snapshot))
-        , testCase "renderMarkdownReport outputs 4D schema columns and rows" do
+        , testCase "renderSummaryJson outputs structured 4D schema JSON" do
             let run1 =
                     RunSummary
                         { runName = "caseA__default__r1"
@@ -1031,10 +1031,10 @@ benchmarkMetricsTests =
                         , runStatus = "completed"
                         }
                 run2 = missingStatsSummary "caseA__intra__r1"
-                md = renderMarkdownReport [run1, run2]
-            assertBool "has header" (T.isInfixOf "| run | reduced_bytes |" md)
-            assertBool "has run1" (T.isInfixOf "caseA__default__r1" md)
-            assertBool "has missing-stats" (T.isInfixOf "missing-stats" md)
+                encoded = BSL.toStrict (encode (renderSummaryJson [run1, run2]))
+            assertBool "has runs array" (BSC.pack "\"runs\"" `BS.isInfixOf` encoded)
+            assertBool "has run1" (BSC.pack "caseA__default__r1" `BS.isInfixOf` encoded)
+            assertBool "has missing-stats" (BSC.pack "missing-stats" `BS.isInfixOf` encoded)
         , testCase "run name parsing keeps extra separators and flags malformed names" do
             let extended = missingStatsSummary "caseA__default__r1__post"
                 malformed = missingStatsSummary "caseA__default"
@@ -1083,7 +1083,7 @@ benchmarkMetricsTests =
             summaryExists <- doesFileExist (testDir </> "summary.json")
             reportExists <- doesFileExist (testDir </> "report.md")
             assertBool "summary.json created" summaryExists
-            assertBool "report.md created" reportExists
+            assertBool "report.md not created" (not reportExists)
             removeDirectoryRecursive testDir
         , testCase "evaluation and metrics emit snake_case JSON keys" $ do
             let encoded = BSL.toStrict (encode sampleEvaluationMetrics)

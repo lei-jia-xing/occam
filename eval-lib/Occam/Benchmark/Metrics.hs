@@ -6,7 +6,6 @@ module Occam.Benchmark.Metrics (
     summarizeStats,
     missingStatsSummary,
     summarizeDirectory,
-    renderMarkdownReport,
     renderSummaryJson,
     writeReport,
     generateReportForDirectory,
@@ -29,12 +28,10 @@ import Data.ByteString.Lazy qualified as BSL
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.IO qualified as TIO
 import GHC.Generics (Generic)
-import Numeric (showFFloat)
 import Occam.Evaluation (
     EvaluationMetrics (..),
     EvaluationPoint (..),
@@ -250,68 +247,18 @@ summarizeDirectory dir = do
                                 Left _ -> pure (Just (missingStatsSummary (T.pack name)))
                                 Right stats -> pure (Just (summarizeStats (T.pack name) stats))
 
--- | A typed Markdown column: header, value accessor, and missing-value formatter.
-type MarkdownColumn = (Text, RunSummary -> Maybe Text, Maybe Text -> Text)
-
-noneOr :: Maybe Text -> Text
-noneOr = fromMaybe "None"
-
-showText :: (Show a) => a -> Text
-showText = T.pack . show
-
-formatFloat :: Double -> Text
-formatFloat x = T.pack (showFFloat (Just 4) x "")
-
-formatOptional :: (a -> Text) -> (RunSummary -> Maybe a) -> RunSummary -> Maybe Text
-formatOptional format value summary = format <$> value summary
-
-markdownColumns :: [MarkdownColumn]
-markdownColumns =
-    [ ("run", Just . runName, noneOr)
-    , ("reduced_bytes", formatOptional showText runReducedBytes, noneOr)
-    , ("reduced_statements", formatOptional showText runReducedStatements, noneOr)
-    , ("reduction_ratio", formatOptional formatFloat runReductionRatio, noneOr)
-    , ("oracle_attempts", formatOptional showText runOracleAttempts, noneOr)
-    , ("accepted", formatOptional showText runAccepted, noneOr)
-    , ("cache_hits", formatOptional showText runCacheHits, noneOr)
-    , ("attempt_auc", formatOptional formatFloat runAttemptAuc, noneOr)
-    , ("engine_overhead_us", formatOptional showText runEngineOverheadUs, noneOr)
-    , ("elapsed_seconds", formatOptional formatFloat runElapsedSeconds, noneOr)
-    , ("status", Just . runStatus, noneOr)
-    ]
-
--- | Format runs as a GitHub Flavored Markdown table matching Tier 3 4D schema.
-renderMarkdownReport :: [RunSummary] -> Text
-renderMarkdownReport runs =
-    let headers = map (\(name, _, _) -> name) markdownColumns
-        header = "| " <> T.intercalate " | " headers <> " |"
-        sep = "|" <> T.intercalate "|" (replicate (length markdownColumns) "---") <> "|"
-        renderField summary (_, accessor, formatter) = formatter (accessor summary)
-        renderRow summary =
-            "| " <> T.intercalate " | " (map (renderField summary) markdownColumns) <> " |"
-        lines' =
-            [ "# Benchmark report"
-            , ""
-            , header
-            , sep
-            ]
-                ++ map renderRow runs
-     in T.unlines lines'
-
 -- | Encode runs into summary JSON payload format @{\"runs\": [...]}@.
 renderSummaryJson :: [RunSummary] -> Value
 renderSummaryJson runs =
     object ["runs" .= runs]
 
--- | Write @summary.json@ and @report.md@ to the target directory.
+-- | Write @summary.json@ to the target directory.
 writeReport :: FilePath -> [RunSummary] -> IO ()
 writeReport runDir runs = do
     let summaryPath = runDir </> "summary.json"
-        reportPath = runDir </> "report.md"
     BSL.writeFile summaryPath (encode (renderSummaryJson runs))
-    TIO.writeFile reportPath (renderMarkdownReport runs)
 
--- | Scan directory, summarize all runs, and write @summary.json@ and @report.md@.
+-- | Scan directory, summarize all runs, and write @summary.json@.
 generateReportForDirectory :: FilePath -> IO [RunSummary]
 generateReportForDirectory dir = do
     runs <- summarizeDirectory dir
