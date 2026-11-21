@@ -10,7 +10,7 @@ module Occam.UI (
 import Control.Monad (when)
 import Data.Char (toUpper)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
@@ -30,7 +30,6 @@ import System.Console.ANSI (
     hSupportsANSI,
     setSGRCode,
  )
-import System.Environment (lookupEnv)
 import System.IO (hFlush, hPutStrLn, stderr)
 import System.ProgressBar (
     Label (..),
@@ -132,8 +131,7 @@ stageVerb t = case t of
 newUI :: UIConfig -> IO UI
 newUI UIConfig {..} = do
     isTTY <- hSupportsANSI stderr
-    noColorEnv <- lookupEnv "NO_COLOR"
-    let useColor = isTTY && isNothing noColorEnv && uiUseColor
+    let useColor = uiUseColor
         targetDesc = if uiTargetFile == "-" then "<stdin>" else uiTargetFile
 
     if uiQuiet || uiVerbose

@@ -69,6 +69,7 @@ instance FromJSON SqliteContract where
             <*> o .:? "check_state" .!= False
 
 instance ToJSON SqliteContract where
+    toJSON :: SqliteContract -> Value
     toJSON contract =
         object
             [ "expected_rows" .= contractExpectedRows contract

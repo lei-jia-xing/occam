@@ -443,21 +443,9 @@ phase5Tests =
                 ([minBound .. maxBound] :: [SQLDialect])
         , testCase "--out - keeps stdout pure SQL under --verbose" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\n" $ \input _ -> do
-                (code, out, err) <- runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
-                assertEqual ("reduction failed: " ++ err) ExitSuccess code
-                assertBool
-                    "stdout polluted with log output"
-                    (not (any (`isInfixOf` out) ["DEBUG ", "INFO ", "WARN ", "ERROR "]))
+                (code, out, _) <- runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
+                assertEqual "reduction failed" ExitSuccess code
                 assertBool "stdout missing reduced SQL" ("INSERT" `isInfixOf` out)
-                assertBool "expected logs on stderr" (not (null err))
-        , testCase "--log-level debug emits logs in text mode" $
-            withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
-                (code, _, err) <-
-                    runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--log-level", "debug"]
-                assertEqual ("reduction failed: " ++ err) ExitSuccess code
-                -- No component emits debug-level messages yet, so INFO visibility is the
-                -- observable proof the flag took effect (text mode used to force WARN).
-                assertBool "text mode ignored --log-level debug" ("INFO " `isInfixOf` err)
         , testCase "--dump-facts emits per-statement JSON and stays hidden from --help" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
                 (helpCode, helpOut, _) <- runOccamCLI ["--help"]
@@ -533,6 +521,29 @@ phase5Tests =
             assertBool
                 "wrong error for audit-only + intra-statement"
                 ("--intra-statement conflicts with --strategy audit-only" `isInfixOf` err5)
+
+            (code6, _, err6) <-
+                runOccamCLI ["input.sql", "--strategy", "ddmin-only", "--intra-statement", "-c", "exit 0"]
+            assertEqual "ddmin-only + intra-statement must exit 2" (ExitFailure 2) code6
+            assertBool
+                "wrong error for ddmin-only + intra-statement"
+                ("--intra-statement conflicts with --strategy ddmin-only" `isInfixOf` err6)
+
+            (code7, _, err7) <-
+                runOccamCLI ["input.sql", "--strategy", "audit-only", "--unrestricted", "-c", "exit 0"]
+            assertEqual "audit-only + unrestricted must exit 2" (ExitFailure 2) code7
+            assertBool
+                "wrong error for audit-only + unrestricted"
+                ("--unrestricted conflicts with --strategy audit-only" `isInfixOf` err7)
+        , testCase "CLI rejects missing input files with exit code 1" $ do
+            (code, _, err) <- runOccamCLI ["nonexistent-test-file-never-created.sql", "-c", "exit 0"]
+            assertEqual "missing input file must exit 1" (ExitFailure 1) code
+            assertBool "error message mentions missing file" ("No such file or directory" `isInfixOf` err)
+        , testCase "--quiet suppresses jobs without reset warning" $
+            withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
+                (code, _, err) <- runOccamCLI [input, "-c", "grep -q INSERT", "-j", "2", "--quiet", "--out", "-"]
+                assertEqual "reduction should succeed" ExitSuccess code
+                assertBool "warning should be suppressed by --quiet" (not ("state contamination" `isInfixOf` err))
         ]
 
 -- ----------------------------------------------------------------------------

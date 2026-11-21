@@ -68,7 +68,7 @@ import Occam.Dependency (
     analyzeStatements,
  )
 import Occam.Facts (editCategoryName)
-import Occam.Logger (Logger, logInfo', logWarn, nullLogger)
+import Occam.Logger (Logger, logDebug', logInfo', logWarn, nullLogger)
 import Occam.Metrics (
     FamilyTag (..),
     MetricsStore,
@@ -206,7 +206,7 @@ seconds ns = fromIntegral ns / 1000000000
 
 logStage :: Logger -> T.Text -> Word64 -> IO ()
 logStage logger stage elapsed =
-    logInfo'
+    logDebug'
         logger
         "reducer"
         ("Finished " <> stage)
@@ -409,15 +409,25 @@ closureDdminWithLogger logger pool baseSQL initialStatements graph = do
             initialStatements
             initialStatements
     stats <- readIORef closureStats
-    logInfo'
-        logger
-        "reducer"
-        "Closure search summary"
-        [ ("closure_requests", toJSON (closureRequests stats))
-        , ("closure_cache_hits", toJSON (closureCacheHits stats))
-        , ("closure_gain_statements", toJSON (closureGainStatements stats))
-        , ("closure_gain_bytes", toJSON (closureGainBytes stats))
-        ]
+    let gainStmts = closureGainStatements stats
+        gainBytes = closureGainBytes stats
+    if gainBytes > 0 || gainStmts > 0
+        then
+            logInfo'
+                logger
+                "reducer"
+                "Closure search accepted reduction"
+                [ ("gain_statements", toJSON gainStmts)
+                , ("gain_bytes", toJSON gainBytes)
+                ]
+        else
+            logDebug'
+                logger
+                "reducer"
+                "Closure search found no further reductions"
+                [ ("closure_requests", toJSON (closureRequests stats))
+                , ("closure_cache_hits", toJSON (closureCacheHits stats))
+                ]
     pure result
 
 data ClosureStats = ClosureStats
@@ -698,15 +708,25 @@ data AuditStats = AuditStats
 
 logAuditStats :: Logger -> AuditStats -> IO ()
 logAuditStats logger stats =
-    logInfo'
-        logger
-        "reducer"
-        "Statement deletion audit reached a fixed point"
-        [ ("audit_passes", toJSON (auditPasses stats))
-        , ("audit_attempts", toJSON (auditAttempts stats))
-        , ("audit_removals", toJSON (auditRemovals stats))
-        , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
-        ]
+    let removals = auditRemovals stats
+     in if removals > 0
+            then
+                logInfo'
+                    logger
+                    "reducer"
+                    "Statement deletion audit reduced statements"
+                    [ ("statements_removed", toJSON removals)
+                    , ("audit_attempts", toJSON (auditAttempts stats))
+                    , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
+                    ]
+            else
+                logDebug'
+                    logger
+                    "reducer"
+                    "Statement deletion audit confirmed 1-minimality"
+                    [ ("audit_attempts", toJSON (auditAttempts stats))
+                    , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
+                    ]
 
 {- | Binary prefix probes. Only monotone predicates guarantee the first accepted
 prefix; arbitrary predicates may have earlier accepted prefixes we never visit.
@@ -754,7 +774,7 @@ analyzeSQL store logger dialect sql = do
         barrierActions = graphBarrierActions graph
         barrierStatements = graphBarrierStatements graph
         barrierEdges = graphBarrierEdges graph
-    logInfo'
+    logDebug'
         logger
         "reducer"
         "Dependency analysis completed"
@@ -826,7 +846,7 @@ sliceWithAnalysis logger pool analysis sql = do
                                             else do
                                                 reportCandidateCount pool candidate (length retained)
                                                 oracleAccepts (poolOracle pool) candidate
-                                    logInfo'
+                                    logDebug'
                                         logger
                                         "reducer"
                                         "Prefix oracle result considered for backward slice"
@@ -893,12 +913,7 @@ reduceSQLWithEvidence reporter config logger pool initialSQL = do
                 "reducer"
                 "Starting reduction iteration"
                 [ ("iteration", toJSON iteration)
-                , ("bytes", toJSON (BS.length currentSQL))
-                , ("slicing", toJSON (reductionSlicing config))
-                , ("closure", toJSON (reductionClosure config))
-                , ("unrestricted", toJSON (reductionUnrestricted config))
-                , ("intra_statement", toJSON (reductionIntraStatement config))
-                , ("dialect", toJSON (T.pack (show (reductionDialect config))))
+                , ("current_bytes", toJSON (BS.length currentSQL))
                 ]
             (nextSQL, evidence) <-
                 reduceIterationWithEvidence reporter config logger pool currentSQL priorEvidence
@@ -1074,7 +1089,7 @@ reduceSyntaxWithDialect ::
     ByteString ->
     IO ByteString
 reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
-    logInfo'
+    logDebug'
         logger
         "reducer"
         "Using ordinal-forward syntax candidate schedule"
@@ -1084,16 +1099,25 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
     stats <- newIORef (SyntaxStats 0 0 0)
     result <- go stats initialSQL
     finalStats <- readIORef stats
-    logInfo'
-        logger
-        "reducer"
-        "Syntax replacement summary"
-        [ ("replacement_attempts", toJSON (syntaxAttempts finalStats))
-        , ("replacement_accepted", toJSON (syntaxAccepted finalStats))
-        , ("replacement_oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
-        , ("search_policy", toJSON (syntaxPolicyName mode))
-        , ("category_order", toJSON categoryOrderName)
-        ]
+    let accepted = syntaxAccepted finalStats
+    if accepted > 0
+        then
+            logInfo'
+                logger
+                "reducer"
+                "Syntax rewrites accepted"
+                [ ("accepted_edits", toJSON accepted)
+                , ("attempts", toJSON (syntaxAttempts finalStats))
+                , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                ]
+        else
+            logDebug'
+                logger
+                "reducer"
+                "Syntax replacement completed with no accepted edits"
+                [ ("attempts", toJSON (syntaxAttempts finalStats))
+                , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                ]
     pure result
     where
         store = poolMetricsStore pool

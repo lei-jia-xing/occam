@@ -43,7 +43,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleOutcome (..))
-import Occam.Logger (Logger (..), logInfo')
+import Occam.Logger (Logger (..), logDebug', logInfo')
 import Occam.Metrics (
     MetricPolicy (..),
     MetricsSnapshot,
@@ -696,16 +696,12 @@ runAuditPhase env state pool reporter evidence = do
                         , evalAuditInitialAccepted = True
                         , evalAuditResult = Just auditInput
                         }
-                logInfo'
+                logDebug'
                     (envLogger env)
                     "audit"
-                    "Shared statement audit finished"
-                    [ ("elapsed_seconds", toJSON elapsed)
-                    , ("candidate_checks", toJSON (0 :: Int))
-                    , ("completed", toJSON True)
-                    , ("candidate_unchanged", toJSON True)
+                    "Shared statement audit skipped (already confirmed 1-minimal)"
+                    [ ("duration_seconds", toJSON elapsed)
                     , ("audit_minimality_confirmed", toJSON True)
-                    , ("skipped", toJSON True)
                     ]
         _ -> do
             auditStart <- ticks

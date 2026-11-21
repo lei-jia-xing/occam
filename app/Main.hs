@@ -31,8 +31,8 @@ import Occam.Logger (
     LogLevel (..),
     Logger,
     logError,
-    logInfo,
     logInfo',
+    logWarn,
     withLogger,
  )
 import Occam.Oracle (
@@ -53,8 +53,10 @@ import Occam.Parser (
     parseSQL,
  )
 import Occam.Reducer (
+    AuditStats (..),
     ColumnMode (..),
     ReductionConfig (..),
+    ReductionEvidence (..),
     ReductionResult (..),
     ReductionStage (..),
     StageEvent (..),
@@ -174,7 +176,7 @@ data RawOptions = RawOptions
     , rawStatsFile :: !(Maybe FilePath)
     , rawResetCmd :: !(Maybe String)
     , rawTimeoutSecs :: !Double
-    , rawLogLevel :: !LogLevel
+    , rawLogLevel :: !(Specified LogLevel)
     , rawLogFormat :: !LogFormat
     , rawVerbose :: !Bool
     , rawQuiet :: !Bool
@@ -203,7 +205,7 @@ data ValidatedOptions = ValidatedOptions
     , valStatsFile :: !(Maybe FilePath)
     , valResetCmd :: !(Maybe String)
     , valTimeoutSecs :: !Double
-    , valLogLevel :: !LogLevel
+    , valLogLevel :: !(Specified LogLevel)
     , valLogFormat :: !LogFormat
     , valVerbose :: !Bool
     , valQuiet :: !Bool
@@ -248,6 +250,12 @@ validateCliOptions RawOptions {..} = do
             when (isExplicit rawClosure && getSpecified rawClosure) $
                 Left
                     "--closure conflicts with --strategy ddmin-only (closure search is disabled in ddmin-only mode)"
+            when (isExplicit rawIntraStatement && getSpecified rawIntraStatement) $
+                Left
+                    "--intra-statement conflicts with --strategy ddmin-only (intra-statement rewrites are disabled in ddmin-only mode)"
+            when (isExplicit rawUnrestricted && getSpecified rawUnrestricted) $
+                Left
+                    "--unrestricted conflicts with --strategy ddmin-only (unrestricted fallback is disabled in ddmin-only mode)"
         Explicit StrategyAuditOnly -> do
             when (isExplicit rawSlicing && getSpecified rawSlicing) $
                 Left "--slicing conflicts with --strategy audit-only"
@@ -255,6 +263,8 @@ validateCliOptions RawOptions {..} = do
                 Left "--closure conflicts with --strategy audit-only"
             when (isExplicit rawIntraStatement && getSpecified rawIntraStatement) $
                 Left "--intra-statement conflicts with --strategy audit-only"
+            when (isExplicit rawUnrestricted && getSpecified rawUnrestricted) $
+                Left "--unrestricted conflicts with --strategy audit-only"
         _ -> pure ()
 
     -- 3. Column mode prerequisite check
@@ -295,7 +305,7 @@ validateCliOptions RawOptions {..} = do
             StrategyAuditOnly -> False
         effIntra = case getSpecified rawStrategy of
             StrategyFull -> getSpecified rawIntraStatement
-            StrategyDdminOnly -> getSpecified rawIntraStatement
+            StrategyDdminOnly -> False
             StrategyAuditOnly -> False
         effUnrestricted = case getSpecified rawStrategy of
             StrategyFull -> getSpecified rawUnrestricted
@@ -419,12 +429,15 @@ rawOptionsParser =
                 <> value 10.0
                 <> help "Per-execution timeout in seconds (default: 10.0)"
             )
-        <*> option
-            (eitherReader parseLogLevel)
-            ( long "log-level"
-                <> metavar "LEVEL"
-                <> value LevelInfo
-                <> help "Log severity level: debug, info, warn, or error (default: info; warn on terminal)"
+        <*> ( ( Explicit
+                    <$> option
+                        (eitherReader parseLogLevel)
+                        ( long "log-level"
+                            <> metavar "LEVEL"
+                            <> help "Log severity level: debug, info, warn, or error (default: warn)"
+                        )
+              )
+                <|> pure (Default LevelWarn)
             )
         <*> option
             (eitherReader parseLogFormat)
@@ -609,24 +622,31 @@ writeAtomicFile :: FilePath -> BS.ByteString -> IO ()
 writeAtomicFile "-" content = do
     BS.putStr content
     hFlush stdout
-writeAtomicFile path content = do
-    now <- getMonotonicTimeNSec
-    let dir = takeDirectory path
-        filename = takeFileName path
-        tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
-    unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-    BS.writeFile tmpPath content
-    renameFile tmpPath path
+writeAtomicFile path content
+    | isSpecialDevice path = BS.writeFile path content
+    | otherwise = do
+        now <- getMonotonicTimeNSec
+        let dir = takeDirectory path
+            filename = takeFileName path
+            tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
+        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+        BS.writeFile tmpPath content
+        renameFile tmpPath path
 
 writeAtomicLazy :: FilePath -> BSL.ByteString -> IO ()
-writeAtomicLazy path content = do
-    now <- getMonotonicTimeNSec
-    let dir = takeDirectory path
-        filename = takeFileName path
-        tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
-    unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-    BSL.writeFile tmpPath content
-    renameFile tmpPath path
+writeAtomicLazy path content
+    | isSpecialDevice path = BSL.writeFile path content
+    | otherwise = do
+        now <- getMonotonicTimeNSec
+        let dir = takeDirectory path
+            filename = takeFileName path
+            tmpPath = dir </> ("." ++ filename ++ ".tmp." ++ show now)
+        unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
+        BSL.writeFile tmpPath content
+        renameFile tmpPath path
+
+isSpecialDevice :: FilePath -> Bool
+isSpecialDevice path = path `elem` ["/dev/null", "/dev/stdout", "/dev/stderr"]
 
 -- ----------------------------------------------------------------------------
 -- Main
@@ -670,7 +690,7 @@ runAction ActionPrintDefaults = do
                 , "intra_statement" .= False
                 , "unrestricted" .= True
                 , "cache" .= True
-                , "log_level" .= ("info" :: Text)
+                , "log_level" .= ("warn" :: Text)
                 , "log_format" .= ("text" :: Text)
                 , "color" .= ("auto" :: Text)
                 ]
@@ -687,14 +707,16 @@ runOccam :: ValidatedOptions -> IO ()
 runOccam opts@ValidatedOptions {..} = do
     isStderrTTY <- hIsTerminalDevice stderr
     useColor <- resolveColor valColor isStderrTTY
-    let isVerboseMode = valVerbose || valLogLevel == LevelDebug
-        defaultLevel
-            | isStderrTTY && not isVerboseMode && valLogFormat == FormatText = LevelWarn
-            | otherwise = valLogLevel
+    let isVerboseMode = valVerbose || getSpecified valLogLevel == LevelDebug
+        resolvedLevel = case valLogLevel of
+            Explicit lvl -> lvl
+            Default defLvl
+                | valLogFormat == FormatJSON -> LevelInfo
+                | otherwise -> defLvl
         effectiveLevel
             | valQuiet = LevelError
             | isVerboseMode = LevelDebug
-            | otherwise = defaultLevel
+            | otherwise = resolvedLevel
         effectiveFormat = valLogFormat
         logCfg =
             LogConfig
@@ -727,7 +749,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                     let msg = "cannot open '" ++ valInputFile ++ "': No such file or directory"
                     logError logger "cli" (T.pack msg)
                     hPutStrLn stderr ("error: " ++ msg)
-                    exitCliError
+                    exitFailure
                 BS.readFile valInputFile
 
     initialStmts <- countStatementsForCLI logger valDialect initialSQL
@@ -741,7 +763,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 , uiInitialStmts = initialStmts
                 , uiDialect = sqlDialectName valDialect
                 , uiQuiet = valQuiet
-                , uiVerbose = valVerbose || valLogLevel == LevelDebug
+                , uiVerbose = valVerbose || getSpecified valLogLevel == LevelDebug
                 , uiUseColor = useColor
                 }
 
@@ -782,11 +804,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("initial_bytes", toJSON initialBytes)
         , ("initial_statements", toJSON initialStmts)
         , ("oracle_cmd", toJSON oracleCmd)
-        , ("evaluation_budget", toJSON configuredBudget)
-        ,
-            ( "reduction_settings"
-            , reductionSettings valCache reductionConfig valStrategy
-            )
+        , ("jobs", toJSON valJobs)
+        , ("strategy", toJSON (strategyName valStrategy))
         ]
 
     initialStart <- getCurrentTime
@@ -819,12 +838,19 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
                 , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
-    logInfo logger "oracle" "Initial predicate check passed"
+    logInfo'
+        logger
+        "oracle"
+        "Initial predicate check passed"
+        [ ("initial_statements", toJSON initialStmts)
+        , ("initial_bytes", toJSON initialBytes)
+        ]
 
     when (valJobs > 1 && isNothing valResetCmd) do
-        hPutStrLn
-            stderr
-            "warning: running with --jobs > 1 without --reset may lead to shared database state contamination"
+        logWarn
+            logger
+            "cli"
+            "running with --jobs > 1 without --reset may lead to shared database state contamination"
 
     isStdoutTTY <- hIsTerminalDevice stdout
     let isStdoutTarget =
@@ -842,8 +868,6 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                     | otherwise -> pure (defaultMinPath valInputFile)
 
     let statsPath = fromMaybe "" valStatsFile
-
-    logInfo logger "reducer" "Running hierarchical reduction engine..."
 
     metricsPolicy <- case valStrategy of
         StrategyFull -> case metricPolicyForReduction reductionConfig valJobs of
@@ -865,12 +889,12 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             StrategyAuditOnly -> do
                 auditStart <- toInteger <$> getMonotonicTimeNSec
                 reporter (StageStarted StageStatementAudit)
-                (sql, _stats) <-
+                (sql, stats) <-
                     statementAuditWithLogger reducerLogger (reductionDialect reductionConfig) pool initialSQL
                 auditEnd <- toInteger <$> getMonotonicTimeNSec
                 let elapsed = fromIntegral (auditEnd - auditStart) / 1000000000 :: Double
                 reporter (StageFinished StageStatementAudit elapsed (BS.length initialSQL) (BS.length sql))
-                pure (ReductionActionResult sql Nothing)
+                pure (ReductionActionResult sql (Just (ReductionEvidence sql (auditMinimalityConfirmed stats))))
 
     result <-
         withCandidateWorkdir $ \tmpDir -> do
@@ -936,7 +960,14 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 }
 
     -- Output file handling
-    unless writeToStdout do
+    let canWriteOutput =
+            not (valInPlace && not (evaluationValidationPassed evaluation))
+    unless canWriteOutput do
+        let msg = "refusing in-place modification because final candidate failed target validation"
+        logError logger "cli" (T.pack msg)
+        hPutStrLn stderr ("error: " ++ msg)
+
+    unless (writeToStdout || not canWriteOutput) do
         when (valInPlace && valInputFile /= "-") do
             writeAtomicFile (valInputFile ++ ".bak") initialSQL
         writeAtomicFile targetMinimalPath reducedSQL
@@ -944,7 +975,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     unless (null statsPath) do
         writeAtomicLazy statsPath (encode stats)
 
-    when writeToStdout do
+    when (writeToStdout && canWriteOutput) do
         BS.putStr reducedSQL
         hFlush stdout
 
@@ -996,7 +1027,7 @@ countStatementsForCLI logger dialect sql = do
             let message = "SQL parser failed while counting statements: " <> T.pack (show err)
             logError logger "parser" message
             hPutStrLn stderr ("error: " ++ T.unpack message)
-            exitCliError
+            exitFailure
         Right count -> pure count
 
 reductionSettings :: Bool -> ReductionConfig -> ReductionStrategy -> Value
@@ -1021,7 +1052,7 @@ dumpStatementFacts dialect fkOn inputFile = do
                 fileExists <- doesFileExist inputFile
                 unless fileExists do
                     hPutStrLn stderr ("error: cannot open '" ++ inputFile ++ "': No such file or directory")
-                    exitCliError
+                    exitFailure
                 BS.readFile inputFile
     let baseOptions = defaultParseOptions dialect
         parseOptions
@@ -1035,5 +1066,5 @@ dumpStatementFacts dialect fkOn inputFile = do
     case parsed of
         Left err -> do
             hPutStrLn stderr ("error: failed to parse input: " ++ T.unpack (parserErrorMessage err))
-            exitCliError
+            exitFailure
         Right result -> BSL.putStr (encode (factDumpJson dialect result) <> "\n")
