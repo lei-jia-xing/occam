@@ -3486,6 +3486,7 @@ pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bo
             | Statement::CreateDatabase { .. }
             | Statement::CreateFunction(_)
             | Statement::CreateProcedure { .. }
+            | Statement::CreateMacro { .. }
             | Statement::CreateRole(_)
             | Statement::CreateUser(_)
             | Statement::AlterUser(_)
@@ -5432,13 +5433,19 @@ pub(crate) fn analyze_statement(
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
         }
+        Statement::CreateMacro { name, .. } => {
+            let excluded = [name.span()];
+            let reads = visitor_reads(&visitor, &excluded, ir::ReadMode::Data);
+            add_reads(&mut facts, reads);
+            add_unmodeled_barriers(&mut facts, &visitor, &excluded);
+        }
         // TODO(upstream-sqlparser): Procedural statements, client commands, and dialect extensions
         // currently hit this fallback barrier:
         // 1. PL/pgSQL & PL/SQL: `CREATE FUNCTION/PROCEDURE ... AS $$ ... $$` procedural blocks
         //    (sqlparser stores function bodies as unparsed strings; inner DML dependencies are opaque).
         // 2. MySQL: `DELIMITER //` client command is outside ANSI/ISO SQL lexical grammar.
         // 3. MySQL: User session variables (`@var := expr`) and dynamic `PREPARE .. FROM @var`.
-        // 4. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`) and `CREATE MACRO`.
+        // 4. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`).
         // 5. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`). (`OUTPUT ... INTO`
         //    is modeled, not a fallback: real table -> second write edge, `@var` -> relation-
         //    scoped fence, anything else -> global `UnknownDml` fence.)

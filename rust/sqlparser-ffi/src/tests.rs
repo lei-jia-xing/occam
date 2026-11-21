@@ -480,8 +480,15 @@ fn conflict_writes_nested_ctes_and_group_by_all_are_handled() {
         DialectKind::PostgreSql,
     )
     .unwrap();
-    assert!(!facts(&dynamic[0]).barriers.is_empty());
+    assert!(facts(&dynamic[0]).barriers.is_empty());
     assert!(!relation_reads(facts(&dynamic[0])).contains(&"generate_series".to_string()));
+
+    let unmodeled = parse(
+        "SELECT * FROM custom_func(1, 2) AS n;",
+        DialectKind::PostgreSql,
+    )
+    .unwrap();
+    assert!(!facts(&unmodeled[0]).barriers.is_empty());
 
     for (dialect, insert) in [
         (
@@ -3235,9 +3242,8 @@ fn shadowed_pure_builtins_still_fence() {
     .unwrap();
     assert_eq!(units.len(), 2);
     assert!(units[0].parse_error.is_none());
-    for unit in &units {
-        assert!(has_routine_barrier(facts(unit)));
-    }
+    assert!(facts(&units[0]).barriers.is_empty());
+    assert!(has_routine_barrier(facts(&units[1])));
     // A parse error anywhere also disables the rule: unparsed routine
     // DDL cannot be ruled out. (This SQLite `abs` case fences
     // unconditionally since the cutback; the Generic cases above pin
@@ -4243,4 +4249,98 @@ fn read_mode_classification_row_count_and_existence() {
     let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts[0].mode, ReadMode::Data);
+}
+
+#[test]
+fn test_duckdb_create_macro() {
+    let sql = "CREATE MACRO add(a, b) AS a + b;";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    assert!(reads(unit_facts).is_empty());
+
+    let sql = "CREATE MACRO select_t() AS TABLE SELECT * FROM t;";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    let read_facts = reads(unit_facts);
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(name_text(&read_facts[0].source.name), "t");
+}
+
+#[test]
+fn test_pure_table_generators() {
+    let sql = "SELECT * FROM generate_series(1, 10);";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    assert!(reads(unit_facts).is_empty());
+
+    let sql = "SELECT * FROM pg_catalog.generate_series(1, 10);";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    assert!(reads(unit_facts).is_empty());
+
+    let sql = "SELECT * FROM range(10) AS t;";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    assert!(reads(unit_facts).is_empty());
+
+    let sql = "SELECT * FROM analytics.generate_series(1, 10);";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let unit_facts = facts(&units[0]);
+    assert!(
+        !unit_facts.barriers.is_empty(),
+        "Custom schema function should not be treated as built-in pure generator"
+    );
+}
+
+#[test]
+fn test_file_table_functions() {
+    let sql = "SELECT * FROM read_parquet('data.parquet') AS p;";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    let read_facts = reads(unit_facts);
+    assert_eq!(read_facts.len(), 1);
+    assert_eq!(name_text(&read_facts[0].source.name), "data.parquet");
+
+    let sql = "SELECT * FROM read_csv(['f1.csv', 'f2.csv']);";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    assert_eq!(units.len(), 1);
+    assert!(units[0].parse_error.is_none());
+    let unit_facts = facts(&units[0]);
+    assert_eq!(unit_facts.barriers, vec![]);
+    let read_facts = reads(unit_facts);
+    assert_eq!(read_facts.len(), 2);
+    assert_eq!(name_text(&read_facts[0].source.name), "f1.csv");
+    assert_eq!(name_text(&read_facts[1].source.name), "f2.csv");
+
+    let sql = "SELECT * FROM read_csv('data.csv', delim = '|', nullstr = 'NA');";
+    let units = parse(sql, DialectKind::DuckDB).unwrap();
+    let unit_facts = facts(&units[0]);
+    let read_facts = reads(unit_facts);
+    assert_eq!(
+        read_facts.len(),
+        1,
+        "Got reads: {:?}",
+        read_facts
+            .iter()
+            .map(|r| name_text(&r.source.name))
+            .collect::<Vec<_>>()
+    );
 }

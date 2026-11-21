@@ -38,6 +38,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     /// Any expression whose span falls inside a root is skipped by the
     /// deferred-function check.
     pub(crate) ignored_function_roots: Vec<Span>,
+    pub(crate) ignored_relation_spans: Vec<Span>,
     pub(crate) select_into_count: usize,
     /// Column reference and the alias scope in which it appeared.
     pub(crate) columns: Vec<(Vec<String>, usize)>,
@@ -76,6 +77,7 @@ impl<'a> AnalysisVisitor<'a> {
             unmodeled_table_source: false,
             has_function: false,
             ignored_function_roots: Vec::new(),
+            ignored_relation_spans: Vec::new(),
             select_into_count: 0,
             columns: Vec::new(),
             whole_rows: Vec::new(),
@@ -182,6 +184,42 @@ impl<'a> AnalysisVisitor<'a> {
         let scope = self.current_alias_scope();
         if let Some(scope) = self.aliases.get_mut(scope) {
             scope.aliases.push((name, target));
+        }
+    }
+
+    fn record_alias_opt(
+        &mut self,
+        alias: Option<&sqlparser::ast::TableAlias>,
+        target: Option<Vec<String>>,
+    ) {
+        if let Some(alias) = alias {
+            self.record_alias(alias, target);
+        }
+    }
+
+    fn record_table_function(
+        &mut self,
+        name_span: Span,
+        kind: TableFunctionKind,
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) {
+        match kind {
+            TableFunctionKind::PureGenerator => {
+                self.ignored_relation_spans.push(name_span);
+                self.record_alias_opt(alias, None);
+            }
+            TableFunctionKind::FileTable(paths) => {
+                self.ignored_relation_spans.push(name_span);
+                for path in &paths {
+                    let parts = vec![ir::Ident(path.clone())];
+                    self.record_relation(Some(relation_from_parts(parts, self.dialect)), name_span);
+                }
+                self.record_alias_opt(alias, paths.first().map(|p| vec![p.clone()]));
+            }
+            TableFunctionKind::Unmodeled => {
+                self.unmodeled_relation_spans.push(name_span);
+                self.record_alias_opt(alias, None);
+            }
         }
     }
 
@@ -2346,7 +2384,15 @@ impl Visitor for AnalysisVisitor<'_> {
             TableFactor::Table {
                 name,
                 alias,
-                args,
+                args: Some(table_args),
+                ..
+            } => {
+                let kind = classify_table_function(name, &table_args.args);
+                self.record_table_function(name.span(), kind, alias.as_ref());
+            }
+            TableFactor::Table {
+                name,
+                alias,
                 inheritance,
                 ..
             } => {
@@ -2357,33 +2403,34 @@ impl Visitor for AnalysisVisitor<'_> {
                         crate::ir::IdentifierClass::Relation,
                     )
                 });
-                // `ONLY t` excludes partition/inheritance children; `t *` and
-                // the unmarked form include them.
                 let only = matches!(inheritance, Some(TableInheritance::Only { .. }));
                 self.current_relation = Some((name.span(), factor_index, alias_name, only));
-                if args.is_some() {
-                    self.unmodeled_relation_spans.push(name.span());
-                    if let Some(alias) = alias {
-                        self.record_alias(alias, None);
-                    }
-                } else if let Some(alias) = alias {
-                    let target = relation_ref(name, self.dialect, self.rules)
-                        .map(|reference| reference.name.0.into_iter().map(|part| part.0).collect());
-                    self.record_alias(alias, target);
-                }
+                let target = alias.as_ref().and_then(|_| {
+                    relation_ref(name, self.dialect, self.rules)
+                        .map(|reference| reference.name.0.into_iter().map(|part| part.0).collect())
+                });
+                self.record_alias_opt(alias.as_ref(), target);
             }
-            TableFactor::Function { name, alias, .. } => {
-                self.unmodeled_relation_spans.push(name.span());
-                if let Some(alias) = alias {
-                    self.record_alias(alias, None);
-                }
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
+                let kind = classify_table_function(name, args);
+                self.record_table_function(name.span(), kind, alias.as_ref());
             }
-            TableFactor::TableFunction { alias, .. } => {
-                self.unmodeled_table_source = true;
-                if let Some(alias) = alias {
-                    self.record_alias(alias, None);
+            TableFactor::TableFunction { expr, alias } => match expr {
+                Expr::Function(func) => {
+                    let args = match &func.args {
+                        sqlparser::ast::FunctionArguments::List(list) => &list.args[..],
+                        _ => &[],
+                    };
+                    let kind = classify_table_function(&func.name, args);
+                    self.record_table_function(expr.span(), kind, alias.as_ref());
                 }
-            }
+                _ => {
+                    self.unmodeled_table_source = true;
+                    self.record_alias_opt(alias.as_ref(), None);
+                }
+            },
             TableFactor::Derived {
                 lateral,
                 subquery,
@@ -2419,7 +2466,7 @@ impl Visitor for AnalysisVisitor<'_> {
     }
 
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
-        if self.nested_dml_depth > 0 {
+        if self.nested_dml_depth > 0 || self.ignored_relation_spans.contains(&relation.span()) {
             return std::ops::ControlFlow::Continue(());
         }
         self.record_relation(
@@ -2869,6 +2916,141 @@ pub(crate) fn preceding_space(source: &[u8], start: usize) -> usize {
         start - 1
     } else {
         start
+    }
+}
+
+pub(crate) fn is_pure_table_generator_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "generate_series"
+            | "generate_subscripts"
+            | "range"
+            | "repeat"
+            | "unnest"
+            | "numbers"
+            | "numbers_mt"
+            | "zeros"
+            | "zeros_mt"
+    )
+}
+
+fn builtin_table_function_ident(name: &ObjectName) -> Option<&str> {
+    match name.0.as_slice() {
+        [sqlparser::ast::ObjectNamePart::Identifier(ident)] => Some(ident.value.as_str()),
+        [
+            sqlparser::ast::ObjectNamePart::Identifier(schema),
+            sqlparser::ast::ObjectNamePart::Identifier(ident),
+        ] if schema.value.eq_ignore_ascii_case("pg_catalog") => Some(ident.value.as_str()),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_pure_table_generator(name: &ObjectName) -> bool {
+    match builtin_table_function_ident(name) {
+        Some(ident) => is_pure_table_generator_name(ident),
+        None => false,
+    }
+}
+
+pub(crate) fn is_file_table_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "read_parquet"
+            | "read_csv"
+            | "read_csv_auto"
+            | "read_json"
+            | "read_json_auto"
+            | "read_ndjson"
+            | "read_ndjson_auto"
+            | "parquet_scan"
+            | "scan_parquet"
+            | "glob"
+    )
+}
+
+pub(crate) fn is_file_table_function(name: &ObjectName) -> bool {
+    match builtin_table_function_ident(name) {
+        Some(ident) => is_file_table_function_name(ident),
+        None => false,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TableFunctionKind {
+    PureGenerator,
+    FileTable(Vec<String>),
+    Unmodeled,
+}
+
+pub(crate) fn classify_table_function(
+    name: &ObjectName,
+    args: &[sqlparser::ast::FunctionArg],
+) -> TableFunctionKind {
+    match (is_pure_table_generator(name), is_file_table_function(name)) {
+        (true, _) => TableFunctionKind::PureGenerator,
+        (_, true) => match extract_paths_from_function_args(args) {
+            paths if paths.is_empty() => TableFunctionKind::Unmodeled,
+            paths => TableFunctionKind::FileTable(paths),
+        },
+        _ => TableFunctionKind::Unmodeled,
+    }
+}
+
+fn is_path_param_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "files" | "filename" | "path" | "paths"
+    )
+}
+
+pub(crate) fn extract_paths_from_function_args(
+    args: &[sqlparser::ast::FunctionArg],
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))) =
+        args.first()
+    {
+        collect_string_literals(expr, &mut paths);
+    }
+    for arg in args {
+        match arg {
+            sqlparser::ast::FunctionArg::Named {
+                name,
+                arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ..
+            } if is_path_param_name(&name.value) => {
+                collect_string_literals(expr, &mut paths);
+            }
+            sqlparser::ast::FunctionArg::ExprNamed {
+                name: Expr::Identifier(ident),
+                arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ..
+            } if is_path_param_name(&ident.value) => {
+                collect_string_literals(expr, &mut paths);
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+fn collect_string_literals(expr: &Expr, paths: &mut Vec<String>) {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s)
+            | sqlparser::ast::Value::TripleSingleQuotedString(s)
+            | sqlparser::ast::Value::TripleDoubleQuotedString(s) => {
+                paths.push(s.clone());
+            }
+            _ => {}
+        },
+        Expr::Array(array) => {
+            for elem in &array.elem {
+                collect_string_literals(elem, paths);
+            }
+        }
+        _ => {}
     }
 }
 
