@@ -65,6 +65,10 @@ library
                     , Occam.Version
     other-modules:    Paths_occam
                     , Occam.Json
+                    , Occam.Parser.Facts
+                    , Occam.Parser.Native
+                    , Occam.Parser.Types
+                    , Occam.Parser.Validate
                     , Occam.Dependency.Alter
                     , Occam.Dependency.Barrier
                     , Occam.Dependency.Define
