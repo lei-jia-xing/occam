@@ -97,6 +97,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 
+      - name: Run harness contract tests
+        run: make harness-check
+
       - name: Run benchmarks
         run: cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 

@@ -1,4 +1,9 @@
 .git
+.direnv
 dist-newstyle
 rust/sqlparser-ffi/target
-.direnv
+occam-out
+benchmarks/**/results
+benchmarks/**/*.jsonl
+__pycache__
+*.pyc

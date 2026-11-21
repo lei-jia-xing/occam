@@ -26,9 +26,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG PG_VERSION=REL_13_0
 ARG PG_REPO=https://github.com/postgres/postgres.git
 
-# Clone and compile PostgreSQL with --enable-cassert and --enable-debug
-RUN git clone --depth 1 --branch ${PG_VERSION} ${PG_REPO} /tmp/postgres && \
+# Clone and compile PostgreSQL with --enable-cassert and --enable-debug.
+# Fetch by tag/branch/commit: shallow fetch first, full fetch as a fallback for
+# servers that do not allow fetching an arbitrary commit by SHA.
+RUN git init /tmp/postgres && \
     cd /tmp/postgres && \
+    git remote add origin "${PG_REPO}" && \
+    if git fetch --depth 1 origin "${PG_VERSION}"; then \
+        git checkout --detach FETCH_HEAD; \
+    else \
+        git fetch origin && git checkout --detach "${PG_VERSION}"; \
+    fi && \
     ./configure --prefix=/usr/local/pgsql \
                 --enable-cassert \
                 --enable-debug \
@@ -62,6 +70,7 @@ RUN { \
         echo "log_directory = '${PGLOG_DIR}'"; \
         echo "log_filename = 'postgresql.log'"; \
         echo "log_truncate_on_rotation = off"; \
+        echo "log_file_mode = 0644"; \
         echo "log_statement = 'all'"; \
         echo "log_min_messages = 'warning'"; \
         echo "log_min_error_statement = 'error'"; \

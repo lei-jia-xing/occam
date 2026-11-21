@@ -28,10 +28,16 @@ RUN echo "mysql-community-server mysql-community-server/root-pass password root"
 
 # Download and install official MySQL Community Server 8.0.20 deb bundle with debug binaries
 ARG MYSQL_BUNDLE_URL=https://cdn.mysql.com/archives/mysql-8.0/mysql-server_8.0.20-1ubuntu18.04_amd64.deb-bundle.tar
+# Optional integrity check; pass --build-arg MYSQL_BUNDLE_SHA256=<sha256>.
+ARG MYSQL_BUNDLE_SHA256=""
 
 RUN mkdir -p /tmp/mysql-debs && \
     cd /tmp/mysql-debs && \
-    curl -sSL "${MYSQL_BUNDLE_URL}" | tar -xf - && \
+    curl -fSL "${MYSQL_BUNDLE_URL}" -o mysql-bundle.tar && \
+    if [ -n "${MYSQL_BUNDLE_SHA256}" ]; then \
+        echo "${MYSQL_BUNDLE_SHA256}  mysql-bundle.tar" | sha256sum -c -; \
+    fi && \
+    tar -xf mysql-bundle.tar && \
     dpkg -i mysql-common_8.0.20-1ubuntu18.04_amd64.deb && \
     dpkg -i libmysqlclient21_8.0.20-1ubuntu18.04_amd64.deb && \
     dpkg -i mysql-community-client-core_8.0.20-1ubuntu18.04_amd64.deb && \

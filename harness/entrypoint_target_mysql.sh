@@ -14,6 +14,9 @@ mkdir -p "$DATADIR" "$LOG_DIR" "$RUN_DIR"
 touch "$ERROR_LOG"
 chown -R mysql:mysql "$DATADIR" "$LOG_DIR" "$RUN_DIR"
 chmod 777 "$RUN_DIR"
+# Keep the error log readable from a host bind mount; mysqld appends to the
+# existing file and preserves this mode.
+chmod 0644 "$ERROR_LOG"
 
 # Restore from template if datadir is empty (e.g. fresh volume or tmpfs)
 if [ ! -d "${DATADIR}/mysql" ]; then
@@ -57,9 +60,13 @@ while [ "$stop_requested" -eq 0 ]; do
         --port=3306 &
     child_pid=$!
 
-    # Wait for server to either crash or stop
-    wait "$child_pid" || true
-    exit_status=$?
+    # Wait for server to either crash or stop. Keep the real exit status;
+    # `wait ... || true` would make $? always zero and hide crashes.
+    if wait "$child_pid"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
 
     if [ "$stop_requested" -eq 1 ]; then
         break

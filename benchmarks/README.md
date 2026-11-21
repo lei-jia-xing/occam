@@ -39,11 +39,17 @@ Run Occam against a target crash:
 
 ```bash
 occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
-  --oracle "python3 harness/crash_oracle.py --dbms postgres --expected-signature 'clauses != NIL'" \
-  --reset "./harness/reset_db.sh --dbms postgres" \
+  --oracle "python3 harness/crash_oracle.py --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
+  --reset "./harness/reset_db.sh --dbms postgres --container-name occam-target-pg" \
   --dialect postgres \
+  --timeout 10 \
+  --jobs 1 \
   --out /tmp/occam_reduced/
 ```
+
+The oracle requires `--log-file` or `--container-name`; client stderr is not
+accepted as crash evidence. Use `--jobs 1` because the harness shares one
+`occam_test` database.
 
 ## Unit & Contract Tests
 

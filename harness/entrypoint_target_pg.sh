@@ -23,6 +23,7 @@ log_destination = 'stderr'
 log_directory = '/var/log/postgresql'
 log_filename = 'postgresql.log'
 log_truncate_on_rotation = off
+log_file_mode = 0644
 log_statement = 'all'
 log_min_messages = 'warning'
 log_min_error_statement = 'error'

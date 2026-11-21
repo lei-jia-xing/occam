@@ -1,4 +1,4 @@
-.PHONY: all build build-check test bench microbench bench-product fmt fmt-check lint rust-check proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test bench microbench bench-product fmt fmt-check lint rust-check harness-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -58,6 +58,14 @@ rust-check:
 	cargo check --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets
 	cargo clippy --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets -- -D warnings
 
+harness-check:
+	python3 -m unittest discover -s harness -p "test_*.py" -v
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -S style harness/*.sh; \
+	else \
+		echo "shellcheck not installed; skipping harness shell checks"; \
+	fi
+
 proof-check:
 	@if command -v lake >/dev/null 2>&1; then \
 		(cd proofs && lake build); \
@@ -65,7 +73,7 @@ proof-check:
 		nix develop --command bash -c "cd proofs && lake build"; \
 	fi
 
-check: fmt-check lint build-check test rust-check proof-check
+check: fmt-check lint build-check test rust-check harness-check proof-check
 
 
 hooks:

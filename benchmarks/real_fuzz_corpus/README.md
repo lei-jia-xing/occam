@@ -120,10 +120,17 @@ In accordance with the thesis specification and DBMS fuzzing research standards:
 Each `.meta.json` file pairs with the raw `.sql` file to drive automated reduction with Occam:
 
 ```bash
-# Example reduction run with Occam on PostgreSQL:
+# Example reduction run with Occam on PostgreSQL. Use the exact
+# crash_signature.expected_signature value from the case's .meta.json.
 occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
-  --oracle "python3 harness/crash_oracle.py --dbms postgres --expected-signature 'clauses != NIL'" \
-  --reset "./harness/reset_db.sh --dbms postgres" \
+  --oracle "python3 harness/crash_oracle.py --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
+  --reset "./harness/reset_db.sh --dbms postgres --container-name occam-target-pg" \
   --dialect postgres \
+  --timeout 10 \
+  --jobs 1 \
   --out /tmp/occam_reduced/
 ```
+
+The oracle requires `--log-file` or `--container-name`; it does not treat client
+stderr as crash evidence. Use `--jobs 1` because all workers would share
+`occam_test`.
