@@ -66,6 +66,22 @@ pub(crate) fn session_init(config: &ParseConfig) -> SessionInit {
     }
 }
 
+fn facts_binary(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
+    let units = parse_units(sql, config).ok()?;
+    let columns = if config.column_bundles {
+        crate::columns::assemble_columns(&units, sql)
+    } else {
+        Vec::new()
+    };
+    let response = NativeResponse {
+        initial_session: session_init(config),
+        units,
+        columns,
+    };
+    crate::binary::encode_native_response(&response).ok()
+}
+
+#[allow(dead_code)]
 fn facts_json(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
     let units = parse_units(sql, config).ok()?;
     let columns = if config.column_bundles {
@@ -151,8 +167,8 @@ pub unsafe extern "C" fn occam_sql_parse(
                 std::slice::from_raw_parts(data, len)
             };
             let sql = std::str::from_utf8(bytes).map_err(|_| 3)?;
-            let json = facts_json(sql, &config).ok_or(4)?;
-            put_bytes(json, out_data, out_len);
+            let payload = facts_binary(sql, &config).ok_or(4)?;
+            put_bytes(payload, out_data, out_len);
             Ok(())
         }));
         match result {

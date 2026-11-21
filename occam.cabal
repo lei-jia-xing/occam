@@ -66,6 +66,7 @@ library
                     , Occam.Version
     other-modules:    Paths_occam
                     , Occam.Json
+                    , Occam.Parser.Binary
                     , Occam.Parser.Facts
                     , Occam.Parser.Native
                     , Occam.Parser.Types
@@ -83,6 +84,7 @@ library
                     , Occam.Dependency.Transaction
                     , Occam.Dependency.Write
     build-depends:    base >= 4.18 && < 5
+                    , binary >= 0.8 && < 0.10
                     , bytestring >= 0.11 && < 0.13
                     , text >= 2.0 && < 2.2
                     , containers >= 0.6 && < 0.9

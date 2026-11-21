@@ -44,6 +44,7 @@ import Occam.Facts (
     StatementUnit (..),
  )
 import Occam.Metrics (MetricsStore, ParseKind (..), recordParseTiming)
+import Occam.Parser.Binary (binaryMagic, decodeBinaryResponse)
 import Occam.Parser.Facts (factDumpJson)
 import Occam.Parser.Native (
     NativeResponse (..),
@@ -108,12 +109,18 @@ parseSQLTimed store kind options sql =
                                     let free = c_freeSQL pointer length'
                                         run = restore $ do
                                             bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
-                                            let parsed = case eitherDecodeStrict' bytes of
-                                                    Left message -> Left (ParserError ParserDecodeFailure (T.pack message))
-                                                    Right response -> do
-                                                        units <- makeUnits sql (responseUnits response)
-                                                        columns <- validateColumns sql units (responseColumns response)
-                                                        pure (ParsedSQL (responseInitialSession response) units columns)
+                                            let buildResponse response = do
+                                                    units <- makeUnits sql (responseUnits response)
+                                                    columns <- validateColumns sql units (responseColumns response)
+                                                    pure (ParsedSQL (responseInitialSession response) units columns)
+                                                parsed =
+                                                    if BS.isPrefixOf binaryMagic bytes
+                                                        then case decodeBinaryResponse (BS.drop (BS.length binaryMagic) bytes) of
+                                                            Left message -> Left (ParserError ParserDecodeFailure message)
+                                                            Right response -> buildResponse response
+                                                        else case eitherDecodeStrict' bytes of
+                                                            Left message -> Left (ParserError ParserDecodeFailure (T.pack message))
+                                                            Right response -> buildResponse response
                                             case store of
                                                 Nothing -> pure parsed
                                                 Just _ -> evaluate (forceParsed parsed)

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 mod actions;
+pub(crate) mod binary;
 mod columns;
 mod edits;
 mod ffi;
