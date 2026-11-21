@@ -256,7 +256,7 @@ tests =
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 100000 "exit 0"
-                config = evaluationConfig True (Just 300000) Nothing
+                config = evaluationConfig True (Just 800000) Nothing
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
                     threadDelay 2000000
