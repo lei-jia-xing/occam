@@ -356,12 +356,11 @@ findConditionEnd bs = go 0 False 0
 bloatExpressions :: ByteString -> Gen ByteString
 bloatExpressions bs = do
     let stmts = splitStatements bs
-    let whereIndices = [i | (i, s) <- zip [0 ..] stmts, "WHERE " `BSC.isInfixOf` s]
-    case whereIndices of
+    let whereStmts = [(i, s) | (i, s) <- zip [0 ..] stmts, "WHERE " `BSC.isInfixOf` s]
+    case whereStmts of
         [] -> pure bs
         _ -> do
-            targetIdx <- elements whereIndices
-            let targetStmt = stmts !! targetIdx
+            (targetIdx, targetStmt) <- elements whereStmts
             let (beforeWhere, fromWhere) = BSC.breakSubstring "WHERE " targetStmt
             if BSC.null fromWhere
                 then pure bs

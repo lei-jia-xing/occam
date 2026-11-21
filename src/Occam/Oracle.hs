@@ -337,12 +337,15 @@ candidateOverrides workDir originalDir =
     , ("TEMP", workDir)
     ]
 
+baseEnvironment :: IO [(String, String)]
+baseEnvironment =
+    filter (not . isCandidateOverrideKey . fst) <$> getEnvironment
+
 candidateEnvironment :: FilePath -> IO [(String, String)]
 candidateEnvironment workDir = do
-    current <- getEnvironment
+    base <- baseEnvironment
     originalDir <- getCurrentDirectory
-    pure
-        (candidateOverrides workDir originalDir ++ filter (not . isCandidateOverrideKey . fst) current)
+    pure (candidateOverrides workDir originalDir ++ base)
 
 {- | Oracle launch context resolved once per reduction: the executable path
 plus the process environment minus the per-candidate overrides. Resolving
@@ -363,12 +366,12 @@ resolveOracleContext OracleConfig {..} = do
             resolvedBin <- resolveExecutable bin
             pure (RawCommand resolvedBin args)
         ShellCommand cmd -> pure (ShellCommand cmd)
-    current <- getEnvironment
+    base <- baseEnvironment
     originalDir <- getCurrentDirectory
     pure
         OracleContext
             { contextCmdSpec = spec
-            , contextBaseEnvironment = filter (not . isCandidateOverrideKey . fst) current
+            , contextBaseEnvironment = base
             , contextOriginalDir = originalDir
             }
 

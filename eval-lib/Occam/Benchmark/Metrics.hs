@@ -29,7 +29,7 @@ import Data.ByteString.Lazy qualified as BSL
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -55,6 +55,7 @@ data RunSummary = RunSummary
     , runCase :: !(Maybe Text)
     , runArm :: !(Maybe Text)
     , runRep :: !(Maybe Text)
+    , runNameWarning :: !(Maybe Text)
     , runReducedBytes :: !(Maybe Int)
     , runReducedStatements :: !(Maybe Int)
     , runReductionRatio :: !(Maybe Double)
@@ -75,6 +76,7 @@ instance ToJSON RunSummary where
             , "case" .= runCase
             , "arm" .= runArm
             , "rep" .= runRep
+            , "name_warning" .= runNameWarning
             , "reduced_bytes" .= runReducedBytes
             , "reduced_statements" .= runReducedStatements
             , "reduction_ratio" .= runReductionRatio
@@ -94,6 +96,7 @@ instance FromJSON RunSummary where
             <*> o .:? "case"
             <*> o .:? "arm"
             <*> o .:? "rep"
+            <*> o .:? "name_warning"
             <*> o .:? "reduced_bytes"
             <*> o .:? "reduced_statements"
             <*> o .:? "reduction_ratio"
@@ -135,16 +138,42 @@ engineOverheadMicros (Just MetricsSnapshot {..}) =
         candidateBuild = sum [candidateBuildMicros c | c <- Map.elems snapshotFamilies]
      in Just (ffi + decode + candidateBuild)
 
-parseRunParts :: Text -> (Maybe Text, Maybe Text, Maybe Text)
+data RunNameParts = RunNameParts
+    { partCase :: !(Maybe Text)
+    , partArm :: !(Maybe Text)
+    , partRep :: !(Maybe Text)
+    , partWarning :: !(Maybe Text)
+    }
+    deriving stock (Eq, Show)
+
+{- | Split @case__arm__rep@ on the first two separators. Any extra separators
+belong to the repetition, so newer run names do not lose their suffix. Names
+with fewer than three non-empty parts carry an explicit warning instead of
+silently producing three Nothings.
+-}
+parseRunParts :: Text -> RunNameParts
 parseRunParts name =
     case T.splitOn "__" name of
-        [c, a, r] -> (Just c, Just a, Just r)
-        _ -> (Nothing, Nothing, Nothing)
+        c : a : r : rest
+            | not (any T.null [c, a, r]) ->
+                RunNameParts
+                    { partCase = Just c
+                    , partArm = Just a
+                    , partRep = Just (T.intercalate "__" (r : rest))
+                    , partWarning = Nothing
+                    }
+        _ ->
+            RunNameParts
+                { partCase = Nothing
+                , partArm = Nothing
+                , partRep = Nothing
+                , partWarning = Just ("expected case__arm__rep, got " <> T.pack (show name))
+                }
 
 -- | Summarize a successful run with its full stats.
 summarizeStats :: Text -> Stats -> RunSummary
 summarizeStats name stats =
-    let (c, a, r) = parseRunParts name
+    let parts = parseRunParts name
         m = evaluation_metrics stats
         curve = evaluationCurve m
         peak = maximum (0 : [pointCallIndex p | p <- curve])
@@ -156,9 +185,10 @@ summarizeStats name stats =
              in if rSecs > 0 then rSecs else elapsed_seconds stats
      in RunSummary
             { runName = name
-            , runCase = c
-            , runArm = a
-            , runRep = r
+            , runCase = partCase parts
+            , runArm = partArm parts
+            , runRep = partRep parts
+            , runNameWarning = partWarning parts
             , runReducedBytes = Just (reduced_bytes stats)
             , runReducedStatements = Just (reduced_statements stats)
             , runReductionRatio = Just (reduction_ratio stats)
@@ -174,12 +204,13 @@ summarizeStats name stats =
 -- | Summary for a missing or corrupt run directory.
 missingStatsSummary :: Text -> RunSummary
 missingStatsSummary name =
-    let (c, a, r) = parseRunParts name
+    let parts = parseRunParts name
      in RunSummary
             { runName = name
-            , runCase = c
-            , runArm = a
-            , runRep = r
+            , runCase = partCase parts
+            , runArm = partArm parts
+            , runRep = partRep parts
+            , runNameWarning = partWarning parts
             , runReducedBytes = Nothing
             , runReducedStatements = Nothing
             , runReductionRatio = Nothing
@@ -219,40 +250,45 @@ summarizeDirectory dir = do
                                 Left _ -> pure (Just (missingStatsSummary (T.pack name)))
                                 Right stats -> pure (Just (summarizeStats (T.pack name) stats))
 
+-- | A typed Markdown column: header, value accessor, and missing-value formatter.
+type MarkdownColumn = (Text, RunSummary -> Maybe Text, Maybe Text -> Text)
+
+noneOr :: Maybe Text -> Text
+noneOr = fromMaybe "None"
+
+showText :: (Show a) => a -> Text
+showText = T.pack . show
+
+formatFloat :: Double -> Text
+formatFloat x = T.pack (showFFloat (Just 4) x "")
+
+formatOptional :: (a -> Text) -> (RunSummary -> Maybe a) -> RunSummary -> Maybe Text
+formatOptional format value summary = format <$> value summary
+
+markdownColumns :: [MarkdownColumn]
+markdownColumns =
+    [ ("run", Just . runName, noneOr)
+    , ("reduced_bytes", formatOptional showText runReducedBytes, noneOr)
+    , ("reduced_statements", formatOptional showText runReducedStatements, noneOr)
+    , ("reduction_ratio", formatOptional formatFloat runReductionRatio, noneOr)
+    , ("oracle_attempts", formatOptional showText runOracleAttempts, noneOr)
+    , ("accepted", formatOptional showText runAccepted, noneOr)
+    , ("cache_hits", formatOptional showText runCacheHits, noneOr)
+    , ("attempt_auc", formatOptional formatFloat runAttemptAuc, noneOr)
+    , ("engine_overhead_us", formatOptional showText runEngineOverheadUs, noneOr)
+    , ("elapsed_seconds", formatOptional formatFloat runElapsedSeconds, noneOr)
+    , ("status", Just . runStatus, noneOr)
+    ]
+
 -- | Format runs as a GitHub Flavored Markdown table matching Tier 3 4D schema.
 renderMarkdownReport :: [RunSummary] -> Text
 renderMarkdownReport runs =
-    let columns =
-            [ "run"
-            , "reduced_bytes"
-            , "reduced_statements"
-            , "reduction_ratio"
-            , "oracle_attempts"
-            , "accepted"
-            , "cache_hits"
-            , "attempt_auc"
-            , "engine_overhead_us"
-            , "elapsed_seconds"
-            , "status"
-            ]
-        header = "| " <> T.intercalate " | " columns <> " |"
-        sep = "|" <> T.intercalate "|" (replicate (length columns) "---") <> "|"
-        formatFloat x = T.pack (showFFloat (Just 4) x "")
-        renderRow RunSummary {..} =
-            let formatField name = case name of
-                    "run" -> runName
-                    "reduced_bytes" -> maybe "None" (T.pack . show) runReducedBytes
-                    "reduced_statements" -> maybe "None" (T.pack . show) runReducedStatements
-                    "reduction_ratio" -> maybe "None" formatFloat runReductionRatio
-                    "oracle_attempts" -> maybe "None" (T.pack . show) runOracleAttempts
-                    "accepted" -> maybe "None" (T.pack . show) runAccepted
-                    "cache_hits" -> maybe "None" (T.pack . show) runCacheHits
-                    "attempt_auc" -> maybe "None" formatFloat runAttemptAuc
-                    "engine_overhead_us" -> maybe "None" (T.pack . show) runEngineOverheadUs
-                    "elapsed_seconds" -> maybe "None" formatFloat runElapsedSeconds
-                    "status" -> runStatus
-                    _ -> ""
-             in "| " <> T.intercalate " | " (map formatField columns) <> " |"
+    let headers = map (\(name, _, _) -> name) markdownColumns
+        header = "| " <> T.intercalate " | " headers <> " |"
+        sep = "|" <> T.intercalate "|" (replicate (length markdownColumns) "---") <> "|"
+        renderField summary (_, accessor, formatter) = formatter (accessor summary)
+        renderRow summary =
+            "| " <> T.intercalate " | " (map (renderField summary) markdownColumns) <> " |"
         lines' =
             [ "# Benchmark report"
             , ""

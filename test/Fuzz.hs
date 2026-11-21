@@ -79,6 +79,9 @@ renderScriptSQL :: FuzzScript -> ByteString
 renderScriptSQL FuzzScript {..} =
     TE.encodeUtf8 (T.intercalate "\n" (scriptDdl ++ scriptDml))
 
+lastMay :: [a] -> Maybe a
+lastMay = foldl' (\_ x -> Just x) Nothing
+
 -- ----------------------------------------------------------------------------
 -- SQL Rendering Helpers
 -- ----------------------------------------------------------------------------
@@ -292,20 +295,31 @@ genDropDummy dummyId =
     pure $ "DROP TABLE IF EXISTS dummy_tbl_" <> T.pack (show dummyId) <> ";"
 
 genTableDef :: Text -> Maybe (Text, Text) -> Gen TableDef
-genTableDef name mFk = do
+genTableDef name mFk = fst <$> genTableDefWithLast name mFk
+
+{- | Generate a table together with its last generated column, so callers can
+target a column without a partial list index.
+-}
+genTableDefWithLast :: Text -> Maybe (Text, Text) -> Gen (TableDef, ColumnDef)
+genTableDefWithLast name mFk = do
     extraColsCount <- chooseInt (2, 4)
-    extraCols <- mapM (genCol mFk) [1 .. extraColsCount]
-    let pkCol =
+    firstExtra <- genCol mFk (1 :: Int)
+    restExtra <- mapM (genCol mFk) [2 .. extraColsCount]
+    let extraCols = firstExtra : restExtra
+        lastExtra = foldl' (\_ col -> col) firstExtra restExtra
+        pkCol =
             ColumnDef
                 { colName = "id"
                 , colType = SqlInt
                 , colConstraints = ["PRIMARY KEY"]
                 }
     pure
-        TableDef
+        ( TableDef
             { tableName = name
             , tableCols = pkCol : extraCols
             }
+        , lastExtra
+        )
     where
         genCol (Just (parentTbl, parentCol)) 1 =
             pure
@@ -340,9 +354,9 @@ genDistractor tbls tag = do
         , (1, genAlterAdd tbl tag)
         ,
             ( 1
-            , if length (tableCols tbl) > 2
-                then genAlterDrop tbl (colName (last (tableCols tbl)))
-                else genAlterAdd tbl tag
+            , case lastMay (tableCols tbl) of
+                Just col | length (tableCols tbl) > 2 -> genAlterDrop tbl (colName col)
+                _ -> genAlterAdd tbl tag
             )
         , (1, genCreateIndex tbl tag)
         , (1, genDropDummy tag)
@@ -367,8 +381,8 @@ genFuzzScript = do
         needleStr = "crash_needle_" <> T.pack (show tag)
         needleQuoted = "'" <> needleStr <> "'"
 
-    targetTblBase <- genTableDef targetTblName Nothing
-    let targetCol = colName (last (tableCols targetTblBase))
+    (targetTblBase, targetLastCol) <- genTableDefWithLast targetTblName Nothing
+    let targetCol = colName targetLastCol
         targetTbl = targetTblBase
 
     (target, initialStmts, targetStmts) <- case targetChoice of

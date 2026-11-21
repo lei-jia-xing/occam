@@ -16,7 +16,7 @@ module Occam.Oracle.Sqlite (
     sqlDataToValue,
 ) where
 
-import Control.Exception.Safe (SomeException, try)
+import Control.Exception.Safe (SomeException, displayException, fromException, try)
 import Control.Monad (forM_, unless)
 import Data.Aeson (
     FromJSON (..),
@@ -40,6 +40,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Database.SQLite3 (
     SQLData (..),
+    SQLError (..),
     Statement,
     StepResult (..),
     columns,
@@ -142,11 +143,27 @@ defaultCandidateTimeoutMicros = 100000
 {- | Failure classes for in-process SQLite execution. Keeping timeout distinct
 from parse/runtime failures prevents infrastructure problems from being
 reported as ordinary predicate rejections.
+
+'SqliteExecutionError' is reserved for SQLite's own diagnostics (syntax errors,
+constraint violations, row mismatches) and remains a candidate rejection.
+Non-SQLite exceptions while running the candidate ('SqliteInfrastructureError')
+are evaluator faults and must stay inconclusive.
 -}
 data SqliteError
     = SqliteTimeout
     | SqliteExecutionError !Text
+    | SqliteInfrastructureError !Text
     deriving (Eq, Show)
+
+classifySqliteException :: SomeException -> SqliteError
+classifySqliteException err =
+    case fromException err of
+        Just sqlErr ->
+            let details = sqlErrorDetails sqlErr
+                context = sqlErrorContext sqlErr
+                message = if T.null details then T.pack (show (sqlError sqlErr)) else details
+             in SqliteExecutionError (if T.null context then message else context <> ": " <> message)
+        Nothing -> SqliteInfrastructureError (T.pack (displayException err))
 
 {- | Execute candidate SQL against a fresh in-memory SQLite database with
 foreign key enforcement enabled. Automatically interrupts runaway queries
@@ -176,7 +193,7 @@ executeSqliteCandidateDetailedTimeout micros sql = do
                         Nothing -> Left SqliteTimeout
                         Just rows -> Right rows
     pure $ case res of
-        Left (err :: SomeException) -> Left (SqliteExecutionError (T.pack (show err)))
+        Left (err :: SomeException) -> Left (classifySqliteException err)
         Right inner -> inner
 
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
@@ -185,6 +202,7 @@ executeSqliteCandidateTimeout micros sql = do
     pure $ case res of
         Left SqliteTimeout -> Left "timeout"
         Left (SqliteExecutionError err) -> Left err
+        Left (SqliteInfrastructureError err) -> Left ("infrastructure error: " <> err)
         Right rows -> Right rows
 
 executeSqliteCandidate :: ByteString -> IO (Either Text [[Value]])
@@ -206,14 +224,16 @@ generateSqliteContract sql = do
 
 {- | In-process contract Oracle for candidate reduction. Returns OracleAccepted
 iff the candidate executes cleanly against SQLite :memory: and produces the
-exact expected rowset. Timeouts are inconclusive; execution errors (syntax
-errors, constraint violations) are rejections.
+exact expected rowset. Timeouts and non-SQL infrastructure faults are
+inconclusive, so evaluator failures never discard a candidate; SQLite execution
+errors (syntax errors, constraint violations) remain rejections.
 -}
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate = do
     res <- executeSqliteCandidateDetailedTimeout micros candidate
     case res of
         Left SqliteTimeout -> pure OracleInconclusive
+        Left (SqliteInfrastructureError _) -> pure OracleInconclusive
         Left (SqliteExecutionError _) -> pure OracleRejected
         Right rows
             | rows == contractExpectedRows contract -> pure OracleAccepted
@@ -229,6 +249,7 @@ sqliteContractObservation contract candidate = do
     pure $ case res of
         Left SqliteTimeout -> OracleTimedOut
         Left (SqliteExecutionError err) -> OracleIOFailed err
+        Left (SqliteInfrastructureError err) -> OracleIOFailed err
         Right rows
             | rows == contractExpectedRows contract -> OracleFinished ExitSuccess
             | otherwise -> OracleFinished (ExitFailure 1)

@@ -945,6 +945,21 @@ sqliteOracleTests =
                             assertBool "error detail is preserved" (not (T.null err))
                         other ->
                             assertFailure ("expected OracleIOFailed, got " ++ show other)
+        , testCase "sqliteContractOracle treats non-SQL execution faults as inconclusive" $ do
+            let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
+                invalidUtf8 = BS.pack [0x53, 0x45, 0x4c, 0x45, 0x43, 0x54, 0x20, 0xff, 0x3b]
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    outcome <- sqliteContractOracle contract invalidUtf8
+                    assertEqual "infrastructure fault is inconclusive" OracleInconclusive outcome
+                    observation <- sqliteContractObservation contract invalidUtf8
+                    case observation of
+                        OracleIOFailed err ->
+                            assertBool "infrastructure detail is preserved" (not (T.null err))
+                        other ->
+                            assertFailure ("expected OracleIOFailed, got " ++ show other)
         , testCase "in-process reduction removes dead noise table" $ do
             let sql =
                     "CREATE TABLE noise (x INT);\nINSERT INTO noise VALUES (99);\nCREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nSELECT count(*) FROM t;"
@@ -1003,6 +1018,7 @@ benchmarkMetricsTests =
                         , runCase = Just "caseA"
                         , runArm = Just "default"
                         , runRep = Just "r1"
+                        , runNameWarning = Nothing
                         , runReducedBytes = Just 200
                         , runReducedStatements = Just 2
                         , runReductionRatio = Just 0.2
@@ -1019,6 +1035,17 @@ benchmarkMetricsTests =
             assertBool "has header" (T.isInfixOf "| run | reduced_bytes |" md)
             assertBool "has run1" (T.isInfixOf "caseA__default__r1" md)
             assertBool "has missing-stats" (T.isInfixOf "missing-stats" md)
+        , testCase "run name parsing keeps extra separators and flags malformed names" do
+            let extended = missingStatsSummary "caseA__default__r1__post"
+                malformed = missingStatsSummary "caseA__default"
+            assertEqual "case parsed" (Just "caseA") (runCase extended)
+            assertEqual "arm parsed" (Just "default") (runArm extended)
+            assertEqual "extra separators stay in repetition" (Just "r1__post") (runRep extended)
+            assertEqual "valid name has no warning" Nothing (runNameWarning extended)
+            assertEqual "malformed case is not guessed" Nothing (runCase malformed)
+            assertEqual "malformed arm is not guessed" Nothing (runArm malformed)
+            assertEqual "malformed rep is not guessed" Nothing (runRep malformed)
+            assertBool "malformed name carries warning" (maybe False (not . T.null) (runNameWarning malformed))
         , testCase "generateReportForDirectory scans run directories and writes reports" do
             tempDir <- getTemporaryDirectory
             let testDir = tempDir </> "occam-test-benchmark-metrics"
