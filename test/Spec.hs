@@ -495,23 +495,156 @@ phase5Tests =
                     assertEqual "default strategy" (Just (String "full")) (Map.lookup "strategy" defaults)
                     assertEqual "default log level" (Just (String "warn")) (Map.lookup "log_level" defaults)
                     assertEqual "json log level" (Just (String "info")) (Map.lookup "log_level_json" defaults)
-        , testCase "--completion generates valid self-contained shell scripts" $ do
+        , testCase "--completion generates valid shell scripts and supports dynamic completion" $ do
             (bCode, bOut, _) <- runOccamCLI ["--completion", "bash"]
             assertEqual "--completion bash exit code" ExitSuccess bCode
             assertBool "bash completion missing function" ("_occam()" `isInfixOf` bOut)
-            assertBool "bash completion missing complete" ("complete -F _occam" `isInfixOf` bOut)
-            assertBool "bash completion missing --print-defaults" ("--print-defaults" `isInfixOf` bOut)
+            assertBool "bash completion missing complete" ("-F _occam" `isInfixOf` bOut)
+            assertBool "bash completion missing dynamic hook" ("--bash-completion-index" `isInfixOf` bOut)
 
             (zCode, zOut, _) <- runOccamCLI ["--completion", "zsh"]
             assertEqual "--completion zsh exit code" ExitSuccess zCode
             assertBool "zsh completion missing compdef" ("#compdef occam" `isInfixOf` zOut)
-            assertBool "zsh completion missing _arguments" ("_arguments" `isInfixOf` zOut)
-            assertBool "zsh completion missing --print-defaults" ("--print-defaults" `isInfixOf` zOut)
+            assertBool "zsh completion missing compadd" ("compadd" `isInfixOf` zOut)
+            assertBool "zsh completion missing dynamic hook" ("--bash-completion-enriched" `isInfixOf` zOut)
 
             (fCode, fOut, _) <- runOccamCLI ["--completion", "fish"]
             assertEqual "--completion fish exit code" ExitSuccess fCode
-            assertBool "fish completion missing complete commands" ("complete -c occam" `isInfixOf` fOut)
-            assertBool "fish completion missing print-defaults" ("print-defaults" `isInfixOf` fOut)
+            assertBool "fish completion missing complete command" ("--command occam" `isInfixOf` fOut)
+            assertBool "fish completion missing function" ("_occam" `isInfixOf` fOut)
+            assertBool "fish completion missing dynamic hook" ("--bash-completion-enriched" `isInfixOf` fOut)
+
+            -- Dynamic option completion
+            (cCode, cOut, _) <-
+                runOccamCLI
+                    ["--bash-completion-index", "1", "--bash-completion-word", "occam", "--bash-completion-word", "--"]
+            assertEqual "completion options exit code" ExitSuccess cCode
+            assertBool "completion includes --print-defaults" ("--print-defaults" `isInfixOf` cOut)
+            assertBool "completion includes --dialect" ("--dialect" `isInfixOf` cOut)
+            assertBool "completion includes --strategy" ("--strategy" `isInfixOf` cOut)
+            assertBool "completion includes --completion" ("--completion" `isInfixOf` cOut)
+
+            -- Dynamic argument completion (completeWith)
+            (dCode, dOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--dialect"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "dialect completion exit code" ExitSuccess dCode
+            assertBool "completion includes postgresql" ("postgresql" `isInfixOf` dOut)
+            assertBool "completion includes mysql" ("mysql" `isInfixOf` dOut)
+            assertBool "completion includes sqlite" ("sqlite" `isInfixOf` dOut)
+
+            (sCode, sOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--strategy"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "strategy completion exit code" ExitSuccess sCode
+            assertBool "completion includes full" ("full" `isInfixOf` sOut)
+            assertBool "completion includes ddmin-only" ("ddmin-only" `isInfixOf` sOut)
+            assertBool "completion includes audit-only" ("audit-only" `isInfixOf` sOut)
+
+            (mCode, mOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--completion"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "shell completion exit code" ExitSuccess mCode
+            assertBool "completion includes bash" ("bash" `isInfixOf` mOut)
+            assertBool "completion includes zsh" ("zsh" `isInfixOf` mOut)
+            assertBool "completion includes fish" ("fish" `isInfixOf` mOut)
+
+            (colCode, colOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--color"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "color completion exit code" ExitSuccess colCode
+            assertBool "completion includes auto" ("auto" `isInfixOf` colOut)
+            assertBool "completion includes always" ("always" `isInfixOf` colOut)
+            assertBool "completion includes never" ("never" `isInfixOf` colOut)
+
+            (llCode, llOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--log-level"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "log-level completion exit code" ExitSuccess llCode
+            assertBool "completion includes debug" ("debug" `isInfixOf` llOut)
+            assertBool "completion includes info" ("info" `isInfixOf` llOut)
+            assertBool "completion includes warn" ("warn" `isInfixOf` llOut)
+            assertBool "completion includes error" ("error" `isInfixOf` llOut)
+
+            (lfCode, lfOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--log-format"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "log-format completion exit code" ExitSuccess lfCode
+            assertBool "completion includes text" ("text" `isInfixOf` lfOut)
+            assertBool "completion includes json" ("json" `isInfixOf` lfOut)
+
+            (cmCode, cmOut, _) <-
+                runOccamCLI
+                    [ "--bash-completion-index"
+                    , "2"
+                    , "--bash-completion-word"
+                    , "occam"
+                    , "--bash-completion-word"
+                    , "--column-mode"
+                    , "--bash-completion-word"
+                    , ""
+                    ]
+            assertEqual "column-mode completion exit code" ExitSuccess cmCode
+            assertBool "completion includes off" ("off" `isInfixOf` cmOut)
+            assertBool "completion includes single" ("single" `isInfixOf` cmOut)
+            assertBool "completion includes atomic" ("atomic" `isInfixOf` cmOut)
+
+            -- Shell completion case-insensitivity and invalid shell rejection
+            (upperCode, upperOut, _) <- runOccamCLI ["--completion", "BASH"]
+            assertEqual "--completion BASH exit code" ExitSuccess upperCode
+            assertBool "case-insensitive completion missing function" ("_occam()" `isInfixOf` upperOut)
+
+            (invCode, _, invErr) <- runOccamCLI ["--completion", "powershell"]
+            assertEqual "--completion powershell exit failure" (ExitFailure 1) invCode
+            assertBool "invalid shell error message" ("Expected 'bash', 'zsh', or 'fish'" `isInfixOf` invErr)
         , testCase "CLI rejects --stats paths that collide with input or output" $
             withCLIInput "SELECT 1;" $ \input outFile -> do
                 (inputCode, _, inputErr) <-

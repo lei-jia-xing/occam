@@ -1,6 +1,11 @@
 module Main (main) where
 
-import Completion (ShellType (..), generateCompletion, parseShellType)
+import Completion (
+    ShellType (..),
+    generateCompletion,
+    parseShellType,
+    supportedShells,
+ )
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, when)
 import Data.Aeson (Value, encode, object, toJSON, (.=))
@@ -78,9 +83,9 @@ import Occam.UI (
 import Options.Applicative (
     Parser,
     ParserInfo,
+    action,
     auto,
-    bashCompleter,
-    completer,
+    completeWith,
     eitherReader,
     execParser,
     flag',
@@ -419,6 +424,7 @@ actionParser =
                     ( long "completion"
                         <> metavar "SHELL"
                         <> help "Generate shell completion script (bash, zsh, fish) and exit"
+                        <> completeWith (map fst supportedShells)
                     )
             )
         <|> (ActionNormal <$> rawOptionsParser)
@@ -429,7 +435,7 @@ rawOptionsParser =
         <$> strArgument
             ( metavar "INPUT.sql"
                 <> help "Path to fuzz SQL input, or '-' for stdin"
-                <> completer (bashCompleter "file")
+                <> action "file"
             )
         <*> optional
             ( strOption
@@ -445,7 +451,7 @@ rawOptionsParser =
                     <> short 'o'
                     <> metavar "PATH"
                     <> help "Output SQL file path, or '-' for stdout (default: <input>.min.sql or stdout)"
-                    <> completer (bashCompleter "file")
+                    <> action "file"
                 )
             )
         <*> switch
@@ -458,7 +464,7 @@ rawOptionsParser =
                 ( long "stats"
                     <> metavar "FILE"
                     <> help "Write JSON reduction statistics to FILE"
-                    <> completer (bashCompleter "file")
+                    <> action "file"
                 )
             )
         <*> optional
@@ -481,6 +487,7 @@ rawOptionsParser =
                         ( long "log-level"
                             <> metavar "LEVEL"
                             <> help "Log severity level: debug, info, warn, or error (default: warn)"
+                            <> completeWith ["debug", "info", "warn", "error"]
                         )
               )
                 <|> pure (rawLogLevel defaultRawOptions)
@@ -491,6 +498,7 @@ rawOptionsParser =
                 <> metavar "FORMAT"
                 <> value (rawLogFormat defaultRawOptions)
                 <> help "Log output format: text or json (default: text)"
+                <> completeWith ["text", "json"]
             )
         <*> switch
             ( long "verbose"
@@ -507,6 +515,7 @@ rawOptionsParser =
                 <> metavar "WHEN"
                 <> value (rawColor defaultRawOptions)
                 <> help "Colorize terminal output: auto, always, or never (default: auto; honors NO_COLOR)"
+                <> completeWith ["auto", "always", "never"]
             )
         <*> optional
             ( option
@@ -564,6 +573,7 @@ rawOptionsParser =
                 <> value (rawDialect defaultRawOptions)
                 <> help
                     "SQL dependency dialect: generic (default), postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
+                <> completeWith (map (T.unpack . dialectName) [minBound .. maxBound])
             )
         <*> strategyParser
         <*> switch
@@ -588,6 +598,7 @@ strategyParser =
         ( long "strategy"
             <> metavar "STRATEGY"
             <> help "Reduction strategy: full (default), ddmin-only, or audit-only"
+            <> completeWith ["full", "ddmin-only", "audit-only"]
         )
         <|> pure (rawStrategy defaultRawOptions)
 
@@ -598,6 +609,7 @@ columnModeParser =
         ( long "column-mode"
             <> metavar "MODE"
             <> help "Column co-reduction mode: off (default), single, or atomic (requires --intra-statement)"
+            <> completeWith ["off", "single", "atomic"]
         )
         <|> pure (rawColumnMode defaultRawOptions)
 
@@ -1146,12 +1158,12 @@ writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath s
         hFlush stdout
 
 runWithinBudget :: Integer -> Maybe Integer -> IO a -> IO (Maybe a)
-runWithinBudget _ Nothing action = Just <$> action
-runWithinBudget started (Just totalMicros) action = do
+runWithinBudget _ Nothing act = Just <$> act
+runWithinBudget started (Just totalMicros) act = do
     now <- toInteger <$> getMonotonicTimeNSec
     let remaining = max 0 (totalMicros - (now - started) `div` 1000)
         timeoutMicros = fromInteger (min remaining (toInteger (maxBound :: Int)))
-    timeout timeoutMicros action
+    timeout timeoutMicros act
 
 countStatementsForCLI :: Logger -> SQLDialect -> BS.ByteString -> IO Int
 countStatementsForCLI logger dialect sql = do
