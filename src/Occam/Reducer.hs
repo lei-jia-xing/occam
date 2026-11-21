@@ -45,7 +45,7 @@ import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.List (sortOn)
+import Data.List (find, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Set (Set)
@@ -1172,12 +1172,12 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
 -- | Reparse after each accepted edit and resweep until a full cycle makes no progress.
 runSyntaxFixedPoint :: SyntaxContext -> IORef SyntaxStats -> ByteString -> IO ByteString
 runSyntaxFixedPoint context stats currentSQL = do
-    (startCount, phases, bundles) <- generateSyntaxCandidates context currentSQL
+    (startUnits, phases, bundles) <- parseSyntaxSnapshot context currentSQL
     sweepSyntaxCategories
         context
         stats
         currentSQL
-        startCount
+        startUnits
         phases
         bundles
         (syntaxCategoryOrder (syntaxMode context))
@@ -1187,43 +1187,170 @@ sweepSyntaxCategories ::
     SyntaxContext ->
     IORef SyntaxStats ->
     ByteString ->
-    Int ->
+    [StatementUnit] ->
     [(ParserEditCategory, [ParserEdit])] ->
     [ColumnTarget] ->
     [ParserEditCategory] ->
     Bool ->
     IO ByteString
-sweepSyntaxCategories context stats currentSQL currentCount phases bundles [] shrunk
-    | shrunk =
+sweepSyntaxCategories context stats currentSQL _ _ _ [] shrunk
+    | shrunk = do
+        (freshUnits, freshPhases, freshBundles) <- parseSyntaxSnapshot context currentSQL
         sweepSyntaxCategories
             context
             stats
             currentSQL
-            currentCount
-            phases
-            bundles
+            freshUnits
+            freshPhases
+            freshBundles
             (syntaxCategoryOrder (syntaxMode context))
             False
     | otherwise = pure currentSQL
-sweepSyntaxCategories context stats currentSQL currentCount phases bundles (category : rest) shrunk = do
-    (nextSQL, nextCount, nextPhases, nextBundles, categoryShrunk) <-
-        exhaustSyntaxCategory context stats currentSQL currentCount phases bundles category
+sweepSyntaxCategories context stats currentSQL currentUnits phases bundles (category : rest) shrunk = do
+    (nextSQL, nextUnits, nextPhases, nextBundles, categoryShrunk) <-
+        exhaustSyntaxCategory context stats currentSQL currentUnits phases bundles category
     sweepSyntaxCategories
         context
         stats
         nextSQL
-        nextCount
+        nextUnits
         nextPhases
         nextBundles
         rest
         (shrunk || categoryShrunk)
 
--- | Parse one snapshot into ordered edit buckets and unblocked column bundles.
-generateSyntaxCandidates ::
+-- | Shift statement spans by a byte offset.
+shiftStatementUnit :: Int -> StatementUnit -> StatementUnit
+shiftStatementUnit delta unit =
+    unit
+        { unitStatement = shiftStatement delta (unitStatement unit)
+        , unitFacts = fmap (shiftStatementFacts delta) (unitFacts unit)
+        }
+
+shiftStatement :: Int -> Statement -> Statement
+shiftStatement delta stmt =
+    stmt {stmtSpan = shiftSpan delta (stmtSpan stmt)}
+
+shiftSpan :: Int -> Span -> Span
+shiftSpan delta (Span start end) =
+    Span (start + delta) (end + delta)
+
+shiftStatementFacts :: Int -> StatementFacts -> StatementFacts
+shiftStatementFacts delta facts =
+    facts {factEdits = map (shiftParserEdit delta) (factEdits facts)}
+
+shiftParserEdit :: Int -> ParserEdit -> ParserEdit
+shiftParserEdit delta edit =
+    edit
+        { parserEditStart = parserEditStart edit + delta
+        , parserEditEnd = parserEditEnd edit + delta
+        }
+
+shiftColumnTarget :: Int -> Int -> ColumnTarget -> ColumnTarget
+shiftColumnTarget threshold delta target =
+    target {targetSites = map shiftSite (targetSites target)}
+    where
+        shiftSite site
+            | siteStart site >= threshold =
+                site
+                    { siteStart = siteStart site + delta
+                    , siteEnd = siteEnd site + delta
+                    }
+            | otherwise = site
+
+-- | Parse a single modified statement in isolation and shift its spans back to global coordinates.
+parseSingleUnit ::
+    SyntaxContext ->
+    StatementUnit ->
+    ParserEdit ->
+    IO (Maybe (StatementUnit, Int))
+parseSingleUnit context oldUnit edit = do
+    let Span start_k end_k = stmtSpan (unitStatement oldUnit)
+        oldRaw = stmtRaw (unitStatement oldUnit)
+        localStart = parserEditStart edit - start_k
+        localEnd = parserEditEnd edit - start_k
+    if localStart < 0 || localEnd > BS.length oldRaw || localStart >= localEnd
+        then pure Nothing
+        else do
+            let newRaw =
+                    BS.concat
+                        [ BS.take localStart oldRaw
+                        , parserEditReplacement edit
+                        , BS.drop localEnd oldRaw
+                        ]
+                delta = BS.length newRaw - (end_k - start_k)
+            parsed <-
+                parseSQLTimed
+                    (syntaxStore context)
+                    (kindOfOptions (syntaxOptions context))
+                    (syntaxOptions context)
+                    newRaw
+            case parsed of
+                Right result
+                    | [singleUnit] <- parsedUnits result -> do
+                        let shifted =
+                                shiftStatementUnit
+                                    start_k
+                                    ( singleUnit
+                                        { unitStatement =
+                                            (unitStatement singleUnit)
+                                                { stmtId = stmtId (unitStatement oldUnit)
+                                                }
+                                        }
+                                    )
+                        pure (Just (shifted, delta))
+                _ -> pure Nothing
+
+-- | Incrementally update syntax snapshot by reparsing only the modified statement.
+updateSyntaxSnapshot ::
+    SyntaxContext ->
+    [StatementUnit] ->
+    [ColumnTarget] ->
+    ParserEdit ->
+    ByteString ->
+    IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
+    let editStart = parserEditStart edit
+        editEnd = parserEditEnd edit
+        targetUnit =
+            find
+                ( \u ->
+                    let Span s e = stmtSpan (unitStatement u)
+                     in editStart >= s && editEnd <= e
+                )
+                currentUnits
+    case targetUnit of
+        Nothing -> parseSyntaxSnapshot context acceptedBytes
+        Just oldUnit -> do
+            singleResult <- parseSingleUnit context oldUnit edit
+            case singleResult of
+                Nothing -> parseSyntaxSnapshot context acceptedBytes
+                Just (updatedUnit, delta) -> do
+                    let targetId = stmtId (unitStatement oldUnit)
+                        updateUnit u
+                            | stmtId (unitStatement u) == targetId = updatedUnit
+                            | spanStartByte (stmtSpan (unitStatement u)) > spanStartByte (stmtSpan (unitStatement oldUnit)) =
+                                shiftStatementUnit delta u
+                            | otherwise = u
+                        freshUnits = map updateUnit currentUnits
+                        freshEdits =
+                            concatMap
+                                (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
+                                freshUnits
+                        oldEnd = spanEndByte (stmtSpan (unitStatement oldUnit))
+                        freshBundles = map (shiftColumnTarget oldEnd delta) currentBundles
+                    pure
+                        ( freshUnits
+                        , groupSyntaxEdits freshEdits
+                        , freshBundles
+                        )
+
+-- | Parse a full snapshot into units, ordered edit buckets, and unblocked column bundles.
+parseSyntaxSnapshot ::
     SyntaxContext ->
     ByteString ->
-    IO (Int, [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
-generateSyntaxCandidates context currentSQL = do
+    IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+parseSyntaxSnapshot context currentSQL = do
     (_, units, columns) <-
         parseUnitsOrThrow (syntaxStore context) (syntaxOptions context) currentSQL
     let edits =
@@ -1236,7 +1363,7 @@ generateSyntaxCandidates context currentSQL = do
         columns
     -- Fold into ordered buckets once; category transitions reuse this snapshot.
     pure
-        ( length units
+        ( units
         , groupSyntaxEdits edits
         , [target | target <- columns, isNothing (targetBlocked target)]
         )
@@ -1263,47 +1390,50 @@ exhaustSyntaxCategory ::
     SyntaxContext ->
     IORef SyntaxStats ->
     ByteString ->
-    Int ->
+    [StatementUnit] ->
     [(ParserEditCategory, [ParserEdit])] ->
     [ColumnTarget] ->
     ParserEditCategory ->
-    IO (ByteString, Int, [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
-exhaustSyntaxCategory context stats sourceSQL sourceCount phases bundles category =
+    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
+exhaustSyntaxCategory context stats sourceSQL sourceUnits phases bundles category =
     sweep
         False
         0
         sourceSQL
-        sourceCount
+        sourceUnits
         phases
         bundles
         (initialSyntaxStream context phases bundles category)
     where
-        sweep changed _ currentSQL currentCount currentPhases currentBundles [] =
-            pure (currentSQL, currentCount, currentPhases, currentBundles, changed)
-        sweep changed ordinal currentSQL currentCount currentPhases currentBundles candidates = do
+        sweep changed _ currentSQL currentUnits currentPhases currentBundles [] =
+            pure (currentSQL, currentUnits, currentPhases, currentBundles, changed)
+        sweep changed ordinal currentSQL currentUnits currentPhases currentBundles candidates = do
             (windowTasks, nextOrdinal, rest) <- fillSyntaxWindow context currentSQL ordinal candidates
             if null windowTasks
-                then sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
+                then sweep changed nextOrdinal currentSQL currentUnits currentPhases currentBundles rest
                 else do
-                    (tested, elapsed, accepted) <- testSyntaxWindow context currentCount windowTasks
+                    (tested, elapsed, accepted) <- testSyntaxWindow context (length currentUnits) windowTasks
                     modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
                     case accepted of
                         Just (acceptedOrdinal, candidate, acceptedBytes) -> do
                             logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
-                            (freshCount, freshPhases, freshBundles) <-
-                                generateSyntaxCandidates context acceptedBytes
+                            (freshUnits, freshPhases, freshBundles) <- case candidate of
+                                SingleCandidate edit
+                                    | category /= EditColumn ->
+                                        updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes
+                                _ -> parseSyntaxSnapshot context acceptedBytes
                             let freshCandidates =
                                     drop acceptedOrdinal (initialSyntaxStream context freshPhases freshBundles category)
                             sweep
                                 True
                                 acceptedOrdinal
                                 acceptedBytes
-                                freshCount
+                                freshUnits
                                 freshPhases
                                 freshBundles
                                 freshCandidates
                         Nothing ->
-                            sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
+                            sweep changed nextOrdinal currentSQL currentUnits currentPhases currentBundles rest
 
 -- | Run one window of candidates and return the first accepted candidate.
 testSyntaxWindow ::
