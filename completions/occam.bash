@@ -4,62 +4,54 @@
 
 _occam()
 {
-    local cur prev opts dialects column_modes strategies log_levels log_formats shells colors
+    local cur prev opts
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="-c --oracle -o --out -i --in-place --stats --reset --timeout \
-          --log-level --log-format --verbose -q --quiet --color --budget \
-          --time-limit --max-oracle-executions --max-evals -j --jobs \
-          --strategy --column-mode -d --dialect --slicing --no-slicing \
-          --closure --no-closure --intra-statement --no-intra-statement \
-          --unrestricted --no-unrestricted --cache --no-cache \
-          --list-dialects --list-column-modes --list-strategies \
-          --print-defaults --completion -v --version -h --help"
-
-    dialects="generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata"
-    column_modes="off single atomic"
-    strategies="full ddmin-only audit-only"
-    log_levels="debug info warn error"
-    log_formats="text json"
-    colors="auto always never"
-    shells="bash zsh fish"
+    opts="-c --oracle -o --out -i --in-place --stats --reset --timeout --log-level --log-format --verbose -q --quiet --color --budget --time-limit --max-oracle-executions --max-evals -j --jobs --strategy --column-mode -d --dialect --slicing --no-slicing --closure --no-closure --intra-statement --no-intra-statement --unrestricted --no-unrestricted --cache --no-cache --list-dialects --list-column-modes --list-strategies --print-defaults --completion -v --version -h --help"
 
     case "${prev}" in
-        -c|--oracle|--reset)
+        -c|--oracle)
             return 0
             ;;
-        -o|--out|--stats)
+        -o|--out)
             COMPREPLY=( $(compgen -f -- "${cur}") )
             return 0
             ;;
-        -d|--dialect)
-            COMPREPLY=( $(compgen -W "${dialects}" -- "${cur}") )
+        --stats)
+            COMPREPLY=( $(compgen -f -- "${cur}") )
             return 0
             ;;
-        --column-mode)
-            COMPREPLY=( $(compgen -W "${column_modes}" -- "${cur}") )
-            return 0
-            ;;
-        --strategy)
-            COMPREPLY=( $(compgen -W "${strategies}" -- "${cur}") )
+        --reset)
             return 0
             ;;
         --log-level)
-            COMPREPLY=( $(compgen -W "${log_levels}" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "debug info warn error" -- "${cur}") )
             return 0
             ;;
         --log-format)
-            COMPREPLY=( $(compgen -W "${log_formats}" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "text json" -- "${cur}") )
             return 0
             ;;
         --color)
-            COMPREPLY=( $(compgen -W "${colors}" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "auto always never" -- "${cur}") )
+            return 0
+            ;;
+        --strategy)
+            COMPREPLY=( $(compgen -W "full ddmin-only audit-only" -- "${cur}") )
+            return 0
+            ;;
+        --column-mode)
+            COMPREPLY=( $(compgen -W "off single atomic" -- "${cur}") )
+            return 0
+            ;;
+        -d|--dialect)
+            COMPREPLY=( $(compgen -W "generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata" -- "${cur}") )
             return 0
             ;;
         --completion)
-            COMPREPLY=( $(compgen -W "${shells}" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
             return 0
             ;;
         *)

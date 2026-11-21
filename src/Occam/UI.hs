@@ -128,209 +128,223 @@ renderAction useColor color verb =
                     ++ " "
             else padded ++ " "
 
+-- | Human-readable action verbs for known stage identifiers.
+stageVerbTable :: [(Text, String)]
+stageVerbTable =
+    [ ("slicing", "Slicing")
+    , ("closure-search", "Closure")
+    , ("graph-free-search", "Ddmin")
+    , ("unrestricted-fallback", "Fallback")
+    , ("statement-audit", "Audit")
+    , ("intra-statement-rewrites", "Rewriting")
+    ]
+
 -- | Map internal stage identifiers to human-readable action verbs.
 stageVerb :: Text -> String
-stageVerb t = case t of
-    "slicing" -> "Slicing"
-    "closure-search" -> "Closure"
-    "graph-free-search" -> "Ddmin"
-    "unrestricted-fallback" -> "Fallback"
-    "statement-audit" -> "Audit"
-    "intra-statement-rewrites" -> "Rewriting"
-    other -> case T.unpack other of
-        [] -> "Working"
-        (c : cs) -> toUpper c : cs
+stageVerb stage = fromMaybe fallback (lookup stage stageVerbTable)
+    where
+        fallback = case T.unpack stage of
+            [] -> "Working"
+            (c : cs) -> toUpper c : cs
 
--- | Initialize the UI, detecting TTY capabilities and using library progress rendering.
+-- | Initialize the UI, selecting a quiet, TTY, or non-TTY renderer.
 newUI :: UIConfig -> IO UI
-newUI UIConfig {..} = do
-    isTTY <- hSupportsANSI stderr
-    let useColor = uiUseColor
-        targetDesc = if uiTargetFile == "-" then "<stdin>" else uiTargetFile
+newUI config
+    | uiQuiet config || uiVerbose config = pure quietUI
+    | otherwise = do
+        tty <- hSupportsANSI stderr
+        if tty then newTTYUI config else newNonTTYUI config
 
-    if uiQuiet || uiVerbose
-        then do
-            pure
-                UI
-                    { uiOnProgress = const (pure ())
-                    , uiFinish = const (pure ())
-                    }
-        else
-            if isTTY
-                then do
+-- | Renderer that stays silent unless it is the only UI.
+quietUI :: UI
+quietUI =
+    UI
+        { uiOnProgress = const (pure ())
+        , uiFinish = const (pure ())
+        }
+
+targetDescription :: UIConfig -> String
+targetDescription UIConfig {uiTargetFile}
+    | uiTargetFile == "-" = "<stdin>"
+    | otherwise = uiTargetFile
+
+printReductionHeader :: Bool -> UIConfig -> IO ()
+printReductionHeader useColor config@UIConfig {..} = do
+    hPutStrLn
+        stderr
+        ( renderAction useColor Cyan "Reducing"
+            ++ targetDescription config
+            ++ " ("
+            ++ formatInt uiInitialStmts
+            ++ " stmts · "
+            ++ formatSize uiInitialBytes
+            ++ " · "
+            ++ T.unpack uiDialect
+            ++ ")"
+        )
+    hFlush stderr
+
+initialProgressInfo :: UIConfig -> ProgressInfo
+initialProgressInfo UIConfig {..} =
+    ProgressInfo
+        { piPhase = "slicing"
+        , piCurrentStmts = uiInitialStmts
+        , piInitialStmts = uiInitialStmts
+        , piCurrentBytes = uiInitialBytes
+        , piTotalRuns = 0
+        , piCacheHits = 0
+        }
+
+ttyProgressStyle :: Bool -> Style ProgressInfo
+ttyProgressStyle useColor =
+    defStyle
+        { styleWidth = TerminalWidth 80
+        , styleOnComplete = Clear
+        , styleOpen = ""
+        , styleClose = ""
+        , styleDone = '━'
+        , styleCurrent = '╺'
+        , styleTodo = '─'
+        , stylePrefix = Label $ \p _ ->
+            let verb = stageVerb (piPhase (progressCustom p))
+             in TL.pack (renderAction useColor Cyan verb)
+        , stylePostfix = Label $ \p timing ->
+            let inf = progressCustom p
+                stmts = piCurrentStmts inf
+                initS = piInitialStmts inf
+                bytes = piCurrentBytes inf
+                runs = piTotalRuns inf
+                hits = piCacheHits inf
+                elapsed = realToFrac (diffUTCTime (timingLastUpdate timing) (timingStart timing)) :: Double
+                hitPct =
+                    if runs > 0
+                        then (fromIntegral hits / fromIntegral runs :: Double) * 100.0
+                        else 0.0
+                elapsedStr = showFFloat (Just 1) elapsed "s"
+                hitStr = showFFloat (Just 0) hitPct "% hit"
+                metaColor = if useColor then setSGRCode [SetColor Foreground Dull White] else ""
+                resetCode = if useColor then setSGRCode [Reset] else ""
+             in TL.pack
+                    ( "  "
+                        ++ formatInt stmts
+                        ++ "/"
+                        ++ formatInt initS
+                        ++ " stmts ("
+                        ++ formatSize bytes
+                        ++ ")"
+                        ++ metaColor
+                        ++ " · "
+                        ++ formatInt runs
+                        ++ " runs · "
+                        ++ hitStr
+                        ++ " · "
+                        ++ elapsedStr
+                        ++ resetCode
+                    )
+        , styleEscapePrefix = const TL.empty
+        , styleEscapeOpen = const TL.empty
+        , styleEscapeClose = const TL.empty
+        , styleEscapePostfix = const TL.empty
+        , styleEscapeDone =
+            if useColor
+                then const (TL.pack (setSGRCode [SetColor Foreground Vivid Green]))
+                else const TL.empty
+        , styleEscapeCurrent =
+            if useColor
+                then const (TL.pack (setSGRCode [SetColor Foreground Vivid Yellow]))
+                else const TL.empty
+        , styleEscapeTodo =
+            if useColor
+                then const (TL.pack (setSGRCode [SetColor Foreground Dull Black]))
+                else const TL.empty
+        }
+
+-- | TTY renderer with the library progress bar on stderr.
+newTTYUI :: UIConfig -> IO UI
+newTTYUI config@UIConfig {..} = do
+    printReductionHeader useColor config
+
+    let pbTodo = max 1 (uiInitialStmts + 1)
+        pbStyle = ttyProgressStyle useColor
+    pb <- hNewProgressBar stderr pbStyle 10.0 (Progress 0 pbTodo (initialProgressInfo config))
+
+    let handleProgress = \case
+            ProgressStage newStage ->
+                updateProgress pb (\p -> p {progressCustom = (progressCustom p) {piPhase = newStage}})
+            ProgressCandidateTested callIndex cacheHit _accepted ->
+                updateProgress
+                    pb
+                    ( \p ->
+                        let inf = progressCustom p
+                            hits' = if cacheHit then piCacheHits inf + 1 else piCacheHits inf
+                         in p {progressCustom = inf {piTotalRuns = callIndex, piCacheHits = hits'}}
+                    )
+            ProgressCandidateAccepted newBytes mNewStmts ->
+                updateProgress
+                    pb
+                    ( \p ->
+                        let inf = progressCustom p
+                            oldStmts = piCurrentStmts inf
+                            newStmts = fromMaybe oldStmts mNewStmts
+                            doneCount = max (progressDone p) (uiInitialStmts - newStmts)
+                         in p
+                                { progressDone = doneCount
+                                , progressCustom =
+                                    inf
+                                        { piCurrentStmts = min oldStmts newStmts
+                                        , piCurrentBytes = min (piCurrentBytes inf) newBytes
+                                        }
+                                }
+                    )
+
+        finish summary = do
+            updateProgress pb (\p -> p {progressDone = progressTodo p})
+            printSummary useColor summary
+
+    pure UI {uiOnProgress = handleProgress, uiFinish = finish}
+    where
+        useColor = uiUseColor
+
+-- | Non-TTY renderer that prints one line per accepted shrink.
+newNonTTYUI :: UIConfig -> IO UI
+newNonTTYUI config@UIConfig {..} = do
+    printReductionHeader False config
+
+    stateRef <-
+        newIORef
+            NonTTYState
+                { ntPhase = "slicing"
+                , ntStmts = uiInitialStmts
+                , ntBytes = uiInitialBytes
+                }
+
+    let handleProgress = \case
+            ProgressStage newStage ->
+                modifyIORef' stateRef (\s -> s {ntPhase = newStage})
+            ProgressCandidateTested {} ->
+                pure ()
+            ProgressCandidateAccepted newBytes mNewStmts -> do
+                oldBytes <- ntBytes <$> readIORef stateRef
+                when (newBytes < oldBytes) do
+                    oldStmts <- ntStmts <$> readIORef stateRef
+                    let newStmts = fromMaybe oldStmts mNewStmts
+                    modifyIORef' stateRef (\s -> s {ntStmts = newStmts, ntBytes = newBytes})
+                    phase <- ntPhase <$> readIORef stateRef
                     hPutStrLn
                         stderr
-                        ( renderAction useColor Cyan "Reducing"
-                            ++ targetDesc
-                            ++ " ("
+                        ( renderAction False Cyan (stageVerb phase)
+                            ++ formatInt newStmts
+                            ++ "/"
                             ++ formatInt uiInitialStmts
-                            ++ " stmts · "
-                            ++ formatSize uiInitialBytes
-                            ++ " · "
-                            ++ T.unpack uiDialect
+                            ++ " stmts ("
+                            ++ formatSize newBytes
                             ++ ")"
                         )
                     hFlush stderr
 
-                    let pbTodo = max 1 (uiInitialStmts + 1)
-                        initInfo =
-                            ProgressInfo
-                                { piPhase = "slicing"
-                                , piCurrentStmts = uiInitialStmts
-                                , piInitialStmts = uiInitialStmts
-                                , piCurrentBytes = uiInitialBytes
-                                , piTotalRuns = 0
-                                , piCacheHits = 0
-                                }
-                        pbStyle =
-                            defStyle
-                                { styleWidth = TerminalWidth 80
-                                , styleOnComplete = Clear
-                                , styleOpen = ""
-                                , styleClose = ""
-                                , styleDone = '━'
-                                , styleCurrent = '╺'
-                                , styleTodo = '─'
-                                , stylePrefix = Label $ \p _ ->
-                                    let verb = stageVerb (piPhase (progressCustom p))
-                                     in TL.pack (renderAction useColor Cyan verb)
-                                , stylePostfix = Label $ \p timing ->
-                                    let inf = progressCustom p
-                                        stmts = piCurrentStmts inf
-                                        initS = piInitialStmts inf
-                                        bytes = piCurrentBytes inf
-                                        runs = piTotalRuns inf
-                                        hits = piCacheHits inf
-                                        elapsed = realToFrac (diffUTCTime (timingLastUpdate timing) (timingStart timing)) :: Double
-                                        hitPct =
-                                            if runs > 0
-                                                then (fromIntegral hits / fromIntegral runs :: Double) * 100.0
-                                                else 0.0
-                                        elapsedStr = showFFloat (Just 1) elapsed "s"
-                                        hitStr = showFFloat (Just 0) hitPct "% hit"
-                                        metaColor = if useColor then setSGRCode [SetColor Foreground Dull White] else ""
-                                        resetCode = if useColor then setSGRCode [Reset] else ""
-                                     in TL.pack
-                                            ( "  "
-                                                ++ formatInt stmts
-                                                ++ "/"
-                                                ++ formatInt initS
-                                                ++ " stmts ("
-                                                ++ formatSize bytes
-                                                ++ ")"
-                                                ++ metaColor
-                                                ++ " · "
-                                                ++ formatInt runs
-                                                ++ " runs · "
-                                                ++ hitStr
-                                                ++ " · "
-                                                ++ elapsedStr
-                                                ++ resetCode
-                                            )
-                                , styleEscapePrefix = const TL.empty
-                                , styleEscapeOpen = const TL.empty
-                                , styleEscapeClose = const TL.empty
-                                , styleEscapePostfix = const TL.empty
-                                , styleEscapeDone =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [SetColor Foreground Vivid Green]))
-                                        else const TL.empty
-                                , styleEscapeCurrent =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [SetColor Foreground Vivid Yellow]))
-                                        else const TL.empty
-                                , styleEscapeTodo =
-                                    if useColor
-                                        then const (TL.pack (setSGRCode [SetColor Foreground Dull Black]))
-                                        else const TL.empty
-                                }
-                    pb <- hNewProgressBar stderr pbStyle 10.0 (Progress 0 pbTodo initInfo)
+        finish = printSummary False
 
-                    let handleProgress = \case
-                            ProgressStage newStage ->
-                                updateProgress pb (\p -> p {progressCustom = (progressCustom p) {piPhase = newStage}})
-                            ProgressCandidateTested callIndex cacheHit _accepted ->
-                                updateProgress
-                                    pb
-                                    ( \p ->
-                                        let inf = progressCustom p
-                                            hits' = if cacheHit then piCacheHits inf + 1 else piCacheHits inf
-                                         in p {progressCustom = inf {piTotalRuns = callIndex, piCacheHits = hits'}}
-                                    )
-                            ProgressCandidateAccepted newBytes mNewStmts ->
-                                updateProgress
-                                    pb
-                                    ( \p ->
-                                        let inf = progressCustom p
-                                            oldStmts = piCurrentStmts inf
-                                            newStmts = fromMaybe oldStmts mNewStmts
-                                            doneCount = max (progressDone p) (uiInitialStmts - newStmts)
-                                         in p
-                                                { progressDone = doneCount
-                                                , progressCustom =
-                                                    inf
-                                                        { piCurrentStmts = min oldStmts newStmts
-                                                        , piCurrentBytes = min (piCurrentBytes inf) newBytes
-                                                        }
-                                                }
-                                    )
-
-                        finish summary = do
-                            updateProgress pb (\p -> p {progressDone = progressTodo p})
-                            printSummary useColor summary
-
-                    pure UI {uiOnProgress = handleProgress, uiFinish = finish}
-                else do
-                    -- Non-TTY fallback
-                    hPutStrLn
-                        stderr
-                        ( renderAction False Cyan "Reducing"
-                            ++ targetDesc
-                            ++ " ("
-                            ++ formatInt uiInitialStmts
-                            ++ " stmts · "
-                            ++ formatSize uiInitialBytes
-                            ++ " · "
-                            ++ T.unpack uiDialect
-                            ++ ")"
-                        )
-                    hFlush stderr
-
-                    stateRef <-
-                        newIORef
-                            NonTTYState
-                                { ntPhase = "slicing"
-                                , ntStmts = uiInitialStmts
-                                , ntBytes = uiInitialBytes
-                                }
-
-                    let handleProgress = \case
-                            ProgressStage newStage ->
-                                modifyIORef' stateRef (\s -> s {ntPhase = newStage})
-                            ProgressCandidateTested {} ->
-                                pure ()
-                            ProgressCandidateAccepted newBytes mNewStmts -> do
-                                oldBytes <- ntBytes <$> readIORef stateRef
-                                when (newBytes < oldBytes) do
-                                    oldStmts <- ntStmts <$> readIORef stateRef
-                                    let newStmts = fromMaybe oldStmts mNewStmts
-                                    modifyIORef' stateRef (\s -> s {ntStmts = newStmts, ntBytes = newBytes})
-                                    phase <- ntPhase <$> readIORef stateRef
-                                    hPutStrLn
-                                        stderr
-                                        ( renderAction False Cyan (stageVerb phase)
-                                            ++ formatInt newStmts
-                                            ++ "/"
-                                            ++ formatInt uiInitialStmts
-                                            ++ " stmts ("
-                                            ++ formatSize newBytes
-                                            ++ ")"
-                                        )
-                                    hFlush stderr
-
-                        finish = printSummary False
-
-                    pure UI {uiOnProgress = handleProgress, uiFinish = finish}
+    pure UI {uiOnProgress = handleProgress, uiFinish = finish}
 
 printSummary :: Bool -> FinishSummary -> IO ()
 printSummary useColor summary = do

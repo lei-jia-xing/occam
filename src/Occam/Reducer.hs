@@ -204,6 +204,12 @@ data ReductionResult = ReductionResult
 seconds :: Word64 -> Double
 seconds ns = fromIntegral ns / 1000000000
 
+-- | Total 'last': the final element, or 'Nothing' for an empty list.
+lastMay :: [a] -> Maybe a
+lastMay [] = Nothing
+lastMay [only] = Just only
+lastMay (_ : rest) = lastMay rest
+
 logStage :: Logger -> T.Text -> Word64 -> IO ()
 logStage logger stage elapsed =
     logDebug'
@@ -668,7 +674,10 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                             if null testables
                                 then do
                                     mapM_ (const (recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking")) batch
-                                    go currentSQL currentKept (afterStatement (last batch) statements) attempts removals
+                                    case lastMay batch of
+                                        Nothing -> pure (currentKept, attempts, removals)
+                                        Just lastStatement ->
+                                            go currentSQL currentKept (afterStatement lastStatement statements) attempts removals
                                 else do
                                     mapM_ (\(_, sql) -> reportCandidateCount pool sql (IntSet.size currentKept - 1)) testables
                                     outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
@@ -683,12 +692,15 @@ statementAuditWithLogger logger dialect pool initialSQL = do
                                                 (attempts + tested)
                                                 (removals + 1)
                                         Nothing ->
-                                            go
-                                                currentSQL
-                                                currentKept
-                                                (afterStatement (last batch) statements)
-                                                (attempts + tested)
-                                                removals
+                                            case lastMay batch of
+                                                Nothing -> pure (currentKept, attempts, removals)
+                                                Just lastStatement ->
+                                                    go
+                                                        currentSQL
+                                                        currentKept
+                                                        (afterStatement lastStatement statements)
+                                                        (attempts + tested)
+                                                        removals
 
                 afterStatement target = goAfter
                     where
@@ -794,34 +806,11 @@ it for the next stage without re-parsing.
 -}
 sliceWithAnalysis ::
     Logger -> OraclePool -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
-sliceWithAnalysis logger pool analysis sql = do
-    let statements = analyzedStatements analysis
-        graph = analyzedGraph analysis
-        keep result =
-            pure (result, if result == sql then Just analysis else Nothing)
-    if null statements
-        then keep sql
-        else do
-            let sliceFor target =
-                    let sliceInts = backwardSliceFast (unStatementId (stmtId target)) graph
-                        retained = filter (\s -> IntSet.member (unStatementId (stmtId s)) sliceInts) statements
-                     in (retained, cutRemovedStatementInts sql statements sliceInts)
-                acceptSlice strategy target retained candidate = do
-                    let StatementId targetId = stmtId target
-                    logInfo'
-                        logger
-                        "reducer"
-                        "Backward slicing accepted"
-                        [ ("seed_strategy", toJSON (strategy :: String))
-                        , ("target_statement_id", toJSON targetId)
-                        , ("statements_before", toJSON (length statements))
-                        , ("statements_after", toJSON (length retained))
-                        , ("bytes_before", toJSON (BS.length sql))
-                        , ("bytes_after", toJSON (BS.length candidate))
-                        ]
-                    pure candidate
-                lastStatement = last statements
-                (lastRetained, lastCandidateRaw) = sliceFor lastStatement
+sliceWithAnalysis logger pool analysis sql =
+    case lastMay statements of
+        Nothing -> keep sql
+        Just lastStatement -> do
+            let (lastRetained, lastCandidateRaw) = sliceFor lastStatement
             lastCandidate <- timeStatementBuild (poolMetricsStore pool) lastCandidateRaw
             lastAccepted <-
                 if BS.length lastCandidate < BS.length sql
@@ -867,6 +856,29 @@ sliceWithAnalysis logger pool analysis sql = do
                     if lastAccepted
                         then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
                         else keep sql
+    where
+        statements = analyzedStatements analysis
+        graph = analyzedGraph analysis
+        keep result =
+            pure (result, if result == sql then Just analysis else Nothing)
+        sliceFor target =
+            let sliceInts = backwardSliceFast (unStatementId (stmtId target)) graph
+                retained = filter (\s -> IntSet.member (unStatementId (stmtId s)) sliceInts) statements
+             in (retained, cutRemovedStatementInts sql statements sliceInts)
+        acceptSlice strategy target retained candidate = do
+            let StatementId targetId = stmtId target
+            logInfo'
+                logger
+                "reducer"
+                "Backward slicing accepted"
+                [ ("seed_strategy", toJSON (strategy :: String))
+                , ("target_statement_id", toJSON targetId)
+                , ("statements_before", toJSON (length statements))
+                , ("statements_after", toJSON (length retained))
+                , ("bytes_before", toJSON (BS.length sql))
+                , ("bytes_after", toJSON (BS.length candidate))
+                ]
+            pure candidate
 
 closureSearchWithAnalysis ::
     Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
@@ -1048,37 +1060,119 @@ data SyntaxStats = SyntaxStats
 allEditCategories :: [ParserEditCategory]
 allEditCategories = [EditClause, EditList, EditColumn, EditConstraint, EditType, EditExpression, EditLiteral]
 
-isSafeClauseLabel :: T.Text -> Bool
-isSafeClauseLabel label =
-    label
-        `elem` [ "remove-order_by"
-               , "remove-limit"
-               , "remove-offset"
-               , "remove-fetch"
-               ]
+-- | Read-only configuration shared by the syntax-reduction phases.
+data SyntaxContext = SyntaxContext
+    { syntaxLogger :: !Logger
+    , syntaxStore :: !(Maybe MetricsStore)
+    , syntaxPool :: !OraclePool
+    , syntaxShouldRun :: ParserEdit -> Bool
+    , syntaxMode :: !ColumnMode
+    , syntaxOptions :: !ParseOptions
+    }
 
-isUnwrapExpression :: ParserEdit -> Bool
-isUnwrapExpression edit =
-    case parserEditLabel edit of
-        "simplify-parenthesized_expression" -> True
-        "simplify-scalar-subquery" -> True
-        label
-            | "unwrap-" `T.isPrefixOf` label -> True
-            | label `elem` ["simplify-unary_expression", "simplify-binary_expression", "simplify-in_list"] ->
-                parserEditReplacement edit `notElem` ["0", "1", "'0'"]
-        _ -> False
+data SyntaxCandidate
+    = SingleCandidate !ParserEdit
+    | BundleCandidate !ColumnTarget
+
+{- | Clause-edit classes in attempt order: safe removals first, structural
+clauses next, and predicate-bearing clauses last.
+-}
+data ClauseEditClass = SafeClauseEdit | StructuralClauseEdit | FragileClauseEdit
+    deriving (Eq, Ord, Show)
+
+{- | Expression-edit classes in attempt order: structure-preserving unwraps
+before edits that may discard an operand value.
+-}
+data ExpressionEditClass = UnwrapExpressionEdit | AggressiveExpressionEdit
+    deriving (Eq, Ord, Show)
+
+-- | Clause labels whose removal cannot change predicate truth.
+safeClauseLabels :: Set T.Text
+safeClauseLabels =
+    Set.fromList
+        [ "remove-order_by"
+        , "remove-limit"
+        , "remove-offset"
+        , "remove-fetch"
+        ]
+
+-- | Predicate-bearing clause labels, attempted after structural clauses.
+fragileClauseLabels :: Set T.Text
+fragileClauseLabels = Set.singleton "remove-where"
+
+-- | Expression labels that only collapse redundant structure.
+unwrappedExpressionLabels :: Set T.Text
+unwrappedExpressionLabels =
+    Set.fromList
+        [ "simplify-parenthesized_expression"
+        , "simplify-scalar-subquery"
+        ]
+
+-- | Operand simplifications that unwrap unless they discard the operand value.
+operandSimplifyLabels :: Set T.Text
+operandSimplifyLabels =
+    Set.fromList
+        [ "simplify-unary_expression"
+        , "simplify-binary_expression"
+        , "simplify-in_list"
+        ]
+
+-- | Replacement constants that make an operand simplification destructive.
+destructiveExpressionReplacements :: Set ByteString
+destructiveExpressionReplacements = Set.fromList ["0", "1", "'0'"]
+
+-- | Prefix used by the frontend for operand-unwrapping edits.
+unwrapExpressionPrefix :: T.Text
+unwrapExpressionPrefix = "unwrap-"
+
+classifyClauseEdit :: ParserEdit -> ClauseEditClass
+classifyClauseEdit edit
+    | label `Set.member` safeClauseLabels = SafeClauseEdit
+    | label `Set.member` fragileClauseLabels = FragileClauseEdit
+    | otherwise = StructuralClauseEdit
+    where
+        label = parserEditLabel edit
+
+classifyExpressionEdit :: ParserEdit -> ExpressionEditClass
+classifyExpressionEdit edit
+    | label `Set.member` unwrappedExpressionLabels = UnwrapExpressionEdit
+    | label `Set.member` operandSimplifyLabels =
+        if parserEditReplacement edit `Set.member` destructiveExpressionReplacements
+            then AggressiveExpressionEdit
+            else UnwrapExpressionEdit
+    | unwrapExpressionPrefix `T.isPrefixOf` label = UnwrapExpressionEdit
+    | otherwise = AggressiveExpressionEdit
+    where
+        label = parserEditLabel edit
+
+-- | Named rank constants: lower ranks are tested first.
+safeClauseRank, structuralClauseRank, fragileClauseRank :: Int
+safeClauseRank = 0
+structuralClauseRank = 1
+fragileClauseRank = 2
+
+unwrappedExpressionRank, aggressiveExpressionRank :: Int
+unwrappedExpressionRank = 0
+aggressiveExpressionRank = 1
 
 clauseEditRank :: ParserEdit -> Int
-clauseEditRank edit =
-    case parserEditLabel edit of
-        label
-            | isSafeClauseLabel label -> 0
-        "remove-where" -> 2
-        _ -> 1
+clauseEditRank edit = case classifyClauseEdit edit of
+    SafeClauseEdit -> safeClauseRank
+    StructuralClauseEdit -> structuralClauseRank
+    FragileClauseEdit -> fragileClauseRank
 
 expressionEditRank :: ParserEdit -> Int
-expressionEditRank edit =
-    if isUnwrapExpression edit then 0 else 1
+expressionEditRank edit = case classifyExpressionEdit edit of
+    UnwrapExpressionEdit -> unwrappedExpressionRank
+    AggressiveExpressionEdit -> aggressiveExpressionRank
+
+-- | Column edits only participate when the column mode is enabled.
+syntaxCategoryOrder :: ColumnMode -> [ParserEditCategory]
+syntaxCategoryOrder ColumnOff = filter (/= EditColumn) allEditCategories
+syntaxCategoryOrder _ = allEditCategories
+
+syntaxCategoryOrderName :: ColumnMode -> T.Text
+syntaxCategoryOrderName = T.intercalate "," . map editCategoryName . syntaxCategoryOrder
 
 reduceSyntaxWithDialect ::
     Logger ->
@@ -1089,224 +1183,318 @@ reduceSyntaxWithDialect ::
     ByteString ->
     IO ByteString
 reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
+    let context =
+            SyntaxContext
+                { syntaxLogger = logger
+                , syntaxStore = poolMetricsStore pool
+                , syntaxPool = pool
+                , syntaxShouldRun = shouldRun
+                , syntaxMode = mode
+                , syntaxOptions = options
+                }
     logDebug'
         logger
         "reducer"
         "Using ordinal-forward syntax candidate schedule"
         [ ("search_policy", toJSON (syntaxPolicyName mode))
-        , ("category_order", toJSON categoryOrderName)
+        , ("category_order", toJSON (syntaxCategoryOrderName mode))
         ]
     stats <- newIORef (SyntaxStats 0 0 0)
-    result <- go stats initialSQL
-    finalStats <- readIORef stats
-    let accepted = syntaxAccepted finalStats
-    if accepted > 0
-        then
-            logInfo'
-                logger
-                "reducer"
-                "Syntax rewrites accepted"
-                [ ("accepted_edits", toJSON accepted)
-                , ("attempts", toJSON (syntaxAttempts finalStats))
-                , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
-                ]
-        else
-            logDebug'
-                logger
-                "reducer"
-                "Syntax replacement completed with no accepted edits"
-                [ ("attempts", toJSON (syntaxAttempts finalStats))
-                , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
-                ]
+    result <- runSyntaxFixedPoint context stats initialSQL
+    logSyntaxStats logger =<< readIORef stats
     pure result
+
+-- | Reparse after each accepted edit and resweep until a full cycle makes no progress.
+runSyntaxFixedPoint :: SyntaxContext -> IORef SyntaxStats -> ByteString -> IO ByteString
+runSyntaxFixedPoint context stats currentSQL = do
+    (startCount, phases, bundles) <- generateSyntaxCandidates context currentSQL
+    sweepSyntaxCategories
+        context
+        stats
+        currentSQL
+        startCount
+        phases
+        bundles
+        (syntaxCategoryOrder (syntaxMode context))
+        False
+
+sweepSyntaxCategories ::
+    SyntaxContext ->
+    IORef SyntaxStats ->
+    ByteString ->
+    Int ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    [ParserEditCategory] ->
+    Bool ->
+    IO ByteString
+sweepSyntaxCategories context stats currentSQL currentCount phases bundles [] shrunk
+    | shrunk =
+        sweepSyntaxCategories
+            context
+            stats
+            currentSQL
+            currentCount
+            phases
+            bundles
+            (syntaxCategoryOrder (syntaxMode context))
+            False
+    | otherwise = pure currentSQL
+sweepSyntaxCategories context stats currentSQL currentCount phases bundles (category : rest) shrunk = do
+    (nextSQL, nextCount, nextPhases, nextBundles, categoryShrunk) <-
+        exhaustSyntaxCategory context stats currentSQL currentCount phases bundles category
+    sweepSyntaxCategories
+        context
+        stats
+        nextSQL
+        nextCount
+        nextPhases
+        nextBundles
+        rest
+        (shrunk || categoryShrunk)
+
+-- | Parse one snapshot into ordered edit buckets and unblocked column bundles.
+generateSyntaxCandidates ::
+    SyntaxContext ->
+    ByteString ->
+    IO (Int, [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+generateSyntaxCandidates context currentSQL = do
+    (_, units, columns) <-
+        parseUnitsOrThrow (syntaxStore context) (syntaxOptions context) currentSQL
+    let edits =
+            concatMap
+                (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
+                units
+    -- Blocked bundles are counted once per snapshot with the frontend's
+    -- cause; they never enter the candidate stream.
+    mapM_
+        (maybe (pure ()) (recordGeneratedSkipped (syntaxStore context)) . targetBlocked)
+        columns
+    -- Fold into ordered buckets once; category transitions reuse this snapshot.
+    pure
+        ( length units
+        , groupSyntaxEdits edits
+        , [target | target <- columns, isNothing (targetBlocked target)]
+        )
+
+groupSyntaxEdits :: [ParserEdit] -> [(ParserEditCategory, [ParserEdit])]
+groupSyntaxEdits edits =
+    let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
+     in [(cat, sortSyntaxEdits cat (Map.findWithDefault [] cat buckets)) | cat <- allEditCategories]
+
+sortSyntaxEdits :: ParserEditCategory -> [ParserEdit] -> [ParserEdit]
+sortSyntaxEdits category edits = case category of
+    EditClause ->
+        -- Prioritize high-probability/safe clause edits (ORDER BY, LIMIT, OFFSET, FETCH)
+        -- before structural clauses (GROUP BY, HAVING, WITH), and fragile WHERE last.
+        sortOn clauseEditRank edits
+    EditExpression ->
+        -- Prioritize expression unwrapping (parens, subquery collapse, operand unwrap)
+        -- before destructive constant replacements (0, 1, '0', exists).
+        sortOn expressionEditRank edits
+    _ -> edits
+
+{- | Drive one category to exhaustion. After a strict shrink, reparse and resume
+at the accepted ordinal; candidates before that cursor are revisited in the
+next full cycle. Each window pulls testable edits from the unchanged snapshot
+and retires them in parser-emitted order.
+-}
+exhaustSyntaxCategory ::
+    SyntaxContext ->
+    IORef SyntaxStats ->
+    ByteString ->
+    Int ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    ParserEditCategory ->
+    IO (ByteString, Int, [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
+exhaustSyntaxCategory context stats sourceSQL sourceCount phases bundles category =
+    sweep
+        False
+        0
+        sourceSQL
+        sourceCount
+        phases
+        bundles
+        (initialSyntaxStream context phases bundles category)
     where
-        store = poolMetricsStore pool
-        categoryOrder = case mode of
-            -- Off keeps the exact legacy six-category order.
-            ColumnOff -> filter (/= EditColumn) allEditCategories
-            _ -> allEditCategories
-        categoryOrderName = T.intercalate "," (map editCategoryName categoryOrder)
-        parseEdits currentSQL = do
-            (_, units, columns) <- parseUnitsOrThrow store options currentSQL
-            let edits =
-                    concatMap
-                        (filter shouldRun . maybe [] factEdits . unitFacts)
-                        units
-            -- Blocked bundles are counted once per snapshot with the
-            -- frontend's cause; they never enter the candidate stream.
-            mapM_
-                (maybe (pure ()) (recordGeneratedSkipped store) . targetBlocked)
-                columns
-            -- Fold into ordered buckets once; category transitions reuse this snapshot.
-            pure
-                (length units, groupEdits edits, [target | target <- columns, isNothing (targetBlocked target)])
+        sweep changed _ currentSQL currentCount currentPhases currentBundles [] =
+            pure (currentSQL, currentCount, currentPhases, currentBundles, changed)
+        sweep changed ordinal currentSQL currentCount currentPhases currentBundles candidates = do
+            (windowTasks, nextOrdinal, rest) <- fillSyntaxWindow context currentSQL ordinal candidates
+            if null windowTasks
+                then sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
+                else do
+                    (tested, elapsed, accepted) <- testSyntaxWindow context currentCount windowTasks
+                    modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+                    case accepted of
+                        Just (acceptedOrdinal, candidate, acceptedBytes) -> do
+                            logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
+                            (freshCount, freshPhases, freshBundles) <-
+                                generateSyntaxCandidates context acceptedBytes
+                            let freshCandidates =
+                                    drop acceptedOrdinal (initialSyntaxStream context freshPhases freshBundles category)
+                            sweep
+                                True
+                                acceptedOrdinal
+                                acceptedBytes
+                                freshCount
+                                freshPhases
+                                freshBundles
+                                freshCandidates
+                        Nothing ->
+                            sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
 
-        groupEdits edits =
-            let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
-             in [(cat, sortCategoryEdits cat (Map.findWithDefault [] cat buckets)) | cat <- allEditCategories]
+-- | Run one window of candidates and return the first accepted candidate.
+testSyntaxWindow ::
+    SyntaxContext ->
+    Int ->
+    [(Int, SyntaxCandidate, ByteString)] ->
+    IO (Int, Word64, Maybe (Int, SyntaxCandidate, ByteString))
+testSyntaxWindow context currentCount windowTasks = do
+    mapM_ (\(_, _, bytes) -> reportCandidateCount (syntaxPool context) bytes currentCount) windowTasks
+    started <- getMonotonicTimeNSec
+    outcomes <-
+        testOrderedTagged
+            (syntaxPool context)
+            [(candidateTag candidate, bytes) | (_, candidate, bytes) <- windowTasks]
+    finished <- getMonotonicTimeNSec
+    let retired = zip windowTasks outcomes
+    pure
+        ( length outcomes
+        , finished - started
+        , listToMaybe
+            [ (ordinal, candidate, bytes)
+            | ((ordinal, candidate, bytes), (outcome, _)) <- retired
+            , outcome == OracleAccepted
+            ]
+        )
 
-        sortCategoryEdits EditClause edits =
-            -- Prioritize high-probability/safe clause edits (ORDER BY, LIMIT, OFFSET, FETCH)
-            -- before structural clauses (GROUP BY, HAVING, WITH), and fragile WHERE last.
-            sortOn clauseEditRank edits
-        sortCategoryEdits EditExpression edits =
-            -- Prioritize expression unwrapping (parens, subquery collapse, operand unwrap)
-            -- before destructive constant replacements (0, 1, '0', exists).
-            sortOn expressionEditRank edits
-        sortCategoryEdits _ edits = edits
+recordSyntaxTest :: Int -> Word64 -> Maybe a -> SyntaxStats -> SyntaxStats
+recordSyntaxTest tested elapsed accepted stats =
+    stats
+        { syntaxAttempts = syntaxAttempts stats + tested
+        , syntaxAccepted = syntaxAccepted stats + maybe 0 (const 1) accepted
+        , syntaxElapsed = syntaxElapsed stats + elapsed
+        }
 
-        go stats currentSQL = do
-            (startCount, phases, bundles) <- parseEdits currentSQL
-            visitPhases stats currentSQL startCount phases bundles categoryOrder False
+{- | Column bundles precede their identical singles in atomic mode; every
+other category is singles only.
+-}
+initialSyntaxStream ::
+    SyntaxContext ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    ParserEditCategory ->
+    [SyntaxCandidate]
+initialSyntaxStream context phases bundles category
+    | category == EditColumn && syntaxMode context == ColumnAtomic =
+        map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
+    | otherwise = map SingleCandidate (phaseCandidates category phases)
 
-        visitPhases stats currentSQL currentCount phases bundles [] shrunk
-            | shrunk = visitPhases stats currentSQL currentCount phases bundles categoryOrder False
-            | otherwise = pure currentSQL
-        visitPhases stats currentSQL currentCount phases bundles (category : rest) shrunk = do
-            (nextSQL, nextCount, nextPhases, nextBundles, categoryShrunk) <-
-                exhaustCategory stats currentSQL currentCount phases bundles category
-            visitPhases
-                stats
-                nextSQL
-                nextCount
-                nextPhases
-                nextBundles
-                rest
-                (shrunk || categoryShrunk)
-        -- After a strict shrink, reparse and resume at the accepted ordinal.
-        -- Any candidates before that cursor are revisited in the next full cycle.
-        -- Each window pulls testable edits from the unchanged snapshot and
-        -- retires them in parser-emitted order.
-        jobs = poolJobCount pool
-        -- The Column stream in atomic mode is bundles first (joint moves
-        -- subsume their singles), then the identical singles in the identical
-        -- relative order as single mode. Any other category is singles only.
-        initialStream phases bundles category
-            | category == EditColumn && mode == ColumnAtomic =
-                map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
-            | otherwise = map SingleCandidate (phaseCandidates category phases)
-        exhaustCategory stats sourceSQL sourceCount phases bundles category =
-            sweep False 0 sourceSQL sourceCount phases bundles (initialStream phases bundles category)
-            where
-                sweep changed _ currentSQL currentCount currentPhases currentBundles [] =
-                    pure (currentSQL, currentCount, currentPhases, currentBundles, changed)
-                sweep changed ordinal currentSQL currentCount currentPhases currentBundles candidates = do
-                    (windowTasks, nextOrdinal, rest) <- fillWindow currentSQL ordinal candidates
-                    if null windowTasks
-                        then sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
-                        else do
-                            mapM_ (\(_, _, bytes) -> reportCandidateCount pool bytes currentCount) windowTasks
-                            started <- getMonotonicTimeNSec
-                            outcomes <-
-                                testOrderedTagged pool [(candidateTag candidate, bytes) | (_, candidate, bytes) <- windowTasks]
-                            finished <- getMonotonicTimeNSec
-                            let elapsed = finished - started
-                                retired = zip windowTasks outcomes
-                                tested = length outcomes
-                            case listToMaybe [(o, e, c) | ((o, e, c), (outcome, _)) <- retired, outcome == OracleAccepted] of
-                                Just (acceptedOrdinal, candidate, acceptedBytes) -> do
-                                    modifyIORef'
-                                        stats
-                                        ( \s ->
-                                            s
-                                                { syntaxAttempts = syntaxAttempts s + tested
-                                                , syntaxAccepted = syntaxAccepted s + 1
-                                                , syntaxElapsed = syntaxElapsed s + elapsed
-                                                }
-                                        )
-                                    logAccept candidate currentSQL acceptedBytes
-                                    (freshCount, freshPhases, freshBundles) <- parseEdits acceptedBytes
-                                    let freshCandidates =
-                                            drop acceptedOrdinal (initialStream freshPhases freshBundles category)
-                                    sweep
-                                        True
-                                        acceptedOrdinal
-                                        acceptedBytes
-                                        freshCount
-                                        freshPhases
-                                        freshBundles
-                                        freshCandidates
-                                Nothing -> do
-                                    modifyIORef'
-                                        stats
-                                        ( \s ->
-                                            s
-                                                { syntaxAttempts = syntaxAttempts s + tested
-                                                , syntaxElapsed = syntaxElapsed s + elapsed
-                                                }
-                                        )
-                                    sweep changed nextOrdinal currentSQL currentCount currentPhases currentBundles rest
+phaseCandidates :: ParserEditCategory -> [(ParserEditCategory, [ParserEdit])] -> [ParserEdit]
+phaseCandidates category = fromMaybe [] . lookup category
 
-                logAccept (SingleCandidate edit) currentSQL acceptedBytes =
-                    let editStart = parserEditStart edit
-                        editEnd = parserEditEnd edit
-                        replacement = parserEditReplacement edit
-                     in logInfo'
-                            logger
-                            "reducer"
-                            "Accepted byte-preserving syntax rewrite"
-                            [ ("rewrite_kind", toJSON (parserEditLabel edit))
-                            , ("rewrite_category", toJSON (parserEditCategory edit))
-                            , ("span_start", toJSON editStart)
-                            , ("span_end", toJSON editEnd)
-                            , ("replacement", toJSON (TE.decodeUtf8Lenient replacement))
-                            , ("bytes_before", toJSON (BS.length currentSQL))
-                            , ("bytes_after", toJSON (BS.length acceptedBytes))
-                            ]
-                logAccept (BundleCandidate target) currentSQL acceptedBytes =
-                    logInfo'
-                        logger
-                        "reducer"
-                        "Accepted atomic column co-reduction"
-                        [ ("rewrite_kind", toJSON ("remove-column-bundle" :: T.Text))
-                        , ("rewrite_category", toJSON EditColumn)
-                        , ("table", toJSON (nameText (targetTable target)))
-                        , ("column", toJSON (identText (targetColumn target)))
-                        , ("sites", toJSON (length (targetSites target)))
-                        , ("bytes_before", toJSON (BS.length currentSQL))
-                        , ("bytes_after", toJSON (BS.length acceptedBytes))
-                        ]
+-- | Fill one oracle window, skipping candidates that do not strictly shrink.
+fillSyntaxWindow ::
+    SyntaxContext ->
+    ByteString ->
+    Int ->
+    [SyntaxCandidate] ->
+    IO ([(Int, SyntaxCandidate, ByteString)], Int, [SyntaxCandidate])
+fillSyntaxWindow context currentSQL startOrdinal = fill (poolJobCount (syntaxPool context)) startOrdinal []
+    where
+        fill _ ordinal acc [] = pure (reverse acc, ordinal, [])
+        fill 0 ordinal acc rest = pure (reverse acc, ordinal, rest)
+        fill remaining ordinal acc (candidate : rest) = do
+            (built, buildMicros) <- timeSyntaxCandidateBuild context currentSQL candidate
+            case built of
+                Nothing -> do
+                    recordGeneratedSkipped (syntaxStore context) "nonshrinking"
+                    fill remaining (ordinal + 1) acc rest
+                Just bytes -> do
+                    recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
+                    fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
 
-                fillWindow currentSQL ordinal = fill jobs ordinal []
-                    where
-                        fill _ o acc [] = pure (reverse acc, o, [])
-                        fill 0 o acc rest = pure (reverse acc, o, rest)
-                        fill n o acc (candidate : rest) = do
-                            (built, buildMicros) <- timeCandidateBuild currentSQL candidate
-                            case built of
-                                Nothing -> do
-                                    recordGeneratedSkipped store "nonshrinking"
-                                    fill n (o + 1) acc rest
-                                Just bytes -> do
-                                    recordCandidateBuildTiming store (candidateTag candidate) buildMicros
-                                    fill (n - 1) (o + 1) ((o, candidate, bytes) : acc) rest
+{- | Time candidate byte assembly when measured; otherwise return the bytes
+untouched with no clocks and no extra forcing. The actual length is forced
+only when a store is present. No candidate, order, or oracle change either
+way.
+-}
+timeSyntaxCandidateBuild ::
+    SyntaxContext -> ByteString -> SyntaxCandidate -> IO (Maybe ByteString, Int)
+timeSyntaxCandidateBuild context currentSQL candidate = case syntaxStore context of
+    -- Unmeasured: no clocks, no extra forcing, same engine.
+    Nothing -> pure (buildCandidate, 0)
+    Just _ -> do
+        started <- getMonotonicTimeNSec
+        -- Force the assembled bytes before stopping the clock; an O(1) length
+        -- touch, never a deepseq.
+        let forced = maybe 0 BS.length buildCandidate
+        forced `seq` pure ()
+        finished <- getMonotonicTimeNSec
+        pure (buildCandidate, fromIntegral ((finished - started) `div` 1000))
+    where
+        buildCandidate = case candidate of
+            SingleCandidate edit -> singleBytes currentSQL edit
+            BundleCandidate target -> bundleBytes currentSQL target
 
-                timeCandidateBuild currentSQL candidate = case store of
-                    -- Unmeasured: no clocks, no extra forcing, same engine.
-                    Nothing -> pure (buildCandidate, 0)
-                    Just _ -> do
-                        started <- getMonotonicTimeNSec
-                        -- Force the assembled bytes before stopping the clock;
-                        -- an O(1) length touch, never a deepseq.
-                        let forced = maybe 0 BS.length buildCandidate
-                        forced `seq` pure ()
-                        finished <- getMonotonicTimeNSec
-                        pure (buildCandidate, fromIntegral ((finished - started) `div` 1000))
-                    where
-                        buildCandidate = case candidate of
-                            SingleCandidate edit -> singleBytes currentSQL edit
-                            BundleCandidate target -> bundleBytes currentSQL target
+logAcceptedSyntaxEdit :: SyntaxContext -> SyntaxCandidate -> ByteString -> ByteString -> IO ()
+logAcceptedSyntaxEdit context (SingleCandidate edit) currentSQL acceptedBytes =
+    let editStart = parserEditStart edit
+        editEnd = parserEditEnd edit
+        replacement = parserEditReplacement edit
+     in logInfo'
+            (syntaxLogger context)
+            "reducer"
+            "Accepted byte-preserving syntax rewrite"
+            [ ("rewrite_kind", toJSON (parserEditLabel edit))
+            , ("rewrite_category", toJSON (parserEditCategory edit))
+            , ("span_start", toJSON editStart)
+            , ("span_end", toJSON editEnd)
+            , ("replacement", toJSON (TE.decodeUtf8Lenient replacement))
+            , ("bytes_before", toJSON (BS.length currentSQL))
+            , ("bytes_after", toJSON (BS.length acceptedBytes))
+            ]
+logAcceptedSyntaxEdit context (BundleCandidate target) currentSQL acceptedBytes =
+    logInfo'
+        (syntaxLogger context)
+        "reducer"
+        "Accepted atomic column co-reduction"
+        [ ("rewrite_kind", toJSON ("remove-column-bundle" :: T.Text))
+        , ("rewrite_category", toJSON EditColumn)
+        , ("table", toJSON (nameText (targetTable target)))
+        , ("column", toJSON (identText (targetColumn target)))
+        , ("sites", toJSON (length (targetSites target)))
+        , ("bytes_before", toJSON (BS.length currentSQL))
+        , ("bytes_after", toJSON (BS.length acceptedBytes))
+        ]
 
-        phaseCandidates category phases =
-            fromMaybe [] (lookup category phases)
+logSyntaxStats :: Logger -> SyntaxStats -> IO ()
+logSyntaxStats logger finalStats =
+    let accepted = syntaxAccepted finalStats
+     in if accepted > 0
+            then
+                logInfo'
+                    logger
+                    "reducer"
+                    "Syntax rewrites accepted"
+                    [ ("accepted_edits", toJSON accepted)
+                    , ("attempts", toJSON (syntaxAttempts finalStats))
+                    , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                    ]
+            else
+                logDebug'
+                    logger
+                    "reducer"
+                    "Syntax replacement completed with no accepted edits"
+                    [ ("attempts", toJSON (syntaxAttempts finalStats))
+                    , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                    ]
 
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
 replaceSpan start end replacement source =
     BS.concat [BS.take start source, replacement, BS.drop end source]
-
-data SyntaxCandidate
-    = SingleCandidate !ParserEdit
-    | BundleCandidate !ColumnTarget
 
 candidateTag :: SyntaxCandidate -> FamilyTag
 candidateTag (SingleCandidate edit) = TagSyntax (parserEditCategory edit) (parserEditLabel edit)

@@ -5,6 +5,7 @@ module Completion (
 ) where
 
 import Data.Char (toLower)
+import Data.List (intercalate)
 
 data ShellType = ShellBash | ShellZsh | ShellFish
     deriving (Eq, Show)
@@ -16,180 +17,239 @@ parseShellType s = case map toLower s of
     "fish" -> Right ShellFish
     _ -> Left "Expected 'bash', 'zsh', or 'fish'"
 
+-- | How an option consumes its value, and which completions it offers.
+data ValueSpec
+    = FlagValue
+    | CommandValue String
+    | FileValue String
+    | NumberValue String
+    | ChoiceValue String [String]
+    deriving (Eq, Show)
+
+-- | One CLI option rendered into every supported shell.
+data OptionSpec = OptionSpec
+    { optionShort :: !(Maybe Char)
+    , optionLong :: ![String]
+    , optionDescription :: !String
+    , optionValue :: !ValueSpec
+    }
+    deriving (Eq, Show)
+
+dialects :: [String]
+dialects =
+    [ "generic"
+    , "postgresql"
+    , "mysql"
+    , "sqlite"
+    , "duckdb"
+    , "clickhouse"
+    , "oracle"
+    , "ansi"
+    , "bigquery"
+    , "databricks"
+    , "hive"
+    , "mssql"
+    , "redshift"
+    , "snowflake"
+    , "spark"
+    , "teradata"
+    ]
+
+shells :: [String]
+shells = ["bash", "zsh", "fish"]
+
+-- | Single source of truth for completion options, descriptions, and values.
+optionSpecs :: [OptionSpec]
+optionSpecs =
+    [ OptionSpec (Just 'c') ["oracle"] "Interestingness predicate command" (CommandValue "COMMAND")
+    , OptionSpec (Just 'o') ["out"] "Output SQL file path, or - for stdout" (FileValue "OUTPUT FILE")
+    , OptionSpec (Just 'i') ["in-place"] "Modify input SQL file in place" FlagValue
+    , OptionSpec Nothing ["stats"] "Write JSON reduction statistics to FILE" (FileValue "FILE")
+    , OptionSpec Nothing ["reset"] "Lightweight state reset command" (CommandValue "RESET COMMAND")
+    , OptionSpec Nothing ["timeout"] "Per-execution timeout in seconds" (NumberValue "SECONDS")
+    , OptionSpec
+        Nothing
+        ["log-level"]
+        "Log severity level"
+        (ChoiceValue "LEVEL" ["debug", "info", "warn", "error"])
+    , OptionSpec Nothing ["log-format"] "Log output format" (ChoiceValue "FORMAT" ["text", "json"])
+    , OptionSpec Nothing ["verbose"] "Enable verbose debug output" FlagValue
+    , OptionSpec (Just 'q') ["quiet"] "Suppress info logs and banners" FlagValue
+    , OptionSpec
+        Nothing
+        ["color"]
+        "Colorized terminal output"
+        (ChoiceValue "MODE" ["auto", "always", "never"])
+    , OptionSpec Nothing ["budget", "time-limit"] "Shared wall-clock cap" (NumberValue "SECONDS")
+    , OptionSpec
+        Nothing
+        ["max-oracle-executions", "max-evals"]
+        "Maximum oracle attempts"
+        (NumberValue "N")
+    , OptionSpec (Just 'j') ["jobs"] "Maximum concurrent oracle executions" (NumberValue "N")
+    , OptionSpec
+        Nothing
+        ["strategy"]
+        "Reduction strategy"
+        (ChoiceValue "STRATEGY" ["full", "ddmin-only", "audit-only"])
+    , OptionSpec
+        Nothing
+        ["column-mode"]
+        "Column co-reduction mode"
+        (ChoiceValue "MODE" ["off", "single", "atomic"])
+    , OptionSpec (Just 'd') ["dialect"] "SQL dependency dialect" (ChoiceValue "DIALECT" dialects)
+    , OptionSpec Nothing ["slicing"] "Enable dependency slicing" FlagValue
+    , OptionSpec Nothing ["no-slicing"] "Disable dependency slicing" FlagValue
+    , OptionSpec Nothing ["closure"] "Enable dependency closure" FlagValue
+    , OptionSpec Nothing ["no-closure"] "Disable dependency closure" FlagValue
+    , OptionSpec Nothing ["intra-statement"] "Enable intra-statement reductions" FlagValue
+    , OptionSpec Nothing ["no-intra-statement"] "Disable intra-statement reductions" FlagValue
+    , OptionSpec Nothing ["unrestricted"] "Enable unrestricted fallback search" FlagValue
+    , OptionSpec Nothing ["no-unrestricted"] "Disable unrestricted fallback search" FlagValue
+    , OptionSpec Nothing ["cache"] "Enable candidate caching" FlagValue
+    , OptionSpec Nothing ["no-cache"] "Disable candidate caching" FlagValue
+    , OptionSpec Nothing ["list-dialects"] "List supported SQL dialects" FlagValue
+    , OptionSpec Nothing ["list-column-modes"] "List supported column modes" FlagValue
+    , OptionSpec Nothing ["list-strategies"] "List supported reduction strategies" FlagValue
+    , OptionSpec Nothing ["print-defaults"] "Print default settings in JSON format" FlagValue
+    , OptionSpec
+        Nothing
+        ["completion"]
+        "Generate shell autocompletion script"
+        (ChoiceValue "SHELL" shells)
+    , OptionSpec (Just 'v') ["version"] "Show version information" FlagValue
+    , OptionSpec (Just 'h') ["help"] "Show this help text" FlagValue
+    ]
+
 generateCompletion :: ShellType -> String
 generateCompletion ShellBash = bashCompletionScript
 generateCompletion ShellZsh = zshCompletionScript
 generateCompletion ShellFish = fishCompletionScript
 
-bashCompletionScript :: String
-bashCompletionScript =
-    unlines
-        [ "# This script enables bash autocompletion for occam."
-        , "# To enable bash completion, add this to your .bashrc:"
-        , "# eval \"$(occam --completion=bash)\""
-        , ""
-        , "_occam()"
-        , "{"
-        , "    local cur prev opts dialects column_modes strategies log_levels log_formats shells colors"
-        , "    COMPREPLY=()"
-        , "    cur=\"${COMP_WORDS[COMP_CWORD]}\""
-        , "    prev=\"${COMP_WORDS[COMP_CWORD-1]}\""
-        , ""
-        , "    opts=\"-c --oracle -o --out -i --in-place --stats --reset --timeout \\"
-        , "          --log-level --log-format --verbose -q --quiet --color --budget \\"
-        , "          --time-limit --max-oracle-executions --max-evals -j --jobs \\"
-        , "          --strategy --column-mode -d --dialect --slicing --no-slicing \\"
-        , "          --closure --no-closure --intra-statement --no-intra-statement \\"
-        , "          --unrestricted --no-unrestricted --cache --no-cache \\"
-        , "          --list-dialects --list-column-modes --list-strategies \\"
-        , "          --print-defaults --completion -v --version -h --help\""
-        , ""
-        , "    dialects=\"generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata\""
-        , "    column_modes=\"off single atomic\""
-        , "    strategies=\"full ddmin-only audit-only\""
-        , "    log_levels=\"debug info warn error\""
-        , "    log_formats=\"text json\""
-        , "    colors=\"auto always never\""
-        , "    shells=\"bash zsh fish\""
-        , ""
-        , "    case \"${prev}\" in"
-        , "        -c|--oracle|--reset)"
-        , "            return 0"
-        , "            ;;"
-        , "        -o|--out|--stats)"
-        , "            COMPREPLY=( $(compgen -f -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        -d|--dialect)"
-        , "            COMPREPLY=( $(compgen -W \"${dialects}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --column-mode)"
-        , "            COMPREPLY=( $(compgen -W \"${column_modes}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --strategy)"
-        , "            COMPREPLY=( $(compgen -W \"${strategies}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --log-level)"
-        , "            COMPREPLY=( $(compgen -W \"${log_levels}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --log-format)"
-        , "            COMPREPLY=( $(compgen -W \"${log_formats}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --color)"
-        , "            COMPREPLY=( $(compgen -W \"${colors}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        --completion)"
-        , "            COMPREPLY=( $(compgen -W \"${shells}\" -- \"${cur}\") )"
-        , "            return 0"
-        , "            ;;"
-        , "        *)"
-        , "            ;;"
-        , "    esac"
-        , ""
-        , "    if [[ \"${cur}\" == -* ]] ; then"
-        , "        COMPREPLY=( $(compgen -W \"${opts}\" -- \"${cur}\") )"
-        , "        return 0"
-        , "    else"
-        , "        COMPREPLY=( $(compgen -f -- \"${cur}\") )"
-        , "        return 0"
-        , "    fi"
-        , "}"
-        , ""
-        , "complete -F _occam -o default occam"
-        ]
+optionAliases :: OptionSpec -> [String]
+optionAliases spec =
+    maybe [] (pure . shortAlias) (optionShort spec)
+        ++ map ("--" ++) (optionLong spec)
+
+shortAlias :: Char -> String
+shortAlias short = ['-', short]
+
+{- | Render a zsh @_arguments@ specification. Multi-alias options leave the
+brace group unquoted so the shell expands it into one spec per alias.
+-}
+zshOption :: OptionSpec -> String
+zshOption spec = case optionAliases spec of
+    [alias] -> "'" ++ alias ++ zshDescription spec ++ "'"
+    aliases ->
+        "'("
+            ++ unwords aliases
+            ++ ")'{"
+            ++ intercalate "," aliases
+            ++ "}'"
+            ++ zshDescription spec
+            ++ "'"
+
+zshDescription :: OptionSpec -> String
+zshDescription spec =
+    "[" ++ optionDescription spec ++ "]" ++ zshValue (optionValue spec)
+
+zshValue :: ValueSpec -> String
+zshValue FlagValue = ""
+zshValue (CommandValue metavar) = ":" ++ metavar ++ ":_command_args"
+zshValue (FileValue metavar) = ":" ++ metavar ++ ":_files"
+zshValue (NumberValue metavar) = ":" ++ metavar ++ ":"
+zshValue (ChoiceValue metavar choices) = ":" ++ metavar ++ ":(" ++ unwords choices ++ ")"
+
+-- | Render an option as a fish @complete@ invocation.
+fishOption :: OptionSpec -> String
+fishOption spec =
+    "complete -c occam"
+        ++ maybe "" (\short -> " -s " ++ [short]) (optionShort spec)
+        ++ concatMap (" -l " ++) (optionLong spec)
+        ++ " -d \""
+        ++ optionDescription spec
+        ++ "\""
+        ++ fishValue (optionValue spec)
+
+fishValue :: ValueSpec -> String
+fishValue FlagValue = ""
+fishValue (CommandValue _) = " -r"
+fishValue (FileValue _) = " -r -F"
+fishValue (NumberValue _) = " -r"
+fishValue (ChoiceValue _ choices) = " -r -a \"" ++ unwords choices ++ "\""
 
 zshCompletionScript :: String
 zshCompletionScript =
     unlines
-        [ "#compdef occam"
-        , ""
-        , "_occam() {"
-        , "  local -a args"
-        , "  args=("
-        , "    '(-c --oracle)'{-c,--oracle}'[Interestingness predicate command]:COMMAND:_command_args'"
-        , "    '(-o --out)'{-o,--out}'[Output SQL file path, or - for stdout]:OUTPUT FILE:_files'"
-        , "    '(-i --in-place)'{-i,--in-place}'[Modify input SQL file in place]'"
-        , "    '--stats[Write JSON reduction statistics to FILE]:FILE:_files'"
-        , "    '--reset[Lightweight state reset command]:RESET COMMAND:_command_args'"
-        , "    '--timeout[Per-execution timeout in seconds]:SECONDS:'"
-        , "    '--log-level[Log severity level]:LEVEL:(debug info warn error)'"
-        , "    '--log-format[Log output format]:FORMAT:(text json)'"
-        , "    '--verbose[Enable verbose debug output]'"
-        , "    '(-q --quiet)'{-q,--quiet}'[Suppress info logs and banners]'"
-        , "    '--color[Colorized terminal output]:MODE:(auto always never)'"
-        , "    '(--budget --time-limit)'{--budget,--time-limit}'[Shared wall-clock cap]:SECONDS:'"
-        , "    '(--max-oracle-executions --max-evals)'{--max-oracle-executions,--max-evals}'[Maximum oracle attempts]:N:'"
-        , "    '(-j --jobs)'{-j,--jobs}'[Maximum concurrent oracle executions]:N:'"
-        , "    '--strategy[Reduction strategy]:STRATEGY:(full ddmin-only audit-only)'"
-        , "    '--column-mode[Column co-reduction mode]:MODE:(off single atomic)'"
-        , "    '(-d --dialect)'{-d,--dialect}'[SQL dependency dialect]:DIALECT:(generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata)'"
-        , "    '--slicing[Enable dependency slicing]'"
-        , "    '--no-slicing[Disable dependency slicing]'"
-        , "    '--closure[Enable dependency closure]'"
-        , "    '--no-closure[Disable dependency closure]'"
-        , "    '--intra-statement[Enable intra-statement reductions]'"
-        , "    '--no-intra-statement[Disable intra-statement reductions]'"
-        , "    '--unrestricted[Enable unrestricted fallback search]'"
-        , "    '--no-unrestricted[Disable unrestricted fallback search]'"
-        , "    '--cache[Enable candidate caching]'"
-        , "    '--no-cache[Disable candidate caching]'"
-        , "    '--list-dialects[List supported SQL dialects]'"
-        , "    '--list-column-modes[List supported column modes]'"
-        , "    '--list-strategies[List supported reduction strategies]'"
-        , "    '--print-defaults[Print default settings in JSON format]'"
-        , "    '--completion[Generate shell autocompletion script]:SHELL:(bash zsh fish)'"
-        , "    '(-v --version)'{-v,--version}'[Show version information]'"
-        , "    '(-h --help)'{-h,--help}'[Show this help text]'"
-        , "    '1:INPUT.sql:_files'"
-        , "  )"
-        , "  _arguments -s -S $args"
-        , "}"
-        , ""
-        , "_occam \"$@\""
-        ]
+        ( [ "#compdef occam"
+          , ""
+          , "_occam() {"
+          , "  local -a args"
+          , "  args=("
+          ]
+            ++ map (\spec -> "    " ++ zshOption spec) optionSpecs
+            ++ [ "    '1:INPUT.sql:_files'"
+               , "  )"
+               , "  _arguments -s -S $args"
+               , "}"
+               , ""
+               , "_occam \"$@\""
+               ]
+        )
 
 fishCompletionScript :: String
 fishCompletionScript =
     unlines
-        [ "# Fish completion for occam"
-        , "complete -c occam -s c -l oracle -d \"Interestingness predicate command\" -r"
-        , "complete -c occam -s o -l out -d \"Output SQL file path, or - for stdout\" -r -F"
-        , "complete -c occam -s i -l in-place -d \"Modify input SQL file in place\""
-        , "complete -c occam -l stats -d \"Write JSON reduction statistics to FILE\" -r -F"
-        , "complete -c occam -l reset -d \"Lightweight state reset command\" -r"
-        , "complete -c occam -l timeout -d \"Per-execution timeout in seconds\" -r"
-        , "complete -c occam -l log-level -d \"Log severity level\" -r -a \"debug info warn error\""
-        , "complete -c occam -l log-format -d \"Log output format\" -r -a \"text json\""
-        , "complete -c occam -l verbose -d \"Enable verbose debug output\""
-        , "complete -c occam -s q -l quiet -d \"Suppress info logs and banners\""
-        , "complete -c occam -l color -d \"Colorized terminal output\" -r -a \"auto always never\""
-        , "complete -c occam -l budget -l time-limit -d \"Shared wall-clock cap\" -r"
-        , "complete -c occam -l max-oracle-executions -l max-evals -d \"Maximum oracle attempts\" -r"
-        , "complete -c occam -s j -l jobs -d \"Maximum concurrent oracle executions\" -r"
-        , "complete -c occam -l strategy -d \"Reduction strategy\" -r -a \"full ddmin-only audit-only\""
-        , "complete -c occam -l column-mode -d \"Column co-reduction mode\" -r -a \"off single atomic\""
-        , "complete -c occam -s d -l dialect -d \"SQL dependency dialect\" -r -a \"generic postgresql mysql sqlite duckdb clickhouse oracle ansi bigquery databricks hive mssql redshift snowflake spark teradata\""
-        , "complete -c occam -l slicing -d \"Enable dependency slicing\""
-        , "complete -c occam -l no-slicing -d \"Disable dependency slicing\""
-        , "complete -c occam -l closure -d \"Enable dependency closure\""
-        , "complete -c occam -l no-closure -d \"Disable dependency closure\""
-        , "complete -c occam -l intra-statement -d \"Enable intra-statement reductions\""
-        , "complete -c occam -l no-intra-statement -d \"Disable intra-statement reductions\""
-        , "complete -c occam -l unrestricted -d \"Enable unrestricted fallback search\""
-        , "complete -c occam -l no-unrestricted -d \"Disable unrestricted fallback search\""
-        , "complete -c occam -l cache -d \"Enable candidate caching\""
-        , "complete -c occam -l no-cache -d \"Disable candidate caching\""
-        , "complete -c occam -l list-dialects -d \"List supported SQL dialects\""
-        , "complete -c occam -l list-column-modes -d \"List supported column modes\""
-        , "complete -c occam -l list-strategies -d \"List supported reduction strategies\""
-        , "complete -c occam -l print-defaults -d \"Print default settings in JSON format\""
-        , "complete -c occam -l completion -d \"Generate shell completion script\" -r -a \"bash zsh fish\""
-        , "complete -c occam -s v -l version -d \"Show version information\""
-        , "complete -c occam -s h -l help -d \"Show help text\""
-        ]
+        ( "# Fish completion for occam"
+            : map fishOption optionSpecs
+        )
+
+bashCompletionScript :: String
+bashCompletionScript =
+    unlines
+        ( [ "# This script enables bash autocompletion for occam."
+          , "# To enable bash completion, add this to your .bashrc:"
+          , "# eval \"$(occam --completion=bash)\""
+          , ""
+          , "_occam()"
+          , "{"
+          , "    local cur prev opts"
+          , "    COMPREPLY=()"
+          , "    cur=\"${COMP_WORDS[COMP_CWORD]}\""
+          , "    prev=\"${COMP_WORDS[COMP_CWORD-1]}\""
+          , ""
+          , "    opts=\"" ++ unwords (concatMap optionAliases optionSpecs) ++ "\""
+          , ""
+          , "    case \"${prev}\" in"
+          ]
+            ++ concatMap bashValueCase optionSpecs
+            ++ [ "        *)"
+               , "            ;;"
+               , "    esac"
+               , ""
+               , "    if [[ \"${cur}\" == -* ]] ; then"
+               , "        COMPREPLY=( $(compgen -W \"${opts}\" -- \"${cur}\") )"
+               , "        return 0"
+               , "    else"
+               , "        COMPREPLY=( $(compgen -f -- \"${cur}\") )"
+               , "        return 0"
+               , "    fi"
+               , "}"
+               , ""
+               , "complete -F _occam -o default occam"
+               ]
+        )
+    where
+        bashValueCase spec = case optionValue spec of
+            CommandValue _ -> bashArm spec []
+            FileValue _ -> bashArm spec ["            COMPREPLY=( $(compgen -f -- \"${cur}\") )"]
+            ChoiceValue _ choices ->
+                bashArm spec ["            COMPREPLY=( $(compgen -W \"" ++ unwords choices ++ "\" -- \"${cur}\") )"]
+            FlagValue -> []
+            NumberValue _ -> []
+        bashArm spec body =
+            ["        " ++ intercalate "|" (optionAliases spec) ++ ")"]
+                ++ body
+                ++ [ "            return 0"
+                   , "            ;;"
+                   ]
