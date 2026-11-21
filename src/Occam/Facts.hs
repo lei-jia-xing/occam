@@ -116,9 +116,7 @@ instance FromJSON ColumnSite where
             <*> objectValue .: "end"
             <*> objectValue .: "kind"
 
-{- | One column's atomic co-reduction bundle. 'targetBlocked' carries the
-frontend's skip cause; blocked targets are never oracle-tested.
--}
+-- | Column co-reduction target with sites and optional blocking reason.
 data ColumnTarget = ColumnTarget
     { targetTable :: !Name
     , targetColumn :: !Ident

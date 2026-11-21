@@ -455,9 +455,7 @@ compositeMutate initialSQL = do
 -- QuickCheck Invariant Properties
 -- ----------------------------------------------------------------------------
 
-{- | Core mutational invariant: recovery preserves the predicate and syntax,
-never grows the script, and removes injected dead statements.
--}
+-- | Core mutational invariant: recovery preserves syntax and predicate while pruning dead statements.
 prop_mutationRecovery :: Property
 prop_mutationRecovery = forAll (elements seedPool) $ \seed ->
     forAllShrink (compositeMutate (seedSQL seed)) (const []) $ \s_mutated -> monadicIO $ do

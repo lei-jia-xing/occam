@@ -78,11 +78,7 @@ import Occam.Dependency.State (
 
 -- Constraint column renames
 
-{- | Rename the columns owned by the table that defines the constraint. For a
-foreign key that is only the child side: the referenced parent columns belong
-to another table and must not change. Self-referential foreign keys are
-updated on both sides by 'processRename'.
--}
+-- | Rename child columns within a table's constraint definition.
 renameConstraintChildColumns :: (Ident -> Ident) -> Constraint -> Constraint
 renameConstraintChildColumns rename constraint =
     case constraint of
@@ -246,9 +242,7 @@ moveRelationObjects placement _sid oldKey newKey relation catalog =
                                 NamedIndexKey name ->
                                     case schemaPlacement of
                                         IndexTableSchema ->
-                                            -- The table-schema placement moves
-                                            -- an unqualified index with the
-                                            -- table into the table's schema.
+                                            -- Table-schema placement moves an unqualified index into table schema.
                                             case (nameParts name, nameParts (relationKeyName new)) of
                                                 ([_], newParts)
                                                     | length newParts > 1 ->
@@ -394,10 +388,7 @@ renameSourceReadColumns session catalog key rename relation =
                 readFact {readColumns = map rename (readColumns readFact)}
             | otherwise = readFact
 
-{- | Rewrite the read facts and inline DML events carried by a trigger. The
-two rename paths share this traversal and differ only in how a matching read
-or event target is rewritten.
--}
+-- | Rewrite read facts and inline DML events carried by a trigger.
 renameTriggerReadsAndBody ::
     (ReadFact -> ReadFact) ->
     (DmlEvent -> DmlEvent) ->

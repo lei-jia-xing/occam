@@ -21,9 +21,7 @@ camelToSnake = concatMap convert
 snakeCaseOptions :: Options
 snakeCaseOptions = defaultOptions {fieldLabelModifier = camelToSnake}
 
-{- | Rewrite top-level object keys to snake_case. Nested objects keep their
-keys so dynamic maps (status names, family tags) are never rewritten.
--}
+-- | Rewrite top-level object keys to snake_case.
 normalizeJsonFieldNames :: Value -> Value
 normalizeJsonFieldNames (Object fields) =
     Object

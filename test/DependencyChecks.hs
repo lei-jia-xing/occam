@@ -452,10 +452,7 @@ tests =
                         ("hidden reads retain writes after the opaque operation: " ++ BSC.unpack operation)
                         (has (StatementId 3) readDeps)
                 )
-                -- NOTE: `INHERITS` is fully modeled (not opaque) and `INSERT`
-                -- into an `INHERITS` parent lands parent-only, so it keeps no
-                -- edge to the child write; see "INHERITS INSERT lands
-                -- parent-only while other writes fan out".
+                -- INHERITS is fully modeled rather than opaque.
                 [ (PostgreSQL, "CREATE EXTENSION hstore;", "hidden_view")
                 , (PostgreSQL, "GRANT SELECT ON t TO PUBLIC;", "hidden_view")
                 , (PostgreSQL, "SELECT mutate_t();", "t")

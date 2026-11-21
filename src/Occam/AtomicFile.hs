@@ -1,8 +1,4 @@
-{- | Crash-safe file replacement: write a sibling temporary file, then rename
-it over the target. The target is never observed half-written, and a failed
-write attempts to remove its temporary file. Special devices (/dev/null, NUL,
-etc.) bypass temporary file creation.
--}
+-- | Crash-safe atomic file replacement using temporary files.
 module Occam.AtomicFile (
     writeAtomicBytes,
     writeAtomicLazyBytes,

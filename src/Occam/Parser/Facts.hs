@@ -1,6 +1,4 @@
-{- | Diagnostics for the hidden @--dump-facts@ CLI. Field names and stable wire
-names are part of the output contract; keep them explicit.
--}
+-- | Diagnostics for the hidden @--dump-facts@ CLI.
 module Occam.Parser.Facts (
     factDumpJson,
 ) where
@@ -92,10 +90,7 @@ statementFactsJson extras idx unit =
         writesJson = concatMap opWrites ops ++ map dataWriteJson cascadeExtras
         ddlJson = concatMap opDdl ops
 
-{- | Reads evaluated when the statement itself runs: direct reads, DML source
-reads, and CTAS/view definition sources. Trigger WHEN-clause reads fire
-with the trigger, so they are reported under @trigger_effects@ instead.
--}
+-- | Reads evaluated when the statement executes directly.
 opReads :: CatalogOp -> [ReadFact]
 opReads (ReadOp r) = [r]
 opReads (WriteDataOp w) = dataWriteReads w
@@ -249,9 +244,7 @@ barrierJson b =
         , "detail" .= barrierDetail b
         ]
 
-{- | Stable wire names for barrier reasons. Kept explicit so renaming a
-constructor cannot silently change the diagnostic JSON.
--}
+-- | Wire names for barrier reasons.
 barrierReasonName :: BarrierReason -> Text
 barrierReasonName reason = case reason of
     SyntaxErrorBarrier -> "SyntaxErrorBarrier"
@@ -315,9 +308,7 @@ txEffectName (TxSavepoint _) = "TxSavepoint"
 txEffectName (TxReleaseSavepoint _) = "TxReleaseSavepoint"
 txEffectName (TxSetReadOnly _) = "TxSetReadOnly"
 
-{- | Trigger body and WHEN-clause effects fire when the trigger fires, not at
-CREATE time, so they are reported separately from the statement's own reads.
--}
+-- | Trigger body and WHEN-clause effects JSON.
 triggerEffectsJson :: [CatalogOp] -> Value
 triggerEffectsJson ops =
     object ["reads" .= readsJson, "writes" .= writesJson, "other" .= otherJson]

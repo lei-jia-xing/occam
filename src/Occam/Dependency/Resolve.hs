@@ -91,9 +91,7 @@ instance ScopedKey SequenceKey where
     scopedKey = SequenceKey
     scopedKeyParts (SequenceKey temporary name) = Just (temporary, name)
 
-{- | Shared resolution for catalog namespaces whose keys differ only by a
-phantom wrapper (relations and sequences).
--}
+-- | Resolve namespaced catalog keys for relations and sequences.
 resolveNamespacedKeys ::
     (Ord k, ScopedKey k) =>
     (Catalog -> Map.Map k v) ->
@@ -167,9 +165,7 @@ resolveTriggerKeys session catalog triggerRef =
             | relationKey <- resolveRelationKeys session catalog table
             ]
 
-{- | Resolve a schema-level object name (index or schema-scoped trigger) using
-the same namespace/search-path rules as relations.
--}
+-- | Resolve a schema-level object name using namespace and search-path rules.
 resolveSchemaObjectName :: SessionState -> [Name] -> Name -> [Name]
 resolveSchemaObjectName session existing name@(Name parts)
     | length parts > 1 = [name]

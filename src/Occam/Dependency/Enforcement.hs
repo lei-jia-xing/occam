@@ -1,11 +1,4 @@
-{- | Cascade-write expansion for @--dump-facts@ cross-validation.
-Dumps carry no cross-statement state, so replay flag + FK catalog in file
-order (mirrors 'applyParentActions'); own effects apply afterwards.
-OFF: nothing. ON: @DELETE@ via @ON DELETE CASCADE@/@SET NULL@/@SET DEFAULT@
-(child @UPDATE@s); @UPDATE@ only on referenced-column overlap, visited-guarded,
-@NoAction@/@Restrict@ skipped. Default stays byte-identical; @--fk-on@ gains
-engine writes. Unmodeled: FK check reads, @TRUNCATE@.
--}
+-- | Cascade-write expansion for cross-statement foreign key effects.
 module Occam.Dependency.Enforcement (
     cascadeWrites,
 ) where
@@ -57,11 +50,7 @@ tableKeyOf (NameRef (Name parts) temporary) =
     where
         lowerPart = T.toLower . identText
 
-{- | Resolve a reference against the accumulated catalog. Qualified names are
-exact; unqualified names follow the namespace prefix, search path, and finally
-a unique suffix match. This keeps schema-qualified tables distinct while still
-matching the common unqualified FK references.
--}
+-- | Resolve a table reference against the accumulated catalog.
 resolveTableKey :: SessionInit -> Map TableKey TableInfo -> NameRef -> Maybe TableKey
 resolveTableKey initial catalog ref
     | Map.member direct catalog = Just direct

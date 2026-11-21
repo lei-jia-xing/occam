@@ -206,9 +206,7 @@ parseSQLDialect value = case map toLower value of
     _ ->
         Left ("Expected one of: " ++ T.unpack (T.intercalate ", " (map dialectName [minBound .. maxBound])))
 
-{- | Canonical CLI spelling. Single source is 'dialectName'; this alias keeps
-the CLI-layer name stable for existing callers.
--}
+-- | Canonical CLI dialect spelling.
 sqlDialectName :: SQLDialect -> Text
 sqlDialectName = dialectName
 
@@ -308,9 +306,7 @@ data Stats = Stats
     deriving stock (Eq, Show, Generic)
     deriving anyclass (ToJSON, FromJSON)
 
-{- | Reducer result: reduced bytes plus fixed-point evidence, if the action
-confirmed 1-minimality on those exact bytes.
--}
+-- | Reducer result containing reduced SQL and optional fixed-point evidence.
 data ReductionActionResult = ReductionActionResult
     { actionSQL :: !ByteString
     , actionEvidence :: !(Maybe ReductionEvidence)
@@ -341,10 +337,7 @@ ticks = toInteger <$> getMonotonicTimeNSec
 seconds :: Ticks -> Ticks -> Double
 seconds start end = fromIntegral (end - start) / 1000000000
 
-{- | Exact named policy for one reducer configuration. Names come from the
-canonical 'Occam.Reducer' helpers; @(intra=False, mode/=off)@ is a config
-error, never a silent relabel, and must be rejected before any oracle call.
--}
+-- | Build a MetricPolicy for the given reduction configuration.
 metricPolicyForReduction :: ReductionConfig -> Int -> Either Text MetricPolicy
 metricPolicyForReduction config jobs
     | not (reductionIntraStatement config) && reductionColumnMode config /= ColumnOff =
@@ -357,9 +350,7 @@ metricPolicyForReduction config jobs
                 , metricJobs = jobs
                 }
 
-{- | Run one reducer with shared budgets/cache/audit policy, uncached repeated
-final checks, and an atomically persisted best accepted result.
--}
+-- | Execute an evaluated reduction workflow.
 runEvaluatedReduction ::
     Maybe MetricPolicy ->
     EvaluationConfig ->
@@ -609,10 +600,7 @@ runEvaluationRequest EvaluationRequest {..} = do
                 }
     pure EvaluationResult {evaluatedSQL = finalSQL, evaluationMetrics = metrics}
 
-{- | Mutable reduction state shared by all phases. Every update goes through
-'modifyEvalState' (atomic): worker billing runs on pool threads while
-retirement, audit, and validation run on the reduction thread.
--}
+-- | Mutable reduction state shared across all execution phases.
 data EvalState = EvalState
     { evalAccepted :: !ByteString
     , evalDatabase :: !Int
@@ -700,10 +688,7 @@ boundedTimeout :: Integer -> Int
 boundedTimeout micros =
     fromInteger (max 0 (min micros (toInteger (maxBound :: Int))))
 
-{- | Reduction phase: run the action plus the shared audit under the shared
-budget, always draining and closing the pool, then snapshot cost
-attribution after the drain.
--}
+-- | Execute the main reduction action and audit phase under budget constraints.
 runReductionPhase ::
     EvalEnv ->
     IORef EvalState ->
@@ -726,9 +711,7 @@ runReductionPhase env state pool metricsStore reporter action = do
             Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
     reductionEnd <- ticks
     let reductionSeconds = seconds (envReductionStart env) reductionEnd
-    -- The pool is closed (workers drained) on every path above, including
-    -- timeout: capture cost attribution after the drain so canceled and
-    -- unselected counters are retained on all end statuses.
+    -- Snapshot cost attribution after workers are drained.
     costAttribution <- traverse snapshotMetrics metricsStore
     pure (outcome, reductionSeconds, costAttribution)
     where
@@ -737,10 +720,7 @@ runReductionPhase env state pool metricsStore reporter action = do
             runAuditPhase env state pool reporter (actionEvidence result)
             pure result
 
-{- | Audit phase: confirm statement-deletion 1-minimality on the accepted
-bytes, skipping the re-run when the action's evidence already confirms
-these exact bytes (a re-run would only replay cache hits).
--}
+-- | Run statement-deletion audit to confirm 1-minimality on the accepted result.
 runAuditPhase ::
     EvalEnv -> IORef EvalState -> OraclePool -> StageReporter -> Maybe ReductionEvidence -> IO ()
 runAuditPhase env state pool reporter evidence = do
@@ -889,9 +869,7 @@ runValidationPhase env state finalSQL skipValidation
                                             modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
                                             pure (Just OracleInconclusive)
 
--- Worker-side billing: every observation is applied in one atomic update so a
--- concurrent snapshot never sees partial accounting. Cancelled speculative
--- work never reaches this path; it counts as cancelled, not here.
+-- | Atomically record worker observation metrics.
 recordReductionObservation :: IORef EvalState -> OracleObservationDetails -> IO ()
 recordReductionObservation state profile = do
     let observation = detailedObservation profile
@@ -934,8 +912,7 @@ recordValidationOutcome state observation =
                 }
         )
 
--- Scheduler-side retirement: curve, progress, and checkpoint updates run
--- in decision order on the single reduction thread.
+-- | Update progress curve and checkpoints upon candidate retirement.
 retireCandidate ::
     (EvaluationProgress -> IO ()) ->
     Ticks ->
@@ -948,9 +925,7 @@ retireCandidate ::
     IO ()
 retireCandidate onProgress reductionStart checkpoint state callIndex candidate outcome hit = do
     let accepted = outcome == OracleAccepted
-    -- Statement counts arrive with the candidates: the reducer reports every
-    -- tested candidate's known count up front, so retirement only looks up
-    -- and never re-parses.
+    -- Retrieve cached statement count for accepted candidate.
     statements <-
         if accepted
             then Map.lookup candidate . evalCounts <$> readIORef state
@@ -975,10 +950,7 @@ retireCandidate onProgress reductionStart checkpoint state callIndex candidate o
                     : evalCurve s
             }
 
-{- | The single typed mapping from reducer stage events to UI progress and
-per-stage summaries. Starts drive the progress display; finishes append
-one summary each, so @evaluationStages@ stays small and truthful.
--}
+-- | Route reducer stage events to UI progress and per-stage summaries.
 evalStageReporter :: (EvaluationProgress -> IO ()) -> IORef EvalState -> StageReporter
 evalStageReporter onProgress state = \case
     StageStarted stage -> onProgress (ProgressStage (reductionStageName stage))

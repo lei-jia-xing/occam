@@ -152,9 +152,7 @@ instance ToJSON FamilyCounters where
 instance FromJSON FamilyCounters where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
-{- | One family entry in the JSON wire format. The internal snapshot keeps a
-map for lookup; arrays are used on the wire so tags stay structured.
--}
+-- | Family entry in JSON wire format.
 data FamilyEntry = FamilyEntry
     { familyEntryTag :: !FamilyTag
     , familyEntryCounters :: !FamilyCounters
@@ -208,10 +206,7 @@ instance FromJSON MetricsSnapshot where
                     <*> objectValue .: "snapshot_parse_decode_micros"
             entryPair entry = (familyEntryTag entry, familyEntryCounters entry)
 
-{- | Mutable per-run cost store. One owner (Evaluation) creates it, threads it
-into the pool config, and snapshots it after the pool drains; record sites
-only add counts. Holds counters plus bounded tag/policy text; no event log, no SQL.
--}
+-- | Mutable per-run metrics and telemetry store.
 data MetricsStore = MetricsStore
     { storePolicy :: !MetricPolicy
     , storeFamilies :: !(IORef (Map FamilyTag FamilyCounters))
@@ -228,9 +223,7 @@ newMetricsStore policy =
         <*> newIORef Map.empty
         <*> newIORef Map.empty
 
-{- | The single end hook. Call after the pool drains, on every end status;
-concurrent records during the snapshot itself are not atomic across maps.
--}
+-- | Capture an immutable snapshot of all metrics in the store.
 snapshotMetrics :: MetricsStore -> IO MetricsSnapshot
 snapshotMetrics MetricsStore {..} =
     MetricsSnapshot storePolicy
@@ -335,11 +328,7 @@ recordCandidateBuildTiming metricsStore tag micros =
     withMetricsStore metricsStore \store ->
         bumpFamily store tag \counters -> counters {candidateBuildMicros = candidateBuildMicros counters + micros}
 
-{- | Add measured oracle/reset micros. Sums cover available completed
-profiles ONLY: 'Nothing' stays unknown (never folded to zero), canceled
-work bills separate interaction wall. Neither sum is total CPU or all
-interaction cost.
--}
+-- | Record measured oracle and reset execution durations.
 recordOracleTiming :: Maybe MetricsStore -> FamilyTag -> Maybe Int -> Maybe Int -> IO ()
 recordOracleTiming (Just _) _ Nothing Nothing = pure ()
 recordOracleTiming metricsStore tag mOracle mReset =

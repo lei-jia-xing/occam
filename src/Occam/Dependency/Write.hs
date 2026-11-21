@@ -314,13 +314,7 @@ writeRelation sid eval key kind columns only =
                 else evalDeps & evalCatalogL %~ insertRelation key (applyWriteState sid kind columns relation)
         evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
         evalCascades = applyForeignKeys sid evalTriggers key kind columns
-        -- A parent write also lands on partition/inheritance children.
-        -- `INSERT` (including `COPY FROM`, modeled as `InsertWrite`)
-        -- routes by key into partition children but lands parent-only
-        -- under plain `INHERITS`, so it fans out to partition children
-        -- only; every other write kind fans out to both. Recursing
-        -- through `writeRelation` reuses trigger matching, cascades, and
-        -- the visited guard uniformly; `ONLY` skips the children.
+        -- Fan out parent write to partition/inheritance children unless ONLY is specified.
         evalChildren =
             if only
                 then evalCascades
@@ -480,9 +474,7 @@ processSequenceWrite sid eval write =
         evalWrites = mutateResolved stepKey eval keys
      in if not transactional && evalTransactionActive eval
             then
-                -- NOTE: durable sequence values across DDL rollback need
-                -- generation history; retain the script instead of restoring
-                -- their values as if they were ordinary transactional rows.
+                -- Non-transactional sequence changes during an active transaction require a barrier.
                 addBarrier
                     ( ScopedBarrier
                         GlobalScope
@@ -562,9 +554,7 @@ applyParentActions sid eval key kind columns =
                         eval
                         (allForeignKeys catalog)
                 else
-                    -- Without CASCADE the server refuses to truncate a parent
-                    -- that is still referenced. The statement therefore depends
-                    -- on the referencing table and its foreign key constraint.
+                    -- TRUNCATE without CASCADE depends on referencing tables and FK constraints.
                     foldl'
                         ( \current (_, state, foreignKey) ->
                             if parentMatches state foreignKey

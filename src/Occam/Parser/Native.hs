@@ -1,7 +1,4 @@
-{- | Raw sqlparser frontend boundary: FFI imports, native status mapping, and
-JSON decoding for the response spine. Nothing here validates source ranges or
-assembles public facts; those live in "Occam.Parser.Validate".
--}
+-- | Raw sqlparser frontend boundary: FFI imports and JSON decoding.
 module Occam.Parser.Native (
     NativeResponse (..),
     NativeUnit (..),

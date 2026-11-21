@@ -109,10 +109,7 @@ posixTests =
                             ++ shellQuote sentinel
                             ++ ") & yes flooding-output | head -c 20000000 >&2; wait"
                     cfg = shellOracleConfig command 500000 Nothing
-                -- The oracle never reads stdin while its 2MiB payload fills
-                -- the pipe and stderr floods; the group must die before the
-                -- blocked writer is joined. Generous outer guard proves
-                -- liveness only, not a wall threshold.
+                -- Verify process-group termination when stdin is unread and stderr floods.
                 result <- timeout 20000000 (observeExternalOracleDetailed cfg input)
                 case result of
                     Nothing -> assertFailure "oracle observation hung on unread stdin"

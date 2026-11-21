@@ -22,9 +22,7 @@ backwardSlice target = backwardSliceMany (Set.singleton target)
 backwardSliceFast :: Int -> DependencyGraph -> IntSet
 backwardSliceFast target = backwardSliceManyFast (IntSet.singleton target)
 
-{- | Computes the union of the backward slices of several targets in a single
-traversal, visiting each statement at most once.
--}
+-- | Computes the union of backward slices for multiple targets.
 backwardSliceMany :: Set StatementId -> DependencyGraph -> Set StatementId
 backwardSliceMany roots graph@DependencyGraph {..}
     | IntMap.null graphFastEdges = go roots (Set.toList roots)
@@ -41,9 +39,7 @@ backwardSliceMany roots graph@DependencyGraph {..}
                     then go visited rest
                     else go (visited `Set.union` newNodes) (Set.foldl' (flip (:)) rest newNodes)
 
-{- | Computes the union of the backward slices of several integer statement targets
-directly over 'graphFastEdges', visiting each statement at most once.
--}
+-- | Fast backward slice union using 'IntSet' representation.
 backwardSliceManyFast :: IntSet -> DependencyGraph -> IntSet
 backwardSliceManyFast roots DependencyGraph {..}
     | IntMap.null graphFastEdges =

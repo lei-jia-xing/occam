@@ -88,9 +88,7 @@ introducedForeignKeysOf change =
                 ++ columnReferences column
         _ -> []
 
-{- | Views that read the dropped column, directly or through another view,
-tracked precisely via column lineage across view layers.
--}
+-- | Find views dependent on the dropped column via column lineage.
 dropColumnDependentViews :: SessionState -> Catalog -> RelationKey -> Ident -> [RelationKey]
 dropColumnDependentViews session catalog tableKey column =
     [ viewKey
@@ -213,17 +211,11 @@ processAlterTable sid eval alter =
              in current1 & evalCatalogL .~ insertRelation key relation2 catalog1
      in mutateResolved stepKey eval keys
 
-{- | `ALTER TABLE parent ATTACH PARTITION child`: route the child's rows
-through the parent from here on. The parent records a schema write so
-later parent reads depend on the attach.
--}
+-- | Process @ALTER TABLE ... ATTACH PARTITION@.
 processAttachPartition :: StatementId -> Eval -> PartitionLink -> Eval
 processAttachPartition sid eval link = attachDetachPartition sid eval link True
 
-{- | `ALTER TABLE parent DETACH PARTITION child`: break routing. Earlier
-statements keep their snapshot edges; later parent reads exclude the
-child but depend on the detach itself through the parent schema write.
--}
+-- | Process @ALTER TABLE ... DETACH PARTITION@.
 processDetachPartition :: StatementId -> Eval -> PartitionLink -> Eval
 processDetachPartition sid eval link = attachDetachPartition sid eval link False
 
@@ -231,9 +223,7 @@ attachDetachPartition :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
 attachDetachPartition =
     attachDetachLink relPartitionParents (\relation links -> relation {relPartitionParents = links})
 
-{- | `ALTER TABLE child INHERIT parent` and `NO INHERIT`: the inheritance
-link set mirrors partition routing but keeps `INSERT` parent-only.
--}
+-- | Process @ALTER TABLE ... INHERIT@.
 processAttachInherit :: StatementId -> Eval -> PartitionLink -> Eval
 processAttachInherit sid eval link = attachDetachInherit sid eval link True
 
@@ -244,9 +234,7 @@ attachDetachInherit :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
 attachDetachInherit =
     attachDetachLink relInheritParents (\relation links -> relation {relInheritParents = links})
 
-{- | Shared attach/detach engine for partition and inheritance links. The two
-callers differ only in which link set they read and write.
--}
+-- | Attach or detach a parent-child routing link.
 attachDetachLink ::
     (RelationState -> Set NameRef) ->
     (RelationState -> Set NameRef -> RelationState) ->
@@ -358,8 +346,7 @@ applyDropColumn session key (catalog, relation) column cascade =
                         session
                         catalog
                         (foreignKeyParent foreignKey)
-        -- Indexes and constraints inside this table are always dropped
-        -- with the column, even without CASCADE.
+        -- Internal table constraints on the dropped column.
         sameTableKeys =
             [ constraintKey
             | constraintKey <- Set.toList (relConstraints relation)
@@ -377,10 +364,7 @@ applyDropColumn session key (catalog, relation) column cascade =
             , indexStateTable state == Just key
             , column `elem` indexStateColumns state
             ]
-        -- Foreign keys in other tables that reference this column as
-        -- a parent column are external dependents. Without CASCADE the
-        -- server rejects the drop, so the whole catalog must stay
-        -- unchanged; with CASCADE the constraints are removed.
+        -- External foreign keys referencing this column as a parent.
         crossTableKeys =
             [ constraintKey
             | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
@@ -388,9 +372,7 @@ applyDropColumn session key (catalog, relation) column cascade =
             , ForeignKeyConstraint foreignKey <- [constraintValue state]
             , isParentColumn foreignKey
             ]
-        -- A self-referential foreign key still makes the dropped
-        -- column a referenced parent column. It must block a RESTRICT
-        -- drop just like a foreign key from another table.
+        -- Self-referential foreign keys on the dropped column.
         selfParentKeys =
             [ constraintKey
             | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
@@ -398,10 +380,7 @@ applyDropColumn session key (catalog, relation) column cascade =
             , ForeignKeyConstraint foreignKey <- [constraintValue state]
             , isParentColumn foreignKey
             ]
-        -- Views retain the columns they read from each source, so a
-        -- view that only uses other columns does not block the drop.
-        -- A source with no retained read information is treated as
-        -- dependent, which is the sound over-approximation.
+        -- Views that depend on the dropped column.
         dependentViews = dropColumnDependentViews session catalog key column
         hasExternalDependents =
             not (null crossTableKeys)
@@ -460,10 +439,7 @@ applyDropConstraint session key (catalog, relation) name cascade =
             | constraintKey <- Set.toList (relConstraints relation)
             , constraintKeyIdentity constraintKey == NamedConstraint name
             ]
-        -- Only primary-key and unique constraints can be referenced by
-        -- a foreign key. The referenced column set decides whether a
-        -- given foreign key depends on the dropped constraint; an
-        -- omitted parent column list means the parent primary key.
+        -- Target columns for dropped primary key or unique constraints.
         dropTarget droppedState =
             case constraintValue droppedState of
                 PrimaryKeyConstraint _ columns ->
@@ -612,9 +588,7 @@ renameConstraintName name constraint =
             UsingIndexConstraint (Just name) index primary placement
         OtherConstraint _ -> OtherConstraint (Just name)
 
-{- | Clear @NOT VALID@ after a successful @VALIDATE CONSTRAINT@. Only foreign
-key and check constraints carry that flag.
--}
+-- | Mark a validated foreign key or check constraint valid.
 validateConstraintValue :: Constraint -> Constraint
 validateConstraintValue constraint =
     case constraint of

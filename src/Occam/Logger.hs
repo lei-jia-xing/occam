@@ -1,3 +1,4 @@
+-- | Structured and colored logging facilities.
 module Occam.Logger (
     LogLevel (..),
     LogFormat (..),
@@ -52,6 +53,7 @@ import System.Log.FastLogger (
     toLogStr,
  )
 
+-- | Log severity level.
 data LogLevel = LevelDebug | LevelInfo | LevelWarn | LevelError
     deriving (Eq, Ord, Show, Read, Generic)
 
@@ -63,9 +65,11 @@ instance ToJSON LogLevel where
 
 instance FromJSON LogLevel
 
+-- | Log rendering format (plain text or structured JSON).
 data LogFormat = FormatText | FormatJSON
     deriving (Eq, Show, Read, Generic, ToJSON, FromJSON)
 
+-- | Logging configuration options.
 data LogConfig = LogConfig
     { logMinLevel :: !LogLevel
     , logFormat :: !LogFormat
@@ -73,15 +77,18 @@ data LogConfig = LogConfig
     }
     deriving (Eq, Show)
 
+-- | Default logging configuration: Info level, colored text.
 defaultLogConfig :: LogConfig
 defaultLogConfig = LogConfig LevelInfo FormatText True
 
+-- | Logger handle wrapping action, configuration, and flush callback.
 data Logger = Logger
     { loggerConfig :: !LogConfig
     , loggerAction :: !(LogLevel -> Text -> Text -> [(Text, Value)] -> IO ())
     , loggerFlush :: !(IO ())
     }
 
+-- | No-op logger that discards all log messages.
 nullLogger :: Logger
 nullLogger = Logger defaultLogConfig (\_ _ _ _ -> pure ()) (pure ())
 
@@ -110,11 +117,13 @@ logAt :: Logger -> LogLevel -> Text -> Text -> [(Text, Value)] -> IO ()
 logAt Logger {..} lvl comp msg meta =
     when (logMinLevel loggerConfig <= lvl) $ loggerAction lvl comp msg meta
 
+-- | Adjust log configuration based on terminal capabilities and NO_COLOR.
 resolveLogConfig :: LogConfig -> IO LogConfig
 resolveLogConfig cfg = do
     supportsColor <- (&&) <$> hSupportsANSI stderr <*> (isNothing <$> lookupEnv "NO_COLOR")
     pure cfg {logUseColor = logUseColor cfg && supportsColor}
 
+-- | Initialize and safely finalize a fast stderr logger.
 withLogger :: LogConfig -> (Logger -> IO a) -> IO a
 withLogger rawCfg action = do
     cfg <- resolveLogConfig rawCfg

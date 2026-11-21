@@ -1,3 +1,4 @@
+-- | SQL test case reduction pipeline combining slicing, ddmin, and intra-statement rewrites.
 module Occam.Reducer (
     ReductionConfig (..),
     ColumnMode (..),
@@ -104,6 +105,7 @@ import Occam.Slicer (
     backwardSliceManyFast,
  )
 
+-- | Column co-reduction mode: disabled, single-site, or atomic multi-site bundles.
 data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
     deriving (Eq, Show)
 
@@ -117,15 +119,13 @@ syntaxPolicyName ColumnOff = "phase-forward-sweep-list-chunks"
 syntaxPolicyName ColumnSingle = "phase-forward-sweep-list-chunks+column-single"
 syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
 
-{- | Total policy description. Without intra-statement passes the column mode
-never executes, so the base policy is reported; the invalid combination is
-rejected by the reducer entry guard before any oracle call.
--}
+-- | Total policy description for the given reduction configuration.
 reductionSearchPolicy :: ReductionConfig -> T.Text
 reductionSearchPolicy config
     | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
     | otherwise = syntaxPolicyName (reductionColumnMode config)
 
+-- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
     , reductionClosure :: !Bool
@@ -136,6 +136,7 @@ data ReductionConfig = ReductionConfig
     }
     deriving (Eq, Show)
 
+-- | Default reduction pipeline configuration.
 defaultReductionConfig :: ReductionConfig
 defaultReductionConfig =
     ReductionConfig
@@ -185,10 +186,7 @@ type StageReporter = StageEvent -> IO ()
 nullStageReporter :: StageReporter
 nullStageReporter _ = pure ()
 
-{- | Proof returned alongside reduced SQL: these exact bytes need no further
-audit work. Every skip guarded by evidence rechecks byte-identity first;
-evidence never crosses a byte change.
--}
+-- | Evidence indicating the reduced SQL has satisfied statement-level audit minimality.
 data ReductionEvidence = ReductionEvidence
     { evidenceBytes :: !ByteString
     , evidenceAuditMinimal :: !Bool
@@ -248,9 +246,7 @@ parseUnitsOrThrow store options sql = do
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
         Right result -> pure (parsedInitialSession result, parsedUnits result, parsedColumns result)
 
-{- | The syntax pass alone opts into list-chunk deletions; statement-only
-parses keep the legacy payload without chunk materialization.
--}
+-- | Parse options for syntax-level rewrites.
 syntaxParseOptions :: SQLDialect -> ParseOptions
 syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True, parseSyntaxEdits = True}
 
@@ -267,9 +263,7 @@ columnParseOptions ColumnOff = syntaxParseOptions
 columnParseOptions ColumnSingle = columnSingleParseOptions
 columnParseOptions ColumnAtomic = columnAtomicParseOptions
 
-{- | A retained candidate set K is closed iff every kept statement's direct
-predecessors are also retained.
--}
+-- | Check whether the retained statement set is closed under dependency predecessors.
 isValidClosure :: DependencyGraph -> Set StatementId -> Bool
 isValidClosure graph kept =
     let !keptInts = IntSet.fromList (map unStatementId (Set.toList kept))
@@ -299,20 +293,13 @@ closeSet graph roots = backwardSliceMany roots graph
 closeSetFast :: DependencyGraph -> IntSet.IntSet -> IntSet.IntSet
 closeSetFast graph roots = backwardSliceManyFast roots graph
 
-{- | Cut removed statements without unparsing or changing retained bytes.
-
-Each statement owns the source bytes from its first token up to the first
-token of the next statement, or to end-of-input for the final statement. That
-partition includes the statement's own terminator and separator, so removing
-a statement cannot leave an orphaned delimiter or blank line behind. The
-partition is exact: it never inspects or rewrites the bytes it keeps.
--}
+-- | Cut removed statements from the source SQL, preserving retained bytes and delimiters.
 cutRemovedStatementIds :: ByteString -> [Statement] -> Set StatementId -> ByteString
 cutRemovedStatementIds baseSQL allStatements keptIds =
     let !keptInts = IntSet.fromList (map unStatementId (Set.toList keptIds))
      in cutRemovedStatementInts baseSQL allStatements keptInts
 
--- | Fast statement byte surgery directly driven by an 'IntSet' of retained statement IDs.
+-- | Fast statement byte surgery directly driven by an 'IntSet.IntSet' of retained statement IDs.
 cutRemovedStatementInts :: ByteString -> [Statement] -> IntSet.IntSet -> ByteString
 cutRemovedStatementInts baseSQL allStatements keptInts =
     case chunks 0 allStatements of
@@ -363,7 +350,7 @@ statementSpanBytes statement =
 statementIds :: [Statement] -> Set StatementId
 statementIds = Set.fromList . map stmtId
 
--- | Collect statement IDs as a bitwise 'IntSet'.
+-- | Collect statement IDs as a bitwise 'IntSet.IntSet'.
 statementIdsInt :: [Statement] -> IntSet.IntSet
 statementIdsInt = IntSet.fromList . map (unStatementId . stmtId)
 
@@ -448,11 +435,7 @@ data CandidateVerdict
     | CandidateRejected
     deriving (Eq, Show)
 
-{- | Verdict memo keyed ONLY by exact candidate bytes. Statement-ID-keyed
-rejection reuse is unsafe for arbitrary oracles: a removal rejected under
-one snapshot can become valid after the current SQL shrinks, so IDs must
-never skip re-testing a changed candidate. Same exact bytes stay valid.
--}
+-- | Verdict memo keyed by exact candidate bytes.
 newtype Feedback = Feedback
     { fbEvaluated :: IORef (HashMap ByteString CandidateVerdict)
     }
@@ -527,14 +510,7 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
 
         trySeeds current currentInts currentLen = pull
             where
-                -- Pull only the next window of eligible candidates, test and
-                -- record them, then classify further seeds with updated
-                -- feedback. Never materializes SQL for the whole granularity.
-                -- Duplicate candidate bytes within one pull are probed once:
-                -- the byte memo would skip the twin right after the first
-                -- rejects, and any other outcome stops before it. The scan is
-                -- bounded too: at most one window of classify work is pulled
-                -- before testing, never a full duplicate-list scan.
+                -- Pull and test eligible candidate windows incrementally.
                 pull [] = pure Nothing
                 pull seeds = collect jobs [] HashSet.empty seeds
                 collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
@@ -602,10 +578,7 @@ statementDdmin dialect pool initialSQL = do
                 searchStatements plainCandidate pool initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
-{- | One-statement deletion to a fixed point; the empty candidate is allowed.
-Successive rejected deletions share the snapshot, so each window pulls the
-next retained statements and retires them in order.
--}
+-- | Repeated single-statement deletion until reaching a 1-minimal fixed point.
 statementAudit :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 statementAudit dialect pool initialSQL = fst <$> statementAuditWithLogger nullLogger dialect pool initialSQL
 
@@ -740,9 +713,7 @@ logAuditStats logger stats =
                     , ("statement_1_minimal", toJSON (auditMinimalityConfirmed stats))
                     ]
 
-{- | Binary prefix probes. Only monotone predicates guarantee the first accepted
-prefix; arbitrary predicates may have earlier accepted prefixes we never visit.
--}
+-- | Binary search for the shortest interesting prefix of statements.
 findInterestingPrefix ::
     OraclePool -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
 findInterestingPrefix pool baseSQL statements
@@ -800,10 +771,7 @@ analyzeSQL store logger dialect sql = do
         ]
     pure SQLAnalysis {analyzedStatements = statements, analyzedGraph = graph}
 
-{- | Slice @sql@ using an analysis of the same bytes. The analysis is returned
-only when the result is byte-identical to @sql@, so the caller can safely reuse
-it for the next stage without re-parsing.
--}
+-- | Slice SQL statements using a precomputed dependency analysis.
 sliceWithAnalysis ::
     Logger -> OraclePool -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
 sliceWithAnalysis logger pool analysis sql =
@@ -896,13 +864,16 @@ closureSearchWithAnalysis logger pool sql analysis =
                         (analyzedGraph analysis)
                 pure (statementSQL sql statements retained)
 
+-- | Reduce SQL test case using default configuration and dialect.
 reduceSQL :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 reduceSQL dialect = reduceSQLWithLogger dialect nullLogger
 
+-- | Reduce SQL test case using custom logger and dialect.
 reduceSQLWithLogger :: SQLDialect -> Logger -> OraclePool -> ByteString -> IO ByteString
 reduceSQLWithLogger dialect =
     reduceSQLWithConfig (defaultReductionConfig {reductionDialect = dialect})
 
+-- | Reduce SQL test case using custom configuration, logger, and oracle pool.
 reduceSQLWithConfig :: ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString
 reduceSQLWithConfig config logger pool initialSQL =
     reductionSQL <$> reduceSQLWithEvidence nullStageReporter config logger pool initialSQL
@@ -984,9 +955,7 @@ reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence
         interleaveStages base
             | Just evidence <- priorEvidence
             , evidenceBytes evidence == base =
-                -- The previous iteration already drove the interleave to a
-                -- fixed point on these exact bytes; re-running would only
-                -- replay cache hits.
+                -- Prior evidence already confirms fixed point on these bytes.
                 pure (base, priorEvidence)
             | otherwise = case (reductionUnrestricted config, reductionIntraStatement config) of
                 (True, True) -> do
@@ -1074,15 +1043,11 @@ data SyntaxCandidate
     = SingleCandidate !ParserEdit
     | BundleCandidate !ColumnTarget
 
-{- | Clause-edit classes in attempt order: safe removals first, structural
-clauses next, and predicate-bearing clauses last.
--}
+-- | Clause edit classification in priority order.
 data ClauseEditClass = SafeClauseEdit | StructuralClauseEdit | FragileClauseEdit
     deriving (Eq, Ord, Show)
 
-{- | Expression-edit classes in attempt order: structure-preserving unwraps
-before edits that may discard an operand value.
--}
+-- | Expression edit classification in priority order.
 data ExpressionEditClass = UnwrapExpressionEdit | AggressiveExpressionEdit
     deriving (Eq, Ord, Show)
 
@@ -1265,8 +1230,7 @@ generateSyntaxCandidates context currentSQL = do
             concatMap
                 (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
                 units
-    -- Blocked bundles are counted once per snapshot with the frontend's
-    -- cause; they never enter the candidate stream.
+    -- Record skipped metrics for blocked bundles.
     mapM_
         (maybe (pure ()) (recordGeneratedSkipped (syntaxStore context)) . targetBlocked)
         columns
@@ -1294,11 +1258,7 @@ sortSyntaxEdits category edits = case category of
         sortOn expressionEditRank edits
     _ -> edits
 
-{- | Drive one category to exhaustion. After a strict shrink, reparse and resume
-at the accepted ordinal; candidates before that cursor are revisited in the
-next full cycle. Each window pulls testable edits from the unchanged snapshot
-and retires them in parser-emitted order.
--}
+-- | Exhaustively apply edits of one category until no further reductions succeed.
 exhaustSyntaxCategory ::
     SyntaxContext ->
     IORef SyntaxStats ->
@@ -1378,9 +1338,7 @@ recordSyntaxTest tested elapsed accepted stats =
         , syntaxElapsed = syntaxElapsed stats + elapsed
         }
 
-{- | Column bundles precede their identical singles in atomic mode; every
-other category is singles only.
--}
+-- | Initial candidate stream for the given syntax category.
 initialSyntaxStream ::
     SyntaxContext ->
     [(ParserEditCategory, [ParserEdit])] ->
@@ -1416,11 +1374,7 @@ fillSyntaxWindow context currentSQL startOrdinal = fill (poolJobCount (syntaxPoo
                     recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
                     fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
 
-{- | Time candidate byte assembly when measured; otherwise return the bytes
-untouched with no clocks and no extra forcing. The actual length is forced
-only when a store is present. No candidate, order, or oracle change either
-way.
--}
+-- | Assemble candidate bytes with optional build timing.
 timeSyntaxCandidateBuild ::
     SyntaxContext -> ByteString -> SyntaxCandidate -> IO (Maybe ByteString, Int)
 timeSyntaxCandidateBuild context currentSQL candidate = case syntaxStore context of
@@ -1511,11 +1465,7 @@ bundleBytes :: ByteString -> ColumnTarget -> Maybe ByteString
 bundleBytes currentSQL target =
     applySpans [(siteStart site, siteEnd site) | site <- targetSites target] currentSQL
 
-{- | Single-pass multi-span deletion assembly. Input spans must be sorted by
-start (the frontend sorts once at build); this pass only verifies
-non-overlap, splices kept slices with one 'BS.concat', and accepts only on
-strict total shrink.
--}
+-- | Apply non-overlapping deletion spans to the source bytes in a single pass.
 applySpans :: [(Int, Int)] -> ByteString -> Maybe ByteString
 applySpans spans source = case spans of
     [] -> Nothing
@@ -1536,11 +1486,7 @@ applySpans spans source = case spans of
                     (BS.take (start - previousEnd) (BS.drop previousEnd source) : acc)
                     (removed + (end - start))
 
-{- | Time statement-candidate byte assembly when measured; otherwise return
-the bytes untouched with no clocks and no extra forcing. The actual length
-is forced only when a store is present. No candidate, order, or oracle
-change either way.
--}
+-- | Record statement assembly time if metrics are enabled.
 timeStatementBuild :: Maybe MetricsStore -> ByteString -> IO ByteString
 timeStatementBuild Nothing bytes = pure bytes
 timeStatementBuild (Just store) bytes = do

@@ -282,8 +282,7 @@ processDefineIndex sid eval definition =
     let session = evalSession eval
         catalog = evalCatalog eval
         tableKeys = resolveRelationKeys session catalog (indexTable definition)
-        -- The frontend records whether an unqualified index name resolves in
-        -- the table's schema or in the current schema.
+        -- Resolve unqualified index in table's schema or current schema.
         indexKeys =
             case (indexRef definition, indexSchemaPlacement definition, tableKeys) of
                 (NamedIndex name@(Name [_]), IndexTableSchema, tableKey : _)
@@ -423,10 +422,7 @@ processDefineTrigger sid eval definition =
         eval0 =
             case triggerBody definition of
                 TriggerFunction name _ ->
-                    -- The function body is opaque to the catalog model. Treat
-                    -- the trigger definition like an unknown statement so the
-                    -- function definition and other prior catalog state are
-                    -- retained.
+                    -- Opaque function trigger bodies require a barrier.
                     addBarrier
                         ( ScopedBarrier
                             GlobalScope

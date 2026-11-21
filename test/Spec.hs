@@ -671,9 +671,7 @@ phase6Tests =
             assertEqual "duplicates share one physical execution" 1 calls
             stats <- poolCacheStats pool
             assertEqual "one miss" 1 (cacheMisses stats)
-            -- Whether a later duplicate joins the in-flight owner or hits its
-            -- completed entry depends on scheduling; either way it never
-            -- re-executes physically.
+            -- Duplicates join in-flight owner or hit completed cache without re-executing.
             assertEqual
                 "every duplicate shared without re-executing"
                 3
@@ -827,9 +825,7 @@ withGraph dialect source action = do
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
         Right parsed -> action (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
-{- | Throwaway pools for unit tests. Workers always join before 'testOrdered'
-returns, so tests never need to close these.
--}
+-- | Create a test oracle pool backed by an in-process predicate.
 testPredicatePool :: (BS.ByteString -> IO Bool) -> IO OraclePool
 testPredicatePool predicate =
     newOraclePool

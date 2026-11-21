@@ -86,11 +86,7 @@ relationColumnWriteDeps session catalog key relation columns
             | column <- Set.toList (coupledWriteColumns session catalog key columns)
             ]
 
-{- | Expand written columns through the constraints they participate in. A
-write to one column of a composite primary key, unique constraint, foreign key,
-or check constraint can affect rows selected through the other columns, so
-column-level dependency tracking must not treat those columns as independent.
--}
+-- | Expand written columns through associated composite keys and constraints.
 coupledWriteColumns :: SessionState -> Catalog -> RelationKey -> [Ident] -> Set Ident
 coupledWriteColumns session catalog key columns
     | null columns = Set.empty
@@ -148,9 +144,7 @@ constraintColumnsOf constraint =
         UsingIndexConstraint {} -> []
         OtherConstraint _ -> []
 
-{- | Columns referenced in the parent table. When the fact IR omits the parent
-column list, the parent's primary key is referenced.
--}
+-- | Columns referenced in the parent table of a foreign key.
 referencedParentColumns :: SessionState -> Catalog -> ForeignKey -> [Ident]
 referencedParentColumns session catalog foreignKey
     | not (null (foreignKeyParentColumns foreignKey)) =
@@ -184,10 +178,7 @@ relationTriggerDeps catalog relation =
         , Just trigger <- [Map.lookup key (catalogTriggers catalog)]
         ]
 
-{- | Partition/inheritance children of a parent: relations whose stored
-parent references resolve to it. Name-based like foreign-key parents, so
-dropped-and-recreated parents re-link and renames are rewritten away.
--}
+-- | Partition and inheritance children of a parent relation.
 childrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
 childrenOf session catalog key =
     childrenWith
@@ -196,17 +187,12 @@ childrenOf session catalog key =
         key
         (\relation -> relPartitionParents relation `Set.union` relInheritParents relation)
 
-{- | Partition children only (`PARTITION OF`, `ATTACH PARTITION`).
-`INSERT` into the parent routes into these by key; plain `INHERITS`
-inserts land parent-only.
--}
+-- | Partition children only (@PARTITION OF@, @ATTACH PARTITION@).
 partitionChildrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
 partitionChildrenOf session catalog key =
     childrenWith session catalog key relPartitionParents
 
-{- | Inheritance children only (`INHERITS`). Parent reads expand over
-these and non-`INSERT` writes fan out to them, but `INSERT` does not.
--}
+-- | Inheritance children only (@INHERITS@).
 inheritChildrenOf :: SessionState -> Catalog -> RelationKey -> [RelationKey]
 inheritChildrenOf session catalog key =
     childrenWith session catalog key relInheritParents
@@ -359,11 +345,7 @@ relationReadDeps session catalog key mode columns only =
                                     ReadRowExistence ->
                                         relCardinalityWrites relation
                                     ReadSchema -> Set.empty
-                            -- Tables populated by CTAS and materialized views
-                            -- are snapshots. Their creation/refresh statement
-                            -- already depends on the source data it evaluated.
-                            -- View sources are evaluated with ReadData as view definitions
-                            -- may filter or project expressions on source columns.
+                            -- View sources are evaluated with ReadData for column dependencies.
                             sourceDeps =
                                 if relKind relation == ViewRelation
                                     then
@@ -374,10 +356,7 @@ relationReadDeps session catalog key mode columns only =
                                                 , Map.member sourceKey (catalogRelations catalog)
                                                 ]
                                     else Set.empty
-                            -- Partition/inheritance children contribute their
-                            -- rows to the parent read (definitions always,
-                            -- writes in data mode), transitively through
-                            -- grandchildren. `ONLY` skips them.
+                            -- Child relations contribute rows to parent reads unless ONLY is set.
                             childDeps =
                                 if only
                                     then Set.empty
@@ -492,11 +471,7 @@ installConstraints session sid key constraints catalog =
                 , next'
                 )
 
-{- | Resolve @PRIMARY KEY USING INDEX@ / @UNIQUE USING INDEX@ to a concrete
-key constraint using the index's columns. An index that cannot be found is
-kept as an opaque constraint: the server would reject the statement, and the
-graph builder must not invent columns for it.
--}
+-- | Resolve @PRIMARY KEY / UNIQUE USING INDEX@ constraints using the index's columns.
 resolveUsingIndex :: SessionState -> Catalog -> RelationKey -> Constraint -> Constraint
 resolveUsingIndex session catalog tableKey constraint =
     case constraint of
@@ -504,9 +479,7 @@ resolveUsingIndex session catalog tableKey constraint =
             let unqualifiedIndexKeys =
                     resolveIndexKeys session catalog (NamedIndex (Name [index]))
                 tableName = relationKeyName tableKey
-                -- The frontend records whether an unqualified index name
-                -- resolves in the altered table's schema or in the current
-                -- schema.
+                -- Resolve unqualified index in table's schema or current schema.
                 tableSchemaIndexKeys =
                     case nameParts tableName of
                         _schema : _table : _ ->
@@ -536,8 +509,7 @@ resolveUsingIndex session catalog tableKey constraint =
                             else UniqueConstraint name columns
         other -> other
 
--- Namespace dependencies
--- All namespace parts use the frontend's relation identifier rules.
+-- | Resolve namespace prefix dependencies from catalog schemas.
 namespaceDeps :: Catalog -> [Ident] -> Set StatementId
 namespaceDeps catalog parts =
     Set.fromList

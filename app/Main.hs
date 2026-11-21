@@ -113,10 +113,7 @@ import System.FilePath (dropExtension, normalise, takeExtension, (</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
--- ----------------------------------------------------------------------------
--- Specified a: Tri-state to distinguish defaults from explicit flags
--- ----------------------------------------------------------------------------
-
+-- | Tri-state distinguishing defaults from explicit CLI flags.
 data Specified a
     = Default a
     | Explicit a
@@ -209,10 +206,7 @@ data RawOptions = RawOptions
     }
     deriving (Eq, Show)
 
-{- | Single source of truth for CLI defaults. 'rawInputFile' is only a
-placeholder; every other field is the value used by the parser and printed by
-@--print-defaults@.
--}
+-- | Default CLI options.
 defaultRawOptions :: RawOptions
 defaultRawOptions =
     RawOptions
@@ -248,10 +242,7 @@ defaultLogLevelForFormat :: LogFormat -> LogLevel
 defaultLogLevelForFormat FormatJSON = LevelInfo
 defaultLogLevelForFormat FormatText = getSpecified (rawLogLevel defaultRawOptions)
 
-{- | Validated, strategy-resolved view of 'RawOptions'. The field mirror is
-intentional: downstream code receives only resolved values, never a
-'Specified' wrapper or an unvalidated default.
--}
+-- | Validated, strategy-resolved CLI options.
 data ValidatedOptions = ValidatedOptions
     { valInputFile :: !FilePath
     , valOracleCmd :: !(Maybe String)
@@ -701,9 +692,7 @@ writeAtomicLazy "-" content = do
     hFlush stdout
 writeAtomicLazy path content = writeAtomicLazyBytes path content
 
-{- | Refuse output paths that would overwrite each other, the input, or the
-in-place backup.
--}
+-- | Ensure stats and output file paths do not collide with inputs or backups.
 validateOutputPaths :: FilePath -> FilePath -> Bool -> Bool -> Maybe FilePath -> IO ()
 validateOutputPaths input target writesStdout inPlace statsFile =
     forM_ statsFile \stats -> do

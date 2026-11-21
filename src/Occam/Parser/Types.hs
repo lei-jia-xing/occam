@@ -19,8 +19,7 @@ import Data.Word (Word8)
 import Occam.Core (SessionInit)
 import Occam.Facts (ColumnTarget, StatementUnit)
 
--- Keep dialect selection at the frontend boundary: parsing and every derived
--- fact use the same selected sqlparser dialect.
+-- | Supported SQL dialects.
 data SQLDialect
     = GenericSQL
     | PostgreSQL
@@ -43,23 +42,14 @@ data SQLDialect
 defaultSQLDialect :: SQLDialect
 defaultSQLDialect = GenericSQL
 
-{- | Server/session configuration that is independent of a particular SQL text.
-The graph builder starts from this state and applies session effects as it
-scans statements.
--}
+-- | Initial server and session configuration.
 data ServerConfig = ServerConfig
     { serverNamespacePrefix :: ![Text]
-    {- ^ Each element is one namespace part. A part may be double-quoted to
-    preserve case.
-    -}
+    -- ^ Namespace parts; double-quoted to preserve case.
     , serverSearchPath :: ![Text]
-    {- ^ Each element is one schema entry. An element may be double-quoted to
-    preserve case.
-    -}
+    -- ^ Schema search path entries; double-quoted to preserve case.
     , serverCurrentUser :: !(Maybe Text)
-    {- ^ An unquoted name follows the dialect's relation folding; a
-    double-quoted name preserves case.
-    -}
+    -- ^ Current session user; double-quoted to preserve case.
     , serverAutocommit :: !Bool
     , serverForeignKeyChecks :: !(Maybe Bool)
     , serverVariables :: !(Map Text Text)
@@ -94,10 +84,7 @@ data ParseOptions = ParseOptions
     }
     deriving (Eq, Show)
 
-{- | Facts-only defaults: statements, boundaries, and dependency/semantic
-facts, but no per-edit syntax IR. Passes that consume 'factEdits' must
-request 'parseSyntaxEdits' explicitly (see 'Occam.Reducer' syntax options).
--}
+-- | Default parse options enabling only core statement and semantic facts.
 defaultParseOptions :: SQLDialect -> ParseOptions
 defaultParseOptions dialect =
     ParseOptions

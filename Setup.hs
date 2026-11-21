@@ -64,10 +64,7 @@ rustLibDir :: FilePath -> FilePath
 rustLibDir = id
 #endif
 
-{- | In dynamic (dev) mode, point every component at the absolute cargo
-release dir and bake it as an rpath, so the loader finds the cdylib with
-no env vars. Static mode skips this untouched (byte-identical output).
--}
+-- | Configure Rust rpath for dev build.
 confRust :: (GenericPackageDescription, HookedBuildInfo) -> ConfigFlags -> IO LocalBuildInfo
 confRust (package, hooked) flags = do
     package' <-

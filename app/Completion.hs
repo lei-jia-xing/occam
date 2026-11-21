@@ -58,7 +58,7 @@ dialects =
 shells :: [String]
 shells = ["bash", "zsh", "fish"]
 
--- | Single source of truth for completion options, descriptions, and values.
+-- | Supported completion options, descriptions, and value specifications.
 optionSpecs :: [OptionSpec]
 optionSpecs =
     [ OptionSpec (Just 'c') ["oracle"] "Interestingness predicate command" (CommandValue "COMMAND")
@@ -134,9 +134,7 @@ optionAliases spec =
 shortAlias :: Char -> String
 shortAlias short = ['-', short]
 
-{- | Render a zsh @_arguments@ specification. Multi-alias options leave the
-brace group unquoted so the shell expands it into one spec per alias.
--}
+-- | Render a zsh @_arguments@ specification.
 zshOption :: OptionSpec -> String
 zshOption spec = case optionAliases spec of
     [alias] -> "'" ++ alias ++ zshDescription spec ++ "'"

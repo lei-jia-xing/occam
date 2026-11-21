@@ -1,7 +1,4 @@
-{- | Source-range and UTF-8 boundary validation for the decoded native
-response. This is where malformed native spans become public 'ParserError's;
-the JSON field names and messages are part of the frontend contract.
--}
+-- | Source-range and UTF-8 boundary validation for the decoded native response.
 module Occam.Parser.Validate (
     makeUnits,
     validateColumns,
@@ -59,11 +56,7 @@ makeUnits source = go 0 1
 
         makeFacts native = StatementFacts (nativeSemantics native) (nativeEdits native)
 
-{- | Validate response-level column targets against the units they cite:
-statement ids resolve, every site sits inside its unit, and no site splits
-UTF-8. Ordering and non-overlap are the frontend's contract, rechecked by
-the bundle assembler before any candidate is built.
--}
+-- | Validate response-level column targets against the statement units they cite.
 validateColumns ::
     ByteString -> [StatementUnit] -> [ColumnTarget] -> Either ParserError [ColumnTarget]
 validateColumns _ _ [] = Right []

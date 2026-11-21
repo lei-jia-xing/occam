@@ -172,9 +172,7 @@ data IndexUniqueness = IndexNonUnique | IndexUnique
 data IndexRole = SecondaryIndex | PrimaryIndex
     deriving (Eq, Ord, Show)
 
-{- | A table constraint. The leading 'Maybe Ident' on most constructors is the
-optional constraint name; the following list holds the constrained columns.
--}
+-- | A table constraint definition.
 data Constraint
     = PrimaryKeyConstraint !(Maybe Ident) ![Ident]
     | UniqueConstraint !(Maybe Ident) ![Ident]
@@ -433,11 +431,7 @@ data CatalogOp
     | RefreshCatalogOp !RefreshOp
     deriving (Eq, Show)
 
-{- | Parent/child routing link. Partition ops (`PARTITION OF` / `ATTACH` /
-`DETACH`) and inheritance ops (`INHERITS` / `INHERIT` / `NO INHERIT`) share
-the shape; the op selects the set (`relPartitionParents` vs
-`relInheritParents`), which is what `INSERT` routing distinguishes.
--}
+-- | Parent/child routing link for partitions and table inheritance.
 data PartitionLink = PartitionLink
     { linkParent :: !NameRef
     , linkChild :: !NameRef
@@ -490,9 +484,7 @@ data SessionEffect
       ResetCurrentUser !SessionScope
     | SetAutocommit !SessionScope !Bool
     | SetForeignKeyChecks !SessionScope !Bool
-    | {- | Restore @foreign_keys@/@foreign_key_checks@ to the session's initial
-      configuration as resolved by the frontend.
-      -}
+    | -- | Restore foreign key checks to the session's initial setting.
       ResetForeignKeyChecks !SessionScope
     | ResetVariable !SessionScope !Name
     | ResetAll !SessionScope
@@ -569,17 +561,14 @@ data SemanticFacts = SemanticFacts
     }
     deriving (Eq, Show)
 
-{- | The oracle classifies a complete candidate. Inconclusive results must not
-be silently treated as rejections because that would make reductions depend
-on timeouts or infrastructure failures.
--}
+-- | Verdict of an oracle execution on a candidate.
 data OracleOutcome
     = OracleAccepted
     | OracleRejected
     | OracleInconclusive
     deriving (Eq, Ord, Show)
 
--- | Primitive per-candidate oracle callback. Batching lives in 'Occam.Pool'.
+-- | Primitive per-candidate oracle callback.
 type Oracle = ByteString -> IO OracleOutcome
 
 data OracleInconclusiveError = OracleInconclusiveError
@@ -587,7 +576,7 @@ data OracleInconclusiveError = OracleInconclusiveError
 
 instance Exception OracleInconclusiveError
 
--- | Require a definite oracle decision, aborting the reduction otherwise.
+-- | Check if the oracle accepts a candidate, throwing on inconclusive.
 oracleAccepts :: Oracle -> ByteString -> IO Bool
 oracleAccepts oracle candidate = do
     outcome <- oracle candidate

@@ -188,9 +188,7 @@ parsedWorkload parsed = sum (map unitWork (parsedUnits parsed))
 graphWorkload :: DependencyGraph -> Int
 graphWorkload graph = Map.foldl' (\total deps -> total + Set.size deps) 0 (graphEdges graph)
 
-{- | Strict byte-sum checksum. Length alone lets GHC eliminate the very copy
-under test for statically shaped splices, so surgery rows fold every byte.
--}
+-- | Strict byte-sum checksum over spliced chunks.
 byteChecksum :: ByteString -> Int
 byteChecksum = BS.foldl' (\total w -> total + fromIntegral w) 0
 
@@ -204,11 +202,7 @@ checkCount expected parsed =
      in unless (actual == expected) $
             die ("occam-bench: expected " ++ show expected ++ " statements, parsed " ++ show actual)
 
-{- | In-process reduction path: evidence reduction, statement audit, and final
-validation against the SQLite contract. This deliberately bypasses the external
-oracle/evaluation wrapper, so it is not a full product-path benchmark; the name
-and result type make that boundary explicit.
--}
+-- | In-process reduction path for SQLite contract benchmarking.
 runInProcessReductionPath :: SqliteContract -> ByteString -> IO ByteString
 runInProcessReductionPath contract sql = do
     reduced <-

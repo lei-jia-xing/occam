@@ -96,9 +96,7 @@ familyCounters snapshot tag = Map.findWithDefault emptyCounters tag (snapshotFam
                 , resetMicros = Nothing
                 }
 
-{- | Completion barrier: waits for the observed event (bounded, fails loudly),
-never a fixed sleep.
--}
+-- | Wait for an observed completion event.
 awaitCompletions :: MetricsStore -> FamilyTag -> Int -> IO ()
 awaitCompletions store tag want = go (10000 :: Int)
     where
@@ -119,9 +117,7 @@ testTaggedAttribution = do
                 then readMVar started >> pure acceptDetails
                 else putMVar started () >> readMVar never >> pure rejectDetails
     pool <- testPoolWith (Just store) 2 False execute (\_ _ _ _ -> pure ())
-    -- The head waits until the lookahead has started (but is still blocked in
-    -- execute), so the lookahead settles deterministically as started, then
-    -- canceled without ever publishing.
+    -- Lookahead starts and blocks before head accepts, settling as started-then-canceled.
     outcomes <-
         testOrderedTagged
             pool
@@ -146,9 +142,7 @@ testLoserCounts = do
                 then awaitCompletions store TagStatement 1 >> pure acceptDetails
                 else pure rejectDetails
     pool <- testPoolWith (Just store) 2 False execute (\_ _ _ _ -> pure ())
-    -- The winner proceeds only after observing the loser's physical
-    -- completion (recorded in the same masked block as publication), so the
-    -- loser is deterministically finished-but-unselected at settle time.
+    -- Winner awaits loser completion so loser settles as finished-but-unselected.
     outcomes <- testOrderedTagged pool [(TagStatement, "winner"), (TagStatement, "loser")]
     assertEqual "outcomes" [(OracleAccepted, False)] outcomes
     snapshot <- snapshotMetrics store
@@ -178,11 +172,7 @@ testCanceledWall = do
             "b" -> loser startedB readyB
             _ -> loser startedC readyC
     pool <- testPoolWith (Just store) 3 False execute (\_ _ _ _ -> pure ())
-    -- Both losers complete 100ms of controlled work then block; the head
-    -- accepts only after both are blocked, so both settle deterministically
-    -- as started-then-canceled. The wall bound below is scale sanity only:
-    -- ~200ms real against a 10s guard catches unit confusion (nanos recorded
-    -- as micros would read >= 200s), never a speed assertion.
+    -- Both losers block after starting; head accepts and cancels both.
     outcomes <-
         testOrderedTagged pool [(TagStatement, "winner"), (TagStatement, "b"), (TagStatement, "c")]
     assertEqual "outcomes" [(OracleAccepted, False)] outcomes

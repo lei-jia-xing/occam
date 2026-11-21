@@ -194,13 +194,8 @@ data RelationState = RelationState
     , -- The reads that defined a view or table source, retaining the columns
       -- used so column drops can distinguish dependent from unaffected views.
       relSourceReads :: ![ReadFact]
-    , -- PostgreSQL partition parents (`PARTITION OF`, `ATTACH PARTITION`)
-      -- and inheritance parents (`INHERITS`), kept distinct because `INSERT`
-      -- routes into partition children by key but lands parent-only under
-      -- plain `INHERITS`. Stored unresolved like foreign-key parents and
-      -- resolved at use, so renames rewrite them the same way. Reads of a
-      -- parent expand over both; non-`INSERT` writes fan out to both.
-      relPartitionParents :: !(Set NameRef)
+    , relPartitionParents :: !(Set NameRef)
+    -- ^ Partition parent references (`PARTITION OF`, `ATTACH PARTITION`).
     , relInheritParents :: !(Set NameRef)
     , relOnCommit :: !(Maybe OnCommitAction)
     , relOnCommitFrameId :: !(Maybe Int)
@@ -263,10 +258,7 @@ data Catalog = Catalog
     , catalogTypes :: !(Map Name DefinitionState)
     , catalogSchemas :: !(Map Name DefinitionState)
     , catalogNextUnnamedConstraint :: !Int
-    {- ^ Monotonic serial used to give unnamed constraints distinct identities.
-    A per-statement index is not enough: one statement can add several
-    constraints through separate @ADD COLUMN@ changes.
-    -}
+    -- ^ Monotonic serial for naming unnamed constraints.
     }
     deriving (Eq, Show)
 
@@ -363,10 +355,7 @@ effectiveSessionUser :: SessionState -> Maybe Ident
 effectiveSessionUser state =
     fromMaybe (sessSessionUser state) (sessTxSessionUser state)
 
-{- | Resolve the symbolic search path against the current user. An empty list
-means "unknown" and makes unqualified resolution conservative, as does an
-unresolved @$user@ entry.
--}
+-- | Resolve symbolic search path entries against the current user.
 effectiveSearchPath :: SessionState -> [Name]
 effectiveSearchPath state =
     case fromMaybe (sessSearchPath state) (sessTxSearchPath state) of

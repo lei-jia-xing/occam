@@ -1,8 +1,4 @@
-{- | Public SQL parsing facade. Owns the native-call timing/exception
-orchestration and re-exports the stable frontend API; the raw FFI boundary,
-source validation, and fact diagnostics live in "Occam.Parser.Native",
-"Occam.Parser.Validate", and "Occam.Parser.Facts" respectively.
--}
+-- | Public SQL parsing facade.
 module Occam.Parser (
     SQLDialect (..),
     dialectName,
@@ -75,12 +71,7 @@ import Occam.Parser.Validate (makeUnits, validateColumns)
 parseSQL :: ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
 parseSQL = parseSQLTimed Nothing ParseStatementOnly
 
-{- | The single native-parse implementation. Splits the native FFI call wall
-from the JSON-decode plus Haskell-validation wall with honest labels; the
-decoded result spine is forced before the decode clock stops, so laziness
-cannot report zero for work the caller needs anyway. Clocks and forcing
-exist only when a store is present: the unmeasured path pays nothing.
--}
+-- | Parse SQL via native parser with optional metrics recording.
 parseSQLTimed ::
     Maybe MetricsStore -> ParseKind -> ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
 parseSQLTimed store kind options sql =
@@ -89,11 +80,7 @@ parseSQLTimed store kind options sql =
             alloca \outputPointer -> alloca \outputLength -> do
                 poke outputPointer nullPtr
                 poke outputLength 0
-                -- The FFI call through `finally` registration runs masked, so
-                -- the natively allocated buffer can never leak to an async
-                -- exception arriving between return and handler installation
-                -- (safe FFI performs no interruptible C work anyway); only the
-                -- decode work inside the installed `finally` runs restored.
+                -- Mask async exceptions across FFI allocation and cleanup registration.
                 mask $ \restore -> do
                     ffiStart <- clockIf
                     status <-
@@ -145,15 +132,14 @@ parseSQLTimed store kind options sql =
             Nothing -> pure 0
             Just _ -> getMonotonicTimeNSec
 
+-- | Count SQL statements in the input according to the chosen dialect.
 countStatements :: SQLDialect -> ByteString -> IO (Either ParserError Int)
 countStatements dialect sql = countStatementsRaw sql (dialectCode dialect)
 
 microsBetween :: Word64 -> Word64 -> Int
 microsBetween start end = fromIntegral ((end - start) `div` 1000)
 
-{- | Force exactly the result spine the caller traverses anyway. Never a
-deepseq of IR for measurement.
--}
+-- | Force the spine of parsed result for accurate timing.
 forceParsed :: Either ParserError ParsedSQL -> Either ParserError ParsedSQL
 forceParsed (Left err) = err `seq` Left err
 forceParsed (Right parsed) =

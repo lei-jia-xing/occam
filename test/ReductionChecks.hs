@@ -497,9 +497,7 @@ tests =
             let unwrapCandidate = "SELECT * FROM t WHERE a = 1;\r\n"
             assertBool "unwrap candidate was tested" (unwrapCandidate `elem` seen)
         , testCase "statement ddmin re-tests a removal enabled by a later shrink (jobs 1 and 4)" $ do
-            -- Statement-ID-keyed rejection memo is unsound: dropping the
-            -- second A is rejected while B is present, then becomes valid
-            -- once B is gone. Only exact candidate bytes memoize verdicts.
+            -- Candidate memo is keyed by exact bytes only to allow removals enabled by later shrinks.
             let sql = BSC.unlines ["SELECT 0;", "SELECT 1;", "SELECT 0;", "SELECT 2;", "SELECT 42;"]
                 expected = BSC.pack "SELECT 1;\nSELECT 42;\n"
                 interesting candidate =
@@ -720,10 +718,7 @@ countOrFail dialect sql = do
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
         Right count -> pure count
 
-{- | Throwaway in-process pools for search-logic tests (serial, no cache, no
-budget). Window workers always join before 'testOrdered' returns, so tests
-never need to close these pools.
--}
+-- | Throwaway in-process pool for search-logic tests.
 predicatePool :: (ByteString -> Bool) -> IO OraclePool
 predicatePool predicate = testPoolWith 1 (pure . decide)
     where

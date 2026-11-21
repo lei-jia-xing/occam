@@ -1,3 +1,4 @@
+-- | Dependency graph analysis for SQL statements.
 module Occam.Dependency (
     DependencyGraph (..),
     emptyGraph,
@@ -65,10 +66,7 @@ import Occam.Dependency.Transaction (
 import Occam.Dependency.Write (processDataWrite, processRead, processRefresh, processSequenceWrite)
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
--- ----------------------------------------------------------------------------
--- Public graph
--- ----------------------------------------------------------------------------
-
+-- | Directed acyclic dependency graph across SQL statements.
 data DependencyGraph = DependencyGraph
     { graphStmts :: !(Set StatementId)
     , graphFacts :: !(Map StatementId SemanticFacts)
@@ -81,6 +79,7 @@ data DependencyGraph = DependencyGraph
     }
     deriving (Eq, Show)
 
+-- | Empty dependency graph.
 emptyGraph :: DependencyGraph
 emptyGraph =
     DependencyGraph
@@ -93,10 +92,6 @@ emptyGraph =
         , graphBarrierEdges = 0
         , graphEdgeCount = 0
         }
-
--- ----------------------------------------------------------------------------
--- Graph construction
--- ----------------------------------------------------------------------------
 
 extractFacts :: StatementUnit -> SemanticFacts
 extractFacts unit =
@@ -116,6 +111,7 @@ extractFacts unit =
         factSemantics
         (unitFacts unit)
 
+-- | Build a dependency graph from statement units and initial session state.
 analyzeStatements :: SessionInit -> [StatementUnit] -> DependencyGraph
 analyzeStatements initialSession units =
     buildGraph
@@ -124,6 +120,7 @@ analyzeStatements initialSession units =
         | unit <- units
         ]
 
+-- | Construct a dependency graph from extracted statement facts.
 buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
     let (_, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
@@ -243,8 +240,7 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
         barrierEdges =
             Set.size (Set.delete sid (Set.difference barrierDeps objectDeps))
         sessionKeys = [SessionBarrierKey | sessionTouched]
-        -- NOTE: unknown effects serialize the remaining script; recover
-        -- precision only when those effects can be represented in the catalog.
+        -- Unknown effects serialize subsequent statements.
         inheritedGlobal = [GlobalBarrierKey | hasGlobalFence]
         registrationKeys = barrierKeys ++ sessionKeys ++ inheritedGlobal
         lastBarriers =

@@ -41,10 +41,7 @@ data CacheStats = CacheStats
 instance ToJSON CacheStats
 instance FromJSON CacheStats
 
-{- | An in-flight entry records its owner's window ordinal. The scheduler
-reserves entries in candidate order, so an owner always retires before its
-joiners and joiners resolve from the owner's retired result without blocking.
--}
+-- | Cache entry state: precomputed, completed, or in-flight with owner ordinal.
 data CacheEntry
     = CachePrecomputed !OracleObservation
     | CacheDone !OracleObservation
@@ -73,12 +70,7 @@ newCache precomputed = do
     pure
         Cache {cacheEntries = entries, cacheHitsRef = hits, cacheMissesRef = misses, cacheJoinsRef = joins}
 
-{- | Ordered cache admission check. Precomputed entries are established facts,
-stored in the same table and served in either mode; they count as hits only
-when memoization is enabled so @--no-cache@ metrics stay honest. Fresh hits and
-joins count only when enabled; a disabled cache reports every fresh candidate
-as a miss so each one executes physically, preserving @--no-cache@ semantics.
--}
+-- | Look up candidate bytes in the cache according to the cache mode.
 cacheLookup :: Cache -> CacheMode -> ByteString -> IO LookupResult
 cacheLookup cache mode sql = do
     entries <- readMVar (cacheEntries cache)
@@ -107,10 +99,7 @@ cacheInstallInflight cache sql ordinal =
     modifyMVar_ (cacheEntries cache) \entries ->
         pure $! HashMap.insert sql (CacheInflight ordinal) entries
 
-{- | Publish a completed miss. Admitted observations are retained; rejected
-ones (timeouts, reset failures, I/O failures) are removed so a later window
-re-observes them physically. Only the owning ordinal may complete its entry.
--}
+-- | Complete an in-flight entry with an admitted observation or remove it.
 cacheCompleteInflight :: Cache -> ByteString -> Int -> Maybe OracleObservation -> IO ()
 cacheCompleteInflight cache sql ordinal admitted =
     modifyMVar_ (cacheEntries cache) \entries -> case HashMap.lookup sql entries of
@@ -131,9 +120,7 @@ cacheStats cache = do
     joins <- readIORef (cacheJoinsRef cache)
     pure CacheStats {cacheHits = hits, cacheMisses = misses, cacheJoins = joins}
 
-{- | Only completed process observations are authoritative; timeouts, reset
-failures, and I/O failures are re-observed physically on later windows.
--}
+-- | Admit only finished executions into the cache.
 observationAdmission :: OracleObservation -> CacheAdmission
 observationAdmission OracleFinished {} = CacheAdmit
 observationAdmission _ = CacheReject

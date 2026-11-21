@@ -70,9 +70,7 @@ data NonTTYState = NonTTYState
     , ntBytes :: !Int
     }
 
-{- | Everything the final summary needs. Keeping this a record avoids a
-seven-positional-argument call at the CLI boundary.
--}
+-- | Parameters required to render the final reduction summary.
 data FinishSummary = FinishSummary
     { finishMetrics :: !EvaluationMetrics
     , finishInitialBytes :: !Int

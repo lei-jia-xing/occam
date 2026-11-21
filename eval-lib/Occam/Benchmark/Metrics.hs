@@ -105,10 +105,7 @@ instance FromJSON RunSummary where
             <*> o .:? "elapsed_seconds"
             <*> o .: "status"
 
-{- | Normalized area under the attempt-versus-size evaluation curve over @1..total@.
-Lower is faster/better. At attempt @i@, the current best size is the minimum
-accepted size up to that call index.
--}
+-- | Normalized area under the attempt-versus-size evaluation curve over @1..total@.
 computeAttemptAuc :: Int -> [EvaluationPoint] -> Int -> Double
 computeAttemptAuc initialBytes curve totalAttempts
     | initialBytes <= 0 || totalAttempts <= 0 = 1.0
@@ -143,11 +140,7 @@ data RunNameParts = RunNameParts
     }
     deriving stock (Eq, Show)
 
-{- | Split @case__arm__rep@ on the first two separators. Any extra separators
-belong to the repetition, so newer run names do not lose their suffix. Names
-with fewer than three non-empty parts carry an explicit warning instead of
-silently producing three Nothings.
--}
+-- | Split @case__arm__rep@ run identifier into components.
 parseRunParts :: Text -> RunNameParts
 parseRunParts name =
     case T.splitOn "__" name of

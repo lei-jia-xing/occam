@@ -130,13 +130,7 @@ data OracleObservationDetails = OracleObservationDetails
 defaultResetTimeoutMicros :: Int
 defaultResetTimeoutMicros = 30000000
 
-{- | Oracle and reset children get a fresh process group. Ordinary descendants
-inherit ownership and are terminated on completion/timeout; children that call
-setsid escape it and are outside the supported Linux/POSIX contract. Process
-groups are job control, not a security sandbox or a hard real-time guarantee:
-kernel-wedged (SIGKILL-immune, D-state) leaders cannot be reaped, and that
-failure aborts loudly via 'OracleReapFailed' instead of claiming cleanup.
--}
+-- | Thrown when an oracle or reset process group cannot be cleanly reaped.
 data OracleReapFailed = OracleReapFailed
     deriving (Show)
 
@@ -171,18 +165,12 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                             timeoutMicros
                                             ( withWorker (writePipe hIn input) \writeInput -> do
                                                 exitCode <- waitForProcess ph
-                                                -- The leader is gone but group members may still hold
-                                                -- the stdin pipe open; kill the owned group before
-                                                -- joining the writer so a lingering grandchild that
-                                                -- inherited stdin cannot stall it.
+                                                -- Kill remaining group members before joining the stdin writer.
                                                 _ <- cleanup
                                                 writeInput
                                                 pure exitCode
                                             )
-                                            -- On timeout the group must die BEFORE the helper
-                                            -- join unwinds: a writer blocked on a full pipe
-                                            -- that nobody reads cannot close until its readers
-                                            -- are gone. This innermost handler runs first.
+                                            -- Kill the process group on timeout before unwinding.
                                             `onException` cleanup
                                 )
                                     `onException` cleanup
@@ -199,12 +187,7 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                 , create_group = createProcessGroup
                 }
 
-{- | Null device for the oracle's opaque output streams. The verdict is the
-exit code only, so children write to the bit bucket instead of pipes: no
-reader threads, no pipe deadlock, no output buffering. POSIX binds
-/dev/null explicitly ('NoStream' would close the streams and fail writing
-children); Windows binds the system NUL device for the same reason.
--}
+-- | Provide null output streams (/dev/null or NUL) for oracle execution.
 #ifdef mingw32_HOST_OS
 withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
 withNullOutput use = withFile "NUL" WriteMode \h -> use (UseHandle h) (UseHandle h)
@@ -231,9 +214,7 @@ createProcessGroup = True
 getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
 getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
 
--- | Terminate the owned group and report whether the leader was reaped.
--- Signals stay masked; only the bounded reap wait is interruptible, so the
--- one-second bound is real even for wedged leaders.
+-- | Terminate the owned process group and report whether the leader was reaped.
 cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO Bool
 cleanupOwnedGroup mPid ph = mask $ \restore -> do
     case mPid of
@@ -247,10 +228,7 @@ cleanupOwnedGroup mPid ph = mask $ \restore -> do
     reaped <- restore (timeout 1000000 (waitForProcess ph))
     pure (isJust reaped)
 
-{- | Give a cooperative process group a short grace period after SIGTERM.
-Poll instead of sleeping for the full delay so fast oracles do not pay it on
-every invocation.
--}
+-- | Wait for process group termination within a short grace period after SIGTERM.
 waitForGroupTermination :: ProcessID -> ProcessHandle -> Int -> IO ()
 waitForGroupTermination pid ph remaining
     | remaining <= 0 = pure ()
@@ -266,11 +244,7 @@ waitForGroupTermination pid ph remaining
                         threadDelay 1000 >> waitForGroupTermination pid ph (remaining - 1)
 #endif
 
-{- | Fork a pipe helper that is always killable and always joined. The helper
-runs unmasked ('forkFinally' under 'mask' would inherit 'MaskedInterruptible'
-and hostile always-ready I/O could starve its kill); completion is published
-masked. Both the user and the release join via persistent 'readMVar'.
--}
+-- | Fork an asynchronous helper action ensuring guaranteed cleanup and join.
 withWorker :: IO a -> (IO a -> IO b) -> IO b
 withWorker action use =
     bracket
@@ -347,11 +321,7 @@ candidateEnvironment workDir = do
     originalDir <- getCurrentDirectory
     pure (candidateOverrides workDir originalDir ++ base)
 
-{- | Oracle launch context resolved once per reduction: the executable path
-plus the process environment minus the per-candidate overrides. Resolving
-once skips a PATH walk and an environment snapshot per candidate; the
-per-candidate workdirs still vary per probe.
--}
+-- | Base launch context resolved once per reduction.
 data OracleContext = OracleContext
     { contextCmdSpec :: !CmdSpec
     , contextBaseEnvironment :: ![(String, String)]
@@ -399,7 +369,7 @@ observeExternalOracleDetailedWith onOracleStarted cfg sql = do
     context <- resolveOracleContext cfg
     observeExternalOracleDetailedWithContext onOracleStarted cfg context sql
 
--- | One-shot observation against a pre-resolved 'OracleContext'.
+-- | One-shot observation against a pre-resolved 't:OracleContext'.
 observeExternalOracleDetailedWithContext ::
     IO () ->
     OracleConfig ->

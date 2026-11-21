@@ -96,15 +96,7 @@ definitionStateDeps :: DefinitionState -> Set StatementId
 definitionStateDeps state =
     definitionDeps (definitionStatement state) (definitionRestoredBy state)
 
-{- | Dropping a relation can change how unqualified names resolve, because a
-temporary or schema-qualified relation may have been shadowing another one.
-Record the drop as a schema write on every relation whose name could have been
-affected, so later reads keep a sound dependency on the drop.
-
-The final name component is what an unqualified reference matches; comparing
-only full suffixes would miss a schema-qualified relation shadowing a relation
-of the same name in another schema.
--}
+-- | Record a schema write on relations whose unqualified resolution might be affected by the drop.
 markResolutionChange :: StatementId -> RelationKey -> Catalog -> Catalog
 markResolutionChange sid dropped catalog =
     catalog & catalogRelationsL %~ Map.mapWithKey adjust

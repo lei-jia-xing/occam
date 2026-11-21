@@ -297,9 +297,7 @@ genDropDummy dummyId =
 genTableDef :: Text -> Maybe (Text, Text) -> Gen TableDef
 genTableDef name mFk = fst <$> genTableDefWithLast name mFk
 
-{- | Generate a table together with its last generated column, so callers can
-target a column without a partial list index.
--}
+-- | Generate a table with its last created column name.
 genTableDefWithLast :: Text -> Maybe (Text, Text) -> Gen (TableDef, ColumnDef)
 genTableDefWithLast name mFk = do
     extraColsCount <- chooseInt (2, 4)
@@ -517,9 +515,7 @@ withScriptPool script = withPredicatePool 1 False (makeScriptPredicate script)
 -- QuickCheck Properties
 -- ----------------------------------------------------------------------------
 
-{- | Core reduction invariant: the reduced script is valid, still satisfies the
-predicate, never grows, and is already a fixed point.
--}
+-- | Core reduction invariant: valid syntax, satisfies predicate, monotonic, fixed point.
 prop_reductionInvariants :: FuzzScript -> Property
 prop_reductionInvariants script = monadicIO $ do
     let initialSQL = renderScriptSQL script

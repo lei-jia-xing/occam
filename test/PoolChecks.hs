@@ -125,11 +125,7 @@ tests =
                 "later acceptance committed despite earlier inconclusive"
                 (all (\(_, _, outcome, _) -> outcome /= OracleAccepted) retired)
             attempts <- poolAttempts pool
-            -- A and T must start: retirement blocks on their published outcomes
-            -- before throwing. C is a speculative loser beyond the throw point
-            -- and may be cancelled before its first physical start (settleAll
-            -- killThreads unretired tasks; a pre-start kill never reaches the
-            -- attempts increment in runWorker), so 2 and 3 are both correct.
+            -- A and T must start; speculative candidate C may be cancelled before starting.
             assertBool ("too few physical starts: " ++ show attempts) (attempts >= 2)
             assertBool ("too many physical starts: " ++ show attempts) (attempts <= 3)
         , testCase "ordered reservation gives the head the sole permit" $ do

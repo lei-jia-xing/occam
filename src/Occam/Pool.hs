@@ -165,11 +165,7 @@ newOraclePool PoolConfig {..}
                 , poolLiveRef = live
                 }
 
-{- | Cancel and join every owned worker, then return once none remain. Windows
-drain themselves before 'testOrdered' returns or throws, so this normally
-observes an empty registry; it still terminates stray work instead of polling
-for voluntary completion.
--}
+-- | Cancel and join all active workers in the pool.
 closeOraclePool :: OraclePool -> IO ()
 closeOraclePool pool = do
     snapshot <- readMVar (poolRegistry pool)
@@ -187,9 +183,7 @@ withOraclePool config action = do
     pool <- newOraclePool config
     action pool `onException` closeOraclePool pool <* closeOraclePool pool
 
-{- | In-process predicate pool for search-logic tests. Unlimited permits, no
-billing or retirement effects; cache mode is explicit.
--}
+-- | In-process predicate pool for tests.
 withPredicatePool :: Int -> Bool -> (ByteString -> IO Bool) -> (OraclePool -> IO a) -> IO a
 withPredicatePool jobs cacheEnabled predicate =
     withOraclePool
@@ -213,23 +207,17 @@ poolOracle pool candidate = do
         [(outcome, _)] -> pure outcome
         _ -> ioError (userError "OraclePool window-1 retired no outcome")
 
-{- | The pool's shared cost store, if any. Single source of truth: reducers
-read it through the pool instead of carrying their own pointer.
--}
+-- | Shared metrics store of the pool, if present.
 poolMetricsStore :: OraclePool -> Maybe MetricsStore
 poolMetricsStore = poolMetricsData
 
-{- | Report a candidate's known statement count before testing it, so
-retirement can attribute counts without re-parsing. Silent when unset.
--}
+-- | Report a candidate's known statement count prior to testing.
 reportCandidateCount :: OraclePool -> ByteString -> Int -> IO ()
 reportCandidateCount pool bytes count = case poolReportCountFn pool of
     Nothing -> pure ()
     Just report -> report bytes count
 
-{- | Interaction wall from a worker start stamp to now, in microseconds. The
-caller guarantees measurement is on; unmeasured paths never clock.
--}
+-- | Elapsed microseconds since the given start timestamp.
 wallSince :: Word64 -> IO Int
 wallSince begin = do
     now <- getMonotonicTimeNSec
@@ -274,10 +262,7 @@ predicateDetails predicate candidate = do
     pure
         (observationDetails (if accepted then OracleFinished ExitSuccess else OracleFinished (ExitFailure 1)))
 
-{- | A finished worker observation with its measured execution wall: worker
-start (after slot acquisition, so no queueing) through worker end.
-Interaction wall, never CPU.
--}
+-- | Finished worker observation with its measured execution duration in microseconds.
 data TimedObservation = TimedObservation
     { timedDetails :: !OracleObservationDetails
     , timedExecWallMicros :: !Int
@@ -295,37 +280,13 @@ data WindowTask
         !FamilyTag
         !(IORef (Maybe Word64))
 
-{- | Test candidates in decision order with bounded speculation.
-
-The input is consumed in job-sized chunks, so an early decision never forces
-the rest of the list and a long input never spawns unbounded threads. Within
-each chunk the scheduler reserves cache entries and execution permits strictly
-in candidate order before forking, so an early head can never lose its permit
-to later lookahead. At most 'poolJobs' physical executions run concurrently
-(pool-global); a slot is held from execution start through process cleanup.
-Retirement walks ordinals in order: the first acceptance commits, the first
-inconclusive throws 'OracleInconclusiveError', and the first budget denial
-throws 'ExecutionBudgetReached'. Every window drains fully before the call
-returns or throws. Later losers are cancelled and reaped; their completed
-physical work stays billed, while killed tasks count as cancelled, never as
-timeouts or errors.
-
-Concurrent 'testOrdered' calls serialize on the shared pool gate; derived
-pools share it. The call is not reentrant.
-
-Returns the retired prefix: outcomes through the first acceptance, or every
-outcome when all candidates reject.
+{- | Test candidates sequentially or speculatively up to concurrency limit.
+Returns outcomes up to the first acceptance, or all outcomes if all reject.
 -}
-
--- | Untagged 'testOrderedTagged': every candidate retires as 'TagUnknown'.
 testOrdered :: OraclePool -> [ByteString] -> IO [WindowOutcome]
 testOrdered pool = testOrderedTagged pool . map (TagUnknown,)
 
-{- | Tagged sibling sharing the identical launch/retire core: the single
-scheduler engine. Tags travel launch to publish/retire/settle, so mixed
-windows attribute retired decisions, physical starts/completions,
-finished losers, and canceled walls per family.
--}
+-- | Like 'testOrdered', but tracks telemetry and costs per 'FamilyTag'.
 testOrderedTagged :: OraclePool -> [(FamilyTag, ByteString)] -> IO [WindowOutcome]
 testOrderedTagged _ [] = pure []
 testOrderedTagged pool candidates =
@@ -344,10 +305,7 @@ testOrderedTagged pool candidates =
 testWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO ([WindowOutcome], WindowDecision)
 testWindow pool tagged = do
     launched <- launchWindow pool tagged
-    -- Highest retired window ordinal (-1 while none). Ordered retirement is a
-    -- prefix, so cleanup classifies finished tasks against this single
-    -- number instead of allocating a set; async cleanup reads the actual
-    -- prefix rather than assuming none retired.
+    -- Highest retired window ordinal (-1 if none).
     retiredThrough <- newIORef (-1)
     let items = [(tag, candidate, (ordinal, task)) | ((tag, candidate), (ordinal, task)) <- zip tagged launched]
     retireWindow pool items retiredThrough
@@ -404,8 +362,6 @@ runWorker pool tag candidate ordinal startRef =
             Just _ -> getMonotonicTimeNSec
         mask_ $ do
             atomicModifyIORef' (poolAttemptsRef pool) (\n -> (n + 1, ()))
-            -- A bare marker when unmeasured (permit refund only); a real stamp
-            -- when measured. No clock runs without a store.
             writeIORef startRef (Just startNs)
             recordPhysicalStart (poolMetricsData pool) tag
         profile <- poolExecuteFn pool candidate
@@ -448,10 +404,7 @@ publishOutcome pool tag candidate ordinal startRef result done outcome = mask_ $
                 Just _ -> pure ()
             when (poolCacheModeData pool == CacheEnabled) $
                 cacheRemoveInflight (poolCacheData pool) candidate ordinal
-            -- Attribute exactly once, here at worker end: a failure observed
-            -- in settle would also charge all queue/retirement wait after the
-            -- thread already ended. ThreadKilled is a genuine cancel; anything
-            -- else is failed work, never a cancellation.
+            -- Record worker metrics at thread termination.
             wall <- case (poolMetricsData pool, started) of
                 (Just _, Just begin) -> wallSince begin
                 _ -> pure 0
@@ -488,8 +441,7 @@ retireWindow pool items retiredThrough = go items [] IntMap.empty
                     OracleAccepted -> RetiredAccept
                     OracleRejected -> RetiredReject
                     OracleInconclusive -> RetiredInconclusive
-            -- The decision commits here, masked, before the user callback can
-            -- throw: async cleanup always reads the actual retired prefix.
+            -- Commit retirement before invoking callback.
             mask_ $ do
                 recordRetired (poolMetricsData pool) tag verdict
                 writeIORef retiredThrough ordinal
@@ -531,15 +483,7 @@ resolveTask pool launched retiredThrough earlier task = case task of
     where
         settleThrough = readIORef retiredThrough >>= settleAll pool launched
 
-{- | Settle every window task exactly once. Finished tasks at or below the
-retired prefix join silently (their physical work is already billed); finished
-tasks beyond it attribute their measured wall as losers. Unpublished tasks
-only join and deregister here: their cancel/failed attribution already
-happened at publication (worker end), so settle never charges queue or
-retirement wait after the fact. Joins use persistent 'readMVar' and per-task
-spent flags, so settling is idempotent and safe to repeat from exception
-handlers; attribution happens only on the first settle.
--}
+-- | Cancel unretired tasks and join all workers in the window.
 settleAll :: OraclePool -> [(Int, WindowTask)] -> Int -> IO ()
 settleAll pool launched retiredThrough = mapM_ settleOne launched
     where

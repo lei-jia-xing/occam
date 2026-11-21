@@ -142,9 +142,7 @@ applyTxEffect sid state effect =
                      in state' {scanTransactions = [frame]}
                 frame : rest
                     | policy == BeginCommitActive ->
-                        -- A `START TRANSACTION`-style begin commits the pending
-                        -- transaction (including an implicit autocommit-off
-                        -- frame) and starts a fresh one.
+                        -- Commit pending transaction before starting a fresh one under BeginCommitActive.
                         applyTxEffect sid (commitFrame sid state) (TxBegin BeginIgnore)
                     | not (frameExplicit frame) ->
                         state
@@ -321,10 +319,7 @@ restoreCatalog sid snapshot current =
                 (catalogNextUnnamedConstraint current)
         }
 
-{- | How one catalog map participates in rollback: how to stamp a restored
-entry, how to compare entries without the stamp, and which entries survive
-rollback because they are not transactional.
--}
+-- | Policy for rolling back a catalog map to a previous snapshot.
 data RestorePolicy state = RestorePolicy
     { policyMark :: StatementId -> state -> state
     , policyStrip :: state -> state
@@ -333,12 +328,7 @@ data RestorePolicy state = RestorePolicy
     , policyKeepsCurrent :: state -> Bool
     }
 
-{- | Roll back one catalog map. A key present in both maps is restored to its
-snapshot value unless the object is nontransactional; a snapshot-only key is
-restored unless the object was nontransactional; a current-only key is dropped
-unless it is nontransactional. The restored value is stamped with the rollback
-statement when it differs from the current value.
--}
+-- | Roll back a catalog map to a snapshot state according to the given policy.
 restoreMap ::
     (Ord key, Eq state) =>
     RestorePolicy state ->

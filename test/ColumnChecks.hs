@@ -48,10 +48,7 @@ tests =
         , testCase "atomic drops despite scoped barrier on another table" testAtomicScopedBarrierOther
         ]
 
--- ----------------------------------------------------------------------------
--- Actual SQLite oracle: every candidate executes in a fresh in-memory database
--- (isolated per call, no shared state, no reset). Binary-safe end to end.
--- ----------------------------------------------------------------------------
+-- In-memory SQLite oracle execution.
 
 hGetStrict :: Handle -> IO ByteString
 hGetStrict handle = go []
@@ -73,9 +70,7 @@ runSQLiteBytes sql = do
     code <- waitForProcess processHandle
     pure (code, out)
 
-{- | Accepts exactly the candidates that execute cleanly and preserve the
-expected ordered rowset of the trailing query.
--}
+-- | Accept candidates matching expected query output in SQLite.
 sqliteOracle :: ByteString -> ByteString -> IO Bool
 sqliteOracle expected candidate = do
     (code, out) <- runSQLiteBytes (".bail on\n" <> candidate)
@@ -189,9 +184,7 @@ testUtf8 = do
     reduced <- reduceWith ColumnAtomic pool script
     assertSchemaAndRows reduced ["a"] "1\n2\n"
 
-{- | A lone-`CREATE`-site column has no bundle (it would duplicate the single);
-both arms drop it through the identical single-point move.
--}
+-- Single-site column without bundle drops via single-point move.
 testSingleOnly :: IO ()
 testSingleOnly = do
     let script =
@@ -278,10 +271,7 @@ testSyntaxGate = do
 
 testAlterColumnOtherKeepsBundle :: IO ()
 testAlterColumnOtherKeepsBundle = do
-    -- `ALTER COLUMN a ...` names `a` only, so `b`'s bundle survives; the
-    -- parse itself proves the extended `alter_column` wire shape decodes.
-    -- (`ALTER COLUMN` is not SQLite-executable, so this asserts bundles,
-    -- not reduction.)
+    -- ALTER COLUMN a retains b's candidate bundle.
     let script =
             BSC.unlines
                 [ "CREATE TABLE t(a INT, b INT);"

@@ -97,9 +97,7 @@ isCompleteStatement bs =
 trimBS :: ByteString -> ByteString
 trimBS = BSC.dropWhile isSpace . fst . BSC.spanEnd isSpace
 
-{- | Split SQL into individual statements matching Python sqlite3.complete_statement
-semantics. Any trailing incomplete fragment is retained fail-closed.
--}
+-- | Split SQL into individual statements matching sqlite3_complete semantics.
 splitStatements :: ByteString -> IO [ByteString]
 splitStatements sql = go (BSC.lines sql) "" []
     where
@@ -140,15 +138,7 @@ stepAll stmt = go []
 defaultCandidateTimeoutMicros :: Int
 defaultCandidateTimeoutMicros = 100000
 
-{- | Failure classes for in-process SQLite execution. Keeping timeout distinct
-from parse/runtime failures prevents infrastructure problems from being
-reported as ordinary predicate rejections.
-
-'SqliteExecutionError' is reserved for SQLite's own diagnostics (syntax errors,
-constraint violations, row mismatches) and remains a candidate rejection.
-Non-SQLite exceptions while running the candidate ('SqliteInfrastructureError')
-are evaluator faults and must stay inconclusive.
--}
+-- | Failure classes for in-process SQLite execution.
 data SqliteError
     = SqliteTimeout
     | SqliteExecutionError !Text
@@ -165,10 +155,7 @@ classifySqliteException err =
              in SqliteExecutionError (if T.null context then message else context <> ": " <> message)
         Nothing -> SqliteInfrastructureError (T.pack (displayException err))
 
-{- | Execute candidate SQL against a fresh in-memory SQLite database with
-foreign key enforcement enabled. Automatically interrupts runaway queries
-(e.g., infinite recursive CTEs) via sqlite3_interrupt and System.Timeout.
--}
+-- | Execute candidate SQL against an in-memory SQLite database with timeout.
 executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteError [[Value]])
 executeSqliteCandidateDetailedTimeout micros sql = do
     stmts <- splitStatements sql
@@ -222,12 +209,7 @@ generateSqliteContract sql = do
                     , contractCheckState = False
                     }
 
-{- | In-process contract Oracle for candidate reduction. Returns OracleAccepted
-iff the candidate executes cleanly against SQLite :memory: and produces the
-exact expected rowset. Timeouts and non-SQL infrastructure faults are
-inconclusive, so evaluator failures never discard a candidate; SQLite execution
-errors (syntax errors, constraint violations) remain rejections.
--}
+-- | In-process contract oracle for SQLite candidate reduction.
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate = do
     res <- executeSqliteCandidateDetailedTimeout micros candidate
