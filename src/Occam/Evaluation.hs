@@ -3,6 +3,7 @@ module Occam.Evaluation (
     EvaluationMetrics (..),
     EvaluationPoint (..),
     EvaluationProgress (..),
+    EvaluationRequest (..),
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
@@ -14,6 +15,7 @@ module Occam.Evaluation (
     parseSQLDialect,
     runEvaluatedReduction,
     runEvaluatedReductionWithProgress,
+    runEvaluationRequest,
     sqlDialectName,
 ) where
 
@@ -26,7 +28,16 @@ import Control.Exception.Safe (
     try,
  )
 import Control.Monad (when)
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withText, (.=))
+import Data.Aeson (
+    FromJSON (..),
+    ToJSON (..),
+    Value,
+    genericParseJSON,
+    genericToJSON,
+    object,
+    withText,
+    (.=),
+ )
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Char (toLower)
@@ -41,6 +52,7 @@ import GHC.Generics (Generic)
 import Occam.AtomicFile (writeAtomicBytes)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleOutcome (..))
+import Occam.Json (normalizeJsonFieldNames, snakeCaseOptions)
 import Occam.Logger (Logger (..), logDebug', logInfo')
 import Occam.Metrics (
     MetricPolicy (..),
@@ -102,8 +114,11 @@ data EvaluationConfig = EvaluationConfig
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON EvaluationConfig
-instance FromJSON EvaluationConfig
+instance ToJSON EvaluationConfig where
+    toJSON = genericToJSON snakeCaseOptions
+
+instance FromJSON EvaluationConfig where
+    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
 data EvaluationStatus
     = EvaluationCompleted
@@ -207,8 +222,11 @@ data EvaluationPoint = EvaluationPoint
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON EvaluationPoint
-instance FromJSON EvaluationPoint
+instance ToJSON EvaluationPoint where
+    toJSON = genericToJSON snakeCaseOptions
+
+instance FromJSON EvaluationPoint where
+    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
 data EvaluationMetrics = EvaluationMetrics
     { evaluationStatus :: !EvaluationStatus
@@ -253,8 +271,11 @@ data EvaluationMetrics = EvaluationMetrics
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON EvaluationMetrics
-instance FromJSON EvaluationMetrics
+instance ToJSON EvaluationMetrics where
+    toJSON = genericToJSON snakeCaseOptions
+
+instance FromJSON EvaluationMetrics where
+    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
 data EvaluationResult = EvaluationResult
     { evaluatedSQL :: !ByteString
@@ -297,6 +318,20 @@ data ReductionActionResult = ReductionActionResult
     deriving (Eq, Show)
 
 type ReductionAction = StageReporter -> Logger -> OraclePool -> IO ReductionActionResult
+
+-- | All inputs for one evaluated reduction run.
+data EvaluationRequest = EvaluationRequest
+    { requestOnProgress :: !(EvaluationProgress -> IO ())
+    , requestMetricsPolicy :: !(Maybe MetricPolicy)
+    , requestConfig :: !EvaluationConfig
+    , requestDialect :: !SQLDialect
+    , requestOracleConfig :: !OracleConfig
+    , requestPreflightObservation :: !(Maybe OracleObservation)
+    , requestLogger :: !Logger
+    , requestInitialSQL :: !ByteString
+    , requestCheckpoint :: !FilePath
+    , requestAction :: !ReductionAction
+    }
 
 type Ticks = Integer
 
@@ -350,7 +385,33 @@ runEvaluatedReductionWithProgress ::
     FilePath ->
     ReductionAction ->
     IO EvaluationResult
-runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracleCfg preflightObservation parentLogger initialSQL checkpoint action = do
+runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracleCfg preflightObservation logger initialSQL checkpoint action =
+    runEvaluationRequest
+        EvaluationRequest
+            { requestOnProgress = onProgress
+            , requestMetricsPolicy = metricsPolicy
+            , requestConfig = config
+            , requestDialect = dialect
+            , requestOracleConfig = oracleCfg
+            , requestPreflightObservation = preflightObservation
+            , requestLogger = logger
+            , requestInitialSQL = initialSQL
+            , requestCheckpoint = checkpoint
+            , requestAction = action
+            }
+
+runEvaluationRequest :: EvaluationRequest -> IO EvaluationResult
+runEvaluationRequest EvaluationRequest {..} = do
+    let onProgress = requestOnProgress
+        metricsPolicy = requestMetricsPolicy
+        config = requestConfig
+        dialect = requestDialect
+        oracleCfg = requestOracleConfig
+        preflightObservation = requestPreflightObservation
+        parentLogger = requestLogger
+        initialSQL = requestInitialSQL
+        checkpoint = requestCheckpoint
+        action = requestAction
     when (evaluationJobs config <= 0) $
         ioError (userError ("Evaluation jobs must be positive, got " ++ show (evaluationJobs config)))
     startedAt <- ticks

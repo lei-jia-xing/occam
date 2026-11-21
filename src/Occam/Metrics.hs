@@ -28,6 +28,8 @@ import Data.Aeson (
     ToJSON (..),
     ToJSONKey (..),
     ToJSONKeyFunction (..),
+    genericParseJSON,
+    genericToJSON,
     object,
     withObject,
     withText,
@@ -43,6 +45,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
 import Occam.Facts (ParserEditCategory)
+import Occam.Json (normalizeJsonFieldNames, snakeCaseOptions)
 
 data MetricPolicy = MetricPolicy
     { metricSearchPolicy :: !Text
@@ -51,8 +54,11 @@ data MetricPolicy = MetricPolicy
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON MetricPolicy
-instance FromJSON MetricPolicy
+instance ToJSON MetricPolicy where
+    toJSON = genericToJSON snakeCaseOptions
+
+instance FromJSON MetricPolicy where
+    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
 data FamilyTag
     = TagUnknown
@@ -140,8 +146,11 @@ data FamilyCounters = FamilyCounters
     }
     deriving (Eq, Show, Generic)
 
-instance ToJSON FamilyCounters
-instance FromJSON FamilyCounters
+instance ToJSON FamilyCounters where
+    toJSON = genericToJSON snakeCaseOptions
+
+instance FromJSON FamilyCounters where
+    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
 {- | One family entry in the JSON wire format. The internal snapshot keeps a
 map for lookup; arrays are used on the wire so tags stay structured.
@@ -177,25 +186,26 @@ data MetricsSnapshot = MetricsSnapshot
 instance ToJSON MetricsSnapshot where
     toJSON MetricsSnapshot {..} =
         object
-            [ "snapshotPolicy" .= snapshotPolicy
-            , "snapshotFamilies"
+            [ "snapshot_policy" .= snapshotPolicy
+            , "snapshot_families"
                 .= [ FamilyEntry tag counters
                    | (tag, counters) <- Map.toList snapshotFamilies
                    ]
-            , "snapshotGeneratedSkipped" .= snapshotGeneratedSkipped
-            , "snapshotParseFfiMicros" .= snapshotParseFfiMicros
-            , "snapshotParseDecodeMicros" .= snapshotParseDecodeMicros
+            , "snapshot_generated_skipped" .= snapshotGeneratedSkipped
+            , "snapshot_parse_ffi_micros" .= snapshotParseFfiMicros
+            , "snapshot_parse_decode_micros" .= snapshotParseDecodeMicros
             ]
 
 instance FromJSON MetricsSnapshot where
-    parseJSON = withObject "MetricsSnapshot" \objectValue ->
-        MetricsSnapshot
-            <$> objectValue .: "snapshotPolicy"
-            <*> (Map.fromList . map entryPair <$> objectValue .: "snapshotFamilies")
-            <*> objectValue .: "snapshotGeneratedSkipped"
-            <*> objectValue .: "snapshotParseFfiMicros"
-            <*> objectValue .: "snapshotParseDecodeMicros"
+    parseJSON = withObject "MetricsSnapshot" parseSnapshot . normalizeJsonFieldNames
         where
+            parseSnapshot objectValue =
+                MetricsSnapshot
+                    <$> objectValue .: "snapshot_policy"
+                    <*> (Map.fromList . map entryPair <$> objectValue .: "snapshot_families")
+                    <*> objectValue .: "snapshot_generated_skipped"
+                    <*> objectValue .: "snapshot_parse_ffi_micros"
+                    <*> objectValue .: "snapshot_parse_decode_micros"
             entryPair entry = (familyEntryTag entry, familyEntryCounters entry)
 
 {- | Mutable per-run cost store. One owner (Evaluation) creates it, threads it
@@ -258,69 +268,72 @@ bumpKey ref key amount = atomicModifyIORef' ref \counts ->
     let total = Map.findWithDefault 0 key counts + amount
      in total `seq` (Map.insert key total counts, ())
 
+withMetricsStore :: Maybe MetricsStore -> (MetricsStore -> IO ()) -> IO ()
+withMetricsStore Nothing _ = pure ()
+withMetricsStore (Just store) action = action store
+
 recordPhysicalStart :: Maybe MetricsStore -> FamilyTag -> IO ()
-recordPhysicalStart Nothing _ = pure ()
-recordPhysicalStart (Just store) tag =
-    bumpFamily store tag \counters -> counters {physicalStarts = physicalStarts counters + 1}
+recordPhysicalStart metricsStore tag =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters -> counters {physicalStarts = physicalStarts counters + 1}
 
 recordRetired :: Maybe MetricsStore -> FamilyTag -> RetiredVerdict -> IO ()
-recordRetired Nothing _ _ = pure ()
-recordRetired (Just store) tag RetiredAccept =
-    bumpFamily store tag \counters -> counters {retiredAccept = retiredAccept counters + 1}
-recordRetired (Just store) tag RetiredReject =
-    bumpFamily store tag \counters -> counters {retiredReject = retiredReject counters + 1}
-recordRetired (Just store) tag RetiredInconclusive =
-    bumpFamily store tag \counters ->
-        counters {retiredInconclusive = retiredInconclusive counters + 1}
+recordRetired metricsStore tag verdict =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters -> case verdict of
+            RetiredAccept -> counters {retiredAccept = retiredAccept counters + 1}
+            RetiredReject -> counters {retiredReject = retiredReject counters + 1}
+            RetiredInconclusive ->
+                counters {retiredInconclusive = retiredInconclusive counters + 1}
 
 recordPhysicalCompletion :: Maybe MetricsStore -> FamilyTag -> IO ()
-recordPhysicalCompletion Nothing _ = pure ()
-recordPhysicalCompletion (Just store) tag =
-    bumpFamily store tag \counters -> counters {physicalCompletions = physicalCompletions counters + 1}
+recordPhysicalCompletion metricsStore tag =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters -> counters {physicalCompletions = physicalCompletions counters + 1}
 
 recordCompletedUnselected :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
-recordCompletedUnselected Nothing _ _ = pure ()
-recordCompletedUnselected (Just store) tag wallMicros =
-    bumpFamily store tag \counters ->
-        counters
-            { completedUnselected = completedUnselected counters + 1
-            , completedUnselectedInteractionWallMicros = loserWall counters + wallMicros
-            }
+recordCompletedUnselected metricsStore tag wallMicros =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters
+                { completedUnselected = completedUnselected counters + 1
+                , completedUnselectedInteractionWallMicros = loserWall counters + wallMicros
+                }
     where
         loserWall = completedUnselectedInteractionWallMicros
 
 recordCanceled :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
-recordCanceled Nothing _ _ = pure ()
-recordCanceled (Just store) tag wallMicros =
-    bumpFamily store tag \counters ->
-        counters
-            { canceled = canceled counters + 1
-            , canceledInteractionWallMicros = canceledInteractionWallMicros counters + wallMicros
-            }
+recordCanceled metricsStore tag wallMicros =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters
+                { canceled = canceled counters + 1
+                , canceledInteractionWallMicros = canceledInteractionWallMicros counters + wallMicros
+                }
 
 recordFailed :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
-recordFailed Nothing _ _ = pure ()
-recordFailed (Just store) tag wallMicros =
-    bumpFamily store tag \counters ->
-        counters
-            { failed = failed counters + 1
-            , failedInteractionWallMicros = failedInteractionWallMicros counters + wallMicros
-            }
+recordFailed metricsStore tag wallMicros =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters
+                { failed = failed counters + 1
+                , failedInteractionWallMicros = failedInteractionWallMicros counters + wallMicros
+                }
 
 recordGeneratedSkipped :: Maybe MetricsStore -> Text -> IO ()
-recordGeneratedSkipped Nothing _ = pure ()
-recordGeneratedSkipped (Just store) reason = bumpKey (storeSkipped store) reason 1
+recordGeneratedSkipped metricsStore reason =
+    withMetricsStore metricsStore \store -> bumpKey (storeSkipped store) reason 1
 
 recordParseTiming :: Maybe MetricsStore -> ParseKind -> Int -> Int -> IO ()
-recordParseTiming Nothing _ _ _ = pure ()
-recordParseTiming (Just store) kind ffiMicros decodeMicros = do
-    bumpKey (storeParseFfi store) kind ffiMicros
-    bumpKey (storeParseDecode store) kind decodeMicros
+recordParseTiming metricsStore kind ffiMicros decodeMicros =
+    withMetricsStore metricsStore \store -> do
+        bumpKey (storeParseFfi store) kind ffiMicros
+        bumpKey (storeParseDecode store) kind decodeMicros
 
 recordCandidateBuildTiming :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
-recordCandidateBuildTiming Nothing _ _ = pure ()
-recordCandidateBuildTiming (Just store) tag micros =
-    bumpFamily store tag \counters -> counters {candidateBuildMicros = candidateBuildMicros counters + micros}
+recordCandidateBuildTiming metricsStore tag micros =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters -> counters {candidateBuildMicros = candidateBuildMicros counters + micros}
 
 {- | Add measured oracle/reset micros. Sums cover available completed
 profiles ONLY: 'Nothing' stays unknown (never folded to zero), canceled
@@ -328,15 +341,15 @@ work bills separate interaction wall. Neither sum is total CPU or all
 interaction cost.
 -}
 recordOracleTiming :: Maybe MetricsStore -> FamilyTag -> Maybe Int -> Maybe Int -> IO ()
-recordOracleTiming Nothing _ _ _ = pure ()
 recordOracleTiming (Just _) _ Nothing Nothing = pure ()
-recordOracleTiming (Just store) tag mOracle mReset =
-    bumpFamily store tag \counters ->
-        counters
-            { oracleMicros = case mOracle of
-                Nothing -> oracleMicros counters
-                Just n -> Just (maybe n (+ n) (oracleMicros counters))
-            , resetMicros = case mReset of
-                Nothing -> resetMicros counters
-                Just n -> Just (maybe n (+ n) (resetMicros counters))
-            }
+recordOracleTiming metricsStore tag mOracle mReset =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters
+                { oracleMicros = case mOracle of
+                    Nothing -> oracleMicros counters
+                    Just n -> Just (maybe n (+ n) (oracleMicros counters))
+                , resetMicros = case mReset of
+                    Nothing -> resetMicros counters
+                    Just n -> Just (maybe n (+ n) (resetMicros counters))
+                }

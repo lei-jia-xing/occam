@@ -1053,66 +1053,8 @@ benchmarkMetricsTests =
                 runDir2 = testDir </> "caseA__intra__r1"
             createDirectoryIfMissing True runDir1
             createDirectoryIfMissing True runDir2
-            let curve =
-                    [ EvaluationPoint 1.0 1 1000 Nothing False True
-                    , EvaluationPoint 2.0 2 500 Nothing False True
-                    , EvaluationPoint 3.0 3 100 Nothing False False
-                    , EvaluationPoint 4.0 4 200 Nothing False True
-                    ]
-                budget =
-                    EvaluationConfig
-                        { evaluationCacheEnabled = True
-                        , evaluationJobs = 1
-                        , evaluationTotalTimeoutMicros = Nothing
-                        , evaluationMaxOracleExecutions = Nothing
-                        , evaluationPreflightMicros = 0
-                        , evaluationPreflightAttempts = 0
-                        , evaluationPreflightResetMicros = Nothing
-                        , evaluationPreflightOracleMicros = Nothing
-                        , evaluationInitialStatements = Just 10
-                        }
-                metrics =
-                    EvaluationMetrics
-                        { evaluationStatus = EvaluationCompleted
-                        , evaluationFailure = Nothing
-                        , evaluationCacheUsed = True
-                        , evaluationBudget = budget
-                        , evaluationTotalSeconds = 7.25
-                        , evaluationReductionSeconds = 7.25
-                        , evaluationOracleSeconds = 5.0
-                        , evaluationResetSeconds = 0.0
-                        , evaluationPreflightResetSeconds = Nothing
-                        , evaluationPreflightOracleSeconds = Nothing
-                        , evaluationOracleAttempts = 4
-                        , evaluationDatabaseObservations = 4
-                        , evaluationCompletedOracleProcesses = 4
-                        , evaluationAcceptedObservations = 2
-                        , evaluationRejectedObservations = 2
-                        , evaluationTimedOutObservations = 0
-                        , evaluationResetFailures = 0
-                        , evaluationOracleErrors = 0
-                        , evaluationCancelledObservations = 0
-                        , evaluationOracleOutcomes = Map.empty
-                        , evaluationCacheHits = 3
-                        , evaluationCacheMisses = 1
-                        , evaluationCacheJoins = 0
-                        , evaluationValidationSeconds = 0.0
-                        , evaluationValidationOracleSeconds = 0.0
-                        , evaluationValidationResetSeconds = 0.0
-                        , evaluationValidationObservations = 0
-                        , evaluationValidationDatabaseObservations = 0
-                        , evaluationValidationErrors = 0
-                        , evaluationValidationOutcomes = Map.empty
-                        , evaluationValidationPassed = True
-                        , evaluationAuditSeconds = 0.0
-                        , evaluationAuditChecks = 0
-                        , evaluationAuditCompleted = True
-                        , evaluationAuditSkipped = False
-                        , evaluationMinimalityClaim = MinimalityNotEstablished
-                        , evaluationCurve = curve
-                        , evaluationStages = []
-                        , evaluationCostAttribution = Nothing
-                        }
+            let budget = sampleEvaluationBudget
+                metrics = sampleEvaluationMetrics
                 stats =
                     Stats
                         { initial_bytes = 1000
@@ -1143,7 +1085,126 @@ benchmarkMetricsTests =
             assertBool "summary.json created" summaryExists
             assertBool "report.md created" reportExists
             removeDirectoryRecursive testDir
+        , testCase "evaluation and metrics emit snake_case JSON keys" $ do
+            let encoded = BSL.toStrict (encode sampleEvaluationMetrics)
+                hasKey key = BSC.pack ("\"" ++ key ++ "\"") `BS.isInfixOf` encoded
+            mapM_
+                (\key -> assertBool ("missing snake_case key: " ++ key) (hasKey key))
+                [ "evaluation_status"
+                , "evaluation_total_seconds"
+                , "evaluation_curve"
+                , "point_call_index"
+                , "evaluation_cost_attribution"
+                , "snapshot_policy"
+                , "snapshot_families"
+                , "snapshot_generated_skipped"
+                , "snapshot_parse_ffi_micros"
+                , "physical_starts"
+                , "tag"
+                , "counters"
+                ]
+            assertBool "legacy camelCase evaluation key leaked" (not (hasKey "evaluationStatus"))
+            assertBool "legacy camelCase snapshot key leaked" (not (hasKey "snapshotPolicy"))
+        , testCase "legacy camelCase evaluation and metrics JSON still decodes" $ do
+            let legacyPoint =
+                    BSC.pack
+                        "{\"pointElapsedSeconds\":1.5,\"pointCallIndex\":3,\"pointCandidateBytes\":100,\"pointCandidateStatements\":null,\"pointCacheHit\":false,\"pointAccepted\":true}"
+                expectedPoint = EvaluationPoint 1.5 3 100 Nothing False True
+                legacyConfig =
+                    BSC.pack
+                        "{\"evaluationCacheEnabled\":true,\"evaluationJobs\":1,\"evaluationTotalTimeoutMicros\":null,\"evaluationMaxOracleExecutions\":null,\"evaluationPreflightMicros\":0,\"evaluationPreflightAttempts\":0,\"evaluationPreflightResetMicros\":null,\"evaluationPreflightOracleMicros\":null,\"evaluationInitialStatements\":10}"
+            assertEqual
+                "legacy point decodes"
+                (Right expectedPoint)
+                (eitherDecodeStrict' legacyPoint :: Either String EvaluationPoint)
+            assertEqual
+                "legacy config decodes"
+                (Right sampleEvaluationBudget)
+                (eitherDecodeStrict' legacyConfig :: Either String EvaluationConfig)
+            let legacySnapshot =
+                    BSC.pack
+                        "{\"snapshotPolicy\":{\"metricSearchPolicy\":\"ddmin\",\"metricColumnMode\":\"none\",\"metricJobs\":1},\"snapshotFamilies\":[{\"tag\":{\"kind\":\"statement\"},\"counters\":{\"physicalStarts\":2,\"retiredAccept\":1,\"retiredReject\":0,\"retiredInconclusive\":0,\"physicalCompletions\":0,\"completedUnselected\":0,\"completedUnselectedInteractionWallMicros\":0,\"canceled\":0,\"canceledInteractionWallMicros\":0,\"failed\":0,\"failedInteractionWallMicros\":0,\"candidateBuildMicros\":0,\"oracleMicros\":null,\"resetMicros\":null}}],\"snapshotGeneratedSkipped\":{},\"snapshotParseFfiMicros\":{},\"snapshotParseDecodeMicros\":{}}"
+            assertEqual
+                "legacy metrics snapshot decodes"
+                (Right sampleMetricsSnapshot)
+                (eitherDecodeStrict' legacySnapshot :: Either String MetricsSnapshot)
         ]
+
+sampleEvaluationBudget :: EvaluationConfig
+sampleEvaluationBudget =
+    EvaluationConfig
+        { evaluationCacheEnabled = True
+        , evaluationJobs = 1
+        , evaluationTotalTimeoutMicros = Nothing
+        , evaluationMaxOracleExecutions = Nothing
+        , evaluationPreflightMicros = 0
+        , evaluationPreflightAttempts = 0
+        , evaluationPreflightResetMicros = Nothing
+        , evaluationPreflightOracleMicros = Nothing
+        , evaluationInitialStatements = Just 10
+        }
+
+sampleMetricsSnapshot :: MetricsSnapshot
+sampleMetricsSnapshot =
+    MetricsSnapshot
+        { snapshotPolicy = MetricPolicy "ddmin" "none" 1
+        , snapshotFamilies =
+            Map.fromList
+                [ (TagStatement, emptyFamilyCounters {physicalStarts = 2, retiredAccept = 1})
+                ]
+        , snapshotGeneratedSkipped = Map.empty
+        , snapshotParseFfiMicros = Map.empty
+        , snapshotParseDecodeMicros = Map.empty
+        }
+
+sampleEvaluationMetrics :: EvaluationMetrics
+sampleEvaluationMetrics =
+    EvaluationMetrics
+        { evaluationStatus = EvaluationCompleted
+        , evaluationFailure = Nothing
+        , evaluationCacheUsed = True
+        , evaluationBudget = sampleEvaluationBudget
+        , evaluationTotalSeconds = 7.25
+        , evaluationReductionSeconds = 7.25
+        , evaluationOracleSeconds = 5.0
+        , evaluationResetSeconds = 0.0
+        , evaluationPreflightResetSeconds = Nothing
+        , evaluationPreflightOracleSeconds = Nothing
+        , evaluationOracleAttempts = 4
+        , evaluationDatabaseObservations = 4
+        , evaluationCompletedOracleProcesses = 4
+        , evaluationAcceptedObservations = 2
+        , evaluationRejectedObservations = 2
+        , evaluationTimedOutObservations = 0
+        , evaluationResetFailures = 0
+        , evaluationOracleErrors = 0
+        , evaluationCancelledObservations = 0
+        , evaluationOracleOutcomes = Map.empty
+        , evaluationCacheHits = 3
+        , evaluationCacheMisses = 1
+        , evaluationCacheJoins = 0
+        , evaluationValidationSeconds = 0.0
+        , evaluationValidationOracleSeconds = 0.0
+        , evaluationValidationResetSeconds = 0.0
+        , evaluationValidationObservations = 0
+        , evaluationValidationDatabaseObservations = 0
+        , evaluationValidationErrors = 0
+        , evaluationValidationOutcomes = Map.empty
+        , evaluationValidationPassed = True
+        , evaluationAuditSeconds = 0.0
+        , evaluationAuditChecks = 0
+        , evaluationAuditCompleted = True
+        , evaluationAuditSkipped = False
+        , evaluationMinimalityClaim = MinimalityNotEstablished
+        , evaluationCurve =
+            [ EvaluationPoint 1.0 1 1000 Nothing False True
+            , EvaluationPoint 2.0 2 500 Nothing False True
+            , EvaluationPoint 3.0 3 100 Nothing False False
+            , EvaluationPoint 4.0 4 200 Nothing False True
+            ]
+        , evaluationStages = []
+        , evaluationCostAttribution = Just sampleMetricsSnapshot
+        }
 
 -- ----------------------------------------------------------------------------
 -- Property Tests: Invariants of Reducer & DAG

@@ -17,13 +17,14 @@ import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationRequest (..),
     EvaluationResult (..),
     EvaluationStatus (..),
     ReductionActionResult (..),
     Stats (..),
     metricPolicyForReduction,
     parseSQLDialect,
-    runEvaluatedReductionWithProgress,
+    runEvaluationRequest,
     sqlDialectName,
  )
 import Occam.Logger (
@@ -974,17 +975,19 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     result <-
         withCandidateWorkdir $ \tmpDir -> do
             let checkpointPath = tmpDir </> "occam-checkpoint.sql"
-            runEvaluatedReductionWithProgress
-                (uiOnProgress ui)
-                metricsPolicy
-                budgetConfig
-                valDialect
-                oracleCfg
-                (Just (detailedObservation preflightDetails))
-                logger
-                initialSQL
-                checkpointPath
-                reductionAction
+            runEvaluationRequest
+                EvaluationRequest
+                    { requestOnProgress = uiOnProgress ui
+                    , requestMetricsPolicy = metricsPolicy
+                    , requestConfig = budgetConfig
+                    , requestDialect = valDialect
+                    , requestOracleConfig = oracleCfg
+                    , requestPreflightObservation = Just (detailedObservation preflightDetails)
+                    , requestLogger = logger
+                    , requestInitialSQL = initialSQL
+                    , requestCheckpoint = checkpointPath
+                    , requestAction = reductionAction
+                    }
 
     let reducedSQL = evaluatedSQL result
         evaluation = evaluationMetrics result

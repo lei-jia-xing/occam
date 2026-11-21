@@ -14,6 +14,7 @@ import Occam.Core (OracleOutcome (..))
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationRequest (..),
     EvaluationResult (..),
     EvaluationStatus (..),
     MinimalityClaim (..),
@@ -21,6 +22,7 @@ import Occam.Evaluation (
     metricPolicyForReduction,
     parseSQLDialect,
     runEvaluatedReduction,
+    runEvaluationRequest,
     sqlDialectName,
  )
 import Occam.Facts (ParserEditCategory (..))
@@ -517,6 +519,33 @@ tests =
             assertEqual "parallel reduction lost the empty fixed point" "" (evaluatedSQL result)
             assertEqual "parallel run did not complete" EvaluationCompleted (evaluationStatus metrics)
             assertBool "parallel result failed final validation" (evaluationValidationPassed metrics)
+        , testCase "evaluation request record runs the same evaluation" $ do
+            let initial = "SELECT 1;\nSELECT 2;\n"
+                candidate = "SELECT 2;\n"
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = evaluationConfig False Nothing Nothing
+                action _ _ pool = do
+                    _ <- poolOracle pool candidate
+                    pure (ReductionActionResult candidate (Just (ReductionEvidence candidate True)))
+            result <- withCheckpoint $ \checkpoint ->
+                runEvaluationRequest
+                    EvaluationRequest
+                        { requestOnProgress = \_ -> pure ()
+                        , requestMetricsPolicy = Nothing
+                        , requestConfig = config
+                        , requestDialect = GenericSQL
+                        , requestOracleConfig = oracleCfg
+                        , requestPreflightObservation = Nothing
+                        , requestLogger = nullLogger
+                        , requestInitialSQL = initial
+                        , requestCheckpoint = checkpoint
+                        , requestAction = action
+                        }
+            let metrics = evaluationMetrics result
+            assertEqual "request run returns the accepted candidate" candidate (evaluatedSQL result)
+            assertEqual "request run completes" EvaluationCompleted (evaluationStatus metrics)
+            assertEqual "request run performs two final checks" 2 (evaluationValidationObservations metrics)
+            assertBool "request run validates the final candidate" (evaluationValidationPassed metrics)
         , testCase "cost attribution is captured on budget exhaustion" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"

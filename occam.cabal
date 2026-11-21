@@ -64,6 +64,7 @@ library
                     , Occam.UI
                     , Occam.Version
     other-modules:    Paths_occam
+                    , Occam.Json
                     , Occam.Dependency.Alter
                     , Occam.Dependency.Barrier
                     , Occam.Dependency.Define
