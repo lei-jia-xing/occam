@@ -152,6 +152,27 @@ tests =
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
             assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
+        , testCase "Intra-statement rewrites reduce UPDATE assignments, WHERE clauses, and DELETE clauses" $ do
+            pool <-
+                predicatePool
+                    ( \candidate ->
+                        BSC.isInfixOf "UPDATE" candidate
+                            && BSC.isInfixOf "target_col = 42" candidate
+                            && BSC.isInfixOf "DELETE" candidate
+                    )
+            let sql =
+                    BSC.unlines
+                        [ "UPDATE t SET noise_col = 999, target_col = 42, other_noise = 888 WHERE dead_cond = 1;"
+                        , "DELETE FROM t WHERE dead_delete_cond = 1;"
+                        ]
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "keeps target assignment" (BSC.isInfixOf "target_col = 42" reduced)
+            assertBool "removes noise_col assignment" (not (BSC.isInfixOf "noise_col" reduced))
+            assertBool "removes other_noise assignment" (not (BSC.isInfixOf "other_noise" reduced))
+            assertBool "removes dead update where clause" (not (BSC.isInfixOf "dead_cond" reduced))
+            assertBool "removes dead delete where clause" (not (BSC.isInfixOf "dead_delete_cond" reduced))
+            assertBool "keeps DELETE statement" (BSC.isInfixOf "DELETE FROM t;" reduced)
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)

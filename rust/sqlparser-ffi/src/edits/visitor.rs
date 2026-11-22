@@ -7,10 +7,11 @@ use crate::ir;
 use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
 use crate::{NativeEdit, NativeEditCategory};
 use sqlparser::ast::{
-    AlterTableOperation, CastKind, ColumnDef, DataType, Expr, FunctionArg, FunctionArgExpr,
-    GroupByExpr, GroupByWithModifier, InTarget, LimitClause, ObjectName, OffsetRows, Parens, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
-    TableConstraint, TableFactor, TableInheritance, TableWithJoins, ValueWithSpan, Visitor,
+    AlterTableOperation, Assignment, AssignmentTarget, CastKind, ColumnDef, DataType, Expr,
+    FunctionArg, FunctionArgExpr, GroupByExpr, GroupByWithModifier, InTarget, LimitClause,
+    ObjectName, OffsetRows, OrderByExpr, Parens, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableConstraint, TableFactor,
+    TableInheritance, TableWithJoins, ValueWithSpan, Visitor,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Tokenizer};
@@ -920,9 +921,36 @@ impl<'a> AnalysisVisitor<'a> {
         let sqlparser::ast::OrderByKind::Expressions(expressions) = &order.kind else {
             return None;
         };
-        let (start, _) = self.expression_source_span(&expressions.first()?.expr)?;
-        let (_, end) = self.expression_source_span(&expressions.last()?.expr)?;
+        self.order_by_exprs_source_span(expressions)
+    }
+
+    fn order_by_exprs_source_span(&self, exprs: &[OrderByExpr]) -> Option<(usize, usize)> {
+        let (start, _) = self.expression_source_span(&exprs.first()?.expr)?;
+        let (_, end) = self.expression_source_span(&exprs.last()?.expr)?;
         Some((start, end))
+    }
+
+    fn assignment_source_span(&self, assignment: &Assignment) -> Option<(usize, usize)> {
+        let (start, _) = match &assignment.target {
+            AssignmentTarget::ColumnName(name) => self.mapped_span(name.span())?,
+            AssignmentTarget::Tuple(names) => {
+                let first = names.first()?;
+                let first_start = self.mapped_span(first.span())?.0;
+                let start = match self.previous_significant(first_start) {
+                    Some(token) if matches!(token.kind, TokenKind::LeftParen) => token.start,
+                    _ => first_start,
+                };
+                (start, first_start)
+            }
+        };
+        let end = self
+            .expression_source_span(&assignment.value)
+            .map(|(_, end)| end)
+            .or_else(|| {
+                self.mapped_span(assignment.value.span())
+                    .map(|(_, end)| end)
+            })?;
+        (start < end).then_some((start, end))
     }
 
     fn fetch_source_span(
@@ -2352,6 +2380,136 @@ impl Visitor for AnalysisVisitor<'_> {
                                 );
                             }
                         }
+                    }
+                }
+            }
+            Statement::Update(update) => {
+                self.list_edits(
+                    "remove-update_assignment",
+                    &update.assignments,
+                    |visitor, item| visitor.assignment_source_span(item),
+                );
+                let mut previous_end = self
+                    .table_factor_source_span(&update.table.relation)
+                    .map(|(_, end)| end);
+                for join in &update.table.joins {
+                    if let (Some(start), Some(end)) = (previous_end, self.join_end(join))
+                        && start < end
+                    {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            "",
+                            NativeEditCategory::List,
+                            "remove-join",
+                        );
+                        previous_end = Some(end);
+                    }
+                }
+                if let Some(selection) = &update.selection {
+                    self.clause_edit_expression(
+                        Keyword::WHERE,
+                        selection,
+                        statement.span(),
+                        "remove-where",
+                    );
+                }
+                if !update.order_by.is_empty()
+                    && let (Some(body), Some(scope)) = (
+                        self.order_by_exprs_source_span(&update.order_by),
+                        self.mapped_span(statement.span()),
+                    )
+                {
+                    self.clause_edit_complete(
+                        Keyword::ORDER,
+                        body,
+                        scope,
+                        &[Keyword::LIMIT, Keyword::RETURNING],
+                        "remove-order_by",
+                    );
+                }
+                if let Some(limit) = &update.limit {
+                    self.clause_edit_expression(
+                        Keyword::LIMIT,
+                        limit,
+                        statement.span(),
+                        "remove-limit",
+                    );
+                }
+                if let Some(returning) = &update.returning {
+                    self.list_edits("remove-returning_expression", returning, |visitor, item| {
+                        visitor.select_item_source_span(item)
+                    });
+                    if let (Some((body_start, _)), Some((_, body_end)), Some(scope)) = (
+                        returning
+                            .first()
+                            .and_then(|item| self.select_item_source_span(item)),
+                        returning
+                            .last()
+                            .and_then(|item| self.select_item_source_span(item)),
+                        self.mapped_span(statement.span()),
+                    ) {
+                        self.clause_edit_complete(
+                            Keyword::RETURNING,
+                            (body_start, body_end),
+                            scope,
+                            &[],
+                            "remove-returning",
+                        );
+                    }
+                }
+            }
+            Statement::Delete(delete) => {
+                if let Some(selection) = &delete.selection {
+                    self.clause_edit_expression(
+                        Keyword::WHERE,
+                        selection,
+                        statement.span(),
+                        "remove-where",
+                    );
+                }
+                if !delete.order_by.is_empty()
+                    && let (Some(body), Some(scope)) = (
+                        self.order_by_exprs_source_span(&delete.order_by),
+                        self.mapped_span(statement.span()),
+                    )
+                {
+                    self.clause_edit_complete(
+                        Keyword::ORDER,
+                        body,
+                        scope,
+                        &[Keyword::LIMIT, Keyword::RETURNING],
+                        "remove-order_by",
+                    );
+                }
+                if let Some(limit) = &delete.limit {
+                    self.clause_edit_expression(
+                        Keyword::LIMIT,
+                        limit,
+                        statement.span(),
+                        "remove-limit",
+                    );
+                }
+                if let Some(returning) = &delete.returning {
+                    self.list_edits("remove-returning_expression", returning, |visitor, item| {
+                        visitor.select_item_source_span(item)
+                    });
+                    if let (Some((body_start, _)), Some((_, body_end)), Some(scope)) = (
+                        returning
+                            .first()
+                            .and_then(|item| self.select_item_source_span(item)),
+                        returning
+                            .last()
+                            .and_then(|item| self.select_item_source_span(item)),
+                        self.mapped_span(statement.span()),
+                    ) {
+                        self.clause_edit_complete(
+                            Keyword::RETURNING,
+                            (body_start, body_end),
+                            scope,
+                            &[],
+                            "remove-returning",
+                        );
                     }
                 }
             }

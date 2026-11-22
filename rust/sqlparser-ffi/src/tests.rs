@@ -4344,3 +4344,83 @@ fn test_file_table_functions() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn test_update_and_delete_syntax_edits() {
+    let sql = "UPDATE t SET a = 1, b = 2, c = 3 WHERE id = 10;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    if units[0].facts.is_none() {
+        panic!("parse error: {:?}", units[0].parse_error);
+    }
+    let edits = &facts(&units[0]).edits;
+
+    let assignment_edits: Vec<String> = edits
+        .iter()
+        .filter(|edit| edit.label == "remove-update_assignment")
+        .map(|edit| {
+            format!(
+                "{}{}{}",
+                &sql[..edit.start],
+                edit.replacement,
+                &sql[edit.end..]
+            )
+        })
+        .collect();
+    assert_eq!(
+        assignment_edits,
+        vec![
+            "UPDATE t SET b = 2, c = 3 WHERE id = 10;",
+            "UPDATE t SET a = 1, c = 3 WHERE id = 10;",
+            "UPDATE t SET a = 1, b = 2 WHERE id = 10;",
+        ]
+    );
+
+    let where_edits: Vec<String> = edits
+        .iter()
+        .filter(|edit| edit.label == "remove-where")
+        .map(|edit| {
+            format!(
+                "{}{}{}",
+                &sql[..edit.start],
+                edit.replacement,
+                &sql[edit.end..]
+            )
+        })
+        .collect();
+    assert_eq!(where_edits, vec!["UPDATE t SET a = 1, b = 2, c = 3;"]);
+
+    let sql2 = "UPDATE t SET a = 1 ORDER BY id LIMIT 5;";
+    let units2 = parse(sql2, DialectKind::MySql).unwrap();
+    let edits2 = &facts(&units2[0]).edits;
+    assert!(edits2.iter().any(|e| e.label == "remove-order_by"));
+    assert!(edits2.iter().any(|e| e.label == "remove-limit"));
+
+    let sql3 = "UPDATE t SET a = 1 RETURNING a, b;";
+    let units3 = parse(sql3, DialectKind::PostgreSql).unwrap();
+    let edits3 = &facts(&units3[0]).edits;
+    assert!(
+        edits3
+            .iter()
+            .any(|e| e.label == "remove-returning_expression")
+    );
+    assert!(edits3.iter().any(|e| e.label == "remove-returning"));
+
+    let sql4 = "DELETE FROM t WHERE id = 10 ORDER BY id LIMIT 5;";
+    let units4 = parse(sql4, DialectKind::MySql).unwrap();
+    let edits4 = &facts(&units4[0]).edits;
+    assert!(edits4.iter().any(|e| e.label == "remove-where"));
+    assert!(edits4.iter().any(|e| e.label == "remove-order_by"));
+    assert!(edits4.iter().any(|e| e.label == "remove-limit"));
+
+    let sql5 = "DELETE FROM t WHERE id = 10 RETURNING id;";
+    let units5 = parse(sql5, DialectKind::PostgreSql).unwrap();
+    let edits5 = &facts(&units5[0]).edits;
+    assert!(edits5.iter().any(|e| e.label == "remove-where"));
+    assert!(edits5.iter().any(|e| e.label == "remove-returning"));
+
+    let sql6 = "UPDATE t1 JOIN t2 ON t1.id = t2.id JOIN t3 ON t1.id = t3.id SET t1.a = 1;";
+    let units6 = parse(sql6, DialectKind::MySql).unwrap();
+    let edits6 = &facts(&units6[0]).edits;
+    let join_edits: Vec<_> = edits6.iter().filter(|e| e.label == "remove-join").collect();
+    assert_eq!(join_edits.len(), 2);
+}
