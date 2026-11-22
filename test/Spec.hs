@@ -78,6 +78,14 @@ import Occam.Metrics (
     emptyFamilyCounters,
  )
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
+import Occam.Oracle.DuckDB (
+    DuckDBContract (..),
+    duckdbContractObservation,
+    duckdbContractOracle,
+    executeDuckDBCandidate,
+    generateDuckDBContract,
+    isDuckDBAvailable,
+ )
 import Occam.Oracle.Sqlite (
     executeSqliteCandidate,
     generateSqliteContract,
@@ -151,6 +159,7 @@ tests =
         , ReductionChecks.tests
         , ColumnChecks.tests
         , sqliteOracleTests
+        , duckdbOracleTests
         , benchmarkMetricsTests
         , propertyTests
         , generativeFuzzTests
@@ -1103,6 +1112,105 @@ sqliteOracleTests =
                     assertBool "table t retained" (BSC.isInfixOf "t" reduced)
                     oReduced <- oracle reduced
                     assertEqual "reduced SQL satisfies oracle" OracleAccepted oReduced
+        ]
+
+-- ----------------------------------------------------------------------------
+-- In-process DuckDB Oracle Tests
+-- ----------------------------------------------------------------------------
+
+duckdbOracleTests :: TestTree
+duckdbOracleTests =
+    testGroup
+        "In-process DuckDB Oracle"
+        [ testCase "executeDuckDBCandidate executes query, handles CREATE MACRO and returns rowset" $ do
+            available <- isDuckDBAvailable
+            if not available
+                then pure ()
+                else do
+                    let sql =
+                            "CREATE MACRO add_ten(x) AS x + 10;\n\
+                            \CREATE TABLE items (id INT, name TEXT, active BOOLEAN);\n\
+                            \INSERT INTO items VALUES (add_ten(32), 'widget', true);\n\
+                            \SELECT id, name, active FROM items;"
+                    res <- executeDuckDBCandidate sql
+                    assertEqual "rowset matches" (Right [[Number 42, String "widget", Bool True]]) res
+        , testCase "duckdbContractOracle accepts matching and rejects invalid SQL" $ do
+            available <- isDuckDBAvailable
+            if not available
+                then pure ()
+                else do
+                    let sql =
+                            "CREATE TABLE items (id INT, name TEXT);\n\
+                            \INSERT INTO items VALUES (1, 'widget');\n\
+                            \SELECT * FROM items;"
+                    contractRes <- generateDuckDBContract sql
+                    case contractRes of
+                        Left err -> assertFailure (T.unpack err)
+                        Right contract -> do
+                            let oracle = duckdbContractOracle contract
+                            o1 <- oracle sql
+                            assertEqual "original accepts" OracleAccepted o1
+                            o2 <- oracle "SYNTAX ERROR;"
+                            assertEqual "syntax error rejects" OracleRejected o2
+                            o3 <- oracle "SELECT 99;"
+                            assertEqual "mismatched query rejects" OracleRejected o3
+                            o4 <- oracle ""
+                            assertEqual "empty candidate rejects" OracleRejected o4
+        , testCase "duckdbContractObservation keeps execution errors distinct from rejection" $ do
+            available <- isDuckDBAvailable
+            if not available
+                then pure ()
+                else do
+                    let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
+                    contractRes <- generateDuckDBContract sql
+                    case contractRes of
+                        Left err -> assertFailure (T.unpack err)
+                        Right contract -> do
+                            observation <- duckdbContractObservation contract "SYNTAX ERROR;"
+                            case observation of
+                                OracleIOFailed err ->
+                                    assertBool "error detail is preserved" (not (T.null err))
+                                other ->
+                                    assertFailure ("expected OracleIOFailed, got " ++ show other)
+        , testCase "in-process DuckDB reduction removes dead noise table and dead macro" $ do
+            available <- isDuckDBAvailable
+            if not available
+                then pure ()
+                else do
+                    let sql =
+                            "CREATE MACRO unused_macro(x) AS x * 2;\n\
+                            \CREATE TABLE noise (val INT);\n\
+                            \INSERT INTO noise VALUES (999);\n\
+                            \CREATE MACRO live_macro(x) AS x + 1;\n\
+                            \CREATE TABLE target (a INT);\n\
+                            \INSERT INTO target VALUES (live_macro(41));\n\
+                            \SELECT * FROM target;"
+                    contractRes <- generateDuckDBContract sql
+                    case contractRes of
+                        Left err -> assertFailure (T.unpack err)
+                        Right contract -> do
+                            let oracle = duckdbContractOracle contract
+                            reduced <- withPredicatePool 1 True (fmap (== OracleAccepted) . oracle) $ \pool ->
+                                statementAudit DuckDB pool sql
+                            assertBool "noise removed" (not (BSC.isInfixOf "noise" reduced))
+                            assertBool "unused_macro removed" (not (BSC.isInfixOf "unused_macro" reduced))
+                            assertBool "target retained" (BSC.isInfixOf "target" reduced)
+                            oReduced <- oracle reduced
+                            assertEqual "reduced SQL satisfies oracle" OracleAccepted oReduced
+        , testCase "DuckDB table generator generate_series works in contract execution" $ do
+            available <- isDuckDBAvailable
+            if not available
+                then pure ()
+                else do
+                    let sql = "SELECT sum(v) FROM generate_series(1, 5) AS t(v);"
+                    contractRes <- generateDuckDBContract sql
+                    case contractRes of
+                        Left err -> assertFailure (T.unpack err)
+                        Right contract -> do
+                            assertEqual "contract rowset matches" [[Number 15]] (contractExpectedRows contract)
+                            let oracle = duckdbContractOracle contract
+                            o1 <- oracle sql
+                            assertEqual "original accepts" OracleAccepted o1
         ]
 
 -- ----------------------------------------------------------------------------

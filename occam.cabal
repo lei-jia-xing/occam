@@ -57,6 +57,9 @@ common io-deps
                     , filepath >= 1.4 && < 1.6
                     , aeson >= 2.0 && < 2.4
 
+    if !os(windows)
+        build-depends: unix >= 2.7 && < 2.9
+
 common rts-threaded
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A32m"
 
@@ -112,9 +115,6 @@ library
                     , microlens >= 0.4 && < 0.5
                     , safe-exceptions >= 0.1 && < 0.2
                     , temporary >= 1.3 && < 1.4
-
-    if !os(windows)
-        build-depends: unix >= 2.7 && < 2.9
     hs-source-dirs:   src
     -- Windows is static-only in v1: dynamic cdylib linking is not supported there.
     -- In dynamic mode Setup.hs adds the absolute cargo target dir + rpath at configure time.
@@ -164,6 +164,7 @@ test-suite occam-test
                     , PoolMetricsChecks
                     , ReductionChecks
                     , Occam.Oracle.Sqlite
+                    , Occam.Oracle.DuckDB
                     , Occam.Benchmark.Metrics
     main-is:          Spec.hs
     build-depends:    occam
@@ -182,6 +183,7 @@ benchmark occam-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench eval-lib
     other-modules:    Occam.Oracle.Sqlite
+                    , Occam.Oracle.DuckDB
                     , Paths_occam
     autogen-modules:  Paths_occam
     main-is:          Main.hs

@@ -38,6 +38,7 @@
               clippy
               elan
               python3
+              duckdb
               bashInteractive
             ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

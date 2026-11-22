@@ -28,6 +28,12 @@ import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Logger (nullLogger)
 import Occam.Metrics (ParseKind (..))
 import Occam.Oracle (OracleObservation (..))
+import Occam.Oracle.DuckDB (
+    DuckDBContract,
+    duckdbContractOracle,
+    generateDuckDBContract,
+    isDuckDBAvailable,
+ )
 import Occam.Oracle.Sqlite (SqliteContract, generateSqliteContract, sqliteContractOracle)
 import Occam.Parser (
     ParseOptions (..),
@@ -221,6 +227,25 @@ runInProcessReductionPath contract sql = do
         die "Final validation failed"
     pure reduced
 
+-- | In-process reduction path for DuckDB contract benchmarking.
+runInProcessDuckDBReductionPath :: DuckDBContract -> ByteString -> IO ByteString
+runInProcessDuckDBReductionPath contract sql = do
+    reduced <-
+        withPredicatePool 1 True (fmap (== OracleAccepted) . duckdbContractOracle contract) $ \pool -> do
+            ReductionResult reducedSql _evidence <-
+                reduceSQLWithEvidence
+                    (\_ -> pure ())
+                    (defaultReductionConfig {reductionDialect = DuckDB})
+                    nullLogger
+                    pool
+                    sql
+            _auditStats <- statementAuditWithLogger nullLogger DuckDB pool reducedSql
+            pure reducedSql
+    valRes <- duckdbContractOracle contract reduced
+    unless (valRes == OracleAccepted) $
+        die "Final DuckDB validation failed"
+    pure reduced
+
 main :: IO ()
 main = do
     let sql64 = syntheticSQL 8
@@ -260,124 +285,148 @@ main = do
         Right c -> pure c
     let oracleScale64 = sqliteContractOracle contractScale64
     loadedCorpus <- mapM loadCorpusCase corpusCases
+    hasDuckDB <- isDuckDBAvailable
+    mDuckDbBench <-
+        if hasDuckDB
+            then do
+                let duckdbSql =
+                        "CREATE MACRO m_add(x) AS x + 1;\n\
+                        \CREATE TABLE noise_tbl (v INT);\n\
+                        \INSERT INTO noise_tbl VALUES (10), (20);\n\
+                        \CREATE TABLE real_tbl (id INT, val TEXT);\n\
+                        \INSERT INTO real_tbl VALUES (m_add(41), 'result');\n\
+                        \SELECT id, val FROM real_tbl;"
+                cRes <- generateDuckDBContract duckdbSql
+                case cRes of
+                    Right c ->
+                        pure
+                            [ bgroup
+                                "reduction-duckdb-validation"
+                                [ bench "macro-and-table-reduction" $ whnfIO (runInProcessDuckDBReductionPath c duckdbSql)
+                                ]
+                            ]
+                    Left _ -> pure []
+            else pure []
     defaultMain
-        [ bgroup
-            "parse"
-            [ bgroup
-                "64"
-                [ bench "stmt-only" $ whnfIO (parsedWorkload <$> parseUnitsOrDie ParseStatementOnly sql64)
-                , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"64\"" $
-                    bench "syntax-chunks" $
-                        whnfIO (parsedWorkload <$> parseUnitsOrDie ParseSyntaxChunks sql64)
-                , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"64\"" $
-                    bench "column-ir" $
-                        whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR sql64)
+        ( [ bgroup
+                "parse"
+                [ bgroup
+                    "64"
+                    [ bench "stmt-only" $ whnfIO (parsedWorkload <$> parseUnitsOrDie ParseStatementOnly sql64)
+                    , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"64\"" $
+                        bench "syntax-chunks" $
+                            whnfIO (parsedWorkload <$> parseUnitsOrDie ParseSyntaxChunks sql64)
+                    , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"64\"" $
+                        bench "column-ir" $
+                            whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR sql64)
+                    ]
+                , bgroup
+                    "512"
+                    [ bench "stmt-only" $ whnfIO (parsedWorkload <$> parseUnitsOrDie ParseStatementOnly sql512)
+                    , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"512\"" $
+                        bench "syntax-chunks" $
+                            whnfIO (parsedWorkload <$> parseUnitsOrDie ParseSyntaxChunks sql512)
+                    , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"512\"" $
+                        bench "column-ir" $
+                            whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR sql512)
+                    ]
                 ]
-            , bgroup
-                "512"
-                [ bench "stmt-only" $ whnfIO (parsedWorkload <$> parseUnitsOrDie ParseStatementOnly sql512)
-                , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"512\"" $
-                    bench "syntax-chunks" $
-                        whnfIO (parsedWorkload <$> parseUnitsOrDie ParseSyntaxChunks sql512)
-                , bcompare "$NF == \"stmt-only\" && $(NF-1) == \"512\"" $
-                    bench "column-ir" $
-                        whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR sql512)
+          , bgroup
+                "dag"
+                [ bgroup
+                    "analyze"
+                    [ bench "64" $ whnf (graphWorkload . analyzeStatements sess64) units64
+                    , bcompare "$NF == \"64\" && $(NF-1) == \"analyze\"" $
+                        bench "512" $
+                            whnf (graphWorkload . analyzeStatements sess512) units512
+                    ]
+                , bgroup
+                    "backward-slice"
+                    [ bench "64" $ whnf (Set.size . flip backwardSlice graph64) (last targets64)
+                    , bcompare "$NF == \"64\" && $(NF-1) == \"backward-slice\"" $
+                        bench "512" $
+                            whnf (Set.size . flip backwardSlice graph512) (last targets512)
+                    ]
+                , bgroup
+                    "close-set"
+                    [ bench "64" $ whnf (Set.size . closeSet graph64) (windowIds ids64 0)
+                    , bcompare "$NF == \"64\" && $(NF-1) == \"close-set\"" $
+                        bench "512" $
+                            whnf (Set.size . closeSet graph512) (windowIds ids512 0)
+                    ]
                 ]
-            ]
-        , bgroup
-            "dag"
-            [ bgroup
-                "analyze"
-                [ bench "64" $ whnf (graphWorkload . analyzeStatements sess64) units64
-                , bcompare "$NF == \"64\" && $(NF-1) == \"analyze\"" $
-                    bench "512" $
-                        whnf (graphWorkload . analyzeStatements sess512) units512
+          , bgroup
+                "surgery"
+                [ bench "cut-removed" $ whnf (byteChecksum . cutRemovedStatementIds sql512 stmts512) keptEven
+                , bcompare "$NF == \"cut-removed\" && $(NF-1) == \"surgery\"" $
+                    bench "replace-span" $
+                        whnf
+                            (\start -> byteChecksum (replaceSpan start (start + 896) ("/* trimmed */" :: ByteString) sql512))
+                            (128 :: Int)
                 ]
-            , bgroup
-                "backward-slice"
-                [ bench "64" $ whnf (Set.size . flip backwardSlice graph64) (last targets64)
-                , bcompare "$NF == \"64\" && $(NF-1) == \"backward-slice\"" $
-                    bench "512" $
-                        whnf (Set.size . flip backwardSlice graph512) (last targets512)
+          , bgroup
+                "cache"
+                [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled candidateKey)
+                , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
+                    bench "miss" $
+                        whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
                 ]
-            , bgroup
-                "close-set"
-                [ bench "64" $ whnf (Set.size . closeSet graph64) (windowIds ids64 0)
-                , bcompare "$NF == \"64\" && $(NF-1) == \"close-set\"" $
-                    bench "512" $
-                        whnf (Set.size . closeSet graph512) (windowIds ids512 0)
-                ]
-            ]
-        , bgroup
-            "surgery"
-            [ bench "cut-removed" $ whnf (byteChecksum . cutRemovedStatementIds sql512 stmts512) keptEven
-            , bcompare "$NF == \"cut-removed\" && $(NF-1) == \"surgery\"" $
-                bench "replace-span" $
-                    whnf
-                        (\start -> byteChecksum (replaceSpan start (start + 896) ("/* trimmed */" :: ByteString) sql512))
-                        (128 :: Int)
-            ]
-        , bgroup
-            "cache"
-            [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled candidateKey)
-            , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
-                bench "miss" $
-                    whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
-            ]
-        , bgroup
-            "reduction"
-            [ bgroup
-                "scale-064"
-                [ bench "default" $
-                    whnfIO $
-                        withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
-                            reduceSQLWithConfig
-                                (defaultReductionConfig {reductionDialect = SQLite})
-                                nullLogger
-                                pool
-                                sqlScale64
-                , bcompare "$NF == \"default\" && $(NF-1) == \"scale-064\"" $
-                    bench "intra-statement" $
+          , bgroup
+                "reduction"
+                [ bgroup
+                    "scale-064"
+                    [ bench "default" $
                         whnfIO $
                             withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
-                                reduceSQLWithConfig
-                                    (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
-                                    nullLogger
-                                    pool
-                                    sqlScale64
-                ]
-            , bgroup
-                "corpus"
-                [ bgroup
-                    name
-                    ( bench
-                        "default"
-                        ( whnfIO $
-                            withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
                                 reduceSQLWithConfig
                                     (defaultReductionConfig {reductionDialect = SQLite})
                                     nullLogger
                                     pool
-                                    sql
+                                    sqlScale64
+                    , bcompare "$NF == \"default\" && $(NF-1) == \"scale-064\"" $
+                        bench "intra-statement" $
+                            whnfIO $
+                                withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
+                                    reduceSQLWithConfig
+                                        (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                        nullLogger
+                                        pool
+                                        sqlScale64
+                    ]
+                , bgroup
+                    "corpus"
+                    [ bgroup
+                        name
+                        ( bench
+                            "default"
+                            ( whnfIO $
+                                withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
+                                    reduceSQLWithConfig
+                                        (defaultReductionConfig {reductionDialect = SQLite})
+                                        nullLogger
+                                        pool
+                                        sql
+                            )
+                            : [ bcompare ("$NF == \"default\" && $(NF-1) == \"" ++ name ++ "\"") $
+                                    bench "intra-statement" $
+                                        whnfIO $
+                                            withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
+                                                reduceSQLWithConfig
+                                                    (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                                    nullLogger
+                                                    pool
+                                                    sql
+                              | name /= "01_cte_recursive_analytics"
+                              ]
                         )
-                        : [ bcompare ("$NF == \"default\" && $(NF-1) == \"" ++ name ++ "\"") $
-                                bench "intra-statement" $
-                                    whnfIO $
-                                        withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
-                                            reduceSQLWithConfig
-                                                (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
-                                                nullLogger
-                                                pool
-                                                sql
-                          | name /= "01_cte_recursive_analytics"
-                          ]
-                    )
+                    | (name, sql, contract) <- loadedCorpus
+                    ]
+                ]
+          , bgroup
+                "reduction-audit-validation"
+                [ bench name $ whnfIO (runInProcessReductionPath contract sql)
                 | (name, sql, contract) <- loadedCorpus
                 ]
-            ]
-        , bgroup
-            "reduction-audit-validation"
-            [ bench name $ whnfIO (runInProcessReductionPath contract sql)
-            | (name, sql, contract) <- loadedCorpus
-            ]
-        ]
+          ]
+            ++ mDuckDbBench
+        )
