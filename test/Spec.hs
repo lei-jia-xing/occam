@@ -453,13 +453,24 @@ phase5Tests =
                         ["single", "atomic"]
                     observed <- BSC.readFile calls
                     assertEqual "oracle ran before validation" "" observed
-        , testCase "help advertises all selected dialects" $ do
+        , testCase "help starts with a compact usage line and points to the dialect list" $ do
             (helpCode, helpOut, _) <- runOccamCLI ["--help"]
             assertEqual "help must exit zero" ExitSuccess helpCode
+            assertEqual
+                "usage and options should appear before any explanatory text"
+                ["Usage: occam INPUT.sql --oracle COMMAND [OPTIONS]", "", "Available options:"]
+                (take 3 (lines helpOut))
+            assertEqual
+                "input, oracle, and output should be listed first"
+                ["INPUT.sql", "-c,--oracle", "-o,--out"]
+                (map (takeWhile (/= ' ') . dropWhile (== ' ')) (take 3 (drop 3 (lines helpOut))))
+            assertBool "missing dialect list pointer" ("See --list-dialects" `isInfixOf` helpOut)
+            (listCode, dialects, _) <- runOccamCLI ["--list-dialects"]
+            assertEqual "dialect list must exit zero" ExitSuccess listCode
             mapM_
                 ( \dialect ->
                     let name = T.unpack (dialectName dialect)
-                     in assertBool ("--help hides dialect: " ++ name) (name `isInfixOf` helpOut)
+                     in assertBool ("--list-dialects hides dialect: " ++ name) (name `elem` words dialects)
                 )
                 ([minBound .. maxBound] :: [SQLDialect])
         , testCase "default stdout includes the best reduction under a two-call budget" $

@@ -86,11 +86,12 @@ import Options.Applicative (
     action,
     auto,
     completeWith,
+    defaultPrefs,
     eitherReader,
-    execParser,
+    execParserPure,
     flag',
     fullDesc,
-    header,
+    handleParseResult,
     help,
     helper,
     info,
@@ -100,7 +101,7 @@ import Options.Applicative (
     metavar,
     option,
     optional,
-    progDesc,
+    overFailure,
     short,
     strArgument,
     strOption,
@@ -108,11 +109,12 @@ import Options.Applicative (
     value,
     (<**>),
  )
+import Options.Applicative.Help (ParserHelp (helpUsage), isEmpty, stringChunk)
 import System.Directory (
     canonicalizePath,
     doesFileExist,
  )
-import System.Environment (lookupEnv)
+import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath ((</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
@@ -398,43 +400,43 @@ validateCliOptions RawOptions {..} = do
 
 actionParser :: Parser Action
 actionParser =
-    flag'
-        ActionListDialects
-        ( long "list-dialects"
-            <> help "List supported SQL dialects and exit"
-        )
+    (ActionNormal <$> rawOptionsParser)
+        <|> flag'
+            ActionListDialects
+            ( long "list-dialects"
+                <> help "List SQL dialects"
+            )
         <|> flag'
             ActionListColumnModes
             ( long "list-column-modes"
-                <> help "List supported column co-reduction modes and exit"
+                <> help "List column reduction modes"
             )
         <|> flag'
             ActionListStrategies
             ( long "list-strategies"
-                <> help "List supported reduction strategies and exit"
+                <> help "List reduction strategies"
             )
         <|> flag'
             ActionPrintDefaults
             ( long "print-defaults"
-                <> help "Print default configuration in JSON format and exit"
+                <> help "Print defaults as JSON"
             )
         <|> ( ActionCompletion
                 <$> option
                     (eitherReader parseShellType)
                     ( long "completion"
                         <> metavar "SHELL"
-                        <> help "Generate shell completion script (bash, zsh, fish) and exit"
+                        <> help "Generate completions for bash, zsh, or fish"
                         <> completeWith (map fst supportedShells)
                     )
             )
-        <|> (ActionNormal <$> rawOptionsParser)
 
 rawOptionsParser :: Parser RawOptions
 rawOptionsParser =
     RawOptions
         <$> strArgument
             ( metavar "INPUT.sql"
-                <> help "Path to fuzz SQL input, or '-' for stdin"
+                <> help "Input SQL file or '-' for stdin"
                 <> action "file"
             )
         <*> optional
@@ -442,7 +444,7 @@ rawOptionsParser =
                 ( long "oracle"
                     <> short 'c'
                     <> metavar "COMMAND"
-                    <> help "Interestingness predicate command (SQL on stdin; exit 0 accepts)"
+                    <> help "Read SQL on stdin. Exit 0 accepts."
                 )
             )
         <*> optional
@@ -450,20 +452,20 @@ rawOptionsParser =
                 ( long "out"
                     <> short 'o'
                     <> metavar "PATH"
-                    <> help "Output SQL file path (default: stdout; '-' also means stdout)"
+                    <> help "Write SQL to PATH, or '-' for stdout (default)"
                     <> action "file"
                 )
             )
         <*> switch
             ( long "in-place"
                 <> short 'i'
-                <> help "Modify input SQL file in place (creates backup <input>.bak)"
+                <> help "Replace input after validation. Keep a .bak backup."
             )
         <*> optional
             ( strOption
                 ( long "stats"
                     <> metavar "FILE"
-                    <> help "Write JSON reduction statistics to FILE"
+                    <> help "Write JSON statistics"
                     <> action "file"
                 )
             )
@@ -471,7 +473,7 @@ rawOptionsParser =
             ( strOption
                 ( long "reset"
                     <> metavar "COMMAND"
-                    <> help "Lightweight state reset command (e.g. dropdb/createdb)"
+                    <> help "Run before each oracle execution"
                 )
             )
         <*> option
@@ -479,14 +481,14 @@ rawOptionsParser =
             ( long "timeout"
                 <> metavar "SECONDS"
                 <> value (rawTimeoutSecs defaultRawOptions)
-                <> help "Per-execution timeout in seconds (default: 10.0)"
+                <> help "Timeout per execution (default: 10 seconds)"
             )
         <*> ( ( Explicit
                     <$> option
                         (eitherReader parseLogLevel)
                         ( long "log-level"
                             <> metavar "LEVEL"
-                            <> help "Log severity level: debug, info, warn, or error (default: warn)"
+                            <> help "debug, info, warn (default), or error"
                             <> completeWith ["debug", "info", "warn", "error"]
                         )
               )
@@ -497,24 +499,24 @@ rawOptionsParser =
             ( long "log-format"
                 <> metavar "FORMAT"
                 <> value (rawLogFormat defaultRawOptions)
-                <> help "Log output format: text or json (default: text)"
+                <> help "text (default) or json"
                 <> completeWith ["text", "json"]
             )
         <*> switch
             ( long "verbose"
-                <> help "Enable verbose debug output (equivalent to --log-level debug)"
+                <> help "Show debug logs and progress"
             )
         <*> switch
             ( long "quiet"
                 <> short 'q'
-                <> help "Suppress info logs and banners (equivalent to --log-level error)"
+                <> help "Show errors only"
             )
         <*> option
             (eitherReader parseColorMode)
             ( long "color"
                 <> metavar "WHEN"
                 <> value (rawColor defaultRawOptions)
-                <> help "Colorize terminal output: auto, always, or never (default: auto; honors NO_COLOR)"
+                <> help "auto (default), always, or never. Honors NO_COLOR."
                 <> completeWith ["auto", "always", "never"]
             )
         <*> optional
@@ -523,7 +525,7 @@ rawOptionsParser =
                 ( long "budget"
                     <> long "time-limit"
                     <> metavar "SECONDS"
-                    <> help "Shared wall-clock cap for entire reduction session"
+                    <> help "Total time limit, including oracle checks"
                 )
             )
         <*> optional
@@ -541,7 +543,7 @@ rawOptionsParser =
                 <> long "jobs"
                 <> metavar "N"
                 <> value (rawJobs defaultRawOptions)
-                <> help "Maximum concurrent oracle executions (default: 1)"
+                <> help "Concurrent oracle runs (default: 1)"
             )
         <*> toggleSpecified
             "slicing"
@@ -572,7 +574,7 @@ rawOptionsParser =
                 <> metavar "DIALECT"
                 <> value (rawDialect defaultRawOptions)
                 <> help
-                    "SQL dependency dialect: generic (default), postgresql, mysql, sqlite, duckdb, clickhouse, oracle, ansi, bigquery, databricks, hive, mssql, redshift, snowflake, spark, or teradata"
+                    "Dialect (default: generic). See --list-dialects."
                 <> completeWith (map (T.unpack . dialectName) [minBound .. maxBound])
             )
         <*> strategyParser
@@ -597,7 +599,7 @@ strategyParser =
         (Explicit <$> eitherReader parseStrategy)
         ( long "strategy"
             <> metavar "STRATEGY"
-            <> help "Reduction strategy: full (default), ddmin-only, or audit-only"
+            <> help "Default: full. See --list-strategies."
             <> completeWith ["full", "ddmin-only", "audit-only"]
         )
         <|> pure (rawStrategy defaultRawOptions)
@@ -608,7 +610,7 @@ columnModeParser =
         (Explicit <$> eitherReader parseColumnMode)
         ( long "column-mode"
             <> metavar "MODE"
-            <> help "Column co-reduction mode: off (default), single, or atomic (requires --intra-statement)"
+            <> help "off (default). Other modes need --intra-statement."
             <> completeWith ["off", "single", "atomic"]
         )
         <|> pure (rawColumnMode defaultRawOptions)
@@ -661,12 +663,7 @@ versionOption =
 
 optsInfo :: ParserInfo Action
 optsInfo =
-    info
-        (actionParser <**> versionOption <**> helper)
-        ( fullDesc
-            <> progDesc "Occam is a dependency-aware test case reducer for multi-statement SQL."
-            <> header "occam - Multi-Statement SQL Reducer"
-        )
+    info (actionParser <**> versionOption <**> helper) fullDesc
 
 -- ----------------------------------------------------------------------------
 -- Exit Codes Contract
@@ -729,7 +726,14 @@ validateOutputPaths input target writesStdout inPlace statsFile = do
 -- ----------------------------------------------------------------------------
 
 main :: IO ()
-main = execParser optsInfo >>= runAction
+main = do
+    args <- getArgs
+    action' <- handleParseResult (overFailure compactUsage (execParserPure defaultPrefs optsInfo args))
+    runAction action'
+    where
+        compactUsage helpText
+            | isEmpty (helpUsage helpText) = helpText
+            | otherwise = helpText {helpUsage = stringChunk "Usage: occam INPUT.sql --oracle COMMAND [OPTIONS]"}
 
 runAction :: Action -> IO ()
 runAction (ActionCompletion shell) = do
