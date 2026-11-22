@@ -9,12 +9,9 @@ import Completion (
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, when)
 import Data.Aeson (Value, encode, object, toJSON, (.=))
-import Data.Bifunctor (first)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
-import Data.IORef (atomicModifyIORef', newIORef)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -22,7 +19,6 @@ import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
 import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
-import Occam.Core (ResultStatement)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -48,7 +44,6 @@ import Occam.Logger (
     withLogger,
  )
 import Occam.Oracle (
-    OracleObservation (OracleFinished),
     OracleObservationDetails (..),
     observeExternalOracleDetailedWithContext,
     prepareOracle,
@@ -56,14 +51,7 @@ import Occam.Oracle (
     shellOracleConfig,
     withCandidateWorkdir,
  )
-import Occam.Oracle.DuckDB (
-    duckdbContractObservationWithResultStatement,
-    generateDuckDBContractWithResultStatement,
- )
-import Occam.Oracle.Sqlite (
-    generateSqliteContractWithResultStatement,
-    sqliteContractObservationWithResultStatement,
- )
+import Occam.Oracle.Inline (newResultStatementTracker, prepareResultOracle)
 import Occam.Parser (
     ParseOptions (..),
     ParserError (..),
@@ -888,17 +876,9 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("strategy", toJSON (strategyName valStrategy))
         ]
 
-    resultStatements <- newIORef Map.empty
-    let rememberResult sql location =
-            when (valStrategy == StrategyFull && valSlicing) $
-                atomicModifyIORef' resultStatements (\locations -> (Map.insert sql location locations, ()))
-        -- A later iteration can reuse a cached observation for a shorter candidate.
-        takeResult sql =
-            atomicModifyIORef' resultStatements $ \locations ->
-                ( Map.filterWithKey (\candidate _ -> BS.length candidate < BS.length sql) locations
-                , Map.lookup sql locations
-                )
-        totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
+    (rememberResult, takeResult) <-
+        newResultStatementTracker (valStrategy == StrategyFull && valSlicing)
+    let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
     (initialStart, initialEnd, preflightDetails, observer, preflightMicros) <-
         runPreflight totalBudgetMicros $ case oracleCmd of
             Nothing -> prepareResultOracle rememberResult valDialect timeoutMicros initialSQL
@@ -1120,44 +1100,6 @@ buildBudgetConfig cacheEnabled jobs budgetSecs maxExecutions initialStmts =
         , evaluationPreflightOracleMicros = Nothing
         , evaluationInitialStatements = Just initialStmts
         }
-
-prepareResultOracle ::
-    (BS.ByteString -> ResultStatement -> IO ()) ->
-    SQLDialect ->
-    Int ->
-    BS.ByteString ->
-    IO (Either Text (OracleObservationDetails, EvaluationObserver))
-prepareResultOracle rememberResult dialect micros sql = do
-    start <- getMonotonicTimeNSec
-    prepared <- case dialect of
-        SQLite ->
-            fmap (first (sqliteContractObservationWithResultStatement micros))
-                <$> generateSqliteContractWithResultStatement micros sql
-        DuckDB ->
-            fmap (first (duckdbContractObservationWithResultStatement micros))
-                <$> generateDuckDBContractWithResultStatement micros sql
-        _ -> pure (Left "Result oracle requires SQLite or DuckDB")
-    end <- getMonotonicTimeNSec
-    case prepared of
-        Left err -> pure (Left err)
-        Right (observe, location) -> do
-            rememberResult sql location
-            let details =
-                    OracleObservationDetails
-                        (OracleFinished ExitSuccess)
-                        (elapsed start end)
-                        0
-                        (Just (elapsed start end))
-            pure (Right (details, timeObservation observe))
-    where
-        elapsed start end = fromIntegral ((end - start) `div` 1000)
-        timeObservation observe started candidate = do
-            start <- getMonotonicTimeNSec
-            _ <- started
-            (observation, location) <- observe candidate
-            mapM_ (rememberResult candidate) location
-            end <- getMonotonicTimeNSec
-            pure (OracleObservationDetails observation (elapsed start end) 0 (Just (elapsed start end)))
 
 runPreflight ::
     Maybe Integer ->

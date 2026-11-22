@@ -130,6 +130,7 @@ executable occam
     import:           warnings, language, core-deps, io-deps, rts-threaded
     main-is:          Main.hs
     other-modules:    Completion
+                    , Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
                     , Occam.Oracle.DuckDB
@@ -192,6 +193,8 @@ benchmark occam-bench
     c-sources:        eval-lib/cbits/duckdb_result.c
     hs-source-dirs:   bench eval-lib
     other-modules:    Occam.Oracle.Result
+                    , Occam.Oracle.Inline
+                    , ResultBaseline
                     , Occam.Oracle.Sqlite
                     , Occam.Oracle.DuckDB
                     , Paths_occam

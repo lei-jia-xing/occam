@@ -56,7 +56,9 @@ import Occam.Reducer (
  )
 import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
+import ResultBaseline (runResultBaseline)
 import System.Directory (doesFileExist)
+import System.Environment (getArgs)
 import System.Exit (ExitCode (..), die)
 import System.FilePath (takeBaseName, (</>))
 import Test.Tasty.Bench (
@@ -67,6 +69,7 @@ import Test.Tasty.Bench (
     whnf,
     whnfIO,
  )
+import Text.Read (readMaybe)
 
 genScale :: Int -> ByteString
 genScale n =
@@ -208,6 +211,9 @@ checkCount expected parsed =
      in unless (actual == expected) $
             die ("occam-bench: expected " ++ show expected ++ " statements, parsed " ++ show actual)
 
+-- NOTE: The tasty-bench audit groups time a direct reducer/audit probe.
+-- Use --result-baseline for the shared evaluation path and its validation evidence.
+
 -- | In-process reduction path for SQLite contract benchmarking.
 runInProcessReductionPath :: SqliteContract -> ByteString -> IO ByteString
 runInProcessReductionPath contract sql = do
@@ -220,8 +226,7 @@ runInProcessReductionPath contract sql = do
                     nullLogger
                     pool
                     sql
-            _auditStats <- statementAuditWithLogger nullLogger SQLite pool reducedSql
-            pure reducedSql
+            fst <$> statementAuditWithLogger nullLogger SQLite pool reducedSql
     valRes <- sqliteContractOracle contract reduced
     unless (valRes == OracleAccepted) $
         die "Final validation failed"
@@ -239,8 +244,7 @@ runInProcessDuckDBReductionPath contract sql = do
                     nullLogger
                     pool
                     sql
-            _auditStats <- statementAuditWithLogger nullLogger DuckDB pool reducedSql
-            pure reducedSql
+            fst <$> statementAuditWithLogger nullLogger DuckDB pool reducedSql
     valRes <- duckdbContractOracle contract reduced
     unless (valRes == OracleAccepted) $
         die "Final DuckDB validation failed"
@@ -248,6 +252,18 @@ runInProcessDuckDBReductionPath contract sql = do
 
 main :: IO ()
 main = do
+    args <- getArgs
+    case args of
+        ["--result-baseline", count, out]
+            | Just pairs <- readMaybe count
+            , pairs >= 2
+            , even pairs ->
+                runResultBaseline pairs out
+        "--result-baseline" : _ -> die "Usage: occam-bench --result-baseline EVEN_PAIRS OUTPUT.json (at least 2)"
+        _ -> runTimingBenchmarks
+
+runTimingBenchmarks :: IO ()
+runTimingBenchmarks = do
     let sql64 = syntheticSQL 8
         sql512 = syntheticSQL 64
     -- Pre-parse once for the DAG/surgery stages; parsing itself is timed below.

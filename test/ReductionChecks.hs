@@ -41,6 +41,7 @@ import Occam.Pool (
 import Occam.Reducer (
     ColumnMode (..),
     ReductionConfig (..),
+    ReductionResult (..),
     ReductionStage (..),
     StageEvent (..),
     defaultReductionConfig,
@@ -123,6 +124,29 @@ tests =
                 "the first candidate is the backward slice of the result statement"
                 [sql, expected]
                 (take 2 attempted)
+        , testCase "Unaligned result statement metadata follows the last-statement search" $ do
+            let sql = "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);"
+                expected = "SELECT 42 AS answer;"
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                run location = do
+                    candidates <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' candidates (candidate :)
+                        pure (if expected `BSC.isInfixOf` candidate then OracleAccepted else OracleRejected)
+                    let locate bytes = pure (if bytes == sql then location else Nothing)
+                    ReductionResult reduced _ <-
+                        reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+                    trace <- reverse <$> readIORef candidates
+                    pure (reduced, trace)
+            baseline@(reduced, trace) <- run Nothing
+            assertEqual "the expected query survives" expected reduced
+            assertEqual "the last statement is tested first" [sql, "CREATE TABLE tail (x INT);"] (take 2 trace)
+            wrongCount <- run (Just (ResultStatement 4 1))
+            assertEqual "an in-range ordinal with a mismatched count is ignored" baseline wrongCount
+            wrongOrdinal <- run (Just (ResultStatement 3 3))
+            assertEqual "an out-of-range ordinal is ignored" baseline wrongOrdinal
+            negativeOrdinal <- run (Just (ResultStatement 3 (-1)))
+            assertEqual "a negative ordinal is ignored" baseline negativeOrdinal
         , testCase "A global barrier discovered during graph construction prioritizes unrestricted search" $ do
             let sql =
                     BSC.unlines
