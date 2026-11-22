@@ -15,6 +15,30 @@ cradle:
               - "filepath"
               - "-package"
               - "process"
+    # eval-lib is shared by occam-test and occam-bench, so Cabal cannot infer
+    # the owning component from a file path. Pin it to the test component.
+    - path: "./eval-lib"
+      config:
+        cradle:
+          cabal:
+            component: "test:occam-test"
+    # test/FuzzMain.hs belongs to occam-fuzz; the other test modules are shared
+    # with occam-test (and TestSupport/MutationalFuzz with occam-fuzz).
+    - path: "./test/FuzzMain.hs"
+      config:
+        cradle:
+          cabal:
+            component: "test:occam-fuzz"
+    - path: "./test"
+      config:
+        cradle:
+          cabal:
+            component: "test:occam-test"
+    - path: "./bench"
+      config:
+        cradle:
+          cabal:
+            component: "bench:occam-bench"
     - path: "./"
       config:
         cradle:

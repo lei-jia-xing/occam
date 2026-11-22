@@ -46,8 +46,25 @@ common language
         OverloadedStrings
         RecordWildCards
 
+common core-deps
+    build-depends:    base >= 4.18 && < 5
+                    , bytestring >= 0.11 && < 0.13
+                    , text >= 2.0 && < 2.2
+                    , containers >= 0.6 && < 0.9
+
+common io-deps
+    build-depends:    directory >= 1.3 && < 1.4
+                    , filepath >= 1.4 && < 1.6
+                    , aeson >= 2.0 && < 2.4
+
+common rts-threaded
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A32m"
+
+common rts-bench
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-T -A32m"
+
 library
-    import:           warnings, language
+    import:           warnings, language, core-deps, io-deps
     exposed-modules:  Occam
                     , Occam.AtomicFile
                     , Occam.Cache
@@ -83,17 +100,10 @@ library
                     , Occam.Dependency.State
                     , Occam.Dependency.Transaction
                     , Occam.Dependency.Write
-    build-depends:    base >= 4.18 && < 5
-                    , binary >= 0.8 && < 0.10
-                    , bytestring >= 0.11 && < 0.13
-                    , text >= 2.0 && < 2.2
-                    , containers >= 0.6 && < 0.9
+    build-depends:    binary >= 0.8 && < 0.10
                     , unordered-containers >= 0.2.14 && < 0.3
                     , hashable >= 1.4 && < 1.6
                     , process >= 1.6 && < 1.7
-                    , filepath >= 1.4 && < 1.6
-                    , directory >= 1.3 && < 1.4
-                    , aeson >= 2.0 && < 2.4
                     , time >= 1.12 && < 1.17
                     , fast-logger >= 3.1 && < 3.3
                     , ansi-terminal >= 1.0 && < 1.2
@@ -117,43 +127,30 @@ library
         extra-libraries: advapi32, ws2_32, userenv, bcrypt, ntdll
 
 executable occam
-    import:           warnings, language
+    import:           warnings, language, core-deps, io-deps, rts-threaded
     main-is:          Main.hs
     other-modules:    Completion
-    build-depends:    base >= 4.18 && < 5
-                    , occam
-                    , bytestring
-                    , text
-                    , containers
-                    , directory
-                    , filepath
+    build-depends:    occam
                     , time
                     , optparse-applicative >= 0.17 && < 0.20
-                    , aeson >= 2.0
     hs-source-dirs:   app
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A32m"
 
 test-suite occam-fuzz
-    import:           warnings, language
+    import:           warnings, language, core-deps, rts-threaded
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     other-modules:    Fuzz
                     , MutationalFuzz
                     , TestSupport
     main-is:          FuzzMain.hs
-    build-depends:    base >= 4.18 && < 5
-                    , occam
-                    , bytestring
-                    , text
-                    , containers
+    build-depends:    occam
                     , directory
                     , tasty
                     , tasty-quickcheck
                     , QuickCheck >= 2.14
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A32m"
 
 test-suite occam-test
-    import:           warnings, language
+    import:           warnings, language, core-deps, io-deps, rts-threaded
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test eval-lib
     other-modules:    Fuzz
@@ -169,13 +166,7 @@ test-suite occam-test
                     , Occam.Oracle.Sqlite
                     , Occam.Benchmark.Metrics
     main-is:          Spec.hs
-    build-depends:    base >= 4.18 && < 5
-                    , occam
-                    , bytestring
-                    , text
-                    , containers
-                    , directory
-                    , filepath
+    build-depends:    occam
                     , process
                     , optparse-applicative
                     , tasty
@@ -183,29 +174,18 @@ test-suite occam-test
                     , tasty-quickcheck
                     , QuickCheck
                     , time
-                    , aeson
                     , direct-sqlite >= 2.3 && < 2.4
                     , safe-exceptions >= 0.1 && < 0.2
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A32m"
 
 benchmark occam-bench
-    import:           warnings, language
+    import:           warnings, language, core-deps, io-deps, rts-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench eval-lib
     other-modules:    Occam.Oracle.Sqlite
-                    , Occam.Benchmark.Metrics
                     , Paths_occam
     autogen-modules:  Paths_occam
     main-is:          Main.hs
-    build-depends:    base >= 4.18 && < 5
-                    , occam
-                    , bytestring
-                    , containers
+    build-depends:    occam
                     , tasty-bench >= 0.3 && < 0.6
-                    , directory >= 1.3 && < 1.4
-                    , filepath >= 1.4 && < 1.6
                     , direct-sqlite >= 2.3 && < 2.4
                     , safe-exceptions >= 0.1 && < 0.2
-                    , text
-                    , aeson
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-T -A32m"
