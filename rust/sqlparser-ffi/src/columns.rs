@@ -1,90 +1,8 @@
 //! Precision-bound column reduction facts.
 //!
-//! The first supported family is one table scope per bundle: a `CREATE TABLE`
-//! column definition together with the matching `INSERT` explicit column-list
-//! items and per-`VALUES`-row item positions (positional binding for implicit
-//! definition-order inserts). All parsing and span extraction happens here in
-//! the Rust frontend; the Haskell engine only consumes exact byte spans.
-//!
-//! Two consumers share one span computation:
-//! - single-point edits (one span each, gated ONLY by span/site validity),
-//! - atomic bundles (all sites of one column, additionally gated by the
-//!   generation/binding fences below).
-//!
-//! A bundle is emitted only when every site is exact and the table scope has
-//! zero fences. Otherwise the column target is emitted with `blocked` set (or
-//! omitted when it would duplicate a single), and is never partially applied.
-//!
-//! Fence boundary (first family + generation solver + namespace resolver):
-//! - Reads elsewhere (projections, `WHERE`, view sources, trigger
-//!   conditions/effects, `RETURNING`) fence by exact column match; any star
-//!   cover over the table fences regardless of what else the unit reads.
-//!   Plain one-source projections that do not read the column never fence.
-//! - Writes elsewhere (`UPDATE`/`DELETE`/`MERGE` assignments, trigger-body
-//!   DML) fence by exact column match.
-//! - Parent-side foreign keys from any table fence the referenced column;
-//!   implicit parent columns fence the whole parent table.
-//! - Opaque units (parse failures, global/session/transaction/schema
-//!   barriers, session effects, transaction effects) can affect any table
-//!   without naming it, so any opaque unit blocks every bundle.
-//!   pre-existing sequence/routine analysis marks every non-pure function
-//!   call as a global opaque barrier; only the Generic reserved-keyword
-//!   rule (`crate::pure`: unquoted `coalesce`/`nullif` on GenericSQL)
-//!   lifts that fence. Unknown and volatile calls, aggregates (including
-//!   `SUM`, `COUNT`), engine-specific calls (including `abs` on
-//!   SQLite/PostgreSQL/MySQL), qualified calls, window/filter/grouping
-//!   shapes, and any call in a script containing routine DDL still fence,
-//!   so first-family proofs keep routine-free projections such as
-//!   `SELECT a FROM t ORDER BY a` whenever a fence-free unit is needed.
-//! - Generation account, per table (a single `CREATE TABLE` generation only;
-//!   zero/non-unique definitions fence the whole table):
-//!   - Operations on other tables (alters, renames, drops) never fence this
-//!     table, even when they name an identical column.
-//!   - `ADD COLUMN other`, `DROP COLUMN other`, `RENAME COLUMN`
-//!     other-to-other, and `ADD CONSTRAINT` without the column lift for
-//!     that column: explicit column lists bind by name, so a change
-//!     elsewhere in the definition cannot move this column's items.
-//!     Anything naming the column fences it.
-//!   - `ADD`/`DROP COLUMN` still fence all when any positional (implicit
-//!     `VALUES`) insert binds: `FIRST`/`AFTER` placement is not in the IR,
-//!     so append is unprovable and ordinals may shift.
-//!   - `ALTER COLUMN` narrows per op: no-expression ops (`SET`/`DROP NOT
-//!     NULL, `DROP DEFAULT`, pure type change, identity/foreign-table
-//!     options) fence the target only; `USING`/`SET DEFAULT` (and
-//!     `CHANGE`/`MODIFY` new-definition expressions) fence the target
-//!     plus the columns they read; `FIRST`/`AFTER` placement fences all
-//!     (ordinals may shift, and the `AFTER` anchor names an uncarried
-//!     sibling). `CHANGE`/`MODIFY` definitions with unparsed dialect
-//!     tokens or implicit self-referencing parent columns stay opaque
-//!     and fence all, as do generated `ADD COLUMN` expressions, opaque
-//!     constraints, and name-addressed changes (`DROP/RENAME CONSTRAINT`,
-//!     `DROP INDEX`, `VALIDATE`).
-//!   - Table renames are followed (sites before the rename bind the old
-//!     name, sites after bind the new name) only when unambiguous: one
-//!     outgoing rename per name, strictly ordered after the definition, no
-//!     cycle or self-rename, no second `CREATE` generation for any followed
-//!     name, no rename into the chain from outside, and no rename sharing
-//!     its unit with an alter of the generation. Anything else fences all.
-//!     Stale uses (a generation name outside its active segment) bind no
-//!     sites; fence checks still scan the whole chain.
-//!   - Drops are never followed across: any drop of a generation name
-//!     fences the whole table. `LIKE`, table sources, `ON COMMIT` actions,
-//!     temporary tables, and pre-definition inserts still fence the whole
-//!     table exactly as before.
-//! - Namespace resolver (no catalog; canonical spellings only):
-//!   - Identical canonical spellings (after `IdentifierRules` folding) are
-//!     the same table: case/quoting variants that fold together never fence
-//!     each other.
-//!   - Genuinely distinct spellings with the same trailing name (e.g. `t`
-//!     vs `main.t`) may alias, and neither same-nor-distinct is provable
-//!     without `search_path`/catalog reasoning (which this layer never
-//!     receives: [`assemble_columns`] sees units plus source only). A
-//!     sibling spelling in any DDL role (second definition, alter, drop,
-//!     rename, index/trigger host) keeps the whole-table fence. Sibling DML
-//!     uses narrow to the columns they can touch under the same-table
-//!     hypothesis: explicit lists touch their listed columns; implicit or
-//!     exotic shapes, stars, unknown sources, and implicit-column
-//!     foreign-key parents touch all.
+//! Identifies column definition and usage sites (such as `CREATE TABLE` column definitions,
+//! explicit `INSERT` column lists, and positional `VALUES` items) and computes safe
+//! reduction fences across table scopes and statement units.
 
 use crate::ir;
 use std::collections::{HashMap, HashSet};
@@ -235,11 +153,10 @@ fn collect_writes(facts: &ir::NativeFacts) -> Vec<(&ir::Name, &[ir::Ident])> {
     let mut refs = Vec::new();
     for op in &facts.ops {
         match op {
-            ir::CatalogOp::WriteData(write) => {
-                if !matches!(write.kind, ir::WriteKind::Insert { .. }) {
-                    refs.push((&write.target.name, write.columns.as_slice()));
-                }
-            }
+            ir::CatalogOp::WriteData(write) => match &write.kind {
+                ir::WriteKind::Insert { .. } => {}
+                _ => refs.push((&write.target.name, write.columns.as_slice())),
+            },
             ir::CatalogOp::DefineTrigger(trigger) => {
                 if let ir::TriggerBody::Inline { effects } = &trigger.body {
                     for effect in effects {
@@ -346,6 +263,7 @@ fn collect_touched(facts: &ir::NativeFacts, reads: &[&ir::ReadFact]) -> HashSet<
     touched
 }
 
+/// Aggregates all table reads, non-insert writes, touched tables, and opacity flags for one unit.
 fn collect_refs(facts: &ir::NativeFacts) -> UnitRefs<'_> {
     let reads = collect_reads(facts);
     let writes = collect_writes(facts);
@@ -415,26 +333,27 @@ fn session_changes_name_resolution(facts: &ir::NativeFacts) -> bool {
     })
 }
 
-/// Tests whether a relation name resides in a given schema.
+/// Tests whether a relation name resides in a given schema under dialect conventions.
+///
+/// Unqualified tables match standard default schemas (`public`, `main`, `dbo`).
+/// Qualified tables compare their prefix schema components against the candidate schema.
 fn table_in_schema(name: &ir::Name, schema: &ir::Name) -> bool {
-    if schema.0.is_empty() || name.0.is_empty() {
-        return false;
-    }
-    if name.0.len() > 1 {
-        if schema.0.len() == name.0.len() - 1 {
-            &name.0[..schema.0.len()] == schema.0.as_slice()
-        } else if schema.0.len() == 1 {
-            name.0[name.0.len() - 2]
-                .0
-                .eq_ignore_ascii_case(&schema.0[0].0)
-        } else {
-            false
+    match (name.0.as_slice(), schema.0.as_slice()) {
+        ([], _) | (_, []) => false,
+        ([prefix @ .., _table], [single_schema]) if !prefix.is_empty() => {
+            prefix == [single_schema.clone()]
+                || prefix
+                    .last()
+                    .is_some_and(|s| s.0.eq_ignore_ascii_case(&single_schema.0))
         }
-    } else {
-        schema.0.len() == 1
-            && (schema.0[0].0.eq_ignore_ascii_case("public")
-                || schema.0[0].0.eq_ignore_ascii_case("main")
-                || schema.0[0].0.eq_ignore_ascii_case("dbo"))
+        ([prefix @ .., _table], schemas) if prefix.len() == schemas.len() => prefix == schemas,
+        ([_single_table], [single_schema]) => {
+            let s = single_schema.0.as_str();
+            s.eq_ignore_ascii_case("public")
+                || s.eq_ignore_ascii_case("main")
+                || s.eq_ignore_ascii_case("dbo")
+        }
+        _ => false,
     }
 }
 
@@ -486,6 +405,7 @@ fn collect_table_fences(
     }
 }
 
+/// Returns whether `constraint` explicitly references `column` on the constrained table.
 fn constraint_touches(constraint: &ir::Constraint, column: &ir::Ident) -> bool {
     match constraint {
         ir::Constraint::PrimaryKey { columns, .. }
@@ -499,6 +419,7 @@ fn constraint_touches(constraint: &ir::Constraint, column: &ir::Ident) -> bool {
     }
 }
 
+/// Returns whether `constraint` cannot be modeled at column granularity and requires a whole-table fence.
 fn constraint_is_opaque(constraint: &ir::Constraint) -> bool {
     matches!(
         constraint,
@@ -538,11 +459,7 @@ struct TableScope {
 }
 
 impl TableScope {
-    /// Generation name active at `unit` (0-based): the last rename target
-    /// strictly before `unit`, else the define name. A rename in `unit`
-    /// itself never rebinds `unit`: single-statement units cannot observe
-    /// their own rename, and a rename sharing its unit with an alter of the
-    /// generation fences the whole table instead.
+    /// Returns the generation name active at `unit` (the last rename target strictly before it).
     fn active(&self, unit: usize) -> &ir::Name {
         let mut active = &self.chain[0];
         for (edge, to) in self.edge_units.iter().zip(self.chain.iter().skip(1)) {
@@ -556,15 +473,15 @@ impl TableScope {
     }
 }
 
-/// Follow unambiguous table renames from `define` (defined in `define_unit`).
-/// Returns the generation chain with its edge units, or `None` when the
-/// generation is broken and every column must fence with
-/// [`BLOCK_GENERATION`]: a forked generation, a rename at or before the
-/// definition, a self-rename or cycle, a rename target colliding with any
-/// `CREATE TABLE` name (a second generation for that name), a rename into
-/// the chain from outside, a temporary-spelled rename touching the chain
-/// (never followed), any drop of a chain name (never followed across a
-/// drop), or a rename sharing its unit with an alter of the generation.
+/// Traces the unambiguous rename sequence for a table definition, returning `(chain, edge_units)`.
+///
+/// Returns `None` (requiring a whole-table fence) when the generation is broken or ambiguous:
+/// - Forked renames (multiple renames from the same table name)
+/// - Out-of-order, self, or cyclic renames
+/// - Collisions with another `CREATE TABLE` name
+/// - Outside renames targeting a chain name, or temporary table renames touching the chain
+/// - Any table drop of a name in the chain
+/// - A rename sharing a statement unit with an `ALTER TABLE` on the generation
 fn build_chain(
     assembly: &Assembly<'_>,
     define: &ir::Name,
@@ -639,23 +556,13 @@ fn build_chain(
     Some((chain, edge_units))
 }
 
-/// Fold one `ALTER TABLE` change targeting the generation into `generation`:
-/// - `ADD COLUMN other` (non-generated, classified constraints) and
-///   `DROP COLUMN other` lift for that column when no positional (implicit
-///   `VALUES`) insert binds: explicit lists bind by name, so an
-///   order/arity change elsewhere cannot move this column's items. Any
-///   implicit insert fences all (`FIRST`/`AFTER` is not in the IR, so
-///   append is unprovable and ordinals may shift).
-/// - `ADD CONSTRAINT` lifts column-wise via its classified column lists;
-///   opaque constraints fence all, as do self-referencing foreign keys
-///   with implicit parent columns.
-/// - `ALTER COLUMN` narrows: the target plus the op's referenced columns
-///   fence, except `FIRST`/`AFTER` placement fences all (ordinals may
-///   shift and the `AFTER` anchor is uncarried). `CHANGE`/`MODIFY`
-///   rewrites whose definition is opaque degrade to `Other` at emission.
-/// - Generated `ADD COLUMN` expressions and name-addressed changes
-///   (`DROP/RENAME CONSTRAINT`, `DROP INDEX`, `VALIDATE`, `Other`) fence
-///   all: names do not map to columns here.
+/// Applies an `ALTER TABLE` change to the generation's column fence set:
+/// - `ADD COLUMN`: records the column name. Generated expressions or implicit positional
+///   inserts fence all columns. Inline constraints and parent FK columns are folded.
+/// - `DROP COLUMN`: records the dropped column; fences all if implicit positional inserts exist.
+/// - `ADD CONSTRAINT`: classifies and folds constraint columns into touched fences.
+/// - `ALTER COLUMN`: fences the target and referenced columns; repositioning (`FIRST`/`AFTER`) fences all.
+/// - Opaque or name-addressed changes (`DROP CONSTRAINT`, `DROP INDEX`, etc.) fence all columns.
 fn fold_generation_change(
     chain: &[ir::Name],
     implicit: bool,
@@ -668,12 +575,9 @@ fn fold_generation_change(
             constraints,
         } => {
             generation.touched.insert(column.name.clone());
-            if column.generated {
-                // A generated expression may read any column; the IR keeps
-                // only the flag, not the expression's columns.
-                generation.all = true;
-            }
-            if implicit {
+            // Generated expressions may read arbitrary columns, and positional inserts
+            // bind by ordinal position, so any column addition shifts ordinal alignments.
+            if column.generated || implicit {
                 generation.all = true;
             }
             for constraint in constraints {
@@ -681,12 +585,10 @@ fn fold_generation_change(
             }
             for reference in &column.references {
                 if chain.contains(&reference.parent.name) {
-                    if reference.parent_columns.is_empty() {
-                        generation.all = true;
-                    } else {
-                        generation
-                            .touched
-                            .extend(reference.parent_columns.iter().cloned());
+                    match reference.parent_columns.as_slice() {
+                        // Implicit parent columns in self-referencing foreign keys fence all columns.
+                        [] => generation.all = true,
+                        cols => generation.touched.extend(cols.iter().cloned()),
                     }
                 }
             }
@@ -722,10 +624,11 @@ fn fold_generation_change(
     }
 }
 
-/// Fold a classified constraint on the generation into `generation`. Opaque
-/// constraints and self-referencing foreign keys with implicit parent
-/// columns fence all; otherwise the named child (and, for self-references,
-/// parent) columns fence.
+/// Applies a table constraint to the generation's column fence set.
+///
+/// Child columns are recorded as touched. For self-referencing foreign keys, referenced parent
+/// columns are also recorded, or all columns are fenced if parent columns are implicit (unspecified).
+/// Opaque or non-column constraints fence all columns.
 fn fold_constraint(chain: &[ir::Name], constraint: &ir::Constraint, generation: &mut FenceSet) {
     match constraint {
         ir::Constraint::PrimaryKey { columns, .. }
@@ -737,12 +640,9 @@ fn fold_constraint(chain: &[ir::Name], constraint: &ir::Constraint, generation: 
         ir::Constraint::ForeignKey(key) => {
             generation.touched.extend(key.child_columns.iter().cloned());
             if chain.contains(&key.parent.name) {
-                if key.parent_columns.is_empty() {
-                    generation.all = true;
-                } else {
-                    generation
-                        .touched
-                        .extend(key.parent_columns.iter().cloned());
+                match key.parent_columns.as_slice() {
+                    [] => generation.all = true,
+                    cols => generation.touched.extend(cols.iter().cloned()),
                 }
             }
         }
@@ -812,13 +712,11 @@ fn build_scope(assembly: &Assembly<'_>, define: &ir::Name, define_unit: usize) -
     scope
 }
 
-/// Fold sibling-spelling ambiguity (same trailing name, distinct canonical
-/// spelling, e.g. `t` vs `main.t`) into `amb`. Identical canonical
-/// spellings are the same table and never fence here. A sibling in any DDL
-/// role fences all; sibling DML uses fence only the columns they can touch
-/// under the same-table hypothesis: explicit lists touch their listed
-/// columns, while implicit or exotic shapes, stars, unknown sources, and
-/// implicit-column foreign-key parents touch all.
+/// Accounts for sibling-spelling ambiguity (e.g. `t` vs `main.t`) across table operations.
+///
+/// DDL on a sibling name fences all columns because schema resolution is ambiguous.
+/// Sibling DML operations fence only the columns they can touch under the same-table hypothesis,
+/// while wildcards (`*`), opaque sources, or unknown sources fence all columns.
 fn build_sibling_scope(assembly: &Assembly<'_>, chain: &[ir::Name], amb: &mut FenceSet) {
     let trailings: HashSet<&ir::Ident> = chain.iter().filter_map(|name| name.last()).collect();
     let siblings: HashSet<&ir::Name> = assembly
@@ -893,6 +791,7 @@ fn build_sibling_scope(assembly: &Assembly<'_>, chain: &[ir::Name], amb: &mut Fe
     }
 }
 
+/// Checks whether any column names are duplicated in the column definition list.
 fn has_duplicate_names(columns: &[ir::ColumnDef]) -> bool {
     let mut seen = HashSet::new();
     columns.iter().any(|column| !seen.insert(&column.name))
@@ -905,6 +804,7 @@ struct TablePlan<'a> {
     defines: TableDefines<'a>,
 }
 
+/// Collects and groups `DefineTable` operations across all statement units by canonical table name in script order.
 fn plan_tables<'a>(views: &'a [UnitView<'a>]) -> Vec<TablePlan<'a>> {
     let mut order: Vec<ir::Name> = Vec::new();
     let mut tables: HashMap<ir::Name, TableDefines<'a>> = HashMap::new();
@@ -1127,6 +1027,7 @@ fn insert_contribution(
     }
 }
 
+/// Constructs a `ColumnTarget` flagged with a blocking cause string that prevents reduction.
 fn blocked_target(
     table: &ir::Name,
     column: ir::Ident,
@@ -1143,6 +1044,7 @@ fn blocked_target(
     }
 }
 
+/// Evaluates a candidate column target, assembling joint sites across CREATE and INSERT or marking it blocked.
 fn column_target(
     assembly: &Assembly<'_>,
     source: &str,

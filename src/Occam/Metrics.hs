@@ -18,6 +18,7 @@ module Occam.Metrics (
     recordGeneratedSkipped,
     recordParseTiming,
     recordCandidateBuildTiming,
+    recordAcceptedBytesSaved,
     recordOracleTiming,
 ) where
 
@@ -41,6 +42,7 @@ import Data.Aeson.Key qualified as Key
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
@@ -63,6 +65,8 @@ instance FromJSON MetricPolicy where
 data FamilyTag
     = TagUnknown
     | TagStatement
+    | TagStatementSubset
+    | TagStatementComplement
     | TagSyntax !ParserEditCategory !Text
     | TagBundle !Text
     deriving (Eq, Ord, Show, Generic)
@@ -70,6 +74,8 @@ data FamilyTag
 instance ToJSON FamilyTag where
     toJSON TagUnknown = object ["kind" .= ("unknown" :: Text)]
     toJSON TagStatement = object ["kind" .= ("statement" :: Text)]
+    toJSON TagStatementSubset = object ["kind" .= ("statement-subset" :: Text)]
+    toJSON TagStatementComplement = object ["kind" .= ("statement-complement" :: Text)]
     toJSON (TagSyntax category label) =
         object
             [ "kind" .= ("syntax" :: Text)
@@ -88,6 +94,8 @@ instance FromJSON FamilyTag where
         case (kind :: Text) of
             "unknown" -> pure TagUnknown
             "statement" -> pure TagStatement
+            "statement-subset" -> pure TagStatementSubset
+            "statement-complement" -> pure TagStatementComplement
             "syntax" -> TagSyntax <$> objectValue .: "category" <*> objectValue .: "label"
             "bundle" -> TagBundle <$> objectValue .: "label"
             _ -> fail ("unknown metrics family kind: " <> T.unpack kind)
@@ -141,6 +149,7 @@ data FamilyCounters = FamilyCounters
     , failed :: !Int
     , failedInteractionWallMicros :: !Int
     , candidateBuildMicros :: !Int
+    , acceptedBytesSaved :: !(Maybe Int)
     , oracleMicros :: !(Maybe Int)
     , resetMicros :: !(Maybe Int)
     }
@@ -247,6 +256,7 @@ emptyFamilyCounters =
         , failed = 0
         , failedInteractionWallMicros = 0
         , candidateBuildMicros = 0
+        , acceptedBytesSaved = Nothing
         , oracleMicros = Nothing
         , resetMicros = Nothing
         }
@@ -327,6 +337,12 @@ recordCandidateBuildTiming :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordCandidateBuildTiming metricsStore tag micros =
     withMetricsStore metricsStore \store ->
         bumpFamily store tag \counters -> counters {candidateBuildMicros = candidateBuildMicros counters + micros}
+
+recordAcceptedBytesSaved :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
+recordAcceptedBytesSaved metricsStore tag bytes =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters {acceptedBytesSaved = Just (fromMaybe 0 (acceptedBytesSaved counters) + bytes)}
 
 -- | Record measured oracle and reset execution durations.
 recordOracleTiming :: Maybe MetricsStore -> FamilyTag -> Maybe Int -> Maybe Int -> IO ()

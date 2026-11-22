@@ -36,27 +36,31 @@ applySessionEffects :: StatementId -> [SessionEffect] -> Eval -> (Eval, Bool)
 applySessionEffects _ effects eval =
     let eval' =
             foldl'
-                ( \current effect ->
-                    let session' = applySessionEffect effect (evalSession current)
-                        schemaDeps =
-                            case effect of
-                                SetNamespace _ _ -> namespaceDeps (evalCatalog current) (effectiveNamespacePrefix session')
-                                SetSearchPath _ _ -> searchPathDeps current session'
-                                SetSessionUser _ _ -> searchPathDeps current session'
-                                ResetSessionUser _ -> searchPathDeps current session'
-                                SetCurrentUser _ _ -> searchPathDeps current session'
-                                ResetCurrentUser _ -> searchPathDeps current session'
-                                _ -> Set.empty
-                     in (addDeps schemaDeps current)
-                            { evalSession = session'
-                            , evalTouches = Set.insert SessionBarrierKey (evalTouches current)
-                            , evalSessionTouched = True
-                            }
-                )
+                applyEffect
                 eval
                 effects
      in (eval', evalSessionTouched eval')
     where
+        applyEffect current (SetSqliteForeignKeys _)
+            | evalTransactionActive current =
+                addDeps (boundaryDeps current) current
+        applyEffect current effect =
+            let session' = applySessionEffect effect (evalSession current)
+                deps = case effect of
+                    SetNamespace _ _ -> namespaceDeps (evalCatalog current) (effectiveNamespacePrefix session')
+                    SetSearchPath _ _ -> searchPathDeps current session'
+                    SetSessionUser _ _ -> searchPathDeps current session'
+                    ResetSessionUser _ -> searchPathDeps current session'
+                    SetCurrentUser _ _ -> searchPathDeps current session'
+                    ResetCurrentUser _ -> searchPathDeps current session'
+                    SetSqliteForeignKeys _ -> boundaryDeps current
+                    _ -> Set.empty
+             in (addDeps deps current)
+                    { evalSession = session'
+                    , evalTouches = Set.insert SessionBarrierKey (evalTouches current)
+                    , evalSessionTouched = True
+                    }
+        boundaryDeps = maybe Set.empty Set.singleton . evalTransactionBoundary
         searchPathDeps current session =
             Set.unions [namespaceDeps (evalCatalog current) parts | Name parts <- effectiveSearchPath session]
 
@@ -88,6 +92,7 @@ applySessionEffect effect session =
             case scope of
                 ScopeSession -> session {sessForeignKeyChecks = value}
                 _ -> session
+        SetSqliteForeignKeys value -> session {sessForeignKeyChecks = value}
         ResetForeignKeyChecks scope ->
             case scope of
                 ScopeSession ->

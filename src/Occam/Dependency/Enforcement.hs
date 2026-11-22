@@ -38,6 +38,8 @@ import Occam.Core (
     UpdateScope (..),
     WriteKind (..),
  )
+import Occam.Dependency.State (initialScanState, transactionActive)
+import Occam.Dependency.Transaction (applyTxEffects, finishStatement)
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
 -- | Temp flag plus lowercased qualified name components.
@@ -113,26 +115,32 @@ collectTable def =
 
 -- | Per-statement cascade expansion against accumulated flag and catalog.
 cascadeWrites :: SessionInit -> [StatementUnit] -> Map StatementId [DataWrite]
-cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty
+cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty (initialScanState initial)
     where
-        go _ _ [] = Map.empty
-        go enforced catalog (unit : rest) =
+        go _ _ _ [] = Map.empty
+        go enforced catalog transaction (unit : rest) =
             let sid = stmtId (unitStatement unit)
-                (ops, effects) = case unitFacts unit of
-                    Nothing -> ([], [])
-                    Just facts -> let semantics = factSemantics facts in (factOps semantics, factSession semantics)
+                (ops, effects, preTx, postTx) = case unitFacts unit of
+                    Nothing -> ([], [], [], [])
+                    Just facts ->
+                        let semantics = factSemantics facts
+                         in (factOps semantics, factSession semantics, factPreTx semantics, factPostTx semantics)
+                (before, _) = applyTxEffects sid preTx transaction
+                (after, _) = applyTxEffects sid postTx before
                 extras
                     | enforced = concatMap (expand initial catalog) ops
                     | otherwise = []
                 catalog' = foldl' (applyOp initial) catalog ops
-                enforced' = foldl' (applySession (sessionForeignKeyChecks initial)) enforced effects
-                tailMap = go enforced' catalog' rest
+                enforced' =
+                    foldl' (applySession (sessionForeignKeyChecks initial) (transactionActive before)) enforced effects
+                tailMap = go enforced' catalog' (finishStatement sid after) rest
              in if null extras then tailMap else Map.insert sid extras tailMap
 
--- | Mirrors 'Occam.Dependency.Session.applySessionEffect'.
-applySession :: Bool -> Bool -> SessionEffect -> Bool
-applySession initial current effect = case effect of
+-- | Mirror the enforcement flag rules in the graph's session scan.
+applySession :: Bool -> Bool -> Bool -> SessionEffect -> Bool
+applySession initial active current effect = case effect of
     SetForeignKeyChecks ScopeSession value -> value
+    SetSqliteForeignKeys value | not active -> value
     ResetForeignKeyChecks ScopeSession -> initial
     ResetAll ScopeSession -> initial
     _ -> current

@@ -33,11 +33,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     pub(crate) unmodeled_relation_spans: Vec<Span>,
     pub(crate) unmodeled_table_source: bool,
     pub(crate) has_function: bool,
-    /// Subtrees whose function calls never fence: PostgreSQL `PARTITION BY`
-    /// scheme expressions (which lower the scheme keyword as `Function`) and
-    /// MySQL index length prefixes (which lower `col(N)` as `Function`).
-    /// Any expression whose span falls inside a root is skipped by the
-    /// deferred-function check.
+    /// Subtrees whose function calls never fence (e.g. partition schemes, index length prefixes).
     pub(crate) ignored_function_roots: Vec<Span>,
     pub(crate) ignored_relation_spans: Vec<Span>,
     pub(crate) select_into_count: usize,
@@ -862,6 +858,10 @@ impl<'a> AnalysisVisitor<'a> {
         found
     }
 
+    /// Locates the byte boundary immediately following a clause body.
+    ///
+    /// Skips balanced parentheses and stops when encountering a boundary token
+    /// (right paren, semicolon, EOF) or any keyword in `following_clauses`.
     fn clause_end_after(
         &self,
         body_end: usize,
@@ -876,26 +876,29 @@ impl<'a> AnalysisVisitor<'a> {
             if token.start >= scope_end {
                 break;
             }
-            if matches!(token.kind, TokenKind::LeftParen) {
-                let pair = token.parentheses?;
-                if pair.end > scope_end {
-                    return None;
+            match token.kind {
+                TokenKind::LeftParen => {
+                    let pair = token.parentheses?;
+                    if pair.end > scope_end {
+                        return None;
+                    }
+                    index = self
+                        .tokens
+                        .partition_point(|candidate| candidate.end <= pair.end);
                 }
-                index = self
-                    .tokens
-                    .partition_point(|candidate| candidate.end <= pair.end);
-                continue;
+                TokenKind::RightParen | TokenKind::Semicolon | TokenKind::Eof => {
+                    return Some(preceding_space(self.source.as_bytes(), token.start));
+                }
+                _ if following_clauses
+                    .iter()
+                    .any(|keyword| token.is_keyword(*keyword)) =>
+                {
+                    return Some(preceding_space(self.source.as_bytes(), token.start));
+                }
+                _ => {
+                    index += 1;
+                }
             }
-            if matches!(
-                token.kind,
-                TokenKind::RightParen | TokenKind::Semicolon | TokenKind::Eof
-            ) || following_clauses
-                .iter()
-                .any(|keyword| token.is_keyword(*keyword))
-            {
-                return Some(preceding_space(self.source.as_bytes(), token.start));
-            }
-            index += 1;
         }
         Some(preceding_space(self.source.as_bytes(), scope_end))
     }
@@ -1438,20 +1441,8 @@ impl<'a> AnalysisVisitor<'a> {
         }
     }
 
-    /// Coarse-to-fine contiguous chunk deletions for one comma-separated list.
-    ///
-    /// Granularities double (2, 4, 8, ...) up to the list length; each level
-    /// partitions the items into contiguous groups and emits one deletion per
-    /// group of two or more. Every level has at least two groups, so a chunk
-    /// always leaves a survivor. Spans reuse the single-item first-vs-nonfirst
-    /// separator convention (a head chunk runs through the first survivor's
-    /// start, otherwise from the previous survivor's end), and only the
-    /// boundary gap holding the actual separator is comma-gated before the
-    /// full composite span is emitted. Item spans are validated once per
-    /// list; groups within a level are disjoint and balanced halving never
-    /// repeats a range across levels, so no candidate is generated twice.
-    /// Chunks precede (never replace) the single-item deletions, which keep
-    /// their exact legacy spans, gating, labels, and order.
+    /// Emits hierarchical chunk deletions for contiguous items in a comma-separated list,
+    /// ensuring at least one survivor remains.
     fn list_chunk_ranges(&mut self, label: &'static str, spans: &[(usize, usize)]) {
         if !self.chunk_edits {
             return;
@@ -1779,6 +1770,7 @@ impl<'a> AnalysisVisitor<'a> {
         }
     }
 
+    /// Proposes removing `DISTINCT`, `ALL`, or `DISTINCT ON (...)` clauses from `SELECT`.
     fn distinct_edits(&mut self, select: &Select) {
         let Some(distinct) = &select.distinct else {
             return;
@@ -1825,25 +1817,21 @@ impl<'a> AnalysisVisitor<'a> {
             Distinct::On(exprs) => {
                 if let Some((distinct_idx, distinct_tok)) =
                     self.find_keyword_between(Keyword::DISTINCT, select_end, limit)
+                    && let Some((on_idx, on_tok)) = self.next_significant(distinct_idx + 1, limit)
+                    && on_tok.is_keyword(Keyword::ON)
+                    && let Some((_, paren_tok)) = self.next_significant(on_idx + 1, limit)
+                    && matches!(paren_tok.kind, TokenKind::LeftParen)
+                    && let Some(pair) = paren_tok.parentheses
                 {
-                    let cur = distinct_idx + 1;
-                    if let Some((on_idx, on_tok)) = self.next_significant(cur, limit)
-                        && on_tok.is_keyword(Keyword::ON)
-                        && let Some((_, paren_tok)) = self.next_significant(on_idx + 1, limit)
-                        && matches!(paren_tok.kind, TokenKind::LeftParen)
-                        && let Some(pair) = paren_tok.parentheses
-                    {
-                        let after_idx = self.tokens.partition_point(|t| t.start < pair.end);
-                        if let Some((_, next_tok)) = self.next_significant(after_idx, self.unit.end)
-                        {
-                            self.add_edit_bytes(
-                                distinct_tok.start,
-                                next_tok.start,
-                                "",
-                                NativeEditCategory::Clause,
-                                "remove-distinct",
-                            );
-                        }
+                    let after_idx = self.tokens.partition_point(|t| t.start < pair.end);
+                    if let Some((_, next_tok)) = self.next_significant(after_idx, self.unit.end) {
+                        self.add_edit_bytes(
+                            distinct_tok.start,
+                            next_tok.start,
+                            "",
+                            NativeEditCategory::Clause,
+                            "remove-distinct",
+                        );
                     }
                 }
                 if exprs.len() > 1 {
@@ -2009,11 +1997,8 @@ impl<'a> AnalysisVisitor<'a> {
         self.add_edit_bytes(start, end, "", NativeEditCategory::Column, label);
     }
 
-    /// Whole-definition deletion span for one `CREATE TABLE` column, reusing
-    /// the table-body item convention: a non-first item takes its preceding
-    /// comma and whitespace, a first item takes the following comma.
-    /// Singleton bodies and unmappable boundaries yield nothing (a survivor
-    /// is required).
+    /// Returns the deletion span for a `CREATE TABLE` column definition,
+    /// including adjacent comma and whitespace while preserving at least one column.
     pub(crate) fn column_def_span(&self, column: &ColumnDef) -> Option<(usize, usize)> {
         let (inner_start, inner_end) = self.mapped_span(column.name.span)?;
         let (open, close) = self.enclosing_parentheses(inner_start, inner_end)?;
@@ -2088,11 +2073,8 @@ impl<'a> AnalysisVisitor<'a> {
         Some(spans)
     }
 
-    /// Comma-gated deletion spans for comma-separated item spans, following
-    /// the single-item list convention: the first item runs through the next
-    /// item's start, others run from the previous item's end. Each range must
-    /// contain a top-level comma; anything else (including singleton lists)
-    /// yields `None` per item so callers can skip precisely.
+    /// Computes comma-gated deletion spans for items in a comma-separated list,
+    /// associating the separator with the appropriate item boundary.
     pub(crate) fn comma_delete_spans(
         &self,
         spans: &[(usize, usize)],
@@ -2327,6 +2309,39 @@ impl<'a> AnalysisVisitor<'a> {
                 NativeEditCategory::Type,
                 "simplify-data_type",
             );
+        }
+    }
+
+    /// Emits type simplification and constraint removal candidate edits for a column definition.
+    ///
+    /// Generates candidate edits for:
+    /// - Simplifying column type declarations (e.g. integer width or precision reductions)
+    /// - Stripping the entire column options span (e.g. constraints, defaults)
+    /// - Stripping individual column options/constraints with preceding whitespace
+    fn add_column_def_edits(&mut self, column: &ColumnDef) {
+        if let Some(range) = self.column_type_span(column) {
+            self.add_type_edits(range);
+        }
+        if let Some((opt_start, opt_end)) = self.column_options_span(column) {
+            self.add_edit_bytes(
+                opt_start,
+                opt_end,
+                "",
+                NativeEditCategory::Constraint,
+                "remove-column_constraint",
+            );
+        }
+        for option in &column.options {
+            if let Some((start, end)) = self.mapped_span(option.span()) {
+                let edit_start = preceding_whitespace(self.source.as_bytes(), start);
+                self.add_edit_bytes(
+                    edit_start,
+                    end,
+                    "",
+                    NativeEditCategory::Constraint,
+                    "remove-column_constraint",
+                );
+            }
         }
     }
 }
@@ -2604,30 +2619,7 @@ impl Visitor for AnalysisVisitor<'_> {
         match statement {
             Statement::CreateTable(create) => {
                 for column in &create.columns {
-                    if let Some(range) = self.column_type_span(column) {
-                        self.add_type_edits(range);
-                    }
-                    if let Some((opt_start, opt_end)) = self.column_options_span(column) {
-                        self.add_edit_bytes(
-                            opt_start,
-                            opt_end,
-                            "",
-                            NativeEditCategory::Constraint,
-                            "remove-column_constraint",
-                        );
-                    }
-                    for option in &column.options {
-                        if let Some((start, end)) = self.mapped_span(option.span()) {
-                            let edit_start = preceding_whitespace(self.source.as_bytes(), start);
-                            self.add_edit_bytes(
-                                edit_start,
-                                end,
-                                "",
-                                NativeEditCategory::Constraint,
-                                "remove-column_constraint",
-                            );
-                        }
-                    }
+                    self.add_column_def_edits(column);
                 }
                 for tc in &create.constraints {
                     if let Some((start, end)) = self.table_constraint_span(tc) {
@@ -2644,31 +2636,7 @@ impl Visitor for AnalysisVisitor<'_> {
             Statement::AlterTable(alter) => {
                 for operation in &alter.operations {
                     if let AlterTableOperation::AddColumn { column_def, .. } = operation {
-                        if let Some(range) = self.column_type_span(column_def) {
-                            self.add_type_edits(range);
-                        }
-                        if let Some((opt_start, opt_end)) = self.column_options_span(column_def) {
-                            self.add_edit_bytes(
-                                opt_start,
-                                opt_end,
-                                "",
-                                NativeEditCategory::Constraint,
-                                "remove-column_constraint",
-                            );
-                        }
-                        for option in &column_def.options {
-                            if let Some((start, end)) = self.mapped_span(option.span()) {
-                                let edit_start =
-                                    preceding_whitespace(self.source.as_bytes(), start);
-                                self.add_edit_bytes(
-                                    edit_start,
-                                    end,
-                                    "",
-                                    NativeEditCategory::Constraint,
-                                    "remove-column_constraint",
-                                );
-                            }
-                        }
+                        self.add_column_def_edits(column_def);
                     }
                 }
             }
@@ -3103,13 +3071,19 @@ impl Visitor for AnalysisVisitor<'_> {
                 }
             }
             Expr::In {
-                expr: left,
-                target: InTarget::List(list),
-                ..
+                expr: left, target, ..
             } => {
-                self.list_edits("remove-in_list", list, |visitor, item| {
-                    visitor.expression_source_span(item)
-                });
+                // Simplify `x IN (...)` by proposing item removals for lists, or reducing the entire
+                // IN expression to the LHS operand or boolean literals (1/0).
+                let label = match target {
+                    InTarget::List(list) => {
+                        self.list_edits("remove-in_list", list, |visitor, item| {
+                            visitor.expression_source_span(item)
+                        });
+                        "simplify-in_list"
+                    }
+                    _ => "simplify-in_subquery",
+                };
                 if let Some((start, end)) = self.expression_source_span(expr) {
                     if let Some(replacement) = self.expression_source_slice(left) {
                         self.add_edit_bytes(
@@ -3117,7 +3091,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             end,
                             replacement,
                             NativeEditCategory::Expression,
-                            "simplify-in_list",
+                            label,
                         );
                     }
                     for replacement in ["1", "0"] {
@@ -3126,33 +3100,7 @@ impl Visitor for AnalysisVisitor<'_> {
                             end,
                             replacement,
                             NativeEditCategory::Expression,
-                            "simplify-in_list",
-                        );
-                    }
-                }
-            }
-            Expr::In {
-                expr: left,
-                target: InTarget::Subquery(_),
-                ..
-            } => {
-                if let Some((start, end)) = self.expression_source_span(expr) {
-                    if let Some(replacement) = self.expression_source_slice(left) {
-                        self.add_edit_bytes(
-                            start,
-                            end,
-                            replacement,
-                            NativeEditCategory::Expression,
-                            "simplify-in_subquery",
-                        );
-                    }
-                    for replacement in ["1", "0"] {
-                        self.add_edit_bytes(
-                            start,
-                            end,
-                            replacement,
-                            NativeEditCategory::Expression,
-                            "simplify-in_subquery",
+                            label,
                         );
                     }
                 }
@@ -3273,22 +3221,23 @@ impl Visitor for AnalysisVisitor<'_> {
                 visitor.expression_source_span(item)
             }),
             Expr::Function(function) => {
-                if let sqlparser::ast::FunctionArguments::List(arguments) = &function.args {
-                    if let Some(treatment) = arguments.duplicate_treatment {
-                        let (_, name_end) = self
-                            .object_name_source_span(&function.name)
-                            .unwrap_or((0, 0));
-                        let start_idx = self.tokens.partition_point(|t| t.start < name_end);
-                        if let Some((paren_idx, paren_tok)) =
-                            self.next_significant(start_idx, self.unit.end)
-                            && matches!(paren_tok.kind, TokenKind::LeftParen)
-                        {
+                match &function.args {
+                    sqlparser::ast::FunctionArguments::List(arguments) => {
+                        // Propose removing duplicate treatment keywords (DISTINCT / ALL) immediately following the open parenthesis.
+                        if let Some(treatment) = arguments.duplicate_treatment {
                             let kw = match treatment {
                                 DuplicateTreatment::Distinct => Keyword::DISTINCT,
                                 DuplicateTreatment::All => Keyword::ALL,
                             };
-                            if let Some((kw_idx, kw_tok)) =
-                                self.next_significant(paren_idx + 1, self.unit.end)
+                            let (_, name_end) = self
+                                .object_name_source_span(&function.name)
+                                .unwrap_or((0, 0));
+                            let start_idx = self.tokens.partition_point(|t| t.start < name_end);
+                            if let Some((paren_idx, paren_tok)) =
+                                self.next_significant(start_idx, self.unit.end)
+                                && matches!(paren_tok.kind, TokenKind::LeftParen)
+                                && let Some((kw_idx, kw_tok)) =
+                                    self.next_significant(paren_idx + 1, self.unit.end)
                                 && kw_tok.is_keyword(kw)
                                 && let Some((_, next_tok)) =
                                     self.next_significant(kw_idx + 1, self.unit.end)
@@ -3302,27 +3251,30 @@ impl Visitor for AnalysisVisitor<'_> {
                                 );
                             }
                         }
-                    }
-                    self.list_edits(
-                        "remove-function_argument",
-                        &arguments.args,
-                        |visitor, argument| visitor.function_arg_source_span(argument),
-                    );
-                    if let Some((start, end)) = self.expression_source_span(expr) {
-                        for arg in &arguments.args {
-                            if let Some(arg_span) = self.function_arg_source_span(arg)
-                                && let Some(replacement) = self.source.get(arg_span.0..arg_span.1)
-                            {
-                                self.add_edit_bytes(
-                                    start,
-                                    end,
-                                    replacement,
-                                    NativeEditCategory::Expression,
-                                    "simplify-function_to_argument",
-                                );
+                        self.list_edits(
+                            "remove-function_argument",
+                            &arguments.args,
+                            |visitor, argument| visitor.function_arg_source_span(argument),
+                        );
+                        if let Some((start, end)) = self.expression_source_span(expr) {
+                            for arg in &arguments.args {
+                                if let Some(arg_span) = self.function_arg_source_span(arg)
+                                    && let Some(replacement) =
+                                        self.source.get(arg_span.0..arg_span.1)
+                                {
+                                    self.add_edit_bytes(
+                                        start,
+                                        end,
+                                        replacement,
+                                        NativeEditCategory::Expression,
+                                        "simplify-function_to_argument",
+                                    );
+                                }
                             }
                         }
                     }
+                    sqlparser::ast::FunctionArguments::None
+                    | sqlparser::ast::FunctionArguments::Subquery(_) => {}
                 }
                 if let Some(WindowType::WindowSpec(spec)) = &function.over {
                     let (_, name_end) = self
@@ -3331,19 +3283,16 @@ impl Visitor for AnalysisVisitor<'_> {
                     let hint = self
                         .mapped_span(function.span())
                         .unwrap_or((0, self.unit.end));
-                    let args_end =
-                        if matches!(&function.args, sqlparser::ast::FunctionArguments::None)
-                            && matches!(
-                                &function.parameters,
-                                sqlparser::ast::FunctionArguments::None
-                            )
-                        {
-                            name_end
-                        } else {
-                            self.matching_parentheses(name_end, hint.1, name_end)
-                                .map(|pair| pair.end)
-                                .unwrap_or(name_end)
-                        };
+                    let args_end = match (&function.args, &function.parameters) {
+                        (
+                            sqlparser::ast::FunctionArguments::None,
+                            sqlparser::ast::FunctionArguments::None,
+                        ) => name_end,
+                        _ => self
+                            .matching_parentheses(name_end, hint.1, name_end)
+                            .map(|pair| pair.end)
+                            .unwrap_or(name_end),
+                    };
                     self.window_spec_edits(spec, args_end);
                 }
                 if let Some((start, end)) = self.expression_source_span(expr) {

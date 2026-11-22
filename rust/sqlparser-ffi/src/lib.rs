@@ -1,3 +1,9 @@
+//! Native SQL parsing and semantic analysis bridge for Occam.
+//!
+//! Exposes C-ABI functions to tokenize, parse, and extract relational dependencies
+//! (reads, writes, DDL operations, session effects) and syntactic reduction edits
+//! using `sqlparser-rs` across multiple SQL dialects.
+
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -14,6 +20,7 @@ mod source;
 pub use ffi::{occam_sql_count, occam_sql_free, occam_sql_parse, occam_sql_parse_error};
 pub(crate) use ir::*;
 
+/// Supported SQL dialect variants for parser configuration and keyword folding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum DialectKind {
     #[serde(rename = "generic")]
@@ -50,9 +57,12 @@ enum DialectKind {
     Teradata,
 }
 
+/// Root response payload returned to Occam callers.
 #[derive(Serialize)]
 struct NativeResponse {
+    /// Initial session state derived from server configuration and dialect defaults.
     initial_session: SessionInit,
+    /// Statement units parsed from the input script in sequence.
     units: Vec<NativeUnit>,
     /// Response-level column targets. Skipped when empty, so parses without
     /// `column_ir` keep the legacy payload bit-identical.
@@ -60,14 +70,20 @@ struct NativeResponse {
     columns: Vec<columns::ColumnTarget>,
 }
 
+/// A parsed statement unit within the SQL script, covering its source span and facts.
 #[derive(Serialize)]
 struct NativeUnit {
+    /// Zero-based byte offset where this statement unit starts in the input.
     pub(crate) start: usize,
+    /// Zero-based byte offset where this statement unit ends in the input.
     pub(crate) end: usize,
+    /// Error message if sqlparser failed to parse this unit.
     pub(crate) parse_error: Option<String>,
+    /// Semantic facts (reads, writes, DDL ops, edit candidates) extracted from the AST.
     pub(crate) facts: Option<NativeFacts>,
 }
 
+/// Category classifying a syntactic reduction edit candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum NativeEditCategory {
@@ -80,12 +96,18 @@ enum NativeEditCategory {
     Literal,
 }
 
+/// A syntactic reduction edit candidate proposing a replacement over a source byte range.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct NativeEdit {
+    /// Start byte offset in the input script.
     start: usize,
+    /// End byte offset in the input script.
     end: usize,
+    /// Replacement string to substitute for `[start, end)`.
     replacement: String,
+    /// Classification category for reduction prioritization.
     category: NativeEditCategory,
+    /// Descriptive label identifying the reduction rule (e.g. "remove-clause", "simplify-in_list").
     label: Cow<'static, str>,
 }
 

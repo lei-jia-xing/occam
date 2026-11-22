@@ -7,12 +7,14 @@ use sqlparser::ast::Statement;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
+/// Parses all statement units from `source` according to `config`, extracting semantic facts and source spans.
 pub(super) fn parse_units(source: &str, config: &ParseConfig) -> Result<Vec<NativeUnit>, String> {
     let mut units = Vec::new();
     walk_units(source, config, true, |unit| units.push(unit))?;
     Ok(units)
 }
 
+/// Counts the number of statement units in `source` for the specified dialect without full semantic analysis.
 pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, String> {
     walk_units(
         source,
@@ -40,6 +42,10 @@ struct PendingUnit {
     has_parse_error: bool,
 }
 
+/// Tokenizes and walks statement units in `source`.
+///
+/// In `detailed` mode, records exact byte offsets and executes AST analysis on each unit;
+/// in non-detailed mode, only counts statement boundaries.
 fn walk_units(
     source: &str,
     config: &ParseConfig,
@@ -54,13 +60,12 @@ fn walk_units(
     let tokenizer_error = tokenizer.tokenize_with_location_into_buf(&mut tokens).err();
     let source_map = detailed.then(|| SourceMap::new(source));
     let mut positions = token_positions(&tokens, source_map.as_ref())?;
-    let mut lexical_suffix: Option<(usize, Option<String>)> = None;
-    if let Some(error) = &tokenizer_error {
-        let prefix_len = positions
-            .iter()
-            .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
-            .map_or(0, |index| index + 1);
-        if detailed {
+    let lexical_suffix = match (&tokenizer_error, detailed) {
+        (Some(error), true) => {
+            let prefix_len = positions
+                .iter()
+                .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
+                .map_or(0, |index| index + 1);
             let start = positions
                 .iter()
                 .skip(prefix_len)
@@ -70,13 +75,21 @@ fn walk_units(
             if start >= source.len() {
                 return Err("sqlparser returned an empty tokenizer error unit".to_string());
             }
-            lexical_suffix = Some((start, Some(error.to_string())));
-        } else {
-            lexical_suffix = Some((0, None));
+            tokens.truncate(prefix_len);
+            positions.truncate(prefix_len);
+            Some((start, Some(error.to_string())))
         }
-        tokens.truncate(prefix_len);
-        positions.truncate(prefix_len);
-    }
+        (Some(_), false) => {
+            let prefix_len = positions
+                .iter()
+                .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
+                .map_or(0, |index| index + 1);
+            tokens.truncate(prefix_len);
+            positions.truncate(prefix_len);
+            Some((0, None))
+        }
+        (None, _) => None,
+    };
 
     let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     let mut count = 0;
@@ -149,26 +162,25 @@ fn walk_units(
         });
         let delimiter_pending = parser.peek_token_ref().token == Token::SemiColon;
         let at_eof = parser.peek_token_ref().token == Token::EOF;
-        let end = if detailed {
-            if at_eof && statement.is_none() && lexical_suffix.is_none() {
-                source.len()
-            } else {
-                positions
-                    .iter()
-                    .take(current_index.saturating_add(1))
-                    .rev()
-                    .find(|token| {
-                        token.start >= start
-                            && !matches!(
-                                token.kind,
-                                TokenKind::Whitespace | TokenKind::Semicolon | TokenKind::Eof
-                            )
-                    })
-                    .map(|token| token.end)
-                    .ok_or_else(|| "sqlparser returned an unmappable statement end".to_string())?
-            }
-        } else {
-            0
+        // In detailed mode, determine the unit's end byte offset:
+        // - At EOF on unparsed trailing content, span to the end of the input source.
+        // - Otherwise, find the last substantive token (excluding trailing whitespace/semicolons/EOF).
+        let end = match detailed {
+            true if at_eof && statement.is_none() && lexical_suffix.is_none() => source.len(),
+            true => positions
+                .iter()
+                .take(current_index.saturating_add(1))
+                .rev()
+                .find(|token| {
+                    token.start >= start
+                        && !matches!(
+                            token.kind,
+                            TokenKind::Whitespace | TokenKind::Semicolon | TokenKind::Eof
+                        )
+                })
+                .map(|token| token.end)
+                .ok_or_else(|| "sqlparser returned an unmappable statement end".to_string())?,
+            false => 0,
         };
         if detailed && end < start {
             return Err("sqlparser returned an invalid statement boundary".to_string());

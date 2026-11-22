@@ -24,27 +24,27 @@ impl Visitor for ColumnCollector<'_> {
                 .map(|ident| canonical_ident(ident, self.rules, ir::IdentifierClass::Column)),
             _ => None,
         };
-        if let Some(column) = column
-            && self.seen.insert(column.clone())
-        {
-            self.columns.push(column);
+        match column {
+            Some(column) if self.seen.insert(column.clone()) => {
+                self.columns.push(column);
+            }
+            _ => {}
         }
         std::ops::ControlFlow::Continue(())
     }
 }
 
+/// Extracts column identifiers referenced within an expression.
 pub(crate) fn expr_columns(expr: &Expr, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
     visit_columns(expr, rules)
 }
 
-/// Expression-position column references under any AST node: the single
-/// extractor behind [`expr_columns`], also shared by `ALTER COLUMN` op
-/// expressions and `CHANGE`/`MODIFY` new-definition options. Only
-/// `Expr::Identifier`/`CompoundIdentifier` positions are collected, so
-/// option names, charset/collation names, and tag/policy names (plain
-/// `Ident` positions that never denote same-table columns) are ignored;
-/// the few same-table references that live outside `Expr` (inline foreign
-/// keys, policy `USING` columns) are handled by the caller.
+/// Extracts column identifiers referenced in expression positions under any AST node.
+///
+/// Only `Expr::Identifier` and the terminal component of `Expr::CompoundIdentifier` are
+/// collected; non-expression positions (such as table options, charset, and collation names)
+/// are excluded. Same-table references outside `Expr` (e.g. inline foreign keys) are handled
+/// by callers.
 pub(crate) fn visit_columns(
     node: &impl sqlparser::ast::Visit,
     rules: &ir::IdentifierRules,

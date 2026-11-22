@@ -1,6 +1,7 @@
 -- | SQL test case reduction pipeline combining slicing, ddmin, and intra-statement rewrites.
 module Occam.Reducer (
     ReductionConfig (..),
+    StatementSearchPolicy (..),
     ColumnMode (..),
     columnModeName,
     reductionSearchPolicy,
@@ -46,9 +47,10 @@ import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.List (find, sortOn)
+import Data.List (find, partition, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isNothing, listToMaybe)
+import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -76,6 +78,7 @@ import Occam.Metrics (
     FamilyTag (..),
     MetricsStore,
     ParseKind (..),
+    recordAcceptedBytesSaved,
     recordCandidateBuildTiming,
     recordGeneratedSkipped,
  )
@@ -123,15 +126,47 @@ syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
 
 -- | Total policy description for the given reduction configuration.
 reductionSearchPolicy :: ReductionConfig -> T.Text
-reductionSearchPolicy config
-    | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
-    | otherwise = syntaxPolicyName (reductionColumnMode config)
+reductionSearchPolicy config = syntax <> statement
+    where
+        syntax
+            | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
+            | otherwise =
+                syntaxPolicyName (reductionColumnMode config)
+                    <> literalBatchPolicy (reductionLiteralBatches config)
+                    <> valuesChunkPolicy (reductionAdaptiveValues config)
+                    <> fullReparsePolicy (reductionFullSyntaxReparse config)
+        statement = case reductionStatementSearch config of
+            StatementSubsetFirst -> ""
+            StatementComplementFirst -> "+complement-first"
+            StatementByteWeighted -> "+complement-first-byte-weighted"
+
+literalBatchPolicy :: Bool -> T.Text
+literalBatchPolicy False = ""
+literalBatchPolicy True = "+literal-batches"
+
+valuesChunkPolicy :: Bool -> T.Text
+valuesChunkPolicy False = ""
+valuesChunkPolicy True = "+defer-fine-values-chunks"
+
+fullReparsePolicy :: Bool -> T.Text
+fullReparsePolicy False = ""
+fullReparsePolicy True = "+full-reparse"
+
+data StatementSearchPolicy
+    = StatementSubsetFirst
+    | StatementComplementFirst
+    | StatementByteWeighted
+    deriving (Eq, Show)
 
 -- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
     , reductionClosure :: !Bool
+    , reductionStatementSearch :: !StatementSearchPolicy
     , reductionIntraStatement :: !Bool
+    , reductionLiteralBatches :: !Bool
+    , reductionAdaptiveValues :: !Bool
+    , reductionFullSyntaxReparse :: !Bool
     , reductionUnrestricted :: !Bool
     , reductionDialect :: !SQLDialect
     , reductionColumnMode :: !ColumnMode
@@ -144,7 +179,11 @@ defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
         , reductionClosure = True
+        , reductionStatementSearch = StatementSubsetFirst
         , reductionIntraStatement = False
+        , reductionLiteralBatches = False
+        , reductionAdaptiveValues = False
+        , reductionFullSyntaxReparse = False
         , reductionUnrestricted = True
         , reductionDialect = defaultSQLDialect
         , reductionColumnMode = ColumnOff
@@ -344,6 +383,28 @@ partitionChunks n xs
                 (chunk, next) = splitAt chunkSize rest
              in chunk : go (remaining - 1) (total - chunkSize) next
 
+{- | Approximate equal-byte contiguous partitions. Reserve a statement for
+each remaining group even when a single unusually large statement dominates.
+-}
+partitionStatementsByBytes :: Int -> [Statement] -> [[Statement]]
+partitionStatementsByBytes groups statements =
+    go groups (length statements) (sum (map statementSpanBytes statements)) statements
+    where
+        go _ _ _ [] = []
+        go remaining _ _ rest | remaining <= 1 = [rest]
+        go remaining count bytes (first : rest) =
+            let target = (bytes + remaining - 1) `div` remaining
+                (chunk, next, consumed, weight) =
+                    consume target (count - remaining) [first] (1 :: Int) (statementSpanBytes first) rest
+             in chunk : go (remaining - 1) (count - consumed) (bytes - weight) next
+        consume target slots taken consumed weight (next : rest)
+            | slots > 0
+            , weight < target
+            , let nextWeight = statementSpanBytes next
+            , abs (target - weight - nextWeight) <= target - weight =
+                consume target (slots - 1) (next : taken) (consumed + 1) (weight + nextWeight) rest
+        consume _ _ taken consumed weight rest = (reverse taken, rest, consumed, weight)
+
 statementSpanBytes :: Statement -> Int
 statementSpanBytes statement =
     let Span start end = stmtSpan statement
@@ -361,11 +422,17 @@ statementSQL = cutRemovedStatements
 
 -- | Closure-constrained delta debugging.
 closureDdmin :: OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
-closureDdmin = closureDdminWithLogger nullLogger
+closureDdmin = closureDdminWithLogger StatementSubsetFirst nullLogger
 
 closureDdminWithLogger ::
-    Logger -> OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
-closureDdminWithLogger logger pool baseSQL initialStatements graph = do
+    StatementSearchPolicy ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    [Statement] ->
+    DependencyGraph ->
+    IO [Statement]
+closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
@@ -398,6 +465,7 @@ closureDdminWithLogger logger pool baseSQL initialStatements graph = do
                 else pure Nothing
     result <-
         searchStatements
+            policy
             buildCandidate
             pool
             baseSQL
@@ -445,15 +513,17 @@ newtype Feedback = Feedback
 newFeedback :: IO Feedback
 newFeedback = Feedback <$> newIORef HashMap.empty
 searchStatements ::
+    StatementSearchPolicy ->
     CandidateBuilder ->
     OraclePool ->
     ByteString ->
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements buildCandidate pool baseSQL allStatements initialStatements = do
+searchStatements policy buildCandidate pool baseSQL allStatements initialStatements = do
     feedback <- newFeedback
     searchDDMin
+        policy
         feedback
         buildCandidate
         pool
@@ -469,10 +539,11 @@ plainCandidate current keptInts =
 
 -- | Classified seeds: previously accepted seeds commit; fresh seeds test in order.
 data SeedToken
-    = SeedAccepted ![Statement]
+    = SeedAccepted ![Statement] !Int
     | SeedFresh ![Statement] !ByteString
 
 searchDDMin ::
+    StatementSearchPolicy ->
     Feedback ->
     CandidateBuilder ->
     OraclePool ->
@@ -480,37 +551,43 @@ searchDDMin ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
+searchDDMin policy feedback buildCandidate pool baseSQL allStatements = go 2
     where
         jobs = poolJobCount pool
         go _ [] = pure []
         go granularity current = do
             let n = min (length current) (max 1 granularity)
-                chunks = partitionChunks n current
+                chunks = case policy of
+                    StatementByteWeighted -> partitionStatementsByBytes n current
+                    _ -> partitionChunks n current
                 currentInts = statementIdsInt current
                 currentSQL = cutRemovedStatementInts baseSQL allStatements currentInts
                 currentLen = BS.length currentSQL
-            subset <- trySubsets current currentInts currentLen chunks
-            case subset of
-                Just reduced -> go 2 reduced
-                Nothing -> do
-                    complement <- tryComplements current currentInts currentLen chunks
-                    case complement of
-                        Just reduced -> go (max 2 (n - 1)) reduced
-                        Nothing
-                            | n < length current -> go (min (length current) (2 * n)) current
-                            | otherwise -> pure current
+                subset = (2, trySubsets current currentInts currentLen chunks)
+                complement = (max 2 (n - 1), tryComplements current currentInts currentLen chunks)
+                schedule = if policy == StatementSubsetFirst then [subset, complement] else [complement, subset]
+            trySchedule current n schedule
+
+        trySchedule current n []
+            | n < length current = go (min (length current) (2 * n)) current
+            | otherwise = pure current
+        trySchedule current n ((next, search) : rest) = do
+            reduced <- search
+            case reduced of
+                Just accepted -> go next accepted
+                Nothing -> trySchedule current n rest
 
         trySubsets current currentInts currentLen chunks =
-            trySeeds current currentInts currentLen (map statementIdsInt chunks)
+            trySeeds TagStatementSubset current currentInts currentLen (map statementIdsInt chunks)
         tryComplements current currentInts currentLen chunks =
             trySeeds
+                TagStatementComplement
                 current
                 currentInts
                 currentLen
                 [currentInts `IntSet.difference` statementIdsInt chunk | chunk <- chunks]
 
-        trySeeds current currentInts currentLen = pull
+        trySeeds tag current currentInts currentLen = pull
             where
                 -- Pull and test eligible candidate windows incrementally.
                 pull [] = pure Nothing
@@ -518,58 +595,76 @@ searchDDMin feedback buildCandidate pool baseSQL allStatements = go 2
                 collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
                 collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
                 collect n acc seen (seedInts : rest) = do
-                    token <- classifySeed current currentInts currentLen seedInts
+                    token <- classifySeed tag current currentInts currentLen seedInts
                     case token of
                         Nothing -> collect (n - 1) acc seen rest
-                        Just (SeedAccepted kept) -> testAndContinue (reverse acc) rest (Just kept)
+                        Just (SeedAccepted kept saved) -> testAndContinue (reverse acc) rest (Just (kept, saved))
                         Just (SeedFresh kept sql)
                             | HashSet.member sql seen -> collect (n - 1) acc seen rest
                             | otherwise -> collect (n - 1) ((kept, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
-                    accepted <- testBatch batch
+                    accepted <- testBatch tag currentLen batch
                     case accepted of
                         Just kept -> pure (Just kept)
                         Nothing -> case barrier of
-                            Just kept -> pure (Just kept)
+                            Just (kept, saved) -> do
+                                recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
+                                pure (Just kept)
                             Nothing -> pull rest
 
-        testBatch [] = pure Nothing
-        testBatch batch = do
+        testBatch _ _ [] = pure Nothing
+        testBatch tag currentLen batch = do
             mapM_ (\(kept, sql) -> reportCandidateCount pool sql (length kept)) batch
-            outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- batch]
+            outcomes <- testOrderedTagged pool [(tag, sql) | (_, sql) <- batch]
             let retired = zip batch outcomes
             mapM_ recordRetired retired
-            pure $ listToMaybe [kept | ((kept, _), (outcome, _)) <- retired, outcome == OracleAccepted]
+            case listToMaybe [candidate | (candidate, (outcome, _)) <- retired, outcome == OracleAccepted] of
+                Just (kept, sql) -> do
+                    recordAcceptedBytesSaved (poolMetricsStore pool) tag (currentLen - BS.length sql)
+                    pure (Just kept)
+                Nothing -> pure Nothing
 
         recordRetired ((_, sql), (outcome, _)) =
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
              in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
-        classifySeed current currentInts currentLen seedInts
+        classifySeed tag current currentInts currentLen seedInts
             | seedInts == currentInts = pure Nothing
             | otherwise = do
                 maybeKept <- buildCandidate current seedInts
                 case maybeKept of
                     Nothing -> pure Nothing
                     Just kept -> do
+                        let projected = statementIdsInt kept
                         candidateSQL <-
-                            timeStatementBuild
+                            timeTaggedStatementBuild
                                 (poolMetricsStore pool)
-                                (cutRemovedStatementInts baseSQL allStatements (statementIdsInt kept))
-                        if BS.length candidateSQL >= currentLen
-                            then pure Nothing
+                                tag
+                                (cutRemovedStatementInts baseSQL allStatements projected)
+                        let saved = currentLen - BS.length candidateSQL
+                        if saved <= 0
+                            then do
+                                when (projected /= seedInts) $
+                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                                pure Nothing
                             else do
                                 evaluated <- readIORef (fbEvaluated feedback)
                                 case HashMap.lookup candidateSQL evaluated of
-                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept))
+                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
                                     Just CandidateRejected -> do
                                         recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                        when (projected /= seedInts) $
+                                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
                                         pure Nothing
                                     Nothing -> pure (Just (SeedFresh kept candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
-statementDdmin dialect pool initialSQL = do
+statementDdmin = statementDdminWithOrder StatementSubsetFirst
+
+statementDdminWithOrder ::
+    StatementSearchPolicy -> SQLDialect -> OraclePool -> ByteString -> IO ByteString
+statementDdminWithOrder policy dialect pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then pure initialSQL
@@ -577,7 +672,7 @@ statementDdmin dialect pool initialSQL = do
             (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
             let allStatements = map unitStatement units
             reduced <-
-                searchStatements plainCandidate pool initialSQL allStatements allStatements
+                searchStatements policy plainCandidate pool initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
 -- | Repeated single-statement deletion until reaching a 1-minimal fixed point.
@@ -872,14 +967,15 @@ sliceWithAnalysis logger pool analysis observedResult sql =
             pure candidate
 
 closureSearchWithAnalysis ::
-    Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
-closureSearchWithAnalysis logger pool sql analysis =
+    StatementSearchPolicy -> Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
+closureSearchWithAnalysis policy logger pool sql analysis =
     let statements = analyzedStatements analysis
      in if null statements
             then pure sql
             else do
                 retained <-
                     closureDdminWithLogger
+                        policy
                         logger
                         pool
                         sql
@@ -984,10 +1080,11 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                     case searchAnalysis of
                         Just cached | searchInput == sliced -> pure cached
                         _ -> analyze searchInput
-                out <- closureSearchWithAnalysis logger pool searchInput analysis
+                out <- closureSearchWithAnalysis (reductionStatementSearch config) logger pool searchInput analysis
                 pure (out, ())
             else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
-                out <- statementDdmin (reductionDialect config) pool searchInput
+                out <-
+                    statementDdminWithOrder (reductionStatementSearch config) (reductionDialect config) pool searchInput
                 pure (out, ())
     fallback <-
         if reductionClosure config
@@ -1001,7 +1098,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
 
         unrestrictedSearch sql =
             fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do
-                out <- statementDdmin (reductionDialect config) pool sql
+                out <- statementDdminWithOrder (reductionStatementSearch config) (reductionDialect config) pool sql
                 pure (out, ())
 
         interleaveStages base
@@ -1029,6 +1126,9 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                                     pool
                                     (const True)
                                     (reductionColumnMode config)
+                                    (reductionLiteralBatches config)
+                                    (reductionAdaptiveValues config)
+                                    (reductionFullSyntaxReparse config)
                                     base
                             pure (r, ())
                     pure (out, Just (ReductionEvidence out False))
@@ -1048,6 +1148,9 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                             pool
                             (const True)
                             (reductionColumnMode config)
+                            (reductionLiteralBatches config)
+                            (reductionAdaptiveValues config)
+                            (reductionFullSyntaxReparse config)
                             afterAudit
                     pure (out, ())
             if BS.length afterSyntax < BS.length current
@@ -1088,6 +1191,9 @@ data SyntaxContext = SyntaxContext
     , syntaxPool :: !OraclePool
     , syntaxShouldRun :: ParserEdit -> Bool
     , syntaxMode :: !ColumnMode
+    , syntaxLiteralBatches :: !Bool
+    , syntaxAdaptiveValues :: !Bool
+    , syntaxFullReparse :: !Bool
     , syntaxOptions :: !ParseOptions
     }
 
@@ -1210,9 +1316,12 @@ reduceSyntaxWithDialect ::
     OraclePool ->
     (ParserEdit -> Bool) ->
     ColumnMode ->
+    Bool ->
+    Bool ->
+    Bool ->
     ByteString ->
     IO ByteString
-reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
+reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches adaptiveValues fullReparse initialSQL = do
     let context =
             SyntaxContext
                 { syntaxLogger = logger
@@ -1220,13 +1329,24 @@ reduceSyntaxWithDialect logger options pool shouldRun mode initialSQL = do
                 , syntaxPool = pool
                 , syntaxShouldRun = shouldRun
                 , syntaxMode = mode
+                , syntaxLiteralBatches = literalBatches
+                , syntaxAdaptiveValues = adaptiveValues
+                , syntaxFullReparse = fullReparse
                 , syntaxOptions = options
                 }
     logDebug'
         logger
         "reducer"
         "Using ordinal-forward syntax candidate schedule"
-        [ ("search_policy", toJSON (syntaxPolicyName mode))
+        [
+            ( "search_policy"
+            , toJSON
+                ( syntaxPolicyName mode
+                    <> literalBatchPolicy literalBatches
+                    <> valuesChunkPolicy adaptiveValues
+                    <> fullReparsePolicy fullReparse
+                )
+            )
         , ("category_order", toJSON (syntaxCategoryOrderName mode))
         ]
     stats <- newIORef (SyntaxStats 0 0 0)
@@ -1258,22 +1378,24 @@ sweepSyntaxCategories ::
     [ParserEditCategory] ->
     Bool ->
     IO ByteString
-sweepSyntaxCategories context stats currentSQL _ _ _ [] shrunk
-    | shrunk = do
-        (freshUnits, freshPhases, freshBundles) <- parseSyntaxSnapshot context currentSQL
-        sweepSyntaxCategories
-            context
-            stats
-            currentSQL
-            freshUnits
-            freshPhases
-            freshBundles
-            (syntaxCategoryOrder (syntaxMode context))
-            False
+sweepSyntaxCategories context stats currentSQL units phases bundles [] shrunk
+    | shrunk = restart currentSQL
+    | syntaxAdaptiveValues context = do
+        (nextSQL, _, _, _, accepted) <-
+            exhaustSyntaxStream context stats currentSQL units phases bundles EditList deferredStream
+        if accepted then restart nextSQL else pure nextSQL
     | otherwise = pure currentSQL
+    where
+        deferredStream buckets _ =
+            map SingleCandidate (valuesChunkEdits True (phaseCandidates EditList buckets))
+        restart = runSyntaxFixedPoint context stats
 sweepSyntaxCategories context stats currentSQL currentUnits phases bundles (category : rest) shrunk = do
+    (batchSQL, batchUnits, batchPhases, batchBundles) <-
+        if category == EditLiteral && syntaxLiteralBatches context
+            then exhaustLiteralBatches context stats currentSQL currentUnits phases bundles
+            else pure (currentSQL, currentUnits, phases, bundles)
     (nextSQL, nextUnits, nextPhases, nextBundles, categoryShrunk) <-
-        exhaustSyntaxCategory context stats currentSQL currentUnits phases bundles category
+        exhaustSyntaxCategory context stats batchSQL batchUnits batchPhases batchBundles category
     sweepSyntaxCategories
         context
         stats
@@ -1282,7 +1404,7 @@ sweepSyntaxCategories context stats currentSQL currentUnits phases bundles (cate
         nextPhases
         nextBundles
         rest
-        (shrunk || categoryShrunk)
+        (shrunk || categoryShrunk || BS.length batchSQL < BS.length currentSQL)
 
 -- | Shift statement spans by a byte offset.
 shiftStatementUnit :: Int -> StatementUnit -> StatementUnit
@@ -1374,6 +1496,8 @@ updateSyntaxSnapshot ::
     ParserEdit ->
     ByteString ->
     IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+updateSyntaxSnapshot context _ _ _ acceptedBytes
+    | syntaxFullReparse context = parseSyntaxSnapshot context acceptedBytes
 updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
     let editStart = parserEditStart edit
         editEnd = parserEditEnd edit
@@ -1450,6 +1574,98 @@ sortSyntaxEdits category edits = case category of
         sortOn expressionEditRank edits
     _ -> edits
 
+{- | Try literal batches before the regular single-edit sweep. A rejection of
+a batch leaves its smaller partitions and the single-edit sweep eligible.
+-}
+exhaustLiteralBatches ::
+    SyntaxContext ->
+    IORef SyntaxStats ->
+    ByteString ->
+    [StatementUnit] ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: Int) candidates
+    where
+        literals = phaseCandidates EditLiteral phases
+        candidates =
+            [ SingleCandidate (combineLiteralEdits sql first rest)
+            | unit <- units
+            , group <-
+                sortOn (Down . sum . map literalSavings) (literalGroups (stmtSpan (unitStatement unit)) literals)
+            , first : rest@(_ : _) <- batchPartitions group
+            ]
+        search _ misses _ | misses <= 0 = pure (sql, units, phases, bundles)
+        search _ _ [] = pure (sql, units, phases, bundles)
+        search ordinal misses remaining = do
+            let (eligible, deferred) = splitAt misses remaining
+            (window, nextOrdinal, rest) <- fillSyntaxWindow context sql ordinal eligible
+            (tested, elapsed, accepted) <- testSyntaxWindow context (length units) window
+            modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+            case accepted of
+                Just (_, SingleCandidate edit, bytes) -> do
+                    logInfo'
+                        (syntaxLogger context)
+                        "reducer"
+                        "Accepted literal batch"
+                        [ ("bytes_before", toJSON (BS.length sql))
+                        , ("bytes_after", toJSON (BS.length bytes))
+                        ]
+                    (nextUnits, nextPhases, nextBundles) <- updateSyntaxSnapshot context units bundles edit bytes
+                    exhaustLiteralBatches context stats bytes nextUnits nextPhases nextBundles
+                _ -> search nextOrdinal (misses - tested) (rest ++ deferred)
+
+{- | Group equal replacements while retaining order within each group. This
+keeps edits to result-bearing literals from blocking batches of noise values.
+-}
+literalGroups :: Span -> [ParserEdit] -> [[ParserEdit]]
+literalGroups (Span start end) = groupReplacements . filter eligible
+    where
+        eligible edit =
+            parserEditStart edit >= start
+                && parserEditEnd edit <= end
+                && literalSavings edit > 0
+        groupReplacements [] = []
+        groupReplacements (first : rest) =
+            let (matching, others) = partition ((== parserEditReplacement first) . parserEditReplacement) rest
+             in group (first : matching) ++ groupReplacements others
+        group [] = []
+        group (first : rest) = collect (15 :: Int) [first] rest
+        collect capacity edits (next : rest)
+            | any (overlaps next) edits = collect capacity edits rest
+            | capacity > 0 = collect (capacity - 1) (next : edits) rest
+        collect _ edits rest = reverse edits : group rest
+        overlaps a b = parserEditStart a < parserEditEnd b && parserEditStart b < parserEditEnd a
+
+literalSavings :: ParserEdit -> Int
+literalSavings edit = parserEditEnd edit - parserEditStart edit - BS.length (parserEditReplacement edit)
+
+batchPartitions :: [ParserEdit] -> [[ParserEdit]]
+batchPartitions edits@(_ : _ : _) =
+    let (left, right) = splitAt (length edits `div` 2) edits
+     in edits : (batchPartitions left ++ batchPartitions right)
+batchPartitions _ = []
+
+{- | Represent the disjoint replacements as one statement-local patch so the
+existing incremental snapshot path can refresh it after oracle acceptance.
+-}
+combineLiteralEdits :: ByteString -> ParserEdit -> [ParserEdit] -> ParserEdit
+combineLiteralEdits sql first rest =
+    first
+        { parserEditStart = start
+        , parserEditEnd = end
+        , parserEditLabel = "simplify-literal-batch"
+        , parserEditReplacement = BS.concat (reverse parts)
+        }
+    where
+        ordered = sortOn parserEditStart (first : rest)
+        start = minimum (map parserEditStart ordered)
+        (end, parts) = foldl' append (start, []) ordered
+        append (previous, acc) edit =
+            ( parserEditEnd edit
+            , parserEditReplacement edit : BS.take (parserEditStart edit - previous) (BS.drop previous sql) : acc
+            )
+
 -- | Exhaustively apply edits of one category until no further reductions succeed.
 exhaustSyntaxCategory ::
     SyntaxContext ->
@@ -1460,7 +1676,28 @@ exhaustSyntaxCategory ::
     [ColumnTarget] ->
     ParserEditCategory ->
     IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
-exhaustSyntaxCategory context stats sourceSQL sourceUnits phases bundles category =
+exhaustSyntaxCategory context stats sql units phases bundles category =
+    exhaustSyntaxStream
+        context
+        stats
+        sql
+        units
+        phases
+        bundles
+        category
+        (\buckets targets -> initialSyntaxStream context buckets targets category)
+
+exhaustSyntaxStream ::
+    SyntaxContext ->
+    IORef SyntaxStats ->
+    ByteString ->
+    [StatementUnit] ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    ParserEditCategory ->
+    ([(ParserEditCategory, [ParserEdit])] -> [ColumnTarget] -> [SyntaxCandidate]) ->
+    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
+exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category stream =
     sweep
         False
         0
@@ -1468,7 +1705,7 @@ exhaustSyntaxCategory context stats sourceSQL sourceUnits phases bundles categor
         sourceUnits
         phases
         bundles
-        (initialSyntaxStream context phases bundles category)
+        (stream phases bundles)
     where
         sweep changed _ currentSQL currentUnits currentPhases currentBundles [] =
             pure (currentSQL, currentUnits, currentPhases, currentBundles, changed)
@@ -1488,7 +1725,7 @@ exhaustSyntaxCategory context stats sourceSQL sourceUnits phases bundles categor
                                         updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes
                                 _ -> parseSyntaxSnapshot context acceptedBytes
                             let freshCandidates =
-                                    drop acceptedOrdinal (initialSyntaxStream context freshPhases freshBundles category)
+                                    drop acceptedOrdinal (stream freshPhases freshBundles)
                             sweep
                                 True
                                 acceptedOrdinal
@@ -1543,7 +1780,24 @@ initialSyntaxStream ::
 initialSyntaxStream context phases bundles category
     | category == EditColumn && syntaxMode context == ColumnAtomic =
         map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
+    | category == EditList && syntaxAdaptiveValues context =
+        map SingleCandidate (valuesChunkEdits False (phaseCandidates category phases))
     | otherwise = map SingleCandidate (phaseCandidates category phases)
+
+-- The frontend emits each VALUES list's chunks coarse-to-fine, then singles.
+-- Leave its coarse pair in the regular sweep and revisit the finer candidates
+-- only when an entire cycle finds no reductions.
+valuesChunkEdits :: Bool -> [ParserEdit] -> [ParserEdit]
+valuesChunkEdits _ [] = []
+valuesChunkEdits deferred edits@(edit : rest)
+    | isChunk edit =
+        let (chunks, remaining) = span isChunk edits
+            (coarse, fine) = splitAt 2 chunks
+         in (if deferred then fine else coarse) ++ valuesChunkEdits deferred remaining
+    | deferred = valuesChunkEdits deferred rest
+    | otherwise = edit : valuesChunkEdits deferred rest
+    where
+        isChunk candidate = parserEditLabel candidate == "remove-values_row-chunk"
 
 phaseCandidates :: ParserEditCategory -> [(ParserEditCategory, [ParserEdit])] -> [ParserEdit]
 phaseCandidates category = fromMaybe [] . lookup category
@@ -1692,13 +1946,16 @@ applySpans spans source = case spans of
 
 -- | Record statement assembly time if metrics are enabled.
 timeStatementBuild :: Maybe MetricsStore -> ByteString -> IO ByteString
-timeStatementBuild Nothing bytes = pure bytes
-timeStatementBuild (Just store) bytes = do
+timeStatementBuild store = timeTaggedStatementBuild store TagStatement
+
+timeTaggedStatementBuild :: Maybe MetricsStore -> FamilyTag -> ByteString -> IO ByteString
+timeTaggedStatementBuild Nothing _ bytes = pure bytes
+timeTaggedStatementBuild (Just store) tag bytes = do
     started <- getMonotonicTimeNSec
     BS.length bytes `seq` pure ()
     finished <- getMonotonicTimeNSec
     recordCandidateBuildTiming
         (Just store)
-        TagStatement
+        tag
         (fromIntegral ((finished - started) `div` 1000))
     pure bytes

@@ -45,6 +45,54 @@ Tiers 2 and 3 evaluate candidate SQL directly against an in-memory SQLite instan
 last result set’s column names and typed rows and requires trailing statements to
 execute successfully.
 
+### Search policy comparisons
+
+```bash
+cabal build bench:occam-bench --offline
+bin=$(cabal list-bin bench:occam-bench --offline)
+"$bin" --search-baseline 8 unlimited /tmp/search-unlimited.json +RTS -N1 -RTS
+"$bin" --search-baseline 8 64 /tmp/search-calls-64.json +RTS -N1 -RTS
+"$bin" --search-baseline 8 wall:20 /tmp/search-wall-20.json +RTS -N1 -RTS
+```
+
+For `--search-baseline`, the control enables statement reduction and the
+treatment adds intra-statement rewrites. Use `--literal-batch-baseline` with
+the same arguments to compare single edits against batching with
+intra-statement rewrites enabled in both arms. Both use the shared evaluation entry point, a fresh result oracle
+and one worker. The cohort includes removable and required VALUES rows,
+independent and interacting literals, and both precise and globally fenced
+graphs. The JSON records AB/BA order, warmups, phase metrics, physical calls
+including preflight and validation, and the improving checkpoint curve.
+
+Use `--values-schedule-baseline` to compare the coarse-to-fine VALUES
+schedule with deferred fine chunks. Use `--combined-syntax-baseline`
+to compare both experimental policies together with the current schedule.
+That mode adds scale-064, deep expressions, and views/aggregates with
+explicit reference results.
+
+Use `--statement-yield-baseline` for graph-free ddmin versus the current
+statement reducer on 8- and 32-row scripts with interleaved noise statements.
+The report includes subset and complement oracle costs, selected byte savings,
+and closure projections rejected for duplicate bytes or lack of shrinkage.
+Use `--statement-order-baseline` to isolate complement-first ordering while
+retaining both search lanes and the normal audit.
+Use `--statement-weight-baseline` to compare equal-count and byte-weighted
+partitions with complement-first ordering in both arms. This comparison
+includes scripts with unusually large noise statements.
+
+Use `--reparse-baseline` to compare single-unit refresh with full script
+reparse after an accepted syntax edit, with both experimental syntax
+schedules enabled. Use `--worker-baseline` with `+RTS -N4 -RTS` and the
+same CPU affinity for both arms to compare one and four ordered workers on
+SQLite. Each worker gets a fresh in-memory database. Include speculative
+starts and cancellations when comparing physical calls.
+
+The call cap includes a reserve for two final checks. A run that hits a
+configured cap retains its status and checkpoint. Successful final checks
+and agreement with the reference result are required in every recorded arm,
+while completed runs also require a confirmed statement audit. Endpoint
+quality and timing comparisons should report capped runs separately.
+
 ### Result semantics and dependency slicing baseline
 
 Build in the pinned development environment and run the benchmark directly to

@@ -1,36 +1,26 @@
-//! Generic-only pure-builtin keyword rule: `coalesce`/`nullif` lift the
-//! routine fence on `GenericSQL` only, for unquoted unqualified plain calls.
+//! Pure built-in function recognition for `GenericSQL`.
 //!
-//! Soundness: both are SQL-standard reserved keywords, so they cannot name
-//! user routines on any conforming engine; pure means no writes, sequences,
-//! or volatility; argument reads are extracted independently, so lifting
-//! drops no read edges.
-//!
-//! Consulted in both fence positions: [`crate::edits::SequenceVisitor`] for
-//! evaluated statements and `has_function` for stored expressions (`DEFAULT`,
-//! `CHECK`, views, index expressions, trigger `WHEN`).
-//!
-//! Shadowing: any routine DDL ([`is_routine_ddl`]) or any parse error anywhere
-//! disables the rule script-wide, restoring the blanket fence.
-//!
-//! MySQL `KEY (b(1))` parses as `Expr::Function`; excluded structurally in index-key position only.
-//!
-//! Generic stays reserved-keyword-only: no per-engine builtin catalogs.
+//! Standard reserved keywords (`coalesce`, `nullif`) are recognized as pure built-ins
+//! that lift routine execution fences under strict soundness conditions:
+//! - **Soundness**: Both are SQL-standard reserved keywords and cannot name user-defined
+//!   routines in conforming engines. Being pure functions, they produce no writes or sequence
+//!   mutations, and argument expression reads are tracked independently.
+//! - **Unquoted requirement**: Only unquoted spellings lift fences. A quoted name (e.g. `"coalesce"`)
+//!   is syntactically an identifier that could reference a custom user routine on unknown engines.
+//! - **Script-wide shadowing**: Any routine DDL ([`is_routine_ddl`]) or parse error in the script
+//!   disables this optimization script-wide, conservatively restoring blanket fences.
 
 use crate::DialectKind;
 use crate::ir;
 use sqlparser::ast::{Function, ObjectNamePart, Statement};
 
-/// Pure builtins on `GenericSQL`: reserved-keyword forms only; unquoted spellings lift, quoted fence.
-const GENERIC_PURE_BUILTINS: &[&str] = &[
-    "coalesce", // Keyword first-non-NULL selection; unquoted spellings only.
-    // SQL:2023/2016/92 reserved; PG bars it as a function/type name (COALESCE row):
-    // https://www.postgresql.org/docs/current/sql-keywords-appendix.html
-    "nullif", // Keyword equality-conditional NULL; unquoted spellings only.
-             // SQL:2023/2016/92 reserved; PG bars it as a function/type name (NULLIF row):
-             // https://www.postgresql.org/docs/current/sql-keywords-appendix.html
-];
-/// Whether `statement` is routine DDL; any hit disables the rule script-wide.
+/// Pure builtins recognized on `GenericSQL`: reserved-keyword forms only.
+const GENERIC_PURE_BUILTINS: &[&str] = &["coalesce", "nullif"];
+
+/// Returns true if `statement` defines, drops, or alters a routine.
+///
+/// Any routine DDL anywhere in a script conservatively disables pure built-in optimizations
+/// across all units to prevent unsoundness under potential routine shadowing.
 pub(super) fn is_routine_ddl(statement: &Statement) -> bool {
     matches!(
         statement,
@@ -44,8 +34,7 @@ pub(super) fn is_routine_ddl(statement: &Statement) -> bool {
     )
 }
 
-/// Whether `ident` names a member of `table` via [`ir::IdentifierRules`] folding
-/// (unquoted folds per dialect; quoted matches exactly unless the dialect folds quoted too).
+/// Checks if `ident` matches any name in `table` under dialect identifier folding rules.
 fn table_matches(
     table: &[&str],
     ident: &sqlparser::ast::Ident,
@@ -61,19 +50,18 @@ fn table_matches(
     })
 }
 
-/// Whether `function` lifts the fence: Generic dialect plus unquoted unqualified
-/// plain-call keyword shape; all other names, shapes, and dialects return `false`.
+/// Checks if `function` is an unquoted, unqualified pure built-in on `GenericSQL`.
+///
+/// Returns `true` only when:
+/// 1. The call contains no window (`OVER`), `FILTER`, `WITHIN GROUP`, null treatment, or parameters.
+/// 2. The function name is an unqualified single identifier.
+/// 3. The dialect is `GenericSQL`, the identifier is unquoted, and the name matches a known pure keyword.
 pub(super) fn is_pure_builtin(
     function: &Function,
     dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> bool {
-    // Window, grouping, filter, null-treatment, and parametric machinery is
-    // never pure, even under a keyword name. ODBC escape syntax
-    // ({fn coalesce(x, y)}) names the same function and may lift. Argument
-    // shapes (DISTINCT, ORDER BY, bare subqueries) need no gating: arguments
-    // are values whose reads expression analysis extracts independently;
-    // ordering and duplicate treatment affect values, not effects.
+    // Functions with window, filter, grouping, or parametric clauses are never pure.
     if function.over.is_some()
         || function.filter.is_some()
         || !function.within_group.is_empty()
@@ -82,16 +70,11 @@ pub(super) fn is_pure_builtin(
     {
         return false;
     }
-    // Unqualified single-part names only: any qualification would need schema
-    // resolution, so it fences.
+    // Only unqualified single-part names can be pure keywords; qualified calls require schema resolution.
     let [ObjectNamePart::Identifier(ident)] = function.name.0.as_slice() else {
         return false;
     };
-    // The Generic claim rests on keyword status, and keywords are unquoted
-    // by definition: a quoted spelling is an identifier, which on an unknown
-    // engine may name a user routine. Case folds through the shared matcher
-    // (Generic compares case-insensitively, as every engine does for
-    // keywords). Every other dialect keeps the blanket fence.
+    // Generic dialect lifts unquoted keyword builtins; quoted names and other dialects retain fences.
     match dialect {
         DialectKind::Generic => {
             ident.quote_style.is_none() && table_matches(GENERIC_PURE_BUILTINS, ident, rules)

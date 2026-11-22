@@ -67,9 +67,9 @@ pub(crate) struct AnalysisContext<'a> {
     pub(crate) chunk_edits: bool,
     pub(crate) column_ir: bool,
     pub(crate) syntax_edits: bool,
-    /// Whether the Generic pure-builtin keyword rule ([`crate::pure`]) may
-    /// lift the routine fence. False whenever any routine DDL or parse error
-    /// exists anywhere in the script (coarse shadowing rule), restoring the
-    /// blanket fence for every unit.
+    /// Whether pure built-in functions ([`crate::pure`]) may lift routine fences.
+    ///
+    /// Disabled (`false`) script-wide whenever any routine DDL statement or parse error
+    /// exists in the script, guaranteeing that potential routine shadowing restores blanket fences.
     pub(crate) pure_table_enabled: bool,
 }

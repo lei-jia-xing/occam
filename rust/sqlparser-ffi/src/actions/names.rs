@@ -3,6 +3,7 @@ use crate::DialectKind;
 use crate::ir;
 use sqlparser::ast::*;
 
+/// Splits an `ObjectName` into canonical identifier parts, applying dialect folding per component.
 pub(crate) fn name_parts(
     name: &ObjectName,
     rules: &ir::IdentifierRules,
@@ -29,6 +30,7 @@ pub(crate) fn name_parts(
         .collect()
 }
 
+/// Converts an AST `ObjectName` into an IR `ir::Name`.
 pub(crate) fn name_from_object(
     name: &ObjectName,
     rules: &ir::IdentifierRules,
@@ -37,6 +39,7 @@ pub(crate) fn name_from_object(
     Some(ir::Name(name_parts(name, rules, class)?))
 }
 
+/// Strips leading temporary schema qualifiers (`pg_temp`, `temp`) and returns whether the object is temporary.
 pub(crate) fn strip_temp_schema(parts: &mut Vec<ir::Ident>, dialect: DialectKind) -> bool {
     if parts.len() < 2 {
         return false;
@@ -51,12 +54,11 @@ pub(crate) fn strip_temp_schema(parts: &mut Vec<ir::Ident>, dialect: DialectKind
     };
     if is_temp {
         parts.remove(0);
-        true
-    } else {
-        false
     }
+    is_temp
 }
 
+/// Converts identifier parts into an `ir::NameRef`, detecting temporary schema qualifiers.
 pub(crate) fn relation_from_parts(mut parts: Vec<ir::Ident>, dialect: DialectKind) -> ir::NameRef {
     let temp = strip_temp_schema(&mut parts, dialect);
     ir::NameRef {
@@ -65,6 +67,7 @@ pub(crate) fn relation_from_parts(mut parts: Vec<ir::Ident>, dialect: DialectKin
     }
 }
 
+/// Resolves an `ObjectName` into an `ir::NameRef` with canonical folding and temporary schema detection.
 pub(crate) fn relation_ref(
     name: &ObjectName,
     dialect: DialectKind,
@@ -76,6 +79,7 @@ pub(crate) fn relation_ref(
     ))
 }
 
+/// Resolves an object definition name and returns `(canonical_name, is_temporary)`.
 pub(crate) fn definition_name(
     name: &ObjectName,
     dialect: DialectKind,
@@ -118,41 +122,34 @@ pub(crate) fn split_identifier_list(value: &str, separator: char) -> Option<Vec<
     Some(parts)
 }
 
-/// Parse one identifier from a string literal. Unquoted identifiers may not
-/// contain whitespace or quotes; quoted identifiers preserve whitespace and
-/// use doubled quotes for an embedded quote. Zero-length quoted identifiers
-/// are rejected, matching PostgreSQL.
+/// Parses an identifier part from a literal string, returning `(unescaped_name, is_quoted)`.
+///
+/// - **Quoted identifiers**: Enclosed in `"..."`, internal whitespace is preserved, and doubled quotes
+///   (`""`) unescape to a single quote (`"`). Empty quoted strings (`""`) are rejected (`None`),
+///   matching PostgreSQL identifier rules.
+/// - **Unquoted identifiers**: Trimmed; may not contain quotes or internal whitespace.
 pub(crate) fn literal_identifier_part(part: &str) -> Option<(String, bool)> {
     let part = part.trim();
     if part.is_empty() {
         return None;
     }
-    if part.starts_with('"') {
-        if part.len() < 2 || !part.ends_with('"') {
-            return None;
-        }
+    if let Some(inner) = part.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
         let mut value = String::new();
-        let mut chars = part[1..part.len() - 1].chars();
+        let mut chars = inner.chars();
         while let Some(character) = chars.next() {
-            if character == '"' {
-                if chars.next() == Some('"') {
-                    value.push('"');
-                } else {
-                    return None;
-                }
-            } else {
-                value.push(character);
+            match character {
+                '"' => match chars.next() {
+                    Some('"') => value.push('"'),
+                    _ => return None,
+                },
+                c => value.push(c),
             }
         }
-        if value.is_empty() {
-            return None;
-        }
-        Some((value, true))
+        (!value.is_empty()).then_some((value, true))
     } else {
-        if part.contains('"') || part.chars().any(char::is_whitespace) {
-            return None;
-        }
-        Some((part.to_string(), false))
+        let valid = !part.contains('"') && !part.chars().any(char::is_whitespace);
+        valid.then(|| (part.to_string(), false))
     }
 }
 

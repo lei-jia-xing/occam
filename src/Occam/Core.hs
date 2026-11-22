@@ -492,6 +492,7 @@ data SessionEffect
       ResetCurrentUser !SessionScope
     | SetAutocommit !SessionScope !Bool
     | SetForeignKeyChecks !SessionScope !Bool
+    | SetSqliteForeignKeys !Bool
     | -- | Restore foreign key checks to the session's initial setting.
       ResetForeignKeyChecks !SessionScope
     | ResetVariable !SessionScope !Name
@@ -1130,6 +1131,7 @@ instance FromJSON SessionEffect where
                 SetForeignKeyChecks
                     <$> objectValue .: "scope"
                     <*> objectValue .: "value"
+            "set_sqlite_foreign_keys" -> SetSqliteForeignKeys <$> objectValue .: "value"
             "reset_foreign_key_checks" ->
                 ResetForeignKeyChecks <$> objectValue .: "scope"
             "reset_variable" ->

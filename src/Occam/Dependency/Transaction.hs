@@ -36,8 +36,11 @@ module Occam.Dependency.Transaction (
     stripDefinitionRestored,
 ) where
 
+import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (listToMaybe)
+import Data.Set (Set)
 import Data.Set qualified as Set
 import Occam.Core (
     BeginPolicy (..),
@@ -72,6 +75,8 @@ import Occam.Dependency.State (
     clearTransactionSession,
     lookupRelation,
     newRelation,
+    transactionActive,
+    transactionOpener,
  )
 
 createFrame :: ScanState -> Bool -> Maybe StatementId -> (TxFrame, ScanState)
@@ -129,8 +134,30 @@ settleAutocommit sid prior next
                  in state' {scanTransactions = [frame]}
             _ -> next
 
-applyTxEffects :: StatementId -> [TxEffect] -> ScanState -> ScanState
-applyTxEffects sid effects state = foldl' (applyTxEffect sid) state effects
+{- | Apply transaction controls and retain the statements that make each
+control valid when replayed as part of a backward slice.
+-}
+applyTxEffects :: StatementId -> [TxEffect] -> ScanState -> (ScanState, Set StatementId)
+applyTxEffects sid effects state = foldl' step (state, Set.empty) effects
+    where
+        step (current, deps) effect =
+            let next = applyTxEffect sid current effect
+                tracked
+                    | transactionActive current && not (transactionActive next) =
+                        next {scanLastTransactionExit = Just sid}
+                    | otherwise = next
+             in (tracked, maybe deps (`Set.insert` deps) (prerequisite current effect))
+        prerequisite current effect = do
+            frame <- listToMaybe (scanTransactions current)
+            let saved name = savepointStatement <$> find ((== name) . savepointName) (frameSavepoints frame)
+                opener = transactionOpener current
+            case effect of
+                TxCommit _ -> opener
+                TxRollbackAll -> opener
+                TxRollbackTo name -> saved name
+                TxReleaseSavepoint name -> saved name
+                TxSavepoint _ -> opener
+                _ -> Nothing
 
 applyTxEffect :: StatementId -> ScanState -> TxEffect -> ScanState
 applyTxEffect sid state effect =

@@ -22,11 +22,13 @@ impl ByteSpan {
     }
 }
 
+/// Maps 1-based `(line, column)` locations into 0-based UTF-8 byte offsets.
 pub(super) struct SourceMap {
     lines: Vec<Vec<usize>>,
 }
 
 impl SourceMap {
+    /// Builds a line/column offset index over the provided UTF-8 source string.
     pub(super) fn new(source: &str) -> Self {
         let mut lines = vec![vec![0]];
         for (index, ch) in source.char_indices() {
@@ -40,12 +42,14 @@ impl SourceMap {
         Self { lines }
     }
 
+    /// Converts a 1-based AST location into a 0-based byte offset.
     pub(super) fn offset(&self, location: Location) -> Option<usize> {
         let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
         let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
         self.lines.get(line)?.get(column).copied()
     }
 
+    /// Converts an AST `Span` into a `ByteSpan`.
     pub(super) fn span(&self, span: Span) -> Option<ByteSpan> {
         let start = self.offset(span.start)?;
         let end = self.offset(span.end)?;
@@ -53,6 +57,7 @@ impl SourceMap {
     }
 }
 
+/// Returns the sqlparser dialect instance for the given [`DialectKind`].
 pub(super) fn dialect(kind: DialectKind) -> &'static dyn Dialect {
     match kind {
         DialectKind::Generic => &GenericDialect {},
@@ -133,6 +138,7 @@ impl TokenPosition {
     }
 }
 
+/// Maps token locations into byte spans and resolves matching parenthesis pairs.
 pub(super) fn token_positions(
     tokens: &[TokenWithSpan],
     source_map: Option<&SourceMap>,

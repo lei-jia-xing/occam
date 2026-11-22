@@ -14,6 +14,7 @@ import Occam.Metrics (
     MetricPolicy (..),
     MetricsSnapshot (..),
     MetricsStore,
+    emptyFamilyCounters,
     newMetricsStore,
     snapshotMetrics,
  )
@@ -76,25 +77,7 @@ testPoolWith store jobs cacheEnabled execute retire =
             }
 
 familyCounters :: MetricsSnapshot -> FamilyTag -> FamilyCounters
-familyCounters snapshot tag = Map.findWithDefault emptyCounters tag (snapshotFamilies snapshot)
-    where
-        emptyCounters =
-            FamilyCounters
-                { physicalStarts = 0
-                , retiredAccept = 0
-                , retiredReject = 0
-                , retiredInconclusive = 0
-                , physicalCompletions = 0
-                , completedUnselected = 0
-                , completedUnselectedInteractionWallMicros = 0
-                , canceled = 0
-                , canceledInteractionWallMicros = 0
-                , failed = 0
-                , failedInteractionWallMicros = 0
-                , candidateBuildMicros = 0
-                , oracleMicros = Nothing
-                , resetMicros = Nothing
-                }
+familyCounters snapshot tag = Map.findWithDefault emptyFamilyCounters tag (snapshotFamilies snapshot)
 
 -- | Wait for an observed completion event.
 awaitCompletions :: MetricsStore -> FamilyTag -> Int -> IO ()

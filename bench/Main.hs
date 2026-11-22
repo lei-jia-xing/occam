@@ -5,7 +5,7 @@ import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.List (intercalate)
+import Data.List (intercalate, stripPrefix)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -56,7 +56,18 @@ import Occam.Reducer (
  )
 import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
-import ResultBaseline (runResultBaseline)
+import ResultBaseline (
+    runCombinedSyntaxBaseline,
+    runLiteralBatchBaseline,
+    runReparseBaseline,
+    runResultBaseline,
+    runSearchBaseline,
+    runStatementOrderBaseline,
+    runStatementWeightBaseline,
+    runStatementYieldBaseline,
+    runValuesScheduleBaseline,
+    runWorkerBaseline,
+ )
 import System.Directory (doesFileExist)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), die)
@@ -260,7 +271,49 @@ main = do
             , even pairs ->
                 runResultBaseline pairs out
         "--result-baseline" : _ -> die "Usage: occam-bench --result-baseline EVEN_PAIRS OUTPUT.json (at least 2)"
+        [mode, count, budget, out]
+            | Just run <- lookup mode searchModes
+            , Just pairs <- readMaybe count
+            , pairs >= 2
+            , even pairs
+            , Just (wallLimit, callLimit) <- parseSearchLimits budget ->
+                run pairs wallLimit callLimit out
+        mode : _
+            | mode `elem` map fst searchModes ->
+                die
+                    ("Usage: occam-bench " ++ mode ++ " EVEN_PAIRS (unlimited|CALLS >= 4|wall:SECONDS >= 20) OUTPUT.json")
         _ -> runTimingBenchmarks
+
+searchModes :: [(String, Int -> Maybe Int -> Maybe Int -> FilePath -> IO ())]
+searchModes =
+    [ ("--search-baseline", runSearchBaseline)
+    , ("--literal-batch-baseline", runLiteralBatchBaseline)
+    , ("--values-schedule-baseline", runValuesScheduleBaseline)
+    , ("--combined-syntax-baseline", runCombinedWithCorpus)
+    , ("--statement-yield-baseline", runStatementYieldBaseline)
+    , ("--statement-order-baseline", runStatementOrderBaseline)
+    , ("--statement-weight-baseline", runStatementWeightBaseline)
+    , ("--reparse-baseline", runReparseBaseline)
+    , ("--worker-baseline", runWorkerBaseline)
+    ]
+
+runCombinedWithCorpus :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runCombinedWithCorpus pairs wallLimit callLimit out = do
+    deep <- locateCorpusFile "03_deep_expressions_polymorphic.sql" >>= BS.readFile
+    views <- locateCorpusFile "06_views_and_aggregates.sql" >>= BS.readFile
+    runCombinedSyntaxBaseline (genScale 64, deep, views) pairs wallLimit callLimit out
+
+parseSearchLimits :: String -> Maybe (Maybe Int, Maybe Int)
+parseSearchLimits "unlimited" = Just (Nothing, Nothing)
+parseSearchLimits budget
+    | Just raw <- stripPrefix "wall:" budget = do
+        seconds <- readMaybe raw
+        if seconds >= 20 && seconds <= maxBound `div` 1000000
+            then Just (Just (seconds * 1000000), Nothing)
+            else Nothing
+    | otherwise = do
+        calls <- readMaybe budget
+        if calls >= 4 then Just (Nothing, Just calls) else Nothing
 
 runTimingBenchmarks :: IO ()
 runTimingBenchmarks = do

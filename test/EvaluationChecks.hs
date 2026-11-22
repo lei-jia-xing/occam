@@ -256,10 +256,10 @@ tests =
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 100000 "exit 0"
-                config = evaluationConfig True (Just 800000) Nothing
+                config = evaluationConfig True (Just 1200000) Nothing
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
-                    threadDelay 2000000
+                    threadDelay 2500000
                     pure (ReductionActionResult candidate Nothing)
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction

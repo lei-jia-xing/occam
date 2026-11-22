@@ -31,6 +31,8 @@ module Occam.Dependency.State (
     TxFrame (..),
     ScanState (..),
     initialScanState,
+    transactionActive,
+    transactionOpener,
     -- Evaluation accumulator
     Eval (..),
     initialEval,
@@ -402,6 +404,7 @@ data ScanState = ScanState
     , scanSession :: !SessionState
     , scanTransactions :: ![TxFrame]
     , scanNextFrameId :: !Int
+    , scanLastTransactionExit :: !(Maybe StatementId)
     , scanLastBarriers :: !(Map BarrierKey StatementId)
     , scanTouchers :: !(Map BarrierKey (Set StatementId))
     , scanPriorStatements :: !(Set StatementId)
@@ -416,6 +419,7 @@ initialScanState initSession =
                 , scanSession = session
                 , scanTransactions = []
                 , scanNextFrameId = 1
+                , scanLastTransactionExit = Nothing
                 , scanLastBarriers = Map.empty
                 , scanTouchers = Map.empty
                 , scanPriorStatements = Set.empty
@@ -448,6 +452,8 @@ data Eval = Eval
     , evalVisitedWrites :: !(Set (RelationKey, WriteSignature))
     , evalFrameId :: !(Maybe Int)
     , evalTransactionActive :: !Bool
+    , -- Used only for SQLite foreign-key PRAGMAs.
+      evalTransactionBoundary :: Maybe StatementId
     , evalSessionTouched :: !Bool
     }
 
@@ -462,11 +468,24 @@ initialEval _ state =
         , evalVisitedTriggers = Set.empty
         , evalVisitedWrites = Set.empty
         , evalFrameId = frameId <$> listToMaybe (scanTransactions state)
-        , evalTransactionActive =
-            any frameExplicit (scanTransactions state)
-                || not (sessAutocommit (scanSession state))
+        , evalTransactionActive = active
+        , evalTransactionBoundary = if active then transactionOpener state else scanLastTransactionExit state
         , evalSessionTouched = False
         }
+    where
+        active = transactionActive state
+
+transactionOpener :: ScanState -> Maybe StatementId
+transactionOpener state = do
+    frame <- listToMaybe (scanTransactions state)
+    case frameBegin frame of
+        Just begin -> Just begin
+        Nothing -> savepointStatement <$> listToMaybe (reverse (frameSavepoints frame))
+
+transactionActive :: ScanState -> Bool
+transactionActive state =
+    any (\frame -> frameExplicit frame || not (null (frameSavepoints frame))) (scanTransactions state)
+        || not (sessAutocommit (scanSession state))
 
 addDeps :: Set StatementId -> Eval -> Eval
 addDeps deps eval

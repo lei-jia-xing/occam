@@ -416,15 +416,11 @@ pub(crate) fn select_into_definition(
 }
 /// The target of an MSSQL `OUTPUT ... INTO` clause.
 pub(crate) enum OutputInto {
-    /// A real table: the statement additionally inserts its output rows
-    /// into it.
+    /// A real table receiving output rows.
     Table(ir::NameRef),
-    /// A table variable (`@var`): no variable catalog exists, so its uses
-    /// are coupled through a relation-scoped fence on the variable name
-    /// instead of a global barrier. Table variables are batch-scoped and
-    /// cannot alias real tables, so only `@var` touches can observe them.
+    /// A batch-scoped table variable (`@var`).
     TableVariable(ir::NameRef),
-    /// Anything else (multiple targets, computed targets): unprovable.
+    /// Unmodeled target shape.
     Unmodeled,
 }
 
@@ -506,10 +502,7 @@ pub(crate) fn read_fact(
     }
 }
 
-/// Whether a relation declared in `relation_scope` is lexically visible from
-/// `column_scope`. The factor position gates unaliased table references, so a
-/// non-LATERAL derived table cannot see sibling FROM items and a LATERAL one
-/// only sees the items before it.
+/// Whether a relation declared in `relation_scope` is lexically visible from `column_scope`.
 pub(crate) fn relation_visible(
     relation_scope: usize,
     relation_factor: usize,
@@ -618,6 +611,10 @@ pub(crate) fn relation_whole_row(
     })
 }
 
+/// Extracts unshadowed column references for `relation` in this statement unit.
+///
+/// Returns an empty list if whole-row usage is detected, as whole-row operations
+/// conservatively prevent granular column-level tracking.
 pub(crate) fn relation_columns(
     relation: &ir::NameRef,
     usage: &crate::edits::RelationUse,
@@ -818,6 +815,11 @@ fn resolve_col_parts(
     matched
 }
 
+/// Extracts output column lineage from a `CREATE VIEW ... AS SELECT` query.
+///
+/// Maps each view column back to the underlying physical table column when the view
+/// definition is a simple single-level projection without subqueries, CTEs, or wildcards.
+/// Returns `(lineage, source_columns)`.
 pub(crate) fn extract_view_lineage(
     query: &Query,
     explicit_columns: Option<&[ir::Ident]>,
@@ -1030,15 +1032,16 @@ pub(crate) fn extract_view_lineage(
     }
 
     if cond_ok && let Some(order_by) = &query.order_by {
-        if let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind {
-            for item in expressions {
-                if !collect_expr_col_parts(&item.expr, &mut cond_parts) {
-                    cond_ok = false;
-                    break;
+        match &order_by.kind {
+            sqlparser::ast::OrderByKind::Expressions(expressions) => {
+                for item in expressions {
+                    if !collect_expr_col_parts(&item.expr, &mut cond_parts) {
+                        cond_ok = false;
+                        break;
+                    }
                 }
             }
-        } else {
-            cond_ok = false;
+            _ => cond_ok = false,
         }
     }
 
@@ -1265,13 +1268,7 @@ pub(crate) fn index_constraint_columns(constraint: &TableConstraint) -> &[IndexC
     }
 }
 
-/// Whether `expr` is a MySQL index length prefix (`col(N)`), which sqlparser
-/// lowers as `Expr::Function`. The match is structural — position plus the
-/// exact prefix shape (single-part name, one unsigned-numeric literal, no
-/// window/filter/grouping/parametric machinery) — never a name-table lookup:
-/// functional key parts require double parens and lower as `Nested`, so a
-/// bare `name(N)` in key position is the length-prefix production, a
-/// positional marker rather than a call.
+/// Whether `expr` represents a MySQL index length prefix (`col(N)`).
 pub(crate) fn is_index_length_prefix(expr: &Expr) -> bool {
     index_length_prefix_ident(expr).is_some()
 }
@@ -1691,11 +1688,7 @@ pub(crate) fn insert_columns(insert: &Insert, rules: &ir::IdentifierRules) -> Ve
     columns
 }
 
-/// Column references in an `ON CONFLICT` clause that read the stored target
-/// row. `EXCLUDED`-qualified references name the proposed row, not stored
-/// data, so they contribute no read; anything else (bare or
-/// target-qualified) is a target-row read, mirroring plain `UPDATE` where
-/// the target stays a readable relation.
+/// Collects column references in an `ON CONFLICT` clause that read stored target rows.
 pub(crate) struct ConflictReadCollector<'a> {
     rules: &'a ir::IdentifierRules,
     /// Each referenced column, kept only if seen outside an `EXCLUDED`
@@ -1747,11 +1740,7 @@ pub(crate) fn conflict_expr_columns(expr: &Expr, rules: &ir::IdentifierRules) ->
         .collect()
 }
 
-/// Target-row reads implied by an `ON CONFLICT` clause: the arbiter probe
-/// reads the conflict-target columns (plus the partial-index predicate, if
-/// any), and `DO UPDATE` re-reads the row through its `SET` values and
-/// `WHERE` filter. Plain `INSERT` excludes its target from visitor reads, so
-/// without this the upsert under-models exactly what the engine authorizes.
+/// Target-row reads implied by an `ON CONFLICT` clause.
 pub(crate) fn conflict_read_columns(
     conflict: &OnConflict,
     rules: &ir::IdentifierRules,
@@ -1803,13 +1792,7 @@ pub(crate) fn merge_conflict_reads(
 ) {
     merge_target_reads(reads, target, conflict_read_columns(conflict, rules));
 }
-/// Whether `function` is the MySQL proposed-row marker `VALUES(col)` in an
-/// `ON DUPLICATE KEY UPDATE` assignment. Positional, never a name-table
-/// lookup: unqualified single-part unquoted `VALUES` (case-insensitive, like
-/// `EXCLUDED`) in the plain call shape. Quoted spellings may name a user
-/// routine and never match; exotic shapes (`OVER`/`FILTER`/...) are invalid
-/// and stay fenced. Shadowing (`CREATE FUNCTION values`) is handled by the
-/// caller via `pure_table_enabled` (no exclusion when shadowed).
+/// Whether `function` is the MySQL proposed-row marker `VALUES(col)` in duplicate-key updates.
 pub(crate) fn is_values_marker(function: &Function) -> bool {
     if function.over.is_some()
         || function.filter.is_some()
@@ -1824,10 +1807,8 @@ pub(crate) fn is_values_marker(function: &Function) -> bool {
     };
     ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("values")
 }
-/// Spans of `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` assignments,
-/// excluded from the routine fence (they name no routine). Collected only on
-/// MySQL when the pure table is enabled (unshadowed); elsewhere `VALUES`
-/// keeps fencing as an unmodeled call.
+
+/// Spans of `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE` assignments.
 pub(crate) struct ValuesMarkerCollector {
     spans: Vec<Span>,
 }
@@ -1853,16 +1834,11 @@ pub(crate) fn values_marker_spans(assignments: &[Assignment]) -> Vec<Span> {
     collector.spans
 }
 
-/// Column references in an `ON DUPLICATE KEY UPDATE` assignment value that
-/// read the stored target row. `VALUES(col)` args and row-alias-qualified
-/// references (`new.col`) name the proposed row, not stored data, so they
-/// contribute no read; anything else (bare or target-qualified) is a
-/// target-row read, mirroring `ON CONFLICT` (where `EXCLUDED` plays the
-/// proposed-row role) and plain `UPDATE` (where the target stays readable).
-/// Subquery columns over other tables are over-approximated onto the target
-/// (safe: visitor reads still attribute them correctly); row-alias matches
-/// are broad (case-insensitive, quoting ignored) since a miss only shrinks
-/// the over-approximation while the visitor covers other-table reads.
+/// Collects column references in `ON DUPLICATE KEY UPDATE` assignments that read stored target rows.
+///
+/// In MySQL upserts, references inside `VALUES(col)` or qualified by a row alias (`new.col`)
+/// denote the proposed inserted row, not stored table data. Bare or target-qualified column
+/// references denote existing stored rows and therefore constitute target-row reads.
 pub(crate) struct DuplicateReadCollector<'a> {
     rules: &'a ir::IdentifierRules,
     row_alias: Option<&'a str>,
@@ -1937,9 +1913,9 @@ pub(crate) fn duplicate_expr_columns(
         .collect()
 }
 
-/// Row alias naming the proposed row in `INSERT ... AS alias
-/// ON DUPLICATE KEY UPDATE` (MySQL 8.0.19+). Only single-part aliases
-/// resolve; anything else stays `None` (no exclusion, safe over-approx).
+/// Row alias naming the proposed row in `INSERT ... AS alias ON DUPLICATE KEY UPDATE` (MySQL 8.0.19+).
+///
+/// Only single-part aliases resolve; compound aliases return `None` (safe over-approximation).
 pub(crate) fn duplicate_row_alias(insert: &Insert) -> Option<&str> {
     let aliases = insert.insert_alias.as_ref()?;
     let [ObjectNamePart::Identifier(ident)] = aliases.row_alias.0.as_slice() else {
@@ -1948,19 +1924,11 @@ pub(crate) fn duplicate_row_alias(insert: &Insert) -> Option<&str> {
     Some(ident.value.as_str())
 }
 
-/// Target-row reads implied by `ON DUPLICATE KEY UPDATE`: the duplicate-key
-/// probe reads the provided key columns (explicit `INSERT` column list, or
-/// `SET` targets for the `INSERT ... SET` form), and the update re-reads
-/// the row through its `SET` values (excluding `VALUES()`/row-alias
-/// proposed-row refs). No explicit list (e.g. `INSERT ... VALUES` without
-/// columns, `INSERT ... SELECT` without a list) leaves the probe vacuous,
-/// mirroring `ON CONFLICT` without an arbiter: without a catalog the
-/// conflicting unique key(s) are unnameable, and the precedent stays
-/// vacuous rather than wildcarding. Residual: provided-list probes may miss
-/// default-valued keys (e.g. auto-increment PK omitted from the list);
-/// composite keys spanning provided plus default columns are likewise
-/// partial. Plain `INSERT` excludes its target from visitor reads, so
-/// without this the upsert under-models the stored-row re-read.
+/// Target-row reads implied by `ON DUPLICATE KEY UPDATE`.
+///
+/// Combines:
+/// 1. Candidate key probe reads from the provided column list (`insert.columns` or `SET` assignments).
+/// 2. Target columns re-read by the update assignment expressions (excluding proposed-row references).
 pub(crate) fn duplicate_read_columns(
     insert: &Insert,
     rules: &ir::IdentifierRules,
@@ -2243,6 +2211,7 @@ pub(crate) fn assignment_targets(
     targets
 }
 
+/// Resolves a `TableFactor` AST node into a `TableSource` with its qualified parts, optional alias, and ONLY flag.
 pub(crate) fn table_factor_source(
     factor: &TableFactor,
     rules: &ir::IdentifierRules,
@@ -2263,6 +2232,7 @@ pub(crate) fn table_factor_source(
     })
 }
 
+/// Collects all table sources from a `TableWithJoins` clause, traversing the base relation and join items.
 pub(crate) fn table_with_joins_sources(
     table: &TableWithJoins,
     rules: &ir::IdentifierRules,
@@ -2279,6 +2249,7 @@ pub(crate) fn table_with_joins_sources(
     sources
 }
 
+/// Collects all referenced table sources across `FROM` items.
 pub(crate) fn from_sources(from: &FromTable, rules: &ir::IdentifierRules) -> Vec<TableSource> {
     let tables = match from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
@@ -2334,11 +2305,13 @@ pub(crate) fn find_source<'a>(
     })
 }
 
-/// Tables assigned by an `UPDATE`. MySQL multi-table updates can write through
-/// joins, so the primary table alone is not enough. Tables that are only read
-/// through the join remain read sources and are not returned here. MSSQL's
-/// `UPDATE alias SET ... FROM table AS alias` form resolves the alias to the
-/// table in `FROM`; the alias itself is not a physical write target.
+/// Target tables and assigned columns for an `UPDATE` statement.
+///
+/// Handles dialect-specific write target forms:
+/// - **MSSQL alias resolution**: In `UPDATE alias SET ... FROM table AS alias`, the target
+///   alias is resolved to the physical table in `FROM` rather than a separate table name.
+/// - **MySQL multi-table updates**: In `UPDATE t1 JOIN t2 ... SET ...`, writes can target both
+///   the primary relation and joined tables.
 pub(crate) fn update_targets(update: &Update, rules: &ir::IdentifierRules) -> Vec<UpdateTarget> {
     let from: Vec<TableSource> = update
         .from
@@ -2355,6 +2328,7 @@ pub(crate) fn update_targets(update: &Update, rules: &ir::IdentifierRules) -> Ve
     let primary = table_factor_source(&update.table.relation, rules);
     let mut targets: Vec<UpdateTarget> = Vec::new();
     let mut resolved_alias = false;
+    // Resolve MSSQL-style `UPDATE alias ... FROM table AS alias` to the physical FROM source.
     if let Some(primary) = &primary
         && primary.alias.is_none()
         && primary.table_parts.len() == 1
@@ -2377,6 +2351,7 @@ pub(crate) fn update_targets(update: &Update, rules: &ir::IdentifierRules) -> Ve
                 designator_span: None,
             });
         }
+        // MySQL multi-table updates: joined tables can also be assigned in SET.
         for join in &update.table.joins {
             if let Some(source) = table_factor_source(&join.relation, rules) {
                 targets.push(UpdateTarget {
@@ -2412,6 +2387,7 @@ pub(crate) fn update_targets(update: &Update, rules: &ir::IdentifierRules) -> Ve
     targets
 }
 
+/// Resolves target tables modified by a `DELETE` statement, supporting multi-table deletes.
 pub(crate) fn delete_targets(delete: &Delete, rules: &ir::IdentifierRules) -> Vec<DeleteTarget> {
     let from = from_sources(&delete.from, rules);
     if delete.tables.is_empty() {
@@ -2439,13 +2415,14 @@ pub(crate) fn delete_targets(delete: &Delete, rules: &ir::IdentifierRules) -> Ve
         .collect()
 }
 
+/// Collects distinct column identifiers updated or inserted across all `WHEN MATCHED` / `WHEN NOT MATCHED` clauses of a `MERGE`.
 pub(crate) fn merge_columns(merge: &Merge, rules: &ir::IdentifierRules) -> Vec<ir::Ident> {
     let mut columns = Vec::new();
     let mut seen = HashSet::new();
     for clause in &merge.clauses {
         match &clause.action {
-            MergeAction::Update(update) => {
-                if let MergeUpdateKind::Set(assignments) = &update.kind {
+            MergeAction::Update(update) => match &update.kind {
+                MergeUpdateKind::Set(assignments) => {
                     for assignment in assignments {
                         for column in assignment_columns(&assignment.target, rules) {
                             if seen.insert(column.clone()) {
@@ -2454,7 +2431,8 @@ pub(crate) fn merge_columns(merge: &Merge, rules: &ir::IdentifierRules) -> Vec<i
                         }
                     }
                 }
-            }
+                MergeUpdateKind::Wildcard => {}
+            },
             MergeAction::Insert(insert) => {
                 for column in &insert.columns {
                     if let Some(column) =
@@ -2479,6 +2457,7 @@ pub(crate) struct NestedDml {
     dml_depth: usize,
 }
 
+/// Returns true if `statement` is a data manipulation statement (`INSERT`, `UPDATE`, `DELETE`, or `MERGE`).
 pub(crate) fn is_dml_statement(statement: &Statement) -> bool {
     matches!(
         statement,
@@ -2517,12 +2496,14 @@ impl Visitor for NestedDml {
     }
 }
 
+/// Collects outermost DML statements nested inside a `Query` (e.g. data-modifying CTEs).
 pub(crate) fn collect_dml_in_query(query: &Query) -> Vec<Statement> {
     let mut collector = NestedDml::default();
     let _ = query.visit(&mut collector);
     collector.statements
 }
 
+/// Collects outermost DML statements nested inside a `Statement`, skipping the statement root itself.
 pub(crate) fn collect_dml_in_statement(statement: &Statement) -> Vec<Statement> {
     let mut collector = NestedDml {
         skip_root: true,
@@ -2532,6 +2513,7 @@ pub(crate) fn collect_dml_in_statement(statement: &Statement) -> Vec<Statement> 
     collector.statements
 }
 
+/// Analyzes nested statements and merges their operations and transaction/session effects into `facts`.
 pub(crate) fn merge_nested(
     facts: &mut ir::NativeFacts,
     statements: Vec<Statement>,
@@ -2586,6 +2568,7 @@ pub(crate) fn trigger_for_each_row(trigger: &CreateTrigger, dialect: DialectKind
     }
 }
 
+/// Converts analyzed statement facts into trigger effects, emitting barriers on any embedded DDL or transactions.
 pub(crate) fn trigger_effects_from_facts(
     facts: ir::NativeFacts,
     effects: &mut Vec<ir::TriggerEffect>,
@@ -2753,6 +2736,7 @@ pub(crate) fn trigger_body(
     ir::TriggerBody::Opaque
 }
 
+/// Maps an AST context modifier (`LOCAL`, `GLOBAL`, `SESSION`) to an IR session scope.
 pub(crate) fn context_scope(scope: Option<ContextModifier>) -> ir::SessionScope {
     match scope {
         Some(ContextModifier::Local) => ir::SessionScope::Local,
@@ -2761,6 +2745,7 @@ pub(crate) fn context_scope(scope: Option<ContextModifier>) -> ir::SessionScope 
     }
 }
 
+/// Parses a boolean setting from a PRAGMA assignment literal (e.g. `1`/`0`, `ON`/`OFF`, `TRUE`/`FALSE`).
 pub(crate) fn pragma_bool(value: &ValueWithSpan) -> Option<bool> {
     match &value.value {
         Value::Boolean(value) => Some(*value),
@@ -2796,6 +2781,7 @@ pub(crate) fn pragma_session_value(value: &ValueWithSpan) -> Option<ir::SessionV
     }
 }
 
+/// Parses a boolean literal or keyword identifier (`ON`/`OFF`, `TRUE`/`FALSE`, `1`/`0`) from an expression.
 pub(crate) fn expr_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -2820,6 +2806,7 @@ pub(crate) fn expr_bool(expr: &Expr) -> Option<bool> {
     }
 }
 
+/// Evaluates a session variable assignment expression into an `ir::SessionValue`.
 pub(crate) fn expr_value(expr: &Expr) -> ir::SessionValue {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -2971,17 +2958,12 @@ pub(crate) fn search_path_value(
     Some(ir::SearchPathValue::Explicit { entries })
 }
 
-/// Resolve the scope of a system-variable assignment (`foreign_keys`,
-/// `autocommit`, `search_path`).
+/// Resolves the session or global scope of a system-variable assignment.
 ///
-/// Only spellings that provably select the session's system variable map to
-/// an effect: a bare name (the statement keyword, if any, selects the
-/// scope), `@@name`/`@@session.name` for the session scope, and
-/// `@@global.name` for the global scope (which provably leaves the current
-/// session untouched, so the evaluator ignores it). Anything else stays
-/// fenced: `@name` is a user variable rather than the system variable,
-/// other qualifiers name custom variables, and a qualifier contradicting
-/// an explicit `GLOBAL`/`SESSION`/`LOCAL` keyword cannot be resolved.
+/// Distinguishes system variables from user variables:
+/// - Bare names and `@@name` map to session scope (or respect statement modifier keywords).
+/// - `@@global.name` maps to global scope.
+/// - `@name` denotes a user-defined session variable (not a system variable) and returns `None`.
 pub(crate) fn system_var_scope(
     name: &ir::Name,
     keyword: Option<ContextModifier>,
@@ -3296,34 +3278,32 @@ pub(crate) fn set_statement_effects(
                 ));
             }
             for mode in modes {
-                match mode {
-                    TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
-                        if *session {
-                            effects.push(ir::SessionEffect::SetVariable {
-                                scope: ir::SessionScope::Session,
-                                name: ir::Name(vec![ir::Ident(
-                                    "default_transaction_read_only".to_string(),
-                                )]),
-                                value: ir::SessionValue::Bool { value: true },
-                            });
-                        } else {
-                            transactions.push(ir::TxEffect::SetReadOnly { value: true });
-                        }
+                match (mode, *session) {
+                    (TransactionMode::AccessMode(TransactionAccessMode::ReadOnly), true) => {
+                        effects.push(ir::SessionEffect::SetVariable {
+                            scope: ir::SessionScope::Session,
+                            name: ir::Name(vec![ir::Ident(
+                                "default_transaction_read_only".to_string(),
+                            )]),
+                            value: ir::SessionValue::Bool { value: true },
+                        });
                     }
-                    TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {
-                        if *session {
-                            effects.push(ir::SessionEffect::SetVariable {
-                                scope: ir::SessionScope::Session,
-                                name: ir::Name(vec![ir::Ident(
-                                    "default_transaction_read_only".to_string(),
-                                )]),
-                                value: ir::SessionValue::Bool { value: false },
-                            });
-                        } else {
-                            transactions.push(ir::TxEffect::SetReadOnly { value: false });
-                        }
+                    (TransactionMode::AccessMode(TransactionAccessMode::ReadOnly), false) => {
+                        transactions.push(ir::TxEffect::SetReadOnly { value: true });
                     }
-                    TransactionMode::IsolationLevel(level) => barriers.push(global_barrier(
+                    (TransactionMode::AccessMode(TransactionAccessMode::ReadWrite), true) => {
+                        effects.push(ir::SessionEffect::SetVariable {
+                            scope: ir::SessionScope::Session,
+                            name: ir::Name(vec![ir::Ident(
+                                "default_transaction_read_only".to_string(),
+                            )]),
+                            value: ir::SessionValue::Bool { value: false },
+                        });
+                    }
+                    (TransactionMode::AccessMode(TransactionAccessMode::ReadWrite), false) => {
+                        transactions.push(ir::TxEffect::SetReadOnly { value: false });
+                    }
+                    (TransactionMode::IsolationLevel(level), _) => barriers.push(global_barrier(
                         ir::BarrierReason::UnsupportedTransaction,
                         Some(format!("ISOLATION LEVEL {level}")),
                     )),
@@ -3488,6 +3468,7 @@ pub(crate) fn use_effect(
     }
 }
 
+/// Determines dialect-specific behavior when a `BEGIN` statement is encountered while a transaction is already active.
 pub(crate) fn begin_policy(dialect: DialectKind) -> ir::BeginPolicy {
     match dialect {
         DialectKind::MySql => ir::BeginPolicy::CommitActive,
@@ -3497,6 +3478,10 @@ pub(crate) fn begin_policy(dialect: DialectKind) -> ir::BeginPolicy {
     }
 }
 
+/// Returns true if `statement` implicitly commits an active transaction on MySQL or Oracle.
+///
+/// On MySQL, DDL and table administrative commands (LOCK TABLES, OPTIMIZE) force an implicit commit,
+/// except for operations specifically on TEMPORARY tables.
 pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bool {
     let ddl = matches!(
         statement,
@@ -3533,27 +3518,22 @@ pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bo
             | Statement::Deny(_)
     );
     match dialect {
-        DialectKind::MySql => {
-            if let Statement::CreateTable(create) = statement
-                && create.temporary
-            {
-                return false;
-            }
-            if let Statement::Drop {
+        DialectKind::MySql => match statement {
+            Statement::CreateTable(create) if create.temporary => false,
+            Statement::Drop {
                 temporary: true, ..
-            } = statement
-            {
-                return false;
+            } => false,
+            _ => {
+                ddl || matches!(
+                    statement,
+                    Statement::LockTables { .. }
+                        | Statement::UnlockTables
+                        | Statement::Analyze(_)
+                        | Statement::OptimizeTable { .. }
+                        | Statement::Flush { .. }
+                )
             }
-            ddl || matches!(
-                statement,
-                Statement::LockTables { .. }
-                    | Statement::UnlockTables
-                    | Statement::Analyze(_)
-                    | Statement::OptimizeTable { .. }
-                    | Statement::Flush { .. }
-            )
-        }
+        },
         DialectKind::Oracle => ddl,
         // ClickHouse, Hive, Spark, Databricks and Snowflake do not expose the
         // MySQL/Oracle style implicit-commit transaction boundary around DDL.
@@ -3643,15 +3623,7 @@ pub(crate) fn drop_object_for(
     }
 }
 
-/// Same-table columns read by a plain `ALTER COLUMN` op. Every
-/// `AlterColumnOperation` variant is classified (exhaustive match: a new
-/// upstream variant fails to compile until it is reviewed here):
-/// - `SET DEFAULT` / `SET DATA TYPE ... USING`: the expression's columns.
-/// - `ADD GENERATED ... AS IDENTITY`: whatever `Expr`-position columns the
-///   sequence options carry (numeric by convention, so usually none).
-/// - `SET`/`DROP NOT NULL`, `DROP DEFAULT`, foreign-table `OPTIONS`: the
-///   target column only (option keys/values are FDW names, never
-///   same-table columns), so no referenced columns.
+/// Same-table columns read by a plain `ALTER COLUMN` operation.
 pub(crate) fn alter_op_columns(
     op: &AlterColumnOperation,
     rules: &ir::IdentifierRules,
@@ -3683,11 +3655,7 @@ pub(crate) fn alter_op_columns(
     }
 }
 
-/// Build the IR change for a MySQL `CHANGE`/`MODIFY COLUMN` rewrite from
-/// its exposed pieces (target column, new-definition options, column
-/// position). An unclassifiable definition (unparsed dialect tokens, or a
-/// self-referencing inline foreign key with implicit parent columns)
-/// degrades to `Other`, keeping the previous whole-table fence.
+/// Builds the IR change for a MySQL `CHANGE`/`MODIFY COLUMN` rewrite.
 pub(crate) fn change_modify_change(
     column: ir::Ident,
     options: &[ColumnOption],
@@ -3709,22 +3677,7 @@ pub(crate) fn change_modify_change(
     }
 }
 
-/// Same-table columns read by a `CHANGE`/`MODIFY` new definition, or
-/// `None` when the definition is opaque. `Expr`-position references
-/// (`DEFAULT`, `CHECK`, generated expressions, `ON UPDATE`, ...) are
-/// collected by [`visit_columns`]; the match below handles the only
-/// same-table references that live outside `Expr`, and is exhaustive so a
-/// new upstream `ColumnOption` variant fails to compile until reviewed:
-/// - inline `FOREIGN KEY`: child columns name this table; parent columns
-///   fence only when the parent may be this table (same trailing name,
-///   covering sibling spellings), and implicit parent columns are then
-///   unnameable (opaque, like `ADD CONSTRAINT` self-references);
-/// - masking/projection policy `USING` columns name this table's columns;
-/// - `DialectSpecific` is unparsed `Token` text (e.g. MySQL
-///   `AUTO_INCREMENT`), so absence of column references is unprovable.
-///
-/// All other variants reference columns only through `Expr` (or not at
-/// all: bare names there are constraint/charset/policy/tag names).
+/// Same-table columns read by a `CHANGE`/`MODIFY` new definition, or `None` if opaque.
 pub(crate) fn change_modify_refs(
     options: &[ColumnOption],
     table: &ir::NameRef,
@@ -3747,11 +3700,13 @@ pub(crate) fn change_modify_refs(
                     push(canonical_ident(column, rules, ir::IdentifierClass::Column));
                 }
                 if alter_parent_may_be_self(&key.foreign_table, table, rules) {
-                    if key.referred_columns.is_empty() {
-                        return None;
-                    }
-                    for column in &key.referred_columns {
-                        push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+                    match key.referred_columns.as_slice() {
+                        [] => return None,
+                        columns => {
+                            for column in columns {
+                                push(canonical_ident(column, rules, ir::IdentifierClass::Column));
+                            }
+                        }
                     }
                 }
             }
@@ -3791,10 +3746,7 @@ pub(crate) fn change_modify_refs(
     Some(referenced)
 }
 
-/// Whether an inline foreign-key parent may be the altered table itself:
-/// identical trailing names after relation folding, which also covers
-/// sibling spellings (`t` vs `main.t`) that may alias. An unresolvable
-/// parent name conservatively counts as self.
+/// Returns whether an inline foreign-key parent may resolve to the altered table itself.
 pub(crate) fn alter_parent_may_be_self(
     parent: &ObjectName,
     table: &ir::NameRef,
@@ -3806,6 +3758,7 @@ pub(crate) fn alter_parent_may_be_self(
     }
 }
 
+/// Maps an `AlterTableOperation` into fine-grained column alterations, catalog operations, and scoped barriers.
 pub(crate) fn alter_change(
     operation: &AlterTableOperation,
     dialect: DialectKind,
@@ -4030,11 +3983,7 @@ pub(crate) fn alter_change(
     (changes, ops, barriers)
 }
 
-/// Sequence effects caused by evaluating a statement. Definition-time
-/// expressions (`CREATE TABLE ... DEFAULT nextval(...)`, view definitions,
-/// index expressions) are not evaluated. `ALTER TABLE ... ADD COLUMN ...
-/// DEFAULT` is evaluated for existing rows and therefore does advance the
-/// sequence; `ALTER COLUMN ... SET DEFAULT` does not.
+/// Extracts sequence effects caused by evaluating a statement, excluding definition-time defaults.
 pub(crate) fn sequence_effects_for_statement<'a>(
     statement: &Statement,
     dialect: DialectKind,
@@ -4094,6 +4043,8 @@ pub(crate) fn sequence_effects_for_statement<'a>(
     visitor
 }
 
+/// Analyzes a single SQL statement AST to extract relational dependencies, session/tx effects,
+/// barriers, and syntactic reduction edits into [`ir::NativeFacts`].
 pub(crate) fn analyze_statement(
     statement: &Statement,
     context: AnalysisContext<'_>,
@@ -4250,39 +4201,31 @@ pub(crate) fn analyze_statement(
                 }
                 _ => None,
             };
-            if let Some(mut table) = into_table {
-                table.sources = reads;
-                facts.ops.push(ir::CatalogOp::DefineTable(table));
-            } else {
-                if visitor.select_into_count > 0 {
-                    facts.barriers.push(global_barrier(
-                        ir::BarrierReason::UnknownDml,
-                        Some(
-                            "unmodeled SELECT INTO target, dialect, or nested context".to_string(),
-                        ),
-                    ));
+            match into_table {
+                Some(mut table) => {
+                    table.sources = reads;
+                    facts.ops.push(ir::CatalogOp::DefineTable(table));
                 }
-                add_reads(&mut facts, reads);
+                None => {
+                    if visitor.select_into_count > 0 {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownDml,
+                            Some(
+                                "unmodeled SELECT INTO target, dialect, or nested context"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                    add_reads(&mut facts, reads);
+                }
             }
             add_unmodeled_barriers(&mut facts, &visitor, &[]);
             merge_nested(&mut facts, nested, context);
         }
         Statement::CreateTable(create) => {
-            // NOTE: PostgreSQL `CREATE TABLE` manual: https://www.postgresql.org/docs/current/sql-createtable.html
-            // MySQL `CREATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/create-table.html
-            // PostgreSQL partitioning and inheritance route child rows
-            // through the parent. The attachment is a fact (`partition_parent`
-            // / `inherit_parents`); the graph builder expands parent reads
-            // over the children and records parent writes on them (`INSERT`
-            // fans out to partition children only; plain `INHERITS` inserts
-            // land parent-only). `FOR
-            // VALUES` bounds and the `PARTITION BY` scheme are parsed and
-            // ignored: they fix row placement (which child holds a row), but
-            // every edge in the model is table-level, so no edge needs them.
-            // Bound expressions are still visited, so routine shapes inside
-            // bounds keep their existing fences; only the scheme keyword
-            // (which lowers as `Function`) is structurally excluded from the
-            // deferred-function check (see `ignored_function_roots`).
+            // PostgreSQL partitioning and inheritance route child rows through
+            // the parent, recorded via `partition_parent` / `inherit_parents`.
+            // Bounds and partitioning schemes fix row placement and are ignored.
             let mut unmodeled_parent = false;
             let partition_parent = create.partition_of.as_ref().and_then(|parent| {
                 relation_ref(parent, dialect, rules).or_else(|| {
@@ -4351,7 +4294,7 @@ pub(crate) fn analyze_statement(
                     false,
                 ));
             }
-            if let Some(table) = table_definition(
+            match table_definition(
                 create,
                 dialect,
                 rules,
@@ -4360,32 +4303,35 @@ pub(crate) fn analyze_statement(
                 partition_parent,
                 inherit_parents,
             ) {
-                for constraint in &table.constraints {
-                    if let ir::Constraint::ForeignKey(reference) = constraint {
-                        facts.ops.push(ir::CatalogOp::Read(read_fact(
-                            reference.parent.clone(),
-                            ir::ReadMode::Schema,
-                            reference.parent_columns.clone(),
-                            false,
-                        )));
+                Some(table) => {
+                    for constraint in &table.constraints {
+                        if let ir::Constraint::ForeignKey(reference) = constraint {
+                            facts.ops.push(ir::CatalogOp::Read(read_fact(
+                                reference.parent.clone(),
+                                ir::ReadMode::Schema,
+                                reference.parent_columns.clone(),
+                                false,
+                            )));
+                        }
                     }
-                }
-                for column in &table.columns {
-                    for reference in &column.references {
-                        facts.ops.push(ir::CatalogOp::Read(read_fact(
-                            reference.parent.clone(),
-                            ir::ReadMode::Schema,
-                            reference.parent_columns.clone(),
-                            false,
-                        )));
+                    for column in &table.columns {
+                        for reference in &column.references {
+                            facts.ops.push(ir::CatalogOp::Read(read_fact(
+                                reference.parent.clone(),
+                                ir::ReadMode::Schema,
+                                reference.parent_columns.clone(),
+                                false,
+                            )));
+                        }
                     }
+                    facts.ops.push(ir::CatalogOp::DefineTable(table));
                 }
-                facts.ops.push(ir::CatalogOp::DefineTable(table));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownDdl,
-                    Some(create.name.to_string()),
-                ));
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDdl,
+                        Some(create.name.to_string()),
+                    ));
+                }
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
             merge_nested(&mut facts, nested, context);
@@ -4405,8 +4351,6 @@ pub(crate) fn analyze_statement(
             }
         }
         Statement::CreateView(create) => {
-            // NOTE: PostgreSQL `CREATE VIEW` manual: https://www.postgresql.org/docs/current/sql-createview.html
-            // MySQL `CREATE VIEW` manual: https://dev.mysql.com/doc/refman/8.0/en/create-view.html
             let excluded = [create.name.span()];
             // Defining a plain view only binds its source columns; it does not
             // read source rows. Materialized views execute the query eagerly,
@@ -4424,57 +4368,62 @@ pub(crate) fn analyze_statement(
                 ));
             }
             let sources = visitor_reads(&visitor, &excluded, source_mode);
-            if let Some((name, temporary)) =
-                definition_name(&create.name, dialect, rules, create.temporary)
-            {
-                let explicit_columns = if create.columns.is_empty() {
-                    None
-                } else {
-                    Some(
-                        create
-                            .columns
-                            .iter()
-                            .map(|column| {
-                                canonical_ident(&column.name, rules, ir::IdentifierClass::Column)
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                };
-                let columns = explicit_columns
-                    .as_deref()
-                    .map(|cols| cols.to_vec())
-                    .unwrap_or_else(|| {
-                        query_output_columns(&create.query, rules).unwrap_or_default()
-                    });
-                let (column_lineage, condition_columns) = extract_view_lineage(
-                    &create.query,
-                    explicit_columns.as_deref(),
-                    &visitor,
-                    &excluded,
-                    rules,
-                );
-                facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
-                    name,
-                    temporary,
-                    materialized: create.materialized,
-                    columns,
-                    sources,
-                    if_not_exists: create.if_not_exists,
-                    or_replace: create.or_replace || create.or_alter,
-                    column_lineage,
-                    condition_columns,
-                }));
-                if create.to.is_some() {
+            match definition_name(&create.name, dialect, rules, create.temporary) {
+                Some((name, temporary)) => {
+                    let explicit_columns = if create.columns.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            create
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    canonical_ident(
+                                        &column.name,
+                                        rules,
+                                        ir::IdentifierClass::Column,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    let columns = explicit_columns
+                        .as_deref()
+                        .map(|cols| cols.to_vec())
+                        .unwrap_or_else(|| {
+                            query_output_columns(&create.query, rules).unwrap_or_default()
+                        });
+                    let (column_lineage, condition_columns) = extract_view_lineage(
+                        &create.query,
+                        explicit_columns.as_deref(),
+                        &visitor,
+                        &excluded,
+                        rules,
+                    );
+                    facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
+                        name,
+                        temporary,
+                        materialized: create.materialized,
+                        columns,
+                        sources,
+                        if_not_exists: create.if_not_exists,
+                        or_replace: create.or_replace || create.or_alter,
+                        column_lineage,
+                        condition_columns,
+                    }));
+                    if create.to.is_some() {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::WriteThroughView,
+                            Some("unmodeled persistent CREATE VIEW ... TO routing".to_string()),
+                        ));
+                    }
+                }
+                None => {
                     facts.barriers.push(global_barrier(
-                        ir::BarrierReason::WriteThroughView,
-                        Some("unmodeled persistent CREATE VIEW ... TO routing".to_string()),
+                        ir::BarrierReason::UnknownView,
+                        Some(create.name.to_string()),
                     ));
                 }
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownView,
-                    Some(create.name.to_string()),
-                ));
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
             if create.materialized {
@@ -4482,8 +4431,6 @@ pub(crate) fn analyze_statement(
             }
         }
         Statement::CreateIndex(create) => {
-            // NOTE: PostgreSQL `CREATE INDEX` manual: https://www.postgresql.org/docs/current/sql-createindex.html
-            // MySQL `CREATE INDEX` manual: https://dev.mysql.com/doc/refman/8.0/en/create-index.html
             let table = relation_ref(&create.table_name, dialect, rules);
             let index_name = create
                 .name
@@ -4518,8 +4465,6 @@ pub(crate) fn analyze_statement(
             add_unmodeled_barriers(&mut facts, &visitor, &[create.table_name.span()]);
         }
         Statement::CreateTrigger(create) => {
-            // NOTE: PostgreSQL `CREATE TRIGGER` manual: https://www.postgresql.org/docs/current/sql-createtrigger.html
-            // MySQL `CREATE TRIGGER` manual: https://dev.mysql.com/doc/refman/8.0/en/create-trigger.html
             let table = relation_ref(&create.table_name, dialect, rules);
             let trigger_name = name_from_object(&create.name, rules, ir::IdentifierClass::Other);
             match (trigger_name, table) {
@@ -4555,21 +4500,24 @@ pub(crate) fn analyze_statement(
             }
         }
         Statement::DropTrigger(drop_trigger) => {
-            if let Some(trigger) = trigger_ref_for_drop(
+            match trigger_ref_for_drop(
                 &drop_trigger.trigger_name,
                 drop_trigger.table_name.as_ref(),
                 dialect,
                 rules,
             ) {
-                facts.ops.push(ir::CatalogOp::Drop(ir::DropOp {
-                    objects: vec![ir::DropObject::Trigger { trigger }],
-                    mode: ir::DropMode::Restrict,
-                }));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownDrop,
-                    Some(drop_trigger.to_string()),
-                ));
+                Some(trigger) => {
+                    facts.ops.push(ir::CatalogOp::Drop(ir::DropOp {
+                        objects: vec![ir::DropObject::Trigger { trigger }],
+                        mode: ir::DropMode::Restrict,
+                    }));
+                }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDrop,
+                        Some(drop_trigger.to_string()),
+                    ));
+                }
             }
         }
         Statement::Drop {
@@ -4580,8 +4528,6 @@ pub(crate) fn analyze_statement(
             table,
             ..
         } => {
-            // NOTE: PostgreSQL `DROP` manual: https://www.postgresql.org/docs/current/sql-droptable.html
-            // MySQL `DROP TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/drop-table.html
             let mut objects = Vec::new();
             let mut failed = false;
             for name in names {
@@ -4609,10 +4555,8 @@ pub(crate) fn analyze_statement(
                 }));
             }
         }
-        Statement::AlterTable(alter) => {
-            // NOTE: PostgreSQL `ALTER TABLE` manual: https://www.postgresql.org/docs/current/sql-altertable.html
-            // MySQL `ALTER TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/alter-table.html
-            if let Some(table) = relation_ref(&alter.name, dialect, rules) {
+        Statement::AlterTable(alter) => match relation_ref(&alter.name, dialect, rules) {
+            Some(table) => {
                 let mut changes = Vec::new();
                 let mut ops = Vec::new();
                 let mut barriers = Vec::new();
@@ -4630,13 +4574,14 @@ pub(crate) fn analyze_statement(
                         .push(ir::CatalogOp::AlterTable(ir::AlterTable { table, changes }));
                 }
                 facts.ops.extend(ops);
-            } else {
+            }
+            None => {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownAlter,
                     Some(alter.name.to_string()),
                 ));
             }
-        }
+        },
         Statement::RenameTable(renames) => {
             for rename in renames {
                 match (
@@ -4665,51 +4610,56 @@ pub(crate) fn analyze_statement(
                 AlterViewOperation::As { columns, query, .. } => {
                     let excluded = [view_name.span()];
                     let sources = visitor_reads(&visitor, &excluded, ir::ReadMode::Schema);
-                    if let Some((name, temporary)) =
-                        definition_name(view_name, dialect, rules, false)
-                    {
-                        let explicit_columns = if columns.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                columns
-                                    .iter()
-                                    .map(|column| {
-                                        canonical_ident(column, rules, ir::IdentifierClass::Column)
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        };
-                        let columns = explicit_columns
-                            .as_deref()
-                            .map(|cols| cols.to_vec())
-                            .unwrap_or_else(|| {
-                                query_output_columns(query, rules).unwrap_or_default()
-                            });
-                        let (column_lineage, condition_columns) = extract_view_lineage(
-                            query,
-                            explicit_columns.as_deref(),
-                            &visitor,
-                            &excluded,
-                            rules,
-                        );
-                        facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
-                            name,
-                            temporary,
-                            materialized: alter_view.materialized,
-                            columns,
-                            sources,
-                            if_not_exists: false,
-                            or_replace: true,
-                            column_lineage,
-                            condition_columns,
-                        }));
-                        add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-                    } else {
-                        facts.barriers.push(global_barrier(
-                            ir::BarrierReason::UnknownView,
-                            Some(statement.to_string()),
-                        ));
+                    match definition_name(view_name, dialect, rules, false) {
+                        Some((name, temporary)) => {
+                            let explicit_columns = if columns.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    columns
+                                        .iter()
+                                        .map(|column| {
+                                            canonical_ident(
+                                                column,
+                                                rules,
+                                                ir::IdentifierClass::Column,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            };
+                            let columns = explicit_columns
+                                .as_deref()
+                                .map(|cols| cols.to_vec())
+                                .unwrap_or_else(|| {
+                                    query_output_columns(query, rules).unwrap_or_default()
+                                });
+                            let (column_lineage, condition_columns) = extract_view_lineage(
+                                query,
+                                explicit_columns.as_deref(),
+                                &visitor,
+                                &excluded,
+                                rules,
+                            );
+                            facts.ops.push(ir::CatalogOp::DefineView(ir::ViewDef {
+                                name,
+                                temporary,
+                                materialized: alter_view.materialized,
+                                columns,
+                                sources,
+                                if_not_exists: false,
+                                or_replace: true,
+                                column_lineage,
+                                condition_columns,
+                            }));
+                            add_unmodeled_barriers(&mut facts, &visitor, &excluded);
+                        }
+                        None => {
+                            facts.barriers.push(global_barrier(
+                                ir::BarrierReason::UnknownView,
+                                Some(statement.to_string()),
+                            ));
+                        }
                     }
                 }
                 AlterViewOperation::RenameTo { new_name } => {
@@ -4758,8 +4708,8 @@ pub(crate) fn analyze_statement(
                 AlterViewOperation::RenameColumn {
                     old_column_name,
                     new_column_name,
-                } => {
-                    if let Some(table) = relation_ref(view_name, dialect, rules) {
+                } => match relation_ref(view_name, dialect, rules) {
+                    Some(table) => {
                         facts.ops.push(ir::CatalogOp::Rename(ir::RenameOp::Column {
                             table,
                             from: canonical_ident(
@@ -4773,13 +4723,14 @@ pub(crate) fn analyze_statement(
                                 ir::IdentifierClass::Column,
                             ),
                         }));
-                    } else {
+                    }
+                    None => {
                         facts.barriers.push(global_barrier(
                             ir::BarrierReason::UnknownView,
                             Some(statement.to_string()),
                         ));
                     }
-                }
+                },
                 _ => facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownView,
                     Some(statement.to_string()),
@@ -4978,8 +4929,6 @@ pub(crate) fn analyze_statement(
             }
         }
         Statement::Truncate(truncate) => {
-            // NOTE: PostgreSQL `TRUNCATE` manual: https://www.postgresql.org/docs/current/sql-truncate.html
-            // MySQL `TRUNCATE TABLE` manual: https://dev.mysql.com/doc/refman/8.0/en/truncate-table.html
             if truncate.table_names.is_empty() {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownTruncate,
@@ -5020,74 +4969,73 @@ pub(crate) fn analyze_statement(
                     Some("external COPY effects".into()),
                 ));
             }
-            if *to {
-                match source {
+            match (*to, source) {
+                (
+                    true,
                     CopySource::Table {
                         table_name,
                         columns,
-                    } => {
-                        let col_idents = columns
-                            .iter()
-                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
-                            .collect();
-                        match relation_ref(table_name, dialect, rules) {
-                            Some(target) => facts.ops.push(ir::CatalogOp::Read(read_fact(
-                                target,
-                                ir::ReadMode::Data,
-                                col_idents,
-                                false,
-                            ))),
-                            None => facts.barriers.push(global_barrier(
-                                ir::BarrierReason::UnknownDml,
-                                Some(table_name.to_string()),
-                            )),
-                        }
-                    }
-                    CopySource::Query(query) => {
-                        let nested = collect_dml_in_query(query);
-                        let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
-                        for read in reads {
-                            facts.ops.push(ir::CatalogOp::Read(read));
-                        }
-                        add_unmodeled_barriers(&mut facts, &visitor, &[]);
-                        merge_nested(&mut facts, nested, context);
+                    },
+                ) => {
+                    let col_idents = columns
+                        .iter()
+                        .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                        .collect();
+                    match relation_ref(table_name, dialect, rules) {
+                        Some(target) => facts.ops.push(ir::CatalogOp::Read(read_fact(
+                            target,
+                            ir::ReadMode::Data,
+                            col_idents,
+                            false,
+                        ))),
+                        None => facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownDml,
+                            Some(table_name.to_string()),
+                        )),
                     }
                 }
-            } else {
-                match source {
+                (true, CopySource::Query(query)) => {
+                    let nested = collect_dml_in_query(query);
+                    let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
+                    for read in reads {
+                        facts.ops.push(ir::CatalogOp::Read(read));
+                    }
+                    add_unmodeled_barriers(&mut facts, &visitor, &[]);
+                    merge_nested(&mut facts, nested, context);
+                }
+                (
+                    false,
                     CopySource::Table {
                         table_name,
                         columns,
-                    } => {
-                        let col_idents = columns
-                            .iter()
-                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
-                            .collect();
-                        match relation_ref(table_name, dialect, rules) {
-                            Some(target) => {
-                                facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
-                                    target,
-                                    kind: ir::WriteKind::Insert {
-                                        conflict: ir::ConflictAction::Error,
-                                    },
-                                    columns: col_idents,
-                                    unqualified_columns: Vec::new(),
-                                    reads: Vec::new(),
-                                    only: false,
-                                }))
-                            }
-                            None => facts.barriers.push(global_barrier(
-                                ir::BarrierReason::UnknownDml,
-                                Some(table_name.to_string()),
-                            )),
-                        }
-                    }
-                    CopySource::Query(query) => {
-                        facts.barriers.push(global_barrier(
+                    },
+                ) => {
+                    let col_idents = columns
+                        .iter()
+                        .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                        .collect();
+                    match relation_ref(table_name, dialect, rules) {
+                        Some(target) => facts.ops.push(ir::CatalogOp::WriteData(ir::DataWrite {
+                            target,
+                            kind: ir::WriteKind::Insert {
+                                conflict: ir::ConflictAction::Error,
+                            },
+                            columns: col_idents,
+                            unqualified_columns: Vec::new(),
+                            reads: Vec::new(),
+                            only: false,
+                        })),
+                        None => facts.barriers.push(global_barrier(
                             ir::BarrierReason::UnknownDml,
-                            Some(query.to_string()),
-                        ));
+                            Some(table_name.to_string()),
+                        )),
                     }
+                }
+                (false, CopySource::Query(query)) => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDml,
+                        Some(query.to_string()),
+                    ));
                 }
             }
         }
@@ -5116,89 +5064,81 @@ pub(crate) fn analyze_statement(
                     ObjectNamePart::Function(_) => None,
                 })
                 .unwrap_or_default();
-            if matches!(pragma.as_str(), "foreign_keys" | "foreign_key_checks") {
-                // `PRAGMA foreign_keys;` without a value is a read-only query.
-                // Only an explicit assignment changes the session setting.
-                if let Some(value) = value {
-                    match pragma_bool(value) {
-                        Some(value) => {
-                            facts.session.push(ir::SessionEffect::SetForeignKeyChecks {
-                                scope: ir::SessionScope::Session,
-                                value,
-                            });
+            match pragma.as_str() {
+                "foreign_key_checks" if dialect == DialectKind::SQLite => {
+                    // SQLite ignores the MySQL spelling as an unknown PRAGMA.
+                }
+                "foreign_keys" | "foreign_key_checks" => {
+                    // `PRAGMA foreign_keys;` without a value is a read-only query.
+                    // Only an explicit assignment changes the session setting.
+                    if let Some(value) = value {
+                        match pragma_bool(value) {
+                            Some(value) if dialect == DialectKind::SQLite => {
+                                facts
+                                    .session
+                                    .push(ir::SessionEffect::SetSqliteForeignKeys { value });
+                            }
+                            Some(value) => {
+                                facts.session.push(ir::SessionEffect::SetForeignKeyChecks {
+                                    scope: ir::SessionScope::Session,
+                                    value,
+                                });
+                            }
+                            None => facts.barriers.push(global_barrier(
+                                ir::BarrierReason::UnknownSessionEffect,
+                                Some(statement.to_string()),
+                            )),
                         }
-                        None => facts.barriers.push(global_barrier(
-                            ir::BarrierReason::UnknownSessionEffect,
-                            Some(statement.to_string()),
-                        )),
                     }
                 }
-            } else if value.is_none()
-                && matches!(pragma.as_str(), "recursive_triggers" | "defer_foreign_keys")
-            {
-                // A bare `PRAGMA recursive_triggers;` / `PRAGMA
-                // defer_foreign_keys;` is a read-only flag query (like `PRAGMA
-                // foreign_keys;`): it returns the current setting and mutates
-                // nothing. Assignments stay fenced below (they change trigger
-                // firing / FK enforcement timing).
-            } else if matches!(
-                pragma.as_str(),
-                "journal_mode" | "synchronous" | "temp_store" | "cache_size" | "page_size"
-            ) {
-                // Storage/durability knobs: provably irrelevant to reads,
-                // writes, trigger firing, and transaction visibility, so they
-                // need no UnknownSessionEffect fence. A bare `PRAGMA
-                // journal_mode;` is a read-only query (like `PRAGMA
-                // foreign_keys;`); an assignment is recorded as an inert
-                // session variable so the script keeps its session ordering
-                // without serializing on a global fence.
-                if let Some(assignment) = value {
-                    match pragma_session_value(assignment) {
-                        Some(session_value) => {
-                            facts.session.push(ir::SessionEffect::SetVariable {
-                                scope: ir::SessionScope::Session,
-                                name: ir::Name(vec![ir::Ident(pragma.clone())]),
-                                value: session_value,
-                            });
-                            inert_pragma_effects = true;
+                "recursive_triggers" | "defer_foreign_keys" if value.is_none() => {
+                    // Bare `PRAGMA` queries return the current setting and mutate nothing.
+                    // Assignments stay fenced as unknown session effects.
+                }
+                "journal_mode" | "synchronous" | "temp_store" | "cache_size" | "page_size" => {
+                    // Storage/durability knobs are recorded as inert session variables.
+                    if let Some(assignment) = value {
+                        match pragma_session_value(assignment) {
+                            Some(session_value) => {
+                                facts.session.push(ir::SessionEffect::SetVariable {
+                                    scope: ir::SessionScope::Session,
+                                    name: ir::Name(vec![ir::Ident(pragma.clone())]),
+                                    value: session_value,
+                                });
+                                inert_pragma_effects = true;
+                            }
+                            None => facts.barriers.push(global_barrier(
+                                ir::BarrierReason::UnknownSessionEffect,
+                                Some(statement.to_string()),
+                            )),
                         }
-                        None => facts.barriers.push(global_barrier(
-                            ir::BarrierReason::UnknownSessionEffect,
-                            Some(statement.to_string()),
-                        )),
                     }
                 }
-            } else {
-                // Assignments to recursive_triggers/defer_foreign_keys and unknown
-                // pragmas stay fenced. Boolean literals (`= true`) reach here as
-                // `Number(1/0)` via the PRAGMA pre-normalization in parser.rs; the
-                // upstream grammar gap is still recorded in TODO.org "Upstream Gaps".
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownSessionEffect,
-                    Some(statement.to_string()),
-                ));
+                _ => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownSessionEffect,
+                        Some(statement.to_string()),
+                    ));
+                }
             }
         }
         Statement::StartTransaction {
             statements, modes, ..
         } => {
-            // NOTE: PostgreSQL `BEGIN` manual: https://www.postgresql.org/docs/current/sql-begin.html
-            // MySQL `START TRANSACTION` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
             if statements.is_empty() {
-                if !modes.is_empty() {
-                    for mode in modes {
-                        if let TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) = mode {
+                for mode in modes {
+                    match mode {
+                        TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
                             facts
                                 .post_tx
                                 .push(ir::TxEffect::SetReadOnly { value: true });
-                        } else if let TransactionMode::AccessMode(
-                            TransactionAccessMode::ReadWrite,
-                        ) = mode
-                        {
+                        }
+                        TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {
                             facts
                                 .post_tx
                                 .push(ir::TxEffect::SetReadOnly { value: false });
-                        } else {
+                        }
+                        _ => {
                             facts.barriers.push(global_barrier(
                                 ir::BarrierReason::UnsupportedTransaction,
                                 Some(mode.to_string()),
@@ -5225,8 +5165,6 @@ pub(crate) fn analyze_statement(
             end,
             modifier,
         } => {
-            // NOTE: PostgreSQL `COMMIT` manual: https://www.postgresql.org/docs/current/sql-commit.html
-            // MySQL `COMMIT` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
             // `END` is a synonym for `COMMIT` in PostgreSQL and SQLite. It is
             // only a block terminator for the T-SQL `END TRY`/`END CATCH`
             // forms, which the parser marks with a modifier.
@@ -5239,23 +5177,19 @@ pub(crate) fn analyze_statement(
                 facts.post_tx.push(ir::TxEffect::Commit { chain: *chain });
             }
         }
-        Statement::Rollback { chain, savepoint } => {
-            // NOTE: PostgreSQL `ROLLBACK` manual: https://www.postgresql.org/docs/current/sql-rollback.html
-            // MySQL `ROLLBACK` manual: https://dev.mysql.com/doc/refman/8.0/en/commit.html
-            match savepoint {
-                Some(savepoint) => facts.post_tx.push(ir::TxEffect::RollbackTo {
-                    savepoint: canonical_ident(savepoint, rules, ir::IdentifierClass::Other),
-                }),
-                None => {
-                    facts.post_tx.push(ir::TxEffect::RollbackAll);
-                    if *chain {
-                        facts.post_tx.push(ir::TxEffect::Begin {
-                            if_active: ir::BeginPolicy::Ignore,
-                        });
-                    }
+        Statement::Rollback { chain, savepoint } => match savepoint {
+            Some(savepoint) => facts.post_tx.push(ir::TxEffect::RollbackTo {
+                savepoint: canonical_ident(savepoint, rules, ir::IdentifierClass::Other),
+            }),
+            None => {
+                facts.post_tx.push(ir::TxEffect::RollbackAll);
+                if *chain {
+                    facts.post_tx.push(ir::TxEffect::Begin {
+                        if_active: ir::BeginPolicy::Ignore,
+                    });
                 }
             }
-        }
+        },
         Statement::Savepoint { name } => {
             facts.post_tx.push(ir::TxEffect::Savepoint {
                 name: canonical_ident(name, rules, ir::IdentifierClass::Other),
@@ -5278,24 +5212,27 @@ pub(crate) fn analyze_statement(
             add_unmodeled_barriers(&mut facts, &visitor, &[]);
         }
         Statement::ExplainTable { table_name, .. } => {
-            if let Some(reference) = relation_ref(table_name, dialect, rules) {
-                facts.ops.push(ir::CatalogOp::Read(read_fact(
-                    reference,
-                    ir::ReadMode::Schema,
-                    Vec::new(),
-                    false,
-                )));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownRelation,
-                    Some(table_name.to_string()),
-                ));
+            match relation_ref(table_name, dialect, rules) {
+                Some(reference) => {
+                    facts.ops.push(ir::CatalogOp::Read(read_fact(
+                        reference,
+                        ir::ReadMode::Schema,
+                        Vec::new(),
+                        false,
+                    )));
+                }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownRelation,
+                        Some(table_name.to_string()),
+                    ));
+                }
             }
         }
         Statement::CreateSequence {
             name, temporary, ..
-        } => {
-            if let Some((name, temporary)) = definition_name(name, dialect, rules, *temporary) {
+        } => match definition_name(name, dialect, rules, *temporary) {
+            Some((name, temporary)) => {
                 facts
                     .ops
                     .push(ir::CatalogOp::DefineSequence(ir::SequenceDef {
@@ -5303,70 +5240,76 @@ pub(crate) fn analyze_statement(
                         temporary,
                         transactional: sequence_transactional(dialect),
                     }));
-            } else {
+            }
+            None => {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownDdl,
                     Some(statement.to_string()),
                 ));
             }
-        }
+        },
         Statement::CreateType { name, .. } => {
-            if let Some(name) = name_from_object(name, rules, ir::IdentifierClass::Other) {
-                facts
-                    .ops
-                    .push(ir::CatalogOp::DefineType(ir::TypeDef { name }));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownDdl,
-                    Some(statement.to_string()),
-                ));
+            match name_from_object(name, rules, ir::IdentifierClass::Other) {
+                Some(name) => {
+                    facts
+                        .ops
+                        .push(ir::CatalogOp::DefineType(ir::TypeDef { name }));
+                }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDdl,
+                        Some(statement.to_string()),
+                    ));
+                }
             }
         }
         Statement::RefreshMaterializedView(refresh) => {
-            // NOTE: PostgreSQL `REFRESH MATERIALIZED VIEW` manual: https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html
-            if let Some(target) = relation_ref(&refresh.name, dialect, rules) {
-                facts.ops.push(ir::CatalogOp::Refresh(ir::RefreshOp {
-                    target,
-                    source_mode: if refresh.with_data == Some(false) {
-                        ir::ReadMode::Schema
-                    } else {
-                        ir::ReadMode::Data
-                    },
-                }));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownView,
-                    Some(refresh.name.to_string()),
-                ));
+            match relation_ref(&refresh.name, dialect, rules) {
+                Some(target) => {
+                    facts.ops.push(ir::CatalogOp::Refresh(ir::RefreshOp {
+                        target,
+                        source_mode: if refresh.with_data == Some(false) {
+                            ir::ReadMode::Schema
+                        } else {
+                            ir::ReadMode::Data
+                        },
+                    }));
+                }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownView,
+                        Some(refresh.name.to_string()),
+                    ));
+                }
             }
         }
         Statement::Analyze(analyze) => {
-            // NOTE: PostgreSQL `ANALYZE` manual: https://www.postgresql.org/docs/current/sql-analyze.html
-            // `ANALYZE [ ( option [, ...] ) ] [ table_and_columns [, ...] ]`
-            // Collects statistics for the database or the specified table.
             if let Some(name) = &analyze.table_name {
-                if let Some(target) = relation_ref(name, dialect, rules) {
-                    let cols = analyze
-                        .columns
-                        .iter()
-                        .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
-                        .collect();
-                    facts.ops.push(ir::CatalogOp::Read(read_fact(
-                        target.clone(),
-                        ir::ReadMode::Data,
-                        cols,
-                        false,
-                    )));
-                    facts.barriers.push(barrier(
-                        ir::BarrierScope::Relation { relation: target },
-                        ir::BarrierReason::UnknownDdl,
-                        Some(format!("ANALYZE on relation {}", name)),
-                    ));
-                } else {
-                    facts.barriers.push(global_barrier(
-                        ir::BarrierReason::UnknownRelation,
-                        Some(name.to_string()),
-                    ));
+                match relation_ref(name, dialect, rules) {
+                    Some(target) => {
+                        let cols = analyze
+                            .columns
+                            .iter()
+                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                            .collect();
+                        facts.ops.push(ir::CatalogOp::Read(read_fact(
+                            target.clone(),
+                            ir::ReadMode::Data,
+                            cols,
+                            false,
+                        )));
+                        facts.barriers.push(barrier(
+                            ir::BarrierScope::Relation { relation: target },
+                            ir::BarrierReason::UnknownDdl,
+                            Some(format!("ANALYZE on relation {}", name)),
+                        ));
+                    }
+                    None => {
+                        facts.barriers.push(global_barrier(
+                            ir::BarrierReason::UnknownRelation,
+                            Some(name.to_string()),
+                        ));
+                    }
                 }
             }
         }
@@ -5394,15 +5337,18 @@ pub(crate) fn analyze_statement(
             with_contacts: None,
             ..
         } if dialect == DialectKind::MySql => {
-            if let Some(name) = name_from_object(db_name, rules, ir::IdentifierClass::Relation) {
-                facts
-                    .ops
-                    .push(ir::CatalogOp::DefineSchema(ir::SchemaDef { name }));
-            } else {
-                facts.barriers.push(global_barrier(
-                    ir::BarrierReason::UnknownDdl,
-                    Some(statement.to_string()),
-                ));
+            match name_from_object(db_name, rules, ir::IdentifierClass::Relation) {
+                Some(name) => {
+                    facts
+                        .ops
+                        .push(ir::CatalogOp::DefineSchema(ir::SchemaDef { name }));
+                }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownDdl,
+                        Some(statement.to_string()),
+                    ));
+                }
             }
         }
         Statement::CreateSchema { schema_name, .. } => {
@@ -5472,16 +5418,8 @@ pub(crate) fn analyze_statement(
             add_reads(&mut facts, reads);
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
         }
-        // TODO(upstream-sqlparser): Procedural statements, client commands, and dialect extensions
-        // currently hit this fallback barrier:
-        // 1. PL/pgSQL & PL/SQL: `CREATE FUNCTION/PROCEDURE ... AS $$ ... $$` procedural blocks
-        //    (sqlparser stores function bodies as unparsed strings; inner DML dependencies are opaque).
-        // 2. MySQL: `DELIMITER //` client command is outside ANSI/ISO SQL lexical grammar.
-        // 3. MySQL: User session variables (`@var := expr`) and dynamic `PREPARE .. FROM @var`.
-        // 4. DuckDB: Direct file queries (`SELECT * FROM 'file.parquet'`).
-        // 5. MSSQL: T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`). (`OUTPUT ... INTO`
-        //    is modeled, not a fallback: real table -> second write edge, `@var` -> relation-
-        //    scoped fence, anything else -> global `UnknownDml` fence.)
+        // Procedural statements, client commands, and dialect extensions
+        // currently hit this fallback barrier.
         _ => facts.barriers.push(global_barrier(
             ir::BarrierReason::UnknownStatement,
             Some(statement.to_string()),

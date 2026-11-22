@@ -1,3 +1,9 @@
+//! Binary serialization protocol for FFI data exchange between Rust and Occam (Haskell).
+//!
+//! Encodes [`NativeResponse`] into a compact binary format starting with the `OCCM\x01` magic
+//! header, followed by initial session state, parsed statement units, candidate syntactic edits,
+//! and atomic column reduction targets.
+
 use crate::columns::{ColumnSite, ColumnSiteKind, ColumnTarget};
 use crate::ir::{
     CatalogOp, Ident, Name, NativeFacts, ScopedBarrier, SearchPathEntry, SessionEffect,
@@ -5,13 +11,16 @@ use crate::ir::{
 };
 use crate::{NativeEdit, NativeEditCategory, NativeResponse, NativeUnit};
 
+/// 5-byte magic header prefix (`b"OCCM\x01"`) identifying the Occam binary response format version 1.
 pub const OCCM_MAGIC: &[u8; 5] = b"OCCM\x01";
 
+/// A byte buffer builder for serializing primitive types and structured payloads in little-endian order.
 pub struct BinaryWriter {
     buf: Vec<u8>,
 }
 
 impl BinaryWriter {
+    /// Creates a new `BinaryWriter` preallocated with initial capacity.
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(4096),
@@ -209,6 +218,7 @@ fn write_column_target(w: &mut BinaryWriter, target: &ColumnTarget) {
     w.write_opt_str(target.blocked.as_deref());
 }
 
+/// Serializes the entire [`NativeResponse`] payload into binary OCCM v1 format.
 pub(crate) fn encode_native_response(
     response: &NativeResponse,
 ) -> Result<Vec<u8>, serde_json::Error> {

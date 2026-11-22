@@ -52,6 +52,7 @@ import Occam.Dependency.State (
     Eval (..),
     ScanState (..),
     addBarrier,
+    addDeps,
     evalToState,
     initialEval,
     initialScanState,
@@ -151,7 +152,7 @@ step ::
 step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) (sid, facts) =
     let
         (state1, _) = ensureFrame priorState
-        state2 = applyTxEffects sid (factPreTx facts) state1
+        (state2, preTxDeps) = applyTxEffects sid (factPreTx facts) state1
         state3 = ensureFrameForOps state2
         eval0 = initialEval sid state3
         eval1 = foldl' (processOp sid) eval0 (factOps facts)
@@ -159,9 +160,9 @@ step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount)
         (eval2, sessionTouched) = applySessionEffects sid (factSession facts) eval1'
         state4 = evalToState eval2 state3
         state5 = settleAutocommit sid state3 state4
-        state6 = applyTxEffects sid (factPostTx facts) state5
+        (state6, postTxDeps) = applyTxEffects sid (factPostTx facts) state5
         eval3 =
-            eval2
+            (addDeps (Set.union preTxDeps postTxDeps) eval2)
                 { evalCatalog = scanCatalog state6
                 , evalSession = scanSession state6
                 }

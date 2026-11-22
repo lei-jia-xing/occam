@@ -5,6 +5,7 @@ use crate::parser::{count_units, parse_units};
 use crate::{DialectKind, NativeResponse};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+/// Folds a session identifier string according to dialect rules and quote status.
 fn session_ident_with_quote(value: &str, quoted: bool, rules: &IdentifierRules) -> Ident {
     let folding = rules.fold(IdentifierClass::Relation, quoted);
     Ident(folding.apply(value))
@@ -23,6 +24,7 @@ fn session_config_ident(value: &str, rules: &IdentifierRules) -> Ident {
     }
 }
 
+/// Parses a configured schema search path entry into a `SearchPathEntry` (`CurrentUser` or `Name`).
 fn session_search_path_entry(value: &str, rules: &IdentifierRules) -> SearchPathEntry {
     let value = value.trim();
     if value == "$user" || value == "\"$user\"" {
@@ -33,6 +35,7 @@ fn session_search_path_entry(value: &str, rules: &IdentifierRules) -> SearchPath
     }
 }
 
+/// Initializes session state from configuration, resolving dialect-specific defaults and identifier folding.
 pub(crate) fn session_init(config: &ParseConfig) -> SessionInit {
     let rules = IdentifierRules::for_dialect(config.dialect, &config.server);
     SessionInit {
@@ -62,6 +65,7 @@ pub(crate) fn session_init(config: &ParseConfig) -> SessionInit {
     }
 }
 
+/// Parses `sql` and encodes the full semantic response into the binary protocol format.
 fn facts_binary(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
     let units = parse_units(sql, config).ok()?;
     let columns = if config.column_bundles {
@@ -93,6 +97,7 @@ fn facts_json(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
     .ok()
 }
 
+/// Maps FFI integer dialect code (0–15) to its corresponding [`DialectKind`].
 fn dialect_from_code(code: u32) -> Option<DialectKind> {
     match code {
         0 => Some(DialectKind::Generic),
@@ -129,11 +134,24 @@ unsafe fn put_bytes(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize)
     }
 }
 
-/// Parses SQL with a JSON `ParseConfig` and returns its statement facts as JSON.
+/// Parses SQL with a JSON-encoded `ParseConfig` and returns the binary-encoded `NativeResponse`.
+///
+/// # Parameters
+/// - `config_data`, `config_len`: Pointer and byte length of a JSON-encoded `ParseConfig`.
+/// - `data`, `len`: Pointer and byte length of the UTF-8 SQL input string.
+/// - `out_data`, `out_len`: Pointers to store the allocated output buffer pointer and length.
+///
+/// # Return Codes
+/// - `0`: Success; `*out_data` points to the binary payload and must be freed with [`occam_sql_free`].
+/// - `1`: Invalid arguments (null pointers when length > 0, or null output pointers).
+/// - `2`: Invalid configuration JSON.
+/// - `3`: SQL input is not valid UTF-8.
+/// - `4`: Native SQL parsing or fact extraction failed.
+/// - `5`: Native parser panicked (caught via `catch_unwind`).
 ///
 /// # Safety
-/// For nonzero lengths, the corresponding input pointers must point to readable
-/// bytes. Non-null output pointers must point to writable storage.
+/// Nonzero-length input buffers must point to valid readable bytes for the given length.
+/// Output pointers `out_data` and `out_len` must point to valid, writable storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_parse(
     config_data: *const u8,
@@ -175,10 +193,18 @@ pub unsafe extern "C" fn occam_sql_parse(
     }
 }
 
-/// Converts a native parser status code into an owned error message.
+/// Converts a native parser status code into an owned UTF-8 error message buffer.
+///
+/// # Parameters
+/// - `code`: The status code returned by [`occam_sql_parse`] or [`occam_sql_count`].
+/// - `out_data`, `out_len`: Pointers to store the allocated message buffer pointer and length.
+///
+/// # Return Codes
+/// - `0`: Success; `*out_data` points to the error string and must be freed with [`occam_sql_free`].
+/// - `1`: Output pointers are null.
 ///
 /// # Safety
-/// Non-null output pointers must point to writable storage.
+/// Non-null output pointers must point to valid, writable storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_parse_error(
     code: i32,
@@ -202,10 +228,23 @@ pub unsafe extern "C" fn occam_sql_parse_error(
     }
 }
 
-/// Counts statements using the selected sqlparser dialect.
+/// Counts statements in the SQL input using the selected sqlparser dialect.
+///
+/// # Parameters
+/// - `data`, `len`: Pointer and byte length of the UTF-8 SQL input.
+/// - `dialect_code`: Integer code corresponding to a [`DialectKind`].
+/// - `out_count`: Pointer to receive the counted statement total.
+///
+/// # Return Codes
+/// - `0`: Success; `*out_count` receives the statement count.
+/// - `1`: Null pointers when `len > 0`, or `out_count` is null.
+/// - `2`: Unknown dialect code.
+/// - `3`: SQL input is not valid UTF-8.
+/// - `4`: Tokenization or counting failed.
+/// - `5`: Counting panicked (caught via `catch_unwind`).
 ///
 /// # Safety
-/// For nonzero `len`, `data` must point to `len` readable bytes, and a non-null `out_count` must point to writable storage.
+/// For nonzero `len`, `data` must point to `len` readable bytes. `out_count` must point to writable storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_count(
     data: *const u8,
@@ -240,10 +279,11 @@ pub unsafe extern "C" fn occam_sql_count(
     }
 }
 
-/// Frees a buffer returned by one of the native parser functions.
+/// Frees a buffer allocated by [`occam_sql_parse`] or [`occam_sql_parse_error`].
 ///
 /// # Safety
-/// For non-null `data`, `len` must match a buffer returned by `occam_sql_parse` or `occam_sql_parse_error`.
+/// For non-null `data`, `len` must exactly match the length of a buffer previously allocated
+/// by this library that has not yet been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn occam_sql_free(data: *mut u8, len: usize) {
     unsafe {

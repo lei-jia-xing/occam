@@ -14,16 +14,16 @@ pub(crate) struct SequenceVisitor<'a> {
     pub(crate) reads: Vec<ir::NameRef>,
     pub(crate) unknown: bool,
     seen: HashSet<ir::NameRef>,
-    /// Subtrees whose function calls never fence: MySQL `VALUES(col)`
-    /// proposed-row markers in `ON DUPLICATE KEY UPDATE` assignments (which
-    /// lower as `Expr::Function` but name no routine). Populated by
-    /// `sequence_effects_for_statement` only when the pure table is enabled
-    /// (no routine-DDL shadowing); shadowed `VALUES` may name a user
-    /// routine and keeps fencing.
+    /// AST spans whose function calls never trigger routine fences.
+    ///
+    /// Specifically used for MySQL `VALUES(col)` proposed-row markers in `ON DUPLICATE KEY UPDATE`
+    /// assignments (which parse as `Expr::Function` despite naming no routine). Only populated
+    /// when `pure_table_enabled` is true (i.e. no routine DDL in the script shadows the name).
     pub(crate) ignored_function_roots: Vec<Span>,
 }
 
 impl<'a> SequenceVisitor<'a> {
+    /// Creates a new sequence visitor tracking sequence mutations and unknown routine invocations.
     pub(crate) fn new(
         dialect: DialectKind,
         rules: &'a crate::ir::IdentifierRules,
@@ -68,13 +68,10 @@ impl Visitor for SequenceVisitor<'_> {
                         &self.ignored_function_roots,
                         expr.span(),
                     );
-                let pure = !ignored
-                    && self.pure_table_enabled
-                    && matches!(expr, Expr::Function(function)
-                        if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
-                // Ignored markers and unconditional count calls are not unmodeled
-                // routines; only non-ignored impure calls fence.
                 if !ignored {
+                    let pure = self.pure_table_enabled
+                        && matches!(expr, Expr::Function(function)
+                            if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
                     self.unknown |= !pure;
                 }
             }

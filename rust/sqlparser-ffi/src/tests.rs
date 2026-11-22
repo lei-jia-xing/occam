@@ -1598,8 +1598,12 @@ fn pragma_foreign_keys_only_changes_state_on_assignment() {
     let units = parse("PRAGMA foreign_keys = 0;", DialectKind::SQLite).unwrap();
     assert!(matches!(
         facts(&units[0]).session.as_slice(),
-        [SessionEffect::SetForeignKeyChecks { value: false, .. }]
+        [SessionEffect::SetSqliteForeignKeys { value: false }]
     ));
+
+    let units = parse("PRAGMA foreign_key_checks = 1;", DialectKind::SQLite).unwrap();
+    assert!(facts(&units[0]).session.is_empty());
+    assert!(facts(&units[0]).barriers.is_empty());
 
     let units = parse("PRAGMA foreign_keys = 'maybe';", DialectKind::SQLite).unwrap();
     assert!(facts(&units[0]).session.is_empty());
@@ -2686,7 +2690,6 @@ fn nested_data_modifying_ctes_are_analyzed_once() {
 
 #[test]
 fn postgres_analyze_table_extracts_relation_and_columns() {
-    // NOTE: PostgreSQL `ANALYZE` manual: https://www.postgresql.org/docs/current/sql-analyze.html
     let sql = "ANALYZE t0 (c0, c2);";
     let units = parse(sql, DialectKind::PostgreSql).unwrap();
     assert_eq!(units.len(), 1);

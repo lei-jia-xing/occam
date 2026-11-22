@@ -5,7 +5,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (elemIndex)
+import Data.List (elemIndex, tails)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
@@ -44,6 +44,7 @@ import Occam.Reducer (
     ReductionResult (..),
     ReductionStage (..),
     StageEvent (..),
+    StatementSearchPolicy (..),
     defaultReductionConfig,
     findInterestingPrefix,
     reduceSQL,
@@ -246,6 +247,129 @@ tests =
             assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
             assertBool "strips column constraint" (not (BSC.isInfixOf "NOT NULL" reduced))
             assertBool "simplifies case to branch" (BSC.isInfixOf "42" reduced)
+        , testCase "Rejected literal batch splits and finds a coupled reduction" $ do
+            let original = "SELECT 1234, 1234, 9999, 9999;"
+                allChanged = "SELECT 0, 0, 0, 0;"
+                expected = "SELECT 0, 0, 9999, 9999;"
+                cfg = defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True}
+                accepted sql = sql == original || sql == expected
+            control <- predicatePool accepted
+            reducedControl <- reduceSQLWithConfig cfg nullLogger control original
+            assertEqual "single edits cannot reach the accepted pair" original reducedControl
+            candidates <- newIORef []
+            treatment <- outcomePool $ \sql -> do
+                modifyIORef' candidates (sql :)
+                pure (if accepted sql then OracleAccepted else OracleRejected)
+            reduced <- reduceSQLWithConfig (cfg {reductionLiteralBatches = True}) nullLogger treatment original
+            assertEqual "batch split applies only the accepted pair" expected reduced
+            attempted <- reverse <$> readIORef candidates
+            let wholeIndex = elemIndex allChanged attempted
+                halfIndex = elemIndex expected attempted
+            assertBool
+                "whole batch was tried before its accepted half"
+                ( case (wholeIndex, halfIndex) of
+                    (Just i, Just j) -> i < j
+                    _ -> False
+                )
+        , testCase "Complement-first statement search still tries useful subsets" $ do
+            let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                complement = "SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                expected = "SELECT 30;SELECT 40;"
+                config =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionStatementSearch = StatementComplementFirst
+                        }
+            attempts <- newIORef []
+            pool <- outcomePool $ \sql -> do
+                modifyIORef' attempts (sql :)
+                pure (if sql == original || sql == expected then OracleAccepted else OracleRejected)
+            reduced <- reduceSQLWithConfig config nullLogger pool original
+            assertEqual "a subset is still selected" expected reduced
+            tested <- reverse <$> readIORef attempts
+            assertBool "the complement is tested before the successful subset" $
+                case (elemIndex complement tested, elemIndex expected tested) of
+                    (Just complementOrdinal, Just subsetOrdinal) -> complementOrdinal < subsetOrdinal
+                    _ -> False
+        , testCase "Single-statement audit can miss a nonadjacent pair" $ do
+            let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
+                original = BSC.concat statements
+                pairReduction = "SELECT 20;SELECT 40;"
+                predicate sql = sql == original || sql == pairReduction
+                config =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionSlicing = False
+                        , reductionClosure = False
+                        }
+            pool <- predicatePool predicate
+            reduced <- reduceSQLWithConfig config nullLogger pool original
+            assertEqual "current partitions and single audit stop at the original" original reduced
+            let acceptedPairs = [left <> right | left : rest <- tails statements, right <- rest, predicate (left <> right)]
+            assertEqual
+                "only the nonadjacent pair passes an exhaustive pair check"
+                [pairReduction]
+                acceptedPairs
+        , testCase "Deferred VALUES chunk remains eligible after singleton rejections" $ do
+            let original = "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8);"
+                singleton = "INSERT INTO t VALUES (2), (3), (4), (5), (6), (7), (8);"
+                expected = "INSERT INTO t VALUES (1), (2), (5), (6), (7), (8);"
+                config =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionIntraStatement = True
+                        , reductionAdaptiveValues = True
+                        }
+            attempts <- newIORef []
+            pool <- outcomePool $ \sql -> do
+                modifyIORef' attempts (sql :)
+                pure (if sql == original || sql == expected then OracleAccepted else OracleRejected)
+            reduced <- reduceSQLWithConfig config nullLogger pool original
+            assertEqual "only the fine chunk is accepted" expected reduced
+            tested <- reverse <$> readIORef attempts
+            assertBool "singletons are tested before the deferred fine chunk" $
+                case (elemIndex singleton tested, elemIndex expected tested) of
+                    (Just singleOrdinal, Just chunkOrdinal) -> singleOrdinal < chunkOrdinal
+                    _ -> False
+        , testCase "Refreshed syntax edits agree with full reparse across statement boundaries" $ do
+            let cases =
+                    [ (SQLite, "CREATE TABLE t(a INT NOT NULL);\r\n-- retained\r\nSELECT a, 123456 FROM t WHERE a > 0;")
+                    ,
+                        ( PostgreSQL
+                        , "SET search_path TO public; CREATE TABLE t(a INT NOT NULL); SELECT a, 123456 FROM t WHERE a > 0;"
+                        )
+                    ,
+                        ( DuckDB
+                        , "CREATE MACRO identity_value(x) AS x; CREATE TABLE t(a INT NOT NULL); SELECT a, 123456 FROM t WHERE a > 0;"
+                        )
+                    ]
+                run fullReparse dialect original = do
+                    candidates <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' candidates (candidate :)
+                        let accepted = all (`BSC.isInfixOf` candidate) ["CREATE TABLE t(", "SELECT a", "FROM t"]
+                        pure (if accepted then OracleAccepted else OracleRejected)
+                    let config =
+                            defaultReductionConfig
+                                { reductionDialect = dialect
+                                , reductionIntraStatement = True
+                                , reductionLiteralBatches = True
+                                , reductionAdaptiveValues = True
+                                , reductionFullSyntaxReparse = fullReparse
+                                }
+                    reduced <- reduceSQLWithConfig config nullLogger pool original
+                    trace <- reverse <$> readIORef candidates
+                    pure (reduced, trace)
+            mapM_
+                ( \(dialect, original) -> do
+                    incremental@(reduced, _) <- run False dialect original
+                    full <- run True dialect original
+                    assertBool (show dialect <> " applies an edit") (BS.length reduced < BS.length original)
+                    assertEqual (show dialect <> " candidate bytes and endpoint") full incremental
+                )
+                cases
         , testCase "Intra-statement rewrites reduce UPDATE assignments, WHERE clauses, and DELETE clauses" $ do
             pool <-
                 predicatePool

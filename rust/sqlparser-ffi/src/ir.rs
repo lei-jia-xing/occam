@@ -87,10 +87,12 @@ pub struct Ident(pub String);
 pub struct Name(pub Vec<Ident>);
 
 impl Name {
+    /// Returns the number of identifier parts in this name.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns the terminal identifier component of this name.
     pub fn last(&self) -> Option<&Ident> {
         self.0.last()
     }
@@ -155,27 +157,16 @@ pub enum CatalogOp {
     WriteData(DataWrite),
     WriteSequence(SequenceWrite),
     AlterTable(AlterTable),
-    /// PostgreSQL `ALTER TABLE parent ATTACH PARTITION child ...`: routes the
-    /// child's rows into parent reads from this statement on. A separate op
-    /// (not an `AlterChange`) so the column pass, which matches `AlterChange`
-    /// exhaustively, keeps compiling untouched.
+    /// Attaches a partition child table to a parent table (PostgreSQL `ALTER TABLE parent ATTACH PARTITION child`).
+    /// Parent reads include child rows, and writes to the parent route into the child by partition key.
     AttachPartition(PartitionLink),
-    /// PostgreSQL `ALTER TABLE parent DETACH PARTITION child ...`: breaks the
-    /// routing established by `PARTITION OF` or a prior attach. Statements
-    /// before the detach keep their edges (the scan snapshots dependencies
-    /// in order); statements after it observe the parent without the child.
+    /// Detaches a partition child table from its parent table (PostgreSQL `ALTER TABLE parent DETACH PARTITION child`).
+    /// Breaks key-based write routing and excludes the child from subsequent parent reads.
     DetachPartition(PartitionLink),
-    /// PostgreSQL `ALTER TABLE child INHERIT parent`: adds `parent` to the
-    /// child's inheritance set. A separate op (not an `AlterChange`, and not
-    /// a partition op): inheritance links live in the inherit-parents set
-    /// where `INSERT` into the parent lands parent-only, while partition
-    /// links route `INSERT` by key. Filing an inherit link as a partition
-    /// link would over-approximate `INSERT` fan-out.
+    /// Adds a parent table to a child's inheritance set (PostgreSQL `ALTER TABLE child INHERIT parent`).
+    /// Unlike partitions where `INSERT` routes by key, parent `INSERT` lands parent-only in inheritance.
     AttachInherit(PartitionLink),
-    /// PostgreSQL `ALTER TABLE child NO INHERIT parent`: removes `parent`
-    /// from the child's inheritance set, whether the link came from
-    /// `INHERITS` or a prior `INHERIT` (same set). Partition detach only
-    /// filters the partition-parents set, so it would no-op here.
+    /// Removes a parent table from a child's inheritance set (PostgreSQL `ALTER TABLE child NO INHERIT parent`).
     DetachInherit(PartitionLink),
     Drop(DropOp),
     Rename(RenameOp),
@@ -679,6 +670,9 @@ pub enum SessionEffect {
         scope: SessionScope,
         value: bool,
     },
+    SetSqliteForeignKeys {
+        value: bool,
+    },
     /// Restore the session's initial `foreign_keys`/`foreign_key_checks`
     /// configuration. The initial value is dialect- and server-dependent.
     ResetForeignKeyChecks {
@@ -787,6 +781,7 @@ pub enum IdentifierClass {
     Other,
 }
 
+/// Case-folding mode applied to normalize SQL identifiers according to engine rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaseFolding {
     Lower,
@@ -796,6 +791,7 @@ pub enum CaseFolding {
 }
 
 impl CaseFolding {
+    /// Applies this case-folding transformation to `value`.
     pub(crate) fn apply(self, value: &str) -> String {
         match self {
             Self::Lower => value.to_lowercase(),
@@ -806,6 +802,7 @@ impl CaseFolding {
     }
 }
 
+/// Dialect- and server-specific rules governing case folding for quoted and unquoted identifiers.
 #[derive(Clone, Debug)]
 pub struct IdentifierRules {
     pub unquoted: CaseFolding,
@@ -817,6 +814,7 @@ pub struct IdentifierRules {
 }
 
 impl IdentifierRules {
+    /// Constructs identifier folding rules for `dialect`, incorporating overrides from `server`.
     pub fn for_dialect(dialect: crate::DialectKind, server: &ServerConfig) -> Self {
         use crate::DialectKind::*;
         let (unquoted, quoted) = match dialect {
@@ -881,6 +879,7 @@ impl IdentifierRules {
         rules
     }
 
+    /// Resolves the effective case-folding transformation for `class` and quoting status.
     pub fn fold(&self, class: IdentifierClass, quoted: bool) -> CaseFolding {
         let specific = match (class, quoted) {
             (IdentifierClass::Relation, true) => self.relation_quoted,
