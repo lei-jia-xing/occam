@@ -1,4 +1,4 @@
-.PHONY: all build build-check test bench microbench bench-product fmt fmt-check lint rust-check harness-check proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test bench microbench bench-product flamegraph fmt fmt-check lint rust-check harness-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -26,6 +26,17 @@ microbench:
 
 bench-product:
 	cabal bench --benchmark-options="-p reduction-audit-validation --stdev 20 --timeout 5s"
+
+FLAMEGRAPH_DIR ?= dist-newstyle/flamegraph
+FLAMEGRAPH_SQL ?= benchmarks/corpus/06_views_and_aggregates.sql
+
+flamegraph:
+	cabal build exe:occam --builddir="$(FLAMEGRAPH_DIR)" --enable-profiling --profiling-detail=none --library-profiling-detail=toplevel-functions
+	@bin=$$(cabal list-bin exe:occam --builddir="$(FLAMEGRAPH_DIR)" --enable-profiling) && \
+		"$$bin" "$(FLAMEGRAPH_SQL)" --dialect sqlite --result-oracle --jobs 1 --intra-statement --quiet \
+			--out /dev/null --stats "$(FLAMEGRAPH_DIR)/stats.json" \
+			+RTS -N1 -pj "-po$(abspath $(FLAMEGRAPH_DIR))/occam" -RTS
+	@printf 'Open %s in https://www.speedscope.app/ (Left Heavy view).\n' "$(FLAMEGRAPH_DIR)/occam.prof"
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \

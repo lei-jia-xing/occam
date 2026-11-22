@@ -124,6 +124,11 @@
 ** DONE [#A] Make COUNT recognition respect dialect identifier folding
 - FIX: PostgreSQL fact dumps classify `"COUNT"(1)` and `"PG_CATALOG".count(1)` as fence-free row-count reads. These quoted names are distinct from the lowercase builtin and schema. The shared recognizer now folds identifiers by dialect and disables the shortcut when routine DDL or parse errors are present. Rust fact checks and Haskell slicing cover both the builtin and quoted lookalikes. [[https://www.postgresql.org/docs/13/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS][PostgreSQL identifier rules]]
 
+** TODO [#B] Measure batched literal simplification
+- NOTE: SQLite scale-064 with the native result oracle shrank from 1111 B to 887 B at 19 vs 641 total oracle executions. Intra-statement literal edits accounted for 348 physical starts; VALUES row and row-chunk deletions accounted for 252 starts with zero accepts. SQLite oracle wall time and frontend parse/decode were the largest measured costs. Candidate rendering took less than 1 ms. Eight AB/BA pairs per case confirmed the call counts and byte sizes across scale-064, deep expressions, and views/aggregates.
+- TODO: Test a batch of disjoint literal edits, with smaller candidates on rejection. Compare per-case final bytes, calls, phase times and final oracle outcomes under paired budgets. Keep single edits in the final fixed-point pass.
+- NOTE: Isolated SQLite fact probes mark SUM(x), COALESCE(x, 0), and NULLIF(x, 0) with global routine fences. COUNT(*) alone stays fence-free. Test routine resolution and effect boundaries before refining those fences; SQL text alone does not establish builtin identity.
+
 ** TODO [#B] Candidate proposals (UNSELECTED, not implementation)
 - Pair-aware search and certificate proposals remain candidates until evidence explicitly selects them; neither implemented nor claimed.
 

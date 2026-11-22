@@ -24,6 +24,21 @@ cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 cabal bench --benchmark-options="+RTS -T -RTS"
 ```
 
+### GHC cost-centre flame graph
+
+Run `make flamegraph` from the pinned development environment. It builds
+a profiling executable in `dist-newstyle/flamegraph` and runs SQLite
+result-preserving intra-statement reduction on `06_views_and_aggregates.sql`
+with one RTS capability. Open `dist-newstyle/flamegraph/occam.prof` in
+[Speedscope](https://www.speedscope.app/) and select **Left Heavy**. The same
+run writes `stats.json` next to the profile. Set `FLAMEGRAPH_SQL` to profile
+another SQLite input.
+
+**NOTE** GHC cost-centre instrumentation changes optimization and excludes time
+in safe foreign calls. Use the profile to locate Haskell work, the regular
+benchmark for timings, and native CPU sampling for SQLite and Rust.
+[GHC profiling guide](https://ghc.gitlab.haskell.org/ghc/doc/users_guide/profiling.html)
+
 ### In-Process SQLite Evaluation (`Occam.Oracle.Sqlite`)
 
 Tiers 2 and 3 evaluate candidate SQL directly against an in-memory SQLite instance via `direct-sqlite`, using SQLite-prepared statement boundaries and a per-probe timeout. It checks the
