@@ -121,6 +121,9 @@
 - BigQuery, Snowflake, Redshift, Databricks, and Teradata: use documented job/query status and IDs for query failure. Require independent server or provider incident evidence to classify a crash. Generic SQL and ANSI are parser modes. [[https://docs.cloud.google.com/bigquery/docs/troubleshoot-queries][BigQuery]] [[https://docs.snowflake.com/en/sql-reference/account-usage/query_history][Snowflake]] [[https://docs.aws.amazon.com/redshift/latest/dg/SYS_QUERY_HISTORY.html][Redshift]] [[https://docs.databricks.com/aws/en/admin/system-tables/query-history][Databricks]] [[https://docs.teradata.com/api/khub/documents/pVj74T8neTyAD~DafwK0Qg/content][Teradata DBQL]]
 - TODO: Keep text matching scoped to version-specific event formats and explicit fault identity. Distinguish a confirmed fault, a healthy observation with no matching fault, and missing evidence. Check those verdicts with positive and negative event fixtures for the pinned versions.
 
+** DONE [#A] Make COUNT recognition respect dialect identifier folding
+- FIX: PostgreSQL fact dumps classify `"COUNT"(1)` and `"PG_CATALOG".count(1)` as fence-free row-count reads. These quoted names are distinct from the lowercase builtin and schema. The shared recognizer now folds identifiers by dialect and disables the shortcut when routine DDL or parse errors are present. Rust fact checks and Haskell slicing cover both the builtin and quoted lookalikes. [[https://www.postgresql.org/docs/13/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS][PostgreSQL identifier rules]]
+
 ** TODO [#B] Candidate proposals (UNSELECTED, not implementation)
 - Pair-aware search and certificate proposals remain candidates until evidence explicitly selects them; neither implemented nor claimed.
 

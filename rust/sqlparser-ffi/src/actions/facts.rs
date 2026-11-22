@@ -82,21 +82,35 @@ fn is_non_null_scalar_literal(expr: &Expr) -> bool {
     }
 }
 
-pub(crate) fn is_unconditional_count_expr(expr: &Expr) -> bool {
+pub(crate) fn is_unconditional_count_expr(
+    expr: &Expr,
+    dialect: DialectKind,
+    rules: &ir::IdentifierRules,
+    pure_table_enabled: bool,
+) -> bool {
     let Expr::Function(func) = expr else {
         return false;
     };
-    let is_count_ident = match func.name.0.as_slice() {
-        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case("count"),
+    if !pure_table_enabled {
+        return false;
+    }
+    let matches_name = |ident: &Ident, name| {
+        canonical_ident_string(ident, rules, ir::IdentifierClass::Other)
+            == rules.fold(ir::IdentifierClass::Other, false).apply(name)
+    };
+    let ident = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident,
         [
             ObjectNamePart::Identifier(schema),
             ObjectNamePart::Identifier(ident),
-        ] if schema.value.eq_ignore_ascii_case("pg_catalog") => {
-            ident.value.eq_ignore_ascii_case("count")
+        ] if matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift)
+            && matches_name(schema, "pg_catalog") =>
+        {
+            ident
         }
-        _ => false,
+        _ => return false,
     };
-    if !is_count_ident {
+    if !matches_name(ident, "count") {
         return false;
     }
     if func.over.is_some()
@@ -160,7 +174,12 @@ fn is_plain_table_factor(factor: &TableFactor) -> bool {
     }
 }
 
-fn is_unconditional_row_count_select(select: &Select) -> bool {
+fn is_unconditional_row_count_select(
+    select: &Select,
+    dialect: DialectKind,
+    rules: &ir::IdentifierRules,
+    pure_table_enabled: bool,
+) -> bool {
     if select.top.is_some()
         || select.into.is_some()
         || select.selection.is_some()
@@ -183,7 +202,7 @@ fn is_unconditional_row_count_select(select: &Select) -> bool {
         let Some(expr) = select_item_expr(item) else {
             return false;
         };
-        if is_unconditional_count_expr(expr) {
+        if is_unconditional_count_expr(expr, dialect, rules, pure_table_enabled) {
             has_count = true;
         } else if !is_non_null_scalar_literal(expr) {
             return false;
@@ -297,6 +316,7 @@ fn is_pure_existence_exists_query(select: &Select) -> bool {
 pub(crate) fn classify_query_read_mode(
     query: &Query,
     visitor: &AnalysisVisitor<'_>,
+    context: &AnalysisContext<'_>,
 ) -> ir::ReadMode {
     if query.with.is_some()
         || query.order_by.is_some()
@@ -314,7 +334,14 @@ pub(crate) fn classify_query_read_mode(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return ir::ReadMode::Data;
     };
-    if query.limit_clause.is_none() && is_unconditional_row_count_select(select) {
+    if query.limit_clause.is_none()
+        && is_unconditional_row_count_select(
+            select,
+            context.dialect,
+            context.rules,
+            context.pure_table_enabled,
+        )
+    {
         return ir::ReadMode::RowCount;
     }
     if is_pure_existence_select_with_limit(query, select) || is_pure_existence_exists_query(select)
@@ -4212,7 +4239,7 @@ pub(crate) fn analyze_statement(
         Statement::Query(query) => {
             let nested = collect_dml_in_query(query);
             let read_mode = if nested.is_empty() && visitor.select_into_count == 0 {
-                classify_query_read_mode(query, &visitor)
+                classify_query_read_mode(query, &visitor, &context)
             } else {
                 ir::ReadMode::Data
             };

@@ -2318,6 +2318,23 @@ tests =
             assertBool "COUNT(*) read S5 does not depend on UPDATE S4" (not (has (StatementId 4) slice))
             assertBool "COUNT(*) read S5 preserves CREATE TABLE S1" (has (StatementId 1) slice)
             assertBool "COUNT(*) read S5 preserves INSERT S2" (has (StatementId 2) slice)
+        , testCase "PostgreSQL quoted COUNT lookalikes preserve preceding UPDATEs" $ do
+            let script call =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT);"
+                        , "INSERT INTO t VALUES (10);"
+                        , "UPDATE t SET a = 1;"
+                        , "SELECT " <> call <> " FROM t;"
+                        ]
+                sliceFor call = backwardSlice (StatementId 4) <$> analyze PostgreSQL (script call)
+            builtin <- sliceFor "\"pg_catalog\".COUNT(1)"
+            assertBool "builtin only reads cardinality" (not (has (StatementId 3) builtin))
+            mapM_
+                ( \call -> do
+                    slice <- sliceFor call
+                    assertBool (BSC.unpack call <> " retains the preceding UPDATE") (has (StatementId 3) slice)
+                )
+                ["\"COUNT\"(1)", "\"PG_CATALOG\".count(1)", "pg_catalog.\"COUNT\"(1)"]
         , testCase "SELECT COUNT(*) does not depend on prior UPDATE even if subsequent INSERT exists" $ do
             let sql =
                     BSC.unlines

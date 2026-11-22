@@ -4153,6 +4153,61 @@ fn unconditional_and_filtered_update_scope() {
 }
 
 #[test]
+fn row_count_respects_routine_identifier_folding() {
+    for (dialect, call, expected) in [
+        (DialectKind::PostgreSql, "COUNT(1)", ReadMode::RowCount),
+        (DialectKind::PostgreSql, r#""count"(1)"#, ReadMode::RowCount),
+        (
+            DialectKind::PostgreSql,
+            r#""pg_catalog".COUNT(1)"#,
+            ReadMode::RowCount,
+        ),
+        (DialectKind::PostgreSql, r#""COUNT"(1)"#, ReadMode::Data),
+        (
+            DialectKind::PostgreSql,
+            r#""PG_CATALOG".count(1)"#,
+            ReadMode::Data,
+        ),
+        (
+            DialectKind::PostgreSql,
+            r#"pg_catalog."COUNT"(1)"#,
+            ReadMode::Data,
+        ),
+        (DialectKind::Redshift, r#""COUNT"(1)"#, ReadMode::Data),
+        (DialectKind::SQLite, r#""COUNT"(1)"#, ReadMode::RowCount),
+        (DialectKind::SQLite, "pg_catalog.count(1)", ReadMode::Data),
+    ] {
+        let sql = format!("SELECT {call} FROM t;");
+        let units = parse(&sql, dialect).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql} on {dialect:?}");
+        let query = facts(&units[0]);
+        assert_eq!(reads(query)[0].mode, expected, "{sql} on {dialect:?}");
+        assert_eq!(
+            has_routine_barrier(query),
+            expected == ReadMode::Data,
+            "{sql} on {dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn routine_ddl_disables_count_specialization() {
+    let select = "SELECT count(1) FROM t;";
+    for ddl in [
+        "CREATE FUNCTION count(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x';",
+        "CREATE AGGREGATE count(int) (SFUNC = int4pl, STYPE = int);",
+    ] {
+        let sql = format!("{ddl} {select}");
+        let units = parse(&sql, DialectKind::PostgreSql).unwrap();
+        assert_eq!(units.len(), 2, "{sql}");
+        assert!(units.iter().all(|unit| unit.parse_error.is_none()), "{sql}");
+        let query = facts(&units[1]);
+        assert_eq!(reads(query)[0].mode, ReadMode::Data, "{sql}");
+        assert!(has_routine_barrier(query), "{sql}");
+    }
+}
+
+#[test]
 fn read_mode_classification_row_count_and_existence() {
     let sql = "SELECT COUNT(*) FROM t;";
     let units = parse(sql, DialectKind::PostgreSql).unwrap();

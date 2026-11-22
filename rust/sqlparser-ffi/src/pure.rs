@@ -35,6 +35,7 @@ pub(super) fn is_routine_ddl(statement: &Statement) -> bool {
     matches!(
         statement,
         Statement::CreateFunction(_)
+            | Statement::CreateAggregate(_)
             | Statement::CreateProcedure { .. }
             | Statement::CreateMacro { .. }
             | Statement::DropFunction(_)

@@ -57,7 +57,12 @@ impl Visitor for SequenceVisitor<'_> {
                 // the routine fence; unknown, volatile, sequence-adjacent, and
                 // shadowed calls keep it. `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE`
                 // never fence (ignored root, populated only when unshadowed).
-                let is_unconditional_count = crate::actions::is_unconditional_count_expr(expr);
+                let is_unconditional_count = crate::actions::is_unconditional_count_expr(
+                    expr,
+                    self.dialect,
+                    self.rules,
+                    self.pure_table_enabled,
+                );
                 let ignored = is_unconditional_count
                     || AnalysisVisitor::in_ignored_function_root(
                         &self.ignored_function_roots,
