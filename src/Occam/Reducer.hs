@@ -55,8 +55,11 @@ import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
+    BarrierScope (GlobalScope),
     Ident (..),
     OracleOutcome (..),
+    ScopedBarrier (barrierScope),
+    SemanticFacts (factBarriers),
     SessionInit (..),
     Span (..),
     Statement (..),
@@ -931,27 +934,40 @@ reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence
                 analysis <- analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) initialSQL
                 sliceWithAnalysis logger pool analysis initialSQL
             else pure (initialSQL, Nothing)
+    -- A reusable analysis means slicing kept these exact bytes.
+    let useEarlyUnrestricted =
+            reductionClosure config
+                && reductionUnrestricted config
+                && maybe False hasGlobalBarrier reusableAnalysis
+    searchInput <-
+        if useEarlyUnrestricted then unrestrictedSearch sliced else pure sliced
     (searched, ()) <-
         if reductionClosure config
-            then timedReductionStage reporter logger StageClosureSearch sliced do
+            then timedReductionStage reporter logger StageClosureSearch searchInput do
                 analysis <-
                     case reusableAnalysis of
-                        Just cached -> pure cached
-                        Nothing -> analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) sliced
-                out <- closureSearchWithAnalysis logger pool sliced analysis
+                        Just cached | searchInput == sliced -> pure cached
+                        _ -> analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) searchInput
+                out <- closureSearchWithAnalysis logger pool searchInput analysis
                 pure (out, ())
-            else timedReductionStage reporter logger StageGraphFreeSearch sliced do
-                out <- statementDdmin (reductionDialect config) pool sliced
+            else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
+                out <- statementDdmin (reductionDialect config) pool searchInput
                 pure (out, ())
     fallback <-
-        if reductionClosure config && reductionUnrestricted config
-            then
-                fst <$> timedReductionStage reporter logger StageUnrestrictedFallback searched do
-                    out <- statementDdmin (reductionDialect config) pool searched
-                    pure (out, ())
+        if reductionClosure config
+            && reductionUnrestricted config
+            && (not useEarlyUnrestricted || searched /= searchInput)
+            then unrestrictedSearch searched
             else pure searched
     interleaveStages fallback
     where
+        hasGlobalBarrier = any (any ((== GlobalScope) . barrierScope) . factBarriers) . graphFacts . analyzedGraph
+
+        unrestrictedSearch sql =
+            fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do
+                out <- statementDdmin (reductionDialect config) pool sql
+                pure (out, ())
+
         interleaveStages base
             | Just evidence <- priorEvidence
             , evidenceBytes evidence == base =

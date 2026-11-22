@@ -24,7 +24,17 @@ The initial input must pass before reduction. The shared time and uncached-execu
 
 `stats.json`'s `evaluation_metrics` keeps reset timings distinct: `evaluation_preflight_reset_seconds` (initial/preflight), `evaluation_reset_seconds` (reduction), and `evaluation_validation_reset_seconds` (final validation); `evaluation_preflight_oracle_seconds` records initial predicate time. Sum reset phases once; unavailable optional preflight measurements serialize as `null`. If initial preflight consumes the execution cap, Occam reports `execution-budget`, performs no reduction/final calls, and preserves the accepted checkpoint.
 
-Concurrency accounting lives in `evaluation_metrics`: the job count is `evaluation_budget.evaluation_jobs` (no top-level echo); `evaluation_cancelled_observations` counts speculatively started tasks killed or dropped without producing an observation (never timeouts or errors); `evaluation_cache_joins` counts duplicate candidates coalesced onto one in-flight physical execution. `evaluation_oracle_attempts` counts every physical start including speculation; `evaluation_database_observations` counts actually spawned oracle processes. Top-level `stats.json` echoes cancellations as `cancelled_observations` and joins as `cache_joins`.
+Concurrency accounting lives in `evaluation_metrics`: the job count is `evaluation_budget.evaluation_jobs` (no top-level echo); `evaluation_cancelled_observations` counts speculatively started tasks killed or dropped without producing an observation (never timeouts or errors); `evaluation_cache_joins` counts duplicate candidates coalesced onto one in-flight physical execution. `evaluation_oracle_attempts` counts every physical start including speculation; `evaluation_database_observations` counts spawned oracle processes or started in-process database observations. Top-level `stats.json` echoes cancellations as `cancelled_observations` and joins as `cache_joins`.
+
+## In-process result oracle
+
+Use `--result-oracle --dialect sqlite` or `--result-oracle --dialect duckdb` to preserve the final query result of the original script. Each candidate runs in a fresh in-memory database. The oracle compares ordered rows, column names and value types. Use deterministic queries and `ORDER BY` to fix row order. SQLite starts with foreign keys off, matching the reducer's SQLite session model. The input can enable them with `PRAGMA foreign_keys = ON`. A result with zero rows still has columns. A script without a result set cannot seed a contract. DuckDB uses a dynamically loaded native library and reports unsupported result types rather than comparing a lossy conversion.
+
+```bash
+occam input.sql --dialect sqlite --result-oracle --out reduced.sql
+```
+
+Use an external `--oracle` for crash reduction, database state, external data sources, or other observations. The in-process engines restrict external data access and run inside Occam's process. The result oracle takes the place of both `--oracle` and `--reset`.
 
 ## Candidate state
 

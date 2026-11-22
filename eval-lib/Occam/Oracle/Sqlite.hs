@@ -6,18 +6,27 @@ module Occam.Oracle.Sqlite (
     SqliteError (..),
     loadSqliteContract,
     generateSqliteContract,
+    generateSqliteContractTimeout,
     executeSqliteCandidate,
     executeSqliteCandidateTimeout,
     executeSqliteCandidateDetailedTimeout,
     sqliteContractOracle,
     sqliteContractOracleTimeout,
     sqliteContractObservation,
+    sqliteContractObservationTimeout,
     splitStatements,
     sqlDataToValue,
 ) where
 
-import Control.Exception.Safe (SomeException, displayException, fromException, try)
-import Control.Monad (forM_, unless)
+import Control.Exception.Safe (
+    SomeException,
+    bracket,
+    displayException,
+    fromException,
+    throwIO,
+    try,
+ )
+import Control.Monad (forM)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -33,8 +42,7 @@ import Data.Aeson (
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.Char (isSpace)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Char (isSpace, toLower)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -43,22 +51,40 @@ import Database.SQLite3 (
     SQLError (..),
     Statement,
     StepResult (..),
+    columnCount,
+    columnName,
     columns,
     exec,
+    finalize,
     interruptibly,
     step,
     withDatabase,
-    withStatement,
+ )
+import Database.SQLite3.Bindings (CDatabase, CError (..), c_sqlite3_prepare_v2)
+import Database.SQLite3.Direct qualified as Direct
+import Foreign (
+    FunPtr,
+    Ptr,
+    alloca,
+    freeHaskellFunPtr,
+    minusPtr,
+    nullFunPtr,
+    nullPtr,
+    peek,
+    plusPtr,
  )
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..))
-import Occam.Core (Oracle, OracleOutcome (..))
-import Occam.Oracle (OracleObservation (..))
+import GHC.Float (castDoubleToWord64)
+import Occam.Core (Oracle)
+import Occam.Oracle (OracleObservation (..), observationOutcome)
+import Occam.Oracle.Result (ResultSet (..))
 import System.Exit (ExitCode (..))
 import System.Timeout (timeout)
 
 data SqliteContract = SqliteContract
     { contractExpectedRows :: ![[Value]]
+    , contractExpectedColumns :: ![Text]
     , contractStateSha256 :: !(Maybe Text)
     , contractCheckState :: !Bool
     }
@@ -68,6 +94,7 @@ instance FromJSON SqliteContract where
     parseJSON = withObject "SqliteContract" $ \o ->
         SqliteContract
             <$> o .: "expected_rows"
+            <*> o .: "expected_columns"
             <*> o .:? "state_sha256"
             <*> o .:? "check_state" .!= False
 
@@ -76,6 +103,7 @@ instance ToJSON SqliteContract where
     toJSON contract =
         object
             [ "expected_rows" .= contractExpectedRows contract
+            , "expected_columns" .= contractExpectedColumns contract
             , "state_sha256" .= contractStateSha256 contract
             , "check_state" .= contractCheckState contract
             ]
@@ -117,9 +145,9 @@ splitStatements sql = go (BSC.lines sql) "" []
 
 sqlDataToValue :: SQLData -> Value
 sqlDataToValue (SQLInteger n) = Number (fromIntegral n)
-sqlDataToValue (SQLFloat f) = toJSON f
+sqlDataToValue (SQLFloat f) = object ["float64_bits" .= castDoubleToWord64 f]
 sqlDataToValue (SQLText t) = String t
-sqlDataToValue (SQLBlob b) = String (TE.decodeUtf8 b)
+sqlDataToValue (SQLBlob b) = object ["blob" .= BS.unpack b]
 sqlDataToValue SQLNull = Null
 
 stepAll :: Statement -> IO [[Value]]
@@ -157,31 +185,87 @@ classifySqliteException err =
 
 -- | Execute candidate SQL against an in-memory SQLite database with timeout.
 executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteError [[Value]])
-executeSqliteCandidateDetailedTimeout micros sql = do
-    stmts <- splitStatements sql
-    res <-
-        try $
+executeSqliteCandidateDetailedTimeout micros sql =
+    fmap (maybe [] resultRows) <$> executeSqliteResult micros sql
+
+executeSqliteResult :: Int -> ByteString -> IO (Either SqliteError (Maybe ResultSet))
+executeSqliteResult micros sql
+    | BS.elem 0 sql = pure (Left (SqliteExecutionError "SQL contains a NUL byte"))
+    | Left err <- TE.decodeUtf8' sql = pure (Left (SqliteInfrastructureError (T.pack (show err))))
+    | otherwise = do
+        res <- try $
             withDatabase ":memory:" $ \db ->
-                interruptibly db $ do
-                    mRes <-
-                        timeout micros $ do
-                            exec db "PRAGMA foreign_keys = ON;"
-                            lastRowsRef <- newIORef []
-                            forM_ stmts $ \stmtBytes -> do
-                                let trimmed = trimBS stmtBytes
-                                unless (BSC.null trimmed) $ do
-                                    let stmtText = TE.decodeUtf8 trimmed
-                                    withStatement db stmtText $ \stmt -> do
-                                        cols <- stepAll stmt
-                                        unless (null cols) $
-                                            writeIORef lastRowsRef cols
-                            readIORef lastRowsRef
-                    pure $ case mRes of
-                        Nothing -> Left SqliteTimeout
-                        Just rows -> Right rows
-    pure $ case res of
-        Left (err :: SomeException) -> Left (classifySqliteException err)
-        Right inner -> inner
+                timeout micros $
+                    interruptibly db $ do
+                        -- Keep the engine baseline aligned with SQLite parser session defaults.
+                        exec db "PRAGMA foreign_keys = OFF;"
+                        withLocalStatements db $ BS.useAsCStringLen sql $ \(start, size) ->
+                            runStatements db (start `plusPtr` size) start Nothing
+        pure $ case res of
+            Left err -> Left (classifySqliteException err)
+            Right Nothing -> Left SqliteTimeout
+            Right (Just result) -> Right result
+
+type Authorizer = Ptr () -> CInt -> CString -> CString -> CString -> CString -> IO CInt
+
+foreign import ccall "wrapper" makeAuthorizer :: Authorizer -> IO (FunPtr Authorizer)
+
+foreign import ccall unsafe "sqlite3_set_authorizer"
+    setAuthorizer :: Ptr CDatabase -> FunPtr Authorizer -> Ptr () -> IO CInt
+
+-- NOTE: A fresh in-memory database still permits ATTACH and some process-wide
+-- PRAGMAs. Allow only database-local PRAGMAs here.
+withLocalStatements :: Direct.Database -> IO a -> IO a
+withLocalStatements (Direct.Database db) action =
+    bracket (makeAuthorizer authorize) freeHaskellFunPtr $ \callback ->
+        bracket (install callback) (const (install nullFunPtr)) (const action)
+    where
+        install callback = do
+            status <- setAuthorizer db callback nullPtr
+            if status == 0 then pure () else fail "Could not install SQLite authorizer"
+        authorize _ op arg _ _ _
+            | op == 19 && arg /= nullPtr = do
+                -- SQLITE_PRAGMA
+                pragma <- BSC.map toLower <$> BS.packCString arg
+                pure $
+                    if pragma `elem` ["foreign_keys", "defer_foreign_keys", "recursive_triggers", "user_version"]
+                        then 0
+                        else 1
+            | op `elem` [24, 25, 29] = pure 1 -- ATTACH, DETACH, CREATE VIRTUAL TABLE
+            | otherwise = pure 0
+
+-- SQLite supplies the unconsumed tail, including for trigger bodies and
+-- multiple statements on one line. Every prepared handle is finalized before
+-- the next statement starts.
+runStatements :: Direct.Database -> CString -> CString -> Maybe ResultSet -> IO (Maybe ResultSet)
+runStatements db@(Direct.Database handle) end start previous
+    | start == end = pure previous
+    | otherwise = do
+        (next, result) <- bracket prepare release $ \(tailPtr, statement) -> do
+            observed <- case statement of
+                Nothing -> pure previous
+                Just stmt -> do
+                    count <- columnCount stmt
+                    names <- forM [0 .. count - 1] $ \i -> do
+                        name <- columnName stmt i
+                        maybe (fail "SQLite omitted a result column name") pure name
+                    rows <- stepAll stmt
+                    pure (if null names then previous else Just (ResultSet names [] rows))
+            pure (tailPtr, observed)
+        runStatements db end next result
+    where
+        prepare = alloca $ \out -> alloca $ \tailOut -> do
+            CError status <- c_sqlite3_prepare_v2 handle start (fromIntegral (end `minusPtr` start)) out tailOut
+            if status /= 0
+                then do
+                    code <- Direct.errcode db
+                    Direct.Utf8 message <- Direct.errmsg db
+                    throwIO (SQLError code (TE.decodeUtf8 message) "prepare")
+                else do
+                    next <- peek tailOut
+                    stmt <- peek out
+                    pure (next, if stmt == nullPtr then Nothing else Just (Direct.Statement stmt))
+        release (_, statement) = mapM_ finalize statement
 
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidateTimeout micros sql = do
@@ -197,41 +281,48 @@ executeSqliteCandidate = executeSqliteCandidateTimeout defaultCandidateTimeoutMi
 
 -- | Generate a contract by executing an authoritative SQL script.
 generateSqliteContract :: ByteString -> IO (Either Text SqliteContract)
-generateSqliteContract sql = do
-    res <- executeSqliteCandidate sql
+generateSqliteContract = generateSqliteContractTimeout defaultCandidateTimeoutMicros
+
+generateSqliteContractTimeout :: Int -> ByteString -> IO (Either Text SqliteContract)
+generateSqliteContractTimeout micros sql = do
+    res <- executeSqliteResult micros sql
     pure $ case res of
-        Left err -> Left err
-        Right rows ->
+        Left SqliteTimeout -> Left "timeout"
+        Left (SqliteExecutionError err) -> Left err
+        Left (SqliteInfrastructureError err) -> Left err
+        Right Nothing -> Left "Input must produce a result set"
+        Right (Just result) ->
             Right
                 SqliteContract
-                    { contractExpectedRows = rows
+                    { contractExpectedRows = resultRows result
+                    , contractExpectedColumns = resultColumns result
                     , contractStateSha256 = Nothing
                     , contractCheckState = False
                     }
 
--- | In-process contract oracle for SQLite candidate reduction.
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
-sqliteContractOracleTimeout micros contract candidate = do
-    res <- executeSqliteCandidateDetailedTimeout micros candidate
-    case res of
-        Left SqliteTimeout -> pure OracleInconclusive
-        Left (SqliteInfrastructureError _) -> pure OracleInconclusive
-        Left (SqliteExecutionError _) -> pure OracleRejected
-        Right rows
-            | rows == contractExpectedRows contract -> pure OracleAccepted
-            | otherwise -> pure OracleRejected
+sqliteContractOracleTimeout micros contract candidate =
+    observationOutcome <$> sqliteContractObservationTimeout micros contract candidate
 
 sqliteContractOracle :: SqliteContract -> Oracle
 sqliteContractOracle = sqliteContractOracleTimeout defaultCandidateTimeoutMicros
 
--- | Observation adapter that preserves timeout and execution-error semantics.
 sqliteContractObservation :: SqliteContract -> ByteString -> IO OracleObservation
-sqliteContractObservation contract candidate = do
-    res <- executeSqliteCandidateDetailedTimeout defaultCandidateTimeoutMicros candidate
-    pure $ case res of
-        Left SqliteTimeout -> OracleTimedOut
-        Left (SqliteExecutionError err) -> OracleIOFailed err
-        Left (SqliteInfrastructureError err) -> OracleIOFailed err
-        Right rows
-            | rows == contractExpectedRows contract -> OracleFinished ExitSuccess
-            | otherwise -> OracleFinished (ExitFailure 1)
+sqliteContractObservation = sqliteContractObservationTimeout defaultCandidateTimeoutMicros
+
+sqliteContractObservationTimeout :: Int -> SqliteContract -> ByteString -> IO OracleObservation
+sqliteContractObservationTimeout micros contract candidate
+    -- TODO: Define a reproducible database-state observation before accepting state contracts.
+    | contractCheckState contract || contractStateSha256 contract /= Nothing =
+        pure (OracleIOFailed "SQLite state contracts are unsupported")
+    | otherwise = do
+        res <- executeSqliteResult micros candidate
+        pure $ case res of
+            Left SqliteTimeout -> OracleTimedOut
+            Left (SqliteExecutionError _) -> OracleFinished (ExitFailure 1)
+            Left (SqliteInfrastructureError err) -> OracleIOFailed err
+            Right observed
+                | observed == Just expected -> OracleFinished ExitSuccess
+                | otherwise -> OracleFinished (ExitFailure 1)
+    where
+        expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)

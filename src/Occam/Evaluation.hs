@@ -1,6 +1,7 @@
 module Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationObserver,
     EvaluationPoint (..),
     EvaluationProgress (..),
     EvaluationRequest (..),
@@ -16,6 +17,7 @@ module Occam.Evaluation (
     runEvaluatedReduction,
     runEvaluatedReductionWithProgress,
     runEvaluationRequest,
+    runEvaluationRequestWithObserver,
     sqlDialectName,
 ) where
 
@@ -63,7 +65,6 @@ import Occam.Metrics (
  )
 import Occam.Oracle (
     OracleConfig (..),
-    OracleContext (..),
     OracleObservation (..),
     OracleObservationDetails (..),
     OracleReapFailed (..),
@@ -317,12 +318,14 @@ data ReductionActionResult = ReductionActionResult
 type ReductionAction = StageReporter -> Logger -> OraclePool -> IO ReductionActionResult
 
 -- | All inputs for one evaluated reduction run.
-data EvaluationRequest = EvaluationRequest
+type EvaluationObserver = IO () -> ByteString -> IO OracleObservationDetails
+
+data EvaluationRequest oracle = EvaluationRequest
     { requestOnProgress :: !(EvaluationProgress -> IO ())
     , requestMetricsPolicy :: !(Maybe MetricPolicy)
     , requestConfig :: !EvaluationConfig
     , requestDialect :: !SQLDialect
-    , requestOracleConfig :: !OracleConfig
+    , requestOracleConfig :: !oracle
     , requestPreflightObservation :: !(Maybe OracleObservation)
     , requestLogger :: !Logger
     , requestInitialSQL :: !ByteString
@@ -392,13 +395,20 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
             , requestAction = action
             }
 
-runEvaluationRequest :: EvaluationRequest -> IO EvaluationResult
-runEvaluationRequest EvaluationRequest {..} = do
+runEvaluationRequest :: EvaluationRequest OracleConfig -> IO EvaluationResult
+runEvaluationRequest request = do
+    let config = requestOracleConfig request
+    context <- resolveOracleContext config
+    let observe started = observeExternalOracleDetailedWithContext started config context
+    runEvaluationRequestWithObserver (oracleTimeoutMicros config) observe request
+
+runEvaluationRequestWithObserver ::
+    Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
+runEvaluationRequestWithObserver timeoutMicros observe EvaluationRequest {..} = do
     let onProgress = requestOnProgress
         metricsPolicy = requestMetricsPolicy
         config = requestConfig
         dialect = requestDialect
-        oracleCfg = requestOracleConfig
         preflightObservation = requestPreflightObservation
         parentLogger = requestLogger
         initialSQL = requestInitialSQL
@@ -418,8 +428,7 @@ runEvaluationRequest EvaluationRequest {..} = do
                 Right count -> Map.singleton initialSQL count
     state <- newIORef (initialEvalState initialSQL seedCounts)
     writeAtomicBytes checkpoint initialSQL
-    oracleCtx <- resolveOracleContext oracleCfg
-    let oracleTimeout = max 1 (toInteger (oracleTimeoutMicros oracleCfg))
+    let oracleTimeout = max 1 (toInteger timeoutMicros)
         validationSlack = max 1000 (min 10000 (oracleTimeout `div` 100))
         perValidationReserve = oracleTimeout + validationSlack
         remainingCalls =
@@ -452,10 +461,7 @@ runEvaluationRequest EvaluationRequest {..} = do
                 , poolPrecomputed = precomputedObservations
                 , poolMetrics = metricsStore
                 , poolExecute =
-                    observeExternalOracleDetailedWithContext
-                        (modifyEvalState state (\s -> s {evalDatabase = evalDatabase s + 1}))
-                        oracleCfg
-                        oracleCtx
+                    observe (modifyEvalState state (\s -> s {evalDatabase = evalDatabase s + 1}))
                 , poolBill = recordReductionObservation state
                 , poolRetire = retireCandidate onProgress reductionStart checkpoint state
                 , poolReportCount =
@@ -466,8 +472,7 @@ runEvaluationRequest EvaluationRequest {..} = do
         env =
             EvalEnv
                 { envDialect = dialect
-                , envOracleCfg = oracleCfg
-                , envOracleCtx = oracleCtx
+                , envObserve = observe
                 , envLogger = parentLogger
                 , envReductionStart = reductionStart
                 , envTotalDeadline = totalDeadline
@@ -670,8 +675,7 @@ modifyEvalState ref f = atomicModifyIORef' ref (\s -> (f s, ()))
 -- | Static phase environment: handles, clocks, and budgets fixed at setup.
 data EvalEnv = EvalEnv
     { envDialect :: !SQLDialect
-    , envOracleCfg :: !OracleConfig
-    , envOracleCtx :: !OracleContext
+    , envObserve :: !EvaluationObserver
     , envLogger :: !Logger
     , envReductionStart :: !Ticks
     , envTotalDeadline :: !(Maybe Ticks)
@@ -814,10 +818,9 @@ runValidationPhase env state finalSQL skipValidation callLimit
                         _ -> do
                             modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
                             let observe =
-                                    observeExternalOracleDetailedWithContext
+                                    envObserve
+                                        env
                                         (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
-                                        (envOracleCfg env)
-                                        (envOracleCtx env)
                                         candidate
                             result <-
                                 case remainingMicros of

@@ -33,10 +33,13 @@ import Occam.Pool (
 import Occam.Reducer (
     ColumnMode (..),
     ReductionConfig (..),
+    ReductionStage (..),
+    StageEvent (..),
     defaultReductionConfig,
     findInterestingPrefix,
     reduceSQL,
     reduceSQLWithConfig,
+    reduceSQLWithEvidence,
     statementAudit,
     statementDdmin,
  )
@@ -83,6 +86,19 @@ tests =
                 (BSC.pack "SELECT id FROM \"mixed\";\n")
                 postgres
             assertEqual "SQLite folds quoted identifiers for closure" sql sqlite
+        , testCase "An unchanged globally fenced slice tries unrestricted deletion before closure" $ do
+            let sql = "CREATE TABLE noise (id INT); SELECT sum(1);"
+                config = defaultReductionConfig {reductionDialect = SQLite}
+            pool <- predicatePool (BSC.isInfixOf "SELECT sum(1)")
+            stages <- newIORef []
+            let report (StageStarted stage) = modifyIORef' stages (stage :)
+                report StageFinished {} = pure ()
+            _ <- reduceSQLWithEvidence report config nullLogger pool sql
+            started <- reverse <$> readIORef stages
+            assertEqual
+                "ordinary deletion should get the first search window after slicing"
+                [StageSlicing, StageUnrestrictedFallback, StageClosureSearch]
+                (take 3 started)
         , testCase "Closure search prunes unneeded independent subgraphs" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)

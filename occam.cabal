@@ -130,10 +130,16 @@ executable occam
     import:           warnings, language, core-deps, io-deps, rts-threaded
     main-is:          Main.hs
     other-modules:    Completion
+                    , Occam.Oracle.Result
+                    , Occam.Oracle.Sqlite
+                    , Occam.Oracle.DuckDB
     build-depends:    occam
                     , time
                     , optparse-applicative >= 0.17 && < 0.20
-    hs-source-dirs:   app
+                    , direct-sqlite >= 2.3 && < 2.4
+                    , safe-exceptions >= 0.1 && < 0.2
+    c-sources:        eval-lib/cbits/duckdb_result.c
+    hs-source-dirs:   app eval-lib
 
 test-suite occam-fuzz
     import:           warnings, language, core-deps, rts-threaded
@@ -152,6 +158,7 @@ test-suite occam-fuzz
 test-suite occam-test
     import:           warnings, language, core-deps, io-deps, rts-threaded
     type:             exitcode-stdio-1.0
+    c-sources:        eval-lib/cbits/duckdb_result.c
     hs-source-dirs:   test eval-lib
     other-modules:    Fuzz
                     , MutationalFuzz
@@ -163,6 +170,7 @@ test-suite occam-test
                     , PoolChecks
                     , PoolMetricsChecks
                     , ReductionChecks
+                    , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
                     , Occam.Oracle.DuckDB
                     , Occam.Benchmark.Metrics
@@ -181,8 +189,10 @@ test-suite occam-test
 benchmark occam-bench
     import:           warnings, language, core-deps, io-deps, rts-bench
     type:             exitcode-stdio-1.0
+    c-sources:        eval-lib/cbits/duckdb_result.c
     hs-source-dirs:   bench eval-lib
-    other-modules:    Occam.Oracle.Sqlite
+    other-modules:    Occam.Oracle.Result
+                    , Occam.Oracle.Sqlite
                     , Occam.Oracle.DuckDB
                     , Paths_occam
     autogen-modules:  Paths_occam

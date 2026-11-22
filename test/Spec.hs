@@ -81,6 +81,7 @@ import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
 import Occam.Oracle.DuckDB (
     DuckDBContract (..),
     duckdbContractObservation,
+    duckdbContractObservationTimeout,
     duckdbContractOracle,
     executeDuckDBCandidate,
     generateDuckDBContract,
@@ -91,6 +92,7 @@ import Occam.Oracle.Sqlite (
     generateSqliteContract,
     splitStatements,
     sqliteContractObservation,
+    sqliteContractObservationTimeout,
     sqliteContractOracle,
  )
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, dialectName, parseSQL)
@@ -458,7 +460,7 @@ phase5Tests =
             assertEqual "help must exit zero" ExitSuccess helpCode
             assertEqual
                 "usage and options should appear before any explanatory text"
-                ["Usage: occam INPUT.sql --oracle COMMAND [OPTIONS]", "", "Available options:"]
+                ["Usage: occam INPUT.sql (--oracle COMMAND | --result-oracle) [OPTIONS]", "", "Available options:"]
                 (take 3 (lines helpOut))
             assertEqual
                 "input, oracle, and output should be listed first"
@@ -473,6 +475,15 @@ phase5Tests =
                      in assertBool ("--list-dialects hides dialect: " ++ name) (name `elem` words dialects)
                 )
                 ([minBound .. maxBound] :: [SQLDialect])
+        , testCase "native result oracle removes irrelevant statements through the CLI" $
+            withCLIInput "CREATE TABLE noise (x INT); SELECT 42 AS answer;" $ \input _ ->
+                mapM_
+                    ( \dialect -> do
+                        (code, out, err) <- runOccamCLI [input, "--dialect", dialect, "--result-oracle", "--quiet"]
+                        assertEqual err ExitSuccess code
+                        assertEqual "only the result-producing statement remains" "SELECT 42 AS answer;" out
+                    )
+                    ["sqlite", "duckdb"]
         , testCase "default stdout includes the best reduction under a two-call budget" $
             withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
                 let predicate = "grep -q 'SELECT 2'"
@@ -1095,18 +1106,47 @@ sqliteOracleTests =
                     assertEqual "mismatched query rejects" OracleRejected o3
                     o4 <- oracle ""
                     assertEqual "empty candidate rejects" OracleRejected o4
-        , testCase "sqliteContractObservation keeps execution errors distinct from rejection" $ do
+        , testCase "SQLite preserves an empty final result and its column names" $ do
+            let sql = "SELECT 1 AS earlier; SELECT 2 AS answer WHERE FALSE;"
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    let oracle = sqliteContractOracle contract
+                    empty <- oracle "SELECT 2 AS answer WHERE FALSE;"
+                    dropped <- oracle "SELECT 1 AS earlier;"
+                    renamed <- oracle "SELECT 2 AS other WHERE FALSE;"
+                    noResult <- oracle "CREATE TABLE x (a INT);"
+                    assertEqual "earlier result is irrelevant" OracleAccepted empty
+                    assertEqual "dropping final result changes the observation" OracleRejected dropped
+                    assertEqual "renaming an empty result column changes the observation" OracleRejected renamed
+                    assertEqual "a script without a result set is distinct" OracleRejected noResult
+        , testCase "SQLite compares value storage types without lossy JSON coercion" $ do
+            result <- generateSqliteContract "SELECT x'ff' AS blob_value, 1.0 AS float_value;"
+            case result of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    changed <- sqliteContractOracle contract "SELECT x'ff' AS blob_value, 1 AS float_value;"
+                    assertEqual "REAL and INTEGER remain different" OracleRejected changed
+        , testCase "SQLite interrupts a long-running inline query" $ do
+            result <- generateSqliteContract "SELECT 1 AS a;"
+            case result of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    observed <-
+                        sqliteContractObservationTimeout
+                            20000
+                            contract
+                            "WITH RECURSIVE t(i) AS (VALUES (0) UNION ALL SELECT i+1 FROM t WHERE i<1000000000) SELECT sum(i) AS a FROM t;"
+                    assertEqual "candidate reaches its per-probe timeout" OracleTimedOut observed
+        , testCase "sqliteContractObservation rejects candidate SQL errors" $ do
             let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
             contractRes <- generateSqliteContract sql
             case contractRes of
                 Left err -> assertFailure (T.unpack err)
                 Right contract -> do
                     observation <- sqliteContractObservation contract "SYNTAX ERROR;"
-                    case observation of
-                        OracleIOFailed err ->
-                            assertBool "error detail is preserved" (not (T.null err))
-                        other ->
-                            assertFailure ("expected OracleIOFailed, got " ++ show other)
+                    assertEqual "SQL error is a definite rejection" (OracleFinished (ExitFailure 1)) observation
         , testCase "sqliteContractOracle treats non-SQL execution faults as inconclusive" $ do
             let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
                 invalidUtf8 = BS.pack [0x53, 0x45, 0x4c, 0x45, 0x43, 0x54, 0x20, 0xff, 0x3b]
@@ -1176,7 +1216,42 @@ duckdbOracleTests =
                     assertEqual "mismatched query rejects" OracleRejected o3
                     o4 <- oracle ""
                     assertEqual "empty candidate rejects" OracleRejected o4
-        , testCase "duckdbContractObservation keeps execution errors distinct from rejection" $ do
+        , testCase "DuckDB preserves an empty final result and its column names" $ do
+            let sql = "SELECT 1 AS earlier; SELECT 2 AS answer WHERE FALSE;"
+            contractRes <- generateDuckDBContract sql
+            case contractRes of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    let oracle = duckdbContractOracle contract
+                    empty <- oracle "SELECT 2 AS answer WHERE FALSE;"
+                    dropped <- oracle "SELECT 1 AS earlier;"
+                    renamed <- oracle "SELECT 2 AS other WHERE FALSE;"
+                    noResult <- oracle "CREATE TABLE x (a INT);"
+                    assertEqual "earlier result is irrelevant" OracleAccepted empty
+                    assertEqual "dropping final result changes the observation" OracleRejected dropped
+                    assertEqual "renaming an empty result column changes the observation" OracleRejected renamed
+                    assertEqual "a script without a result set is distinct" OracleRejected noResult
+        , testCase "DuckDB preserves typed rows and string bytes after a NUL" $ do
+            result <- generateDuckDBContract "SELECT 'a' || chr(0) || 'b' AS s, NULL::BIGINT AS v;"
+            case result of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    changed <- duckdbContractOracle contract "SELECT 'a' || chr(0) || 'c' AS s, NULL::BIGINT AS v;"
+                    retyped <- duckdbContractOracle contract "SELECT 'a' || chr(0) || 'b' AS s, NULL::INTEGER AS v;"
+                    assertEqual "preserve bytes following the NUL" OracleRejected changed
+                    assertEqual "preserve column types for NULL values" OracleRejected retyped
+        , testCase "DuckDB interrupts a long-running inline query" $ do
+            result <- generateDuckDBContract "SELECT 1 AS a;"
+            case result of
+                Left err -> assertFailure (T.unpack err)
+                Right contract -> do
+                    observed <-
+                        duckdbContractObservationTimeout
+                            20000
+                            contract
+                            "SELECT sum(sin(i)) AS a FROM range(1000000000) t(i);"
+                    assertEqual "candidate reaches its per-probe timeout" OracleTimedOut observed
+        , testCase "duckdbContractObservation rejects candidate SQL errors" $ do
             available <- isDuckDBAvailable
             assertBool "DuckDB library must be detected and available" available
             let sql = "CREATE TABLE t (a INT);\nSELECT * FROM t;"
@@ -1185,11 +1260,7 @@ duckdbOracleTests =
                 Left err -> assertFailure (T.unpack err)
                 Right contract -> do
                     observation <- duckdbContractObservation contract "SYNTAX ERROR;"
-                    case observation of
-                        OracleIOFailed err ->
-                            assertBool "error detail is preserved" (not (T.null err))
-                        other ->
-                            assertFailure ("expected OracleIOFailed, got " ++ show other)
+                    assertEqual "SQL error is a definite rejection" (OracleFinished (ExitFailure 1)) observation
         , testCase "in-process DuckDB reduction removes dead noise table and dead macro" $ do
             available <- isDuckDBAvailable
             assertBool "DuckDB library must be detected and available" available

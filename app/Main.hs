@@ -22,6 +22,7 @@ import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationObserver,
     EvaluationRequest (..),
     EvaluationResult (..),
     EvaluationStatus (..),
@@ -29,7 +30,7 @@ import Occam.Evaluation (
     Stats (..),
     metricPolicyForReduction,
     parseSQLDialect,
-    runEvaluationRequest,
+    runEvaluationRequestWithObserver,
     sqlDialectName,
  )
 import Occam.Logger (
@@ -43,12 +44,16 @@ import Occam.Logger (
     withLogger,
  )
 import Occam.Oracle (
-    OracleConfig (..),
+    OracleObservation (OracleFinished),
     OracleObservationDetails (..),
+    observeExternalOracleDetailedWithContext,
     prepareOracle,
+    resolveOracleContext,
     shellOracleConfig,
     withCandidateWorkdir,
  )
+import Occam.Oracle.DuckDB (duckdbContractObservationTimeout, generateDuckDBContractTimeout)
+import Occam.Oracle.Sqlite (generateSqliteContractTimeout, sqliteContractObservationTimeout)
 import Occam.Parser (
     ParseOptions (..),
     ParserError (..),
@@ -188,6 +193,7 @@ data RawOptions = RawOptions
     { rawInputFile :: !FilePath
     , rawOracleCmd :: !(Maybe String)
     , rawOut :: !(Maybe FilePath)
+    , rawResultOracle :: !Bool
     , rawInPlace :: !Bool
     , rawStatsFile :: !(Maybe FilePath)
     , rawResetCmd :: !(Maybe String)
@@ -219,6 +225,7 @@ defaultRawOptions =
     RawOptions
         { rawInputFile = "INPUT.sql"
         , rawOracleCmd = Nothing
+        , rawResultOracle = False
         , rawOut = Nothing
         , rawInPlace = False
         , rawStatsFile = Nothing
@@ -253,6 +260,7 @@ defaultLogLevelForFormat FormatText = getSpecified (rawLogLevel defaultRawOption
 data ValidatedOptions = ValidatedOptions
     { valInputFile :: !FilePath
     , valOracleCmd :: !(Maybe String)
+    , valResultOracle :: !Bool
     , valOut :: !(Maybe FilePath)
     , valInPlace :: !Bool
     , valStatsFile :: !(Maybe FilePath)
@@ -294,6 +302,12 @@ validateCliOptions RawOptions {..} = do
 
     when (rawInPlace && rawInputFile == "-") $
         Left "Cannot modify stdin in place (--in-place with '-' input)"
+
+    when rawResultOracle $ do
+        when (isJust rawOracleCmd || isJust rawResetCmd) $
+            Left "--result-oracle cannot be combined with --oracle or --reset"
+        when (rawDialect /= SQLite && rawDialect /= DuckDB) $
+            Left "--result-oracle requires --dialect sqlite or duckdb"
 
     -- 2. Strategy conflicts
     case rawStrategy of
@@ -369,6 +383,7 @@ validateCliOptions RawOptions {..} = do
         ValidatedOptions
             { valInputFile = rawInputFile
             , valOracleCmd = rawOracleCmd
+            , valResultOracle = rawResultOracle
             , valOut = rawOut
             , valInPlace = rawInPlace
             , valStatsFile = rawStatsFile
@@ -455,6 +470,10 @@ rawOptionsParser =
                     <> help "Write SQL to PATH, or '-' for stdout (default)"
                     <> action "file"
                 )
+            )
+        <*> switch
+            ( long "result-oracle"
+                <> help "Preserve query results with SQLite or DuckDB"
             )
         <*> switch
             ( long "in-place"
@@ -733,7 +752,10 @@ main = do
     where
         compactUsage helpText
             | isEmpty (helpUsage helpText) = helpText
-            | otherwise = helpText {helpUsage = stringChunk "Usage: occam INPUT.sql --oracle COMMAND [OPTIONS]"}
+            | otherwise =
+                helpText
+                    { helpUsage = stringChunk "Usage: occam INPUT.sql (--oracle COMMAND | --result-oracle) [OPTIONS]"
+                    }
 
 runAction :: Action -> IO ()
 runAction (ActionCompletion shell) = do
@@ -815,7 +837,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         dumpStatementFacts valDialect valDumpFactsFkOn valInputFile
         exitSuccess
 
-    oracleCmd <- requireOracleCommand valOracleCmd
+    oracleCmd <- if valResultOracle then pure Nothing else Just <$> requireOracleCommand valOracleCmd
     (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
 
     (writeToStdout, targetMinimalPath, statsPath) <-
@@ -833,8 +855,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 , uiUseColor = useColor
                 }
 
-    let baseOracleConfig =
-            shellOracleConfig oracleCmd (round (valTimeoutSecs * 1000000)) valResetCmd
+    let timeoutMicros = round (valTimeoutSecs * 1000000)
         reductionConfig =
             buildReductionConfig
                 valSlicing
@@ -858,10 +879,18 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         ]
 
     let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
-    (initialStart, initialEnd, preflightDetails, preflightMicros) <-
-        runPreflight baseOracleConfig initialSQL totalBudgetMicros
-    let oracleCfg = baseOracleConfig
-        budgetConfig =
+    (initialStart, initialEnd, preflightDetails, observer, preflightMicros) <-
+        runPreflight totalBudgetMicros $ case oracleCmd of
+            Nothing -> prepareResultOracle valDialect timeoutMicros initialSQL
+            Just command -> do
+                let config = shellOracleConfig command timeoutMicros valResetCmd
+                prepared <- prepareOracle config initialSQL
+                case prepared of
+                    Left err -> pure (Left err)
+                    Right details -> do
+                        context <- resolveOracleContext config
+                        pure (Right (details, \started -> observeExternalOracleDetailedWithContext started config context))
+    let budgetConfig =
             configuredBudget
                 { evaluationPreflightMicros = preflightMicros
                 , evaluationPreflightAttempts = 1
@@ -876,7 +905,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("initial_bytes", toJSON initialBytes)
         ]
 
-    when (valJobs > 1 && isNothing valResetCmd) do
+    when (valJobs > 1 && isNothing valResetCmd && not valResultOracle) do
         logWarn
             logger
             "cli"
@@ -912,13 +941,15 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     result <-
         withCandidateWorkdir $ \tmpDir -> do
             let checkpointPath = tmpDir </> "occam-checkpoint.sql"
-            runEvaluationRequest
+            runEvaluationRequestWithObserver
+                timeoutMicros
+                observer
                 EvaluationRequest
                     { requestOnProgress = uiOnProgress ui
                     , requestMetricsPolicy = metricsPolicy
                     , requestConfig = budgetConfig
                     , requestDialect = valDialect
-                    , requestOracleConfig = oracleCfg
+                    , requestOracleConfig = ()
                     , requestPreflightObservation = Just (detailedObservation preflightDetails)
                     , requestLogger = logger
                     , requestInitialSQL = initialSQL
@@ -1023,7 +1054,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
 requireOracleCommand :: Maybe String -> IO String
 requireOracleCommand (Just command) = pure command
 requireOracleCommand Nothing = do
-    hPutStrLn stderr "error: --oracle COMMAND is required (unless --dump-facts is given)"
+    hPutStrLn stderr "error: specify --oracle COMMAND or --result-oracle"
     hPutStrLn stderr " note: specify predicate with -c or --oracle (e.g. -c './check.sh')"
     exitCliError
 
@@ -1070,26 +1101,50 @@ buildBudgetConfig cacheEnabled jobs budgetSecs maxExecutions initialStmts =
         , evaluationInitialStatements = Just initialStmts
         }
 
-runPreflight ::
-    OracleConfig ->
+prepareResultOracle ::
+    SQLDialect ->
+    Int ->
     BS.ByteString ->
+    IO (Either Text (OracleObservationDetails, EvaluationObserver))
+prepareResultOracle dialect micros sql = do
+    start <- getMonotonicTimeNSec
+    prepared <- case dialect of
+        SQLite -> fmap (sqliteContractObservationTimeout micros) <$> generateSqliteContractTimeout micros sql
+        DuckDB -> fmap (duckdbContractObservationTimeout micros) <$> generateDuckDBContractTimeout micros sql
+        _ -> pure (Left "Result oracle requires SQLite or DuckDB")
+    end <- getMonotonicTimeNSec
+    pure $ do
+        observe <- prepared
+        let details =
+                OracleObservationDetails
+                    (OracleFinished ExitSuccess)
+                    (elapsed start end)
+                    0
+                    (Just (elapsed start end))
+        pure (details, timeObservation observe)
+    where
+        elapsed start end = fromIntegral ((end - start) `div` 1000)
+        timeObservation observe started candidate = do
+            start <- getMonotonicTimeNSec
+            _ <- started
+            observation <- observe candidate
+            end <- getMonotonicTimeNSec
+            pure (OracleObservationDetails observation (elapsed start end) 0 (Just (elapsed start end)))
+
+runPreflight ::
     Maybe Integer ->
-    IO (UTCTime, UTCTime, OracleObservationDetails, Int)
-runPreflight oracleCfg initialSQL totalBudgetMicros = do
+    IO (Either Text (OracleObservationDetails, EvaluationObserver)) ->
+    IO (UTCTime, UTCTime, OracleObservationDetails, EvaluationObserver, Int)
+runPreflight totalBudgetMicros prepare = do
     initialStart <- getCurrentTime
     preflightStart <- toInteger <$> getMonotonicTimeNSec
-    prepared <-
-        runWithinBudget
-            preflightStart
-            totalBudgetMicros
-            (prepareOracle oracleCfg initialSQL)
-    details <- case prepared of
+    prepared <- runWithinBudget preflightStart totalBudgetMicros prepare
+    (details, observer) <- case prepared of
         Nothing -> do
             hPutStrLn stderr "error: initial predicate check exceeded the total budget"
             exitTimeout
         Just (Left err) -> do
             hPutStrLn stderr ("error: initial predicate check failed: " ++ T.unpack err)
-            hPutStrLn stderr " note: oracle command rejected the original unreduced SQL input"
             exitFailure
         Just (Right checked) -> pure checked
     preflightEnd <- toInteger <$> getMonotonicTimeNSec
@@ -1097,7 +1152,7 @@ runPreflight oracleCfg initialSQL totalBudgetMicros = do
     let micros =
             fromInteger
                 (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
-    pure (initialStart, initialEnd, details, micros)
+    pure (initialStart, initialEnd, details, observer, micros)
 
 resolveOutputTargets ::
     FilePath ->

@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -7,18 +8,31 @@ module Occam.Oracle.DuckDB (
     DuckDBError (..),
     loadDuckDBContract,
     generateDuckDBContract,
+    generateDuckDBContractTimeout,
     executeDuckDBCandidate,
     executeDuckDBCandidateTimeout,
     executeDuckDBCandidateDetailedTimeout,
     duckdbContractOracle,
     duckdbContractOracleTimeout,
     duckdbContractObservation,
+    duckdbContractObservationTimeout,
     isDuckDBAvailable,
     defaultDuckDBCandidateTimeoutMicros,
 ) where
 
+import Control.Concurrent (
+    forkIO,
+    forkIOWithUnmask,
+    killThread,
+    newEmptyMVar,
+    putMVar,
+    readMVar,
+    threadDelay,
+    tryReadMVar,
+ )
+import Control.Exception qualified as Exception
 import Control.Exception.Safe (SomeException, bracket, displayException, try)
-import Control.Monad (filterM, forM)
+import Control.Monad (filterM, forM, when)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -31,32 +45,33 @@ import Data.Aeson (
     (.:?),
     (.=),
  )
+import Data.Bits (shiftL)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.Int (Int64)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Int (Int16, Int32, Int64, Int8)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Word (Word64)
-import Foreign.C.String (CString, peekCString)
-import Foreign.C.Types (CBool (..), CInt (..))
+import Data.Word (Word16, Word32, Word64, Word8)
+import Foreign.C.String (CString, peekCString, withCString)
+import Foreign.C.Types (CBool (..), CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullPtr)
-import Foreign.Storable (Storable (..))
-import Occam.Core (Oracle, OracleOutcome (..))
-import Occam.Oracle (OracleObservation (..))
+import Foreign.Storable (Storable, peek, peekByteOff, peekElemOff, poke)
+import GHC.Float (castDoubleToWord64)
+import Occam.Core (Oracle)
+import Occam.Oracle (OracleObservation (..), observationOutcome)
+import Occam.Oracle.Result (ResultSet (..))
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
-import Text.Read (readMaybe)
 
 #if defined(mingw32_HOST_OS)
-import Foreign.C.String (withCString)
 import Foreign.Ptr (nullFunPtr)
 
 foreign import ccall "windows.h LoadLibraryA"
@@ -82,32 +97,26 @@ type DuckdbExtractedStatements = Ptr ()
 type IdxT = Word64
 
 data DuckDBResult
-    = DuckDBResult
-        !IdxT
-        !IdxT
-        !IdxT
-        !(Ptr ())
-        !CString
-        !(Ptr ())
 
-instance Storable DuckDBResult where
-    sizeOf _ = 48
-    alignment _ = 8
-    peek p =
-        DuckDBResult
-            <$> peekByteOff p 0
-            <*> peekByteOff p 8
-            <*> peekByteOff p 16
-            <*> peekByteOff p 24
-            <*> peekByteOff p 32
-            <*> peekByteOff p 40
-    poke p (DuckDBResult a b c d e f) = do
-        pokeByteOff p 0 a
-        pokeByteOff p 8 b
-        pokeByteOff p 16 c
-        pokeByteOff p 24 d
-        pokeByteOff p 32 e
-        pokeByteOff p 40 f
+foreign import ccall unsafe "occam_duckdb_result_size"
+    resultSize :: IO CSize
+
+foreign import ccall unsafe "occam_duckdb_result_kind"
+    resultKind :: FunPtr FnResultKind -> Ptr DuckDBResult -> IO CInt
+
+foreign import ccall unsafe "occam_duckdb_fetch_chunk"
+    fetchChunk :: FunPtr FnFetchChunk -> Ptr DuckDBResult -> IO Chunk
+
+foreign import ccall unsafe "occam_duckdb_vector_bytes"
+    vectorBytes :: FunPtr FnStringData -> Ptr () -> IdxT -> Ptr IdxT -> IO CString
+
+-- The by-value signatures are called by the C shim.
+data FnResultKind
+data FnFetchChunk
+data FnStringData
+
+type Chunk = Ptr ()
+type Vector = Ptr ()
 
 type FnOpen = CString -> Ptr DuckdbDatabase -> IO CInt
 type FnClose = Ptr DuckdbDatabase -> IO ()
@@ -116,25 +125,24 @@ type FnDisconnect = Ptr DuckdbConnection -> IO ()
 type FnInterrupt = DuckdbConnection -> IO ()
 type FnExtract = DuckdbConnection -> CString -> Ptr DuckdbExtractedStatements -> IO IdxT
 type FnExtractError = DuckdbExtractedStatements -> IO CString
-type FnPrepExtracted = DuckdbConnection -> DuckdbExtractedStatements -> IdxT -> Ptr DuckdbPreparedStatement -> IO CInt
+type FnPrepExtracted =
+    DuckdbConnection -> DuckdbExtractedStatements -> IdxT -> Ptr DuckdbPreparedStatement -> IO CInt
 type FnPrepError = DuckdbPreparedStatement -> IO CString
-type FnPrepType = DuckdbPreparedStatement -> IO CInt
+type FnQuery = DuckdbConnection -> CString -> Ptr DuckDBResult -> IO CInt
 type FnExecPrepared = DuckdbPreparedStatement -> Ptr DuckDBResult -> IO CInt
 type FnDestroyPrepare = Ptr DuckdbPreparedStatement -> IO ()
 type FnDestroyExtracted = Ptr DuckdbExtractedStatements -> IO ()
 type FnDestroyResult = Ptr DuckDBResult -> IO ()
 type FnResultError = Ptr DuckDBResult -> IO CString
-type FnRowCount = Ptr DuckDBResult -> IO IdxT
 type FnColumnCount = Ptr DuckDBResult -> IO IdxT
+type FnColumnName = Ptr DuckDBResult -> IdxT -> IO CString
 type FnColumnType = Ptr DuckDBResult -> IdxT -> IO CInt
-type FnValueIsNull = Ptr DuckDBResult -> IdxT -> IdxT -> IO CBool
-type FnValueBoolean = Ptr DuckDBResult -> IdxT -> IdxT -> IO CBool
-type FnValueInt64 = Ptr DuckDBResult -> IdxT -> IdxT -> IO Int64
-type FnValueUint64 = Ptr DuckDBResult -> IdxT -> IdxT -> IO Word64
-type FnValueDouble = Ptr DuckDBResult -> IdxT -> IdxT -> IO Double
-type FnValueVarchar = Ptr DuckDBResult -> IdxT -> IdxT -> IO CString
-type FnFree = Ptr () -> IO ()
-
+type FnChunkSize = Chunk -> IO IdxT
+type FnDestroyChunk = Ptr Chunk -> IO ()
+type FnChunkVector = Chunk -> IdxT -> IO Vector
+type FnVectorData = Vector -> IO (Ptr ())
+type FnValidity = Vector -> IO (Ptr Word64)
+type FnRowValid = Ptr Word64 -> IdxT -> IO CBool
 foreign import ccall "dynamic" mkOpen :: FunPtr FnOpen -> FnOpen
 foreign import ccall "dynamic" mkClose :: FunPtr FnClose -> FnClose
 foreign import ccall "dynamic" mkConnect :: FunPtr FnConnect -> FnConnect
@@ -144,22 +152,21 @@ foreign import ccall "dynamic" mkExtract :: FunPtr FnExtract -> FnExtract
 foreign import ccall "dynamic" mkExtractError :: FunPtr FnExtractError -> FnExtractError
 foreign import ccall "dynamic" mkPrepExtracted :: FunPtr FnPrepExtracted -> FnPrepExtracted
 foreign import ccall "dynamic" mkPrepError :: FunPtr FnPrepError -> FnPrepError
-foreign import ccall "dynamic" mkPrepType :: FunPtr FnPrepType -> FnPrepType
+foreign import ccall "dynamic" mkQuery :: FunPtr FnQuery -> FnQuery
 foreign import ccall "dynamic" mkExecPrepared :: FunPtr FnExecPrepared -> FnExecPrepared
 foreign import ccall "dynamic" mkDestroyPrepare :: FunPtr FnDestroyPrepare -> FnDestroyPrepare
 foreign import ccall "dynamic" mkDestroyExtracted :: FunPtr FnDestroyExtracted -> FnDestroyExtracted
 foreign import ccall "dynamic" mkDestroyResult :: FunPtr FnDestroyResult -> FnDestroyResult
 foreign import ccall "dynamic" mkResultError :: FunPtr FnResultError -> FnResultError
-foreign import ccall "dynamic" mkRowCount :: FunPtr FnRowCount -> FnRowCount
 foreign import ccall "dynamic" mkColumnCount :: FunPtr FnColumnCount -> FnColumnCount
+foreign import ccall "dynamic" mkColumnName :: FunPtr FnColumnName -> FnColumnName
 foreign import ccall "dynamic" mkColumnType :: FunPtr FnColumnType -> FnColumnType
-foreign import ccall "dynamic" mkValueIsNull :: FunPtr FnValueIsNull -> FnValueIsNull
-foreign import ccall "dynamic" mkValueBoolean :: FunPtr FnValueBoolean -> FnValueBoolean
-foreign import ccall "dynamic" mkValueInt64 :: FunPtr FnValueInt64 -> FnValueInt64
-foreign import ccall "dynamic" mkValueUint64 :: FunPtr FnValueUint64 -> FnValueUint64
-foreign import ccall "dynamic" mkValueDouble :: FunPtr FnValueDouble -> FnValueDouble
-foreign import ccall "dynamic" mkValueVarchar :: FunPtr FnValueVarchar -> FnValueVarchar
-foreign import ccall "dynamic" mkFree :: FunPtr FnFree -> FnFree
+foreign import ccall "dynamic" mkChunkSize :: FunPtr FnChunkSize -> FnChunkSize
+foreign import ccall "dynamic" mkDestroyChunk :: FunPtr FnDestroyChunk -> FnDestroyChunk
+foreign import ccall "dynamic" mkChunkVector :: FunPtr FnChunkVector -> FnChunkVector
+foreign import ccall "dynamic" mkVectorData :: FunPtr FnVectorData -> FnVectorData
+foreign import ccall "dynamic" mkValidity :: FunPtr FnValidity -> FnValidity
+foreign import ccall "dynamic" mkRowValid :: FunPtr FnRowValid -> FnRowValid
 
 data DuckDBAPI = DuckDBAPI
     { apiOpen :: !FnOpen
@@ -171,26 +178,30 @@ data DuckDBAPI = DuckDBAPI
     , apiExtractStatementsError :: !FnExtractError
     , apiPrepareExtractedStatement :: !FnPrepExtracted
     , apiPrepareError :: !FnPrepError
-    , apiPreparedStatementType :: !FnPrepType
+    , apiQuery :: !FnQuery
+    , apiResultKind :: !(FunPtr FnResultKind)
     , apiExecutePrepared :: !FnExecPrepared
     , apiDestroyPrepare :: !FnDestroyPrepare
     , apiDestroyExtracted :: !FnDestroyExtracted
     , apiDestroyResult :: !FnDestroyResult
     , apiResultError :: !FnResultError
-    , apiRowCount :: !FnRowCount
     , apiColumnCount :: !FnColumnCount
+    , apiColumnName :: !FnColumnName
     , apiColumnType :: !FnColumnType
-    , apiValueIsNull :: !FnValueIsNull
-    , apiValueBoolean :: !FnValueBoolean
-    , apiValueInt64 :: !FnValueInt64
-    , apiValueUint64 :: !FnValueUint64
-    , apiValueDouble :: !FnValueDouble
-    , apiValueVarchar :: !FnValueVarchar
-    , apiFree :: !FnFree
+    , apiFetchChunk :: !(FunPtr FnFetchChunk)
+    , apiDestroyChunk :: !FnDestroyChunk
+    , apiChunkSize :: !FnChunkSize
+    , apiChunkVector :: !FnChunkVector
+    , apiVectorData :: !FnVectorData
+    , apiValidity :: !FnValidity
+    , apiRowValid :: !FnRowValid
+    , apiStringData :: !(FunPtr FnStringData)
     }
 
 data DuckDBContract = DuckDBContract
     { contractExpectedRows :: ![[Value]]
+    , contractExpectedColumns :: ![Text]
+    , contractExpectedTypes :: ![Int]
     , contractStateSha256 :: !(Maybe Text)
     , contractCheckState :: !Bool
     }
@@ -200,6 +211,8 @@ instance FromJSON DuckDBContract where
     parseJSON = withObject "DuckDBContract" $ \o ->
         DuckDBContract
             <$> o .: "expected_rows"
+            <*> o .: "expected_columns"
+            <*> o .: "expected_types"
             <*> o .:? "state_sha256"
             <*> o .:? "check_state" .!= False
 
@@ -208,6 +221,8 @@ instance ToJSON DuckDBContract where
     toJSON contract =
         object
             [ "expected_rows" .= contractExpectedRows contract
+            , "expected_columns" .= contractExpectedColumns contract
+            , "expected_types" .= contractExpectedTypes contract
             , "state_sha256" .= contractStateSha256 contract
             , "check_state" .= contractCheckState contract
             ]
@@ -327,22 +342,24 @@ loadSymbols libPath = withCString libPath $ \cLib -> do
             apiExtractStatementsError <- getProc "duckdb_extract_statements_error" mkExtractError
             apiPrepareExtractedStatement <- getProc "duckdb_prepare_extracted_statement" mkPrepExtracted
             apiPrepareError <- getProc "duckdb_prepare_error" mkPrepError
-            apiPreparedStatementType <- getProc "duckdb_prepared_statement_type" mkPrepType
+            apiQuery <- getProc "duckdb_query" mkQuery
             apiExecutePrepared <- getProc "duckdb_execute_prepared" mkExecPrepared
             apiDestroyPrepare <- getProc "duckdb_destroy_prepare" mkDestroyPrepare
             apiDestroyExtracted <- getProc "duckdb_destroy_extracted" mkDestroyExtracted
             apiDestroyResult <- getProc "duckdb_destroy_result" mkDestroyResult
             apiResultError <- getProc "duckdb_result_error" mkResultError
-            apiRowCount <- getProc "duckdb_row_count" mkRowCount
             apiColumnCount <- getProc "duckdb_column_count" mkColumnCount
+            apiColumnName <- getProc "duckdb_column_name" mkColumnName
             apiColumnType <- getProc "duckdb_column_type" mkColumnType
-            apiValueIsNull <- getProc "duckdb_value_is_null" mkValueIsNull
-            apiValueBoolean <- getProc "duckdb_value_boolean" mkValueBoolean
-            apiValueInt64 <- getProc "duckdb_value_int64" mkValueInt64
-            apiValueUint64 <- getProc "duckdb_value_uint64" mkValueUint64
-            apiValueDouble <- getProc "duckdb_value_double" mkValueDouble
-            apiValueVarchar <- getProc "duckdb_value_varchar" mkValueVarchar
-            apiFree <- getProc "duckdb_free" mkFree
+            apiFetchChunk <- getProc "duckdb_fetch_chunk" id
+            apiDestroyChunk <- getProc "duckdb_destroy_data_chunk" mkDestroyChunk
+            apiChunkSize <- getProc "duckdb_data_chunk_get_size" mkChunkSize
+            apiChunkVector <- getProc "duckdb_data_chunk_get_vector" mkChunkVector
+            apiVectorData <- getProc "duckdb_vector_get_data" mkVectorData
+            apiValidity <- getProc "duckdb_vector_get_validity" mkValidity
+            apiRowValid <- getProc "duckdb_validity_row_is_valid" mkRowValid
+            apiStringData <- getProc "duckdb_string_t_data" id
+            apiResultKind <- getProc "duckdb_result_return_type" id
             pure DuckDBAPI{..}
 #else
 loadSymbols :: FilePath -> IO DuckDBAPI
@@ -361,22 +378,24 @@ loadSymbols libPath = do
     apiExtractStatementsError <- getSym "duckdb_extract_statements_error" mkExtractError
     apiPrepareExtractedStatement <- getSym "duckdb_prepare_extracted_statement" mkPrepExtracted
     apiPrepareError <- getSym "duckdb_prepare_error" mkPrepError
-    apiPreparedStatementType <- getSym "duckdb_prepared_statement_type" mkPrepType
+    apiQuery <- getSym "duckdb_query" mkQuery
     apiExecutePrepared <- getSym "duckdb_execute_prepared" mkExecPrepared
     apiDestroyPrepare <- getSym "duckdb_destroy_prepare" mkDestroyPrepare
     apiDestroyExtracted <- getSym "duckdb_destroy_extracted" mkDestroyExtracted
     apiDestroyResult <- getSym "duckdb_destroy_result" mkDestroyResult
     apiResultError <- getSym "duckdb_result_error" mkResultError
-    apiRowCount <- getSym "duckdb_row_count" mkRowCount
     apiColumnCount <- getSym "duckdb_column_count" mkColumnCount
+    apiColumnName <- getSym "duckdb_column_name" mkColumnName
     apiColumnType <- getSym "duckdb_column_type" mkColumnType
-    apiValueIsNull <- getSym "duckdb_value_is_null" mkValueIsNull
-    apiValueBoolean <- getSym "duckdb_value_boolean" mkValueBoolean
-    apiValueInt64 <- getSym "duckdb_value_int64" mkValueInt64
-    apiValueUint64 <- getSym "duckdb_value_uint64" mkValueUint64
-    apiValueDouble <- getSym "duckdb_value_double" mkValueDouble
-    apiValueVarchar <- getSym "duckdb_value_varchar" mkValueVarchar
-    apiFree <- getSym "duckdb_free" mkFree
+    apiFetchChunk <- getSym "duckdb_fetch_chunk" id
+    apiDestroyChunk <- getSym "duckdb_destroy_data_chunk" mkDestroyChunk
+    apiChunkSize <- getSym "duckdb_data_chunk_get_size" mkChunkSize
+    apiChunkVector <- getSym "duckdb_data_chunk_get_vector" mkChunkVector
+    apiVectorData <- getSym "duckdb_vector_get_data" mkVectorData
+    apiValidity <- getSym "duckdb_vector_get_validity" mkValidity
+    apiRowValid <- getSym "duckdb_validity_row_is_valid" mkRowValid
+    apiStringData <- getSym "duckdb_string_t_data" id
+    apiResultKind <- getSym "duckdb_result_return_type" id
     pure DuckDBAPI{..}
 #endif
 
@@ -397,53 +416,65 @@ isDuckDBAvailable = do
         Right _ -> True
         Left _ -> False
 
-convertCell :: DuckDBAPI -> Ptr DuckDBResult -> IdxT -> IdxT -> IO Value
-convertCell api resPtr col row = do
-    isNull <- apiValueIsNull api resPtr col row
-    if isNull /= 0
+-- NOTE: DuckDB's legacy string accessors truncate at embedded NULs. Read
+-- chunk vectors here, including for scalars, to preserve complete values.
+convertCell :: DuckDBAPI -> (CInt, Ptr (), Ptr Word64) -> IdxT -> IO Value
+convertCell api (colType, values, validity) row = do
+    valid <- if validity == nullPtr then pure 1 else apiRowValid api validity row
+    if valid == 0
         then pure Null
-        else do
-            colType <- apiColumnType api resPtr col
-            case colType of
-                1 -> do
-                    b <- apiValueBoolean api resPtr col row
-                    pure (Bool (b /= 0))
-                n | n >= 2 && n <= 5 -> do
-                    v <- apiValueInt64 api resPtr col row
-                    pure (Number (fromIntegral v))
-                n | n >= 6 && n <= 9 -> do
-                    v <- apiValueUint64 api resPtr col row
-                    pure (Number (fromIntegral v))
-                n | n >= 10 && n <= 11 -> do
-                    v <- apiValueDouble api resPtr col row
-                    pure (toJSON v)
-                n | n == 16 || n == 32 -> do
-                    cStr <- apiValueVarchar api resPtr col row
-                    if cStr == nullPtr
-                        then pure Null
-                        else do
-                            str <- peekCString cStr
-                            apiFree api (castPtr cStr)
-                            case readMaybe str of
-                                Just (val :: Integer) -> pure (Number (fromInteger val))
-                                Nothing -> pure (String (T.pack str))
-                _ -> do
-                    cStr <- apiValueVarchar api resPtr col row
-                    if cStr == nullPtr
-                        then pure Null
-                        else do
-                            bs <- BS.packCString cStr
-                            apiFree api (castPtr cStr)
-                            pure (String (TE.decodeUtf8 bs))
+        else case colType of
+            1 -> Bool . (/= (0 :: Word8)) <$> item
+            2 -> integral @Int8
+            3 -> integral @Int16
+            4 -> integral @Int32
+            5 -> integral @Int64
+            6 -> integral @Word8
+            7 -> integral @Word16
+            8 -> integral @Word32
+            9 -> integral @Word64
+            10 -> floatBits . realToFrac <$> item @Float
+            11 -> floatBits <$> item @Double
+            16 -> wide (toInteger . (fromIntegral :: Word64 -> Int64))
+            17 -> do
+                value <- readBytes
+                either (fail . show) (pure . String) (TE.decodeUtf8' value)
+            18 -> do
+                value <- readBytes
+                pure (object ["blob" .= BS.unpack value])
+            32 -> wide toInteger
+            36 -> pure Null
+            _ -> fail ("Unsupported DuckDB result type " ++ show colType)
+    where
+        item :: (Storable a) => IO a
+        item = peekElemOff (castPtr values) (fromIntegral row)
+        integral :: forall a. (Integral a, Storable a) => IO Value
+        integral = Number . fromIntegral <$> item @a
+        floatBits value = object ["float64_bits" .= castDoubleToWord64 value]
+        wide highInteger = do
+            let offset = fromIntegral row * 16
+            low <- peekByteOff values offset :: IO Word64
+            high <- peekByteOff values (offset + 8) :: IO Word64
+            pure (Number (fromInteger ((highInteger high `shiftL` 64) + toInteger low)))
+        readBytes = alloca $ \sizePtr -> do
+            ptr <- vectorBytes (apiStringData api) values row sizePtr
+            size <- peek sizePtr
+            if size == 0 then pure BS.empty else BS.packCStringLen (ptr, fromIntegral size)
 
 executeDuckDBCandidateDetailedTimeout :: Int -> ByteString -> IO (Either DuckDBError [[Value]])
-executeDuckDBCandidateDetailedTimeout micros sql = do
-    mApi <- getDuckDBAPI
-    case mApi of
-        Left err -> pure (Left err)
-        Right api -> executeWithAPI api micros sql
+executeDuckDBCandidateDetailedTimeout micros sql =
+    fmap (maybe [] resultRows) <$> executeDuckDBResult micros sql
 
-executeWithAPI :: DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError [[Value]])
+executeDuckDBResult :: Int -> ByteString -> IO (Either DuckDBError (Maybe ResultSet))
+executeDuckDBResult micros sql
+    | BS.elem 0 sql = pure (Left (DuckDBExecutionError "SQL contains a NUL byte"))
+    | otherwise = do
+        mApi <- getDuckDBAPI
+        case mApi of
+            Left err -> pure (Left err)
+            Right api -> executeWithAPI api micros sql
+
+executeWithAPI :: DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe ResultSet))
 executeWithAPI api micros sql = do
     res <- try $
         alloca $ \dbPtr ->
@@ -470,78 +501,138 @@ executeWithAPI api micros sql = do
                                 apiDisconnect api conPtr
                             )
                             $ \con -> do
-                                mRes <- timeout micros (runStatements con)
-                                case mRes of
-                                    Nothing -> do
-                                        apiInterrupt api con
-                                        pure (Left DuckDBTimeout)
-                                    Just inner -> pure inner
+                                mRes <- executeInterruptibly micros (apiInterrupt api con) $ do
+                                    configure con
+                                    runStatements con
+                                pure (maybe (Left DuckDBTimeout) id mRes)
     pure $ case res of
         Left (err :: SomeException) -> Left (DuckDBInfrastructureError (T.pack (displayException err)))
         Right inner -> inner
-  where
-    runStatements con =
-        BSC.useAsCString sql $ \sqlCStr ->
-            alloca $ \extPtr ->
-                bracket
-                    ( do
-                        n <- apiExtractStatements api con sqlCStr extPtr
-                        ext <- peek extPtr
-                        pure (n, ext)
-                    )
-                    ( \_ -> apiDestroyExtracted api extPtr
-                    )
-                    $ \(n, ext) -> do
-                        cErr <- apiExtractStatementsError api ext
-                        if cErr /= nullPtr
-                            then do
-                                errStr <- peekCString cErr
-                                pure (Left (DuckDBExecutionError (T.pack errStr)))
-                            else if n == 0
-                                then pure (Right [])
-                                else executeExtractedStatements con ext n
-
-    executeExtractedStatements con ext n = do
-        lastRowsRef <- newIORef []
-        alloca $ \prepPtr ->
-            allocaBytes 48 $ \resPtr -> do
-                let loop i
-                        | i >= n = Right <$> readIORef lastRowsRef
-                        | otherwise = do
-                            prepSt <- apiPrepareExtractedStatement api con ext i prepPtr
-                            if prepSt /= 0
+    where
+        runStatements con =
+            BSC.useAsCString sql $ \sqlCStr ->
+                alloca $ \extPtr ->
+                    bracket
+                        ( do
+                            n <- apiExtractStatements api con sqlCStr extPtr
+                            ext <- peek extPtr
+                            pure (n, ext)
+                        )
+                        (\_ -> apiDestroyExtracted api extPtr)
+                        $ \(n, ext) -> do
+                            cErr <- apiExtractStatementsError api ext
+                            if cErr /= nullPtr
                                 then do
-                                    prep <- peek prepPtr
-                                    cErr <- apiPrepareError api prep
-                                    errStr <- if cErr == nullPtr then pure "Prepare error" else peekCString cErr
-                                    apiDestroyPrepare api prepPtr
+                                    errStr <- peekCString cErr
                                     pure (Left (DuckDBExecutionError (T.pack errStr)))
-                                else do
-                                    prep <- peek prepPtr
-                                    stype <- apiPreparedStatementType api prep
-                                    execSt <- apiExecutePrepared api prep resPtr
-                                    if execSt /= 0
-                                        then do
-                                            cErr <- apiResultError api resPtr
-                                            errStr <- if cErr == nullPtr then pure "Execution error" else peekCString cErr
-                                            apiDestroyResult api resPtr
-                                            apiDestroyPrepare api prepPtr
-                                            pure (Left (DuckDBExecutionError (T.pack errStr)))
-                                        else do
-                                            rows <- apiRowCount api resPtr
-                                            cols <- apiColumnCount api resPtr
-                                            let isQuery = stype == 1 || (stype /= 2 && stype /= 3 && stype /= 5 && stype /= 7 && stype /= 15 && rows > 0)
-                                            if isQuery && rows > 0 && cols > 0
-                                                then do
-                                                    rowList <- forM [0 .. rows - 1] $ \r ->
-                                                        forM [0 .. cols - 1] $ \c ->
-                                                            convertCell api resPtr c r
-                                                    writeIORef lastRowsRef rowList
-                                                else pure ()
-                                            apiDestroyResult api resPtr
-                                            apiDestroyPrepare api prepPtr
-                                            loop (i + 1)
-                loop 0
+                                else
+                                    if n == 0
+                                        then pure (Right Nothing)
+                                        else executeExtractedStatements con ext n
+
+        -- NOTE: In-memory connections can otherwise read or modify external files.
+        configure con = withCString "SET enable_external_access = false; SET lock_configuration = true;" $ \settings ->
+            withResult (apiQuery api con settings) $ \status _ ->
+                when (status /= 0) (fail "Could not disable and lock DuckDB external access")
+
+        withResult :: (Ptr DuckDBResult -> IO CInt) -> (CInt -> Ptr DuckDBResult -> IO a) -> IO a
+        withResult run use = do
+            size <- resultSize
+            allocaBytes (fromIntegral size) $ \ptr ->
+                bracket (run ptr) (const (apiDestroyResult api ptr)) (\status -> use status ptr)
+
+        executeExtractedStatements con ext n = alloca $ \prepPtr ->
+            let loop i previous
+                    | i >= n = pure (Right previous)
+                    | otherwise = do
+                        observed <- bracket
+                            (apiPrepareExtractedStatement api con ext i prepPtr)
+                            (const (apiDestroyPrepare api prepPtr))
+                            $ \status -> do
+                                prep <- peek prepPtr
+                                if status /= 0
+                                    then Left . DuckDBExecutionError <$> errorText "Prepare error" (apiPrepareError api prep)
+                                    else withResult (apiExecutePrepared api prep) $ \execStatus ptr ->
+                                        if execStatus /= 0
+                                            then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api ptr)
+                                            else Right <$> observeRows ptr previous
+                        case observed of
+                            Left err -> pure (Left err)
+                            Right result -> loop (i + 1) result
+             in loop 0 Nothing
+
+        errorText fallback action = do
+            message <- action
+            if message == nullPtr then pure fallback else T.pack <$> peekCString message
+
+        observeRows ptr previous = do
+            kind <- resultKind (apiResultKind api) ptr
+            if kind /= 3 -- DUCKDB_RESULT_TYPE_QUERY_RESULT
+                then pure previous
+                else do
+                    count <- apiColumnCount api ptr
+                    let columns = takeWhile (< count) [0 ..]
+                    names <- forM columns $ \col -> do
+                        name <- apiColumnName api ptr col
+                        if name == nullPtr
+                            then fail "DuckDB omitted a result column name"
+                            else TE.decodeUtf8 <$> BS.packCString name
+                    types <- mapM (apiColumnType api ptr) columns
+                    -- TODO: Add lossless decoding for exact decimals and composite types.
+                    when (any (not . supportedType) types) $
+                        fail ("Unsupported DuckDB result column types " ++ show types)
+                    rows <- readChunks ptr (zip types columns) []
+                    pure (Just (ResultSet names (map fromIntegral types) rows))
+
+        readChunks ptr columnTypes accumulated = do
+            chunkRows <- alloca $ \chunkPtr -> do
+                bracket
+                    (do chunk <- fetchChunk (apiFetchChunk api) ptr; poke chunkPtr chunk; pure chunk)
+                    (\chunk -> when (chunk /= nullPtr) (apiDestroyChunk api chunkPtr))
+                    $ \chunk ->
+                        if chunk == nullPtr
+                            then pure Nothing
+                            else do
+                                size <- apiChunkSize api chunk
+                                vectors <- forM columnTypes $ \(ty, col) -> do
+                                    vector <- apiChunkVector api chunk col
+                                    values <- apiVectorData api vector
+                                    validity <- apiValidity api vector
+                                    pure (ty, values, validity)
+                                Just
+                                    <$> forM (takeWhile (< size) [0 ..]) (\row -> mapM (\vector -> convertCell api vector row) vectors)
+            case chunkRows of
+                Nothing -> pure (concat (reverse accumulated))
+                Just rows -> readChunks ptr columnTypes (rows : accumulated)
+
+        supportedType ty = (ty >= 1 && ty <= 11) || ty `elem` [16, 17, 18, 32, 36]
+
+-- NOTE: Native interruption is cooperative. Keep the connection alive until
+-- the worker leaves DuckDB, including when the shared budget cancels a probe.
+executeInterruptibly :: Int -> IO () -> IO a -> IO (Maybe a)
+executeInterruptibly micros interrupt work =
+    bracket start terminate $ \(_, done) ->
+        timeout micros (readMVar done >>= either Exception.throwIO pure)
+    where
+        start = do
+            done <- newEmptyMVar
+            worker <- forkIOWithUnmask $ \unmask ->
+                Exception.try @SomeException (unmask work) >>= putMVar done
+            pure (worker, done)
+        terminate (worker, done) = Exception.uninterruptibleMask_ $ do
+            pending <- tryReadMVar done
+            case pending of
+                Just _ -> pure ()
+                Nothing -> do
+                    _ <- forkIO (killThread worker)
+                    drain done
+        drain done = do
+            interrupt
+            threadDelay 1000
+            result <- tryReadMVar done
+            case result of
+                Nothing -> drain done
+                Just _ -> pure ()
 
 executeDuckDBCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeDuckDBCandidateTimeout micros sql = do
@@ -556,39 +647,53 @@ executeDuckDBCandidate :: ByteString -> IO (Either Text [[Value]])
 executeDuckDBCandidate = executeDuckDBCandidateTimeout defaultDuckDBCandidateTimeoutMicros
 
 generateDuckDBContract :: ByteString -> IO (Either Text DuckDBContract)
-generateDuckDBContract sql = do
-    res <- executeDuckDBCandidate sql
+generateDuckDBContract = generateDuckDBContractTimeout defaultDuckDBCandidateTimeoutMicros
+
+generateDuckDBContractTimeout :: Int -> ByteString -> IO (Either Text DuckDBContract)
+generateDuckDBContractTimeout micros sql = do
+    res <- executeDuckDBResult micros sql
     pure $ case res of
-        Left err -> Left err
-        Right rows ->
+        Left DuckDBTimeout -> Left "timeout"
+        Left (DuckDBExecutionError err) -> Left err
+        Left (DuckDBInfrastructureError err) -> Left err
+        Right Nothing -> Left "Input must produce a result set"
+        Right (Just result) ->
             Right
                 DuckDBContract
-                    { contractExpectedRows = rows
+                    { contractExpectedRows = resultRows result
+                    , contractExpectedColumns = resultColumns result
+                    , contractExpectedTypes = resultColumnTypes result
                     , contractStateSha256 = Nothing
                     , contractCheckState = False
                     }
 
 duckdbContractOracleTimeout :: Int -> DuckDBContract -> Oracle
-duckdbContractOracleTimeout micros contract candidate = do
-    res <- executeDuckDBCandidateDetailedTimeout micros candidate
-    case res of
-        Left DuckDBTimeout -> pure OracleInconclusive
-        Left (DuckDBInfrastructureError _) -> pure OracleInconclusive
-        Left (DuckDBExecutionError _) -> pure OracleRejected
-        Right rows
-            | rows == contractExpectedRows contract -> pure OracleAccepted
-            | otherwise -> pure OracleRejected
+duckdbContractOracleTimeout micros contract candidate =
+    observationOutcome <$> duckdbContractObservationTimeout micros contract candidate
 
 duckdbContractOracle :: DuckDBContract -> Oracle
 duckdbContractOracle = duckdbContractOracleTimeout defaultDuckDBCandidateTimeoutMicros
 
 duckdbContractObservation :: DuckDBContract -> ByteString -> IO OracleObservation
-duckdbContractObservation contract candidate = do
-    res <- executeDuckDBCandidateDetailedTimeout defaultDuckDBCandidateTimeoutMicros candidate
-    pure $ case res of
-        Left DuckDBTimeout -> OracleTimedOut
-        Left (DuckDBExecutionError err) -> OracleIOFailed err
-        Left (DuckDBInfrastructureError err) -> OracleIOFailed err
-        Right rows
-            | rows == contractExpectedRows contract -> OracleFinished ExitSuccess
-            | otherwise -> OracleFinished (ExitFailure 1)
+duckdbContractObservation = duckdbContractObservationTimeout defaultDuckDBCandidateTimeoutMicros
+
+duckdbContractObservationTimeout :: Int -> DuckDBContract -> ByteString -> IO OracleObservation
+duckdbContractObservationTimeout micros contract candidate
+    -- TODO: Define a reproducible database-state observation before accepting state contracts.
+    | contractCheckState contract || contractStateSha256 contract /= Nothing =
+        pure (OracleIOFailed "DuckDB state contracts are unsupported")
+    | otherwise = do
+        res <- executeDuckDBResult micros candidate
+        pure $ case res of
+            Left DuckDBTimeout -> OracleTimedOut
+            Left (DuckDBExecutionError _) -> OracleFinished (ExitFailure 1)
+            Left (DuckDBInfrastructureError err) -> OracleIOFailed err
+            Right observed
+                | observed == Just expected -> OracleFinished ExitSuccess
+                | otherwise -> OracleFinished (ExitFailure 1)
+    where
+        expected =
+            ResultSet
+                (contractExpectedColumns contract)
+                (contractExpectedTypes contract)
+                (contractExpectedRows contract)
