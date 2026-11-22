@@ -183,6 +183,19 @@ tests =
             assertBool "removes noise branch 999" (not (BSC.isInfixOf "999" reduced))
             assertBool "removes noise branch 888" (not (BSC.isInfixOf "888" reduced))
             assertEqual "reduces to clean single query" "SELECT 42;" reduced
+        , testCase "Intra-statement rewrites reduce DISTINCT, GROUP BY, ORDER BY, and window specifications" $ do
+            pool <- predicatePool (BSC.isInfixOf "42")
+            let sql =
+                    "SELECT DISTINCT sum(42) OVER (PARTITION BY noise_part ORDER BY noise_ord ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t GROUP BY a, noise_grp ORDER BY x, noise_order;"
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
+            assertBool "removes distinct modifier" (not (BSC.isInfixOf "DISTINCT" reduced))
+            assertBool "removes noise partition" (not (BSC.isInfixOf "noise_part" reduced))
+            assertBool "removes noise window order" (not (BSC.isInfixOf "noise_ord" reduced))
+            assertBool "removes noise frame" (not (BSC.isInfixOf "ROWS BETWEEN" reduced))
+            assertBool "removes noise group by item" (not (BSC.isInfixOf "noise_grp" reduced))
+            assertBool "removes noise query order by item" (not (BSC.isInfixOf "noise_order" reduced))
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)

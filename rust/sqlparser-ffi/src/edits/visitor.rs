@@ -7,11 +7,11 @@ use crate::ir;
 use crate::source::{ByteSpan, SourceMap, TokenKind, TokenPosition, dialect};
 use crate::{NativeEdit, NativeEditCategory};
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, CastKind, ColumnDef, DataType, Expr,
-    FunctionArg, FunctionArgExpr, GroupByExpr, GroupByWithModifier, InTarget, LimitClause,
-    ObjectName, OffsetRows, OrderByExpr, Parens, Query, Select, SelectItem,
+    AlterTableOperation, Assignment, AssignmentTarget, CastKind, ColumnDef, DataType, Distinct,
+    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, GroupByWithModifier,
+    InTarget, LimitClause, ObjectName, OffsetRows, OrderByExpr, Parens, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableConstraint, TableFactor,
-    TableInheritance, TableWithJoins, ValueWithSpan, Visitor,
+    TableInheritance, TableWithJoins, ValueWithSpan, Visitor, WindowSpec, WindowType,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Span, Token, Tokenizer};
@@ -700,7 +700,6 @@ impl<'a> AnalysisVisitor<'a> {
             Expr::Function(function) => {
                 if function.uses_odbc_syntax
                     || function.null_treatment.is_some()
-                    || function.over.is_some()
                     || !function.within_group.is_empty()
                     || function.filter.is_some()
                 {
@@ -708,16 +707,23 @@ impl<'a> AnalysisVisitor<'a> {
                 } else {
                     let (start, name_end) = self.object_name_source_span(&function.name)?;
                     let hint = self.mapped_span(function.span())?;
-                    if matches!(&function.args, sqlparser::ast::FunctionArguments::None)
-                        && matches!(
-                            &function.parameters,
-                            sqlparser::ast::FunctionArguments::None
-                        )
-                    {
-                        Some((start, name_end))
+                    let args_end =
+                        if matches!(&function.args, sqlparser::ast::FunctionArguments::None)
+                            && matches!(
+                                &function.parameters,
+                                sqlparser::ast::FunctionArguments::None
+                            )
+                        {
+                            name_end
+                        } else {
+                            self.matching_parentheses(start, hint.1, start)
+                                .map(|pair| pair.end)?
+                        };
+                    if let Some(over) = &function.over {
+                        let (_, over_end) = self.window_type_source_span(over, args_end)?;
+                        Some((start, over_end))
                     } else {
-                        self.matching_parentheses(start, hint.1, start)
-                            .map(|pair| (start, pair.end))
+                        Some((start, args_end))
                     }
                 }
             }
@@ -943,13 +949,7 @@ impl<'a> AnalysisVisitor<'a> {
                 (start, first_start)
             }
         };
-        let end = self
-            .expression_source_span(&assignment.value)
-            .map(|(_, end)| end)
-            .or_else(|| {
-                self.mapped_span(assignment.value.span())
-                    .map(|(_, end)| end)
-            })?;
+        let (_, end) = self.expression_source_span(&assignment.value)?;
         (start < end).then_some((start, end))
     }
 
@@ -1648,6 +1648,213 @@ impl<'a> AnalysisVisitor<'a> {
         self.set_operation_edits(right);
     }
 
+    fn window_type_source_span(&self, over: &WindowType, after: usize) -> Option<(usize, usize)> {
+        let after_idx = self.tokens.partition_point(|token| token.start < after);
+        let (over_idx, over_tok) = self.next_significant(after_idx, self.unit.end)?;
+        if !over_tok.is_keyword(Keyword::OVER) {
+            return None;
+        }
+        match over {
+            WindowType::WindowSpec(_) => {
+                let (_, paren_tok) = self.next_significant(over_idx + 1, self.unit.end)?;
+                if !matches!(paren_tok.kind, TokenKind::LeftParen) {
+                    return None;
+                }
+                let pair = paren_tok.parentheses?;
+                Some((over_tok.start, pair.end))
+            }
+            WindowType::NamedWindow(ident) => {
+                let (_, end) = self.mapped_span(ident.span)?;
+                Some((over_tok.start, end))
+            }
+        }
+    }
+
+    fn find_keyword_between(
+        &self,
+        kw: Keyword,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, TokenPosition)> {
+        let mut idx = self.tokens.partition_point(|token| token.start < start);
+        while let Some((next_idx, tok)) = self.next_significant(idx, end) {
+            if tok.is_keyword(kw) {
+                return Some((next_idx, tok));
+            }
+            idx = next_idx + 1;
+        }
+        None
+    }
+
+    fn window_spec_edits(&mut self, spec: &WindowSpec, after: usize) {
+        let after_idx = self.tokens.partition_point(|token| token.start < after);
+        let Some((over_idx, over_tok)) = self.next_significant(after_idx, self.unit.end) else {
+            return;
+        };
+        if !over_tok.is_keyword(Keyword::OVER) {
+            return;
+        }
+        let Some((_, paren_tok)) = self.next_significant(over_idx + 1, self.unit.end) else {
+            return;
+        };
+        if !matches!(paren_tok.kind, TokenKind::LeftParen) {
+            return;
+        }
+        let Some(pair) = paren_tok.parentheses else {
+            return;
+        };
+        let inside_start = pair.start + 1;
+        let inside_end = pair.end - 1;
+
+        if !spec.partition_by.is_empty()
+            || !spec.order_by.is_empty()
+            || spec.window_frame.is_some()
+            || spec.window_name.is_some()
+        {
+            self.add_edit_bytes(
+                inside_start,
+                inside_end,
+                "",
+                NativeEditCategory::Clause,
+                "simplify-window_spec_empty",
+            );
+        }
+
+        let scope = (inside_start, inside_end);
+        let mut clauses = Vec::new();
+        let frame_keyword = spec.window_frame.as_ref().map(|frame| match frame.units {
+            sqlparser::ast::WindowFrameUnits::Rows => Keyword::ROWS,
+            sqlparser::ast::WindowFrameUnits::Range => Keyword::RANGE,
+            sqlparser::ast::WindowFrameUnits::Groups => Keyword::GROUPS,
+        });
+        for (keyword, label) in [
+            (
+                (!spec.partition_by.is_empty()).then_some(Keyword::PARTITION),
+                "remove-window_partition_by",
+            ),
+            (
+                (!spec.order_by.is_empty()).then_some(Keyword::ORDER),
+                "remove-window_order_by",
+            ),
+            (frame_keyword, "remove-window_frame"),
+        ] {
+            if let Some(keyword) = keyword {
+                let Some(token) = self.top_level_keyword(keyword, scope) else {
+                    return;
+                };
+                clauses.push((token.start, label));
+            }
+        }
+        if clauses.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            for (index, &(start, label)) in clauses.iter().enumerate() {
+                let (start, end) = match clauses.get(index + 1) {
+                    Some(next) => (start, next.0),
+                    None => (
+                        preceding_space(self.source.as_bytes(), start).max(inside_start),
+                        inside_end,
+                    ),
+                };
+                self.add_edit_bytes(start, end, "", NativeEditCategory::Clause, label);
+            }
+        }
+
+        if spec.partition_by.len() > 1 {
+            self.list_edits(
+                "remove-window_partition_by_expression",
+                &spec.partition_by,
+                |visitor, expr| visitor.expression_source_span(expr),
+            );
+        }
+
+        if spec.order_by.len() > 1 {
+            self.list_edits(
+                "remove-window_order_by_expression",
+                &spec.order_by,
+                |visitor, item| {
+                    (item.options == Default::default() && item.with_fill.is_none())
+                        .then(|| visitor.expression_source_span(&item.expr))
+                        .flatten()
+                },
+            );
+        }
+    }
+
+    fn distinct_edits(&mut self, select: &Select) {
+        let Some(distinct) = &select.distinct else {
+            return;
+        };
+        let Some((_, select_end)) = self.mapped_span(select.select_token.0.span) else {
+            return;
+        };
+        let limit = select
+            .projection
+            .first()
+            .and_then(|item| self.select_item_source_span(item))
+            .map(|(s, _)| s)
+            .unwrap_or(self.unit.end);
+        match distinct {
+            Distinct::Distinct => {
+                if let Some((distinct_idx, distinct_tok)) =
+                    self.find_keyword_between(Keyword::DISTINCT, select_end, limit)
+                    && let Some((_, next_tok)) =
+                        self.next_significant(distinct_idx + 1, self.unit.end)
+                {
+                    self.add_edit_bytes(
+                        distinct_tok.start,
+                        next_tok.start,
+                        "",
+                        NativeEditCategory::Clause,
+                        "remove-distinct",
+                    );
+                }
+            }
+            Distinct::All => {
+                if let Some((all_idx, all_tok)) =
+                    self.find_keyword_between(Keyword::ALL, select_end, limit)
+                    && let Some((_, next_tok)) = self.next_significant(all_idx + 1, self.unit.end)
+                {
+                    self.add_edit_bytes(
+                        all_tok.start,
+                        next_tok.start,
+                        "",
+                        NativeEditCategory::Clause,
+                        "remove-distinct",
+                    );
+                }
+            }
+            Distinct::On(exprs) => {
+                if let Some((distinct_idx, distinct_tok)) =
+                    self.find_keyword_between(Keyword::DISTINCT, select_end, limit)
+                {
+                    let cur = distinct_idx + 1;
+                    if let Some((on_idx, on_tok)) = self.next_significant(cur, limit)
+                        && on_tok.is_keyword(Keyword::ON)
+                        && let Some((_, paren_tok)) = self.next_significant(on_idx + 1, limit)
+                        && matches!(paren_tok.kind, TokenKind::LeftParen)
+                        && let Some(pair) = paren_tok.parentheses
+                    {
+                        let after_idx = self.tokens.partition_point(|t| t.start < pair.end);
+                        if let Some((_, next_tok)) = self.next_significant(after_idx, self.unit.end)
+                        {
+                            self.add_edit_bytes(
+                                distinct_tok.start,
+                                next_tok.start,
+                                "",
+                                NativeEditCategory::Clause,
+                                "remove-distinct",
+                            );
+                        }
+                    }
+                }
+                if exprs.len() > 1 {
+                    self.list_edits("remove-distinct_on_expression", exprs, |visitor, expr| {
+                        visitor.expression_source_span(expr)
+                    });
+                }
+            }
+        }
+    }
+
     fn data_type_pattern(&self, data_type: &DataType) -> Option<Vec<TokenKind>> {
         let sql = data_type.to_string();
         let type_dialect = dialect(self.dialect);
@@ -2200,23 +2407,30 @@ impl Visitor for AnalysisVisitor<'_> {
         }
         self.record_table_commands(&query.body);
         let query_scope = self.query_source_scope(query);
-        if let Some(order) = &query.order_by
-            && let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope)
-        {
-            self.clause_edit_complete(
-                Keyword::ORDER,
-                body,
-                scope,
-                &[
-                    Keyword::LIMIT,
-                    Keyword::OFFSET,
-                    Keyword::FETCH,
-                    Keyword::FOR,
-                    Keyword::SETTINGS,
-                    Keyword::FORMAT,
-                ],
-                "remove-order_by",
-            );
+        if let Some(order) = &query.order_by {
+            if let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope) {
+                self.clause_edit_complete(
+                    Keyword::ORDER,
+                    body,
+                    scope,
+                    &[
+                        Keyword::LIMIT,
+                        Keyword::OFFSET,
+                        Keyword::FETCH,
+                        Keyword::FOR,
+                        Keyword::SETTINGS,
+                        Keyword::FORMAT,
+                    ],
+                    "remove-order_by",
+                );
+            }
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
+                && exprs.len() > 1
+            {
+                self.list_edits("remove-order_by_expression", exprs, |visitor, expr| {
+                    visitor.mapped_span(expr.span())
+                });
+            }
         }
         if let Some(limit) = &query.limit_clause {
             self.limit_edits(query, limit);
@@ -2318,6 +2532,7 @@ impl Visitor for AnalysisVisitor<'_> {
             &select.projection,
             |visitor, item| visitor.select_item_source_span(item),
         );
+        self.distinct_edits(select);
         self.list_edits("remove-from-relation", &select.from, |visitor, table| {
             visitor.table_with_joins_source_span(table)
         });
@@ -2342,7 +2557,12 @@ impl Visitor for AnalysisVisitor<'_> {
         }
         match &select.group_by {
             GroupByExpr::All(modifiers) => self.group_by_all_edit(select, modifiers),
-            GroupByExpr::Expressions(..) => {
+            GroupByExpr::Expressions(exprs, ..) => {
+                if exprs.len() > 1 {
+                    self.list_edits("remove-group_by_expression", exprs, |visitor, expr| {
+                        visitor.expression_source_span(expr)
+                    });
+                }
                 if let (Some(body), Some(scope)) = (
                     self.group_by_source_span(&select.group_by),
                     self.select_scope(select),
@@ -2483,19 +2703,26 @@ impl Visitor for AnalysisVisitor<'_> {
                         "remove-where",
                     );
                 }
-                if !update.order_by.is_empty()
-                    && let (Some(body), Some(scope)) = (
+                if !update.order_by.is_empty() {
+                    if let (Some(body), Some(scope)) = (
                         self.order_by_exprs_source_span(&update.order_by),
                         self.mapped_span(statement.span()),
-                    )
-                {
-                    self.clause_edit_complete(
-                        Keyword::ORDER,
-                        body,
-                        scope,
-                        &[Keyword::LIMIT, Keyword::RETURNING],
-                        "remove-order_by",
-                    );
+                    ) {
+                        self.clause_edit_complete(
+                            Keyword::ORDER,
+                            body,
+                            scope,
+                            &[Keyword::LIMIT, Keyword::RETURNING],
+                            "remove-order_by",
+                        );
+                    }
+                    if update.order_by.len() > 1 {
+                        self.list_edits(
+                            "remove-order_by_expression",
+                            &update.order_by,
+                            |visitor, expr| visitor.mapped_span(expr.span()),
+                        );
+                    }
                 }
                 if let Some(limit) = &update.limit {
                     self.clause_edit_expression(
@@ -2537,19 +2764,26 @@ impl Visitor for AnalysisVisitor<'_> {
                         "remove-where",
                     );
                 }
-                if !delete.order_by.is_empty()
-                    && let (Some(body), Some(scope)) = (
+                if !delete.order_by.is_empty() {
+                    if let (Some(body), Some(scope)) = (
                         self.order_by_exprs_source_span(&delete.order_by),
                         self.mapped_span(statement.span()),
-                    )
-                {
-                    self.clause_edit_complete(
-                        Keyword::ORDER,
-                        body,
-                        scope,
-                        &[Keyword::LIMIT, Keyword::RETURNING],
-                        "remove-order_by",
-                    );
+                    ) {
+                        self.clause_edit_complete(
+                            Keyword::ORDER,
+                            body,
+                            scope,
+                            &[Keyword::LIMIT, Keyword::RETURNING],
+                            "remove-order_by",
+                        );
+                    }
+                    if delete.order_by.len() > 1 {
+                        self.list_edits(
+                            "remove-order_by_expression",
+                            &delete.order_by,
+                            |visitor, expr| visitor.mapped_span(expr.span()),
+                        );
+                    }
                 }
                 if let Some(limit) = &delete.limit {
                     self.clause_edit_expression(
@@ -3040,6 +3274,35 @@ impl Visitor for AnalysisVisitor<'_> {
             }),
             Expr::Function(function) => {
                 if let sqlparser::ast::FunctionArguments::List(arguments) = &function.args {
+                    if let Some(treatment) = arguments.duplicate_treatment {
+                        let (_, name_end) = self
+                            .object_name_source_span(&function.name)
+                            .unwrap_or((0, 0));
+                        let start_idx = self.tokens.partition_point(|t| t.start < name_end);
+                        if let Some((paren_idx, paren_tok)) =
+                            self.next_significant(start_idx, self.unit.end)
+                            && matches!(paren_tok.kind, TokenKind::LeftParen)
+                        {
+                            let kw = match treatment {
+                                DuplicateTreatment::Distinct => Keyword::DISTINCT,
+                                DuplicateTreatment::All => Keyword::ALL,
+                            };
+                            if let Some((kw_idx, kw_tok)) =
+                                self.next_significant(paren_idx + 1, self.unit.end)
+                                && kw_tok.is_keyword(kw)
+                                && let Some((_, next_tok)) =
+                                    self.next_significant(kw_idx + 1, self.unit.end)
+                            {
+                                self.add_edit_bytes(
+                                    kw_tok.start,
+                                    next_tok.start,
+                                    "",
+                                    NativeEditCategory::Clause,
+                                    "remove-distinct",
+                                );
+                            }
+                        }
+                    }
                     self.list_edits(
                         "remove-function_argument",
                         &arguments.args,
@@ -3060,6 +3323,28 @@ impl Visitor for AnalysisVisitor<'_> {
                             }
                         }
                     }
+                }
+                if let Some(WindowType::WindowSpec(spec)) = &function.over {
+                    let (_, name_end) = self
+                        .object_name_source_span(&function.name)
+                        .unwrap_or((0, 0));
+                    let hint = self
+                        .mapped_span(function.span())
+                        .unwrap_or((0, self.unit.end));
+                    let args_end =
+                        if matches!(&function.args, sqlparser::ast::FunctionArguments::None)
+                            && matches!(
+                                &function.parameters,
+                                sqlparser::ast::FunctionArguments::None
+                            )
+                        {
+                            name_end
+                        } else {
+                            self.matching_parentheses(name_end, hint.1, name_end)
+                                .map(|pair| pair.end)
+                                .unwrap_or(name_end)
+                        };
+                    self.window_spec_edits(spec, args_end);
                 }
                 if let Some((start, end)) = self.expression_source_span(expr) {
                     for replacement in ["0", "1"] {

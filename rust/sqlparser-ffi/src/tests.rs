@@ -1788,7 +1788,7 @@ fn copy_statement_records_read_and_write_facts() {
     .unwrap();
     // COPY FROM t is a WriteData op
     let f0 = facts(&units[0]);
-    assert_eq!(f0.barriers.len(), 0);
+    assert_eq!(f0.barriers.len(), 1);
     assert!(matches!(
         f0.ops.as_slice(),
         [CatalogOp::WriteData(DataWrite { target, kind: WriteKind::Insert { .. }, .. })]
@@ -1796,7 +1796,7 @@ fn copy_statement_records_read_and_write_facts() {
     ));
     // COPY t TO is a Read op
     let f1 = facts(&units[1]);
-    assert_eq!(f1.barriers.len(), 0);
+    assert_eq!(f1.barriers.len(), 1);
     assert!(matches!(
         f1.ops.as_slice(),
         [CatalogOp::Read(ReadFact { source, .. })]
@@ -4526,4 +4526,235 @@ fn test_set_operation_syntax_edits() {
             "(SELECT 888 AS noise) UNION ALL SELECT 42 AS target;",
         ]
     );
+}
+
+#[test]
+fn test_distinct_and_group_by_syntax_edits() {
+    let sql = "SELECT DISTINCT a, b FROM t GROUP BY a, b ORDER BY a, b;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let edits = &facts(&units[0]).edits;
+
+    let distinct_edit = edits.iter().find(|e| e.label == "remove-distinct").unwrap();
+    let mut s = sql.to_string();
+    s.replace_range(
+        distinct_edit.start..distinct_edit.end,
+        &distinct_edit.replacement,
+    );
+    assert_eq!(s, "SELECT a, b FROM t GROUP BY a, b ORDER BY a, b;");
+
+    let group_edits: Vec<_> = edits
+        .iter()
+        .filter(|e| e.label == "remove-group_by_expression")
+        .map(|e| {
+            let mut s = sql.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect();
+    assert_eq!(
+        group_edits,
+        vec![
+            "SELECT DISTINCT a, b FROM t GROUP BY b ORDER BY a, b;",
+            "SELECT DISTINCT a, b FROM t GROUP BY a ORDER BY a, b;",
+        ]
+    );
+
+    let order_edits: Vec<_> = edits
+        .iter()
+        .filter(|e| e.label == "remove-order_by_expression")
+        .map(|e| {
+            let mut s = sql.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect();
+    assert_eq!(
+        order_edits,
+        vec![
+            "SELECT DISTINCT a, b FROM t GROUP BY a, b ORDER BY b;",
+            "SELECT DISTINCT a, b FROM t GROUP BY a, b ORDER BY a;",
+        ]
+    );
+
+    let sql2 = "SELECT ALL a FROM t;";
+    let units2 = parse(sql2, DialectKind::Generic).unwrap();
+    let edits2 = &facts(&units2[0]).edits;
+    let all_edit = edits2
+        .iter()
+        .find(|e| e.label == "remove-distinct")
+        .unwrap();
+    let mut s2 = sql2.to_string();
+    s2.replace_range(all_edit.start..all_edit.end, &all_edit.replacement);
+    assert_eq!(s2, "SELECT a FROM t;");
+
+    let sql3 = "SELECT DISTINCT ON (a, b) c FROM t;";
+    let units3 = parse(sql3, DialectKind::PostgreSql).unwrap();
+    let edits3 = &facts(&units3[0]).edits;
+    let on_edit = edits3
+        .iter()
+        .find(|e| e.label == "remove-distinct")
+        .unwrap();
+    let mut s3 = sql3.to_string();
+    s3.replace_range(on_edit.start..on_edit.end, &on_edit.replacement);
+    assert_eq!(s3, "SELECT c FROM t;");
+
+    let on_expr_edits: Vec<_> = edits3
+        .iter()
+        .filter(|e| e.label == "remove-distinct_on_expression")
+        .map(|e| {
+            let mut s = sql3.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect();
+    assert_eq!(
+        on_expr_edits,
+        vec![
+            "SELECT DISTINCT ON (b) c FROM t;",
+            "SELECT DISTINCT ON (a) c FROM t;",
+        ]
+    );
+
+    let sql4 = "SELECT count(DISTINCT x) FROM t;";
+    let units4 = parse(sql4, DialectKind::Generic).unwrap();
+    let edits4 = &facts(&units4[0]).edits;
+    let count_distinct_edit = edits4
+        .iter()
+        .find(|e| e.label == "remove-distinct")
+        .unwrap();
+    let mut s4 = sql4.to_string();
+    s4.replace_range(
+        count_distinct_edit.start..count_distinct_edit.end,
+        &count_distinct_edit.replacement,
+    );
+    assert_eq!(s4, "SELECT count(x) FROM t;");
+}
+
+#[test]
+fn test_window_spec_syntax_edits() {
+    let sql = "SELECT sum(x) OVER (PARTITION BY a, b ORDER BY c, d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let edits = &facts(&units[0]).edits;
+
+    let empty_edit = edits
+        .iter()
+        .find(|e| e.label == "simplify-window_spec_empty")
+        .unwrap();
+    let mut s = sql.to_string();
+    s.replace_range(empty_edit.start..empty_edit.end, &empty_edit.replacement);
+    assert_eq!(s, "SELECT sum(x) OVER () FROM t;");
+
+    let part_edit = edits
+        .iter()
+        .find(|e| e.label == "remove-window_partition_by")
+        .unwrap();
+    let mut s_part = sql.to_string();
+    s_part.replace_range(part_edit.start..part_edit.end, &part_edit.replacement);
+    assert_eq!(
+        s_part,
+        "SELECT sum(x) OVER (ORDER BY c, d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;"
+    );
+
+    let order_edit = edits
+        .iter()
+        .find(|e| e.label == "remove-window_order_by")
+        .unwrap();
+    let mut s_order = sql.to_string();
+    s_order.replace_range(order_edit.start..order_edit.end, &order_edit.replacement);
+    assert_eq!(
+        s_order,
+        "SELECT sum(x) OVER (PARTITION BY a, b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;"
+    );
+
+    let frame_edit = edits
+        .iter()
+        .find(|e| e.label == "remove-window_frame")
+        .unwrap();
+    let mut s_frame = sql.to_string();
+    s_frame.replace_range(frame_edit.start..frame_edit.end, &frame_edit.replacement);
+    assert_eq!(
+        s_frame,
+        "SELECT sum(x) OVER (PARTITION BY a, b ORDER BY c, d) FROM t;"
+    );
+
+    let part_expr_edits: Vec<_> = edits
+        .iter()
+        .filter(|e| e.label == "remove-window_partition_by_expression")
+        .map(|e| {
+            let mut s = sql.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect();
+    assert_eq!(
+        part_expr_edits,
+        vec![
+            "SELECT sum(x) OVER (PARTITION BY b ORDER BY c, d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+            "SELECT sum(x) OVER (PARTITION BY a ORDER BY c, d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        ]
+    );
+
+    let order_expr_edits: Vec<_> = edits
+        .iter()
+        .filter(|e| e.label == "remove-window_order_by_expression")
+        .map(|e| {
+            let mut s = sql.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect();
+    assert_eq!(
+        order_expr_edits,
+        vec![
+            "SELECT sum(x) OVER (PARTITION BY a, b ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+            "SELECT sum(x) OVER (PARTITION BY a, b ORDER BY c ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        ]
+    );
+}
+
+#[test]
+fn lexical_suffix_preserves_prefix_and_disables_pure_builtins() {
+    let sql = "SELECT coalesce(1, 2); /* unfinished";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    assert_eq!(count_units(sql, DialectKind::Generic), Ok(units.len()));
+    assert_eq!(units.len(), 2);
+    assert!(!facts(&units[0]).barriers.is_empty());
+    assert_eq!(&sql[units[1].start..units[1].end], "/* unfinished");
+    assert!(units[1].parse_error.is_some());
+}
+
+#[test]
+fn sqlite_identifiers_fold_ascii_only() {
+    let sql = r#"CREATE TABLE "Å"(x); CREATE TABLE "å"(y); SELECT x FROM "Å";"#;
+    let units = parse(sql, DialectKind::SQLite).unwrap();
+    assert_eq!(mentioned_relations(facts(&units[0])), ["Å"]);
+    assert_eq!(mentioned_relations(facts(&units[1])), ["å"]);
+    assert_eq!(relation_reads(facts(&units[2])), ["Å"]);
+}
+
+#[test]
+fn partial_assignment_span_is_not_used_for_list_deletion() {
+    let sql = "UPDATE t SET a = 1, b = sum(c) FILTER (WHERE d > 0)";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    assert!(
+        !facts(&units[0])
+            .edits
+            .iter()
+            .any(|edit| edit.label == "remove-update_assignment")
+    );
+}
+
+#[test]
+fn window_partition_deletion_skips_nested_order_by() {
+    let sql =
+        "SELECT sum(a) OVER (PARTITION BY (SELECT b FROM u ORDER BY b LIMIT 1) ORDER BY c) FROM t";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    let edit = facts(&units[0])
+        .edits
+        .iter()
+        .find(|edit| edit.label == "remove-window_partition_by")
+        .unwrap();
+    let mut candidate = sql.to_owned();
+    candidate.replace_range(edit.start..edit.end, &edit.replacement);
+    assert_eq!(candidate, "SELECT sum(a) OVER (ORDER BY c) FROM t");
 }

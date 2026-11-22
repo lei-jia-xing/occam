@@ -1059,6 +1059,11 @@ safeClauseLabels =
         , "remove-limit"
         , "remove-offset"
         , "remove-fetch"
+        , "remove-distinct"
+        , "simplify-window_spec_empty"
+        , "remove-window_partition_by"
+        , "remove-window_order_by"
+        , "remove-window_frame"
         ]
 
 -- | Predicate-bearing clause labels, attempted after structural clauses.
