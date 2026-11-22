@@ -138,6 +138,10 @@
 ** DONE [#B] Parse SQLite keyword spellings of foreign_keys
 - FIX: sqlparser-rs 0.64.0 rejects bare boolean keywords in PRAGMA values. The SQLite frontend recognizes the documented boolean words for foreign_keys with their original spans. Parser tests cover both forms and native slices exercise transaction boundaries. [[https://www.sqlite.org/pragma.html#pragma_foreign_keys][SQLite PRAGMA foreign_keys]]
 
+** TODO [#B] Report SQLite PRAGMA keyword arguments to sqlparser-rs
+- Repro with =Parser::parse_sql(&SQLiteDialect {}, "PRAGMA foreign_keys = ON;")=. SQLite accepts it, while sqlparser-rs 0.64.0 rejects =ON=. Also cover =PRAGMA foreign_keys(OFF);= and the documented =YES/NO= and =TRUE/FALSE= aliases. [[https://www.sqlite.org/pragma.html#pragma_syntax][SQLite PRAGMA syntax]]
+- Ask upstream to accept SQLite PRAGMA keyword arguments in both forms, with source spans. Recheck on upstream main and look for an existing issue before filing. Occam's local workaround is in =159d2bf=. [[https://github.com/apache/datafusion-sqlparser-rs/blob/main/src/parser/mod.rs][Upstream parser]]
+
 ** TODO [#B] Reducer optimization roadmap
 *** Evidence and invariants
 - SQLite scale-064 goes from 1111 B and 19 physical oracle executions to 887 B and 641 executions with intra-statement edits. Literal edits account for 348 starts. VALUES row and row-chunk deletions account for 252 starts with zero accepts. Oracle and frontend parse/decode are the largest measured costs. Candidate rendering is below 1 ms on this input. Eight AB/BA pairs per case establish the current comparison for scale-064, deep expressions, and views/aggregates.
@@ -168,6 +172,26 @@
 - NOTE: With the combined syntax policy, the 64-row case spent about 111 ms in oracle execution and 23 ms in parse/decode in the original paired run. Four isolated SQLite workers used 581 physical calls versus 510 with one worker (median 13.5 cancellations), with median wall ratio 0.94. For removable 64-row input, four workers used 46 calls versus 29 and the median wall ratio was 1.20. At cap 256 the required-row four-worker checkpoint was 673 B versus 655 B, with both validated. Keep one worker as the baseline and leave parallelism opt-in. Native and GHC profiling evidence does not prioritize a data-structure rewrite.
 - NOTE: The four-statement nonmonotone fixture exposes a real neighborhood gap. Exhaustively checking its six pairs finds one accepted nonadjacent pair after current ddmin and the one-statement audit stall. Keep pair search experimental research until matched workloads show a quality gain worth the additional calls.
 - NOTE: All 544 completed runs in the uncapped combined syntax, statement order and statement weight reports reused their existing audit evidence with zero shared-audit checks. The two final oracle executions are the agreed validation contract. No further certificate optimization is justified by these runs.
+
+*** TODO [#A] Expose and promote validated search policies in CLI
+- Evidence: Statement-level complement-first (`StatementComplementFirst`) cuts 32 calls on 32-row fenced cases; byte-weighting (`StatementByteWeighted`) cuts 69 calls (-8%) on skewed fenced inputs; literal batching and deferred VALUES chunks cut required-values-64 calls from 622 to 510 (-18%) with identical final SQL.
+- [ ] Add CLI flags to expose statement search policy (`--statement-order=subset-first|complement-first|byte-weighted`) on `exe:occam`.
+- [ ] Add CLI flags for intra-statement search refinements (`--literal-batches`, `--adaptive-values` or unified `--syntax-policy`).
+- [ ] Benchmark corpus qualification: evaluate promoting `StatementComplementFirst` / `StatementByteWeighted` to the engine default across non-fenced corpus cases.
+
+*** TODO [#B] Intra-statement independent AST edit batching
+- Evidence: Intra-statement mode currently triggers a physical oracle execution for every single syntax edit (29x wall time, 49x allocations on scale-064). Profiling shows `SYSTEM` and `finally` bracket overhead dominate when thousands of single-edit candidates are evaluated individually.
+- [ ] Model non-interfering AST edit independence: identify disjoint spans with no shared identifier or subquery scope (e.g. column attributes on different tables/columns, independent constant literals, non-overlapping clauses).
+- [ ] Implement multi-edit candidate batching with DDMin-style recursive subdivision on batch rejection.
+- [ ] Verify monotonic shrink and exact byte boundaries across all dialects.
+
+*** TODO [#B] In-process Oracle handle reuse and FFI binary cutover
+- Evidence: GHC profiling (`dist-newstyle/flamegraph/occam.prof`) and Linux `perf record` show:
+  - `Control.Exception.Safe.finally` / bracket teardown consumes ~17% of ticks and 6.08 MB allocations across oracle calls.
+  - SQLite in-process execution consumes ~35% CPU, dominated by `sqlite3RunParser` and per-call heap allocation (`malloc`/`__memmove`).
+  - Aeson JSON decoding still accounts for ~15% ticks and ~5.5 MB allocations.
+- [ ] Connection & prepared statement pooling for in-process SQLite: reuse thread-local `:memory:` or open db handles across candidate validations instead of re-initializing per call.
+- [ ] Complete full migration to binary FFI protocol (`Occam.Parser.Binary` / `rust/sqlparser-ffi/src/binary.rs`), eliminating remaining Aeson JSON decode paths in facts and edits extraction.
 
 * Upstream Gaps (recorded, not scheduled)
 # Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.
