@@ -3369,6 +3369,27 @@ impl Visitor for AnalysisVisitor<'_> {
                 {
                     self.add_type_edits(range);
                 }
+                if let (Some((start, end)), Some(replacement)) = (
+                    self.expression_source_span(expr),
+                    self.expression_source_slice(inner),
+                ) {
+                    self.add_edit_bytes(
+                        start,
+                        end,
+                        replacement,
+                        NativeEditCategory::Expression,
+                        "simplify-cast",
+                    );
+                    for lit in ["0", "1"] {
+                        self.add_edit_bytes(
+                            start,
+                            end,
+                            lit,
+                            NativeEditCategory::Expression,
+                            "simplify-cast_literal",
+                        );
+                    }
+                }
             }
             _ => {}
         }

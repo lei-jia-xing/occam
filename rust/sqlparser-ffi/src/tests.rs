@@ -4724,6 +4724,33 @@ fn lexical_suffix_preserves_prefix_and_disables_pure_builtins() {
 }
 
 #[test]
+fn test_cast_simplification_syntax_edits() {
+    let sql = "SELECT CAST(col AS VARCHAR(255)) FROM t;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let edits = &facts(&units[0]).edits;
+    let cast_edit = edits.iter().find(|e| e.label == "simplify-cast").unwrap();
+    let mut s = sql.to_string();
+    s.replace_range(cast_edit.start..cast_edit.end, &cast_edit.replacement);
+    assert_eq!(s, "SELECT col FROM t;");
+
+    let sql2 = "SELECT col::text FROM t;";
+    let units2 = parse(sql2, DialectKind::PostgreSql).unwrap();
+    let edits2 = &facts(&units2[0]).edits;
+    let cast_edit2 = edits2.iter().find(|e| e.label == "simplify-cast").unwrap();
+    let mut s2 = sql2.to_string();
+    s2.replace_range(cast_edit2.start..cast_edit2.end, &cast_edit2.replacement);
+    assert_eq!(s2, "SELECT col FROM t;");
+
+    let sql3 = "SELECT TRY_CAST(col AS INT) FROM t;";
+    let units3 = parse(sql3, DialectKind::Generic).unwrap();
+    let edits3 = &facts(&units3[0]).edits;
+    let cast_edit3 = edits3.iter().find(|e| e.label == "simplify-cast").unwrap();
+    let mut s3 = sql3.to_string();
+    s3.replace_range(cast_edit3.start..cast_edit3.end, &cast_edit3.replacement);
+    assert_eq!(s3, "SELECT col FROM t;");
+}
+
+#[test]
 fn sqlite_identifiers_fold_ascii_only() {
     let sql = r#"CREATE TABLE "Å"(x); CREATE TABLE "å"(y); SELECT x FROM "Å";"#;
     let units = parse(sql, DialectKind::SQLite).unwrap();

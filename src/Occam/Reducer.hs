@@ -1076,6 +1076,10 @@ unwrappedExpressionLabels =
     Set.fromList
         [ "simplify-parenthesized_expression"
         , "simplify-scalar-subquery"
+        , "simplify-cast"
+        , "simplify-function_to_argument"
+        , "simplify-case_result"
+        , "simplify-case_else"
         ]
 
 -- | Operand simplifications that unwrap unless they discard the operand value.
@@ -1085,6 +1089,10 @@ operandSimplifyLabels =
         [ "simplify-unary_expression"
         , "simplify-binary_expression"
         , "simplify-in_list"
+        , "simplify-in_subquery"
+        , "simplify-between"
+        , "simplify-like"
+        , "simplify-is_null"
         ]
 
 -- | Replacement constants that make an operand simplification destructive.

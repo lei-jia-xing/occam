@@ -196,6 +196,18 @@ tests =
             assertBool "removes noise frame" (not (BSC.isInfixOf "ROWS BETWEEN" reduced))
             assertBool "removes noise group by item" (not (BSC.isInfixOf "noise_grp" reduced))
             assertBool "removes noise query order by item" (not (BSC.isInfixOf "noise_order" reduced))
+        , testCase "Intra-statement rewrites unwrap CAST expressions" $ do
+            pool <- predicatePool (BSC.isInfixOf "42")
+            let sql = "SELECT CAST(42 AS VARCHAR(255));"
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertEqual "unwraps cast to inner expression" "SELECT 42;" reduced
+        , testCase "Intra-statement rewrites unwrap CASE expressions to matching branch" $ do
+            pool <- predicatePool (BSC.isInfixOf "42")
+            let sql = "SELECT CASE WHEN cond THEN 42 ELSE 99 END;"
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertEqual "unwraps case expression to inner branch" "SELECT 42;" reduced
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)
