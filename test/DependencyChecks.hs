@@ -1145,9 +1145,9 @@ tests =
                 ["emp", "task"]
                 (targets (StatementId 10))
             assertBool
-                "cascaded deletes carry the delete kind"
+                "cascaded deletes are limited to matching child rows"
                 ( all
-                    (\write -> dataWriteKind write == DeleteWrite DeleteAllRows)
+                    (\write -> dataWriteKind write == DeleteWrite DeleteFilteredRows)
                     (Map.findWithDefault [] (StatementId 10) enforcedExtras)
                 )
         , testCase "schema-qualified tables with the same base name cascade independently" $ do
@@ -2602,11 +2602,17 @@ sqliteForeignKeyBoundaryChecks =
             [ testCase "ignores disabling enforcement inside the transaction" $ do
                 let input =
                         schema
-                            ++ ["PRAGMA foreign_keys = 1;", opener, "PRAGMA foreign_keys = 0;", deleteParent, closer, readChild]
+                            ++ [ "PRAGMA foreign_keys = ON;"
+                               , opener
+                               , "PRAGMA main.foreign_keys(OFF);"
+                               , deleteParent
+                               , closer
+                               , readChild
+                               ]
                 checkNativeSlice SQLite input emptyChild [1, 8] [(6, presentChild), (9, presentChild)]
                 checkCascade input 9 True
             , testCase "ignored enable does not persist after the transaction" $ do
-                let input = schema ++ [opener, "PRAGMA foreign_keys = 1;", closer, deleteParent, readChild]
+                let input = schema ++ [opener, "PRAGMA foreign_keys(YES);", closer, deleteParent, readChild]
                 checkNativeSlice SQLite input presentChild [1, 7, 9] [(5, emptyChild)]
                 checkCascade input 9 False
             , testCase "enabling after the transaction retains the exit boundary" $ do

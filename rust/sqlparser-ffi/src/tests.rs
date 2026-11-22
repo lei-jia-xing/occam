@@ -1590,6 +1590,34 @@ fn explain_reads_schema_metadata_unless_analyze_executes() {
 }
 
 #[test]
+fn sqlite_foreign_keys_accepts_boolean_keywords_with_original_spans() {
+    for (pragma, enabled) in [
+        ("PRAGMA foreign_keys = ON", true),
+        ("PRAGMA main.foreign_keys(Off)", false),
+        ("PRAGMA \"foreign_keys\" /* 外鍵 */ = YeS", true),
+        ("PRAGMA foreign_keys(NO)", false),
+        ("PRAGMA foreign_keys = TRUE", true),
+        ("PRAGMA foreign_keys(FALSE)", false),
+        ("PRAGMA foreign_keys = 'yes'", true),
+        ("PRAGMA foreign_keys('no')", false),
+    ] {
+        let sql = format!("SELECT 1; {pragma}; SELECT 2;");
+        let units = parse(&sql, DialectKind::SQLite).unwrap();
+        assert_eq!(units.len(), 3, "{pragma}");
+        assert_eq!(&sql[units[1].start..units[1].end], pragma);
+        assert!(facts(&units[1]).barriers.is_empty(), "{pragma}");
+        assert!(
+            matches!(
+                facts(&units[1]).session.as_slice(),
+                [SessionEffect::SetSqliteForeignKeys { value }] if *value == enabled
+            ),
+            "{pragma}"
+        );
+        assert_eq!(&sql[units[2].start..units[2].end], "SELECT 2");
+    }
+}
+
+#[test]
 fn pragma_foreign_keys_only_changes_state_on_assignment() {
     let units = parse("PRAGMA foreign_keys;", DialectKind::SQLite).unwrap();
     assert!(facts(&units[0]).session.is_empty());

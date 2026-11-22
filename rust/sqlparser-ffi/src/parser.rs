@@ -3,9 +3,57 @@ use crate::edits::AnalysisContext;
 use crate::ir::{IdentifierRules, ParseConfig};
 use crate::source::{ByteSpan, SourceMap, TokenKind, dialect, token_positions};
 use crate::{DialectKind, NativeUnit};
-use sqlparser::ast::Statement;
-use sqlparser::parser::Parser;
+use sqlparser::ast::{Statement, Value};
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer};
+
+/// Accept SQLite's bare boolean arguments for foreign_keys with their original spans.
+fn parse_sqlite_foreign_keys(parser: &mut Parser<'_>) -> Option<Result<Statement, ParserError>> {
+    let token = |n| &parser.peek_nth_token_ref(n).token;
+    if !matches!(token(0), Token::Word(word) if word.keyword == Keyword::PRAGMA) {
+        return None;
+    }
+    let name_index = if matches!(token(1), Token::Word(word) if word.value.eq_ignore_ascii_case("main") || word.value.eq_ignore_ascii_case("temp"))
+        && *token(2) == Token::Period
+    {
+        3
+    } else {
+        1
+    };
+    if !matches!(token(name_index), Token::Word(word) if word.value.eq_ignore_ascii_case("foreign_keys"))
+    {
+        return None;
+    }
+    let is_eq = match token(name_index + 1) {
+        Token::Eq => true,
+        Token::LParen if *token(name_index + 3) == Token::RParen => false,
+        _ => return None,
+    };
+    let argument = parser.peek_nth_token_ref(name_index + 2);
+    let Token::Word(word) = &argument.token else {
+        return None;
+    };
+    let enabled = match word.value.to_ascii_lowercase().as_str() {
+        "on" | "yes" | "true" if word.quote_style.is_none() => true,
+        "off" | "no" | "false" if word.quote_style.is_none() => false,
+        _ => return None,
+    };
+    let value = Value::Boolean(enabled).with_span(argument.span);
+    parser.advance_token(); // PRAGMA
+    Some(parser.parse_object_name(false).map(|name| {
+        parser.advance_token(); // = or (
+        parser.advance_token(); // boolean argument
+        if !is_eq {
+            parser.advance_token(); // )
+        }
+        Statement::Pragma {
+            name,
+            value: Some(value),
+            is_eq,
+        }
+    }))
+}
 
 /// Parses all statement units from `source` according to `config`, extracting semantic facts and source spans.
 pub(super) fn parse_units(source: &str, config: &ParseConfig) -> Result<Vec<NativeUnit>, String> {
@@ -110,7 +158,11 @@ fn walk_units(
             return Err("sqlparser returned an unmappable statement start".to_string());
         };
         let start = first_position.start;
-        let parsed = parser.parse_statement();
+        let parsed = if kind == DialectKind::SQLite {
+            parse_sqlite_foreign_keys(&mut parser).unwrap_or_else(|| parser.parse_statement())
+        } else {
+            parser.parse_statement()
+        };
         let mut parse_error = None;
         let mut has_parse_error = false;
         let statement = match parsed {

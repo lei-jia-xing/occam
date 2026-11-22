@@ -2754,8 +2754,8 @@ pub(crate) fn pragma_bool(value: &ValueWithSpan) -> Option<bool> {
         | Value::DoubleQuotedString(value)
         | Value::TripleSingleQuotedString(value)
         | Value::TripleDoubleQuotedString(value) => match value.to_ascii_lowercase().as_str() {
-            "on" | "true" | "1" => Some(true),
-            "off" | "false" | "0" => Some(false),
+            "on" | "yes" | "true" | "1" => Some(true),
+            "off" | "no" | "false" | "0" => Some(false),
             _ => None,
         },
         _ => None,

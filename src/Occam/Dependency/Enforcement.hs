@@ -290,7 +290,7 @@ expandWrite initial catalog write = case dataWriteKind write of
                 guard = (key, isDelete, Set.fromList columns)
 
         childWrite :: NameRef -> Bool -> [Ident] -> DataWrite
-        childWrite ref True _ = DataWrite ref (DeleteWrite DeleteAllRows) [] [] [] False
+        childWrite ref True _ = DataWrite ref (DeleteWrite DeleteFilteredRows) [] [] [] False
         childWrite ref False childColumns = DataWrite ref (UpdateWrite UpdateFilteredRows) childColumns [] [] False
 
         cascadeChildren :: TableKey -> Bool -> [Text] -> [(TableKey, NameRef, Bool, [Ident])]

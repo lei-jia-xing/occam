@@ -131,6 +131,13 @@
 ** DONE [#A] Align SQLite foreign-key PRAGMA with transaction boundaries
 - FIX: SQLite ignores assignment to foreign_keys while a BEGIN or SAVEPOINT is pending. The graph and cascade diagnostics share the transaction state rule. A retained PRAGMA uses the opening or closing boundary needed to preserve its effect under slicing. Six native regressions cover disabling, enabling, and enabling after either boundary. [[https://www.sqlite.org/pragma.html#pragma_foreign_keys][SQLite PRAGMA foreign_keys]]
 
+** DONE [#A] Exercise transaction and cascade combinations against native engines
+- NOTE: Exhaust commit/rollback pairs on SQLite and DuckDB, check primary-key conflicts on both, and combine SQLite nested and reused savepoints with cascades and triggers. Compare raw slices with independent expected rows and check that unrelated DDL is removed.
+- FIX: A cascading delete only removes matching child rows. Treating it as a full child-table delete discarded updates to surviving rows. Use a filtered delete for graph construction and cascade diagnostics.
+
+** DONE [#B] Parse SQLite keyword spellings of foreign_keys
+- FIX: sqlparser-rs 0.64.0 rejects bare boolean keywords in PRAGMA values. The SQLite frontend recognizes the documented boolean words for foreign_keys with their original spans. Parser tests cover both forms and native slices exercise transaction boundaries. [[https://www.sqlite.org/pragma.html#pragma_foreign_keys][SQLite PRAGMA foreign_keys]]
+
 ** TODO [#B] Reducer optimization roadmap
 *** Evidence and invariants
 - SQLite scale-064 goes from 1111 B and 19 physical oracle executions to 887 B and 641 executions with intra-statement edits. Literal edits account for 348 starts. VALUES row and row-chunk deletions account for 252 starts with zero accepts. Oracle and frontend parse/decode are the largest measured costs. Candidate rendering is below 1 ms on this input. Eight AB/BA pairs per case establish the current comparison for scale-064, deep expressions, and views/aggregates.

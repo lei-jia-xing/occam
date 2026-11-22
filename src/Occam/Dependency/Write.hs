@@ -600,7 +600,9 @@ applyParentActions sid eval key kind columns =
                     Cascade ->
                         case action of
                             DeleteWrite _ ->
-                                writeChild current (constraintStateTable state) (DeleteWrite DeleteAllRows) []
+                                -- Only matching children are deleted, even when the parent
+                                -- delete is unfiltered (nullable foreign keys can survive).
+                                writeChild current (constraintStateTable state) (DeleteWrite DeleteFilteredRows) []
                             UpdateWrite _ ->
                                 writeChild
                                     current
