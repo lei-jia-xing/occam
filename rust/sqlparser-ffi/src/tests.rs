@@ -4424,3 +4424,106 @@ fn test_update_and_delete_syntax_edits() {
     let join_edits: Vec<_> = edits6.iter().filter(|e| e.label == "remove-join").collect();
     assert_eq!(join_edits.len(), 2);
 }
+
+#[test]
+fn test_set_operation_syntax_edits() {
+    let sql = "SELECT 1 UNION ALL SELECT 2;";
+    let units = parse(sql, DialectKind::Generic).unwrap();
+    let edits = &facts(&units[0]).edits;
+
+    let applied: Vec<String> = edits
+        .iter()
+        .filter(|edit| {
+            edit.label == "simplify-set_operation_left"
+                || edit.label == "simplify-set_operation_right"
+        })
+        .map(|edit| {
+            format!(
+                "{}{}{}",
+                &sql[..edit.start],
+                edit.replacement,
+                &sql[edit.end..]
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        applied,
+        vec![
+            "SELECT 1;", // simplify-set_operation_left
+            "SELECT 2;", // simplify-set_operation_right
+        ]
+    );
+
+    let sql2 = "(SELECT 1) UNION ALL (SELECT 2);";
+    let units2 = parse(sql2, DialectKind::Generic).unwrap();
+    let edits2 = &facts(&units2[0]).edits;
+
+    let applied2: Vec<String> = edits2
+        .iter()
+        .filter(|edit| {
+            edit.label == "simplify-set_operation_left"
+                || edit.label == "simplify-set_operation_right"
+        })
+        .map(|edit| {
+            format!(
+                "{}{}{}",
+                &sql2[..edit.start],
+                edit.replacement,
+                &sql2[edit.end..]
+            )
+        })
+        .collect();
+
+    assert_eq!(applied2, vec!["(SELECT 1);", "(SELECT 2);",]);
+
+    let sql3 = "SELECT 1 UNION ALL SELECT 2 ORDER BY 1 LIMIT 1;";
+    let units3 = parse(sql3, DialectKind::Generic).unwrap();
+    let edits3 = &facts(&units3[0]).edits;
+
+    let applied3: Vec<String> = edits3
+        .iter()
+        .filter(|edit| {
+            edit.label == "simplify-set_operation_left"
+                || edit.label == "simplify-set_operation_right"
+        })
+        .map(|edit| {
+            format!(
+                "{}{}{}",
+                &sql3[..edit.start],
+                edit.replacement,
+                &sql3[edit.end..]
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        applied3,
+        vec![
+            "SELECT 1 ORDER BY 1 LIMIT 1;",
+            "SELECT 2 ORDER BY 1 LIMIT 1;",
+        ]
+    );
+
+    let sql4 = "SELECT 999 AS noise UNION ALL (SELECT 888 AS noise) UNION ALL SELECT 42 AS target;";
+    let units4 = parse(sql4, DialectKind::Generic).unwrap();
+    let edits4 = &facts(&units4[0]).edits;
+    let applied4 = edits4
+        .iter()
+        .filter(|e| e.label.starts_with("simplify-set_operation"))
+        .map(|e| {
+            let mut s = sql4.to_string();
+            s.replace_range(e.start..e.end, &e.replacement);
+            s
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied4,
+        vec![
+            "SELECT 999 AS noise UNION ALL (SELECT 888 AS noise);",
+            "SELECT 42 AS target;",
+            "SELECT 999 AS noise UNION ALL SELECT 42 AS target;",
+            "(SELECT 888 AS noise) UNION ALL SELECT 42 AS target;",
+        ]
+    );
+}

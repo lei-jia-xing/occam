@@ -173,6 +173,16 @@ tests =
             assertBool "removes dead update where clause" (not (BSC.isInfixOf "dead_cond" reduced))
             assertBool "removes dead delete where clause" (not (BSC.isInfixOf "dead_delete_cond" reduced))
             assertBool "keeps DELETE statement" (BSC.isInfixOf "DELETE FROM t;" reduced)
+        , testCase "Intra-statement rewrites reduce compound queries across set operations" $ do
+            pool <- predicatePool (BSC.isInfixOf "42")
+            let sql =
+                    "SELECT 999 UNION ALL (SELECT 888) UNION ALL SELECT 42;"
+                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            reduced <- reduceSQLWithConfig config nullLogger pool sql
+            assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
+            assertBool "removes noise branch 999" (not (BSC.isInfixOf "999" reduced))
+            assertBool "removes noise branch 888" (not (BSC.isInfixOf "888" reduced))
+            assertEqual "reduces to clean single query" "SELECT 42;" reduced
         , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "main_tbl" candidate && BSC.isInfixOf "42" candidate)

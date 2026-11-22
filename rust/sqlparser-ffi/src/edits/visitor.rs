@@ -1580,6 +1580,74 @@ impl<'a> AnalysisVisitor<'a> {
         Some((start, end))
     }
 
+    fn set_expr_source_span(&self, expr: &SetExpr) -> Option<(usize, usize)> {
+        let (start, end) = match expr {
+            SetExpr::Select(select) => {
+                let (start, _) = self.mapped_span(select.select_token.0.span)?;
+                let (_, end) = self.mapped_span(select.span())?;
+                (start, end)
+            }
+            SetExpr::Query(query) => {
+                if let Some(span) = self.mapped_span(query.span()) {
+                    span
+                } else {
+                    self.set_expr_source_span(&query.body)?
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                let (start, _) = self.set_expr_source_span(left)?;
+                let (_, end) = self.set_expr_source_span(right)?;
+                (start, end)
+            }
+            SetExpr::Values(values) => self.mapped_span(values.span())?,
+            _ => self.mapped_span(expr.span())?,
+        };
+        if start < self.unit.start || end > self.unit.end {
+            return None;
+        }
+        let before = self.tokens.partition_point(|token| token.start < start);
+        if let Some(pair) = self.tokens[..before].iter().rev().find_map(|token| {
+            matches!(token.kind, TokenKind::LeftParen)
+                .then_some(token.parentheses)
+                .flatten()
+                .filter(|pair| pair.end >= end)
+        }) {
+            return Some((pair.start, pair.end));
+        }
+        Some((start, end))
+    }
+
+    fn set_operation_edits(&mut self, expr: &SetExpr) {
+        let SetExpr::SetOperation { left, right, .. } = expr else {
+            return;
+        };
+        if let (Some(left_span), Some(right_span)) = (
+            self.set_expr_source_span(left),
+            self.set_expr_source_span(right),
+        ) {
+            if left_span.1 < right_span.1 {
+                self.add_edit_bytes(
+                    left_span.1,
+                    right_span.1,
+                    "",
+                    NativeEditCategory::Clause,
+                    "simplify-set_operation_left",
+                );
+            }
+            if left_span.0 < right_span.0 {
+                self.add_edit_bytes(
+                    left_span.0,
+                    right_span.0,
+                    "",
+                    NativeEditCategory::Clause,
+                    "simplify-set_operation_right",
+                );
+            }
+        }
+        self.set_operation_edits(left);
+        self.set_operation_edits(right);
+    }
+
     fn data_type_pattern(&self, data_type: &DataType) -> Option<Vec<TokenKind>> {
         let sql = data_type.to_string();
         let type_dialect = dialect(self.dialect);
@@ -2177,6 +2245,7 @@ impl Visitor for AnalysisVisitor<'_> {
                 self.list_edit_ranges("remove-values_row", &spans);
             }
         }
+        self.set_operation_edits(&query.body);
         std::ops::ControlFlow::Continue(())
     }
 
