@@ -462,6 +462,13 @@ phase5Tests =
                      in assertBool ("--help hides dialect: " ++ name) (name `isInfixOf` helpOut)
                 )
                 ([minBound .. maxBound] :: [SQLDialect])
+        , testCase "default stdout includes the best reduction under a two-call budget" $
+            withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
+                let predicate = "grep -q 'SELECT 2'"
+                (code, out, _) <-
+                    runOccamCLI [input, "-c", predicate, "--max-oracle-executions", "2", "--quiet"]
+                assertBool "budget exhaustion must remain nonzero" (code /= ExitSuccess)
+                assertEqual "preflight must leave one call for reduction" "SELECT 2;" out
         , testCase "--out - keeps stdout pure SQL under --verbose" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\n" $ \input _ -> do
                 (code, out, _) <- runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
@@ -654,6 +661,12 @@ phase5Tests =
             (invCode, _, invErr) <- runOccamCLI ["--completion", "powershell"]
             assertEqual "--completion powershell exit failure" (ExitFailure 1) invCode
             assertBool "invalid shell error message" ("Expected 'bash', 'zsh', or 'fish'" `isInfixOf` invErr)
+        , testCase "CLI requires in-place mode to overwrite the input" $
+            withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
+                (code, _, err) <- runOccamCLI [input, "-c", "exit 0", "--out", input]
+                assertEqual ("--out input must exit 2: " ++ err) (ExitFailure 2) code
+                inputAfter <- BS.readFile input
+                assertEqual "input file changed" "SELECT 1; SELECT 2;" inputAfter
         , testCase "CLI rejects --stats paths that collide with input or output" $
             withCLIInput "SELECT 1;" $ \input outFile -> do
                 (inputCode, _, inputErr) <-

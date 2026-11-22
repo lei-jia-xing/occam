@@ -13,14 +13,16 @@ cabal run occam -- input.sql \
   --oracle './interesting.sh' \
   --reset './reset-db' \
   --timeout 30 --budget 300 --max-oracle-executions 1000 \
-  --out /tmp/occam-result
+  --out /tmp/occam-result.sql
 ```
 
-`--reset` is optional. The initial input must pass before reduction. Per-call, total-time, and uncached-execution budgets include the initial and final checks; when budgets permit, Occam performs two uncached final validations. On exhaustion, it preserves the last accepted SQL and reports a nonzero status. `stats.json` reports available measurements; per-candidate statement counts and tokens can be unknown.
+`--reset` is optional. Occam writes reduced SQL to stdout by default. Use `--out FILE` to write to a file or `--in-place` to replace the input with a backup after final validation.
+
+The initial input must pass before reduction. The shared time and uncached-execution budgets include initial and final checks. After the initial check, Occam gives reduction the first available attempt, reserves room for up to two final checks when the budget allows, and uses the remaining budget for uncached final checks. On exhaustion, it preserves the last accepted SQL and reports a nonzero status. `stats.json` reports available measurements; per-candidate statement counts and tokens can be unknown.
 
 `--jobs N` (default `1`, must be positive) bounds concurrent oracle/reset executions and declares that the predicate AND reset support `N` concurrent independent calls with independent database state. The scheduler enforces at most `N` in flight; it never provides database isolation itself. With `--jobs 1` all external interactions serialize on the same scheduler; higher counts only help when the external predicate/reset is genuinely concurrency-safe.
 
-`stats.json`'s `evaluation_metrics` keeps reset timings distinct: `evaluation_preflight_reset_seconds` (initial/preflight), `evaluation_reset_seconds` (reduction), and `evaluation_validation_reset_seconds` (final validation); `evaluation_preflight_oracle_seconds` records initial predicate time. Sum reset phases once; unavailable optional preflight measurements serialize as `null`. Final-validation wall time is reserved only for calls actually scheduled, so zero scheduled calls reserve zero. If initial preflight consumes the execution cap, Occam reports `execution-budget`, performs no reduction/final calls, and preserves the accepted checkpoint.
+`stats.json`'s `evaluation_metrics` keeps reset timings distinct: `evaluation_preflight_reset_seconds` (initial/preflight), `evaluation_reset_seconds` (reduction), and `evaluation_validation_reset_seconds` (final validation); `evaluation_preflight_oracle_seconds` records initial predicate time. Sum reset phases once; unavailable optional preflight measurements serialize as `null`. If initial preflight consumes the execution cap, Occam reports `execution-budget`, performs no reduction/final calls, and preserves the accepted checkpoint.
 
 Concurrency accounting lives in `evaluation_metrics`: the job count is `evaluation_budget.evaluation_jobs` (no top-level echo); `evaluation_cancelled_observations` counts speculatively started tasks killed or dropped without producing an observation (never timeouts or errors); `evaluation_cache_joins` counts duplicate candidates coalesced onto one in-flight physical execution. `evaluation_oracle_attempts` counts every physical start including speculation; `evaluation_database_observations` counts actually spawned oracle processes. Top-level `stats.json` echoes cancellations as `cancelled_observations` and joins as `cache_joins`.
 

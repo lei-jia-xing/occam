@@ -109,12 +109,12 @@ import Options.Applicative (
     (<**>),
  )
 import System.Directory (
+    canonicalizePath,
     doesFileExist,
-    makeAbsolute,
  )
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath (dropExtension, normalise, takeExtension, (</>))
+import System.FilePath ((</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
@@ -450,7 +450,7 @@ rawOptionsParser =
                 ( long "out"
                     <> short 'o'
                     <> metavar "PATH"
-                    <> help "Output SQL file path, or '-' for stdout (default: <input>.min.sql or stdout)"
+                    <> help "Output SQL file path (default: stdout; '-' also means stdout)"
                     <> action "file"
                 )
             )
@@ -682,12 +682,6 @@ exitCliError = exitWith (ExitFailure 2)
 exitTimeout :: IO a
 exitTimeout = exitWith (ExitFailure 124)
 
-defaultMinPath :: FilePath -> FilePath
-defaultMinPath "-" = "minimal.sql"
-defaultMinPath fp
-    | takeExtension fp == ".sql" = dropExtension fp ++ ".min.sql"
-    | otherwise = fp ++ ".min.sql"
-
 -- ----------------------------------------------------------------------------
 -- Atomic File Output
 -- ----------------------------------------------------------------------------
@@ -706,30 +700,29 @@ writeAtomicLazy path content = writeAtomicLazyBytes path content
 
 -- | Ensure stats and output file paths do not collide with inputs or backups.
 validateOutputPaths :: FilePath -> FilePath -> Bool -> Bool -> Maybe FilePath -> IO ()
-validateOutputPaths input target writesStdout inPlace statsFile =
-    forM_ statsFile \stats -> do
-        when (stats == "-" && writesStdout) $ do
-            hPutStrLn stderr "error: --stats - cannot be combined with writing reduced SQL to stdout"
-            exitCliError
-        unless (stats == "-") $ do
-            statsAbs <- absoluteNormalized stats
-            when (input /= "-") $ do
-                inputAbs <- absoluteNormalized input
-                when (statsAbs == inputAbs) $ do
-                    hPutStrLn stderr "error: --stats path must differ from the input path"
-                    exitCliError
+validateOutputPaths input target writesStdout inPlace statsFile = do
+    inputPath <- traverse canonicalizePath (if input == "-" then Nothing else Just input)
+    targetPath <- traverse canonicalizePath (if writesStdout then Nothing else Just target)
+    unless inPlace $
+        rejectCollision inputPath targetPath "--out path must differ from the input path (use --in-place)"
+    forM_ statsFile \stats ->
+        if stats == "-"
+            then
+                when writesStdout $
+                    failPath "--stats - cannot be combined with writing reduced SQL to stdout"
+            else do
+                statsPath <- Just <$> canonicalizePath stats
+                rejectCollision statsPath inputPath "--stats path must differ from the input path"
+                rejectCollision statsPath targetPath "--stats path must differ from the output path"
                 when inPlace $ do
-                    backupAbs <- absoluteNormalized (input ++ ".bak")
-                    when (statsAbs == backupAbs) $ do
-                        hPutStrLn stderr "error: --stats path must differ from the in-place backup path"
-                        exitCliError
-            unless (null target) $ do
-                targetAbs <- absoluteNormalized target
-                when (statsAbs == targetAbs) $ do
-                    hPutStrLn stderr "error: --stats path must differ from the output path"
-                    exitCliError
+                    backupPath <- Just <$> canonicalizePath (input ++ ".bak")
+                    rejectCollision statsPath backupPath "--stats path must differ from the in-place backup path"
     where
-        absoluteNormalized path = normalise <$> makeAbsolute path
+        rejectCollision left right message =
+            when (isJust left && left == right) (failPath message)
+        failPath message = do
+            hPutStrLn stderr ("error: " ++ message)
+            exitCliError
 
 -- ----------------------------------------------------------------------------
 -- Main
@@ -821,6 +814,9 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     oracleCmd <- requireOracleCommand valOracleCmd
     (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
 
+    (writeToStdout, targetMinimalPath, statsPath) <-
+        resolveOutputTargets valInputFile valOut valInPlace valStatsFile
+
     ui <-
         newUI
             UIConfig
@@ -881,9 +877,6 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             logger
             "cli"
             "running with --jobs > 1 without --reset may lead to shared database state contamination"
-
-    (writeToStdout, targetMinimalPath, statsPath) <-
-        resolveOutputTargets valInputFile valOut valInPlace valStatsFile
 
     metricsPolicy <- case valStrategy of
         StrategyFull -> case metricPolicyForReduction reductionConfig valJobs of
@@ -1109,19 +1102,9 @@ resolveOutputTargets ::
     Maybe FilePath ->
     IO (Bool, FilePath, FilePath)
 resolveOutputTargets inputFile outputFile inPlace statsFile = do
-    isStdoutTTY <- hIsTerminalDevice stdout
-    let writeToStdout =
-            outputFile == Just "-"
-                || (isNothing outputFile && not inPlace && (not isStdoutTTY || inputFile == "-"))
-    targetMinimalPath <-
-        if writeToStdout
-            then pure ""
-            else case outputFile of
-                Just path -> pure path
-                Nothing
-                    | inPlace -> pure inputFile
-                    | otherwise -> pure (defaultMinPath inputFile)
-    let statsPath = fromMaybe "" statsFile
+    let targetMinimalPath = fromMaybe (if inPlace then inputFile else "-") outputFile
+        writeToStdout = targetMinimalPath == "-"
+        statsPath = fromMaybe "" statsFile
     validateOutputPaths inputFile targetMinimalPath writeToStdout inPlace statsFile
     pure (writeToStdout, targetMinimalPath, statsPath)
 

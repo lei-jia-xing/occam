@@ -12,6 +12,7 @@ module Occam.Pool (
     poolOracle,
     poolMetricsStore,
     mapPoolRetire,
+    withCandidateCountCleanup,
     poolCacheStats,
     poolAttempts,
     poolCancelled,
@@ -42,7 +43,9 @@ import Control.Exception (
     Exception,
     SomeException,
     bracket_,
+    finally,
     fromException,
+    mask,
     mask_,
     onException,
     throwIO,
@@ -86,6 +89,7 @@ import Occam.Metrics (
 import Occam.Oracle (
     OracleObservation (..),
     OracleObservationDetails (..),
+    OracleReapFailed (..),
     observationOutcome,
  )
 import System.Exit (ExitCode (..))
@@ -124,6 +128,8 @@ data OraclePool = OraclePool
     , poolExecuteFn :: !(ByteString -> IO OracleObservationDetails)
     , poolBillFn :: !(OracleObservationDetails -> IO ())
     , poolRetireFn :: !(Int -> ByteString -> OracleOutcome -> Bool -> IO ())
+    , poolCleanupCounts :: !(IO ())
+    , poolReapFailed :: !(IORef Bool)
     , poolReportCountFn :: !(Maybe (ByteString -> Int -> IO ()))
     , poolRegistry :: !(MVar (Map ThreadId (MVar ())))
     , poolIndexRef :: !(IORef Int)
@@ -145,6 +151,7 @@ newOraclePool PoolConfig {..}
         attempts <- newIORef 0
         cancelled <- newIORef 0
         live <- newIORef 0
+        reapFailed <- newIORef False
         pure
             OraclePool
                 { poolJobsCount = poolJobs
@@ -157,6 +164,8 @@ newOraclePool PoolConfig {..}
                 , poolExecuteFn = poolExecute
                 , poolBillFn = poolBill
                 , poolRetireFn = poolRetire
+                , poolCleanupCounts = pure ()
+                , poolReapFailed = reapFailed
                 , poolReportCountFn = poolReportCount
                 , poolRegistry = registry
                 , poolIndexRef = index
@@ -167,13 +176,20 @@ newOraclePool PoolConfig {..}
 
 -- | Cancel and join all active workers in the pool.
 closeOraclePool :: OraclePool -> IO ()
-closeOraclePool pool = do
-    snapshot <- readMVar (poolRegistry pool)
-    unless (Map.null snapshot) $ do
-        mapM_ killThread (Map.keys snapshot)
-        mapM_ readMVar (Map.elems snapshot)
-        mapM_ (deregWorker pool) (Map.keys snapshot)
-        closeOraclePool pool
+closeOraclePool pool = drain >> checkReapFailure pool
+    where
+        drain = do
+            snapshot <- readMVar (poolRegistry pool)
+            unless (Map.null snapshot) $ do
+                mapM_ killThread (Map.keys snapshot)
+                mapM_ readMVar (Map.elems snapshot)
+                mapM_ (deregWorker pool) (Map.keys snapshot)
+                drain
+
+checkReapFailure :: OraclePool -> IO ()
+checkReapFailure pool = do
+    failed <- readIORef (poolReapFailed pool)
+    when failed (throwIO OracleReapFailed)
 
 deregWorker :: OraclePool -> ThreadId -> IO ()
 deregWorker pool tid = modifyMVar_ (poolRegistry pool) (pure . Map.delete tid)
@@ -231,6 +247,9 @@ mapPoolRetire ::
     OraclePool ->
     OraclePool
 mapPoolRetire f pool = pool {poolRetireFn = f (poolRetireFn pool)}
+
+withCandidateCountCleanup :: IO () -> OraclePool -> OraclePool
+withCandidateCountCleanup cleanup pool = pool {poolCleanupCounts = cleanup}
 
 poolJobCount :: OraclePool -> Int
 poolJobCount = poolJobsCount
@@ -290,7 +309,8 @@ testOrdered pool = testOrderedTagged pool . map (TagUnknown,)
 testOrderedTagged :: OraclePool -> [(FamilyTag, ByteString)] -> IO [WindowOutcome]
 testOrderedTagged _ [] = pure []
 testOrderedTagged pool candidates =
-    bracket_ (takeMVar (poolGate pool)) (putMVar (poolGate pool) ()) (goChunks candidates [])
+    bracket_ (takeMVar (poolGate pool)) (putMVar (poolGate pool) ()) $
+        (checkReapFailure pool >> goChunks candidates []) `finally` poolCleanupCounts pool
     where
         jobs = poolJobsCount pool
         goChunks [] acc = pure (reverse acc)
@@ -303,13 +323,16 @@ testOrderedTagged pool candidates =
                 WindowReject -> goChunks remaining acc'
 
 testWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO ([WindowOutcome], WindowDecision)
-testWindow pool tagged = do
+testWindow pool tagged = mask \restore -> do
     launched <- launchWindow pool tagged
     -- Highest retired window ordinal (-1 if none).
     retiredThrough <- newIORef (-1)
     let items = [(tag, candidate, (ordinal, task)) | ((tag, candidate), (ordinal, task)) <- zip tagged launched]
-    retireWindow pool items retiredThrough
-        `onException` (readIORef retiredThrough >>= settleAll pool launched)
+    outcome <-
+        restore (retireWindow pool items retiredThrough)
+            `onException` (readIORef retiredThrough >>= settleAll pool launched)
+    checkReapFailure pool
+    pure outcome
 
 launchWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO [(Int, WindowTask)]
 launchWindow pool window = mask_ (go 0 [] window)
@@ -398,6 +421,9 @@ publishOutcome pool tag candidate ordinal startRef result done outcome = mask_ $
                 (Just (resetElapsedMicros details))
             putMVar result (Right timed)
         Left err -> do
+            case fromException err of
+                Just OracleReapFailed -> writeIORef (poolReapFailed pool) True
+                Nothing -> pure ()
             started <- readIORef startRef
             case started of
                 Nothing -> refundPermit (poolPermitsVar pool)

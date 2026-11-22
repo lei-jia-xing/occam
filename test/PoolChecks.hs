@@ -26,7 +26,7 @@ import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleInconclusiveError, OracleOutcome (..))
-import Occam.Oracle (OracleObservation (..), OracleObservationDetails)
+import Occam.Oracle (OracleObservation (..), OracleObservationDetails, OracleReapFailed (..))
 import Occam.Pool (
     ExecutionBudgetReached (..),
     OraclePool,
@@ -74,6 +74,29 @@ tests =
             assertEqual "late duplicate served from cache" 1 (cacheHits stats)
             attempts <- poolAttempts pool
             assertEqual "physical starts across both windows" 3 attempts
+        , testCase "reap failure in an unselected worker stops the pool" $ do
+            poolRef <- newEmptyMVar
+            let execute candidate
+                    | candidate == "fails-reap" = throwIO OracleReapFailed
+                    | otherwise = pure acceptDetails
+                retire _ _ _ _ = do
+                    pool <- readMVar poolRef
+                    let waitForWorkers = do
+                            live <- poolLiveWorkers pool
+                            if live == 0 then pure () else threadDelay 1000 >> waitForWorkers
+                    waitForWorkers
+            pool <- testPool 2 Nothing execute (const (pure ())) retire
+            putMVar poolRef pool
+            result <- timeout 5000000 (try (testOrdered pool ["accept", "fails-reap"]))
+            case result of
+                Just (Left OracleReapFailed) -> pure ()
+                _ -> assertFailure "unselected worker's reap failure was lost"
+            retry <- try (testOrdered pool ["new-candidate"])
+            case retry of
+                Left OracleReapFailed -> pure ()
+                Right _ -> assertFailure "pool accepted work after a reap failure"
+            attempts <- poolAttempts pool
+            assertEqual "new candidate must not start" 2 attempts
         , testCase "racing later acceptance cannot overtake a gated earlier acceptance" $ do
             retiredRef <- newIORef []
             billedRef <- newIORef (0 :: Int)

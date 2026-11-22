@@ -7,12 +7,7 @@ pub(crate) fn canonical_ident(
     class: ir::IdentifierClass,
 ) -> ir::Ident {
     let fold = rules.fold(class, ident.quote_style.is_some());
-    let value = match fold {
-        ir::CaseFolding::Lower => ident.value.to_lowercase(),
-        ir::CaseFolding::Upper => ident.value.to_uppercase(),
-        ir::CaseFolding::Preserve => ident.value.clone(),
-    };
-    ir::Ident(value)
+    ir::Ident(fold.apply(&ident.value))
 }
 
 pub(crate) fn canonical_ident_string(

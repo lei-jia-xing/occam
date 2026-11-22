@@ -52,7 +52,7 @@ fn table_matches(
 ) -> bool {
     table.iter().any(|name| {
         match rules.fold(ir::IdentifierClass::Other, ident.quote_style.is_some()) {
-            ir::CaseFolding::Lower | ir::CaseFolding::Upper => {
+            ir::CaseFolding::Lower | ir::CaseFolding::AsciiLower | ir::CaseFolding::Upper => {
                 ident.value.eq_ignore_ascii_case(name)
             }
             ir::CaseFolding::Preserve => ident.value == *name,

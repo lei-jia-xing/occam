@@ -155,7 +155,9 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                     case mbIn of
                         Just hIn -> do
                             groupId <- getOwnedGroup ph
-                            let cleanup = cleanupOwnedGroup groupId ph
+                            let cleanup = do
+                                    reaped <- cleanupOwnedGroup groupId ph
+                                    unless reaped $ throwIO OracleReapFailed
                             result <-
                                 ( do
                                     onStarted
@@ -166,7 +168,7 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                             ( withWorker (writePipe hIn input) \writeInput -> do
                                                 exitCode <- waitForProcess ph
                                                 -- Kill remaining group members before joining the stdin writer.
-                                                _ <- cleanup
+                                                cleanup
                                                 writeInput
                                                 pure exitCode
                                             )
@@ -174,8 +176,7 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                             `onException` cleanup
                                 )
                                     `onException` cleanup
-                            reaped <- cleanup
-                            unless reaped $ throwIO OracleReapFailed
+                            cleanup
                             pure (True, result)
                         _ -> ioError (userError "Missing oracle process pipes")
     where

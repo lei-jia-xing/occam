@@ -61,16 +61,12 @@ fn walk_units(
             .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
             .map_or(0, |index| index + 1);
         if detailed {
-            let map = source_map.as_ref().unwrap();
-            let error_start = map.offset(error.location).ok_or_else(|| {
-                "sqlparser returned an unmappable tokenizer error location".to_string()
-            })?;
             let start = positions
                 .iter()
                 .skip(prefix_len)
                 .find(|token| !matches!(token.kind, TokenKind::Whitespace))
                 .map(|token| token.start)
-                .unwrap_or(error_start);
+                .unwrap_or_else(|| positions.last().map_or(0, |token| token.end));
             if start >= source.len() {
                 return Err("sqlparser returned an empty tokenizer error unit".to_string());
             }
@@ -198,6 +194,7 @@ fn walk_units(
     // script disables the pure-builtin table for every unit, restoring the
     // blanket routine fence. Analysis runs only now so the flag is known.
     let pure_table_enabled = detailed
+        && lexical_suffix.is_none()
         && !pending.iter().any(|unit| unit.has_parse_error)
         && !pending.iter().any(|unit| {
             unit.statement

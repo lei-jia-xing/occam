@@ -85,6 +85,7 @@ import Occam.Pool (
     poolAttempts,
     poolCacheStats,
     poolCancelled,
+    withCandidateCountCleanup,
  )
 import Occam.Reducer (
     AuditStats (..),
@@ -421,33 +422,28 @@ runEvaluationRequest EvaluationRequest {..} = do
     let oracleTimeout = max 1 (toInteger (oracleTimeoutMicros oracleCfg))
         validationSlack = max 1000 (min 10000 (oracleTimeout `div` 100))
         perValidationReserve = oracleTimeout + validationSlack
-        callsAvailable = case evaluationMaxOracleExecutions config of
+        remainingCalls =
+            (\limit -> max 0 (limit - max 0 (evaluationPreflightAttempts config)))
+                <$> evaluationMaxOracleExecutions config
+        callsToReserve = maybe 2 (min 2 . max 0 . subtract 1) remainingCalls
+        timeToReserve = fromInteger $ case evaluationTotalTimeoutMicros config of
             Nothing -> 2
             Just limit ->
-                min 2 (max 0 (limit - max 0 (evaluationPreflightAttempts config)))
-        timeAvailable = fromInteger $ case evaluationTotalTimeoutMicros config of
-            Nothing -> 2
-            Just limit ->
-                let remaining = max 0 (toInteger limit - preflightMicros)
-                 in min 2 (remaining `div` perValidationReserve)
-        validationCallLimit = min callsAvailable timeAvailable
+                let remaining = toInteger limit - preflightMicros
+                 in min 2 (max 0 (remaining - oracleTimeout) `div` perValidationReserve)
+        validationCallReserve = min callsToReserve timeToReserve
         validationReserve = case evaluationTotalTimeoutMicros config of
             Nothing -> 0
-            Just limit ->
-                min
-                    (max 0 (toInteger limit - preflightMicros))
-                    (toInteger validationCallLimit * perValidationReserve)
+            Just _ -> toInteger validationCallReserve * perValidationReserve
         totalDeadline =
             (\limit -> totalStart + max 0 (toInteger limit) * 1000)
                 <$> evaluationTotalTimeoutMicros config
-        reductionCallLimit =
-            (\limit -> max 0 (limit - max 0 (evaluationPreflightAttempts config) - validationCallLimit))
-                <$> evaluationMaxOracleExecutions config
+        reductionCallLimit = subtract validationCallReserve <$> remainingCalls
         precomputedObservations =
             maybe Map.empty (Map.singleton initialSQL) preflightObservation
     reductionStart <- ticks
     metricsStore <- traverse newMetricsStore metricsPolicy
-    pool <-
+    rawPool <-
         newOraclePool
             PoolConfig
                 { poolJobs = evaluationJobs config
@@ -466,7 +462,8 @@ runEvaluationRequest EvaluationRequest {..} = do
                     Just
                         (\bytes count -> modifyEvalState state (\s -> s {evalCounts = Map.insert bytes count (evalCounts s)}))
                 }
-    let env =
+    let pool = withCandidateCountCleanup (modifyEvalState state (\s -> s {evalCounts = seedCounts})) rawPool
+        env =
             EvalEnv
                 { envDialect = dialect
                 , envOracleCfg = oracleCfg
@@ -474,9 +471,7 @@ runEvaluationRequest EvaluationRequest {..} = do
                 , envLogger = parentLogger
                 , envReductionStart = reductionStart
                 , envTotalDeadline = totalDeadline
-                , envValidationCallLimit = validationCallLimit
                 , envValidationReserve = validationReserve
-                , envPerValidationReserve = perValidationReserve
                 }
         reporter = evalStageReporter onProgress state
     (reductionOutcome, reductionSeconds, costAttribution) <-
@@ -502,9 +497,10 @@ runEvaluationRequest EvaluationRequest {..} = do
             case auditResult of
                 Just result -> result == finalSQL
                 Nothing -> False
-    validationPassed <- runValidationPhase env state finalSQL skipValidation
-    cacheStats <- poolCacheStats pool
     attempts <- poolAttempts pool
+    let validationCallLimit = maybe 2 (min 2 . max 0 . subtract attempts) remainingCalls
+    validationPassed <- runValidationPhase env state finalSQL skipValidation validationCallLimit
+    cacheStats <- poolCacheStats pool
     cancelled <- poolCancelled pool
     st <- readIORef state
     let curve = reverse (evalCurve st)
@@ -679,9 +675,7 @@ data EvalEnv = EvalEnv
     , envLogger :: !Logger
     , envReductionStart :: !Ticks
     , envTotalDeadline :: !(Maybe Ticks)
-    , envValidationCallLimit :: !Int
     , envValidationReserve :: !Integer
-    , envPerValidationReserve :: !Integer
     }
 
 boundedTimeout :: Integer -> Int
@@ -800,8 +794,8 @@ runAuditPhase env state pool reporter evidence = do
                 )
 
 -- | Validation phase: repeat the final check twice within the shared limits.
-runValidationPhase :: EvalEnv -> IORef EvalState -> ByteString -> Bool -> IO Bool
-runValidationPhase env state finalSQL skipValidation
+runValidationPhase :: EvalEnv -> IORef EvalState -> ByteString -> Bool -> Int -> IO Bool
+runValidationPhase env state finalSQL skipValidation callLimit
     | skipValidation = pure False
     | otherwise = do
         first <- validateOnce finalSQL
@@ -810,13 +804,13 @@ runValidationPhase env state finalSQL skipValidation
     where
         validateOnce candidate = do
             prior <- evalValidationObs <$> readIORef state
-            if prior >= envValidationCallLimit env
+            if prior >= callLimit
                 then pure Nothing
                 else do
                     start <- ticks
                     let remainingMicros = (`div` 1000) . subtract start <$> envTotalDeadline env
                     case remainingMicros of
-                        Just remaining | remaining < envPerValidationReserve env -> pure Nothing
+                        Just remaining | remaining <= 0 -> pure Nothing
                         _ -> do
                             modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
                             let observe =

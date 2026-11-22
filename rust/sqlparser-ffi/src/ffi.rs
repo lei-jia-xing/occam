@@ -7,11 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn session_ident_with_quote(value: &str, quoted: bool, rules: &IdentifierRules) -> Ident {
     let folding = rules.fold(IdentifierClass::Relation, quoted);
-    Ident(match folding {
-        crate::ir::CaseFolding::Lower => value.to_lowercase(),
-        crate::ir::CaseFolding::Upper => value.to_uppercase(),
-        crate::ir::CaseFolding::Preserve => value.to_string(),
-    })
+    Ident(folding.apply(value))
 }
 
 /// Parse a configured identifier using the same literal syntax as a

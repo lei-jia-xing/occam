@@ -790,8 +790,20 @@ pub enum IdentifierClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaseFolding {
     Lower,
+    AsciiLower,
     Upper,
     Preserve,
+}
+
+impl CaseFolding {
+    pub(crate) fn apply(self, value: &str) -> String {
+        match self {
+            Self::Lower => value.to_lowercase(),
+            Self::AsciiLower => value.to_ascii_lowercase(),
+            Self::Upper => value.to_uppercase(),
+            Self::Preserve => value.to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -811,10 +823,11 @@ impl IdentifierRules {
             PostgreSql | Redshift => (CaseFolding::Lower, CaseFolding::Preserve),
             Oracle | Ansi | Snowflake | Teradata => (CaseFolding::Upper, CaseFolding::Preserve),
             ClickHouse => (CaseFolding::Preserve, CaseFolding::Preserve),
+            SQLite | DuckDB => (CaseFolding::AsciiLower, CaseFolding::AsciiLower),
             // These dialects are case-preserving but compare identifiers
             // case-insensitively, so folding both classes to lower-case models
             // their matching semantics.
-            DuckDB | MsSql | SQLite | BigQuery | Hive | Spark | Databricks | MySql | Generic => {
+            MsSql | BigQuery | Hive | Spark | Databricks | MySql | Generic => {
                 (CaseFolding::Lower, CaseFolding::Lower)
             }
         };

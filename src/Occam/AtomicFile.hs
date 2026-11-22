@@ -1,4 +1,4 @@
--- | Crash-safe atomic file replacement using temporary files.
+-- | Atomic file replacement using temporary files.
 module Occam.AtomicFile (
     writeAtomicBytes,
     writeAtomicLazyBytes,
@@ -10,9 +10,9 @@ import Control.Monad (unless)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Char (toLower)
-import GHC.Clock (getMonotonicTimeNSec)
 import System.Directory (createDirectoryIfMissing, removeFile, renameFile)
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (takeDirectory, takeFileName)
+import System.IO (Handle, hClose, openBinaryTempFileWithDefaultPermissions)
 
 isSpecialDevice :: FilePath -> Bool
 isSpecialDevice path =
@@ -22,25 +22,21 @@ isSpecialDevice path =
 writeAtomicBytes :: FilePath -> BS.ByteString -> IO ()
 writeAtomicBytes path content
     | isSpecialDevice path = BS.writeFile path content
-    | otherwise = writeAtomicWith path (`BS.writeFile` content)
+    | otherwise = writeAtomicWith path (`BS.hPut` content)
 
 writeAtomicLazyBytes :: FilePath -> BSL.ByteString -> IO ()
 writeAtomicLazyBytes path content
     | isSpecialDevice path = BSL.writeFile path content
-    | otherwise = writeAtomicWith path (`BSL.writeFile` content)
+    | otherwise = writeAtomicWith path (`BSL.hPut` content)
 
-writeAtomicWith :: FilePath -> (FilePath -> IO ()) -> IO ()
+writeAtomicWith :: FilePath -> (Handle -> IO ()) -> IO ()
 writeAtomicWith path write = mask \restore -> do
     let dir = takeDirectory path
     unless (null dir || dir == ".") (createDirectoryIfMissing True dir)
-    temporary <- freshTemporaryPath path
-    (restore (write temporary) >> renameFile temporary path)
-        `onException` ignoreIOException (removeFile temporary)
-
-freshTemporaryPath :: FilePath -> IO FilePath
-freshTemporaryPath path = do
-    now <- getMonotonicTimeNSec
-    pure (takeDirectory path </> ("." ++ takeFileName path ++ ".tmp." ++ show now))
+    (temporary, handle) <-
+        openBinaryTempFileWithDefaultPermissions dir ("." ++ takeFileName path ++ ".tmp")
+    (restore (write handle) >> hClose handle >> renameFile temporary path)
+        `onException` (ignoreIOException (hClose handle) >> ignoreIOException (removeFile temporary))
 
 ignoreIOException :: IO () -> IO ()
 ignoreIOException action = action `catch` \(_ :: IOException) -> pure ()

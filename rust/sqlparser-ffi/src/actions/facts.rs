@@ -277,23 +277,21 @@ fn is_pure_existence_exists_query(select: &Select) -> bool {
     let SetExpr::Select(inner) = subquery.body.as_ref() else {
         return false;
     };
-    if inner.top.is_some()
-        || inner.into.is_some()
-        || inner.selection.is_some()
-        || inner.having.is_some()
-        || inner.qualify.is_some()
-        || inner.distinct.is_some()
-        || inner.prewhere.is_some()
-        || !inner.connect_by.is_empty()
-        || !inner.named_window.is_empty()
-        || !is_empty_group_by(&inner.group_by)
-        || inner.from.len() != 1
-        || !inner.from[0].joins.is_empty()
-        || !is_plain_table_factor(&inner.from[0].relation)
-    {
+    let [source] = inner.from.as_slice() else {
         return false;
-    }
-    true
+    };
+    inner.top.is_none()
+        && inner.into.is_none()
+        && inner.selection.is_none()
+        && inner.having.is_none()
+        && inner.qualify.is_none()
+        && inner.distinct.is_none()
+        && inner.prewhere.is_none()
+        && inner.connect_by.is_empty()
+        && inner.named_window.is_empty()
+        && is_empty_group_by(&inner.group_by)
+        && source.joins.is_empty()
+        && is_plain_table_factor(&source.relation)
 }
 
 pub(crate) fn classify_query_read_mode(
@@ -4986,7 +4984,15 @@ pub(crate) fn analyze_statement(
                 }
             }
         }
-        Statement::Copy { source, to, .. } => {
+        Statement::Copy {
+            source, to, target, ..
+        } => {
+            if matches!(target, CopyTarget::File { .. } | CopyTarget::Program { .. }) {
+                facts.barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownStatement,
+                    Some("external COPY effects".into()),
+                ));
+            }
             if *to {
                 match source {
                     CopySource::Table {
