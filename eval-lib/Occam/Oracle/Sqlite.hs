@@ -7,6 +7,7 @@ module Occam.Oracle.Sqlite (
     loadSqliteContract,
     generateSqliteContract,
     generateSqliteContractTimeout,
+    generateSqliteContractWithResultStatement,
     executeSqliteCandidate,
     executeSqliteCandidateTimeout,
     executeSqliteCandidateDetailedTimeout,
@@ -14,6 +15,7 @@ module Occam.Oracle.Sqlite (
     sqliteContractOracleTimeout,
     sqliteContractObservation,
     sqliteContractObservationTimeout,
+    sqliteContractObservationWithResultStatement,
     splitStatements,
     sqlDataToValue,
 ) where
@@ -39,10 +41,12 @@ import Data.Aeson (
     (.:?),
     (.=),
  )
+import Data.Bifunctor (second)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isSpace, toLower)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -76,7 +80,7 @@ import Foreign (
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..))
 import GHC.Float (castDoubleToWord64)
-import Occam.Core (Oracle)
+import Occam.Core (Oracle, ResultStatement (..))
 import Occam.Oracle (OracleObservation (..), observationOutcome)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Exit (ExitCode (..))
@@ -186,9 +190,10 @@ classifySqliteException err =
 -- | Execute candidate SQL against an in-memory SQLite database with timeout.
 executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteError [[Value]])
 executeSqliteCandidateDetailedTimeout micros sql =
-    fmap (maybe [] resultRows) <$> executeSqliteResult micros sql
+    fmap (maybe [] (resultRows . fst)) <$> executeSqliteResult micros sql
 
-executeSqliteResult :: Int -> ByteString -> IO (Either SqliteError (Maybe ResultSet))
+executeSqliteResult ::
+    Int -> ByteString -> IO (Either SqliteError (Maybe (ResultSet, ResultStatement)))
 executeSqliteResult micros sql
     | BS.elem 0 sql = pure (Left (SqliteExecutionError "SQL contains a NUL byte"))
     | Left err <- TE.decodeUtf8' sql = pure (Left (SqliteInfrastructureError (T.pack (show err))))
@@ -200,7 +205,7 @@ executeSqliteResult micros sql
                         -- Keep the engine baseline aligned with SQLite parser session defaults.
                         exec db "PRAGMA foreign_keys = OFF;"
                         withLocalStatements db $ BS.useAsCStringLen sql $ \(start, size) ->
-                            runStatements db (start `plusPtr` size) start Nothing
+                            runStatements db (start `plusPtr` size) start 0 Nothing
         pure $ case res of
             Left err -> Left (classifySqliteException err)
             Right Nothing -> Left SqliteTimeout
@@ -237,22 +242,28 @@ withLocalStatements (Direct.Database db) action =
 -- SQLite supplies the unconsumed tail, including for trigger bodies and
 -- multiple statements on one line. Every prepared handle is finalized before
 -- the next statement starts.
-runStatements :: Direct.Database -> CString -> CString -> Maybe ResultSet -> IO (Maybe ResultSet)
-runStatements db@(Direct.Database handle) end start previous
-    | start == end = pure previous
+runStatements ::
+    Direct.Database ->
+    CString ->
+    CString ->
+    Int ->
+    Maybe (ResultSet, Int) ->
+    IO (Maybe (ResultSet, ResultStatement))
+runStatements db@(Direct.Database handle) end start ordinal previous
+    | start == end = pure (fmap (second (ResultStatement ordinal)) previous)
     | otherwise = do
-        (next, result) <- bracket prepare release $ \(tailPtr, statement) -> do
-            observed <- case statement of
-                Nothing -> pure previous
+        (next, nextOrdinal, result) <- bracket prepare release $ \(tailPtr, statement) -> do
+            (nextIndex, observed) <- case statement of
+                Nothing -> pure (ordinal, previous)
                 Just stmt -> do
                     count <- columnCount stmt
                     names <- forM [0 .. count - 1] $ \i -> do
                         name <- columnName stmt i
                         maybe (fail "SQLite omitted a result column name") pure name
                     rows <- stepAll stmt
-                    pure (if null names then previous else Just (ResultSet names [] rows))
-            pure (tailPtr, observed)
-        runStatements db end next result
+                    pure (ordinal + 1, if null names then previous else Just (ResultSet names [] rows, ordinal))
+            pure (tailPtr, nextIndex, observed)
+        runStatements db end next nextOrdinal result
     where
         prepare = alloca $ \out -> alloca $ \tailOut -> do
             CError status <- c_sqlite3_prepare_v2 handle start (fromIntegral (end `minusPtr` start)) out tailOut
@@ -284,21 +295,28 @@ generateSqliteContract :: ByteString -> IO (Either Text SqliteContract)
 generateSqliteContract = generateSqliteContractTimeout defaultCandidateTimeoutMicros
 
 generateSqliteContractTimeout :: Int -> ByteString -> IO (Either Text SqliteContract)
-generateSqliteContractTimeout micros sql = do
+generateSqliteContractTimeout micros sql =
+    fmap fst <$> generateSqliteContractWithResultStatement micros sql
+
+generateSqliteContractWithResultStatement ::
+    Int -> ByteString -> IO (Either Text (SqliteContract, ResultStatement))
+generateSqliteContractWithResultStatement micros sql = do
     res <- executeSqliteResult micros sql
     pure $ case res of
         Left SqliteTimeout -> Left "timeout"
         Left (SqliteExecutionError err) -> Left err
         Left (SqliteInfrastructureError err) -> Left err
         Right Nothing -> Left "Input must produce a result set"
-        Right (Just result) ->
+        Right (Just (result, location)) ->
             Right
-                SqliteContract
+                ( SqliteContract
                     { contractExpectedRows = resultRows result
                     , contractExpectedColumns = resultColumns result
                     , contractStateSha256 = Nothing
                     , contractCheckState = False
                     }
+                , location
+                )
 
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate =
@@ -311,18 +329,25 @@ sqliteContractObservation :: SqliteContract -> ByteString -> IO OracleObservatio
 sqliteContractObservation = sqliteContractObservationTimeout defaultCandidateTimeoutMicros
 
 sqliteContractObservationTimeout :: Int -> SqliteContract -> ByteString -> IO OracleObservation
-sqliteContractObservationTimeout micros contract candidate
+sqliteContractObservationTimeout micros contract candidate =
+    fst <$> sqliteContractObservationWithResultStatement micros contract candidate
+
+sqliteContractObservationWithResultStatement ::
+    Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
+sqliteContractObservationWithResultStatement micros contract candidate
     -- TODO: Define a reproducible database-state observation before accepting state contracts.
-    | contractCheckState contract || contractStateSha256 contract /= Nothing =
-        pure (OracleIOFailed "SQLite state contracts are unsupported")
+    | contractCheckState contract || isJust (contractStateSha256 contract) =
+        pure (OracleIOFailed "SQLite state contracts are unsupported", Nothing)
     | otherwise = do
         res <- executeSqliteResult micros candidate
         pure $ case res of
-            Left SqliteTimeout -> OracleTimedOut
-            Left (SqliteExecutionError _) -> OracleFinished (ExitFailure 1)
-            Left (SqliteInfrastructureError err) -> OracleIOFailed err
+            Left SqliteTimeout -> (OracleTimedOut, Nothing)
+            Left (SqliteExecutionError _) -> (OracleFinished (ExitFailure 1), Nothing)
+            Left (SqliteInfrastructureError err) -> (OracleIOFailed err, Nothing)
             Right observed
-                | observed == Just expected -> OracleFinished ExitSuccess
-                | otherwise -> OracleFinished (ExitFailure 1)
+                | Just (result, location) <- observed
+                , result == expected ->
+                    (OracleFinished ExitSuccess, Just location)
+                | otherwise -> (OracleFinished (ExitFailure 1), Nothing)
     where
         expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)

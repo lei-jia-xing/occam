@@ -9,6 +9,7 @@ module Occam.Oracle.DuckDB (
     loadDuckDBContract,
     generateDuckDBContract,
     generateDuckDBContractTimeout,
+    generateDuckDBContractWithResultStatement,
     executeDuckDBCandidate,
     executeDuckDBCandidateTimeout,
     executeDuckDBCandidateDetailedTimeout,
@@ -16,6 +17,7 @@ module Occam.Oracle.DuckDB (
     duckdbContractOracleTimeout,
     duckdbContractObservation,
     duckdbContractObservationTimeout,
+    duckdbContractObservationWithResultStatement,
     isDuckDBAvailable,
     defaultDuckDBCandidateTimeoutMicros,
 ) where
@@ -51,17 +53,19 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64, Int8)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C.String (CString, peekCString, withCString)
 import Foreign.C.Types (CBool (..), CInt (..), CSize (..))
-import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, callocBytes, free)
+import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, peekByteOff, peekElemOff, poke)
 import GHC.Float (castDoubleToWord64)
-import Occam.Core (Oracle)
+import Occam.Core (Oracle, ResultStatement (..))
 import Occam.Oracle (OracleObservation (..), observationOutcome)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
@@ -238,6 +242,7 @@ defaultDuckDBCandidateTimeoutMicros = 100000
 data DuckDBError
     = DuckDBTimeout
     | DuckDBExecutionError !Text
+    | DuckDBUnsupportedResultTypes ![Int]
     | DuckDBInfrastructureError !Text
     deriving (Eq, Show)
 
@@ -463,9 +468,10 @@ convertCell api (colType, values, validity) row = do
 
 executeDuckDBCandidateDetailedTimeout :: Int -> ByteString -> IO (Either DuckDBError [[Value]])
 executeDuckDBCandidateDetailedTimeout micros sql =
-    fmap (maybe [] resultRows) <$> executeDuckDBResult micros sql
+    fmap (maybe [] (resultRows . fst)) <$> executeDuckDBResult micros sql
 
-executeDuckDBResult :: Int -> ByteString -> IO (Either DuckDBError (Maybe ResultSet))
+executeDuckDBResult ::
+    Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultStatement)))
 executeDuckDBResult micros sql
     | BS.elem 0 sql = pure (Left (DuckDBExecutionError "SQL contains a NUL byte"))
     | otherwise = do
@@ -474,7 +480,8 @@ executeDuckDBResult micros sql
             Left err -> pure (Left err)
             Right api -> executeWithAPI api micros sql
 
-executeWithAPI :: DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe ResultSet))
+executeWithAPI ::
+    DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultStatement)))
 executeWithAPI api micros sql = do
     res <- try $
         alloca $ \dbPtr ->
@@ -504,7 +511,7 @@ executeWithAPI api micros sql = do
                                 mRes <- executeInterruptibly micros (apiInterrupt api con) $ do
                                     configure con
                                     runStatements con
-                                pure (maybe (Left DuckDBTimeout) id mRes)
+                                pure (fromMaybe (Left DuckDBTimeout) mRes)
     pure $ case res of
         Left (err :: SomeException) -> Left (DuckDBInfrastructureError (T.pack (displayException err)))
         Right inner -> inner
@@ -539,50 +546,68 @@ executeWithAPI api micros sql = do
         withResult run use = do
             size <- resultSize
             allocaBytes (fromIntegral size) $ \ptr ->
-                bracket (run ptr) (const (apiDestroyResult api ptr)) (\status -> use status ptr)
+                bracket (run ptr) (const (apiDestroyResult api ptr)) (`use` ptr)
 
-        executeExtractedStatements con ext n = alloca $ \prepPtr ->
-            let loop i previous
-                    | i >= n = pure (Right previous)
+        executeExtractedStatements con ext n = alloca $ \prepPtr -> do
+            size <- fromIntegral <$> resultSize
+            let withBuffer = bracket (callocBytes size) $ \ptr -> do
+                    apiDestroyResult api ptr
+                    free ptr
+                clear ptr = Exception.mask_ $ do
+                    apiDestroyResult api ptr
+                    fillBytes ptr 0 size
+                loop i current retained lastResult
+                    | i >= n = case lastResult of
+                        Nothing -> pure (Right Nothing)
+                        Just index -> do
+                            result <- observeRows retained
+                            pure (fmap (\rows -> Just (rows, ResultStatement (fromIntegral n) (fromIntegral index))) result)
                     | otherwise = do
-                        observed <- bracket
+                        executed <- bracket
                             (apiPrepareExtractedStatement api con ext i prepPtr)
                             (const (apiDestroyPrepare api prepPtr))
                             $ \status -> do
                                 prep <- peek prepPtr
                                 if status /= 0
                                     then Left . DuckDBExecutionError <$> errorText "Prepare error" (apiPrepareError api prep)
-                                    else withResult (apiExecutePrepared api prep) $ \execStatus ptr ->
+                                    else do
+                                        execStatus <- apiExecutePrepared api prep current
                                         if execStatus /= 0
-                                            then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api ptr)
-                                            else Right <$> observeRows ptr previous
-                        case observed of
+                                            then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api current)
+                                            else Right <$> resultKind (apiResultKind api) current
+                        case executed of
                             Left err -> pure (Left err)
-                            Right result -> loop (i + 1) result
-             in loop 0 Nothing
+                            Right kind
+                                | kind == 3 -> do
+                                    -- DUCKDB_RESULT_TYPE_QUERY_RESULT
+                                    clear retained
+                                    loop (i + 1) retained current (Just i)
+                                | otherwise -> do
+                                    clear current
+                                    loop (i + 1) current retained lastResult
+            -- The buffers own the latest query result and the current execution.
+            withBuffer $ \current -> withBuffer $ \retained -> loop 0 current retained Nothing
 
         errorText fallback action = do
             message <- action
             if message == nullPtr then pure fallback else T.pack <$> peekCString message
 
-        observeRows ptr previous = do
-            kind <- resultKind (apiResultKind api) ptr
-            if kind /= 3 -- DUCKDB_RESULT_TYPE_QUERY_RESULT
-                then pure previous
-                else do
-                    count <- apiColumnCount api ptr
-                    let columns = takeWhile (< count) [0 ..]
-                    names <- forM columns $ \col -> do
-                        name <- apiColumnName api ptr col
-                        if name == nullPtr
-                            then fail "DuckDB omitted a result column name"
-                            else TE.decodeUtf8 <$> BS.packCString name
-                    types <- mapM (apiColumnType api ptr) columns
-                    -- TODO: Add lossless decoding for exact decimals and composite types.
-                    when (any (not . supportedType) types) $
-                        fail ("Unsupported DuckDB result column types " ++ show types)
+        observeRows ptr = do
+            count <- apiColumnCount api ptr
+            let columns = takeWhile (< count) [0 ..]
+            names <- forM columns $ \col -> do
+                name <- apiColumnName api ptr col
+                if name == nullPtr
+                    then fail "DuckDB omitted a result column name"
+                    else TE.decodeUtf8 <$> BS.packCString name
+            types <- mapM (apiColumnType api ptr) columns
+            -- TODO: Add lossless decoding for exact decimals and composite types.
+            let columnTypes = map fromIntegral types
+            if all supportedType types
+                then do
                     rows <- readChunks ptr (zip types columns) []
-                    pure (Just (ResultSet names (map fromIntegral types) rows))
+                    pure (Right (ResultSet names columnTypes rows))
+                else pure (Left (DuckDBUnsupportedResultTypes columnTypes))
 
         readChunks ptr columnTypes accumulated = do
             chunkRows <- alloca $ \chunkPtr -> do
@@ -640,6 +665,7 @@ executeDuckDBCandidateTimeout micros sql = do
     pure $ case res of
         Left DuckDBTimeout -> Left "timeout"
         Left (DuckDBExecutionError err) -> Left err
+        Left (DuckDBUnsupportedResultTypes types) -> Left (unsupportedResultTypes types)
         Left (DuckDBInfrastructureError err) -> Left ("infrastructure error: " <> err)
         Right rows -> Right rows
 
@@ -650,22 +676,30 @@ generateDuckDBContract :: ByteString -> IO (Either Text DuckDBContract)
 generateDuckDBContract = generateDuckDBContractTimeout defaultDuckDBCandidateTimeoutMicros
 
 generateDuckDBContractTimeout :: Int -> ByteString -> IO (Either Text DuckDBContract)
-generateDuckDBContractTimeout micros sql = do
+generateDuckDBContractTimeout micros sql =
+    fmap fst <$> generateDuckDBContractWithResultStatement micros sql
+
+generateDuckDBContractWithResultStatement ::
+    Int -> ByteString -> IO (Either Text (DuckDBContract, ResultStatement))
+generateDuckDBContractWithResultStatement micros sql = do
     res <- executeDuckDBResult micros sql
     pure $ case res of
         Left DuckDBTimeout -> Left "timeout"
         Left (DuckDBExecutionError err) -> Left err
+        Left (DuckDBUnsupportedResultTypes types) -> Left (unsupportedResultTypes types)
         Left (DuckDBInfrastructureError err) -> Left err
         Right Nothing -> Left "Input must produce a result set"
-        Right (Just result) ->
+        Right (Just (result, location)) ->
             Right
-                DuckDBContract
+                ( DuckDBContract
                     { contractExpectedRows = resultRows result
                     , contractExpectedColumns = resultColumns result
                     , contractExpectedTypes = resultColumnTypes result
                     , contractStateSha256 = Nothing
                     , contractCheckState = False
                     }
+                , location
+                )
 
 duckdbContractOracleTimeout :: Int -> DuckDBContract -> Oracle
 duckdbContractOracleTimeout micros contract candidate =
@@ -678,22 +712,35 @@ duckdbContractObservation :: DuckDBContract -> ByteString -> IO OracleObservatio
 duckdbContractObservation = duckdbContractObservationTimeout defaultDuckDBCandidateTimeoutMicros
 
 duckdbContractObservationTimeout :: Int -> DuckDBContract -> ByteString -> IO OracleObservation
-duckdbContractObservationTimeout micros contract candidate
+duckdbContractObservationTimeout micros contract candidate =
+    fst <$> duckdbContractObservationWithResultStatement micros contract candidate
+
+duckdbContractObservationWithResultStatement ::
+    Int -> DuckDBContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
+duckdbContractObservationWithResultStatement micros contract candidate
     -- TODO: Define a reproducible database-state observation before accepting state contracts.
-    | contractCheckState contract || contractStateSha256 contract /= Nothing =
-        pure (OracleIOFailed "DuckDB state contracts are unsupported")
+    | contractCheckState contract || isJust (contractStateSha256 contract) =
+        pure (OracleIOFailed "DuckDB state contracts are unsupported", Nothing)
     | otherwise = do
         res <- executeDuckDBResult micros candidate
         pure $ case res of
-            Left DuckDBTimeout -> OracleTimedOut
-            Left (DuckDBExecutionError _) -> OracleFinished (ExitFailure 1)
-            Left (DuckDBInfrastructureError err) -> OracleIOFailed err
+            Left DuckDBTimeout -> (OracleTimedOut, Nothing)
+            Left (DuckDBExecutionError _) -> (OracleFinished (ExitFailure 1), Nothing)
+            Left (DuckDBUnsupportedResultTypes types)
+                | types /= contractExpectedTypes contract -> (OracleFinished (ExitFailure 1), Nothing)
+                | otherwise -> (OracleIOFailed (unsupportedResultTypes types), Nothing)
+            Left (DuckDBInfrastructureError err) -> (OracleIOFailed err, Nothing)
             Right observed
-                | observed == Just expected -> OracleFinished ExitSuccess
-                | otherwise -> OracleFinished (ExitFailure 1)
+                | Just (result, location) <- observed
+                , result == expected ->
+                    (OracleFinished ExitSuccess, Just location)
+                | otherwise -> (OracleFinished (ExitFailure 1), Nothing)
     where
         expected =
             ResultSet
                 (contractExpectedColumns contract)
                 (contractExpectedTypes contract)
                 (contractExpectedRows contract)
+
+unsupportedResultTypes :: [Int] -> Text
+unsupportedResultTypes types = "Unsupported DuckDB result column types " <> T.pack (show types)

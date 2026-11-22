@@ -1,6 +1,7 @@
 module Occam.Core (
     StatementId (..),
     Statement (..),
+    ResultStatement (..),
     Span (..),
     Ident (..),
     Name (..),
@@ -107,6 +108,13 @@ data Statement = Statement
     { stmtId :: !StatementId
     , stmtSpan :: !Span
     , stmtRaw :: !ByteString
+    }
+    deriving (Eq, Show)
+
+-- | Engine statement count and zero-based ordinal of its last result set.
+data ResultStatement = ResultStatement
+    { resultStatementCount :: !Int
+    , resultStatementIndex :: !Int
     }
     deriving (Eq, Show)
 

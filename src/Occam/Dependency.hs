@@ -72,6 +72,7 @@ data DependencyGraph = DependencyGraph
     , graphFacts :: !(Map StatementId SemanticFacts)
     , graphEdges :: !(Map StatementId (Set StatementId))
     , graphFastEdges :: !(IntMap IntSet)
+    , graphHasGlobalBarrier :: !Bool
     , graphBarrierActions :: !Int
     , graphBarrierStatements :: !Int
     , graphBarrierEdges :: !Int
@@ -87,6 +88,7 @@ emptyGraph =
         , graphFacts = Map.empty
         , graphEdges = Map.empty
         , graphFastEdges = IntMap.empty
+        , graphHasGlobalBarrier = False
         , graphBarrierActions = 0
         , graphBarrierStatements = 0
         , graphBarrierEdges = 0
@@ -123,7 +125,7 @@ analyzeStatements initialSession units =
 -- | Construct a dependency graph from extracted statement facts.
 buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
-    let (_, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
+    let (finalState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
             foldl' step (initialScanState initialSession, Map.empty, 0, 0, 0) stmtFacts
         fastEdges =
             IntMap.fromList
@@ -135,6 +137,7 @@ buildGraph initialSession stmtFacts =
             , graphFacts = Map.fromList stmtFacts
             , graphEdges = edges
             , graphFastEdges = fastEdges
+            , graphHasGlobalBarrier = Map.member GlobalBarrierKey (scanLastBarriers finalState)
             , graphBarrierActions = barrierActionCount
             , graphBarrierStatements = barrierStmtCount
             , graphBarrierEdges = barrierEdgeCount

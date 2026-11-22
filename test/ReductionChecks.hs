@@ -10,7 +10,15 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text.Encoding qualified as TE
-import Occam.Core (OracleInconclusiveError, OracleOutcome (..), StatementId (..))
+import Occam.Core (
+    BarrierScope (GlobalScope),
+    OracleInconclusiveError,
+    OracleOutcome (..),
+    ResultStatement (..),
+    ScopedBarrier (barrierScope),
+    SemanticFacts (factBarriers),
+    StatementId (..),
+ )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (StatementUnit (..))
 import Occam.Logger (nullLogger)
@@ -40,6 +48,7 @@ import Occam.Reducer (
     reduceSQL,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
+    reduceSQLWithResultSlicing,
     statementAudit,
     statementDdmin,
  )
@@ -99,6 +108,51 @@ tests =
                 "ordinary deletion should get the first search window after slicing"
                 [StageSlicing, StageUnrestrictedFallback, StageClosureSearch]
                 (take 3 started)
+        , testCase "Result slicing tries the observed statement before other candidates" $ do
+            let sql = "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);"
+                expected = "SELECT 42 AS answer;"
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                locate bytes = pure (if bytes == sql then Just (ResultStatement 3 1) else Nothing)
+            candidates <- newIORef []
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' candidates (candidate :)
+                pure (if expected `BSC.isInfixOf` candidate then OracleAccepted else OracleRejected)
+            _ <- reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+            attempted <- reverse <$> readIORef candidates
+            assertEqual
+                "the first candidate is the backward slice of the result statement"
+                [sql, expected]
+                (take 2 attempted)
+        , testCase "A global barrier discovered during graph construction prioritizes unrestricted search" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE SCHEMA a;"
+                        , "CREATE SCHEMA b;"
+                        , "CREATE TABLE a.t (x INT);"
+                        , "CREATE TABLE b.t (x INT);"
+                        , "DROP TABLE t;"
+                        , "SELECT x FROM b.t;"
+                        ]
+                config = defaultReductionConfig {reductionDialect = PostgreSQL, reductionSlicing = False}
+            parsed <- parseSQL (defaultParseOptions PostgreSQL) sql
+            case parsed of
+                Left err -> assertFailure (show err)
+                Right result -> do
+                    let graph = analyzeStatements (parsedInitialSession result) (parsedUnits result)
+                    assertBool
+                        "the parser emitted no global barrier"
+                        (all (all ((/= GlobalScope) . barrierScope) . factBarriers) (graphFacts graph))
+                    assertBool "graph construction discovered a global barrier" (graphHasGlobalBarrier graph)
+            pool <- predicatePool (BSC.isInfixOf "DROP TABLE t;")
+            stages <- newIORef []
+            let report (StageStarted stage) = modifyIORef' stages (stage :)
+                report StageFinished {} = pure ()
+            _ <- reduceSQLWithEvidence report config nullLogger pool sql
+            started <- reverse <$> readIORef stages
+            assertEqual
+                "unrestricted search precedes closure"
+                [StageUnrestrictedFallback, StageClosureSearch]
+                (take 2 started)
         , testCase "Closure search prunes unneeded independent subgraphs" $ do
             pool <-
                 predicatePool (\candidate -> BSC.isInfixOf "crash_tbl" candidate && BSC.isInfixOf "42" candidate)

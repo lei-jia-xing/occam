@@ -21,6 +21,7 @@ module Occam.Reducer (
     reduceSQLWithLogger,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
+    reduceSQLWithResultSlicing,
     ReductionResult (..),
     ReductionEvidence (..),
     ReductionStage (..),
@@ -55,11 +56,9 @@ import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
-    BarrierScope (GlobalScope),
     Ident (..),
     OracleOutcome (..),
-    ScopedBarrier (barrierScope),
-    SemanticFacts (factBarriers),
+    ResultStatement (..),
     SessionInit (..),
     Span (..),
     Statement (..),
@@ -719,9 +718,13 @@ logAuditStats logger stats =
 -- | Binary search for the shortest interesting prefix of statements.
 findInterestingPrefix ::
     OraclePool -> ByteString -> [Statement] -> IO (Maybe (Statement, ByteString, Int), Int)
-findInterestingPrefix pool baseSQL statements
-    | null statements = pure (Nothing, 0)
-    | otherwise = go 1 (length statements) Nothing 0
+findInterestingPrefix pool baseSQL statements =
+    findInterestingPrefixThrough pool baseSQL statements (length statements)
+
+findInterestingPrefixThrough ::
+    OraclePool -> ByteString -> [Statement] -> Int -> IO (Maybe (Statement, ByteString, Int), Int)
+findInterestingPrefixThrough pool baseSQL statements limit =
+    go 1 limit Nothing 0
     where
         go !low !high best !tests
             | low > high = pure (best, tests)
@@ -776,21 +779,29 @@ analyzeSQL store logger dialect sql = do
 
 -- | Slice SQL statements using a precomputed dependency analysis.
 sliceWithAnalysis ::
-    Logger -> OraclePool -> SQLAnalysis -> ByteString -> IO (ByteString, Maybe SQLAnalysis)
-sliceWithAnalysis logger pool analysis sql =
-    case lastMay statements of
+    Logger ->
+    OraclePool ->
+    SQLAnalysis ->
+    Maybe ResultStatement ->
+    ByteString ->
+    IO (ByteString, Maybe SQLAnalysis)
+sliceWithAnalysis logger pool analysis observedResult sql =
+    case seedTarget of
         Nothing -> keep sql
-        Just lastStatement -> do
-            let (lastRetained, lastCandidateRaw) = sliceFor lastStatement
-            lastCandidate <- timeStatementBuild (poolMetricsStore pool) lastCandidateRaw
-            lastAccepted <-
-                if BS.length lastCandidate < BS.length sql
+        Just seedStatement -> do
+            let (seedRetained, seedCandidateRaw) = sliceFor seedStatement
+            seedCandidate <- timeStatementBuild (poolMetricsStore pool) seedCandidateRaw
+            seedAccepted <-
+                if BS.length seedCandidate < BS.length sql
                     then do
-                        reportCandidateCount pool lastCandidate (length lastRetained)
-                        oracleAccepts (poolOracle pool) lastCandidate
+                        reportCandidateCount pool seedCandidate (length seedRetained)
+                        oracleAccepts (poolOracle pool) seedCandidate
                     else pure False
-            let tryPrefix bestCandidate = do
-                    (maybeTarget, prefixTests) <- findInterestingPrefix pool sql statements
+            let prefixLimit = case (seedAccepted, resultTarget) of
+                    (True, Just (index, _)) -> index
+                    _ -> length statements
+                tryPrefix bestCandidate = do
+                    (maybeTarget, prefixTests) <- findInterestingPrefixThrough pool sql statements prefixLimit
                     case maybeTarget of
                         Nothing -> pure bestCandidate
                         Just (targetStatement, prefixSQL, prefixLength) -> do
@@ -818,18 +829,27 @@ sliceWithAnalysis logger pool analysis sql =
                                     if ok && BS.length candidate < bestLen
                                         then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
                                         else pure bestCandidate
-            let initialBest = if lastAccepted then Just lastCandidate else Nothing
+            let initialBest = if seedAccepted then Just seedCandidate else Nothing
             better <- tryPrefix initialBest
             case better of
                 Just result
                     | Just result /= initialBest -> keep result
                 _ ->
-                    if lastAccepted
-                        then acceptSlice "last-statement" lastStatement lastRetained lastCandidate >>= keep
+                    if seedAccepted
+                        then acceptSlice seedStrategy seedStatement seedRetained seedCandidate >>= keep
                         else keep sql
     where
         statements = analyzedStatements analysis
         graph = analyzedGraph analysis
+        resultTarget = do
+            ResultStatement count index <- observedResult
+            -- The engine and frontend can recognize different statement boundaries.
+            if count == length statements && index >= 0
+                then (index,) <$> listToMaybe (drop index statements)
+                else Nothing
+        (seedTarget, seedStrategy) = case resultTarget of
+            Just (_, stmt) -> (Just stmt, "result-statement")
+            Nothing -> (lastMay statements, "last-statement")
         keep result =
             pure (result, if result == sql then Just analysis else Nothing)
         sliceFor target =
@@ -883,7 +903,18 @@ reduceSQLWithConfig config logger pool initialSQL =
 
 reduceSQLWithEvidence ::
     StageReporter -> ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ReductionResult
-reduceSQLWithEvidence reporter config logger pool initialSQL = do
+reduceSQLWithEvidence = reduceSQLWithResultSlicing (const (pure Nothing))
+
+-- | Use the engine's result statement for each observed input to slicing.
+reduceSQLWithResultSlicing ::
+    (ByteString -> IO (Maybe ResultStatement)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQL = do
     when (reductionColumnMode config /= ColumnOff && not (reductionIntraStatement config)) $
         ioError (userError "reductionColumnMode requires reductionIntraStatement")
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
@@ -902,7 +933,7 @@ reduceSQLWithEvidence reporter config logger pool initialSQL = do
                 , ("current_bytes", toJSON (BS.length currentSQL))
                 ]
             (nextSQL, evidence) <-
-                reduceIterationWithEvidence reporter config logger pool currentSQL priorEvidence
+                reduceIterationWithEvidence resultStatement reporter config logger pool currentSQL priorEvidence
             if BS.length nextSQL < BS.length currentSQL
                 then loop (iteration + 1) nextSQL evidence
                 else do
@@ -920,6 +951,7 @@ reduceSQLWithEvidence reporter config logger pool initialSQL = do
                     pure (ReductionResult currentSQL confirmed)
 
 reduceIterationWithEvidence ::
+    (ByteString -> IO (Maybe ResultStatement)) ->
     StageReporter ->
     ReductionConfig ->
     Logger ->
@@ -927,27 +959,31 @@ reduceIterationWithEvidence ::
     ByteString ->
     Maybe ReductionEvidence ->
     IO (ByteString, Maybe ReductionEvidence)
-reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence = do
+reduceIterationWithEvidence resultStatement reporter config logger pool initialSQL priorEvidence = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedReductionStage reporter logger StageSlicing initialSQL do
                 analysis <- analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) initialSQL
-                sliceWithAnalysis logger pool analysis initialSQL
+                observedResult <- resultStatement initialSQL
+                sliceWithAnalysis logger pool analysis observedResult initialSQL
             else pure (initialSQL, Nothing)
-    -- A reusable analysis means slicing kept these exact bytes.
+    searchAnalysis <-
+        if reductionClosure config && reductionUnrestricted config
+            then Just <$> maybe (analyze sliced) pure reusableAnalysis
+            else pure reusableAnalysis
     let useEarlyUnrestricted =
             reductionClosure config
                 && reductionUnrestricted config
-                && maybe False hasGlobalBarrier reusableAnalysis
+                && maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
     searchInput <-
         if useEarlyUnrestricted then unrestrictedSearch sliced else pure sliced
     (searched, ()) <-
         if reductionClosure config
             then timedReductionStage reporter logger StageClosureSearch searchInput do
                 analysis <-
-                    case reusableAnalysis of
+                    case searchAnalysis of
                         Just cached | searchInput == sliced -> pure cached
-                        _ -> analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) searchInput
+                        _ -> analyze searchInput
                 out <- closureSearchWithAnalysis logger pool searchInput analysis
                 pure (out, ())
             else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
@@ -961,7 +997,7 @@ reduceIterationWithEvidence reporter config logger pool initialSQL priorEvidence
             else pure searched
     interleaveStages fallback
     where
-        hasGlobalBarrier = any (any ((== GlobalScope) . barrierScope) . factBarriers) . graphFacts . analyzedGraph
+        analyze = analyzeSQL (poolMetricsStore pool) logger (reductionDialect config)
 
         unrestrictedSearch sql =
             fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do

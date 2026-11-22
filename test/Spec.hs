@@ -53,6 +53,7 @@ import Occam.Core (
     OracleOutcome (..),
     ReadFact (..),
     ReadMode (..),
+    ResultStatement (..),
     SemanticFacts (..),
     SessionInit (..),
     StatementId (..),
@@ -85,11 +86,13 @@ import Occam.Oracle.DuckDB (
     duckdbContractOracle,
     executeDuckDBCandidate,
     generateDuckDBContract,
+    generateDuckDBContractWithResultStatement,
     isDuckDBAvailable,
  )
 import Occam.Oracle.Sqlite (
     executeSqliteCandidate,
     generateSqliteContract,
+    generateSqliteContractWithResultStatement,
     splitStatements,
     sqliteContractObservation,
     sqliteContractObservationTimeout,
@@ -476,14 +479,16 @@ phase5Tests =
                 )
                 ([minBound .. maxBound] :: [SQLDialect])
         , testCase "native result oracle removes irrelevant statements through the CLI" $
-            withCLIInput "CREATE TABLE noise (x INT); SELECT 42 AS answer;" $ \input _ ->
-                mapM_
-                    ( \dialect -> do
+            mapM_
+                ( \(dialect, sql) ->
+                    withCLIInput sql $ \input _ -> do
                         (code, out, err) <- runOccamCLI [input, "--dialect", dialect, "--result-oracle", "--quiet"]
                         assertEqual err ExitSuccess code
                         assertEqual "only the result-producing statement remains" "SELECT 42 AS answer;" out
-                    )
-                    ["sqlite", "duckdb"]
+                )
+                [ ("sqlite", "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);")
+                , ("duckdb", "SELECT [1,2] AS ignored;SELECT 42 AS answer;CREATE TABLE tail (x INT);")
+                ]
         , testCase "default stdout includes the best reduction under a two-call budget" $
             withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
                 let predicate = "grep -q 'SELECT 2'"
@@ -1121,6 +1126,15 @@ sqliteOracleTests =
                     assertEqual "dropping final result changes the observation" OracleRejected dropped
                     assertEqual "renaming an empty result column changes the observation" OracleRejected renamed
                     assertEqual "a script without a result set is distinct" OracleRejected noResult
+        , testCase "SQLite locates its final result before trailing DDL and ignores empty statements" $ do
+            result <-
+                generateSqliteContractWithResultStatement
+                    1000000
+                    ";; SELECT 1 AS answer; CREATE TABLE tail (x INT); -- end"
+            assertEqual
+                "the result belongs to the first of two statements"
+                (Right (ResultStatement 2 0))
+                (fmap snd result)
         , testCase "SQLite compares value storage types without lossy JSON coercion" $ do
             result <- generateSqliteContract "SELECT x'ff' AS blob_value, 1.0 AS float_value;"
             case result of
@@ -1231,6 +1245,29 @@ duckdbOracleTests =
                     assertEqual "dropping final result changes the observation" OracleRejected dropped
                     assertEqual "renaming an empty result column changes the observation" OracleRejected renamed
                     assertEqual "a script without a result set is distinct" OracleRejected noResult
+        , testCase "DuckDB decodes only the last result set and still executes trailing statements" $ do
+            let sql = "SELECT [1, 2] AS ignored; SELECT 42 AS answer; CREATE TABLE tail (x INT);"
+            result <- generateDuckDBContractWithResultStatement 1000000 sql
+            case result of
+                Left err -> assertFailure (T.unpack err)
+                Right (contract, location) -> do
+                    assertEqual "result statement precedes trailing DDL" (ResultStatement 3 1) location
+                    matched <- duckdbContractOracle contract "SELECT 42 AS answer;"
+                    failed <- duckdbContractOracle contract "SELECT 42 AS answer; DROP TABLE nonexistent;"
+                    changedType <- duckdbContractOracle contract "SELECT [1, 2] AS answer;"
+                    assertEqual
+                        "an unsupported type cannot match the supported contract type"
+                        OracleRejected
+                        changedType
+                    assertEqual "unsupported intermediate types do not affect matching" OracleAccepted matched
+                    assertEqual "trailing execution errors reject the candidate" OracleRejected failed
+            unsupported <- generateDuckDBContract "SELECT 42 AS answer; SELECT [1, 2] AS answer;"
+            case unsupported of
+                Left err ->
+                    assertBool
+                        "the final result still needs lossless decoding"
+                        ("Unsupported DuckDB result column types" `T.isInfixOf` err)
+                Right _ -> assertFailure "accepted an unsupported final result type"
         , testCase "DuckDB preserves typed rows and string bytes after a NUL" $ do
             result <- generateDuckDBContract "SELECT 'a' || chr(0) || 'b' AS s, NULL::BIGINT AS v;"
             case result of
