@@ -38,6 +38,7 @@ import Occam.Core (
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Drop (removeRelationCascade)
 import Occam.Dependency.Query (
+    allForeignKeys,
     constraintColumnsOf,
     installConstraints,
     referencedParentColumns,
@@ -367,17 +368,15 @@ applyDropColumn session key (catalog, relation) column cascade =
         -- External foreign keys referencing this column as a parent.
         crossTableKeys =
             [ constraintKey
-            | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+            | (constraintKey, state, foreignKey) <- allForeignKeys catalog
             , constraintStateTable state /= key
-            , ForeignKeyConstraint foreignKey <- [constraintValue state]
             , isParentColumn foreignKey
             ]
         -- Self-referential foreign keys on the dropped column.
         selfParentKeys =
             [ constraintKey
-            | (constraintKey, state) <- Map.toList (catalogConstraints catalog)
+            | (constraintKey, state, foreignKey) <- allForeignKeys catalog
             , constraintStateTable state == key
-            , ForeignKeyConstraint foreignKey <- [constraintValue state]
             , isParentColumn foreignKey
             ]
         -- Views that depend on the dropped column.
@@ -464,9 +463,8 @@ applyDropConstraint session key (catalog, relation) name cascade =
                 , Just droppedState <- [Map.lookup droppedKey (catalogConstraints catalog)]
                 , Just target <- [dropTarget droppedState]
                 , not (Set.null (snd target))
-                , (foreignKey, state) <- Map.toList (catalogConstraints catalog)
+                , (foreignKey, _, keyValue) <- allForeignKeys catalog
                 , foreignKey `notElem` matching
-                , ForeignKeyConstraint keyValue <- [constraintValue state]
                 , dependsOn target keyValue
                 ]
         removedKeys = matching ++ dependentKeys
@@ -503,12 +501,17 @@ applyRenameConstraint key (catalog, relation) from to =
                                 { constraintStateTable = key
                                 , constraintValue = renameConstraintName to (constraintValue state)
                                 }
+                        fks' = case constraintValue newState of
+                            ForeignKeyConstraint fk ->
+                                Map.insert newKey (newState, fk) (Map.delete constraintKey (catalogForeignKeys catalog'))
+                            _ -> catalogForeignKeys catalog'
                      in catalog'
                             { catalogConstraints =
                                 Map.insert
                                     newKey
                                     newState
                                     (Map.delete constraintKey (catalogConstraints catalog'))
+                            , catalogForeignKeys = fks'
                             }
         catalog1 = foldl' renameOne catalog matching
         newKeys = Set.fromList [ConstraintKey key (NamedConstraint to) | _ <- matching]
@@ -534,18 +537,31 @@ applyValidateConstraint (catalog, relation) name =
         catalog1 =
             foldl'
                 ( \current constraintKey ->
-                    current
-                        { catalogConstraints =
-                            Map.adjust
-                                ( \state ->
-                                    state
-                                        { constraintValue =
-                                            validateConstraintValue (constraintValue state)
-                                        }
-                                )
-                                constraintKey
-                                (catalogConstraints current)
-                        }
+                    let fks' =
+                            if Map.member constraintKey (catalogForeignKeys current)
+                                then
+                                    Map.adjust
+                                        ( \(st, fk) ->
+                                            let st' = st {constraintValue = validateConstraintValue (constraintValue st)}
+                                                fk' = fk {foreignKeyNotValid = False}
+                                             in (st', fk')
+                                        )
+                                        constraintKey
+                                        (catalogForeignKeys current)
+                                else catalogForeignKeys current
+                     in current
+                            { catalogConstraints =
+                                Map.adjust
+                                    ( \state ->
+                                        state
+                                            { constraintValue =
+                                                validateConstraintValue (constraintValue state)
+                                            }
+                                    )
+                                    constraintKey
+                                    (catalogConstraints current)
+                            , catalogForeignKeys = fks'
+                            }
                 )
                 catalog
                 matching

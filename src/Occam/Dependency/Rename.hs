@@ -61,6 +61,7 @@ import Occam.Dependency.State (
     lookupRelation,
     mutateResolved,
     newRelation,
+    rebuildForeignKeys,
     relColumnLineageL,
     relColumnWritesL,
     relColumnsL,
@@ -205,10 +206,14 @@ processRename sid eval renameOp =
                                 & catalogRelationsL
                                     %~ Map.map
                                         (renameSourceReadColumns session currentCatalog key renameColumn)
+                        catalog2 =
+                            if Map.null (catalogForeignKeys catalog1)
+                                then catalog1
+                                else catalog1 {catalogForeignKeys = rebuildForeignKeys (catalogConstraints catalog1)}
                      in current
                             & addTouches (relationTouchKeys key)
                             & addDeps deps
-                            & evalCatalogL .~ insertRelation key relation1 catalog1
+                            & evalCatalogL .~ insertRelation key relation1 catalog2
              in mutateResolved stepKey eval keys
 
 moveRelationObjects ::
@@ -274,8 +279,13 @@ moveRelationObjects placement _sid oldKey newKey relation catalog =
                 Just state ->
                     let newConstraintKey = ConstraintKey new (constraintKeyIdentity constraintKey)
                         state1 = state {constraintStateTable = new}
+                        fks' = case constraintValue state1 of
+                            ForeignKeyConstraint fk ->
+                                Map.insert newConstraintKey (state1, fk) (Map.delete constraintKey (catalogForeignKeys current))
+                            _ -> catalogForeignKeys current
                      in ( current
                             & catalogConstraintsL %~ Map.insert newConstraintKey state1 . Map.delete constraintKey
+                            & (\c -> c {catalogForeignKeys = fks'})
                         , Set.insert newConstraintKey keys
                         )
 
@@ -321,8 +331,14 @@ updateForeignKeyParents ::
     RelationKey ->
     Catalog ->
     Catalog
-updateForeignKeyParents session resolutionCatalog oldKey newKey catalog =
-    catalog & catalogConstraintsL %~ Map.map adjust
+updateForeignKeyParents session resolutionCatalog oldKey newKey catalog
+    | Map.null (catalogForeignKeys catalog) = catalog
+    | otherwise =
+        let constraints' = Map.map adjust (catalogConstraints catalog)
+         in catalog
+                { catalogConstraints = constraints'
+                , catalogForeignKeys = rebuildForeignKeys constraints'
+                }
     where
         adjust state =
             case constraintValue state of

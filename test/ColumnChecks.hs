@@ -1,5 +1,7 @@
 module ColumnChecks (tests) where
 
+import Control.Concurrent (forkIOWithUnmask, killThread, newEmptyMVar, putMVar, readMVar)
+import Control.Exception (SomeException, bracket, finally, handle, throwIO, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -25,7 +27,8 @@ import Occam.Reducer (
  )
 import System.Exit (ExitCode (..))
 import System.IO (Handle, hClose, hSetBinaryMode)
-import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
+import System.IO.Error (isResourceVanishedError)
+import System.Process (CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
@@ -51,24 +54,50 @@ tests =
 -- In-memory SQLite oracle execution.
 
 hGetStrict :: Handle -> IO ByteString
-hGetStrict handle = go []
+hGetStrict pipeHandle = go []
     where
         go acc = do
-            chunk <- BS.hGetSome handle 4096
+            chunk <- BS.hGetSome pipeHandle 4096
             if BS.null chunk then pure (BS.concat (reverse acc)) else go (chunk : acc)
 
+withDrain :: Handle -> (IO ByteString -> IO a) -> IO a
+withDrain pipeHandle use =
+    bracket
+        ( do
+            result <- newEmptyMVar
+            tid <- forkIOWithUnmask $ \unmask -> do
+                res <- try @SomeException (unmask (hGetStrict pipeHandle `finally` hClose pipeHandle))
+                putMVar result res
+            pure (tid, result)
+        )
+        ( \(tid, result) -> do
+            killThread tid
+            _ <- readMVar result
+            pure ()
+        )
+        (\(_, result) -> use (readMVar result >>= either throwIO pure))
+
 runSQLiteBytes :: ByteString -> IO (ExitCode, ByteString)
-runSQLiteBytes sql = do
-    let process = (proc "sqlite3" [":memory:"]) {std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe}
-    (Just stdinHandle, Just stdoutHandle, Just stderrHandle, processHandle) <- createProcess process
-    hSetBinaryMode stdinHandle True
-    hSetBinaryMode stdoutHandle True
-    BS.hPut stdinHandle sql
-    hClose stdinHandle
-    out <- hGetStrict stdoutHandle
-    _err <- hGetStrict stderrHandle
-    code <- waitForProcess processHandle
-    pure (code, out)
+runSQLiteBytes sql =
+    withCreateProcess process $ \mIn mOut mErr ph ->
+        case (mIn, mOut, mErr) of
+            (Just stdinHandle, Just stdoutHandle, Just stderrHandle) -> do
+                hSetBinaryMode stdinHandle True
+                hSetBinaryMode stdoutHandle True
+                hSetBinaryMode stderrHandle True
+                withDrain stdoutHandle $ \waitOut ->
+                    withDrain stderrHandle $ \waitErr -> do
+                        handle
+                            (\err -> if isResourceVanishedError err then pure () else throwIO err)
+                            (BS.hPut stdinHandle sql)
+                            `finally` hClose stdinHandle
+                        out <- waitOut
+                        _err <- waitErr
+                        code <- waitForProcess ph
+                        pure (code, out)
+            _ -> ioError (userError "Missing sqlite3 process pipes")
+    where
+        process = (proc "sqlite3" [":memory:"]) {std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe}
 
 -- | Accept candidates matching expected query output in SQLite.
 sqliteOracle :: ByteString -> ByteString -> IO Bool

@@ -44,14 +44,13 @@ barrierKeyMatches left right = left == right
 
 relationSchemaBarrierKeys :: RelationKey -> [BarrierKey]
 relationSchemaBarrierKeys (RelationKey _ name) =
-    map SchemaBarrierKey (dedupe (prefixes ++ lastPrefix))
-    where
-        parts = nameParts name
-        prefixes = [Name (take n parts) | n <- [1 .. length parts - 1]]
-        lastPrefix =
-            [ Name [last (init parts)]
-            | length parts > 1
-            ]
+    case nameParts name of
+        [] -> []
+        [_] -> []
+        parts ->
+            let prefixes = [Name (take n parts) | n <- [1 .. length parts - 1]]
+                lastPrefix = [Name [last (init parts)]]
+             in map SchemaBarrierKey (dedupe (prefixes ++ lastPrefix))
 
 dedupe :: (Ord a) => [a] -> [a]
 dedupe = Set.toList . Set.fromList

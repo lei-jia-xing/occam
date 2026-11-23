@@ -95,6 +95,9 @@ module Occam.Dependency.State (
     writeSignature,
     nameSuffix,
     nameLast,
+    rebuildForeignKeys,
+    rebuildChildRelations,
+    rebuildRelationsByLast,
 ) where
 
 import Data.Map.Strict (Map)
@@ -107,8 +110,9 @@ import Lens.Micro (Lens', lens, (%~), (&))
 import Occam.Core (
     BarrierReason (..),
     BarrierScope (..),
-    Constraint,
+    Constraint (..),
     DeleteScope,
+    ForeignKey,
     Ident,
     Name (..),
     NameRef,
@@ -253,10 +257,13 @@ data DefinitionState = DefinitionState
 
 data Catalog = Catalog
     { catalogRelations :: !(Map RelationKey RelationState)
+    , catalogRelationsByLast :: !(Map Ident (Set RelationKey))
     , catalogIndexes :: !(Map IndexKey IndexState)
     , catalogTriggers :: !(Map TriggerKey TriggerState)
     , catalogSequences :: !(Map SequenceKey SequenceState)
     , catalogConstraints :: !(Map ConstraintKey ConstraintState)
+    , catalogForeignKeys :: !(Map ConstraintKey (ConstraintState, ForeignKey))
+    , catalogChildRelations :: !(Set RelationKey)
     , catalogTypes :: !(Map Name DefinitionState)
     , catalogSchemas :: !(Map Name DefinitionState)
     , catalogNextUnnamedConstraint :: !Int
@@ -268,10 +275,13 @@ emptyCatalog :: Catalog
 emptyCatalog =
     Catalog
         { catalogRelations = Map.empty
+        , catalogRelationsByLast = Map.empty
         , catalogIndexes = Map.empty
         , catalogTriggers = Map.empty
         , catalogSequences = Map.empty
         , catalogConstraints = Map.empty
+        , catalogForeignKeys = Map.empty
+        , catalogChildRelations = Set.empty
         , catalogTypes = Map.empty
         , catalogSchemas = Map.empty
         , catalogNextUnnamedConstraint = 0
@@ -677,11 +687,50 @@ lookupRelation catalog key = Map.lookup key (catalogRelations catalog)
 
 insertRelation :: RelationKey -> RelationState -> Catalog -> Catalog
 insertRelation key relation catalog =
-    catalog {catalogRelations = Map.insert key relation (catalogRelations catalog)}
+    let isChild = not (Set.null (relPartitionParents relation) && Set.null (relInheritParents relation))
+        children = catalogChildRelations catalog
+        children'
+            | isChild = Set.insert key children
+            | Set.null children = children
+            | otherwise = Set.delete key children
+        (mbExisting, rels') =
+            Map.insertLookupWithKey (\_ new _ -> new) key relation (catalogRelations catalog)
+        byLast' = case mbExisting of
+            Just _ -> catalogRelationsByLast catalog
+            Nothing
+                | relationKeyTemp key -> catalogRelationsByLast catalog
+                | otherwise -> case nameLast (relationKeyName key) of
+                    Nothing -> catalogRelationsByLast catalog
+                    Just ident ->
+                        Map.insertWith Set.union ident (Set.singleton key) (catalogRelationsByLast catalog)
+     in catalog
+            { catalogRelations = rels'
+            , catalogRelationsByLast = byLast'
+            , catalogChildRelations = children'
+            }
 
 deleteRelation :: RelationKey -> Catalog -> Catalog
 deleteRelation key catalog =
-    catalog {catalogRelations = Map.delete key (catalogRelations catalog)}
+    let children = catalogChildRelations catalog
+        children' = if Set.null children then children else Set.delete key children
+        byLast = catalogRelationsByLast catalog
+        byLast'
+            | relationKeyTemp key || Map.null byLast = byLast
+            | otherwise = case nameLast (relationKeyName key) of
+                Nothing -> byLast
+                Just ident ->
+                    Map.update
+                        ( \keys ->
+                            let keys' = Set.delete key keys
+                             in if Set.null keys' then Nothing else Just keys'
+                        )
+                        ident
+                        byLast
+     in catalog
+            { catalogRelations = Map.delete key (catalogRelations catalog)
+            , catalogRelationsByLast = byLast'
+            , catalogChildRelations = children'
+            }
 
 deleteIndex :: IndexKey -> Catalog -> Catalog
 deleteIndex key catalog =
@@ -697,14 +746,46 @@ deleteSequence key catalog =
 
 deleteConstraint :: ConstraintKey -> Catalog -> Catalog
 deleteConstraint key catalog =
-    catalog
-        { catalogConstraints = Map.delete key (catalogConstraints catalog)
-        , catalogRelations =
-            Map.adjust
-                (\relation -> relation {relConstraints = Set.delete key (relConstraints relation)})
-                (constraintKeyTable key)
-                (catalogRelations catalog)
-        }
+    let fks = catalogForeignKeys catalog
+        fks' = if Map.null fks then fks else Map.delete key fks
+     in catalog
+            { catalogConstraints = Map.delete key (catalogConstraints catalog)
+            , catalogForeignKeys = fks'
+            , catalogRelations =
+                Map.adjust
+                    (\relation -> relation {relConstraints = Set.delete key (relConstraints relation)})
+                    (constraintKeyTable key)
+                    (catalogRelations catalog)
+            }
+
+rebuildForeignKeys ::
+    Map ConstraintKey ConstraintState -> Map ConstraintKey (ConstraintState, ForeignKey)
+rebuildForeignKeys =
+    Map.mapMaybe $ \state -> case constraintValue state of
+        ForeignKeyConstraint fk -> Just (state, fk)
+        _ -> Nothing
+
+rebuildChildRelations :: Map RelationKey RelationState -> Set RelationKey
+rebuildChildRelations =
+    Map.foldlWithKey'
+        ( \acc key relation ->
+            if Set.null (relPartitionParents relation) && Set.null (relInheritParents relation)
+                then acc
+                else Set.insert key acc
+        )
+        Set.empty
+
+rebuildRelationsByLast :: Map RelationKey RelationState -> Map Ident (Set RelationKey)
+rebuildRelationsByLast =
+    Map.foldlWithKey'
+        ( \acc key _ ->
+            if relationKeyTemp key
+                then acc
+                else case nameLast (relationKeyName key) of
+                    Nothing -> acc
+                    Just ident -> Map.insertWith Set.union ident (Set.singleton key) acc
+        )
+        Map.empty
 
 clearRelationObjects :: RelationKey -> Catalog -> Catalog
 clearRelationObjects key catalog =

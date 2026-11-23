@@ -31,6 +31,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import Foreign (alloca, castPtr, nullPtr, peek, poke)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -134,10 +135,37 @@ parseSQLTimed store kind options sql =
                                                           )
                                     finally timed free
     where
-        configBytes = BL.toStrict (encode options)
+        configBytes = encodeOptionsFast options
         clockIf = case store of
             Nothing -> pure 0
             Just _ -> getMonotonicTimeNSec
+
+defaultServerConfigJson :: ByteString
+defaultServerConfigJson = BL.toStrict (encode defaultServerConfig)
+
+boolJsonBytes :: Bool -> ByteString
+boolJsonBytes True = "true"
+boolJsonBytes False = "false"
+
+encodeOptionsFast :: ParseOptions -> ByteString
+encodeOptionsFast options
+    | parseServerConfig options == defaultServerConfig =
+        BS.concat
+            [ "{\"dialect\":\""
+            , TE.encodeUtf8 (dialectName (parseDialect options))
+            , "\",\"server\":"
+            , defaultServerConfigJson
+            , ",\"chunk_edits\":"
+            , boolJsonBytes (parseChunkEdits options)
+            , ",\"column_ir\":"
+            , boolJsonBytes (parseColumnIR options)
+            , ",\"column_bundles\":"
+            , boolJsonBytes (parseColumnBundles options)
+            , ",\"syntax_edits\":"
+            , boolJsonBytes (parseSyntaxEdits options)
+            , "}"
+            ]
+    | otherwise = BL.toStrict (encode options)
 
 -- | Count SQL statements in the input according to the chosen dialect.
 countStatements :: SQLDialect -> ByteString -> IO (Either ParserError Int)

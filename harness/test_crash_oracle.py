@@ -393,16 +393,18 @@ exit 2
             decision_log = os.path.join(td, "decisions.jsonl")
             self.write_mock(
                 td,
-                "psql",
+                "mysql",
                 f"""cat >/dev/null || true
 echo 'Assertion failure: [x] failed' >> {shlex.quote(log_path)}
-echo 'server closed the connection unexpectedly' >&2
-exit 2
+echo 'Lost connection to MySQL server during query' >&2
+exit 1
 """,
             )
             code, _, _ = self.run_oracle(
                 "SELECT 1;",
                 args=[
+                    "--dbms",
+                    "mysql",
                     "--log-file",
                     log_path,
                     "--expected-signature",
@@ -453,6 +455,320 @@ exit 1
                 env=self.path_env(td),
             )
             self.assertEqual(code, 0)
+
+    def test_pg13_postmaster_child_exit_and_csv_sqlstate_57p02(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            csv_row = (
+                '2026-11-22 12:00:00.123 UTC,"postgres","occam_test",1234,'
+                '"127.0.0.1:50000",673f,1,"SELECT",2026-11-22 12:00:00 UTC,3/1,0,'
+                'FATAL,57P02,"terminating connection because of crash of another server process",,,,,,,,,"psql"'
+            )
+            postmaster_line = (
+                "2026-11-22 12:00:00.124 UTC [1] LOG:  "
+                "server process (PID 1230) was terminated by signal 11: Segmentation fault"
+            )
+            self.write_mock(
+                td,
+                "psql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(csv_row)} >> {shlex.quote(log_path)}
+printf '%s\\n' {shlex.quote(postmaster_line)} >> {shlex.quote(log_path)}
+echo 'server closed the connection unexpectedly' >&2
+exit 2
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "postgres",
+                    "--log-file",
+                    log_path,
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 0)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["classification"], "confirmed_fault")
+            self.assertTrue(records[0]["corroboration"]["sqlstate_57p02"])
+            self.assertEqual(records[0]["corroboration"]["postmaster_child_pids"], [1230])
+
+    def test_pg13_sql_echo_and_normal_exit_are_healthy_no_fault(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            echo_line = (
+                "2026-11-22 12:00:00.100 UTC [1234] postgres@occam_test "
+                "LOG:  statement: SELECT 'TRAP: FailedAssertion(\"!(x)\", File: \"mcv.c\", Line: 1)';"
+            )
+            normal_exit = (
+                "2026-11-22 12:00:00.101 UTC [1] LOG:  "
+                "server process (PID 1234) exited with exit code 0"
+            )
+            self.write_mock(
+                td,
+                "psql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(echo_line)} >> {shlex.quote(log_path)}
+printf '%s\\n' {shlex.quote(normal_exit)} >> {shlex.quote(log_path)}
+exit 0
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "postgres",
+                    "--log-file",
+                    log_path,
+                    "--expected-signature",
+                    "mcv.c",
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 1)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["verdict"], "rejected")
+            self.assertEqual(records[0]["classification"], "healthy_no_fault")
+
+    def test_mysql80_error_event_and_supervisor_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            mysql_err = (
+                "2026-11-22T12:00:00.123456Z 0 [ERROR] [MY-013183] [InnoDB] "
+                "Assertion failure: btr0cur.cc:1234:cursor->index"
+            )
+            sup_line = "[entrypoint_target_mysql] mysqld-debug terminated (exit status: 134). Restarting..."
+            self.write_mock(
+                td,
+                "mysql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(mysql_err)} >> {shlex.quote(log_path)}
+printf '%s\\n' {shlex.quote(sup_line)} >> {shlex.quote(log_path)}
+echo 'ERROR 2013 (HY000): Lost connection to MySQL server during query' >&2
+exit 1
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "mysql",
+                    "--log-file",
+                    log_path,
+                    "--expected-signature",
+                    "MY-013183",
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 0)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["classification"], "confirmed_fault")
+            self.assertEqual(records[0]["corroboration"]["supervisor_exit_codes"], [134])
+
+    def test_mysql80_transport_disconnect_without_server_fault_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            note_line = (
+                "2026-11-22T12:00:00.123456Z 9 [Note] [MY-010914] [Server] "
+                "Aborted connection 9 to db: 'occam_test' user: 'root' (Got timeout reading communication packets)"
+            )
+            normal_exit = "[entrypoint_target_mysql] mysqld-debug terminated (exit status: 0)."
+            self.write_mock(
+                td,
+                "mysql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(note_line)} >> {shlex.quote(log_path)}
+printf '%s\\n' {shlex.quote(normal_exit)} >> {shlex.quote(log_path)}
+echo 'ERROR 2006 (HY000): MySQL server has gone away' >&2
+exit 1
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "mysql",
+                    "--log-file",
+                    log_path,
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 1)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["classification"], "healthy_no_fault")
+            self.assertTrue(records[0]["corroboration"]["connection_lost"])
+
+    def test_missing_evidence_classification_when_log_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            decision_log = os.path.join(td, "decisions.jsonl")
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=["--decision-log", decision_log],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 1)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["classification"], "missing_evidence")
+            self.assertEqual(records[0]["reason"], "log-source-required")
+
+    def test_pg13_multiline_statement_echo_and_csv_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            stderr_multiline = (
+                "2026-11-22 12:00:00.100 UTC [1234] postgres@occam_test "
+                "LOG:  statement: SELECT 1,\n"
+                "\t'TRAP: FailedAssertion(\"!(x)\", File: \"mcv.c\", Line: 1)';\n"
+                "\tPANIC: fake continuation line"
+            )
+            csv_multiline = (
+                '2026-11-22 12:00:00.101 UTC,"postgres","occam_test",1234,'
+                '"127.0.0.1:50000",673f,1,"SELECT",2026-11-22 12:00:00 UTC,3/1,0,'
+                'LOG,00000,"statement: SELECT 1,\n'
+                'TRAP: FailedAssertion(""!(x)"", File: ""mcv.c"", Line: 1)",,,,,,,,,"psql"'
+            )
+            self.write_mock(
+                td,
+                "psql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(stderr_multiline)} >> {shlex.quote(log_path)}
+printf '%s\\n' {shlex.quote(csv_multiline)} >> {shlex.quote(log_path)}
+exit 0
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "postgres",
+                    "--log-file",
+                    log_path,
+                    "--expected-signature",
+                    "mcv.c",
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 1)
+            records = self.read_jsonl(decision_log)
+            self.assertEqual(records[0]["classification"], "healthy_no_fault")
+            self.assertEqual(records[0]["fault_events"], [])
+
+    def test_expected_signature_without_fault_is_healthy_no_fault(self):
+        with tempfile.TemporaryDirectory() as td:
+            pg_log = self.make_log(td)
+            pg_decisions = os.path.join(td, "pg_decisions.jsonl")
+            pg_fatal = (
+                '2026-11-22 12:00:00.100 UTC [1234] postgres@occam_test '
+                'FATAL:  database "mcv.c" does not exist'
+            )
+            self.write_mock(
+                td,
+                "psql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(pg_fatal)} >> {shlex.quote(pg_log)}
+exit 2
+""",
+            )
+            pg_code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "postgres",
+                    "--log-file",
+                    pg_log,
+                    "--expected-signature",
+                    "mcv.c",
+                    "--decision-log",
+                    pg_decisions,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(pg_code, 1)
+            pg_rec = self.read_jsonl(pg_decisions)[0]
+            self.assertEqual(pg_rec["classification"], "healthy_no_fault")
+            self.assertEqual(pg_rec["reason"], "no-crash")
+
+            mysql_log = os.path.join(td, "mysql.log")
+            with open(mysql_log, "w", encoding="utf-8") as handle:
+                handle.write("Log started\n")
+            mysql_decisions = os.path.join(td, "mysql_decisions.jsonl")
+            mysql_err = (
+                "2026-11-22T12:00:00.123456Z 9 [ERROR] [MY-010123] [Server] "
+                "Can't find file: 'btr0cur.cc'"
+            )
+            self.write_mock(
+                td,
+                "mysql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(mysql_err)} >> {shlex.quote(mysql_log)}
+exit 1
+""",
+            )
+            mysql_code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "mysql",
+                    "--log-file",
+                    mysql_log,
+                    "--expected-signature",
+                    "btr0cur.cc",
+                    "--decision-log",
+                    mysql_decisions,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(mysql_code, 1)
+            mysql_rec = self.read_jsonl(mysql_decisions)[0]
+            self.assertEqual(mysql_rec["classification"], "healthy_no_fault")
+            self.assertEqual(mysql_rec["reason"], "no-crash")
+
+    def test_pg13_asan_stack_overflow_is_confirmed_fault(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            decision_log = os.path.join(td, "decisions.jsonl")
+            asan_line = "==1234==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7fff"
+            self.write_mock(
+                td,
+                "psql",
+                f"""cat >/dev/null || true
+printf '%s\\n' {shlex.quote(asan_line)} >> {shlex.quote(log_path)}
+echo 'server closed the connection unexpectedly' >&2
+exit 2
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "postgres",
+                    "--log-file",
+                    log_path,
+                    "--expected-signature",
+                    "stack-buffer-overflow",
+                    "--decision-log",
+                    decision_log,
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 0)
+            rec = self.read_jsonl(decision_log)[0]
+            self.assertEqual(rec["classification"], "confirmed_fault")
 
 
 if __name__ == "__main__":

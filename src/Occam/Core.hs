@@ -694,8 +694,8 @@ instance FromJSON OnCommitAction where
             _ -> fail ("unknown ON COMMIT action: " <> T.unpack name)
 
 instance FromJSON ConstraintValidity where
-    parseJSON = withBool "ConstraintValidity" \valid ->
-        pure (if valid then ConstraintValid else ConstraintNotValid)
+    parseJSON = withBool "ConstraintValidity" \notValid ->
+        pure (if notValid then ConstraintNotValid else ConstraintValid)
 
 instance FromJSON IndexUniqueness where
     parseJSON = withBool "IndexUniqueness" \unique ->

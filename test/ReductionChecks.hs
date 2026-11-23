@@ -20,7 +20,7 @@ import Occam.Core (
     StatementId (..),
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
-import Occam.Facts (StatementUnit (..))
+import Occam.Facts (ParserEdit (..), ParserEditCategory (..), StatementUnit (..))
 import Occam.Logger (nullLogger)
 import Occam.Oracle (OracleObservation (..))
 import Occam.Parser (
@@ -45,12 +45,14 @@ import Occam.Reducer (
     ReductionStage (..),
     StageEvent (..),
     StatementSearchPolicy (..),
+    applyParserEdits,
     defaultReductionConfig,
     findInterestingPrefix,
     reduceSQL,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
     reduceSQLWithResultSlicing,
+    selectIndependentEdits,
     statementAudit,
     statementDdmin,
  )
@@ -370,6 +372,117 @@ tests =
                     assertEqual (show dialect <> " candidate bytes and endpoint") full incremental
                 )
                 cases
+        , testCase "applyParserEdits and selectIndependentEdits enforce disjoint non-gluing boundaries" $ do
+            let sql = "CREATE TABLE t (a VARCHAR(20) NOT NULL, b BIGINT DEFAULT 1);"
+                -- a: VARCHAR(20) [18..29) -> "INT", NOT NULL [29..38) -> ""
+                -- b: BIGINT [42..48) -> "INT", DEFAULT 1 [48..58) -> ""
+                eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type"
+                eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type"
+                eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint"
+                eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type"
+                eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint"
+                gluedA = ParserEdit 18 23 "AA" EditExpression "test"
+                gluedB = ParserEdit 23 29 "BB" EditExpression "test"
+            assertEqual
+                "applyParserEdits applies adjacent replacement + deletion cleanly"
+                (Just "CREATE TABLE t (a INT, b INT);")
+                (applyParserEdits sql [eConsB, eTypeA, eTypeB, eConsA])
+            assertEqual
+                "applyParserEdits rejects overlapping edits"
+                Nothing
+                (applyParserEdits sql [eTypeA, eTypeAText])
+            assertEqual
+                "applyParserEdits rejects gluing non-empty adjacent replacements"
+                Nothing
+                (applyParserEdits sql [gluedA, gluedB])
+            assertEqual
+                "applyParserEdits rejects out-of-bounds spans"
+                Nothing
+                (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob"])
+            let selected = selectIndependentEdits [eTypeAText, eTypeA, gluedA, gluedB, eTypeB]
+            assertEqual
+                "selectIndependentEdits picks highest-savings non-overlapping non-gluing set"
+                [eTypeA, eTypeB]
+                selected
+        , testCase "Independent AST edit batching cuts calls and subdivides rejected batches across dialects" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t1 (a VARCHAR(50) NOT NULL DEFAULT 'abc', b BIGINT NOT NULL, PRIMARY KEY (a));"
+                        , "CREATE TABLE t2 (c VARCHAR(50) NOT NULL, d DECIMAL(10, 2) DEFAULT 0);"
+                        , "SELECT a, c FROM t1 JOIN t2 ON t1.a = t2.c WHERE 1 = 1 ORDER BY a LIMIT 5;"
+                        ]
+                accepted sqlCandidate =
+                    BSC.isInfixOf "PRIMARY KEY (a)" sqlCandidate
+                        && BSC.isInfixOf "CREATE TABLE t1" sqlCandidate
+                        && BSC.isInfixOf "CREATE TABLE t2" sqlCandidate
+                        && BSC.isInfixOf "SELECT" sqlCandidate
+                        && BSC.isInfixOf "WHERE 1 = 1" sqlCandidate
+            mapM_
+                ( \dialect -> do
+                    controlCalls <- newIORef (0 :: Int)
+                    controlPool <- outcomePool $ \c -> do
+                        modifyIORef' controlCalls (+ 1)
+                        pure (if accepted c then OracleAccepted else OracleRejected)
+                    let controlCfg =
+                            defaultReductionConfig
+                                { reductionDialect = dialect
+                                , reductionSlicing = False
+                                , reductionClosure = False
+                                , reductionUnrestricted = False
+                                , reductionIntraStatement = True
+                                }
+                    reducedControl <- reduceSQLWithConfig controlCfg nullLogger controlPool sql
+                    nControl <- readIORef controlCalls
+
+                    batchCalls <- newIORef (0 :: Int)
+                    batchPool <- outcomePool $ \c -> do
+                        modifyIORef' batchCalls (+ 1)
+                        pure (if accepted c then OracleAccepted else OracleRejected)
+                    let batchCfg = controlCfg {reductionAstBatching = True}
+                    reducedBatch <- reduceSQLWithConfig batchCfg nullLogger batchPool sql
+                    nBatch <- readIORef batchCalls
+
+                    assertBool (show dialect <> " preserves PRIMARY KEY") (BSC.isInfixOf "PRIMARY KEY (a)" reducedBatch)
+                    assertBool (show dialect <> " removes NOT NULL") (not (BSC.isInfixOf "NOT NULL" reducedBatch))
+                    assertBool (show dialect <> " removes DEFAULT") (not (BSC.isInfixOf "DEFAULT" reducedBatch))
+                    assertBool (show dialect <> " removes ORDER BY") (not (BSC.isInfixOf "ORDER BY" reducedBatch))
+                    assertBool (show dialect <> " removes LIMIT") (not (BSC.isInfixOf "LIMIT" reducedBatch))
+                    assertBool
+                        (show dialect <> " batching reduces oracle calls (" ++ show nBatch ++ " vs " ++ show nControl ++ ")")
+                        (nBatch < nControl)
+                    assertBool
+                        (show dialect <> " batching shrinks at least as much as control")
+                        (BS.length reducedBatch <= BS.length reducedControl)
+                )
+                [SQLite, PostgreSQL, MySQL, DuckDB]
+        , testCase "ColumnAtomic refreshes bundles cleanly after EditList and AST batching in same statement" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t (a INT, b VARCHAR(40) NOT NULL);"
+                        , "INSERT INTO t(a, b) VALUES (1, 'keep'), (2, 'drop');"
+                        , "SELECT a FROM t ORDER BY a;"
+                        ]
+                accepted candidate =
+                    BSC.isInfixOf "CREATE TABLE t" candidate
+                        && BSC.isInfixOf "INSERT INTO t" candidate
+                        && BSC.isInfixOf "(1" candidate
+                        && BSC.isInfixOf "SELECT a FROM t" candidate
+            pool <- predicatePool accepted
+            let cfg =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionUnrestricted = False
+                        , reductionIntraStatement = True
+                        , reductionAstBatching = True
+                        , reductionColumnMode = ColumnAtomic
+                        }
+            reduced <- reduceSQLWithConfig cfg nullLogger pool sql
+            assertBool "accepted output remains valid" (accepted reduced)
+            assertBool "unused column b removed by atomic bundle" (not (BSC.isInfixOf "'keep'" reduced))
+            assertBool "redundant ORDER BY removed" (not (BSC.isInfixOf "ORDER BY" reduced))
+            assertBool "unused row (2, 'drop') removed" (not (BSC.isInfixOf "'drop'" reduced))
         , testCase "Intra-statement rewrites reduce UPDATE assignments, WHERE clauses, and DELETE clauses" $ do
             pool <-
                 predicatePool

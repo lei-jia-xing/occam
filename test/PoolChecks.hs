@@ -2,7 +2,9 @@ module PoolChecks (tests) where
 
 import Control.Concurrent (
     MVar,
+    ThreadId,
     forkIO,
+    killThread,
     modifyMVar_,
     newEmptyMVar,
     newMVar,
@@ -19,11 +21,14 @@ import Control.Exception (
     fromException,
     throwIO,
     try,
+    uninterruptibleMask_,
  )
+import Control.Monad (replicateM_)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
+import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleInconclusiveError, OracleOutcome (..))
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails, OracleReapFailed (..))
@@ -253,7 +258,81 @@ tests =
             assertEqual "killed task was not accounted as cancelled" 1 cancelled
             attempts <- poolAttempts pool
             assertEqual "killed task started physically" 1 attempts
+        , testCase "killed closeOraclePool caller mid-killThread still drains serial worker" $ do
+            workerEntered <- newEmptyMVar
+            releaseWorker <- newEmptyMVar
+            let execute _ = uninterruptibleMask_ $ do
+                    putMVar workerEntered ()
+                    takeMVar releaseWorker
+                    pure acceptDetails
+            pool <- testPool 1 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
+            workerVar <- newEmptyMVar
+            _ <- forkIO (try (testOrdered pool ["serial"]) >>= putMVar workerVar)
+            takeMVar workerEntered
+            closerVar <- newEmptyMVar
+            closerTid <- forkIO (try (closeOraclePool pool) >>= putMVar closerVar)
+            awaitBlockedOnException closerTid
+            killThread closerTid
+            closerOutcome <- timeout 5000000 (takeMVar closerVar)
+            case closerOutcome of
+                Just (Left err) -> case fromException err of
+                    Just ThreadKilled -> pure ()
+                    _ -> assertFailure ("unexpected closer exception: " ++ displayException err)
+                _ -> assertFailure "closer did not terminate after killThread"
+            putMVar releaseWorker ()
+            workerOutcome <- timeout 5000000 (takeMVar workerVar)
+            case workerOutcome of
+                Just (Left err) -> case fromException err of
+                    Just ThreadKilled -> pure ()
+                    _ -> assertFailure ("serial worker got wrong exception: " ++ displayException err)
+                Just (Right _) -> assertFailure "cancelled serial worker returned an outcome"
+                Nothing -> assertFailure "serial worker deadlocked waiting on cancelAck"
+            live <- poolLiveWorkers pool
+            assertEqual "serial worker outlived killed closer" 0 live
+            cancelled <- poolCancelled pool
+            assertEqual "cancelled serial worker was not accounted" 1 cancelled
+            followUp <- timeout 5000000 (closeOraclePool pool)
+            assertEqual "follow-up closeOraclePool did not drain" (Just ()) followUp
+        , testCase "closeOraclePool observes serial worker reap failure before returning" $
+            replicateM_ 50 $ do
+                workerEntered <- newEmptyMVar
+                releaseWorker <- newEmptyMVar
+                let execute _ = uninterruptibleMask_ $ do
+                        putMVar workerEntered ()
+                        takeMVar releaseWorker
+                        throwIO OracleReapFailed
+                pool <- testPool 1 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
+                workerVar <- newEmptyMVar
+                _ <- forkIO (try (testOrdered pool ["reap-fail"]) >>= putMVar workerVar)
+                takeMVar workerEntered
+                closerVar <- newEmptyMVar
+                closerTid <- forkIO (try (closeOraclePool pool) >>= putMVar closerVar)
+                awaitBlockedOnException closerTid
+                putMVar releaseWorker ()
+                closerOutcome <- timeout 5000000 (takeMVar closerVar)
+                case closerOutcome of
+                    Just (Left err) -> case fromException err of
+                        Just OracleReapFailed -> pure ()
+                        _ -> assertFailure ("unexpected closer error: " ++ displayException err)
+                    Just (Right ()) -> assertFailure "closeOraclePool missed serial OracleReapFailed"
+                    Nothing -> assertFailure "closeOraclePool timed out"
+                workerOutcome <- timeout 5000000 (takeMVar workerVar)
+                case workerOutcome of
+                    Just (Left err) -> case fromException err of
+                        Just OracleReapFailed -> pure ()
+                        _ -> assertFailure ("unexpected worker error: " ++ displayException err)
+                    _ -> assertFailure "serial worker did not surface OracleReapFailed"
         ]
+
+awaitBlockedOnException :: ThreadId -> IO ()
+awaitBlockedOnException tid = go (5000 :: Int)
+    where
+        go 0 = assertFailure "timed out waiting for thread to block in killThread"
+        go n = do
+            st <- threadStatus tid
+            case st of
+                ThreadBlocked BlockedOnException -> pure ()
+                _ -> threadDelay 1000 >> go (n - 1)
 
 testPool ::
     Int ->

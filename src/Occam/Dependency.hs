@@ -223,20 +223,28 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
             concatMap
                 (barrierKeysForScope resolutionSession resolutionCatalog . barrierScope)
                 declared
+        lastBarriersMap = scanLastBarriers priorState
+        hasAnyBarrier = not (Map.null lastBarriersMap)
         touchedKeys = Set.toList (evalTouches eval)
-        baseDeps =
-            lastBarrierDeps
-                priorState
-                [GlobalBarrierKey, SessionBarrierKey, TransactionBarrierKey]
-        touchDeps = lastBarrierDeps priorState touchedKeys
-        hasGlobalFence = Map.member GlobalBarrierKey (scanLastBarriers priorState)
-        declaredDeps =
-            Set.unions
-                [ if key == GlobalBarrierKey
-                    then if hasGlobalFence then Set.empty else scanPriorStatements priorState
-                    else touchersForBarrier priorState key
-                | key <- barrierKeys
-                ]
+        baseDeps
+            | hasAnyBarrier =
+                lastBarrierDeps
+                    priorState
+                    [GlobalBarrierKey, SessionBarrierKey, TransactionBarrierKey]
+            | otherwise = Set.empty
+        touchDeps
+            | hasAnyBarrier = lastBarrierDeps priorState touchedKeys
+            | otherwise = Set.empty
+        hasGlobalFence = hasAnyBarrier && Map.member GlobalBarrierKey lastBarriersMap
+        declaredDeps
+            | null declared = Set.empty
+            | otherwise =
+                Set.unions
+                    [ if key == GlobalBarrierKey
+                        then if hasGlobalFence then Set.empty else scanPriorStatements priorState
+                        else touchersForBarrier priorState key
+                    | key <- barrierKeys
+                    ]
         barrierDeps =
             Set.unions [baseDeps, touchDeps, declaredDeps]
         objectDeps = evalDeps eval

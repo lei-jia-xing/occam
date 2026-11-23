@@ -3,7 +3,7 @@ module Main (main) where
 import ColumnChecks qualified
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.Aeson (FromJSON (..), Value (..), eitherDecodeStrict', encode, withObject, (.:))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -536,6 +536,13 @@ phase5Tests =
                     assertEqual "default jobs" (Just (Number 1)) (Map.lookup "jobs" defaults)
                     assertEqual "default dialect" (Just (String "generic")) (Map.lookup "dialect" defaults)
                     assertEqual "default strategy" (Just (String "full")) (Map.lookup "strategy" defaults)
+                    assertEqual
+                        "default statement_order"
+                        (Just (String "byte-weighted"))
+                        (Map.lookup "statement_order" defaults)
+                    assertEqual "default literal_batches" (Just (Bool False)) (Map.lookup "literal_batches" defaults)
+                    assertEqual "default ast_batching" (Just (Bool False)) (Map.lookup "ast_batching" defaults)
+                    assertEqual "default adaptive_values" (Just (Bool False)) (Map.lookup "adaptive_values" defaults)
                     assertEqual "default log level" (Just (String "warn")) (Map.lookup "log_level" defaults)
                     assertEqual "json log level" (Just (String "info")) (Map.lookup "log_level_json" defaults)
         , testCase "--completion generates valid shell scripts and supports dynamic completion" $ do
@@ -756,6 +763,85 @@ phase5Tests =
             assertBool
                 "wrong error for audit-only + unrestricted"
                 ("--unrestricted conflicts with --strategy audit-only" `isInfixOf` err7)
+
+            (code8, _, err8) <-
+                runOccamCLI
+                    ["input.sql", "--strategy", "audit-only", "--statement-order", "complement-first", "-c", "exit 0"]
+            assertEqual "audit-only + statement-order must exit 2" (ExitFailure 2) code8
+            assertBool
+                "wrong error for audit-only + statement-order"
+                ("--statement-order conflicts with --strategy audit-only" `isInfixOf` err8)
+
+            (code9, _, err9) <-
+                runOccamCLI ["input.sql", "--literal-batches", "-c", "exit 0"]
+            assertEqual "literal-batches without intra-statement must exit 2" (ExitFailure 2) code9
+            assertBool
+                "wrong error for literal-batches without intra-statement"
+                ("--literal-batches requires --intra-statement" `isInfixOf` err9)
+
+            (code10, _, err10) <-
+                runOccamCLI ["input.sql", "--adaptive-values", "-c", "exit 0"]
+            assertEqual "adaptive-values without intra-statement must exit 2" (ExitFailure 2) code10
+            assertBool
+                "wrong error for adaptive-values without intra-statement"
+                ("--adaptive-values requires --intra-statement" `isInfixOf` err10)
+
+            (code11, _, err11) <-
+                runOccamCLI ["input.sql", "--ast-batching", "-c", "exit 0"]
+            assertEqual "ast-batching without intra-statement must exit 2" (ExitFailure 2) code11
+            assertBool
+                "wrong error for ast-batching without intra-statement"
+                ("--ast-batching requires --intra-statement" `isInfixOf` err11)
+        , testCase "CLI exposes search policy flags in completion and stats" $
+            withCLIInput "SELECT 1234, 1234, 9999, 9999;" $ \input outFile -> do
+                let statsFile = outFile ++ ".stats.json"
+                (ordCompCode, ordCompOut, _) <-
+                    runOccamCLI
+                        [ "--bash-completion-index"
+                        , "2"
+                        , "--bash-completion-word"
+                        , "occam"
+                        , "--bash-completion-word"
+                        , "--statement-order"
+                        , "--bash-completion-word"
+                        , ""
+                        ]
+                assertEqual "statement-order completion exit code" ExitSuccess ordCompCode
+                assertBool "completion includes subset-first" ("subset-first" `isInfixOf` ordCompOut)
+                assertBool "completion includes complement-first" ("complement-first" `isInfixOf` ordCompOut)
+                assertBool "completion includes byte-weighted" ("byte-weighted" `isInfixOf` ordCompOut)
+
+                (code, _, err) <-
+                    runOccamCLI
+                        [ input
+                        , "-c"
+                        , "sql=$(cat); [ \"$sql\" = 'SELECT 1234, 1234, 9999, 9999;' ] || [ \"$sql\" = 'SELECT 0, 0, 9999, 9999;' ]"
+                        , "--dialect"
+                        , "sqlite"
+                        , "--statement-order"
+                        , "complement-first"
+                        , "--intra-statement"
+                        , "--literal-batches"
+                        , "--adaptive-values"
+                        , "--out"
+                        , outFile
+                        , "--stats"
+                        , statsFile
+                        , "--quiet"
+                        ]
+                assertEqual ("CLI policy run failed: " ++ err) ExitSuccess code
+                reduced <- BS.readFile outFile
+                assertEqual "literal-batches coupled shrink works through CLI" "SELECT 0, 0, 9999, 9999;" reduced
+                statsBytes <- BS.readFile statsFile
+                case eitherDecodeStrict' statsBytes :: Either String Value of
+                    Left e -> assertFailure ("stats.json did not decode: " ++ e)
+                    Right val -> do
+                        assertBool "stats missing statement_order" ("\"complement-first\"" `BSC.isInfixOf` statsBytes)
+                        assertBool "stats missing literal_batches" ("\"literal_batches\":true" `BSC.isInfixOf` statsBytes)
+                        assertBool "stats missing adaptive_values" ("\"adaptive_values\":true" `BSC.isInfixOf` statsBytes)
+                        let _ = val
+                        pure ()
+                removeFile statsFile
         , testCase "CLI rejects missing input files with exit code 1" $ do
             (code, _, err) <- runOccamCLI ["nonexistent-test-file-never-created.sql", "-c", "exit 0"]
             assertEqual "missing input file must exit 1" (ExitFailure 1) code
@@ -1190,7 +1276,114 @@ sqliteOracleTests =
                     assertBool "table t retained" (BSC.isInfixOf "t" reduced)
                     oReduced <- oracle reduced
                     assertEqual "reduced SQL satisfies oracle" OracleAccepted oReduced
+        , testCase "pooled SQLite handles isolate tables, temp objects, PRAGMAs, and open transactions" $ do
+            -- 1. Mutate main schema + AUTOINCREMENT, PRAGMAs, and leave an open transaction
+            r1 <-
+                executeSqliteCandidate
+                    "PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA user_version = 99; BEGIN; CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v INT); INSERT INTO t(v) VALUES (7);"
+            assertEqual "first script executes" (Right []) r1
+
+            -- 2. Verify PRAGMAs, main tables, and autocommit were cleanly reset
+            r2 <-
+                executeSqliteCandidate
+                    "PRAGMA foreign_keys;"
+            assertEqual "foreign_keys reset to OFF" (Right [[Number 0]]) r2
+            r3 <-
+                executeSqliteCandidate
+                    "PRAGMA user_version;"
+            assertEqual "user_version reset to 0" (Right [[Number 0]]) r3
+            r4 <-
+                executeSqliteCandidate
+                    "SELECT count(*) FROM sqlite_master;"
+            assertEqual "main schema reset to empty" (Right [[Number 0]]) r4
+
+            -- 3. Touch TEMP database, then verify TEMP does not leak to subsequent call
+            r5 <-
+                executeSqliteCandidate
+                    "CREATE TEMP TABLE tmp_leak(x INT); INSERT INTO tmp_leak VALUES (1); SELECT x FROM tmp_leak;"
+            assertEqual "temp table query works" (Right [[Number 1]]) r5
+            r6 <-
+                executeSqliteCandidate
+                    "SELECT x FROM tmp_leak;"
+            assertBool "temp table must not leak to next pooled execution" (isLeft r6)
+
+            -- 4. Mid-script SQL error must leave next execution clean
+            r7 <-
+                executeSqliteCandidate
+                    "CREATE TABLE residual(x INT); SELECT * FROM nonexistent_table;"
+            assertBool "mid-script error rejects" (isLeft r7)
+            r8 <-
+                executeSqliteCandidate
+                    "SELECT * FROM residual;"
+            assertBool "residual table from failed script must not leak" (isLeft r8)
+
+            -- 5. DML connection counters (last_insert_rowid/changes/total_changes) must not leak
+            r9 <-
+                executeSqliteCandidate
+                    "CREATE TABLE t_dml(id INTEGER PRIMARY KEY, v INT); INSERT INTO t_dml(v) VALUES (10), (20);"
+            assertEqual "DML setup executes" (Right []) r9
+            r10 <-
+                executeSqliteCandidate
+                    "SELECT last_insert_rowid(), changes(), total_changes();"
+            assertEqual
+                "connection DML counters remain zero on subsequent execution"
+                (Right [[Number 0, Number 0, Number 0]])
+                r10
+
+            -- 6. Normal views/triggers stay valid, and unpoolable PRAGMAs/ATTACH execute without leaking
+            r11 <-
+                executeSqliteCandidate
+                    "CREATE TABLE tv(x INT); INSERT INTO tv VALUES (1); CREATE VIEW v AS SELECT x FROM tv; SELECT x FROM v;"
+            assertEqual "normal view executes cleanly" (Right [[Number 1]]) r11
+            r12 <-
+                executeSqliteCandidate
+                    "PRAGMA case_sensitive_like = ON; SELECT 'a' LIKE 'A';"
+            assertEqual "non-allowlisted PRAGMA executes cleanly" (Right [[Number 0]]) r12
+            r13 <-
+                executeSqliteCandidate
+                    "SELECT 'a' LIKE 'A';"
+            assertEqual "case_sensitive_like must not leak to next execution" (Right [[Number 1]]) r13
+            r14 <-
+                executeSqliteCandidate
+                    "ATTACH ':memory:' AS aux; CREATE TABLE aux.a(x INT); INSERT INTO aux.a VALUES (5); SELECT x FROM aux.a;"
+            assertEqual "ATTACH executes cleanly without leaking" (Right [[Number 5]]) r14
+        , testCase "pooled SQLite handles remain isolated under concurrent threads" $ do
+            let workers = 8 :: Int
+                rounds = 15 :: Int
+            dones <- forM [0 .. workers - 1] $ \wid -> do
+                done <- newEmptyMVar
+                _ <- forkIO $ do
+                    res <- try @SomeException $ forM_ [0 .. rounds - 1] $ \r -> do
+                        let tag = wid * 100 + r
+                            sql1 =
+                                BSC.pack
+                                    ( "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT); INSERT INTO c(x) VALUES ("
+                                        ++ show tag
+                                        ++ "); SELECT x, last_insert_rowid() FROM c;"
+                                    )
+                        o1 <- executeSqliteCandidate sql1
+                        assertEqual
+                            "concurrent DML query returns expected row and rowid"
+                            (Right [[Number (fromIntegral tag), Number 1]])
+                            o1
+                        o2 <-
+                            executeSqliteCandidate
+                                "SELECT count(*) FROM sqlite_master UNION ALL SELECT total_changes();"
+                        assertEqual
+                            "concurrent fresh query observes clean schema and zero total_changes"
+                            (Right [[Number 0], [Number 0]])
+                            o2
+                    putMVar done res
+                pure done
+            forM_ dones $ \done -> do
+                res <- takeMVar done
+                case res of
+                    Left err -> assertFailure ("concurrent SQLite pool error: " ++ show err)
+                    Right () -> pure ()
         ]
+    where
+        isLeft (Left _) = True
+        isLeft (Right _) = False
 
 -- ----------------------------------------------------------------------------
 -- In-process DuckDB Oracle Tests

@@ -7,6 +7,7 @@ module Occam.Parser.Validate (
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Unsafe qualified as BSU
 import Data.IntMap.Strict qualified as IntMap
 import Occam.Core (Span (..), Statement (..), StatementId (..))
 import Occam.Facts (
@@ -20,30 +21,32 @@ import Occam.Parser.Native (NativeFacts (..), NativeUnit (..))
 import Occam.Parser.Types (ParserError (..), ParserErrorKind (..))
 
 -- | True when the byte offset is zero, end-of-input, or a UTF-8 lead byte.
-isUtf8Boundary :: ByteString -> Int -> Bool
-isUtf8Boundary source offset =
-    offset == 0 || offset == sourceLength || BS.index source offset .&. 0xc0 /= 0x80
-    where
-        sourceLength = BS.length source
+{-# INLINE isUtf8Boundary #-}
+isUtf8Boundary :: ByteString -> Int -> Int -> Bool
+isUtf8Boundary source sourceLength offset =
+    offset == 0 || offset == sourceLength || BSU.unsafeIndex source offset .&. 0xc0 /= 0x80
 
 makeUnits :: ByteString -> [NativeUnit] -> Either ParserError [StatementUnit]
-makeUnits source = go 0 1
+makeUnits source = go 0 1 []
     where
-        sourceLength = BS.length source
+        !sourceLength = BS.length source
 
-        go _ _ [] = Right []
-        go previousEnd index (native : rest)
+        go _ _ acc [] = Right (reverse acc)
+        go previousEnd index acc (native : rest)
             | start < 0 || start >= end || end > sourceLength || start < previousEnd =
                 Left (ParserError ParserInvalidSourceRange "sqlparser returned an invalid source byte range")
-            | not (isUtf8Boundary source start && isUtf8Boundary source end) =
+            | not (isUtf8Boundary source sourceLength start && isUtf8Boundary source sourceLength end) =
                 Left (ParserError ParserInvalidSourceRange "sqlparser returned a source range splitting UTF-8")
             | maybe False (not . all (validEdit start end) . nativeEdits) (nativeFacts native) =
                 Left (ParserError ParserInvalidEditRange "sqlparser returned an invalid edit range")
-            | otherwise = do
-                let statement = Statement (StatementId index) (Span start end) (BS.take (end - start) (BS.drop start source))
+            | otherwise =
+                let !statement =
+                        Statement
+                            (StatementId index)
+                            (Span start end)
+                            (BSU.unsafeTake (end - start) (BSU.unsafeDrop start source))
                     facts = fmap makeFacts (nativeFacts native)
-                units <- go end (index + 1) rest
-                pure (StatementUnit statement facts (nativeParseError native) : units)
+                 in go end (index + 1) (StatementUnit statement facts (nativeParseError native) : acc) rest
             where
                 start = nativeStart native
                 end = nativeEnd native
@@ -51,8 +54,8 @@ makeUnits source = go 0 1
                     parserEditStart edit >= unitStart
                         && parserEditStart edit < parserEditEnd edit
                         && parserEditEnd edit <= unitEnd
-                        && isUtf8Boundary source (parserEditStart edit)
-                        && isUtf8Boundary source (parserEditEnd edit)
+                        && isUtf8Boundary source sourceLength (parserEditStart edit)
+                        && isUtf8Boundary source sourceLength (parserEditEnd edit)
 
         makeFacts native = StatementFacts (nativeSemantics native) (nativeEdits native)
 
@@ -71,11 +74,12 @@ validateColumns source units targets = do
     mapM_ (mapM_ checkSite . targetSites) targets
     pure targets
     where
+        !sourceLength = BS.length source
         statementBounds statement =
             let Span start end = stmtSpan statement in (start, end)
         validSite (unitStart, unitEnd) site =
             siteStart site >= unitStart
                 && siteStart site < siteEnd site
                 && siteEnd site <= unitEnd
-                && isUtf8Boundary source (siteStart site)
-                && isUtf8Boundary source (siteEnd site)
+                && isUtf8Boundary source sourceLength (siteStart site)
+                && isUtf8Boundary source sourceLength (siteEnd site)

@@ -22,7 +22,7 @@ bench:
 	cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 
 microbench:
-	cabal bench --benchmark-options="-p 'parse || dag || surgery || cache' --stdev 20 --timeout 5s"
+	cabal bench --benchmark-option=-p --benchmark-option='$$2 == "parse" || $$2 == "dag" || $$2 == "surgery" || $$2 == "cache"' --benchmark-options="--stdev 20 --timeout 5s"
 
 bench-product:
 	cabal bench --benchmark-options="-p reduction-audit-validation --stdev 20 --timeout 5s"

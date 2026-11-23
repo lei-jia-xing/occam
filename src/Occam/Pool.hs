@@ -30,6 +30,7 @@ import Control.Concurrent (
     killThread,
     modifyMVar,
     modifyMVar_,
+    myThreadId,
     newEmptyMVar,
     newMVar,
     putMVar,
@@ -49,10 +50,13 @@ import Control.Exception (
     mask_,
     onException,
     throwIO,
+    toException,
     try,
+    uninterruptibleMask_,
  )
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
@@ -66,6 +70,7 @@ import Occam.Cache (
     CacheStats,
     LookupResult (..),
     cacheCompleteInflight,
+    cacheInsertDone,
     cacheInstallInflight,
     cacheLookup,
     cacheRemoveInflight,
@@ -117,6 +122,11 @@ type WindowOutcome = (OracleOutcome, Bool)
 data WindowDecision = WindowAccept | WindowReject
     deriving (Eq, Show)
 
+data WorkerEntry = WorkerEntry
+    { entryDone :: !(MVar ())
+    , entryCancel :: !(IO ())
+    }
+
 data OraclePool = OraclePool
     { poolJobsCount :: !Int
     , poolGate :: !(MVar ())
@@ -131,7 +141,7 @@ data OraclePool = OraclePool
     , poolCleanupCounts :: !(IO ())
     , poolReapFailed :: !(IORef Bool)
     , poolReportCountFn :: !(Maybe (ByteString -> Int -> IO ()))
-    , poolRegistry :: !(MVar (Map ThreadId (MVar ())))
+    , poolRegistry :: !(MVar (Map ThreadId WorkerEntry))
     , poolIndexRef :: !(IORef Int)
     , poolAttemptsRef :: !(IORef Int)
     , poolCancelledRef :: !(IORef Int)
@@ -181,8 +191,8 @@ closeOraclePool pool = drain >> checkReapFailure pool
         drain = do
             snapshot <- readMVar (poolRegistry pool)
             unless (Map.null snapshot) $ do
-                mapM_ killThread (Map.keys snapshot)
-                mapM_ readMVar (Map.elems snapshot)
+                mapM_ entryCancel (Map.elems snapshot)
+                mapM_ (readMVar . entryDone) (Map.elems snapshot)
                 mapM_ (deregWorker pool) (Map.keys snapshot)
                 drain
 
@@ -310,9 +320,12 @@ testOrderedTagged :: OraclePool -> [(FamilyTag, ByteString)] -> IO [WindowOutcom
 testOrderedTagged _ [] = pure []
 testOrderedTagged pool candidates =
     bracket_ (takeMVar (poolGate pool)) (putMVar (poolGate pool) ()) $
-        (checkReapFailure pool >> goChunks candidates []) `finally` poolCleanupCounts pool
+        (checkReapFailure pool >> dispatch) `finally` poolCleanupCounts pool
     where
         jobs = poolJobsCount pool
+        dispatch
+            | jobs == 1 = goSerial candidates []
+            | otherwise = goChunks candidates []
         goChunks [] acc = pure (reverse acc)
         goChunks rest acc = do
             let (window, remaining) = splitAt jobs rest
@@ -321,6 +334,100 @@ testOrderedTagged pool candidates =
             case decision of
                 WindowAccept -> pure (reverse acc')
                 WindowReject -> goChunks remaining acc'
+
+        goSerial [] acc = pure (reverse acc)
+        goSerial ((tag, candidate) : rest) acc = do
+            look <- cacheLookup (poolCacheData pool) (poolCacheModeData pool) candidate
+            case look of
+                LookupHit observation -> retireSerial tag candidate observation True rest acc
+                LookupJoin _ -> ioError (userError "OraclePool serial path encountered in-flight join")
+                LookupMiss -> do
+                    profile <- mask $ \restore -> do
+                        reserved <- reservePermit (poolPermitsVar pool)
+                        unless reserved $ throwIO (ExecutionBudgetReached ())
+                        startNs <- case poolMetricsData pool of
+                            Nothing -> pure 0
+                            Just _ -> getMonotonicTimeNSec
+                        tid <- myThreadId
+                        done <- newEmptyMVar
+                        cancelAck <- newEmptyMVar
+                        stateRef <- newIORef (0 :: Int)
+                        let cancelWorker = mask_ $ do
+                                killIt <- atomicModifyIORef' stateRef $ \s ->
+                                    if s == 0 then (2, True) else (s, False)
+                                when killIt $
+                                    killThread tid `finally` putMVar cancelAck ()
+                        modifyMVar_ (poolRegistry pool) (pure . Map.insert tid (WorkerEntry done cancelWorker))
+                            `onException` refundPermit (poolPermitsVar pool)
+                        atomicModifyIORef' (poolLiveRef pool) (\n -> (n + 1, ()))
+                        atomicModifyIORef' (poolAttemptsRef pool) (\n -> (n + 1, ()))
+                        recordPhysicalStart (poolMetricsData pool) tag
+                        outcome <- try (restore (poolExecuteFn pool candidate))
+                        cancelling <- atomicModifyIORef' stateRef (\s -> (1, s == 2))
+                        cancelResult <-
+                            if cancelling
+                                then Just <$> (try (readMVar cancelAck) :: IO (Either SomeException ()))
+                                else pure Nothing
+                        let recordCancelled wall = do
+                                atomicModifyIORef' (poolCancelledRef pool) (\n -> (n + 1, ()))
+                                recordCanceled (poolMetricsData pool) tag wall
+                            recordFailure err = do
+                                case fromException err of
+                                    Just OracleReapFailed -> writeIORef (poolReapFailed pool) True
+                                    Nothing -> pure ()
+                                wall <- case poolMetricsData pool of
+                                    Nothing -> pure 0
+                                    Just _ -> wallSince startNs
+                                case fromException err of
+                                    Just ThreadKilled -> recordCancelled wall
+                                    _ -> recordFailed (poolMetricsData pool) tag wall
+                        settled <-
+                            uninterruptibleMask_ $
+                                ( case outcome of
+                                    Left err -> recordFailure err >> pure (Left err)
+                                    Right details -> case cancelResult of
+                                        Just (Left err) -> recordFailure err >> pure (Left err)
+                                        Just (Right ()) -> do
+                                            wall <- case poolMetricsData pool of
+                                                Nothing -> pure 0
+                                                Just _ -> wallSince startNs
+                                            recordCancelled wall
+                                            pure (Left (toException ThreadKilled))
+                                        Nothing -> do
+                                            poolBillFn pool details
+                                            let observation = detailedObservation details
+                                            when (poolCacheModeData pool == CacheEnabled) $
+                                                for_ (admitObservation observation) (cacheInsertDone (poolCacheData pool) candidate)
+                                            recordPhysicalCompletion (poolMetricsData pool) tag
+                                            recordOracleTiming
+                                                (poolMetricsData pool)
+                                                tag
+                                                (oracleElapsedMicros details)
+                                                (Just (resetElapsedMicros details))
+                                            pure (Right details)
+                                )
+                                    `finally` ( do
+                                                    atomicModifyIORef' (poolLiveRef pool) (\n -> (n - 1, ()))
+                                                    modifyMVar_ (poolRegistry pool) (pure . Map.delete tid)
+                                                    putMVar done ()
+                                              )
+                        either throwIO pure settled
+                    retireSerial tag candidate (detailedObservation profile) False rest acc
+
+        retireSerial tag candidate observation hit rest acc = do
+            let outcome = observationOutcome observation
+                verdict = case outcome of
+                    OracleAccepted -> RetiredAccept
+                    OracleRejected -> RetiredReject
+                    OracleInconclusive -> RetiredInconclusive
+            recordRetired (poolMetricsData pool) tag verdict
+            index <- atomicModifyIORef' (poolIndexRef pool) (\n -> (n + 1, n))
+            poolRetireFn pool index candidate outcome hit
+            let acc' = (outcome, hit) : acc
+            case outcome of
+                OracleAccepted -> pure (reverse acc')
+                OracleInconclusive -> throwIO OracleInconclusiveError
+                OracleRejected -> goSerial rest acc'
 
 testWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO ([WindowOutcome], WindowDecision)
 testWindow pool tagged = mask \restore -> do
@@ -367,7 +474,7 @@ launchTask pool ordinal tag candidate = do
                                         outcome <- try (unmask (runWorker pool tag candidate ordinal startRef))
                                         mask_ $ publishOutcome pool tag candidate ordinal startRef result done outcome
                                 atomicModifyIORef' (poolLiveRef pool) (\n -> (n + 1, ()))
-                                modifyMVar_ (poolRegistry pool) (pure . Map.insert tid done)
+                                modifyMVar_ (poolRegistry pool) (pure . Map.insert tid (WorkerEntry done (killThread tid)))
                                 pure (TaskPending tid result done spent tag startRef)
                         )
                         `onException` ( do
@@ -542,6 +649,8 @@ reservePermit permits = modifyMVar permits reserve
             | otherwise = pure (Just 0, False)
 
 refundPermit :: MVar (Maybe Int) -> IO ()
-refundPermit permits = modifyMVar_ permits \current -> pure $ case current of
-    Nothing -> Nothing
-    Just n -> Just (n + 1)
+refundPermit permits =
+    uninterruptibleMask_ $
+        modifyMVar_ permits \current -> pure $ case current of
+            Nothing -> Nothing
+            Just n -> Just (n + 1)

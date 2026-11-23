@@ -20,15 +20,16 @@ module Occam.Oracle.Sqlite (
     sqlDataToValue,
 ) where
 
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
+import Control.Exception (bracket, mask, onException)
 import Control.Exception.Safe (
     SomeException,
-    bracket,
     displayException,
     fromException,
     throwIO,
     try,
  )
-import Control.Monad (forM)
+import Control.Monad (forM, unless, when)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -42,48 +43,60 @@ import Data.Aeson (
     (.=),
  )
 import Data.Bifunctor (second)
+import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.Char (isSpace, toLower)
+import Data.ByteString.Unsafe qualified as BSU
+import Data.Char (isSpace)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Word (Word8)
 import Database.SQLite3 (
     SQLData (..),
     SQLError (..),
     Statement,
     StepResult (..),
+    close,
     columnCount,
     columnName,
     columns,
     exec,
     finalize,
     interruptibly,
+    open,
     step,
-    withDatabase,
  )
-import Database.SQLite3.Bindings (CDatabase, CError (..), c_sqlite3_prepare_v2)
+import Database.SQLite3.Bindings (
+    CDatabase,
+    CStatement,
+    c_sqlite3_finalize,
+ )
 import Database.SQLite3.Direct qualified as Direct
 import Foreign (
     FunPtr,
     Ptr,
     alloca,
-    freeHaskellFunPtr,
-    minusPtr,
+    castPtr,
+    free,
+    malloc,
     nullFunPtr,
     nullPtr,
     peek,
     plusPtr,
+    poke,
  )
 import Foreign.C.String (CString)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CInt (..), CSize (..))
 import GHC.Float (castDoubleToWord64)
 import Occam.Core (Oracle, ResultStatement (..))
 import Occam.Oracle (OracleObservation (..), observationOutcome)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Exit (ExitCode (..))
+import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
 
 data SqliteContract = SqliteContract
@@ -192,56 +205,162 @@ executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteE
 executeSqliteCandidateDetailedTimeout micros sql =
     fmap (maybe [] (resultRows . fst)) <$> executeSqliteResult micros sql
 
-executeSqliteResult ::
-    Int -> ByteString -> IO (Either SqliteError (Maybe (ResultSet, ResultStatement)))
-executeSqliteResult micros sql
-    | BS.elem 0 sql = pure (Left (SqliteExecutionError "SQL contains a NUL byte"))
-    | Left err <- TE.decodeUtf8' sql = pure (Left (SqliteInfrastructureError (T.pack (show err))))
-    | otherwise = do
-        res <- try $
-            withDatabase ":memory:" $ \db ->
-                timeout micros $
-                    interruptibly db $ do
-                        -- Keep the engine baseline aligned with SQLite parser session defaults.
-                        exec db "PRAGMA foreign_keys = OFF;"
-                        withLocalStatements db $ BS.useAsCStringLen sql $ \(start, size) ->
-                            runStatements db (start `plusPtr` size) start 0 Nothing
-        pure $ case res of
-            Left err -> Left (classifySqliteException err)
-            Right Nothing -> Left SqliteTimeout
-            Right (Just result) -> Right result
+data SqliteConn = SqliteConn
+    { scDb :: !Direct.Database
+    , scTemplate :: !Direct.Database
+    , scDirtyPtr :: !(Ptr CInt)
+    , scDmlTainted :: !(IORef Bool)
+    }
+
+dirtyTemp, dirtyDml, dirtyConnCounter :: CInt
+dirtyTemp = 4
+dirtyDml = 8
+dirtyConnCounter = 16
+
+maxPooledConns :: Int
+maxPooledConns = 16
+
+{-# NOINLINE sharedSqlitePool #-}
+sharedSqlitePool :: MVar [SqliteConn]
+sharedSqlitePool = unsafePerformIO (newMVar [])
 
 type Authorizer = Ptr () -> CInt -> CString -> CString -> CString -> CString -> IO CInt
 
-foreign import ccall "wrapper" makeAuthorizer :: Authorizer -> IO (FunPtr Authorizer)
+foreign import ccall "&occam_sqlite_authorizer"
+    sharedAuthorizer :: FunPtr Authorizer
 
 foreign import ccall unsafe "sqlite3_set_authorizer"
     setAuthorizer :: Ptr CDatabase -> FunPtr Authorizer -> Ptr () -> IO CInt
 
--- NOTE: A fresh in-memory database still permits ATTACH and some process-wide
--- PRAGMAs. Allow only database-local PRAGMAs here.
-withLocalStatements :: Direct.Database -> IO a -> IO a
-withLocalStatements (Direct.Database db) action =
-    bracket (makeAuthorizer authorize) freeHaskellFunPtr $ \callback ->
-        bracket (install callback) (const (install nullFunPtr)) (const action)
-    where
-        install callback = do
-            status <- setAuthorizer db callback nullPtr
-            if status == 0 then pure () else fail "Could not install SQLite authorizer"
-        authorize _ op arg _ _ _
-            | op == 19 && arg /= nullPtr = do
-                -- SQLITE_PRAGMA
-                pragma <- BSC.map toLower <$> BS.packCString arg
-                pure $
-                    if pragma `elem` ["foreign_keys", "defer_foreign_keys", "recursive_triggers", "user_version"]
-                        then 0
-                        else 1
-            | op `elem` [24, 25, 29] = pure 1 -- ATTACH, DETACH, CREATE VIRTUAL TABLE
-            | otherwise = pure 0
+foreign import ccall safe "occam_sqlite_reset"
+    c_occamSqliteReset :: Ptr CDatabase -> Ptr CDatabase -> Ptr CInt -> IO CInt
+
+foreign import ccall safe "occam_sqlite_next_result"
+    c_occamSqliteNextResult ::
+        Ptr CDatabase ->
+        CString ->
+        CString ->
+        CInt ->
+        Ptr CString ->
+        Ptr (Ptr CStatement) ->
+        Ptr CInt ->
+        IO CInt
+
+openFreshMemoryDb :: IO Direct.Database
+openFreshMemoryDb = open ":memory:"
+
+createSqliteConn :: IO SqliteConn
+createSqliteConn = do
+    db <- openFreshMemoryDb
+    tmpl <- openFreshMemoryDb `onException` close db
+    dirtyPtr <- malloc `onException` (close tmpl >> close db)
+    let cleanup = free dirtyPtr >> close tmpl >> close db
+    poke dirtyPtr 0
+    -- Keep the engine baseline aligned with SQLite parser session defaults.
+    exec db "PRAGMA foreign_keys = OFF;" `onException` cleanup
+    dmlTainted <- newIORef False
+    let Direct.Database dbPtr = db
+    status <- setAuthorizer dbPtr sharedAuthorizer (castPtr dirtyPtr)
+    if status /= 0
+        then cleanup >> fail "Could not install SQLite authorizer"
+        else
+            pure SqliteConn {scDb = db, scTemplate = tmpl, scDirtyPtr = dirtyPtr, scDmlTainted = dmlTainted}
+
+destroySqliteConn :: SqliteConn -> IO ()
+destroySqliteConn SqliteConn {..} = do
+    let Direct.Database dbPtr = scDb
+    _ <- setAuthorizer dbPtr nullFunPtr nullPtr
+    free scDirtyPtr
+    close scTemplate
+    close scDb
+
+resetSqliteConn :: SqliteConn -> IO Bool
+resetSqliteConn SqliteConn {..} = do
+    let Direct.Database dbPtr = scDb
+        Direct.Database tmplPtr = scTemplate
+    (/= 0) <$> c_occamSqliteReset dbPtr tmplPtr scDirtyPtr
+
+acquireSqliteConn :: IO SqliteConn
+acquireSqliteConn = do
+    mConn <- modifyMVar sharedSqlitePool $ \case
+        [] -> pure ([], Nothing)
+        (c : cs) -> pure (cs, Just c)
+    maybe createSqliteConn pure mConn
+
+releaseSqliteConn :: Bool -> SqliteConn -> IO ()
+releaseSqliteConn False conn = destroySqliteConn conn
+releaseSqliteConn True conn = do
+    ok <- resetSqliteConn conn
+    if not ok
+        then destroySqliteConn conn
+        else do
+            returned <- modifyMVar sharedSqlitePool $ \conns ->
+                if length conns < maxPooledConns
+                    then pure (conn : conns, True)
+                    else pure (conns, False)
+            unless returned (destroySqliteConn conn)
+
+withPooledSqliteConn :: (SqliteConn -> IO (Bool, a)) -> IO a
+withPooledSqliteConn action = mask $ \restore -> do
+    conn <- acquireSqliteConn
+    (keep, val) <- restore (action conn) `onException` destroySqliteConn conn
+    releaseSqliteConn keep conn
+    pure val
+
+runCandidateOnConn ::
+    Int ->
+    ByteString ->
+    SqliteConn ->
+    IO (Bool, Bool, Either SqliteError (Maybe (ResultSet, ResultStatement)))
+runCandidateOnConn micros sql conn = do
+    poke (scDirtyPtr conn) 0
+    tainted <- readIORef (scDmlTainted conn)
+    let db = scDb conn
+    res <- try $
+        timeout micros $
+            interruptibly db $
+                BS.useAsCStringLen sql $ \(start, size) ->
+                    runStatements db (start `plusPtr` size) start 0 Nothing
+    dirty <- peek (scDirtyPtr conn)
+    when ((dirty .&. dirtyDml) /= 0) $
+        writeIORef (scDmlTainted conn) True
+    let poolable = (dirty .&. dirtyTemp) == 0
+        counterPolluted = tainted && (dirty .&. dirtyConnCounter) /= 0
+    case res of
+        Left err ->
+            case classifySqliteException err of
+                e@(SqliteExecutionError _) -> pure (poolable, counterPolluted, Left e)
+                e -> pure (False, False, Left e)
+        Right Nothing -> pure (False, False, Left SqliteTimeout)
+        Right (Just result) -> pure (poolable, counterPolluted, Right result)
+
+foreign import ccall unsafe "occam_sqlite_check_sql"
+    c_checkSql :: Ptr Word8 -> CSize -> IO CInt
+
+executeSqliteResult ::
+    Int -> ByteString -> IO (Either SqliteError (Maybe (ResultSet, ResultStatement)))
+executeSqliteResult micros sql = do
+    checkStatus <- BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
+        c_checkSql (castPtr ptr) (fromIntegral len)
+    case checkStatus of
+        1 -> pure (Left (SqliteExecutionError "SQL contains a NUL byte"))
+        2 ->
+            pure $ case TE.decodeUtf8' sql of
+                Left err -> Left (SqliteInfrastructureError (T.pack (show err)))
+                Right _ -> Left (SqliteInfrastructureError "Invalid UTF-8")
+        _ -> do
+            (retryFresh, outcome) <- withPooledSqliteConn $ \conn -> do
+                (poolable, counterPolluted, outcome) <- runCandidateOnConn micros sql conn
+                pure (poolable, (counterPolluted, outcome))
+            if retryFresh
+                then bracket createSqliteConn destroySqliteConn $ \freshConn -> do
+                    (_, _, outcomeFresh) <- runCandidateOnConn micros sql freshConn
+                    pure outcomeFresh
+                else pure outcome
 
 -- SQLite supplies the unconsumed tail, including for trigger bodies and
--- multiple statements on one line. Every prepared handle is finalized before
--- the next statement starts.
+-- multiple statements on one line. Zero-column statements run in C before
+-- returning each result-bearing statement to Haskell.
 runStatements ::
     Direct.Database ->
     CString ->
@@ -249,34 +368,53 @@ runStatements ::
     Int ->
     Maybe (ResultSet, Int) ->
     IO (Maybe (ResultSet, ResultStatement))
-runStatements db@(Direct.Database handle) end start ordinal previous
-    | start == end = pure (fmap (second (ResultStatement ordinal)) previous)
-    | otherwise = do
-        (next, nextOrdinal, result) <- bracket prepare release $ \(tailPtr, statement) -> do
-            (nextIndex, observed) <- case statement of
-                Nothing -> pure (ordinal, previous)
-                Just stmt -> do
-                    count <- columnCount stmt
-                    names <- forM [0 .. count - 1] $ \i -> do
-                        name <- columnName stmt i
-                        maybe (fail "SQLite omitted a result column name") pure name
-                    rows <- stepAll stmt
-                    pure (ordinal + 1, if null names then previous else Just (ResultSet names [] rows, ordinal))
-            pure (tailPtr, nextIndex, observed)
-        runStatements db end next nextOrdinal result
-    where
-        prepare = alloca $ \out -> alloca $ \tailOut -> do
-            CError status <- c_sqlite3_prepare_v2 handle start (fromIntegral (end `minusPtr` start)) out tailOut
-            if status /= 0
-                then do
-                    code <- Direct.errcode db
-                    Direct.Utf8 message <- Direct.errmsg db
-                    throwIO (SQLError code (TE.decodeUtf8 message) "prepare")
-                else do
-                    next <- peek tailOut
-                    stmt <- peek out
-                    pure (next, if stmt == nullPtr then Nothing else Just (Direct.Statement stmt))
-        release (_, statement) = mapM_ finalize statement
+runStatements db@(Direct.Database handle) end start0 ordinal0 previous0 =
+    alloca $ \outTail ->
+        alloca $ \outStmt ->
+            alloca $ \outOrdinal ->
+                let go !start !ordinal previous
+                        | start >= end = pure (fmap (second (ResultStatement ordinal)) previous)
+                        | otherwise = do
+                            rc <-
+                                c_occamSqliteNextResult
+                                    handle
+                                    start
+                                    end
+                                    (fromIntegral ordinal)
+                                    outTail
+                                    outStmt
+                                    outOrdinal
+                            tailPtr <- peek outTail
+                            stmtPtr <- peek outStmt
+                            nextOrd <- fromIntegral <$> peek outOrdinal
+                            case rc of
+                                0 -> pure (fmap (second (ResultStatement nextOrd)) previous)
+                                1 -> do
+                                    let stmt = Direct.Statement stmtPtr
+                                    observed <-
+                                        ( do
+                                            count <- columnCount stmt
+                                            names <- forM [0 .. count - 1] $ \i -> do
+                                                name <- columnName stmt i
+                                                maybe (fail "SQLite omitted a result column name") pure name
+                                            rows <- stepAll stmt
+                                            pure (Just (ResultSet names [] rows, nextOrd))
+                                        )
+                                            `onException` c_sqlite3_finalize stmtPtr
+                                    finalize stmt
+                                    go tailPtr (nextOrd + 1) observed
+                                -1 -> do
+                                    code <- Direct.errcode db
+                                    Direct.Utf8 message <- Direct.errmsg db
+                                    throwIO (SQLError code (TE.decodeUtf8 message) "prepare")
+                                _ -> do
+                                    code <- Direct.errcode db
+                                    Direct.Utf8 message <- Direct.errmsg db
+                                    when (stmtPtr /= nullPtr) $ do
+                                        _ <- c_sqlite3_finalize stmtPtr
+                                        pure ()
+                                    throwIO (SQLError code (TE.decodeUtf8 message) "step")
+                 in go start0 ordinal0 previous0
 
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidateTimeout micros sql = do

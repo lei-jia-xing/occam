@@ -75,6 +75,9 @@ import Occam.Dependency.State (
     clearTransactionSession,
     lookupRelation,
     newRelation,
+    rebuildChildRelations,
+    rebuildForeignKeys,
+    rebuildRelationsByLast,
     transactionActive,
     transactionOpener,
  )
@@ -325,26 +328,38 @@ applyOnCommit transactionId session catalog =
 
 restoreCatalog :: StatementId -> Catalog -> Catalog -> Catalog
 restoreCatalog sid snapshot current =
-    Catalog
-        { catalogRelations =
-            restoreRelationMap sid (catalogRelations snapshot) (catalogRelations current)
-        , catalogIndexes =
-            restoreIndexMap sid snapshot current
-        , catalogTriggers =
-            restoreTriggerMap sid snapshot current
-        , catalogSequences =
-            restoreSequenceMap sid (catalogSequences snapshot) (catalogSequences current)
-        , catalogConstraints =
-            restoreConstraintMap sid snapshot current
-        , catalogTypes =
-            restoreDefinitionMap sid (catalogTypes snapshot) (catalogTypes current)
-        , catalogSchemas =
-            restoreDefinitionMap sid (catalogSchemas snapshot) (catalogSchemas current)
-        , catalogNextUnnamedConstraint =
-            max
-                (catalogNextUnnamedConstraint snapshot)
-                (catalogNextUnnamedConstraint current)
-        }
+    let rels = restoreRelationMap sid (catalogRelations snapshot) (catalogRelations current)
+        constraints = restoreConstraintMap sid snapshot current
+        fks
+            | Map.null (catalogForeignKeys snapshot) && Map.null (catalogForeignKeys current) = Map.empty
+            | otherwise = rebuildForeignKeys constraints
+        children
+            | Set.null (catalogChildRelations snapshot) && Set.null (catalogChildRelations current) = Set.empty
+            | otherwise = rebuildChildRelations rels
+        relsByLast
+            | Map.null rels = Map.empty
+            | otherwise = rebuildRelationsByLast rels
+     in Catalog
+            { catalogRelations = rels
+            , catalogRelationsByLast = relsByLast
+            , catalogIndexes =
+                restoreIndexMap sid snapshot current
+            , catalogTriggers =
+                restoreTriggerMap sid snapshot current
+            , catalogSequences =
+                restoreSequenceMap sid (catalogSequences snapshot) (catalogSequences current)
+            , catalogConstraints = constraints
+            , catalogForeignKeys = fks
+            , catalogChildRelations = children
+            , catalogTypes =
+                restoreDefinitionMap sid (catalogTypes snapshot) (catalogTypes current)
+            , catalogSchemas =
+                restoreDefinitionMap sid (catalogSchemas snapshot) (catalogSchemas current)
+            , catalogNextUnnamedConstraint =
+                max
+                    (catalogNextUnnamedConstraint snapshot)
+                    (catalogNextUnnamedConstraint current)
+            }
 
 -- | Policy for rolling back a catalog map to a previous snapshot.
 data RestorePolicy state = RestorePolicy

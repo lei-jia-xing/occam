@@ -93,35 +93,37 @@ coupledWriteColumns session catalog key columns
     | otherwise =
         let written = Set.fromList columns
             relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
+            fks = allForeignKeys catalog
+            fkSets =
+                if null fks
+                    then []
+                    else
+                        [ foreignKeyChildColumns foreignKey
+                            ++ referencedParentColumns session catalog foreignKey
+                        | (_, state, foreignKey) <- fks
+                        , constraintStateTable state == key
+                        , key
+                            `elem` resolveRelationKeys
+                                session
+                                catalog
+                                (foreignKeyParent foreignKey)
+                        ]
+                            ++ [ referencedParentColumns session catalog foreignKey
+                               | (_, state, foreignKey) <- fks
+                               , constraintStateTable state /= key
+                               , key
+                                    `elem` resolveRelationKeys
+                                        session
+                                        catalog
+                                        (foreignKeyParent foreignKey)
+                               ]
             localSets =
                 [ constraintColumnsOf (constraintValue state)
                 | constraintKey <- Set.toList (relConstraints relation)
                 , Just state <- [Map.lookup constraintKey (catalogConstraints catalog)]
                 ]
-                    ++ [ -- A self-referential foreign key links its child and
-                       -- parent columns inside the same relation, so they must
-                       -- expand together instead of as disjoint candidates.
-                       foreignKeyChildColumns foreignKey
-                        ++ referencedParentColumns session catalog foreignKey
-                       | (_, state, foreignKey) <- allForeignKeys catalog
-                       , constraintStateTable state == key
-                       , key
-                            `elem` resolveRelationKeys
-                                session
-                                catalog
-                                (foreignKeyParent foreignKey)
-                       ]
-            parentSets =
-                [ referencedParentColumns session catalog foreignKey
-                | (_, state, foreignKey) <- allForeignKeys catalog
-                , constraintStateTable state /= key
-                , key
-                    `elem` resolveRelationKeys
-                        session
-                        catalog
-                        (foreignKeyParent foreignKey)
-                ]
-            candidates = map Set.fromList (localSets ++ parentSets)
+                    ++ fkSets
+            candidates = map Set.fromList localSets
             expand current =
                 let next =
                         Set.unions
@@ -199,16 +201,19 @@ inheritChildrenOf session catalog key =
 
 childrenWith ::
     SessionState -> Catalog -> RelationKey -> (RelationState -> Set.Set NameRef) -> [RelationKey]
-childrenWith session catalog key parents =
-    [ childKey
-    | (childKey, relation) <- Map.toList (catalogRelations catalog)
-    , not (Set.null (parents relation))
-    , childKey /= key
-    , key
-        `elem` concatMap
-            (resolveRelationKeys session catalog)
-            (Set.toList (parents relation))
-    ]
+childrenWith session catalog key parents
+    | Set.null (catalogChildRelations catalog) = []
+    | otherwise =
+        [ childKey
+        | childKey <- Set.toList (catalogChildRelations catalog)
+        , childKey /= key
+        , Just relation <- [Map.lookup childKey (catalogRelations catalog)]
+        , not (Set.null (parents relation))
+        , key
+            `elem` concatMap
+                (resolveRelationKeys session catalog)
+                (Set.toList (parents relation))
+        ]
 
 viewSourceRequirements ::
     SessionState ->
@@ -426,8 +431,7 @@ relationAllDeps session catalog key =
 allForeignKeys :: Catalog -> [(ConstraintKey, ConstraintState, ForeignKey)]
 allForeignKeys catalog =
     [ (key, state, foreignKey)
-    | (key, state) <- Map.toList (catalogConstraints catalog)
-    , ForeignKeyConstraint foreignKey <- [constraintValue state]
+    | (key, (state, foreignKey)) <- Map.toList (catalogForeignKeys catalog)
     ]
 
 constraintNameIdent :: Constraint -> Maybe Ident
@@ -462,9 +466,13 @@ installConstraints session sid key constraints catalog =
                         Nothing -> (UnnamedConstraint sid next, next + 1)
                 constraintKey = ConstraintKey key identity
                 state = ConstraintState key (Just sid) resolved Nothing
+                fks' = case resolved of
+                    ForeignKeyConstraint fk -> Map.insert constraintKey (state, fk) (catalogForeignKeys current)
+                    _ -> catalogForeignKeys current
              in ( current
                     { catalogConstraints =
                         Map.insert constraintKey state (catalogConstraints current)
+                    , catalogForeignKeys = fks'
                     , catalogNextUnnamedConstraint = next'
                     }
                 , Set.insert constraintKey keys

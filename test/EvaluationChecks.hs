@@ -255,8 +255,8 @@ tests =
         , testCase "timeouts keep the last accepted checkpoint and make no 1-minimal claim" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
-                oracleCfg = predicateOracle 100000 "exit 0"
-                config = evaluationConfig True (Just 1200000) Nothing
+                oracleCfg = predicateOracle 500000 "exit 0"
+                config = evaluationConfig True (Just 2200000) Nothing
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
                     threadDelay 2500000
@@ -283,8 +283,8 @@ tests =
                 (evaluationMinimalityClaim metrics)
         , testCase "wall-budget cancellation counts an oracle process already started" $ do
             let initial = "SELECT 1;\n"
-                oracleCfg = predicateOracle 100000 "sleep 2"
-                config = evaluationConfig False (Just 300000) Nothing
+                oracleCfg = predicateOracle 2000000 "sleep 2"
+                config = evaluationConfig False (Just 400000) Nothing
                 action _ _ pool = do
                     _ <- poolOracle pool initial
                     pure (ReductionActionResult initial Nothing)

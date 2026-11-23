@@ -331,7 +331,10 @@ runStatementOrderBaseline pairs wallLimit callLimit out =
         wallLimit
         callLimit
         (searchCensoredStatuses wallLimit callLimit)
-        ( serialArm "statement-subset-first" id True
+        ( serialArm
+            "statement-subset-first"
+            (\config -> config {reductionStatementSearch = StatementSubsetFirst})
+            True
         , serialArm
             "statement-complement-first"
             (\config -> config {reductionStatementSearch = StatementComplementFirst})

@@ -24,29 +24,65 @@ impl ByteSpan {
 
 /// Maps 1-based `(line, column)` locations into 0-based UTF-8 byte offsets.
 pub(super) struct SourceMap {
-    lines: Vec<Vec<usize>>,
+    source_len: usize,
+    line_starts: Vec<usize>,
+    non_ascii_lines: Option<Vec<Vec<usize>>>,
 }
 
 impl SourceMap {
     /// Builds a line/column offset index over the provided UTF-8 source string.
     pub(super) fn new(source: &str) -> Self {
-        let mut lines = vec![vec![0]];
-        for (index, ch) in source.char_indices() {
-            let end = index + ch.len_utf8();
-            if ch == '\n' {
-                lines.push(vec![end]);
-            } else {
-                lines.last_mut().unwrap().push(end);
+        if source.is_ascii() {
+            let bytes = source.as_bytes();
+            let mut line_starts = Vec::with_capacity(bytes.len() / 32 + 1);
+            line_starts.push(0);
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte == b'\n' {
+                    line_starts.push(index + 1);
+                }
+            }
+            Self {
+                source_len: bytes.len(),
+                line_starts,
+                non_ascii_lines: None,
+            }
+        } else {
+            let mut lines = Vec::with_capacity(source.len() / 32 + 1);
+            lines.push(vec![0]);
+            for (index, ch) in source.char_indices() {
+                let end = index + ch.len_utf8();
+                if ch == '\n' {
+                    lines.push(vec![end]);
+                } else {
+                    lines.last_mut().unwrap().push(end);
+                }
+            }
+            Self {
+                source_len: source.len(),
+                line_starts: Vec::new(),
+                non_ascii_lines: Some(lines),
             }
         }
-        Self { lines }
     }
 
     /// Converts a 1-based AST location into a 0-based byte offset.
     pub(super) fn offset(&self, location: Location) -> Option<usize> {
         let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
         let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
-        self.lines.get(line)?.get(column).copied()
+        if let Some(lines) = &self.non_ascii_lines {
+            lines.get(line)?.get(column).copied()
+        } else {
+            let start = *self.line_starts.get(line)?;
+            let line_end = match self.line_starts.get(line + 1) {
+                Some(&next_start) => next_start - 1,
+                None => self.source_len,
+            };
+            if column <= line_end - start {
+                Some(start + column)
+            } else {
+                None
+            }
+        }
     }
 
     /// Converts an AST `Span` into a `ByteSpan`.
@@ -143,14 +179,14 @@ pub(super) fn token_positions(
     tokens: &[TokenWithSpan],
     source_map: Option<&SourceMap>,
 ) -> Result<Vec<TokenPosition>, String> {
-    let mut positions: Vec<_> = tokens
-        .iter()
-        .map(|token| TokenPosition::new(token, source_map))
-        .collect::<Result<_, _>>()?;
+    let mut positions = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        positions.push(TokenPosition::new(token, source_map)?);
+    }
     if source_map.is_none() {
         return Ok(positions);
     }
-    let mut openings = Vec::new();
+    let mut openings = Vec::with_capacity(16);
     for index in 0..positions.len() {
         match positions[index].kind {
             TokenKind::LeftParen => openings.push(index),

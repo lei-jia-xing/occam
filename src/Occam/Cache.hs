@@ -8,6 +8,7 @@ module Occam.Cache (
     cacheLookup,
     cacheInstallInflight,
     cacheCompleteInflight,
+    cacheInsertDone,
     cacheRemoveInflight,
     cacheStats,
     LookupResult (..),
@@ -98,6 +99,12 @@ cacheInstallInflight :: Cache -> ByteString -> Int -> IO ()
 cacheInstallInflight cache sql ordinal =
     modifyMVar_ (cacheEntries cache) \entries ->
         pure $! HashMap.insert sql (CacheInflight ordinal) entries
+
+-- | Directly insert a completed observation into the cache (serial path).
+cacheInsertDone :: Cache -> ByteString -> OracleObservation -> IO ()
+cacheInsertDone cache sql res =
+    modifyMVar_ (cacheEntries cache) \entries ->
+        pure $! HashMap.insert sql (CacheDone res) entries
 
 -- | Complete an in-flight entry with an admitted observation or remove it.
 cacheCompleteInflight :: Cache -> ByteString -> Int -> Maybe OracleObservation -> IO ()

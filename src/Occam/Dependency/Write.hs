@@ -488,6 +488,7 @@ processSequenceWrite sid eval write =
 applyForeignKeys :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
 applyForeignKeys sid eval key kind columns
     | not (sessForeignKeyChecks (evalSession eval)) = eval
+    | Map.null (catalogForeignKeys (evalCatalog eval)) = eval
     | otherwise =
         let evalChecks = applyChildChecks eval key kind columns
             evalActions = applyParentActions sid evalChecks key kind columns

@@ -111,7 +111,7 @@
 - [X] [StatementId Set/Map Specialization via `IntSet`/`IntMap`] Integrated `IntMap IntSet` fast-path edges (`graphFastEdges`) into `DependencyGraph`, `Occam.Slicer.backwardSliceFast`/`backwardSliceManyFast`, `Occam.Reducer.isValidClosureFast`, `closeSetFast`, `cutRemovedStatementInts`, `statementIdsInt`, `searchDDMin`, `closureDdmin`, `statementAuditWithLogger`, and `sliceWithAnalysis`, achieving 25%-35% speedups on graph reachability and closure benchmarks, and cutting heap allocations across all corpus benchmarks with zero breaking changes.
 - [X] [Algebraic Graph Formal Alignment Assessment] Evaluated `algebraic-graphs` (Alga). While Alga's algebraic formulation provides a clean mathematical representation, its polymorphic inductive data constructors incur significant pointer indirections and heap allocations during reachability queries. Occam's bitwise `IntMap IntSet` fast-path (`graphFastEdges`) already has an exact 1:1 mathematical correspondence with Lean 4's `edge` relation and transitive closure `Reach` (proved in `proofs/Reachability.lean`), while executing in ~350ns on corpus DAGs with zero heap allocations per traversal. We retain `IntMap IntSet` as the optimal runtime representation.
 
-** TODO [#B] Align harness crash evidence with upstream semantics
+** DONE [#B] Align harness crash evidence with upstream semantics
 - PostgreSQL 13: use the postmaster's abnormal child-exit event, tied to the failing backend and evaluation window. CSV logs provide event context, while the child PID and exit reason are in the event message. SQLSTATE 57P02 corroborates crash shutdown. [[https://github.com/postgres/postgres/blob/REL_13_0/src/backend/postmaster/postmaster.c#L3470][Postmaster source]] [[https://www.postgresql.org/docs/13/runtime-config-logging.html][PG 13 logging]]
 - MySQL 8.0: observe the actual mysqld exit, including under a supervisor, and use version-specific server event codes where available. Client disconnect codes describe transport. [[https://dev.mysql.com/doc/refman/8.0/en/error-log-format.html][Log format]] [[https://dev.mysql.com/doc/refman/8.0/en/gone-away.html][Client errors]]
 - SQLite: observe the isolated engine process's termination status. SQLITE_ABORT describes an interrupted operation. [[https://www.sqlite.org/rescode.html#abort][SQLite result codes]]
@@ -119,7 +119,7 @@
 - ClickHouse: use the server process status and, where available, crash log signal and query ID. SQL Server: correlate the engine error log with a dump or process event; severity 20–25 can terminate a connection. Oracle: correlate the alert log with the ADR incident; ORA-07445 records an OS exception in a database process. [[https://clickhouse.com/blog/trace-similarity-stack-traces][ClickHouse crash logs]] [[https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/database-engine-error-severities][SQL Server severities]] [[https://docs.oracle.com/en/error-help/db/ora-07445/][Oracle ORA-07445]]
 - Spark/Hive: correlate driver/executor or HiveServer2/runtime termination with Spark event logs or Hive operation logs. A task or operation failure alone is insufficient evidence. [[https://spark.apache.org/docs/latest/monitoring.html][Spark monitoring]] [[https://hive.apache.org/docs/latest/user/hiveserver2-clients/][Hive operation logs]]
 - BigQuery, Snowflake, Redshift, Databricks, and Teradata: use documented job/query status and IDs for query failure. Require independent server or provider incident evidence to classify a crash. Generic SQL and ANSI are parser modes. [[https://docs.cloud.google.com/bigquery/docs/troubleshoot-queries][BigQuery]] [[https://docs.snowflake.com/en/sql-reference/account-usage/query_history][Snowflake]] [[https://docs.aws.amazon.com/redshift/latest/dg/SYS_QUERY_HISTORY.html][Redshift]] [[https://docs.databricks.com/aws/en/admin/system-tables/query-history][Databricks]] [[https://docs.teradata.com/api/khub/documents/pVj74T8neTyAD~DafwK0Qg/content][Teradata DBQL]]
-- TODO: Keep text matching scoped to version-specific event formats and explicit fault identity. Distinguish a confirmed fault, a healthy observation with no matching fault, and missing evidence. Check those verdicts with positive and negative event fixtures for the pinned versions.
+- [X] Scoped `harness/crash_oracle.py` evidence extraction to pinned PostgreSQL 13 (postmaster `LogChildExit`, `TRAP: FailedAssertion`, `PANIC`, CSV logs, `SQLSTATE 57P02` corroboration, filtering `LOG: statement:` echoes and normal exit 0) and MySQL 8.0 (`[ERROR] [MY-xxxxxx]`, `mysqld got signal`, assertions, supervisor nonzero exit status, filtering `[Note]`/`Aborted connection` and transport codes 2006/2013). Classified every verdict into `confirmed_fault`, `healthy_no_fault`, and `missing_evidence` with 28 unit tests in `harness/test_crash_oracle.py` & `harness/test_reset_db.py`. (Engines not in `crash_oracle.py` such as ClickHouse/MSSQL/Oracle/Spark/cloud DWs remain out of harness scope.)
 
 ** DONE [#A] Make COUNT recognition respect dialect identifier folding
 - FIX: PostgreSQL fact dumps classify `"COUNT"(1)` and `"PG_CATALOG".count(1)` as fence-free row-count reads. These quoted names are distinct from the lowercase builtin and schema. The shared recognizer now folds identifiers by dialect and disables the shortcut when routine DDL or parse errors are present. Rust fact checks and Haskell slicing cover both the builtin and quoted lookalikes. [[https://www.postgresql.org/docs/13/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS][PostgreSQL identifier rules]]
@@ -173,25 +173,40 @@
 - NOTE: The four-statement nonmonotone fixture exposes a real neighborhood gap. Exhaustively checking its six pairs finds one accepted nonadjacent pair after current ddmin and the one-statement audit stall. Keep pair search experimental research until matched workloads show a quality gain worth the additional calls.
 - NOTE: All 544 completed runs in the uncapped combined syntax, statement order and statement weight reports reused their existing audit evidence with zero shared-audit checks. The two final oracle executions are the agreed validation contract. No further certificate optimization is justified by these runs.
 
-*** TODO [#A] Expose and promote validated search policies in CLI
+*** DONE [#A] Expose and promote validated search policies in CLI
 - Evidence: Statement-level complement-first (`StatementComplementFirst`) cuts 32 calls on 32-row fenced cases; byte-weighting (`StatementByteWeighted`) cuts 69 calls (-8%) on skewed fenced inputs; literal batching and deferred VALUES chunks cut required-values-64 calls from 622 to 510 (-18%) with identical final SQL.
-- [ ] Add CLI flags to expose statement search policy (`--statement-order=subset-first|complement-first|byte-weighted`) on `exe:occam`.
-- [ ] Add CLI flags for intra-statement search refinements (`--literal-batches`, `--adaptive-values` or unified `--syntax-policy`).
-- [ ] Benchmark corpus qualification: evaluate promoting `StatementComplementFirst` / `StatementByteWeighted` to the engine default across non-fenced corpus cases.
+- [X] Added `--statement-order=byte-weighted|complement-first|subset-first` on `exe:occam` (including `--strategy ddmin-only`, shell completions, `--print-defaults`, and `reduction_settings`).
+- [X] Added `--literal-batches`/`--no-literal-batches`, `--ast-batching`/`--no-ast-batching`, and `--adaptive-values`/`--no-adaptive-values` with `--intra-statement` prerequisite validation.
+- [X] Benchmark corpus qualification: evaluated all 9 SQLite corpus cases (both default slicing and `--no-slicing`) plus `--statement-order-baseline` and `--statement-weight-baseline`; promoted `StatementByteWeighted` to the engine default (`defaultReductionConfig`) with equal final bytes across all 9 cases and fewer calls on `02_transaction_savepoint_churn` (36->33; 66->51 no-slicing), `04_multitable_diamond_dag` (40->39; 40->38 no-slicing), and `skewed-fenced-statements-32` (873->804).
 
-*** TODO [#B] Intra-statement independent AST edit batching
-- Evidence: Intra-statement mode currently triggers a physical oracle execution for every single syntax edit (29x wall time, 49x allocations on scale-064). Profiling shows `SYSTEM` and `finally` bracket overhead dominate when thousands of single-edit candidates are evaluated individually.
-- [ ] Model non-interfering AST edit independence: identify disjoint spans with no shared identifier or subquery scope (e.g. column attributes on different tables/columns, independent constant literals, non-overlapping clauses).
-- [ ] Implement multi-edit candidate batching with DDMin-style recursive subdivision on batch rejection.
-- [ ] Verify monotonic shrink and exact byte boundaries across all dialects.
+*** DONE [#B] Intra-statement independent AST edit batching
+- Evidence: Intra-statement mode currently triggers a physical oracle execution for every single syntax edit (29x wall time, 49x allocations on scale-064).
+- [X] Modeled non-interfering AST edit independence (`selectIndependentEdits`, `independentEditBatches`, `applyParserEdits`) enforcing disjoint, non-gluing byte spans and grouping by category/rank (`SafeClauseEdit`, `UnwrapExpressionEdit`, `EditConstraint`, `EditType`, `EditLiteral`).
+- [X] Implemented multi-edit candidate batching (`exhaustIndependentAstBatches`) with DDMin-style recursive halving on batch rejection and incremental single-unit snapshot refresh when intra-statement edits fall inside one unit.
+- [X] Verified monotonic shrink and exact byte boundaries across SQLite, PostgreSQL, MySQL, and DuckDB in `test/ReductionChecks.hs` (kept opt-in via `--ast-batching` because result-oracle runs on tightly coupled expressions incur subdivision misses).
 
-*** TODO [#B] In-process Oracle handle reuse and FFI binary cutover
-- Evidence: GHC profiling (`dist-newstyle/flamegraph/occam.prof`) and Linux `perf record` show:
-  - `Control.Exception.Safe.finally` / bracket teardown consumes ~17% of ticks and 6.08 MB allocations across oracle calls.
-  - SQLite in-process execution consumes ~35% CPU, dominated by `sqlite3RunParser` and per-call heap allocation (`malloc`/`__memmove`).
-  - Aeson JSON decoding still accounts for ~15% ticks and ~5.5 MB allocations.
-- [ ] Connection & prepared statement pooling for in-process SQLite: reuse thread-local `:memory:` or open db handles across candidate validations instead of re-initializing per call.
-- [ ] Complete full migration to binary FFI protocol (`Occam.Parser.Binary` / `rust/sqlparser-ffi/src/binary.rs`), eliminating remaining Aeson JSON decode paths in facts and edits extraction.
+*** DONE [#B] In-process Oracle handle reuse and FFI binary cutover
+- [X] Added thread-safe SQLite `:memory:` handle & static `FunPtr Authorizer` pooling (`sharedSqlitePool`, `sharedAuthorizer`, `sqlite3_backup` reset + dirty-bit tracking for `main`/`pragma`/`temp`) in `eval-lib/Occam/Oracle/Sqlite.hs`, and replaced per-statement `Control.Exception.Safe.bracket` with `Control.Exception.bracket`. Verified full isolation (tables, `TEMP` tables, `PRAGMA`s, open transactions, mid-script errors) in `test/Spec.hs`.
+- [X] Completed full migration to binary FFI protocol `OCCM\x02` (`Occam.Parser.Binary` / `rust/sqlparser-ffi/src/binary.rs`), encoding and decoding all `SemanticFacts` (`CatalogOp`, `SessionEffect`, `TxEffect`, `ScopedBarrier`) in pure binary with zero `serde_json` / `Data.Aeson` decoding in facts and edits extraction.
+
+** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
+*** Stage 1: Local harness & orchestration (no server required)
+- [X] Target DBMS Dockerfiles prepared in `harness/`: `Dockerfile.target-sqlite` (release zip + Fossil snapshot ref, `SQLITE_DEBUG`, optional ASan), `Dockerfile.target-mariadb` (source `Debug`, optional ASan, crash supervisor), `Dockerfile.target-duckdb` (`RelWithDebInfo` + `FORCE_ASSERT=1`, optional ASan), `Dockerfile.target-clickhouse` (pinned official `.deb` packages, optional `-dbg`, crash supervisor), alongside existing `Dockerfile.target-pg` and `Dockerfile.target-mysql`.
+- [ ] Extend `harness/crash_oracle.py` and `harness/reset_db.sh` beyond `postgres`/`mysql`:
+  - `sqlite` and `duckdb` (embedded `occam-exec`: process exit code + stderr assertion/ASan evidence, stateless per-probe execution).
+  - `mariadb` (reuse MySQL protocol/error-log rules) and `clickhouse` (server error log / supervisor exit / exit status).
+  - Add unit tests in `harness/test_crash_oracle.py` and `harness/test_reset_db.py`, and update `harness/README.md`.
+- [ ] Structured crash signature & slippage tracking (RQ3):
+  - Extract normalized crash signatures (signal + top-N stack frames / ASan error kind + location / assertion identity) in `crash_oracle.py` to support deduplication and measure bug slippage across reductions.
+- [ ] Fuzzer integration & horizontal batch runner:
+  - Prepare fuzzer containers/drivers (`SQLancer` and `SQUIRREL`) and a resumable container-per-worker evaluation orchestrator aligned with `--jobs`, 5-replay stability verification, and `stats.json` aggregation.
+- [ ] Workspace hygiene: reconcile uncommitted engine edits and evaluate filing upstream `sqlparser-rs` PRAGMA issue above.
+
+*** Stage 2: Server-backed corpus build, barrier census & thesis evaluation
+- [ ] Build all 6 target images on rented server and verify end-to-end reproduction and reduction on `benchmarks/real_fuzz_corpus/` (including Fossil snapshots for historical SQLite bugs).
+- [ ] Run a 24-48h multi-DBMS fuzzing pilot to measure crash yield, deduplicated signature count, and per-case reduction cost before scaling to the full corpus target.
+- [ ] Evidence-driven semantic barrier census: profile `Opaque` / `GlobalBarrier` hits across real collected crashes and prioritize modeling only barriers that materially block real reductions.
+- [ ] Execute full RQ1-RQ4 thesis experiments (`audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep` x 3 repeats), reporting results stratified by unique crash signature.
 
 * Upstream Gaps (recorded, not scheduled)
 # Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.

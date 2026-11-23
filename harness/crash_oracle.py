@@ -17,19 +17,28 @@ Timeout ownership:
 Crash evidence:
   - A crash is accepted only from the DBMS server log (--log-file or
     --container-name). Client stderr is used only to corroborate connection
-    loss; it is never scanned for crash signatures because psql/mysql echo the
-    failing statement in error messages.
-  - --allow-stderr-only is available for trusted, log-less setups and is
-    explicitly unsafe.
+    loss / transport errors; it is never scanned for crash signatures because
+    psql/mysql echo the failing statement in error messages.
+  - Evidence extraction is scoped to the pinned server event formats:
+      * PostgreSQL 13 (REL_13_0) stderr and CSV logs (postmaster LogChildExit,
+        TRAP: FailedAssertion, PANIC, and SQLSTATE 57P02 corroboration).
+      * MySQL 8.0 (8.0.20) error logs ([ERROR] [MY-xxxxxx], mysqld signal,
+        assertions, and supervisor non-zero mysqld exit status).
+  - Verdict classification distinguishes:
+      * confirmed_fault: server evidence confirms an explicit DBMS fault
+      * healthy_no_fault: server log observed cleanly with no matching fault
+      * missing_evidence: server log unavailable, execution error, or unsafe mode
 
 DBMS supported:
-  - postgres (default)
-  - mysql
+  - postgres (default, pinned to PostgreSQL 13 semantics)
+  - mysql (pinned to MySQL 8.0 semantics)
 """
 
 import argparse
+import csv
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -43,32 +52,66 @@ MAX_TOTAL_LOG_BYTES = 32 * 1024 * 1024
 LOG_WAIT_SECONDS = 2.0
 LOG_POLL_INTERVAL = 0.05
 
-# These phrases are emitted by the client when the server connection drops.
-# They are only used as corroboration, never as proof of a crash.
-CONNECTION_LOST_PHRASES = [
+# Client transport disconnect phrases / error codes. Used only for corroboration,
+# never as standalone proof of a server crash.
+PG_CONNECTION_LOST_PHRASES = [
     "server closed the connection unexpectedly",
     "connection to server was lost",
     "could not receive data from server",
+]
+PG_CRASH_SHUTDOWN_PHRASES = [
+    "57P02",
+    "terminating connection because of crash of another server process",
+]
+MYSQL_CONNECTION_LOST_PHRASES = [
     "Lost connection to MySQL server",
     "MySQL server has gone away",
+    "ERROR 2006",
+    "ERROR 2013",
 ]
 
-# Server-log crash evidence. Deliberately excludes generic client phrases such
-# as "Aborted" (MySQL logs "Aborted connection" for ordinary client drops).
-CRASH_INDICATORS = [
-    r"TRAP:\s*FailedAssertion\([^\n]+\)",
-    r"server process \(PID \d+\) was terminated by signal \d+",
-    r"terminating any other active server processes",
-    r"PANIC:\s+[^\n]+",
-    r"Assertion failure:\s+[^\n]+",
-    r"Assertion `[^`]+' failed",
-    r"\[ERROR\].*Fatal signal \d+",
-    r"\[ERROR\].*Got signal \d+",
-    r"mysqld got signal \d+",
-    r"Segmentation fault",
-    r"Aborted\s*\(core dumped\)",
-    r"AddressSanitizer:\s+[^\n]+",
-]
+# PostgreSQL 13 stderr prefix: "%m [%p] %q%u@%d " -> timestamp [pid] [user@db ]SEVERITY: msg
+PG_STDERR_LINE_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+\S+)?\s+)?"
+    r"(?:\[(?P<pid>\d+)\]\s+)?"
+    r"(?:(?P<context>\S+@\S+)\s+)?"
+    r"(?P<severity>TRAP|PANIC|FATAL|LOG|ERROR|WARNING|NOTICE|INFO|DEBUG\d*|STATEMENT|DETAIL|HINT|CONTEXT|QUERY):\s*"
+    r"(?P<message>.*)$"
+)
+PG_TRAP_RE = re.compile(r"TRAP:\s*FailedAssertion\([^\n]+\)")
+PG_CHILD_SIGNAL_RE = re.compile(
+    r"server process \(PID (\d+)\) was terminated by signal (\d+)"
+)
+PG_CHILD_EXCEPTION_RE = re.compile(
+    r"server process \(PID (\d+)\) was terminated by exception (0x[0-9a-fA-F]+)"
+)
+PG_CHILD_EXIT_NONZERO_RE = re.compile(
+    r"server process \(PID (\d+)\) exited with exit code ([1-9]\d*)"
+)
+PG_CRASH_RECOVERY_RE = re.compile(r"terminating any other active server processes")
+PG_NON_FAULT_LOG_MSG_RE = re.compile(r"^(?:statement|duration|execute\s+\S+|parse\s+\S+):")
+
+# MySQL 8.0 error log format:
+#   2026-11-22T12:00:00.123456Z 0 [ERROR] [MY-013183] [InnoDB] Assertion failure: ...
+MYSQL_80_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+"
+    r"(?P<thread_id>\d+)\s+"
+    r"\[(?P<level>[A-Za-z]+)\]\s*"
+    r"(?:\[(?P<code>MY-\d{6})\]\s*)?"
+    r"(?:\[(?P<subsystem>[^\]]+)\]\s*)?"
+    r"(?P<message>.*)$"
+)
+MYSQL_SUPERVISOR_EXIT_RE = re.compile(
+    r"mysqld(?:-debug)?\s+terminated\s+\(exit status:\s*(\d+)\)"
+)
+MYSQL_SIGNAL_RE = re.compile(
+    r"(?:mysqld got signal (\d+)|(?:Fatal|Got) signal (\d+))"
+)
+MYSQL_ASSERTION_RE = re.compile(
+    r"(?:Assertion failure:\s+[^\n]+|Assertion `[^']+' failed)"
+)
+MYSQL_ABORTED_CONNECTION_RE = re.compile(r"Aborted connection \d+")
+ASAN_RE = re.compile(r"AddressSanitizer:\s+[^\n]+")
 
 
 def env_flag(name):
@@ -201,13 +244,332 @@ def read_container_stdout_logs(container_name, since_iso):
         return ""
 
 
-def find_indicators(text):
-    return [
-        match.group(0)
-        for pattern in CRASH_INDICATORS
-        for match in [re.search(pattern, text, re.IGNORECASE)]
-        if match
-    ]
+PG_CSV_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}")
+
+
+def _parse_pg_csv_row(record_text):
+    """Return (pid, severity, sqlstate, message) if record_text is a PG 13 CSV log row."""
+    if not record_text or "," not in record_text:
+        return None
+    # PG 13 CSV logs have 23 columns (26 in PG 14+); column 3 is process_id,
+    # column 11 is error_severity, column 12 is sql_state_code, column 13 is message.
+    try:
+        row = next(csv.reader(io.StringIO(record_text)))
+    except (csv.Error, StopIteration):
+        return None
+    if len(row) < 14:
+        return None
+    pid_raw = row[3].strip()
+    severity = row[11].strip().upper()
+    sqlstate = row[12].strip().upper()
+    message = row[13]
+    if not pid_raw.isdigit():
+        return None
+    if severity not in {
+        "LOG",
+        "FATAL",
+        "PANIC",
+        "ERROR",
+        "WARNING",
+        "NOTICE",
+        "INFO",
+        "DEBUG1",
+        "DEBUG2",
+        "DEBUG3",
+        "DEBUG4",
+        "DEBUG5",
+        "TRAP",
+    }:
+        return None
+    return int(pid_raw), severity, sqlstate, message
+
+
+def extract_postgres_evidence(server_log_text, stderr_text):
+    """
+    Extract PostgreSQL 13 (REL_13_0) server-side fault events and corroboration.
+    Excludes SQL statement echoes (`LOG: statement:`, `STATEMENT:`, `ERROR:`),
+    tab-indented continuation lines of excluded entries, and multi-line CSV
+    statement fields so user queries cannot spoof server crash signatures.
+    """
+    faults = []
+    candidate_lines = []
+    backend_pids = set()
+    postmaster_child_pids = set()
+    sqlstate_57p02 = any(phrase in stderr_text for phrase in PG_CRASH_SHUTDOWN_PHRASES)
+
+    raw_lines = server_log_text.splitlines()
+    idx = 0
+    in_excluded_entry = False
+
+    while idx < len(raw_lines):
+        raw_line = raw_lines[idx]
+        idx += 1
+        if not raw_line.strip():
+            continue
+
+        # Handle multi-line quoted CSV records (e.g. multi-line SQL in LOG: statement:).
+        csv_buf = raw_line
+        if PG_CSV_START_RE.match(raw_line) and "," in raw_line:
+            while csv_buf.count('"') % 2 == 1 and idx < len(raw_lines):
+                csv_buf += "\n" + raw_lines[idx]
+                idx += 1
+
+        csv_parsed = _parse_pg_csv_row(csv_buf)
+        if csv_parsed is not None:
+            in_excluded_entry = False
+            pid, severity, sqlstate, message = csv_parsed
+            if sqlstate == "57P02":
+                sqlstate_57p02 = True
+            if severity == "LOG" and PG_NON_FAULT_LOG_MSG_RE.match(message):
+                continue
+            if severity in {"ERROR", "WARNING", "NOTICE", "INFO"} or severity.startswith("DEBUG"):
+                continue
+            line_text = f"{severity}: {message}"
+        else:
+            # PostgreSQL elog.c indents continuation lines of a log entry with a tab.
+            if raw_line.startswith("\t"):
+                if in_excluded_entry:
+                    continue
+                candidate_lines.append(raw_line.strip())
+                continue
+
+            line = raw_line.strip()
+            m = PG_STDERR_LINE_RE.match(line)
+            if m:
+                pid = int(m.group("pid")) if m.group("pid") else None
+                severity = m.group("severity")
+                message = m.group("message")
+                if severity == "LOG" and PG_NON_FAULT_LOG_MSG_RE.match(message):
+                    in_excluded_entry = True
+                    continue
+                if severity in {
+                    "STATEMENT",
+                    "DETAIL",
+                    "HINT",
+                    "CONTEXT",
+                    "QUERY",
+                    "ERROR",
+                    "WARNING",
+                    "NOTICE",
+                    "INFO",
+                } or severity.startswith("DEBUG"):
+                    in_excluded_entry = True
+                    continue
+                in_excluded_entry = False
+                if severity == "FATAL" and (
+                    "57P02" in message
+                    or "terminating connection because of crash of another server process"
+                    in message
+                ):
+                    sqlstate_57p02 = True
+                line_text = f"{severity}: {message}"
+            else:
+                in_excluded_entry = False
+                pid = None
+                severity = ""
+                message = line
+                line_text = line
+
+        candidate_lines.append(line_text)
+
+        if PG_TRAP_RE.search(line_text):
+            if pid is not None:
+                backend_pids.add(pid)
+            faults.append(
+                {
+                    "kind": "pg_assertion_trap",
+                    "pid": pid,
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        if severity == "PANIC" or line_text.startswith("PANIC:"):
+            if pid is not None:
+                backend_pids.add(pid)
+            faults.append(
+                {
+                    "kind": "pg_backend_panic",
+                    "pid": pid,
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        m_sig = PG_CHILD_SIGNAL_RE.search(message)
+        if m_sig:
+            child_pid = int(m_sig.group(1))
+            sig = int(m_sig.group(2))
+            postmaster_child_pids.add(child_pid)
+            faults.append(
+                {
+                    "kind": "pg_postmaster_child_signal",
+                    "child_pid": child_pid,
+                    "signal": sig,
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        m_exc = PG_CHILD_EXCEPTION_RE.search(message)
+        if m_exc:
+            child_pid = int(m_exc.group(1))
+            postmaster_child_pids.add(child_pid)
+            faults.append(
+                {
+                    "kind": "pg_postmaster_child_exception",
+                    "child_pid": child_pid,
+                    "exception": m_exc.group(2),
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        m_exit = PG_CHILD_EXIT_NONZERO_RE.search(message)
+        if m_exit:
+            child_pid = int(m_exit.group(1))
+            postmaster_child_pids.add(child_pid)
+            faults.append(
+                {
+                    "kind": "pg_postmaster_child_exit",
+                    "child_pid": child_pid,
+                    "exit_code": int(m_exit.group(2)),
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        if PG_CRASH_RECOVERY_RE.search(message):
+            faults.append(
+                {
+                    "kind": "pg_postmaster_crash_recovery",
+                    "detail": line_text,
+                }
+            )
+            continue
+
+        if ASAN_RE.search(line_text):
+            faults.append(
+                {
+                    "kind": "pg_asan_fault",
+                    "pid": pid,
+                    "detail": line_text,
+                }
+            )
+
+    corroboration = {
+        "sqlstate_57p02": sqlstate_57p02,
+        "connection_lost": any(p in stderr_text for p in PG_CONNECTION_LOST_PHRASES),
+        "backend_pids": sorted(backend_pids),
+        "postmaster_child_pids": sorted(postmaster_child_pids),
+    }
+    return faults, candidate_lines, corroboration
+
+
+def extract_mysql_evidence(server_log_text, stderr_text):
+    """
+    Extract MySQL 8.0 (8.0.20) server error log fault events and supervisor exits.
+    Excludes [Note]/[Warning] lines, Aborted connection warnings, normal exit
+    status 0, and client-only transport errors (2006/2013).
+    """
+    faults = []
+    candidate_lines = []
+    supervisor_exits = []
+
+    for raw_line in server_log_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m_sup = MYSQL_SUPERVISOR_EXIT_RE.search(line)
+        if m_sup:
+            status = int(m_sup.group(1))
+            supervisor_exits.append(status)
+            if status != 0:
+                candidate_lines.append(line)
+                faults.append(
+                    {
+                        "kind": "mysql_supervisor_abnormal_exit",
+                        "exit_status": status,
+                        "detail": line,
+                    }
+                )
+            continue
+
+        m_log = MYSQL_80_LINE_RE.match(line)
+        if m_log:
+            level = m_log.group("level")
+            event_code = m_log.group("code")
+            subsystem = m_log.group("subsystem")
+            message = m_log.group("message")
+            if level in {"Note", "Warning"}:
+                continue
+            if MYSQL_ABORTED_CONNECTION_RE.search(message) or event_code in {
+                "MY-010914",
+                "MY-010926",
+            }:
+                continue
+        else:
+            level = ""
+            event_code = None
+            subsystem = None
+            message = line
+            if MYSQL_ABORTED_CONNECTION_RE.search(line):
+                continue
+
+        candidate_lines.append(line)
+
+        m_sig = MYSQL_SIGNAL_RE.search(line)
+        if m_sig:
+            sig = int(m_sig.group(1) or m_sig.group(2))
+            faults.append(
+                {
+                    "kind": "mysql_server_signal",
+                    "signal": sig,
+                    "event_code": event_code,
+                    "subsystem": subsystem,
+                    "detail": line,
+                }
+            )
+            continue
+
+        if MYSQL_ASSERTION_RE.search(message):
+            faults.append(
+                {
+                    "kind": "mysql_assertion_failure",
+                    "event_code": event_code,
+                    "subsystem": subsystem,
+                    "detail": line,
+                }
+            )
+            continue
+
+        if ASAN_RE.search(line):
+            faults.append(
+                {
+                    "kind": "mysql_asan_fault",
+                    "event_code": event_code,
+                    "detail": line,
+                }
+            )
+            continue
+
+        # In MySQL 8.0, [ERROR] with an explicit [MY-xxxxxx] server error code from
+        # fatal crash reporting (e.g. [MY-013183] InnoDB assertion) is captured above;
+        # ordinary SQL/plugin [ERROR] entries are not crashes without signal/assertion/exit.
+        _ = level
+
+    corroboration = {
+        "connection_lost": any(p in stderr_text for p in MYSQL_CONNECTION_LOST_PHRASES),
+        "supervisor_exit_codes": supervisor_exits,
+    }
+    return faults, candidate_lines, corroboration
+
+
+def extract_dbms_evidence(dbms, server_log_text, stderr_text):
+    if dbms == "mysql":
+        return extract_mysql_evidence(server_log_text, stderr_text)
+    return extract_postgres_evidence(server_log_text, stderr_text)
 
 
 def signature_matches(text, signature):
@@ -374,25 +736,31 @@ def main():
         "workdir": workdir or None,
     }
 
-    def finish(code, verdict, reason, **extra):
+    def finish(code, verdict, classification, reason, **extra):
         payload = dict(base_payload)
-        payload.update({"verdict": verdict, "reason": reason})
+        payload.update(
+            {
+                "verdict": verdict,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
         payload.update(extra)
         emit_decision(decision_log, payload)
         if args.verbose:
             sys.stderr.write(
-                f"[crash_oracle] {verdict.upper()}: {reason}"
+                f"[crash_oracle] {verdict.upper()} [{classification}]: {reason}"
                 + (f" ({extra})" if extra else "")
                 + "\n"
             )
         sys.exit(code)
 
     if not candidate_sql.strip():
-        finish(1, "rejected", "empty-sql")
+        finish(1, "rejected", "healthy_no_fault", "empty-sql")
 
     if args.dbms == "postgres" and not args.allow_psql_meta:
         if has_psql_meta_command(candidate_sql):
-            finish(1, "rejected", "psql-meta-command")
+            finish(1, "rejected", "healthy_no_fault", "psql-meta-command")
 
     # Build client command.
     env = os.environ.copy()
@@ -460,13 +828,14 @@ def main():
                 log_offset = stat.st_size
                 log_inode = stat.st_ino
             except OSError:
-                finish(1, "rejected", "log-stat-failed", log_file=log_file)
+                finish(1, "rejected", "missing_evidence", "log-stat-failed", log_file=log_file)
         elif args.container_name:
             log_mode = "container"
         else:
             finish(
                 1,
                 "rejected",
+                "missing_evidence",
                 "log-unreadable",
                 log_file=log_file,
                 hint="mount the log readably or pass --container-name",
@@ -479,6 +848,7 @@ def main():
         finish(
             1,
             "rejected",
+            "missing_evidence",
             "log-source-required",
             hint="pass --log-file or --container-name (or --allow-stderr-only)",
         )
@@ -490,6 +860,7 @@ def main():
             finish(
                 1,
                 "rejected",
+                "missing_evidence",
                 "container-log-unavailable",
                 container=args.container_name,
                 container_log=internal_log,
@@ -526,52 +897,64 @@ def main():
             process.communicate(timeout=1.0)
         except Exception:
             pass
-        finish(124, "timeout", "client-timeout", timeout=args.timeout)
+        finish(124, "timeout", "missing_evidence", "client-timeout", timeout=args.timeout)
     except FileNotFoundError:
-        finish(1, "rejected", "client-not-found", binary=cmd[0])
+        finish(1, "rejected", "missing_evidence", "client-not-found", binary=cmd[0])
     except OSError as exc:
-        finish(1, "rejected", "execution-error", error=str(exc))
+        finish(1, "rejected", "missing_evidence", "execution-error", error=str(exc))
 
-    connection_lost = any(phrase in stderr_text for phrase in CONNECTION_LOST_PHRASES)
+    conn_phrases = (
+        MYSQL_CONNECTION_LOST_PHRASES if args.dbms == "mysql" else PG_CONNECTION_LOST_PHRASES
+    )
+    connection_lost = any(phrase in stderr_text for phrase in conn_phrases)
     possible_crash = connection_lost or retcode != 0
 
     # Collect only new server-log bytes. Poll briefly when a crash is plausible
     # because logging collectors flush asynchronously.
+    file_log_text = ""
+    stdout_log_text = ""
     server_log_text = ""
     log_read_ok = True
-    container_stdout_read = False
     deadline = time.monotonic() + (LOG_WAIT_SECONDS if possible_crash else 0.0)
 
     def collect_logs():
-        nonlocal log_offset, log_inode, container_stdout_read
+        nonlocal log_offset, log_inode, file_log_text, stdout_log_text
         if log_mode == "file":
-            text, log_offset, log_inode, ok = read_new_log_file(
+            chunk, log_offset, log_inode, ok = read_new_log_file(
                 log_file, log_offset, log_inode
             )
-            return text, ok
+            if chunk:
+                file_log_text = (file_log_text + chunk)[-MAX_TOTAL_LOG_BYTES:]
+            return file_log_text, ok
         if log_mode == "container":
-            text, log_offset, log_inode, ok = read_container_file_log(
+            chunk, log_offset, log_inode, ok = read_container_file_log(
                 args.container_name, internal_log, log_offset, log_inode
             )
-            if not container_stdout_read:
-                text += read_container_stdout_logs(args.container_name, since_iso)
-                container_stdout_read = True
-            return text, ok
+            if chunk:
+                file_log_text = (file_log_text + chunk)[-MAX_TOTAL_LOG_BYTES:]
+            stdout_log_text = read_container_stdout_logs(args.container_name, since_iso)
+            combined = file_log_text
+            if stdout_log_text:
+                combined = (combined + "\n" + stdout_log_text) if combined else stdout_log_text
+            return combined[-MAX_TOTAL_LOG_BYTES:], ok
         return "", True
 
     if log_mode in ("file", "container"):
         while True:
-            chunk, ok = collect_logs()
-            if chunk:
-                server_log_text = (server_log_text + chunk)[-MAX_TOTAL_LOG_BYTES:]
+            server_log_text, ok = collect_logs()
             if not ok:
                 log_read_ok = False
                 break
+            faults, candidate_lines, _ = extract_dbms_evidence(
+                args.dbms, server_log_text, stderr_text
+            )
             if args.expected_signature:
-                matched, _ = signature_matches(server_log_text, args.expected_signature)
-                if matched:
-                    break
-            elif find_indicators(server_log_text):
+                if faults:
+                    scope_text = "\n".join([f["detail"] for f in faults] + candidate_lines)
+                    matched, _ = signature_matches(scope_text, args.expected_signature)
+                    if matched:
+                        break
+            elif faults:
                 break
             if time.monotonic() >= deadline:
                 break
@@ -581,72 +964,99 @@ def main():
             finish(
                 1,
                 "rejected",
+                "missing_evidence",
                 "log-read-failed",
                 log_mode=log_mode,
                 log_file=log_file or internal_log,
             )
 
-    indicators = find_indicators(server_log_text)
-    signature_found = False
-    regex_valid = True
-    if args.expected_signature:
-        signature_found, regex_valid = signature_matches(
-            server_log_text if log_mode != "stderr" else stderr_text,
-            args.expected_signature,
-        )
-
     if log_mode == "stderr":
-        stderr_indicators = find_indicators(stderr_text)
+        stderr_faults, _, _ = extract_dbms_evidence(args.dbms, stderr_text, stderr_text)
         if args.expected_signature:
-            if signature_found:
+            matched, regex_valid = signature_matches(stderr_text, args.expected_signature)
+            if matched:
                 finish(
                     0,
                     "accepted",
+                    "missing_evidence",
                     "stderr-signature-unsafe",
                     regex_valid=regex_valid,
                 )
             finish(
                 1,
                 "rejected",
+                "missing_evidence",
                 "stderr-signature-mismatch",
                 regex_valid=regex_valid,
             )
-        if connection_lost or stderr_indicators:
+        if connection_lost or stderr_faults:
             finish(
                 0,
                 "accepted",
+                "missing_evidence",
                 "stderr-crash-unsafe",
-                indicators=stderr_indicators,
+                fault_events=stderr_faults,
                 connection_lost=connection_lost,
             )
-        finish(1, "rejected", "no-crash", connection_lost=connection_lost)
+        finish(
+            1,
+            "rejected",
+            "missing_evidence",
+            "no-crash",
+            connection_lost=connection_lost,
+        )
+
+    faults, candidate_lines, corroboration = extract_dbms_evidence(
+        args.dbms, server_log_text, stderr_text
+    )
+    indicators = [f["detail"] for f in faults]
+    signature_found = False
+    regex_valid = True
+    if args.expected_signature:
+        # Require at least one explicit server fault event before classifying as
+        # confirmed_fault; when a fault exists, allow matching its detail or
+        # accompanying non-echo server log lines (e.g. crash backtrace frames).
+        if faults:
+            scope_text = "\n".join(indicators + candidate_lines)
+            signature_found, regex_valid = signature_matches(scope_text, args.expected_signature)
+        else:
+            _, regex_valid = signature_matches("", args.expected_signature)
 
     if args.expected_signature:
-        if signature_found:
+        if faults and signature_found:
             finish(
                 0,
                 "accepted",
+                "confirmed_fault",
                 "crash-signature",
                 indicators=indicators,
+                fault_events=faults,
+                corroboration=corroboration,
                 connection_lost=connection_lost,
                 regex_valid=regex_valid,
             )
         finish(
             1,
             "rejected",
-            "signature-mismatch" if indicators else "no-crash",
+            "healthy_no_fault",
+            "signature-mismatch" if faults else "no-crash",
             indicators=indicators,
+            fault_events=faults,
+            corroboration=corroboration,
             connection_lost=connection_lost,
             retcode=retcode,
             regex_valid=regex_valid,
         )
 
-    if indicators:
+    if faults:
         finish(
             0,
             "accepted",
+            "confirmed_fault",
             "crash-indicator",
             indicators=indicators,
+            fault_events=faults,
+            corroboration=corroboration,
             connection_lost=connection_lost,
             retcode=retcode,
         )
@@ -655,6 +1065,7 @@ def main():
         finish(
             0,
             "accepted",
+            "missing_evidence",
             "connection-loss-stderr-unsafe",
             connection_lost=True,
             retcode=retcode,
@@ -663,7 +1074,9 @@ def main():
     finish(
         1,
         "rejected",
+        "healthy_no_fault",
         "no-crash",
+        corroboration=corroboration,
         connection_lost=connection_lost,
         retcode=retcode,
         log_mode=log_mode,

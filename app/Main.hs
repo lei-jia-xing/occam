@@ -71,11 +71,13 @@ import Occam.Reducer (
     ReductionResult (..),
     ReductionStage (..),
     StageEvent (..),
+    StatementSearchPolicy (..),
     columnModeName,
     defaultReductionConfig,
     reduceSQLWithResultSlicing,
     statementAuditWithLogger,
-    statementDdmin,
+    statementDdminWithOrder,
+    statementSearchPolicyName,
  )
 import Occam.UI (
     FinishSummary (..),
@@ -207,6 +209,10 @@ data RawOptions = RawOptions
     , rawSlicing :: !(Specified Bool)
     , rawClosure :: !(Specified Bool)
     , rawIntraStatement :: !(Specified Bool)
+    , rawStatementOrder :: !(Specified StatementSearchPolicy)
+    , rawLiteralBatches :: !(Specified Bool)
+    , rawAstBatching :: !(Specified Bool)
+    , rawAdaptiveValues :: !(Specified Bool)
     , rawColumnMode :: !(Specified ColumnMode)
     , rawUnrestricted :: !(Specified Bool)
     , rawCache :: !(Specified Bool)
@@ -240,6 +246,10 @@ defaultRawOptions =
         , rawSlicing = Default True
         , rawClosure = Default True
         , rawIntraStatement = Default False
+        , rawStatementOrder = Default (reductionStatementSearch defaultReductionConfig)
+        , rawLiteralBatches = Default (reductionLiteralBatches defaultReductionConfig)
+        , rawAstBatching = Default (reductionAstBatching defaultReductionConfig)
+        , rawAdaptiveValues = Default (reductionAdaptiveValues defaultReductionConfig)
         , rawColumnMode = Default ColumnOff
         , rawUnrestricted = Default True
         , rawCache = Default True
@@ -275,6 +285,10 @@ data ValidatedOptions = ValidatedOptions
     , valSlicing :: !Bool
     , valClosure :: !Bool
     , valIntraStatement :: !Bool
+    , valStatementOrder :: !StatementSearchPolicy
+    , valLiteralBatches :: !Bool
+    , valAstBatching :: !Bool
+    , valAdaptiveValues :: !Bool
     , valColumnMode :: !ColumnMode
     , valUnrestricted :: !Bool
     , valCache :: !Bool
@@ -318,6 +332,15 @@ validateCliOptions RawOptions {..} = do
             when (isExplicit rawIntraStatement && getSpecified rawIntraStatement) $
                 Left
                     "--intra-statement conflicts with --strategy ddmin-only (intra-statement rewrites are disabled in ddmin-only mode)"
+            when (isExplicit rawLiteralBatches && getSpecified rawLiteralBatches) $
+                Left
+                    "--literal-batches conflicts with --strategy ddmin-only (intra-statement rewrites are disabled in ddmin-only mode)"
+            when (isExplicit rawAstBatching && getSpecified rawAstBatching) $
+                Left
+                    "--ast-batching conflicts with --strategy ddmin-only (intra-statement rewrites are disabled in ddmin-only mode)"
+            when (isExplicit rawAdaptiveValues && getSpecified rawAdaptiveValues) $
+                Left
+                    "--adaptive-values conflicts with --strategy ddmin-only (intra-statement rewrites are disabled in ddmin-only mode)"
             when (isExplicit rawUnrestricted && getSpecified rawUnrestricted) $
                 Left
                     "--unrestricted conflicts with --strategy ddmin-only (unrestricted fallback is disabled in ddmin-only mode)"
@@ -328,16 +351,33 @@ validateCliOptions RawOptions {..} = do
                 Left "--closure conflicts with --strategy audit-only"
             when (isExplicit rawIntraStatement && getSpecified rawIntraStatement) $
                 Left "--intra-statement conflicts with --strategy audit-only"
+            when (isExplicit rawLiteralBatches && getSpecified rawLiteralBatches) $
+                Left "--literal-batches conflicts with --strategy audit-only"
+            when (isExplicit rawAstBatching && getSpecified rawAstBatching) $
+                Left "--ast-batching conflicts with --strategy audit-only"
+            when (isExplicit rawAdaptiveValues && getSpecified rawAdaptiveValues) $
+                Left "--adaptive-values conflicts with --strategy audit-only"
+            when (isExplicit rawStatementOrder) $
+                Left "--statement-order conflicts with --strategy audit-only"
             when (isExplicit rawUnrestricted && getSpecified rawUnrestricted) $
                 Left "--unrestricted conflicts with --strategy audit-only"
         _ -> pure ()
 
-    -- 3. Column mode prerequisite check
+    -- 3. Intra-statement refinement prerequisites
     let colMode = getSpecified rawColumnMode
         intra = getSpecified rawIntraStatement
+        litBatches = getSpecified rawLiteralBatches
+        astBatches = getSpecified rawAstBatching
+        adaptValues = getSpecified rawAdaptiveValues
     when (colMode /= ColumnOff && not intra) $
         Left
             "--column-mode single|atomic requires --intra-statement to be enabled (add '--intra-statement')"
+    when (isExplicit rawLiteralBatches && litBatches && not intra) $
+        Left "--literal-batches requires --intra-statement to be enabled (add '--intra-statement')"
+    when (isExplicit rawAstBatching && astBatches && not intra) $
+        Left "--ast-batching requires --intra-statement to be enabled (add '--intra-statement')"
+    when (isExplicit rawAdaptiveValues && adaptValues && not intra) $
+        Left "--adaptive-values requires --intra-statement to be enabled (add '--intra-statement')"
 
     -- 4. Numeric bounds
     let maxSeconds = fromIntegral (maxBound :: Int) / 1000000 :: Double
@@ -372,6 +412,9 @@ validateCliOptions RawOptions {..} = do
             StrategyFull -> getSpecified rawIntraStatement
             StrategyDdminOnly -> False
             StrategyAuditOnly -> False
+        effLitBatches = effIntra && litBatches
+        effAstBatches = effIntra && astBatches
+        effAdaptValues = effIntra && adaptValues
         effUnrestricted = case getSpecified rawStrategy of
             StrategyFull -> getSpecified rawUnrestricted
             StrategyDdminOnly -> False
@@ -398,6 +441,10 @@ validateCliOptions RawOptions {..} = do
             , valSlicing = effSlicing
             , valClosure = effClosure
             , valIntraStatement = effIntra
+            , valStatementOrder = getSpecified rawStatementOrder
+            , valLiteralBatches = effLitBatches
+            , valAstBatching = effAstBatches
+            , valAdaptiveValues = effAdaptValues
             , valColumnMode = colMode
             , valUnrestricted = effUnrestricted
             , valCache = getSpecified rawCache
@@ -577,6 +624,22 @@ rawOptionsParser =
             "no-intra-statement"
             "intra-statement reductions"
             (getSpecified (rawIntraStatement defaultRawOptions))
+        <*> statementOrderParser
+        <*> toggleSpecified
+            "literal-batches"
+            "no-literal-batches"
+            "literal edit batching (requires --intra-statement)"
+            (getSpecified (rawLiteralBatches defaultRawOptions))
+        <*> toggleSpecified
+            "ast-batching"
+            "no-ast-batching"
+            "independent AST edit batching (requires --intra-statement)"
+            (getSpecified (rawAstBatching defaultRawOptions))
+        <*> toggleSpecified
+            "adaptive-values"
+            "no-adaptive-values"
+            "deferred fine VALUES chunks (requires --intra-statement)"
+            (getSpecified (rawAdaptiveValues defaultRawOptions))
         <*> columnModeParser
         <*> toggleSpecified
             "unrestricted"
@@ -609,6 +672,17 @@ toggleSpecified enableName disableName description def =
     flag' (Explicit True) (long enableName <> help ("Enable " ++ description))
         <|> flag' (Explicit False) (long disableName <> help ("Disable " ++ description))
         <|> pure (Default def)
+
+statementOrderParser :: Parser (Specified StatementSearchPolicy)
+statementOrderParser =
+    option
+        (Explicit <$> eitherReader parseStatementOrder)
+        ( long "statement-order"
+            <> metavar "ORDER"
+            <> help "Statement ddmin search order: byte-weighted (default), complement-first, or subset-first"
+            <> completeWith ["byte-weighted", "complement-first", "subset-first"]
+        )
+        <|> pure (rawStatementOrder defaultRawOptions)
 
 strategyParser :: Parser (Specified ReductionStrategy)
 strategyParser =
@@ -654,6 +728,13 @@ parseJobs s = case reads s of
         , n <= toInteger (maxBound :: Int) ->
             Right (fromInteger n)
     _ -> Left "Expected a positive --jobs value"
+
+parseStatementOrder :: String -> Either String StatementSearchPolicy
+parseStatementOrder s = case map toLower s of
+    "subset-first" -> Right StatementSubsetFirst
+    "complement-first" -> Right StatementComplementFirst
+    "byte-weighted" -> Right StatementByteWeighted
+    _ -> Left "Expected subset-first, complement-first, or byte-weighted"
 
 parseColumnMode :: String -> Either String ColumnMode
 parseColumnMode s = case map toLower s of
@@ -785,10 +866,14 @@ runAction ActionPrintDefaults = do
                 , "jobs" .= rawJobs opts
                 , "dialect" .= dialectName (rawDialect opts)
                 , "strategy" .= strategyName (getSpecified (rawStrategy opts))
+                , "statement_order" .= statementSearchPolicyName (getSpecified (rawStatementOrder opts))
                 , "column_mode" .= columnModeName (getSpecified (rawColumnMode opts))
                 , "slicing" .= getSpecified (rawSlicing opts)
                 , "closure" .= getSpecified (rawClosure opts)
                 , "intra_statement" .= getSpecified (rawIntraStatement opts)
+                , "literal_batches" .= getSpecified (rawLiteralBatches opts)
+                , "ast_batching" .= getSpecified (rawAstBatching opts)
+                , "adaptive_values" .= getSpecified (rawAdaptiveValues opts)
                 , "unrestricted" .= getSpecified (rawUnrestricted opts)
                 , "cache" .= getSpecified (rawCache opts)
                 , "log_level" .= getSpecified (rawLogLevel opts)
@@ -858,7 +943,11 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             buildReductionConfig
                 valSlicing
                 valClosure
+                valStatementOrder
                 valIntraStatement
+                valLiteralBatches
+                valAstBatching
+                valAdaptiveValues
                 valColumnMode
                 valUnrestricted
                 valDialect
@@ -926,7 +1015,12 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                     reduceSQLWithResultSlicing takeResult reporter reductionConfig reducerLogger pool initialSQL
                 pure (ReductionActionResult sql evidence)
             StrategyDdminOnly -> do
-                sql <- statementDdmin (reductionDialect reductionConfig) pool initialSQL
+                sql <-
+                    statementDdminWithOrder
+                        (reductionStatementSearch reductionConfig)
+                        (reductionDialect reductionConfig)
+                        pool
+                        initialSQL
                 pure (ReductionActionResult sql Nothing)
             StrategyAuditOnly -> do
                 auditStart <- toInteger <$> getMonotonicTimeNSec
@@ -1075,12 +1169,26 @@ loadInitialInput logger dialect inputFile = do
     pure (sql, statements, BS.length sql)
 
 buildReductionConfig ::
-    Bool -> Bool -> Bool -> ColumnMode -> Bool -> SQLDialect -> ReductionConfig
-buildReductionConfig slicing closure intra columnMode unrestricted dialect =
+    Bool ->
+    Bool ->
+    StatementSearchPolicy ->
+    Bool ->
+    Bool ->
+    Bool ->
+    Bool ->
+    ColumnMode ->
+    Bool ->
+    SQLDialect ->
+    ReductionConfig
+buildReductionConfig slicing closure statementOrder intra literalBatches astBatching adaptiveValues columnMode unrestricted dialect =
     defaultReductionConfig
         { reductionSlicing = slicing
         , reductionClosure = closure
+        , reductionStatementSearch = statementOrder
         , reductionIntraStatement = intra
+        , reductionLiteralBatches = literalBatches
+        , reductionAstBatching = astBatching
+        , reductionAdaptiveValues = adaptiveValues
         , reductionColumnMode = columnMode
         , reductionUnrestricted = unrestricted
         , reductionDialect = dialect
@@ -1193,7 +1301,11 @@ reductionSettings cacheEnabled ReductionConfig {..} strategy =
     object
         [ "slicing" .= reductionSlicing
         , "closure" .= reductionClosure
+        , "statement_order" .= statementSearchPolicyName reductionStatementSearch
         , "intra_statement" .= reductionIntraStatement
+        , "literal_batches" .= reductionLiteralBatches
+        , "ast_batching" .= reductionAstBatching
+        , "adaptive_values" .= reductionAdaptiveValues
         , "column_mode" .= columnModeName reductionColumnMode
         , "unrestricted" .= reductionUnrestricted
         , "cache" .= cacheEnabled

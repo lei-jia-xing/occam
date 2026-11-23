@@ -40,6 +40,7 @@ import Occam.Dependency.State (
     TriggerKey (..),
     effectiveNamespacePrefix,
     effectiveSearchPath,
+    nameLast,
     nameSuffix,
  )
 
@@ -95,14 +96,15 @@ instance ScopedKey SequenceKey where
 resolveNamespacedKeys ::
     (Ord k, ScopedKey k) =>
     (Catalog -> Map.Map k v) ->
+    (Catalog -> Name -> [k]) ->
     (SessionState -> NameRef -> k) ->
     SessionState ->
     Catalog ->
     NameRef ->
     [k]
-resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temporary)
+resolveNamespacedKeys entriesOf wildcardOf fallbackKeyOf session catalog (NameRef name temporary)
     | temporary = [temporaryKey]
-    | length (nameParts name) > 1 = [scopedKey False name]
+    | isQualified = [scopedKey False name]
     | Map.member temporaryKey entries = [temporaryKey]
     | not (null prefixKeys) = prefixKeys
     | null (effectiveSearchPath session) =
@@ -117,6 +119,9 @@ resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temp
             Nothing -> [fallbackKey]
     where
         entries = entriesOf catalog
+        isQualified = case nameParts name of
+            (_ : _ : _) -> True
+            _ -> False
         temporaryKey = scopedKey True name
         directKey = scopedKey False name
         fallbackKey = fallbackKeyOf session (NameRef name temporary)
@@ -131,21 +136,41 @@ resolveNamespacedKeys entriesOf fallbackKeyOf session catalog (NameRef name temp
                    ]
                 ++ [directKey]
         firstExisting = find (`Map.member` entries)
-        wildcardMatches =
-            Map.foldrWithKey
-                ( \key _ acc ->
-                    case scopedKeyParts key of
-                        Just (False, stored) | nameSuffix name stored -> key : acc
-                        _ -> acc
-                )
-                []
-                entries
+        wildcardMatches = wildcardOf catalog name
+
+wildcardScan :: (ScopedKey k) => (Catalog -> Map.Map k v) -> Catalog -> Name -> [k]
+wildcardScan entriesOf catalog name
+    | Map.null entries = []
+    | otherwise =
+        Map.foldrWithKey
+            ( \key _ acc ->
+                case scopedKeyParts key of
+                    Just (False, stored) | nameSuffix name stored -> key : acc
+                    _ -> acc
+            )
+            []
+            entries
+    where
+        entries = entriesOf catalog
+
+resolveRelationWildcard :: Catalog -> Name -> [RelationKey]
+resolveRelationWildcard catalog name =
+    case nameLast name of
+        Nothing -> wildcardScan catalogRelations catalog name
+        Just ident ->
+            case Map.lookup ident (catalogRelationsByLast catalog) of
+                Nothing -> []
+                Just keys ->
+                    [ key
+                    | key <- Set.toList keys
+                    , nameSuffix name (relationKeyName key)
+                    ]
 
 resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
-resolveRelationKeys = resolveNamespacedKeys catalogRelations relationFallbackKey
+resolveRelationKeys = resolveNamespacedKeys catalogRelations resolveRelationWildcard relationFallbackKey
 
 resolveSequenceKeys :: SessionState -> Catalog -> NameRef -> [SequenceKey]
-resolveSequenceKeys = resolveNamespacedKeys catalogSequences sequenceFallbackKey
+resolveSequenceKeys = resolveNamespacedKeys catalogSequences (wildcardScan catalogSequences) sequenceFallbackKey
 
 resolveIndexKeys :: SessionState -> Catalog -> IndexRef -> [IndexKey]
 resolveIndexKeys session catalog indexRef =

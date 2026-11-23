@@ -2,6 +2,7 @@
 module Occam.Reducer (
     ReductionConfig (..),
     StatementSearchPolicy (..),
+    statementSearchPolicyName,
     ColumnMode (..),
     columnModeName,
     reductionSearchPolicy,
@@ -17,6 +18,9 @@ module Occam.Reducer (
     statementIds,
     statementIdsInt,
     replaceSpan,
+    applyParserEdits,
+    selectIndependentEdits,
+    independentEditBatches,
     partitionChunks,
     reduceSQL,
     reduceSQLWithLogger,
@@ -31,6 +35,7 @@ module Occam.Reducer (
     StageReporter,
     nullStageReporter,
     statementDdmin,
+    statementDdminWithOrder,
     statementAudit,
     statementAuditWithLogger,
     AuditStats (..),
@@ -133,6 +138,7 @@ reductionSearchPolicy config = syntax <> statement
             | otherwise =
                 syntaxPolicyName (reductionColumnMode config)
                     <> literalBatchPolicy (reductionLiteralBatches config)
+                    <> astBatchPolicy (reductionAstBatching config)
                     <> valuesChunkPolicy (reductionAdaptiveValues config)
                     <> fullReparsePolicy (reductionFullSyntaxReparse config)
         statement = case reductionStatementSearch config of
@@ -143,6 +149,10 @@ reductionSearchPolicy config = syntax <> statement
 literalBatchPolicy :: Bool -> T.Text
 literalBatchPolicy False = ""
 literalBatchPolicy True = "+literal-batches"
+
+astBatchPolicy :: Bool -> T.Text
+astBatchPolicy False = ""
+astBatchPolicy True = "+ast-batches"
 
 valuesChunkPolicy :: Bool -> T.Text
 valuesChunkPolicy False = ""
@@ -158,6 +168,11 @@ data StatementSearchPolicy
     | StatementByteWeighted
     deriving (Eq, Show)
 
+statementSearchPolicyName :: StatementSearchPolicy -> T.Text
+statementSearchPolicyName StatementSubsetFirst = "subset-first"
+statementSearchPolicyName StatementComplementFirst = "complement-first"
+statementSearchPolicyName StatementByteWeighted = "byte-weighted"
+
 -- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
@@ -165,6 +180,7 @@ data ReductionConfig = ReductionConfig
     , reductionStatementSearch :: !StatementSearchPolicy
     , reductionIntraStatement :: !Bool
     , reductionLiteralBatches :: !Bool
+    , reductionAstBatching :: !Bool
     , reductionAdaptiveValues :: !Bool
     , reductionFullSyntaxReparse :: !Bool
     , reductionUnrestricted :: !Bool
@@ -179,9 +195,10 @@ defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
         , reductionClosure = True
-        , reductionStatementSearch = StatementSubsetFirst
+        , reductionStatementSearch = StatementByteWeighted
         , reductionIntraStatement = False
         , reductionLiteralBatches = False
+        , reductionAstBatching = False
         , reductionAdaptiveValues = False
         , reductionFullSyntaxReparse = False
         , reductionUnrestricted = True
@@ -1127,6 +1144,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                                     (const True)
                                     (reductionColumnMode config)
                                     (reductionLiteralBatches config)
+                                    (reductionAstBatching config)
                                     (reductionAdaptiveValues config)
                                     (reductionFullSyntaxReparse config)
                                     base
@@ -1149,6 +1167,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                             (const True)
                             (reductionColumnMode config)
                             (reductionLiteralBatches config)
+                            (reductionAstBatching config)
                             (reductionAdaptiveValues config)
                             (reductionFullSyntaxReparse config)
                             afterAudit
@@ -1192,6 +1211,7 @@ data SyntaxContext = SyntaxContext
     , syntaxShouldRun :: ParserEdit -> Bool
     , syntaxMode :: !ColumnMode
     , syntaxLiteralBatches :: !Bool
+    , syntaxAstBatching :: !Bool
     , syntaxAdaptiveValues :: !Bool
     , syntaxFullReparse :: !Bool
     , syntaxOptions :: !ParseOptions
@@ -1200,6 +1220,7 @@ data SyntaxContext = SyntaxContext
 data SyntaxCandidate
     = SingleCandidate !ParserEdit
     | BundleCandidate !ColumnTarget
+    | BatchCandidate !ParserEditCategory ![ParserEdit]
 
 -- | Clause edit classification in priority order.
 data ClauseEditClass = SafeClauseEdit | StructuralClauseEdit | FragileClauseEdit
@@ -1319,9 +1340,10 @@ reduceSyntaxWithDialect ::
     Bool ->
     Bool ->
     Bool ->
+    Bool ->
     ByteString ->
     IO ByteString
-reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches adaptiveValues fullReparse initialSQL = do
+reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches astBatching adaptiveValues fullReparse initialSQL = do
     let context =
             SyntaxContext
                 { syntaxLogger = logger
@@ -1330,6 +1352,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches adapti
                 , syntaxShouldRun = shouldRun
                 , syntaxMode = mode
                 , syntaxLiteralBatches = literalBatches
+                , syntaxAstBatching = astBatching
                 , syntaxAdaptiveValues = adaptiveValues
                 , syntaxFullReparse = fullReparse
                 , syntaxOptions = options
@@ -1343,6 +1366,7 @@ reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches adapti
             , toJSON
                 ( syntaxPolicyName mode
                     <> literalBatchPolicy literalBatches
+                    <> astBatchPolicy astBatching
                     <> valuesChunkPolicy adaptiveValues
                     <> fullReparsePolicy fullReparse
                 )
@@ -1391,9 +1415,13 @@ sweepSyntaxCategories context stats currentSQL units phases bundles [] shrunk
         restart = runSyntaxFixedPoint context stats
 sweepSyntaxCategories context stats currentSQL currentUnits phases bundles (category : rest) shrunk = do
     (batchSQL, batchUnits, batchPhases, batchBundles) <-
-        if category == EditLiteral && syntaxLiteralBatches context
-            then exhaustLiteralBatches context stats currentSQL currentUnits phases bundles
-            else pure (currentSQL, currentUnits, phases, bundles)
+        if syntaxAstBatching context
+            && category `elem` [EditClause, EditConstraint, EditType, EditExpression, EditLiteral]
+            then exhaustIndependentAstBatches context stats currentSQL currentUnits phases bundles category
+            else
+                if category == EditLiteral && syntaxLiteralBatches context
+                    then exhaustLiteralBatches context stats currentSQL currentUnits phases bundles
+                    else pure (currentSQL, currentUnits, phases, bundles)
     (nextSQL, nextUnits, nextPhases, nextBundles, categoryShrunk) <-
         exhaustSyntaxCategory context stats batchSQL batchUnits batchPhases batchBundles category
     sweepSyntaxCategories
@@ -1510,29 +1538,41 @@ updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
                 currentUnits
     case targetUnit of
         Nothing -> parseSyntaxSnapshot context acceptedBytes
-        Just oldUnit -> do
-            singleResult <- parseSingleUnit context oldUnit edit
-            case singleResult of
-                Nothing -> parseSyntaxSnapshot context acceptedBytes
-                Just (updatedUnit, delta) -> do
-                    let targetId = stmtId (unitStatement oldUnit)
-                        updateUnit u
-                            | stmtId (unitStatement u) == targetId = updatedUnit
-                            | spanStartByte (stmtSpan (unitStatement u)) > spanStartByte (stmtSpan (unitStatement oldUnit)) =
-                                shiftStatementUnit delta u
-                            | otherwise = u
-                        freshUnits = map updateUnit currentUnits
-                        freshEdits =
-                            concatMap
-                                (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
-                                freshUnits
-                        oldEnd = spanEndByte (stmtSpan (unitStatement oldUnit))
-                        freshBundles = map (shiftColumnTarget oldEnd delta) currentBundles
-                    pure
-                        ( freshUnits
-                        , groupSyntaxEdits freshEdits
-                        , freshBundles
-                        )
+        Just oldUnit
+            | hasAffectedBundleSite oldUnit ->
+                parseSyntaxSnapshot context acceptedBytes
+            | otherwise -> do
+                singleResult <- parseSingleUnit context oldUnit edit
+                case singleResult of
+                    Nothing -> parseSyntaxSnapshot context acceptedBytes
+                    Just (updatedUnit, delta) -> do
+                        let targetId = stmtId (unitStatement oldUnit)
+                            updateUnit u
+                                | stmtId (unitStatement u) == targetId = updatedUnit
+                                | delta /= 0
+                                , spanStartByte (stmtSpan (unitStatement u)) > spanStartByte (stmtSpan (unitStatement oldUnit)) =
+                                    shiftStatementUnit delta u
+                                | otherwise = u
+                            freshUnits = map updateUnit currentUnits
+                            freshEdits =
+                                concatMap
+                                    (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
+                                    freshUnits
+                            oldEnd = spanEndByte (stmtSpan (unitStatement oldUnit))
+                            freshBundles
+                                | delta == 0 || null currentBundles = currentBundles
+                                | otherwise = map (shiftColumnTarget oldEnd delta) currentBundles
+                        pure
+                            ( freshUnits
+                            , groupSyntaxEdits freshEdits
+                            , freshBundles
+                            )
+    where
+        hasAffectedBundleSite u =
+            let Span oldStart oldEnd = stmtSpan (unitStatement u)
+             in any
+                    (any (\site -> siteStart site >= oldStart && siteStart site < oldEnd) . targetSites)
+                    currentBundles
 
 -- | Parse a full snapshot into units, ordered edit buckets, and unblocked column bundles.
 parseSyntaxSnapshot ::
@@ -1559,20 +1599,50 @@ parseSyntaxSnapshot context currentSQL = do
 
 groupSyntaxEdits :: [ParserEdit] -> [(ParserEditCategory, [ParserEdit])]
 groupSyntaxEdits edits =
-    let buckets = foldr (\e -> Map.insertWith (++) (parserEditCategory e) [e]) Map.empty edits
-     in [(cat, sortSyntaxEdits cat (Map.findWithDefault [] cat buckets)) | cat <- allEditCategories]
+    let !(cl, li, co, cn, ty, ex, lt) = go edits
+     in [ (EditClause, sortClauses cl)
+        , (EditList, li)
+        , (EditColumn, co)
+        , (EditConstraint, cn)
+        , (EditType, ty)
+        , (EditExpression, sortExpressions ex)
+        , (EditLiteral, lt)
+        ]
+    where
+        go [] = ([], [], [], [], [], [], [])
+        go (e : es) =
+            let !(cl, li, co, cn, ty, ex, lt) = go es
+             in case parserEditCategory e of
+                    EditClause -> (e : cl, li, co, cn, ty, ex, lt)
+                    EditList -> (cl, e : li, co, cn, ty, ex, lt)
+                    EditColumn -> (cl, li, e : co, cn, ty, ex, lt)
+                    EditConstraint -> (cl, li, co, e : cn, ty, ex, lt)
+                    EditType -> (cl, li, co, cn, e : ty, ex, lt)
+                    EditExpression -> (cl, li, co, cn, ty, e : ex, lt)
+                    EditLiteral -> (cl, li, co, cn, ty, ex, e : lt)
 
-sortSyntaxEdits :: ParserEditCategory -> [ParserEdit] -> [ParserEdit]
-sortSyntaxEdits category edits = case category of
-    EditClause ->
-        -- Prioritize high-probability/safe clause edits (ORDER BY, LIMIT, OFFSET, FETCH)
-        -- before structural clauses (GROUP BY, HAVING, WITH), and fragile WHERE last.
-        sortOn clauseEditRank edits
-    EditExpression ->
-        -- Prioritize expression unwrapping (parens, subquery collapse, operand unwrap)
-        -- before destructive constant replacements (0, 1, '0', exists).
-        sortOn expressionEditRank edits
-    _ -> edits
+        sortClauses [] = []
+        sortClauses xs =
+            let !(safe, struct, frag) = partitionClauses xs
+             in safe ++ struct ++ frag
+        partitionClauses [] = ([], [], [])
+        partitionClauses (e : es) =
+            let !(safe, struct, frag) = partitionClauses es
+             in case classifyClauseEdit e of
+                    SafeClauseEdit -> (e : safe, struct, frag)
+                    StructuralClauseEdit -> (safe, e : struct, frag)
+                    FragileClauseEdit -> (safe, struct, e : frag)
+
+        sortExpressions [] = []
+        sortExpressions xs =
+            let !(unwrap, aggr) = partitionExpressions xs
+             in unwrap ++ aggr
+        partitionExpressions [] = ([], [])
+        partitionExpressions (e : es) =
+            let !(unwrap, aggr) = partitionExpressions es
+             in case classifyExpressionEdit e of
+                    UnwrapExpressionEdit -> (e : unwrap, aggr)
+                    AggressiveExpressionEdit -> (unwrap, e : aggr)
 
 {- | Try literal batches before the regular single-edit sweep. A rejection of
 a batch leaves its smaller partitions and the single-edit sweep eligible.
@@ -1665,6 +1735,135 @@ combineLiteralEdits sql first rest =
             ( parserEditEnd edit
             , parserEditReplacement edit : BS.take (parserEditStart edit - previous) (BS.drop previous sql) : acc
             )
+
+-- | Select maximal non-interfering edits with disjoint, non-gluing spans.
+selectIndependentEdits :: [ParserEdit] -> [ParserEdit]
+selectIndependentEdits =
+    sortOn parserEditStart
+        . foldl' pick []
+        . sortOn (\e -> (Down (literalSavings e), parserEditStart e))
+    where
+        pick acc edit
+            | literalSavings edit <= 0 = acc
+            | any (interferes edit) acc = acc
+            | otherwise = edit : acc
+        interferes a b =
+            overlaps a b
+                || (adjacent a b && not (BS.null (parserEditReplacement a) || BS.null (parserEditReplacement b)))
+        overlaps a b = parserEditStart a < parserEditEnd b && parserEditStart b < parserEditEnd a
+        adjacent a b = parserEditEnd a == parserEditStart b || parserEditEnd b == parserEditStart a
+
+-- | Build independent edit batches (>= 2 edits) grouped by semantic rank/category.
+independentEditBatches :: ParserEditCategory -> [ParserEdit] -> [[ParserEdit]]
+independentEditBatches category edits =
+    sortOn (Down . sum . map literalSavings) (filter (\g -> length g >= 2) rawGroups)
+    where
+        rawGroups = case category of
+            EditClause ->
+                partitionMax 16 (selectIndependentEdits [e | e <- edits, clauseEditRank e == safeClauseRank])
+            EditExpression ->
+                partitionMax
+                    16
+                    (selectIndependentEdits [e | e <- edits, expressionEditRank e == unwrappedExpressionRank])
+            EditLiteral ->
+                concatMap (partitionMax 16 . selectIndependentEdits) (groupByReplacement edits)
+            _ ->
+                partitionMax 16 (selectIndependentEdits edits)
+        groupByReplacement [] = []
+        groupByReplacement (first : rest) =
+            let (same, others) = partition ((== parserEditReplacement first) . parserEditReplacement) rest
+             in (first : same) : groupByReplacement others
+        partitionMax _ [] = []
+        partitionMax cap xs =
+            let (chunk, rest) = splitAt cap xs
+             in chunk : partitionMax cap rest
+
+-- | Apply sorted disjoint parser edits to source bytes, enforcing strict byte shrink.
+applyParserEdits :: ByteString -> [ParserEdit] -> Maybe ByteString
+applyParserEdits source edits = case sortOn parserEditStart edits of
+    [] -> Nothing
+    first : rest
+        | not (validEdit first) -> Nothing
+        | otherwise -> go first rest [parserEditReplacement first, BS.take (parserEditStart first) source]
+    where
+        sourceLen = BS.length source
+        validEdit e =
+            let s = parserEditStart e
+                eEnd = parserEditEnd e
+             in s >= 0 && s < eEnd && eEnd <= sourceLen && BS.length (parserEditReplacement e) < eEnd - s
+        go prev [] acc =
+            let candidate = BS.concat (reverse (BS.drop (parserEditEnd prev) source : acc))
+             in if BS.length candidate < sourceLen then Just candidate else Nothing
+        go prev (e : more) acc
+            | not (validEdit e) = Nothing
+            | parserEditStart e < parserEditEnd prev = Nothing
+            | parserEditStart e == parserEditEnd prev
+            , not (BS.null (parserEditReplacement prev))
+            , not (BS.null (parserEditReplacement e)) =
+                Nothing
+            | otherwise =
+                let gap = BS.take (parserEditStart e - parserEditEnd prev) (BS.drop (parserEditEnd prev) source)
+                 in go e more (parserEditReplacement e : gap : acc)
+
+-- | Try independent AST edit batches with DDMin-style recursive subdivision on rejection.
+exhaustIndependentAstBatches ::
+    SyntaxContext ->
+    IORef SyntaxStats ->
+    ByteString ->
+    [StatementUnit] ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    ParserEditCategory ->
+    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+exhaustIndependentAstBatches context stats initSQL initUnits initPhases initBundles category =
+    go initSQL initUnits initPhases initBundles HashSet.empty
+    where
+        go sql units phases bundles seenRejected =
+            let batches = independentEditBatches category (phaseCandidates category phases)
+             in search sql units phases bundles seenRejected (8 :: Int) batches
+
+        search sql units phases bundles _ misses _ | misses <= 0 = pure (sql, units, phases, bundles)
+        search sql units phases bundles _ _ [] = pure (sql, units, phases, bundles)
+        search sql units phases bundles seenRejected misses (batch : rest) =
+            case applyParserEdits sql batch of
+                Nothing -> search sql units phases bundles seenRejected misses rest
+                Just candidateBytes
+                    | BS.length candidateBytes >= BS.length sql
+                        || HashSet.member candidateBytes seenRejected ->
+                        search sql units phases bundles seenRejected misses rest
+                    | otherwise -> do
+                        let candidate = BatchCandidate category batch
+                        (tested, elapsed, accepted) <-
+                            testSyntaxWindow context (length units) [(0, candidate, candidateBytes)]
+                        modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+                        case accepted of
+                            Just (_, _, bytes) -> do
+                                logAcceptedSyntaxEdit context candidate sql bytes
+                                (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
+                                    Just patch -> updateSyntaxSnapshot context units bundles patch bytes
+                                    Nothing -> parseSyntaxSnapshot context bytes
+                                go bytes nextUnits nextPhases nextBundles seenRejected
+                            Nothing ->
+                                let (left, right) = splitAt (length batch `div` 2) batch
+                                    subdivisions = [sub | sub <- [left, right], length sub >= 2]
+                                    seen' = HashSet.insert candidateBytes seenRejected
+                                 in search sql units phases bundles seen' (misses - 1) (subdivisions ++ rest)
+
+        singleUnitPatch sql units batch = case sortOn parserEditStart batch of
+            first : rest@(_ : _) ->
+                let minStart = parserEditStart first
+                    maxEnd = maximum (map parserEditEnd (first : rest))
+                    inSingleUnit =
+                        any
+                            ( \u ->
+                                let Span s e = stmtSpan (unitStatement u)
+                                 in minStart >= s && maxEnd <= e
+                            )
+                            units
+                 in if inSingleUnit
+                        then Just (combineLiteralEdits sql first rest)
+                        else Nothing
+            _ -> Nothing
 
 -- | Exhaustively apply edits of one category until no further reductions succeed.
 exhaustSyntaxCategory ::
@@ -1841,6 +2040,7 @@ timeSyntaxCandidateBuild context currentSQL candidate = case syntaxStore context
         buildCandidate = case candidate of
             SingleCandidate edit -> singleBytes currentSQL edit
             BundleCandidate target -> bundleBytes currentSQL target
+            BatchCandidate _ edits -> applyParserEdits currentSQL edits
 
 logAcceptedSyntaxEdit :: SyntaxContext -> SyntaxCandidate -> ByteString -> ByteString -> IO ()
 logAcceptedSyntaxEdit context (SingleCandidate edit) currentSQL acceptedBytes =
@@ -1869,6 +2069,17 @@ logAcceptedSyntaxEdit context (BundleCandidate target) currentSQL acceptedBytes 
         , ("table", toJSON (nameText (targetTable target)))
         , ("column", toJSON (identText (targetColumn target)))
         , ("sites", toJSON (length (targetSites target)))
+        , ("bytes_before", toJSON (BS.length currentSQL))
+        , ("bytes_after", toJSON (BS.length acceptedBytes))
+        ]
+logAcceptedSyntaxEdit context (BatchCandidate category edits) currentSQL acceptedBytes =
+    logInfo'
+        (syntaxLogger context)
+        "reducer"
+        "Accepted independent AST edit batch"
+        [ ("rewrite_kind", toJSON ("independent-ast-batch" :: T.Text))
+        , ("rewrite_category", toJSON category)
+        , ("edits_count", toJSON (length edits))
         , ("bytes_before", toJSON (BS.length currentSQL))
         , ("bytes_after", toJSON (BS.length acceptedBytes))
         ]
@@ -1911,6 +2122,7 @@ replaceSpan start end replacement source
 candidateTag :: SyntaxCandidate -> FamilyTag
 candidateTag (SingleCandidate edit) = TagSyntax (parserEditCategory edit) (parserEditLabel edit)
 candidateTag (BundleCandidate _) = TagBundle "remove-column-bundle"
+candidateTag (BatchCandidate category _) = TagSyntax category "independent-ast-batch"
 
 singleBytes :: ByteString -> ParserEdit -> Maybe ByteString
 singleBytes currentSQL edit

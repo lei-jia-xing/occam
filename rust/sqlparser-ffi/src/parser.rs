@@ -104,7 +104,7 @@ fn walk_units(
     let rules = IdentifierRules::for_dialect(kind, &config.server);
     let dialect = dialect(kind);
     let mut tokenizer = Tokenizer::new(dialect, source);
-    let mut tokens = Vec::new();
+    let mut tokens = Vec::with_capacity((source.len() / 4).max(16));
     let tokenizer_error = tokenizer.tokenize_with_location_into_buf(&mut tokens).err();
     let source_map = detailed.then(|| SourceMap::new(source));
     let mut positions = token_positions(&tokens, source_map.as_ref())?;
@@ -141,7 +141,11 @@ fn walk_units(
 
     let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     let mut count = 0;
-    let mut pending: Vec<PendingUnit> = Vec::new();
+    let mut pending: Vec<PendingUnit> = if detailed {
+        Vec::with_capacity(16)
+    } else {
+        Vec::new()
+    };
     loop {
         while parser.peek_token_ref().token == Token::SemiColon {
             parser.advance_token();
@@ -269,6 +273,7 @@ fn walk_units(
         let source_map = source_map
             .as_ref()
             .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
+        let mut pos_cursor = 0usize;
         for unit in pending {
             let PendingUnit {
                 start,
@@ -283,8 +288,12 @@ fn walk_units(
                 let statement = statement.as_ref().ok_or_else(|| {
                     "sqlparser returned no statement for error-free unit".to_string()
                 })?;
-                let token_start = positions.partition_point(|token| token.start < start);
-                let token_end = positions.partition_point(|token| token.end <= end);
+                let rel_start =
+                    positions[pos_cursor..].partition_point(|token| token.start < start);
+                let token_start = pos_cursor + rel_start;
+                let rel_end = positions[token_start..].partition_point(|token| token.end <= end);
+                let token_end = token_start + rel_end;
+                pos_cursor = token_end;
                 let facts = analyze_statement(
                     statement,
                     AnalysisContext {

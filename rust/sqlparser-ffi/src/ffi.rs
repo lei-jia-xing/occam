@@ -78,7 +78,7 @@ fn facts_binary(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
         units,
         columns,
     };
-    crate::binary::encode_native_response(&response).ok()
+    Some(crate::binary::encode_native_response(&response))
 }
 
 #[allow(dead_code)]

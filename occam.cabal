@@ -140,6 +140,7 @@ executable occam
                     , direct-sqlite >= 2.3 && < 2.4
                     , safe-exceptions >= 0.1 && < 0.2
     c-sources:        eval-lib/cbits/duckdb_result.c
+                      eval-lib/cbits/sqlite_authorizer.c
     hs-source-dirs:   app eval-lib
 
 test-suite occam-fuzz
@@ -160,6 +161,7 @@ test-suite occam-test
     import:           warnings, language, core-deps, io-deps, rts-threaded
     type:             exitcode-stdio-1.0
     c-sources:        eval-lib/cbits/duckdb_result.c
+                      eval-lib/cbits/sqlite_authorizer.c
     hs-source-dirs:   test eval-lib
     other-modules:    Fuzz
                     , MutationalFuzz
@@ -191,6 +193,7 @@ benchmark occam-bench
     import:           warnings, language, core-deps, io-deps, rts-bench
     type:             exitcode-stdio-1.0
     c-sources:        eval-lib/cbits/duckdb_result.c
+                      eval-lib/cbits/sqlite_authorizer.c
     hs-source-dirs:   bench eval-lib
     other-modules:    Occam.Oracle.Result
                     , Occam.Oracle.Inline
