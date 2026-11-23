@@ -1,0 +1,103 @@
+# Target ClickHouse image installed from ClickHouse's official prebuilt
+# release packages (no multi-hour C++ build required). Installs clickhouse-server,
+# clickhouse-client, and clickhouse-local, with optional debug symbols
+# (INSTALL_DBG=1) for readable crash stack traces.
+#
+# Server layout:
+# - Config overrides: /etc/clickhouse-server/{config.d,users.d}/occam.xml
+# - Data directory:   /var/lib/clickhouse (pristine copy at /var/lib/clickhouse_template)
+# - Logs:             /var/log/clickhouse-server/clickhouse-server{.err}.log
+# - Ports:            9000 (native TCP), 8123 (HTTP)
+FROM ubuntu:24.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    adduser \
+    ca-certificates \
+    curl \
+    gosu \
+    procps \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG CLICKHOUSE_VERSION=26.8.44.3
+ARG CLICKHOUSE_POOL_URL=https://packages.clickhouse.com/deb/pool/main/c/clickhouse
+# Set to 1 to also install clickhouse-common-static-dbg (~1.1 GB) for DWARF frames.
+ARG INSTALL_DBG=0
+# Optional SHA256 checks for the downloaded .deb packages.
+ARG CLICKHOUSE_COMMON_SHA256=""
+ARG CLICKHOUSE_SERVER_SHA256=""
+ARG CLICKHOUSE_CLIENT_SHA256=""
+
+WORKDIR /tmp/ch-debs
+RUN set -eu; \
+    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-common-static_${CLICKHOUSE_VERSION}_amd64.deb" -o common.deb; \
+    if [ -n "${CLICKHOUSE_COMMON_SHA256}" ]; then echo "${CLICKHOUSE_COMMON_SHA256}  common.deb" | sha256sum -c -; fi; \
+    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-server_${CLICKHOUSE_VERSION}_amd64.deb" -o server.deb; \
+    if [ -n "${CLICKHOUSE_SERVER_SHA256}" ]; then echo "${CLICKHOUSE_SERVER_SHA256}  server.deb" | sha256sum -c -; fi; \
+    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-client_${CLICKHOUSE_VERSION}_amd64.deb" -o client.deb; \
+    if [ -n "${CLICKHOUSE_CLIENT_SHA256}" ]; then echo "${CLICKHOUSE_CLIENT_SHA256}  client.deb" | sha256sum -c -; fi; \
+    dpkg -i common.deb server.deb client.deb; \
+    if [ "${INSTALL_DBG}" = "1" ]; then \
+        curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-common-static-dbg_${CLICKHOUSE_VERSION}_amd64.deb" -o common-dbg.deb; \
+        dpkg -i common-dbg.deb; \
+    fi; \
+    rm -rf /tmp/ch-debs
+WORKDIR /
+
+# Configure passwordless default user, readable log permissions (0644),
+# occam_test database initialization, and stderr/error log visibility.
+RUN set -eu; \
+    mkdir -p /etc/clickhouse-server/config.d /etc/clickhouse-server/users.d \
+             /var/lib/clickhouse /var/log/clickhouse-server /var/run/clickhouse-server; \
+    printf '%s\n' \
+        '<clickhouse>' \
+        '    <listen_host>0.0.0.0</listen_host>' \
+        '    <logger>' \
+        '        <level>information</level>' \
+        '        <log>/var/log/clickhouse-server/clickhouse-server.log</log>' \
+        '        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>' \
+        '        <size>1000M</size>' \
+        '        <count>3</count>' \
+        '    </logger>' \
+        '</clickhouse>' > /etc/clickhouse-server/config.d/occam.xml; \
+    printf '%s\n' \
+        '<clickhouse>' \
+        '    <users>' \
+        '        <default>' \
+        '            <password></password>' \
+        '            <access_management>1</access_management>' \
+        '        </default>' \
+        '    </users>' \
+        '</clickhouse>' > /etc/clickhouse-server/users.d/occam.xml; \
+    chown -R clickhouse:clickhouse /var/lib/clickhouse /var/log/clickhouse-server /var/run/clickhouse-server; \
+    gosu clickhouse clickhouse-server --config-file=/etc/clickhouse-server/config.xml --daemon \
+        --pid-file=/var/run/clickhouse-server/clickhouse-server.pid; \
+    for _ in $(seq 1 60); do \
+        if clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then break; fi; \
+        sleep 0.5; \
+    done; \
+    clickhouse-client --query "CREATE DATABASE IF NOT EXISTS occam_test"; \
+    kill "$(cat /var/run/clickhouse-server/clickhouse-server.pid)"; \
+    for _ in $(seq 1 60); do \
+        if [ ! -e /var/run/clickhouse-server/clickhouse-server.pid ]; then break; fi; \
+        sleep 0.2; \
+    done; \
+    rm -f /var/log/clickhouse-server/*; \
+    cp -a /var/lib/clickhouse /var/lib/clickhouse_template
+
+LABEL org.occam.target.dbms="clickhouse" \
+      org.occam.target.kind="server" \
+      org.occam.target.version="${CLICKHOUSE_VERSION}" \
+      org.occam.target.build="official-release" \
+      org.occam.target.dbg="${INSTALL_DBG}"
+
+EXPOSE 9000 8123
+
+COPY harness/entrypoint_target_clickhouse.sh /usr/local/bin/entrypoint_target_clickhouse.sh
+RUN chmod +x /usr/local/bin/entrypoint_target_clickhouse.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_target_clickhouse.sh"]
+CMD ["clickhouse-server"]

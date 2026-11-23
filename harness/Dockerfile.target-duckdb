@@ -1,0 +1,82 @@
+# Target DuckDB image: the duckdb shell built from source as DuckDB's
+# "relassert" configuration (RelWithDebInfo with internal assertions forced on,
+# the same mode DuckDB's own fuzzing CI uses) with optional AddressSanitizer.
+# DuckDB is embedded, so there is no server: every candidate runs in a fresh
+# process on a fresh in-memory database through /usr/local/bin/occam-exec.
+FROM ubuntu:24.04 AS build
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    ninja-build \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG DUCKDB_VERSION=v1.1.3
+# Optional integrity check of the source tarball.
+ARG DUCKDB_SHA256=""
+# none | asan
+ARG SANITIZER=none
+# Parallel compile jobs; empty means all CPUs. DuckDB translation units are
+# large (roughly 2 GB peak each), so lower this on small-memory hosts.
+ARG BUILD_JOBS=""
+
+RUN set -eu; \
+    curl -fSL "https://github.com/duckdb/duckdb/archive/refs/tags/${DUCKDB_VERSION}.tar.gz" -o /tmp/duckdb.tar.gz; \
+    if [ -n "${DUCKDB_SHA256}" ]; then echo "${DUCKDB_SHA256}  /tmp/duckdb.tar.gz" | sha256sum -c -; fi; \
+    mkdir -p /src/duckdb; \
+    tar -xzf /tmp/duckdb.tar.gz -C /src/duckdb --strip-components=1; \
+    rm /tmp/duckdb.tar.gz
+
+# A source tarball has no .git, so the version string is supplied explicitly.
+RUN set -eu; \
+    case "${SANITIZER}" in \
+        none) sanitize="" ;; \
+        asan) sanitize="-fsanitize=address" ;; \
+        *) echo "unsupported SANITIZER=${SANITIZER}" >&2; exit 1 ;; \
+    esac; \
+    cmake -S /src/duckdb -B /src/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DFORCE_ASSERT=1 \
+        -DCMAKE_C_FLAGS="-fno-omit-frame-pointer ${sanitize}" \
+        -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer ${sanitize}" \
+        -DCMAKE_EXE_LINKER_FLAGS="${sanitize}" \
+        -DCMAKE_SHARED_LINKER_FLAGS="${sanitize}" \
+        -DENABLE_SANITIZER=FALSE \
+        -DENABLE_UBSAN=FALSE \
+        -DBUILD_UNITTESTS=FALSE \
+        -DBUILD_SHELL=TRUE \
+        -DOVERRIDE_GIT_DESCRIBE="${DUCKDB_VERSION}-0-g0000000000"; \
+    cmake --build /src/build --target shell --parallel ${BUILD_JOBS:-"$(nproc)"}; \
+    install -m 0755 /src/build/duckdb /usr/local/bin/duckdb; \
+    /usr/local/bin/duckdb -batch :memory: -c 'SELECT version();'
+
+FROM ubuntu:24.04
+
+ARG DUCKDB_VERSION=v1.1.3
+ARG SANITIZER=none
+
+RUN if [ "${SANITIZER}" = "asan" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libasan8 && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+LABEL org.occam.target.dbms="duckdb" \
+      org.occam.target.kind="embedded" \
+      org.occam.target.version="${DUCKDB_VERSION}" \
+      org.occam.target.build="RelWithDebInfo FORCE_ASSERT=1" \
+      org.occam.target.sanitizer="${SANITIZER}"
+
+ENV ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:disable_coredump=1:symbolize=1"
+
+COPY --from=build /usr/local/bin/duckdb /usr/local/bin/duckdb
+COPY harness/target_exec_embedded.sh /usr/local/bin/occam-exec
+COPY harness/target_idle.sh /usr/local/bin/occam-idle
+RUN chmod +x /usr/local/bin/occam-exec /usr/local/bin/occam-idle
+
+ENV OCCAM_TARGET_DBMS=duckdb
+ENTRYPOINT ["/usr/local/bin/occam-idle"]

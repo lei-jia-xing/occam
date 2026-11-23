@@ -1,0 +1,100 @@
+# Target SQLite image: the sqlite3 shell built from source with SQLite's
+# internal assertions (SQLITE_DEBUG) and optional AddressSanitizer.
+#
+# Two source modes are supported:
+# - Default (SQLITE_REF empty): official amalgamation release zip for
+#   SQLITE_VERSION + SQLITE_YEAR (fast, no Tcl required).
+# - Fossil snapshot (SQLITE_REF set, e.g. "trunk:2020-02-10" or "version-3.30.0"):
+#   downloads the Fossil source tarball and generates the amalgamation with tclsh,
+#   needed to reproduce bugs reported against trunk or older patch check-ins.
+#
+# SQLite is embedded, so there is no server: every candidate runs in a fresh
+# process on a fresh in-memory database through /usr/local/bin/occam-exec.
+FROM ubuntu:24.04 AS build
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    tcl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# SQLITE_YEAR is the release-year directory on sqlite.org (3.30.x: 2019, 3.31.x: 2020).
+ARG SQLITE_VERSION=3.31.0
+ARG SQLITE_YEAR=2020
+# Optional Fossil check-in, branch:timestamp, or tag (e.g. trunk:2020-02-10).
+ARG SQLITE_REF=""
+# Optional integrity check of the downloaded archive.
+ARG SQLITE_SHA256=""
+# none | asan
+ARG SANITIZER=none
+
+WORKDIR /src
+RUN set -eu; \
+    mkdir -p amalgamation; \
+    if [ -n "${SQLITE_REF}" ]; then \
+        curl -fSL "https://www.sqlite.org/src/tarball/${SQLITE_REF}/sqlite.tar.gz" -o sqlite.tar.gz; \
+        if [ -n "${SQLITE_SHA256}" ]; then echo "${SQLITE_SHA256}  sqlite.tar.gz" | sha256sum -c -; fi; \
+        mkdir -p fossil; \
+        tar -xzf sqlite.tar.gz -C fossil --strip-components=1; \
+        mkdir -p fossil-build; \
+        env -C fossil-build ../fossil/configure; \
+        make -C fossil-build sqlite3.c; \
+        cp fossil-build/sqlite3.c fossil-build/sqlite3.h fossil-build/shell.c /src/amalgamation/; \
+    else \
+        major="${SQLITE_VERSION%%.*}"; rest="${SQLITE_VERSION#*.}"; \
+        minor="${rest%%.*}"; patch="${rest#*.}"; \
+        number="$(printf '%d%02d%02d00' "$major" "$minor" "$patch")"; \
+        curl -fSL "https://www.sqlite.org/${SQLITE_YEAR}/sqlite-amalgamation-${number}.zip" -o sqlite.zip; \
+        if [ -n "${SQLITE_SHA256}" ]; then echo "${SQLITE_SHA256}  sqlite.zip" | sha256sum -c -; fi; \
+        unzip -q sqlite.zip; \
+        mv "sqlite-amalgamation-${number}"/* amalgamation/; \
+    fi
+
+# -O1 keeps assertion-bearing code close to the corpus builds while leaving
+# usable frames; SQLITE_DEBUG enables assert() and VDBE consistency checks.
+RUN set -eu; \
+    sanitize=(); \
+    case "${SANITIZER}" in \
+        none) ;; \
+        asan) sanitize=(-fsanitize=address -static-libasan) ;; \
+        *) echo "unsupported SANITIZER=${SANITIZER}" >&2; exit 1 ;; \
+    esac; \
+    gcc -O1 -g -fno-omit-frame-pointer "${sanitize[@]}" \
+        -DSQLITE_DEBUG=1 \
+        -DSQLITE_THREADSAFE=0 \
+        -DSQLITE_ENABLE_FTS4 \
+        -DSQLITE_ENABLE_FTS5 \
+        -DSQLITE_ENABLE_RTREE \
+        -DSQLITE_ENABLE_JSON1 \
+        -DSQLITE_ENABLE_DBSTAT_VTAB \
+        -DSQLITE_OMIT_LOAD_EXTENSION \
+        amalgamation/shell.c amalgamation/sqlite3.c -o /usr/local/bin/sqlite3 -lm; \
+    /usr/local/bin/sqlite3 :memory: 'SELECT sqlite_version();'
+
+FROM ubuntu:24.04
+
+ARG SQLITE_VERSION=3.31.0
+ARG SQLITE_REF=""
+ARG SANITIZER=none
+
+LABEL org.occam.target.dbms="sqlite" \
+      org.occam.target.kind="embedded" \
+      org.occam.target.version="${SQLITE_REF:-$SQLITE_VERSION}" \
+      org.occam.target.build="SQLITE_DEBUG -O1 -g" \
+      org.occam.target.sanitizer="${SANITIZER}"
+
+# detect_leaks=0: the shell exits without freeing everything; leaks are not crashes.
+ENV ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:disable_coredump=1:symbolize=1"
+
+COPY --from=build /usr/local/bin/sqlite3 /usr/local/bin/sqlite3
+COPY harness/target_exec_embedded.sh /usr/local/bin/occam-exec
+COPY harness/target_idle.sh /usr/local/bin/occam-idle
+RUN chmod +x /usr/local/bin/occam-exec /usr/local/bin/occam-idle
+
+ENV OCCAM_TARGET_DBMS=sqlite
+ENTRYPOINT ["/usr/local/bin/occam-idle"]

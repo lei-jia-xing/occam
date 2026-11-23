@@ -1,0 +1,129 @@
+# Target MariaDB image built from source as a Debug build (server assertions
+# enabled; DBUG tracing and safemalloc compiled out for speed) with optional
+# AddressSanitizer. The layout mirrors the MySQL target: datadir
+# /var/lib/mysql, error log /var/log/mysql/error.log, TCP port 3306, socket
+# /var/run/mysqld/mysqld.sock, passwordless root, and an `occam_test` database.
+#
+# Ubuntu 20.04 (GCC 9, OpenSSL 1.1) matches the toolchain of the 10.4-10.6 era,
+# where most fuzzer-reported MariaDB crashes live. Ubuntu 20.04 is EOL; this
+# image is for isolated crash reproduction only.
+FROM ubuntu:20.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bison \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    gosu \
+    libaio-dev \
+    libncurses-dev \
+    libpcre2-dev \
+    libssl-dev \
+    ninja-build \
+    perl \
+    pkg-config \
+    procps \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MARIADB_VERSION=10.5.8
+# Optional integrity check of the source tarball.
+ARG MARIADB_SHA256=""
+# none | asan
+ARG SANITIZER=none
+# Parallel compile jobs; empty means all CPUs. Lower it on small-memory hosts.
+ARG BUILD_JOBS=""
+
+# Storage engines that need extra toolchains or downloads (RocksDB, Mroonga,
+# Spider, CONNECT, ColumnStore, OQGraph, S3) and the test suite are disabled to
+# keep the build to the core server; InnoDB, Aria, MyISAM, MEMORY stay.
+RUN set -eu; \
+    curl -fSL "https://archive.mariadb.org/mariadb-${MARIADB_VERSION}/source/mariadb-${MARIADB_VERSION}.tar.gz" \
+        -o /tmp/mariadb.tar.gz; \
+    if [ -n "${MARIADB_SHA256}" ]; then echo "${MARIADB_SHA256}  /tmp/mariadb.tar.gz" | sha256sum -c -; fi; \
+    mkdir -p /tmp/mariadb; \
+    tar -xzf /tmp/mariadb.tar.gz -C /tmp/mariadb --strip-components=1; \
+    rm /tmp/mariadb.tar.gz; \
+    case "${SANITIZER}" in \
+        none) asan=OFF ;; \
+        asan) asan=ON ;; \
+        *) echo "unsupported SANITIZER=${SANITIZER}" >&2; exit 1 ;; \
+    esac; \
+    cmake -S /tmp/mariadb -B /tmp/mariadb-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_INSTALL_PREFIX=/usr/local/mysql \
+        -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" \
+        -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer" \
+        -DWITH_ASAN="${asan}" \
+        -DWITH_DBUG_TRACE=OFF \
+        -DWITH_SAFEMALLOC=OFF \
+        -DWITH_UNIT_TESTS=OFF \
+        -DCONC_WITH_UNIT_TESTS=OFF \
+        -DWITH_EMBEDDED_SERVER=OFF \
+        -DWITH_WSREP=OFF \
+        -DWITH_SSL=system \
+        -DWITH_PCRE=system \
+        -DINSTALL_MYSQLTESTDIR= \
+        -DINSTALL_SQLBENCHDIR= \
+        -DPLUGIN_TOKUDB=NO \
+        -DPLUGIN_ROCKSDB=NO \
+        -DPLUGIN_MROONGA=NO \
+        -DPLUGIN_SPIDER=NO \
+        -DPLUGIN_CONNECT=NO \
+        -DPLUGIN_COLUMNSTORE=NO \
+        -DPLUGIN_OQGRAPH=NO \
+        -DPLUGIN_S3=NO; \
+    cmake --build /tmp/mariadb-build --parallel ${BUILD_JOBS:-"$(nproc)"}; \
+    cmake --install /tmp/mariadb-build; \
+    rm -rf /tmp/mariadb /tmp/mariadb-build
+
+ENV PATH="/usr/local/mysql/bin:/usr/local/mysql/scripts:${PATH}"
+ENV MYSQL_DATADIR="/var/lib/mysql"
+ENV MYSQL_LOGDIR="/var/log/mysql"
+# detect_leaks=0: shutdown-time leaks are not crashes.
+ENV ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:disable_coredump=1:symbolize=1"
+
+RUN groupadd -r mysql && useradd -r -g mysql -d /var/lib/mysql mysql && \
+    mkdir -p "${MYSQL_DATADIR}" "${MYSQL_LOGDIR}" /var/run/mysqld && \
+    chown -R mysql:mysql "${MYSQL_DATADIR}" "${MYSQL_LOGDIR}" /var/run/mysqld && \
+    chmod 777 /var/run/mysqld
+
+# Bootstrap a passwordless root reachable over TCP and the `occam_test` and
+# `template_occam` databases, then archive the pristine datadir as a template.
+RUN set -eu; \
+    mysql_install_db --user=mysql --basedir=/usr/local/mysql --datadir="${MYSQL_DATADIR}" \
+        --auth-root-authentication-method=normal --skip-test-db > /dev/null; \
+    gosu mysql mysqld --datadir="${MYSQL_DATADIR}" --socket=/var/run/mysqld/mysqld.sock \
+        --skip-networking --log-error="${MYSQL_LOGDIR}/bootstrap.log" & \
+    for _ in $(seq 1 120); do \
+        if mysqladmin --socket=/var/run/mysqld/mysqld.sock -u root ping --silent 2>/dev/null; then break; fi; \
+        sleep 0.5; \
+    done; \
+    mysql --socket=/var/run/mysqld/mysqld.sock -u root -e "\
+        CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY ''; \
+        GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION; \
+        CREATE DATABASE IF NOT EXISTS template_occam; \
+        CREATE DATABASE IF NOT EXISTS occam_test; \
+        FLUSH PRIVILEGES;"; \
+    mysqladmin --socket=/var/run/mysqld/mysqld.sock -u root shutdown; \
+    wait; \
+    rm -f "${MYSQL_LOGDIR}/bootstrap.log"; \
+    cp -a "${MYSQL_DATADIR}" /var/lib/mysql_template
+
+LABEL org.occam.target.dbms="mariadb" \
+      org.occam.target.kind="server" \
+      org.occam.target.version="${MARIADB_VERSION}" \
+      org.occam.target.build="CMAKE_BUILD_TYPE=Debug" \
+      org.occam.target.sanitizer="${SANITIZER}"
+
+EXPOSE 3306
+
+COPY harness/entrypoint_target_mariadb.sh /usr/local/bin/entrypoint_target_mariadb.sh
+RUN chmod +x /usr/local/bin/entrypoint_target_mariadb.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_target_mariadb.sh"]
+CMD ["mysqld"]
