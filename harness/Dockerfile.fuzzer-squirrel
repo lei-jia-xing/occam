@@ -1,0 +1,178 @@
+# Reproducible SQUIRREL + AFL++ coverage-guided fuzzer image (Stage 1/2).
+# Builds SQUIRREL's dialect mutators (libsqlite_mutator.so, libmysql_mutator.so,
+# libpostgresql_mutator.so), db_driver, AFL++, and an optional AFL++-instrumented
+# target binary (SQUIRREL_TARGET=sqlite|postgresql|mysql|mariadb|all|none).
+FROM ubuntu:22.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    automake \
+    bison \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    default-libmysqlclient-dev \
+    flex \
+    git \
+    gosu \
+    libcmocka-dev \
+    libglib2.0-0 \
+    libpq-dev \
+    libreadline-dev \
+    libssl-dev \
+    libtool \
+    libtool-bin \
+    libyaml-cpp-dev \
+    lld \
+    llvm-14 \
+    llvm-14-dev \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-yaml \
+    tcl \
+    tcl8.6 \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SQUIRREL_REPO=https://github.com/s3team/Squirrel.git
+ARG SQUIRREL_REF=master
+# sqlite | postgresql | mysql | mariadb | all | none
+ARG SQUIRREL_TARGET=sqlite
+ARG SQLITE_REPO=https://github.com/sqlite/sqlite.git
+ARG SQLITE_REF=master
+ARG PG_REPO=https://github.com/postgres/postgres.git
+ARG PG_REF=REL_13_0
+
+ENV SQUIRREL_HOME="/opt/squirrel"
+WORKDIR /opt
+
+RUN git init "${SQUIRREL_HOME}" && \
+    cd "${SQUIRREL_HOME}" && \
+    git remote add origin "${SQUIRREL_REPO}" && \
+    if git fetch --depth 1 origin "${SQUIRREL_REF}"; then \
+        git checkout --detach FETCH_HEAD; \
+    else \
+        git fetch origin && git checkout --detach "${SQUIRREL_REF}"; \
+    fi && \
+    git submodule update --init --recursive && \
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev && \
+    cmake --build build -j"$(nproc)" && \
+    make -C AFLplusplus LLVM_CONFIG=llvm-config-14 -j"$(nproc)" && \
+    mkdir -p /opt/squirrel/bin /opt/squirrel/targets
+
+# Optional AFL++-instrumented target builds for coverage feedback.
+RUN set -eu; \
+    case ",${SQUIRREL_TARGET}," in \
+        *,sqlite,*|*,all,*) \
+            git clone --depth 1 --branch "${SQLITE_REF}" "${SQLITE_REPO}" /tmp/sqlite && \
+            mkdir -p /tmp/sqlite/bld && \
+            cd /tmp/sqlite/bld && \
+            CC="${SQUIRREL_HOME}/AFLplusplus/afl-cc" \
+            CXX="${SQUIRREL_HOME}/AFLplusplus/afl-c++" \
+            ../configure && \
+            make -j"$(nproc)" && \
+            make -j"$(nproc)" sqlite3.c sqlite3.o && \
+            CFLAGS="-DSQLITE_MAX_LENGTH=128000000 -DSQLITE_MAX_SQL_LENGTH=128000000 -DSQLITE_MAX_MEMORY=25000000 -DSQLITE_PRINTF_PRECISION_LIMIT=1048576 -DSQLITE_DEBUG=1 -DSQLITE_MAX_PAGE_COUNT=16384" && \
+            "${SQUIRREL_HOME}/AFLplusplus/afl-cc" ${CFLAGS} -I. -c /tmp/sqlite/test/ossfuzz.c -o /tmp/ossfuzz.o && \
+            "${SQUIRREL_HOME}/AFLplusplus/afl-cc" ${CFLAGS} -I. -c /tmp/sqlite/test/ossshell.c -o /tmp/ossshell.o && \
+            "${SQUIRREL_HOME}/AFLplusplus/afl-c++" /tmp/ossfuzz.o /tmp/ossshell.o ./sqlite3.o \
+                -o /opt/squirrel/bin/sqlite_ossfuzz -ldl -pthread && \
+            rm -rf /tmp/sqlite /tmp/ossfuzz.o /tmp/ossshell.o ;; \
+    esac; \
+    case ",${SQUIRREL_TARGET}," in \
+        *,postgresql,*|*,all,*) \
+            git init /tmp/pg && cd /tmp/pg && \
+            git remote add origin "${PG_REPO}" && \
+            if git fetch --depth 1 origin "${PG_REF}"; then \
+                git checkout --detach FETCH_HEAD; \
+            else \
+                git fetch origin && git checkout --detach "${PG_REF}"; \
+            fi && \
+            mkdir -p /tmp/pg-bld && cd /tmp/pg-bld && \
+            CC="${SQUIRREL_HOME}/AFLplusplus/afl-cc" \
+            CXX="${SQUIRREL_HOME}/AFLplusplus/afl-c++" \
+            /tmp/pg/configure --prefix=/opt/squirrel/targets/pgsql --enable-cassert --enable-debug && \
+            make -j"$(nproc)" && make install && \
+            useradd -ms /bin/bash squirrel || true && \
+            mkdir -p /opt/squirrel/targets/pgsql/data /var/run/postgresql && \
+            chown -R squirrel:squirrel /opt/squirrel/targets/pgsql /var/run/postgresql && \
+            gosu squirrel env AFL_IGNORE_PROBLEMS=1 /opt/squirrel/targets/pgsql/bin/initdb \
+                -D /opt/squirrel/targets/pgsql/data --auth=trust --auth-local=trust && \
+            gosu squirrel env AFL_IGNORE_PROBLEMS=1 /opt/squirrel/targets/pgsql/bin/pg_ctl \
+                -D /opt/squirrel/targets/pgsql/data -l /tmp/pg_init.log -w start && \
+            gosu squirrel /opt/squirrel/targets/pgsql/bin/psql -h /var/run/postgresql -d postgres -v ON_ERROR_STOP=0 \
+                -c "CREATE ROLE root WITH SUPERUSER LOGIN;" && \
+            gosu squirrel /opt/squirrel/targets/pgsql/bin/psql -h /var/run/postgresql -d postgres -v ON_ERROR_STOP=0 \
+                -c "CREATE ROLE postgres WITH SUPERUSER LOGIN;" && \
+            gosu squirrel /opt/squirrel/targets/pgsql/bin/pg_ctl -D /opt/squirrel/targets/pgsql/data -w stop && \
+            rm -f /tmp/pg_init.log && \
+            map_val="$((AFL_DEBUG=1 __AFL_SHM_ID=1234 /opt/squirrel/targets/pgsql/bin/postgres 2>&1 || true) \
+                | grep -oE '__afl_map_size[=:, ]+[0-9]+' | tail -n 1 | grep -oE '[0-9]+' || true)" && \
+            if [ -n "${map_val}" ]; then printf '%s\n' "${map_val}" > /opt/squirrel/mapsize.postgresql; fi && \
+            rm -rf /tmp/pg /tmp/pg-bld ;; \
+    esac; \
+    case ",${SQUIRREL_TARGET}," in \
+        *,mysql,*|*,all,*) \
+            apt-get update && apt-get install -y --no-install-recommends libncurses-dev libtirpc-dev && rm -rf /var/lib/apt/lists/* && \
+            git clone --depth=1 --branch mysql-8.0.20 https://github.com/mysql/mysql-server.git /tmp/mysql && \
+            mkdir -p /tmp/mysql-bld && cd /tmp/mysql-bld && \
+            CC="${SQUIRREL_HOME}/AFLplusplus/afl-cc" \
+            CXX="${SQUIRREL_HOME}/AFLplusplus/afl-c++" \
+            cmake /tmp/mysql -DDOWNLOAD_BOOST=1 -DWITH_BOOST=/tmp/boost \
+                -DWITH_DEBUG=1 -DCPACK_MONOLITHIC_INSTALL=1 -DWITH_UNIT_TESTS=OFF && \
+            cmake --build . -j"$(nproc)" && \
+            cmake --install . --prefix /opt/squirrel/targets/mysql && \
+            useradd -ms /bin/bash squirrel || true && \
+            mkdir -p /opt/squirrel/targets/mysql/data /opt/squirrel/targets/mysql/mysql-files && \
+            chmod 750 /opt/squirrel/targets/mysql/mysql-files && \
+            chown -R squirrel:squirrel /opt/squirrel/targets/mysql && \
+            AFL_IGNORE_PROBLEMS=1 /opt/squirrel/targets/mysql/bin/mysqld --initialize-insecure --user=squirrel \
+                --datadir=/opt/squirrel/targets/mysql/data && \
+            map_val="$((AFL_DEBUG=1 __AFL_SHM_ID=1234 /opt/squirrel/targets/mysql/bin/mysqld 2>&1 || true) \
+                | grep -oE '__afl_map_size[=:, ]+[0-9]+' | tail -n 1 | grep -oE '[0-9]+' || true)" && \
+            if [ -n "${map_val}" ]; then printf '%s\n' "${map_val}" > /opt/squirrel/mapsize.mysql; fi && \
+            rm -rf /tmp/mysql /tmp/mysql-bld /tmp/boost ;; \
+    esac; \
+    case ",${SQUIRREL_TARGET}," in \
+        *,mariadb,*|*,all,*) \
+            apt-get update && apt-get install -y --no-install-recommends libaio-dev libncurses-dev libpcre2-dev && rm -rf /var/lib/apt/lists/* && \
+            curl -fSL "https://archive.mariadb.org/mariadb-10.5.8/source/mariadb-10.5.8.tar.gz" -o /tmp/mariadb.tar.gz && \
+            mkdir -p /tmp/mariadb /tmp/mariadb-bld && \
+            tar -xzf /tmp/mariadb.tar.gz -C /tmp/mariadb --strip-components=1 && \
+            rm /tmp/mariadb.tar.gz && \
+            cd /tmp/mariadb-bld && \
+            CC="${SQUIRREL_HOME}/AFLplusplus/afl-cc" \
+            CXX="${SQUIRREL_HOME}/AFLplusplus/afl-c++" \
+            cmake /tmp/mariadb -DCMAKE_BUILD_TYPE=Debug -DWITH_UNIT_TESTS=OFF -DWITH_WSREP=OFF \
+                -DWITH_SSL=system -DWITH_PCRE=system -DWITH_DBUG_TRACE=OFF -DWITH_SAFEMALLOC=OFF && \
+            cmake --build . -j"$(nproc)" && \
+            cmake --install . --prefix /opt/squirrel/targets/mariadb && \
+            useradd -ms /bin/bash squirrel || true && \
+            mkdir -p /opt/squirrel/targets/mariadb/data && \
+            chown -R squirrel:squirrel /opt/squirrel/targets/mariadb && \
+            AFL_IGNORE_PROBLEMS=1 /opt/squirrel/targets/mariadb/scripts/mysql_install_db --user=squirrel \
+                --auth-root-authentication-method=normal \
+                --basedir=/opt/squirrel/targets/mariadb --datadir=/opt/squirrel/targets/mariadb/data && \
+            map_val="$((AFL_DEBUG=1 __AFL_SHM_ID=1234 /opt/squirrel/targets/mariadb/bin/mariadbd 2>&1 || true) \
+                | grep -oE '__afl_map_size[=:, ]+[0-9]+' | tail -n 1 | grep -oE '[0-9]+' || true)" && \
+            if [ -n "${map_val}" ]; then printf '%s\n' "${map_val}" > /opt/squirrel/mapsize.mariadb; fi && \
+            rm -rf /tmp/mariadb /tmp/mariadb-bld ;; \
+    esac
+
+LABEL org.occam.fuzzer="squirrel" \
+      org.occam.fuzzer.ref="${SQUIRREL_REF}" \
+      org.occam.fuzzer.target="${SQUIRREL_TARGET}" \
+      org.occam.fuzzer.targets="sqlite,postgresql,mysql,mariadb"
+
+COPY harness/squirrel_driver.sh /usr/local/bin/squirrel-driver
+RUN chmod +x /usr/local/bin/squirrel-driver
+
+WORKDIR /opt/squirrel
+ENTRYPOINT ["/usr/local/bin/squirrel-driver"]
+CMD ["--help"]

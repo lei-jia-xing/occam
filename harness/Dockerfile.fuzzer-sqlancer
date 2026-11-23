@@ -1,0 +1,61 @@
+# Reproducible SQLancer fuzzer image for multi-DBMS crash discovery Pilot (Stage 1/2).
+# Builds SQLancer from source via Maven (retaining both sqlancer.jar and target/lib/*.jar
+# JDBC drivers) and wraps invocation through /usr/local/bin/sqlancer-driver.
+FROM maven:3.9-eclipse-temurin-17 AS build
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SQLANCER_REPO=https://github.com/sqlancer/sqlancer.git
+ARG SQLANCER_REF=main
+
+WORKDIR /src/sqlancer
+RUN git init . && \
+    git remote add origin "${SQLANCER_REPO}" && \
+    if git fetch --depth 1 origin "${SQLANCER_REF}"; then \
+        git checkout --detach FETCH_HEAD; \
+    else \
+        git fetch origin && git checkout --detach "${SQLANCER_REF}"; \
+    fi && \
+    mvn package -DskipTests -B && \
+    mkdir -p /opt/sqlancer/lib && \
+    jar_path="$(find target -maxdepth 1 -type f -name 'sqlancer-*.jar' ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-tests.jar' | sort | head -n 1)" && \
+    test -n "${jar_path}" && \
+    cp "${jar_path}" /opt/sqlancer/sqlancer.jar && \
+    if compgen -G "target/lib/*.jar" >/dev/null; then \
+        cp target/lib/*.jar /opt/sqlancer/lib/; \
+    fi
+
+FROM ubuntu:24.04
+
+ARG SQLANCER_REF=main
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    default-mysql-client \
+    libstdc++6 \
+    openjdk-17-jre-headless \
+    postgresql-client \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+LABEL org.occam.fuzzer="sqlancer" \
+      org.occam.fuzzer.ref="${SQLANCER_REF}" \
+      org.occam.fuzzer.targets="postgres,mysql,mariadb,clickhouse,sqlite3,duckdb"
+
+COPY --from=build /opt/sqlancer /opt/sqlancer
+COPY harness/sqlancer_driver.sh /usr/local/bin/sqlancer-driver
+RUN chmod +x /usr/local/bin/sqlancer-driver && \
+    mkdir -p /var/log/sqlancer
+
+ENV SQLANCER_HOME="/opt/sqlancer"
+ENV SQLANCER_JAR="/opt/sqlancer/sqlancer.jar"
+
+WORKDIR /opt/sqlancer
+ENTRYPOINT ["/usr/local/bin/sqlancer-driver"]
+CMD ["--help"]

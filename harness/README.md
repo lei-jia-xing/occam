@@ -218,7 +218,75 @@ occam /path/to/crash_repro.sql \
 
 ---
 
-## 7. Security
+## 7. Fuzzer Containers & Drivers (`SQLancer`, `SQUIRREL`, `SQLsmith`)
+
+### SQLancer (`Dockerfile.fuzzer-sqlancer` & `sqlancer_driver.sh`)
+
+Builds SQLancer from source (including JDBC dependencies under `/opt/sqlancer/lib/`) and wraps `MainOptions` vs DBMS subcommand flag ordering across `postgres`, `mysql`, `mariadb`, `clickhouse` (HTTP port `8123`), `sqlite3`, and `duckdb`.
+
+```bash
+docker build -t occam-fuzzer-sqlancer -f harness/Dockerfile.fuzzer-sqlancer .
+
+# Fuzz PostgreSQL target container and stream SQLancer logs into /tmp/sqlancer_pg
+docker run --rm --network host -v /tmp/sqlancer_pg:/fuzz_out \
+  occam-fuzzer-sqlancer \
+  --dbms postgres --host 127.0.0.1 --port 5432 --user postgres \
+  --num-threads 1 --timeout-seconds 3600 --out-dir /fuzz_out
+```
+
+### SQUIRREL (`Dockerfile.fuzzer-squirrel` & `squirrel_driver.sh`)
+
+Builds SQUIRREL's mutators (`libsqlite_mutator.so`, `libmysql_mutator.so`, `libpostgresql_mutator.so`), `db_driver`, `AFLplusplus`, and an optional AFL++-instrumented target (`--build-arg SQUIRREL_TARGET=sqlite|postgresql|mysql|mariadb|all|none`, default `sqlite`).
+
+```bash
+docker build -t occam-fuzzer-squirrel -f harness/Dockerfile.fuzzer-squirrel .
+
+# Run SQUIRREL against its instrumented SQLite harness for 1 hour
+docker run --rm -v /tmp/squirrel_sqlite:/fuzz_out \
+  occam-fuzzer-squirrel \
+  --dbms sqlite --output-dir /fuzz_out --timeout-secs 3600
+```
+
+### SQLsmith (`sqlsmith_driver.sh`)
+
+Drives `sqlsmith` against PostgreSQL using `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER` and optional `--dump-file` query capture.
+
+---
+
+## 8. Crash Harvesting (`collect_fuzzer_crashes.py`)
+
+Normalizes raw fuzzer outputs (`squirrel` `crashes/id:*`, `sqlancer` `.log`/`-cur.log` stripping Java stack traces and harness `DROP/CREATE DATABASE`/`\c` preambles, `sqlsmith`, or `raw`), deduplicates exact bytes, and optionally runs 5-replay verification + RQ3 crash-signature deduplication into a `manifest.json`:
+
+```bash
+python3 harness/collect_fuzzer_crashes.py \
+  --source sqlancer --dbms postgres \
+  --input-dir /tmp/sqlancer_pg/logs/postgres \
+  --out-dir /tmp/harvested_pg \
+  --verify --replays 5 --container-name occam-target-pg
+```
+
+---
+
+## 9. Resumable Horizontal Batch Orchestrator (`batch_eval.py`)
+
+`harness/batch_eval.py` coordinates multi-case, multi-profile, multi-repeat crash reductions across `--jobs` isolated worker containers (one target container per worker, with `--occam-jobs 1` enforced on server DBMSes sharing `occam_test`, or `--local-embedded` for local SQLite/DuckDB):
+
+- **Phase 1 (Input 5-Replay Qualification)**: Replays each case 5 times on clean state (`reset_db.sh` + `crash_oracle.py --print-signature`), recording `baseline_signature` and filtering unstable cases (`skipped_unstable_input`).
+- **Phase 2 (Resumable Reduction + Post-Reduction 5-Replay & RQ3 Slippage)**: Runs `occam` across profiles (`audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep`, or custom `--profile-spec`), verifies the reduced SQL with 5 clean-state replays, and records exact match vs RQ3 signature slippage.
+- **Resumability**: Commits per-run `job_result.json` atomically; re-running skips valid completed/censored checkpoints (`--rerun-failed` retries errors) and cleans partial artifacts. On `SIGINT`/`SIGTERM`, terminates active `occam` process groups and removes managed worker containers.
+- **Aggregation**: Produces `aggregated_stats.json` and `summary.md`, keeping `completed` separate from `timeout`/`execution-budget` censoring, computing Attempt-AUC and engine overhead, and stratifying results by unique crash signature (`by_signature`, `signature_stratified_by_profile`).
+
+```bash
+# Dry-run plan across benchmarks/real_fuzz_corpus (14 cases x 6 profiles x 3 repeats)
+python3 harness/batch_eval.py \
+  --corpus-dir benchmarks/real_fuzz_corpus \
+  --profiles audit-only,ddmin-only,Ours-S,Ours-SI,Ours-Full,Ours-NoDep \
+  --repeats 3 --jobs 4 --out-dir occam-out/thesis_eval --dry-run
+```
+
+---
+
+## 10. Security
 
 This harness executes untrusted SQL and is **not a sandbox**.
 
@@ -230,7 +298,7 @@ This harness executes untrusted SQL and is **not a sandbox**.
 
 ---
 
-## 8. Unit Tests
+## 11. Unit Tests
 
 ```bash
 python3 -m unittest discover -s harness -p "test_*.py" -v
@@ -238,4 +306,4 @@ python3 -m unittest discover -s harness -p "test_*.py" -v
 make harness-check
 ```
 
-The suite uses mock DBMS clients, mock embedded binaries, and mock `docker` commands (requiring neither a built `occam` binary nor live DBMS containers) to verify exit-code contracts, server-log-only evidence for `postgres`/`mysql`/`mariadb`/`clickhouse`, `occam-exec`/local execution and anti-spoofing for `sqlite`/`duckdb`, OOM/`SQLITE_ABORT` handling, RQ3 crash signature normalization and slippage tracking, and `reset_db.sh` state resets across all 6 DBMSes.
+The suite uses mock DBMS clients, mock embedded binaries, mock fuzzer binaries, and mock `docker` commands (requiring neither a built `occam` binary nor live DBMS containers, while running an optional E2E check when `occam` is built) to verify exit-code contracts, server-log-only evidence for `postgres`/`mysql`/`mariadb`/`clickhouse`, `occam-exec`/local execution and anti-spoofing for `sqlite`/`duckdb`, OOM/`SQLITE_ABORT` handling, RQ3 crash signature normalization and slippage tracking, `reset_db.sh` state resets across all 6 DBMSes, SQLancer/SQUIRREL driver flag/env contracts, fuzzer crash collection/deduplication, and resumable `--jobs`-aligned batch orchestration + `stats.json` aggregation.

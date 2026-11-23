@@ -198,8 +198,8 @@
   - Added unit tests in `harness/test_crash_oracle.py` and `harness/test_reset_db.py` (64/64 tests + `shellcheck -S style` passing via `make harness-check`), and updated `harness/README.md`.
 - [X] Structured crash signature & slippage tracking (RQ3):
   - Added normalized crash signature extraction (`extract_crash_signature`: sanitizer kind+location, assertion identity, engine internal/logical/panic error, or signal+top-N non-wrapper stack frames with PID/ASLR/build-path stripping) and slippage evaluation (`--baseline-signature`, `--reject-on-slippage`, `--stack-frames`, `--print-signature`, `decision_log` `crash_signature` / `slippage` fields) in `harness/crash_oracle.py`.
-- [ ] Fuzzer integration & horizontal batch runner:
-  - Prepare fuzzer containers/drivers (`SQLancer` and `SQUIRREL`) and a resumable container-per-worker evaluation orchestrator aligned with `--jobs`, 5-replay stability verification, and `stats.json` aggregation.
+- [X] Fuzzer integration & horizontal batch runner:
+  - Prepared fuzzer containers/drivers (`harness/Dockerfile.fuzzer-sqlancer`, `harness/sqlancer_driver.sh`, `harness/Dockerfile.fuzzer-squirrel`, `harness/squirrel_driver.sh`), crash harvester (`harness/collect_fuzzer_crashes.py`), and resumable container-per-worker orchestrator (`harness/batch_eval.py`) aligned with `--jobs`, 5-replay qualification/stability & RQ3 slippage verification, and `stats.json` aggregation (`aggregated_stats.json` / `summary.md`), plus unit/integration tests (`harness/test_fuzzer_drivers.py`, `harness/test_collect_fuzzer_crashes.py`, `harness/test_batch_eval.py`) and `harness/README.md` documentation (verified locally with `make harness-check`: 98/98 tests + `shellcheck -S style` passing; container image builds deferred to Stage 2).
 - [X] Workspace hygiene: reconciled uncommitted engine edits in `adb428d` (upstream `sqlparser-rs` PRAGMA issue evaluation remains tracked separately in `Report SQLite PRAGMA keyword arguments to sqlparser-rs` above).
 
 *** Stage 2: Server-backed corpus build, barrier census & thesis evaluation
