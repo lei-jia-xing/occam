@@ -208,22 +208,30 @@
 - [ ] Evidence-driven semantic barrier census: profile `Opaque` / `GlobalBarrier` hits across real collected crashes and prioritize modeling only barriers that materially block real reductions.
 - [ ] Execute full RQ1-RQ4 thesis experiments (`audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep` x 3 repeats), reporting results stratified by unique crash signature.
 
+* TODO Compare frontend syntax acceptance with native DBMS parsers
+- Start with SQLite and DuckDB using harmless SQL and versioned engine configurations. Record the SQL, dialect, engine version, and acceptance result for both sides. Include engine-valid syntax that Occam rejects and parser-accepted syntax that the engine rejects.
+- Keep native syntax failures distinct from missing objects, unsupported extensions, and execution errors. Report Occam statement boundaries and dependency barriers separately from parser acceptance.
+- Extend the same cases to PostgreSQL and MySQL with pinned versions and relevant session settings.
+
 * Upstream Gaps (recorded, not scheduled)
 # Pinned sqlparser =0.64.0 (rust/sqlparser-ffi/Cargo.toml:13); upstream is https://github.com/apache/datafusion-sqlparser-rs -- verify each item against upstream main before filing.
 # Detailed tracking and upstream PR proposals live in docs/UPSTREAM_TRACKER.md.
 - [UP-05] `CREATE STATISTICS` unsupported by grammar -- 10 units: benchmarks/real_fuzz_corpus/pg_stack_overflow_27stmts.sql (s0-s7), pg_fuzzer_mcv_clauses.sql:3, pg_fuzzer_mcv_enhanced.sql:30
-- [UP-06] `PRAGMA recursive_triggers = true` / `PRAGMA foreign_keys = ON` boolean word literals unparsed -- benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1
+- [UP-06] SQLite PRAGMA word arguments are still an upstream grammar gap. Occam accepts bare boolean words for `foreign_keys` through a local workaround; `PRAGMA recursive_triggers = true` still produces a parse error (benchmarks/real_fuzz_corpus/sqlite_fuzz_recursive_trigger.sql:1).
 - [UP-07] MySQL `BINARY` column attribute unparsed (`col CHAR(1) BINARY`) -- benchmarks/real_fuzz_corpus/mysql_bug88355.sql:1,3
 - [UP-08] ClickHouse `CREATE MATERIALIZED VIEW mv ENGINE = ... AS SELECT` unparsed -- rejects table engine on materialized view
 - [UP-02] `CREATE VIRTUAL TABLE ... USING fts5/fts4` exposes no module/shadow-table structure -- lowered to RelationScope in analyze_statement (sqlite_fuzz_fts5_savepoint.sql de-fenced)
-- Standalone `TABLE t` rejected -- README.md:77 ("Parser limits" paragraph)
-- CTAS `WITH NO DATA` rejected under Snowflake -- README.md:77
+- PostgreSQL standalone `TABLE t;` fails at the first token. The nested form `(TABLE t)` parses.
+- Snowflake `CREATE TABLE copied AS SELECT 1 WITH NO DATA;` fails at `NO`. Confirm native support before treating this as an upstream syntax gap.
 - PL/pgSQL & PL/SQL bodies stored as unparsed strings -- TODO(upstream-sqlparser) catch-all in analyze_statement (procedural-body item)
-- MySQL `DELIMITER` client command outside grammar -- TODO(upstream-sqlparser) catch-all in analyze_statement (DELIMITER item)
 - MySQL `@var := expr` + dynamic `PREPARE .. FROM @var` -- TODO(upstream-sqlparser) catch-all in analyze_statement (@var/PREPARE item)
 - MSSQL T-SQL procedural batches (`DECLARE @x`, `IF..ELSE`) -- TODO(upstream-sqlparser) catch-all in analyze_statement (T-SQL batch item)
 - Incomplete `Spanned` impls (window, NULL-treatment, ODBC, unknown) block whole-node byte edits -- README.md:35
 - RESOLVED: MySQL index prefix `b(1)` as Expr::Function handled via structural recognition `index_length_prefix_ident` (`docs/UPSTREAM_TRACKER.md` UP-01; `mysql_bug_91975.sql` false barrier eliminated).
+
+* TODO Handle native client script boundaries
+- MySQL client `DELIMITER` directives and SQL Server client `GO` batches need script-level handling. Occam currently rejects a script starting with `DELIMITER $$` and reports a missing semicolon for `SELECT 1\nGO\nSELECT 2\nGO`.
+- Preserve original source ranges and keep statement counting consistent with parsing. Verify that directive-like text inside strings, comments, and compound statements is handled according to the selected client format.
 
 * Completed Milestones
 ** DONE Semantic refinement & barrier de-fencing (6-dimensional overhaul) [2026-11]

@@ -13,6 +13,7 @@ import Data.Graph qualified as Graph
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf, subsequences)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import DependencyChecks qualified
@@ -56,6 +57,7 @@ import Occam.Core (
     ResultStatement (..),
     SemanticFacts (..),
     SessionInit (..),
+    Statement (stmtRaw),
     StatementId (..),
     TableDef (..),
     WriteKind (..),
@@ -98,7 +100,14 @@ import Occam.Oracle.Sqlite (
     sqliteContractObservationTimeout,
     sqliteContractOracle,
  )
-import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, dialectName, parseSQL)
+import Occam.Parser (
+    ParsedSQL (..),
+    SQLDialect (..),
+    StatementUnit (..),
+    defaultParseOptions,
+    dialectName,
+    parseSQL,
+ )
 import Occam.Pool (
     OraclePool,
     PoolConfig (..),
@@ -1055,36 +1064,30 @@ phase7Tests :: TestTree
 phase7Tests =
     testGroup
         "Selected frontend dialects"
-        [ testCase "every selected dialect parses statement boundaries" $
-            mapM_
-                ( \dialect -> do
-                    result <- parseSQL (defaultParseOptions dialect) "SELECT 1; SELECT 2;"
-                    case result of
-                        Left err -> assertFailure (show dialect ++ " parser transport error: " ++ show err)
-                        Right parsed ->
-                            assertEqual
-                                (show dialect ++ " parses two statement units")
-                                2
-                                (length (parsedUnits parsed))
-                )
-                [ GenericSQL
-                , Ansi
-                , Teradata
-                , PostgreSQL
-                , Redshift
-                , MySQL
-                , SQLite
-                , DuckDB
-                , ClickHouse
-                , Oracle
-                , Snowflake
-                , Hive
-                , Spark
-                , Databricks
-                , BigQuery
-                , MsSql
-                ]
-        ]
+        ( map (\dialect -> check dialect "SELECT 1" "SELECT 2") [minBound .. maxBound]
+            ++ [ check PostgreSQL "SELECT $$a;b$$" "SELECT 2"
+               , check
+                    SQLite
+                    "CREATE TRIGGER trg AFTER INSERT ON t BEGIN UPDATE t SET a = 1; UPDATE t SET a = 2; END"
+                    "SELECT 2"
+               , check MySQL "CREATE TABLE `t` (`c` CHAR(8), INDEX (`c`(4)))" "SELECT 2"
+               , check DuckDB "SELECT * FROM range(3) QUALIFY row_number() OVER () = 1" "SELECT 2"
+               , check MsSql "SELECT TOP (1) [a] FROM [t]" "SELECT 2"
+               , check Oracle "SELECT seq.NEXTVAL FROM dual" "SELECT 2 FROM dual"
+               , check BigQuery "SELECT * EXCEPT (a) FROM `project.dataset.t`" "SELECT 2"
+               ]
+        )
+    where
+        check dialect first second =
+            testCase (show dialect ++ ": " ++ BSC.unpack first) $ do
+                let source = first <> "; " <> second <> ";"
+                result <- parseSQL (defaultParseOptions dialect) source
+                case result of
+                    Left err -> assertFailure (show err)
+                    Right parsed -> do
+                        let units = parsedUnits parsed
+                        assertEqual "statement text and boundaries" [first, second] (map (stmtRaw . unitStatement) units)
+                        assertEqual "parse errors" [] (mapMaybe unitParseError units)
 
 withGraph :: SQLDialect -> BS.ByteString -> (DependencyGraph -> IO ()) -> IO ()
 withGraph dialect source action = do
