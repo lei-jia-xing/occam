@@ -1,6 +1,6 @@
 # Occam Crash Oracle & Isolation Harness
 
-This directory provides the crash reproduction oracle, target DBMS container definitions, and candidate state reset scripts for validating Occam on authentic PostgreSQL and MySQL multi-statement fuzz crashes. SQLite is not supported by this oracle yet.
+This directory provides the crash reproduction oracle, target DBMS container definitions, and candidate state reset scripts for validating Occam on authentic multi-statement DBMS crashes across **PostgreSQL**, **MySQL**, **MariaDB**, **ClickHouse**, **SQLite**, and **DuckDB**.
 
 ---
 
@@ -11,7 +11,7 @@ Occam communicates with external test harnesses using standard POSIX stream and 
 | Contract Component | Protocol Specification |
 | :--- | :--- |
 | **`--oracle <cmd>`** | Candidate SQL is piped into `sys.stdin` of `<cmd>`.<br>• **Exit 0**: Accepted / interesting.<br>• **Any nonzero exit**: Rejected. Occam does not reserve predicate exit codes, so **124 is not a timeout signal**; it is just another rejection. |
-| **`--reset <cmd>`** | Executed before candidate evaluation when specified.<br>• PostgreSQL: drops and recreates `occam_test` from `template_occam`.<br>• MySQL: drops and recreates `occam_test` and clears `read_only` / `super_read_only` globals.<br>• Restarts or waits for the server after a crash.<br>• **Exit 0**: State cleanly reset and target database ready.<br>• **Exit non-zero**: Infrastructure failure. This is the only clean infrastructure-error channel in Occam's predicate contract. |
+| **`--reset <cmd>`** | Executed before candidate evaluation when specified.<br>• PostgreSQL: drops and recreates `occam_test` from `template_occam`.<br>• MySQL: clears `super_read_only` / `read_only`, drops and recreates `occam_test`.<br>• MariaDB: clears `read_only`, drops and recreates `occam_test`.<br>• ClickHouse: synchronously drops (`DROP DATABASE ... SYNC`) and recreates `occam_test`.<br>• SQLite / DuckDB: stateless `:memory:` per-probe execution; if `--container-name` is passed, restarts/verifies the idle target container.<br>• Restarts or waits for the server/container after a crash.<br>• **Exit 0**: State cleanly reset and target ready.<br>• **Exit non-zero**: Infrastructure failure. This is the only clean infrastructure-error channel in Occam's predicate contract. |
 | **`OCCAM_WORKDIR`** | Occam provides a clean candidate temporary directory in `OCCAM_WORKDIR`, `TMPDIR`, `TMP`, and `TEMP`. The oracle uses it as the client working directory. |
 
 **Timeout ownership.** `crash_oracle.py` disables its own client timeout by default (`--timeout 0`). Under Occam, leave it disabled and let Occam's `--timeout` kill the whole process group. Occam starts its timer before reset, so an internal oracle timeout that fires first would turn an inconclusive candidate into a rejection. Pass `--timeout` only for standalone use.
@@ -20,148 +20,193 @@ Occam communicates with external test harnesses using standard POSIX stream and 
 
 ## 2. Crash Evidence and Logs
 
-A verdict is accepted only from the **DBMS server log**. Client stderr is used only to corroborate connection loss; it is never scanned for crash signatures, because psql and mysql echo the failing statement in error messages. This prevents candidates containing strings such as `Segmentation fault` from being accepted as crashes.
+### Server DBMS Targets (`postgres`, `mysql`, `mariadb`, `clickhouse`)
 
-- Pass `--log-file` (host path) or `--container-name` (read logs with `docker exec`). If neither is given, the oracle rejects with `log-source-required`.
-- `--container-log` selects the log path inside the container. Defaults: `/var/log/postgresql/postgresql.log` for PostgreSQL and `/var/log/mysql/error.log` for MySQL.
+A verdict is accepted only from the **DBMS server log**. Client stderr is used only to corroborate connection loss; it is never scanned for crash signatures, because clients echo the failing statement in error messages. This prevents candidates containing strings such as `Segmentation fault` from being accepted as crashes.
+
+- Pass `--log-file` (host path) or `--container-name` (read logs with `docker exec` + `docker logs --since`). If neither is given, the oracle rejects with `log-source-required`.
+- `--container-log` selects the log path inside the container. Defaults:
+  - `postgres`: `/var/log/postgresql/postgresql.log`
+  - `mysql` / `mariadb`: `/var/log/mysql/error.log`
+  - `clickhouse`: `/var/log/clickhouse-server/clickhouse-server.err.log`
 - `--decision-log` appends one JSON verdict record per invocation. This is useful because Occam discards oracle stdout/stderr.
 - `--allow-stderr-only` is available for trusted, log-less setups. It is explicitly unsafe and should not be used for reduction.
 
-PostgreSQL log files default to mode `0600`, which is not readable from a non-root host user. The target images set `log_file_mode = 0644`; the MySQL entrypoint also keeps its error log at `0644`. If a bind-mounted log is still unreadable, use `--container-name` instead.
+PostgreSQL log files default to mode `0600`, which is not readable from a non-root host user. The target images keep logs readable (`0644`) across PostgreSQL, MySQL, MariaDB, and ClickHouse. If a bind-mounted log is still unreadable, use `--container-name` instead.
+
+### Embedded DBMS Targets (`sqlite`, `duckdb`)
+
+SQLite and DuckDB execute **statelessly per probe** against `:memory:` in a fresh engine process — either inside a target container via `docker exec -i <container> occam-exec` (when `--container-name` is passed) or directly via local `sqlite3` / `duckdb` (`-batch :memory:`).
+
+- No `--log-file` is needed or used for embedded targets.
+- Crash verdicts combine POSIX process termination signals (`SIGABRT`, `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, etc.) with sanitized engine stderr evidence (C `assert()`, ASan/UBSan reports, and DuckDB `INTERNAL Error` / `FATAL Error: database has been invalidated`).
+- SQL error echoes (`Parse error` / `Runtime error` / `Error` in SQLite; `Catalog Error` / `Binder Error` / `Parser Error` / `Constraint Error` + `LINE N:` blocks in DuckDB) are filtered out so quoted identifiers cannot spoof crash evidence.
+- Non-crash conditions are explicitly distinguished:
+  - SQLite `SQLITE_ABORT` (exit `4`) is rejected as `healthy_no_fault` (`reason: "sqlite-abort"`).
+  - DuckDB `Out of Memory Error:` and `SIGKILL` (`137` / `-9`) are retained as their own OOM cause (`corroboration.oom = true`, `reason: "oom"` / `"oom-kill"`, `healthy_no_fault`) rather than misclassified as internal errors or crashes.
+  - `docker exec` infrastructure failures (`125`, `126`, `127`) are rejected as `missing_evidence` (`reason: "container-exec-failed"`).
 
 ---
 
-## 3. Target PostgreSQL Image (`Dockerfile.target-pg`)
+## 3. Target DBMS Images
 
-A reproducible Dockerfile based on Ubuntu 24.04 that builds PostgreSQL from source with assertion checks (`--enable-cassert`) and debug symbols (`--enable-debug` with `CFLAGS="-O1 -g -fno-omit-frame-pointer"`).
+### PostgreSQL (`Dockerfile.target-pg`)
 
-### Building the Image
+Builds PostgreSQL from source (default `REL_13_0`) with `--enable-cassert` and `--enable-debug` (`CFLAGS="-O1 -g -fno-omit-frame-pointer"`).
 
 ```bash
-# Build default PostgreSQL 13 (REL_13_0)
 docker build -t occam-target-pg -f harness/Dockerfile.target-pg .
+# Or a specific tag/branch/SHA:
+docker build -t occam-target-pg -f harness/Dockerfile.target-pg --build-arg PG_VERSION=REL_12_0 .
 
-# Or build a specific tag, branch, or commit:
-docker build -t occam-target-pg -f harness/Dockerfile.target-pg \
-  --build-arg PG_VERSION=REL_12_0 .
-```
-
-`PG_VERSION` is fetched by tag, branch, or commit SHA. A shallow fetch is tried first; a full fetch is used as a fallback for servers that do not allow fetching an arbitrary commit by SHA.
-
-### Running the Target Container
-
-```bash
-# Bind the port to localhost only; the container uses trust authentication.
-docker run -d --name occam-target-pg \
-  --restart unless-stopped \
+docker run -d --name occam-target-pg --restart unless-stopped \
   -p 127.0.0.1:5432:5432 \
   -v /tmp/occam-pg-log:/var/log/postgresql \
   occam-target-pg
-
-# Verify database cluster is ready
-pg_isready -h 127.0.0.1 -p 5432
 ```
 
-The container configures:
-- Unix sockets at `/var/run/postgresql` and `/tmp`.
-- `logging_collector = on` logging to `/var/log/postgresql/postgresql.log` with `log_statement = 'all'`, `log_min_messages = 'warning'`, and `log_file_mode = 0644`.
-- Template database `template_occam` and pre-created test database `occam_test`.
+Configures `logging_collector = on`, `log_file_mode = 0644`, `template_occam`, and `occam_test`.
 
-If the postmaster dies, the container exits; `--restart unless-stopped` or `reset_db.sh --container-name` brings it back.
+### MySQL 8.0 (`Dockerfile.target-mysql`)
 
----
-
-## 4. Target MySQL Image (`Dockerfile.target-mysql`)
-
-The MySQL image is pinned to MySQL Community Server 8.0.20 debug binaries on Ubuntu 18.04. Ubuntu 18.04 is EOL; the image is intended for isolated crash reproduction, not general use. For other MySQL versions, override `MYSQL_BUNDLE_URL` and update the pinned package names in the Dockerfile.
+Pinned to MySQL Community Server `8.0.20` debug binaries (`mysqld-debug`) on Ubuntu 18.04 (EOL; isolated crash reproduction only).
 
 ```bash
 docker build -t occam-target-mysql -f harness/Dockerfile.target-mysql .
-# Optional integrity check:
-#   --build-arg MYSQL_BUNDLE_SHA256=<sha256>
-
-docker run -d --name occam-target-mysql \
-  --restart unless-stopped \
+docker run -d --name occam-target-mysql --restart unless-stopped \
   -p 127.0.0.1:3306:3306 \
   -v /tmp/occam-mysql-log:/var/log/mysql \
   occam-target-mysql
 ```
 
-The entrypoint supervises `mysqld-debug` and restarts it after an assertion abort or signal. The error log is written to `/var/log/mysql/error.log` with `--log-error-verbosity=3`.
+The entrypoint supervises `mysqld-debug`, logs to `/var/log/mysql/error.log`, and restarts after assertion aborts or signals.
+
+### MariaDB (`Dockerfile.target-mariadb`)
+
+Builds MariaDB from source (default `10.5.8`) with `CMAKE_BUILD_TYPE=Debug` and optional `SANITIZER=asan`, supervising `mysqld` on port `3306` and `/var/log/mysql/error.log`.
+
+```bash
+docker build -t occam-target-mariadb -f harness/Dockerfile.target-mariadb .
+docker run -d --name occam-target-mariadb --restart unless-stopped \
+  -p 127.0.0.1:3307:3306 \
+  -v /tmp/occam-mariadb-log:/var/log/mysql \
+  occam-target-mariadb
+```
+
+### ClickHouse (`Dockerfile.target-clickhouse`)
+
+Installs pinned official ClickHouse `.deb` packages (default `26.8.44.3`, optional `INSTALL_DBG=1`), supervising `clickhouse-server` on native TCP port `9000` (HTTP `8123`) and `/var/log/clickhouse-server/clickhouse-server.err.log`.
+
+```bash
+docker build -t occam-target-clickhouse -f harness/Dockerfile.target-clickhouse .
+docker run -d --name occam-target-clickhouse --restart unless-stopped \
+  -p 127.0.0.1:9000:9000 \
+  -v /tmp/occam-ch-log:/var/log/clickhouse-server \
+  occam-target-clickhouse
+```
+
+### SQLite (`Dockerfile.target-sqlite`) & DuckDB (`Dockerfile.target-duckdb`)
+
+Both images run `occam-idle` (`target_idle.sh`) and execute probes in fresh `:memory:` processes via `/usr/local/bin/occam-exec` (`target_exec_embedded.sh`), with optional `SANITIZER=asan` (`ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:disable_coredump=1:symbolize=1"`). SQLite supports both release amalgamation zips (`SQLITE_VERSION` / `SQLITE_YEAR`) and Fossil snapshots (`SQLITE_REF`, e.g., `trunk:2020-02-10`).
+
+```bash
+docker build -t occam-target-sqlite -f harness/Dockerfile.target-sqlite .
+docker run -d --name occam-target-sqlite --restart unless-stopped occam-target-sqlite
+
+docker build -t occam-target-duckdb -f harness/Dockerfile.target-duckdb .
+docker run -d --name occam-target-duckdb --restart unless-stopped occam-target-duckdb
+```
 
 ---
 
-## 5. Crash Oracle (`crash_oracle.py`)
+## 4. Crash Oracle (`crash_oracle.py`)
 
-`harness/crash_oracle.py` connects to the target DBMS, runs candidate SQL from stdin, captures DBMS disconnects / backend crashes, reads only newly appended server-log bytes, and verifies the crash signature.
+`harness/crash_oracle.py` executes candidate SQL from stdin, collects server logs or embedded engine status/stderr, validates crash signatures, and extracts normalized crash signatures for deduplication and RQ3 slippage analysis.
 
 ### Arguments
 
-- `--dbms {postgres,mysql}`: Target DBMS (default: `postgres`, or `DBMS` env).
-- `--host`: DBMS host or PostgreSQL unix socket directory (default: `127.0.0.1`, or `PGHOST` / `MYSQL_HOST`).
-- `--port`: DBMS port (default: 5432 for PostgreSQL, 3306 for MySQL).
-- `--socket`: MySQL unix socket path (overrides `--host`/`--port`).
-- `--user`: DBMS user (default: `postgres` or `root`).
-- `--password`: DBMS password (prefer `PGPASSWORD` / `MYSQL_PWD`; the MySQL client receives it through `MYSQL_PWD`, not argv).
-- `--dbname`: Target test database (default: `occam_test`).
-- `--expected-signature`: Regex or literal substring to match in the **server log** (e.g. `TRAP: FailedAssertion` or `subselect.c:2883`). Invalid regexes fall back to literal matching and are marked in the decision log.
-- `--log-file`: Host path to the server log.
-- `--container-name`: Docker container name used to read logs via `docker exec` when the host path is unavailable.
+- `--dbms {postgres,mysql,mariadb,clickhouse,sqlite,duckdb}`: Target DBMS (default: `postgres`, or `DBMS` env).
+- `--host`: DBMS host or PostgreSQL unix socket directory (default: `127.0.0.1`, or `PGHOST` / `MYSQL_HOST` / `MARIADB_HOST` / `CLICKHOUSE_HOST`).
+- `--port`: DBMS port (default: `5432` postgres, `3306` mysql/mariadb, `9000` clickhouse).
+- `--socket`: MySQL/MariaDB unix socket path (overrides `--host`/`--port`).
+- `--user`: DBMS user (default: `postgres` / `root` / `default`).
+- `--password`: DBMS password (prefer `PGPASSWORD` / `MYSQL_PWD` / `MARIADB_PWD` / `CLICKHOUSE_PASSWORD` env vars).
+- `--dbname`: Target test database (default: `occam_test`; `:memory:` for embedded).
+- `--engine-bin`: Override embedded engine executable (`sqlite3` / `duckdb` locally, or `occam-exec` inside `--container-name`).
+- `--expected-signature`: Regex or literal substring to match in fault evidence (e.g., `TRAP: FailedAssertion` or `subselect.c:2883`). Invalid regexes fall back to literal matching and are marked in the decision log.
+- `--log-file`: Host path to the server log (server DBMSes).
+- `--container-name`: Docker container name (reads logs for server DBMSes; runs `occam-exec` for embedded DBMSes).
 - `--container-log`: Server log path inside the container.
 - `--decision-log`: Append JSON verdict records to this file.
-- `--timeout`: Optional standalone client timeout in seconds (default: 0 = disabled). Do not use under Occam; use Occam's `--timeout`.
-- `--allow-stderr-only`: Unsafe fallback for trusted, log-less setups.
+- `--baseline-signature`: Baseline normalized crash signature (`id`, `hash`, JSON string, or `.json`/`.jsonl` file path) for RQ3 slippage tracking (`BASELINE_SIGNATURE` env).
+- `--reject-on-slippage`: Reject faults (`exit 1`, `classification: "confirmed_fault"`, `reason: "signature-slippage"`) when the observed `crash_signature` differs from `--baseline-signature` (`ORACLE_REJECT_ON_SLIPPAGE` env).
+- `--stack-frames N`: Top-N non-wrapper stack frames retained in normalized crash signatures (default: `5`, or `ORACLE_STACK_FRAMES` env).
+- `--print-signature`: Print the extracted `crash_signature` JSON object to stdout on fault (off by default; for standalone triaging).
+- `--timeout`: Optional standalone client timeout in seconds (default: `0` = disabled). Do not use under Occam; use Occam's `--timeout`.
+- `--allow-stderr-only`: Unsafe fallback for trusted, log-less server setups.
 - `--allow-psql-meta`: Unsafe; allows psql backslash meta-commands. By default, candidates with line-leading `\` are rejected.
 - `--verbose`: Print acceptance/rejection diagnostics to stderr.
+
+### Structured Crash Signatures & Slippage Tracking (RQ3)
+
+Whenever a fault is detected, `crash_oracle.py` builds a deterministic `crash_signature` record in `--decision-log` (and optionally stdout with `--print-signature`), stripping volatile PIDs, timestamps, ASLR `0x...` addresses, build directory prefixes, and signal/sanitizer wrapper frames (`__asan_*`, `handle_fatal_signal`, `BaseDaemon`, `abort`, etc.):
+
+- **`id` / `hash`**: Canonical normalized identifier and 16-char SHA-256 hash across:
+  - Sanitizer findings (`asan:<kind>:<top_non_wrapper_frame>` / `ubsan:<kind>:<loc>`)
+  - Assertion identities (`assertion:<file>:<line>:<func>:<expr>`)
+  - Engine internal/logical/panic errors (`internal_error:<msg>`, `logical_error:<msg>`, `panic:<msg>`)
+  - Signals + top-N stack frames (`signal:<SIG>:<frame0>|...|<frameN-1>`)
+- **`slippage`**: When `--baseline-signature` is provided, logs `{"baseline", "observed_id", "observed_hash", "slipped", "match_type", "category_changed"}`. Without `--reject-on-slippage`, slippage is measured and logged passively; with `--reject-on-slippage`, any slipped crash is rejected (`reason: "signature-slippage"`).
 
 ### Standalone Testing
 
 ```bash
-# Test candidate against a running PostgreSQL container
+# PostgreSQL
 python3 harness/crash_oracle.py \
-  --host 127.0.0.1 \
-  --port 5432 \
-  --user postgres \
-  --dbname occam_test \
+  --dbms postgres --host 127.0.0.1 --port 5432 \
   --log-file /tmp/occam-pg-log/postgresql.log \
   --expected-signature "FailedAssertion.*subselect.c" \
   < candidate.sql
 
-echo "Oracle result: $?"
+# Embedded SQLite inside target container
+python3 harness/crash_oracle.py \
+  --dbms sqlite --container-name occam-target-sqlite \
+  --expected-signature "sqlite3VdbeExec" \
+  --print-signature \
+  < sqlite_case.sql
 ```
 
 ---
 
-## 6. State Reset (`reset_db.sh`)
+## 5. State Reset (`reset_db.sh`)
 
-`harness/reset_db.sh` restores the target database before each candidate execution.
+`harness/reset_db.sh` restores target database state before each candidate execution.
 
-- PostgreSQL: terminates active connections to `occam_test` and recreates it from `template_occam`.
-- MySQL: clears `read_only` / `super_read_only` globals, then drops and recreates `occam_test`. This is required for cases such as `mysql_bug_91975`, which sets `@@global.super_read_only = TRUE`.
-- If the server died from a prior candidate crash, waits for recovery or restarts the container/server.
-- Uses DBMS-aware environment defaults (`PGHOST` vs `MYSQL_HOST`, `PGPASSWORD` vs `MYSQL_PWD`) after parsing `--dbms`.
+- **PostgreSQL**: terminates active connections to `occam_test` and recreates it from `template_occam`.
+- **MySQL**: clears `super_read_only` / `read_only` globals (for cases such as `mysql_bug_91975`), then drops and recreates `occam_test`.
+- **MariaDB**: clears `read_only` (MariaDB lacks `super_read_only`), then drops and recreates `occam_test`.
+- **ClickHouse**: runs `DROP DATABASE IF EXISTS ... SYNC` followed by `CREATE DATABASE ...`.
+- **SQLite / DuckDB**: stateless per-probe execution; returns `0` immediately locally, or ensures the target container is running and responsive when `--container-name` is specified.
+- If a server/container died from a prior candidate crash, waits for recovery or restarts it within `--max-wait`.
 
 ```bash
-# Reset PostgreSQL database
-./harness/reset_db.sh --dbms postgres --host 127.0.0.1 --port 5432 \
-  --container-name occam-target-pg
-
-# Reset MySQL database
-./harness/reset_db.sh --dbms mysql --host 127.0.0.1 --port 3306 \
-  --container-name occam-target-mysql
+./harness/reset_db.sh --dbms postgres --container-name occam-target-pg
+./harness/reset_db.sh --dbms mariadb --container-name occam-target-mariadb
+./harness/reset_db.sh --dbms clickhouse --container-name occam-target-clickhouse
+./harness/reset_db.sh --dbms sqlite --container-name occam-target-sqlite
 ```
 
-**Limitations.** The reset is database-level, not cluster-level. PostgreSQL roles, extensions installed outside the database, other databases, and `postgresql.auto.conf` persist; MySQL global variables other than the read-only flags, users, grants, and other databases persist. Use a fresh container or restore the datadir from the image templates for full global-state isolation. MySQL has no `CREATE DATABASE ... TEMPLATE`; `template_occam` is only used by PostgreSQL.
+**Limitations.** Server resets are database-level, not cluster-level: roles, external extensions, other databases, and non-read-only global variables persist across candidates unless using fresh containers or template datadir restores.
 
-**Concurrency.** This harness is designed for `--jobs 1`. All workers would share the same `occam_test`; a reset from one worker can terminate another worker's connections. Do not use `--jobs > 1` without per-worker databases.
+**Concurrency.** Server-based targets are designed for `--jobs 1` when sharing `occam_test`; embedded targets (`sqlite`, `duckdb`) are stateless per probe, though container orchestration should still use per-worker containers or isolated databases when scaling `--jobs`.
 
 ---
 
-## 7. End-to-End Occam Reduction Example
+## 6. End-to-End Occam Reduction Example
 
 ```bash
 occam /path/to/crash_repro.sql \
-  --oracle "python3 harness/crash_oracle.py --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
+  --oracle "python3 harness/crash_oracle.py --dbms postgres --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
   --reset "./harness/reset_db.sh --dbms postgres --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
   --dialect postgres \
   --timeout 10 \
@@ -173,19 +218,19 @@ occam /path/to/crash_repro.sql \
 
 ---
 
-## 8. Security
+## 7. Security
 
 This harness executes untrusted SQL and is **not a sandbox**.
 
-- PostgreSQL containers use `trust` authentication and a superuser role; bind published ports to `127.0.0.1`, not all interfaces.
-- The oracle rejects line-leading psql backslash meta-commands by default, and passes `--binary-mode` to the MySQL client to disable `system`/`source`. `--allow-psql-meta` disables the psql protection.
-- Server-side `COPY ... FROM PROGRAM` can still execute commands as the DBMS superuser. Use a non-superuser role and container/network isolation for untrusted corpora.
-- MySQL passwords are passed through `MYSQL_PWD`, not `-p<password>` on argv. Prefer environment variables over `--password`.
+- Target containers use passwordless/trust authentication; bind published ports to `127.0.0.1`, not all interfaces.
+- `crash_oracle.py` rejects line-leading psql backslash meta-commands by default, and passes `--binary-mode` to MySQL/MariaDB clients to disable `system`/`source`. `--allow-psql-meta` disables the psql protection.
+- Server-side commands (`COPY ... FROM PROGRAM`, file/table functions) can still execute with DBMS process privileges. Use isolated containers and networks for untrusted corpora.
+- Passwords should be supplied through environment variables (`PGPASSWORD`, `MYSQL_PWD`, `MARIADB_PWD`, `CLICKHOUSE_PASSWORD`) rather than CLI `--password`.
 - Do not run this against a database you care about.
 
 ---
 
-## 9. Unit Tests
+## 8. Unit Tests
 
 ```bash
 python3 -m unittest discover -s harness -p "test_*.py" -v
@@ -193,4 +238,4 @@ python3 -m unittest discover -s harness -p "test_*.py" -v
 make harness-check
 ```
 
-The tests cover exit-code semantics, server-log-only crash evidence, log rotation/flush, decision logging, MySQL client hardening flags, `OCCAM_WORKDIR`, and container log mode. They do not need a built Occam binary or a real DBMS.
+The suite uses mock DBMS clients, mock embedded binaries, and mock `docker` commands (requiring neither a built `occam` binary nor live DBMS containers) to verify exit-code contracts, server-log-only evidence for `postgres`/`mysql`/`mariadb`/`clickhouse`, `occam-exec`/local execution and anti-spoofing for `sqlite`/`duckdb`, OOM/`SQLITE_ABORT` handling, RQ3 crash signature normalization and slippage tracking, and `reset_db.sh` state resets across all 6 DBMSes.

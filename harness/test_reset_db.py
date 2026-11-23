@@ -37,6 +37,18 @@ class TestResetDb(unittest.TestCase):
             "MYSQL_PWD",
             "MYSQL_DATABASE",
             "MYSQL_SOCKET",
+            "MARIADB_HOST",
+            "MARIADB_TCP_PORT",
+            "MARIADB_USER",
+            "MARIADB_PWD",
+            "MARIADB_DATABASE",
+            "MARIADB_UNIX_PORT",
+            "CLICKHOUSE_HOST",
+            "CLICKHOUSE_PORT",
+            "CLICKHOUSE_USER",
+            "CLICKHOUSE_PASSWORD",
+            "CLICKHOUSE_DATABASE",
+            "CLICKHOUSE_DB",
             "CONTAINER_NAME",
             "TEMPLATE_DB",
         ):
@@ -192,6 +204,186 @@ exit 0
             self.assertIn("/tmp/mysql.sock", argv)
             self.assertNotIn("-h", argv)
             self.assertNotIn("9999", argv)
+
+    def test_mariadb_clears_read_only_without_super_read_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            args_file = os.path.join(td, "args.txt")
+            sql_file = os.path.join(td, "sql.txt")
+            password_file = os.path.join(td, "password.txt")
+            self.write_mock(td, "mariadb-admin", "exit 0\n")
+            self.write_mock(
+                td,
+                "mariadb",
+                f"""printf '%s\\n' "$@" > {args_file}
+cat > {sql_file}
+printf '%s' "$MYSQL_PWD" > {password_file}
+exit 0
+""",
+            )
+            result = self.run_reset(
+                ["--dbms", "mariadb", "--password", "msecret"],
+                td,
+                env={
+                    "MYSQL_HOST": "mysql-host",
+                    "MARIADB_HOST": "maria-host",
+                    "MARIADB_DATABASE": "maria_db",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(args_file, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertIn("maria-host", argv)
+            self.assertNotIn("mysql-host", argv)
+            self.assertIn("--no-defaults", argv)
+            with open(password_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "msecret")
+            with open(sql_file, encoding="utf-8") as handle:
+                sql = handle.read()
+            self.assertIn("SET GLOBAL read_only = OFF;", sql)
+            self.assertNotIn("super_read_only", sql)
+            self.assertIn("DROP DATABASE IF EXISTS `maria_db`;", sql)
+            self.assertIn("CREATE DATABASE `maria_db`;", sql)
+
+    def test_mariadb_rejects_unsafe_database_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            called = os.path.join(td, "called")
+            self.write_mock(td, "mariadb-admin", f"touch {called}\nexit 0\n")
+            self.write_mock(td, "mariadb", f"touch {called}\nexit 0\n")
+            result = self.run_reset(
+                ["--dbms", "mariadb", "--dbname", "bad;name"],
+                td,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must match", result.stderr)
+            self.assertFalse(os.path.exists(called))
+
+    def test_clickhouse_uses_defaults_sync_drop_and_password(self):
+        with tempfile.TemporaryDirectory() as td:
+            args_file = os.path.join(td, "args.txt")
+            sql_file = os.path.join(td, "sql.txt")
+            password_file = os.path.join(td, "password.txt")
+            self.write_mock(
+                td,
+                "clickhouse-client",
+                f"""if echo "$*" | grep -q -- '--query'; then
+    exit 0
+fi
+printf '%s\\n' "$@" > {args_file}
+cat > {sql_file}
+printf '%s' "$CLICKHOUSE_PASSWORD" > {password_file}
+exit 0
+""",
+            )
+            result = self.run_reset(
+                ["--dbms", "clickhouse", "--password", "chsecret"],
+                td,
+                env={
+                    "PGHOST": "pg-host",
+                    "CLICKHOUSE_HOST": "ch-host",
+                    "CLICKHOUSE_PORT": "9001",
+                    "CLICKHOUSE_DATABASE": "ch_test",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(args_file, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertIn("--multiquery", argv)
+            self.assertIn("ch-host", argv)
+            self.assertIn("9001", argv)
+            self.assertNotIn("--password", argv)
+            self.assertNotIn("chsecret", argv)
+            self.assertNotIn("pg-host", argv)
+            with open(password_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "chsecret")
+            with open(sql_file, encoding="utf-8") as handle:
+                sql = handle.read()
+            self.assertIn("DROP DATABASE IF EXISTS `ch_test` SYNC;", sql)
+            self.assertIn("CREATE DATABASE `ch_test`;", sql)
+
+    def test_clickhouse_rejects_unsafe_database_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            called = os.path.join(td, "called")
+            self.write_mock(td, "clickhouse-client", f"touch {called}\nexit 0\n")
+            result = self.run_reset(
+                ["--dbms", "clickhouse", "--dbname", "bad-name"],
+                td,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must match", result.stderr)
+            self.assertFalse(os.path.exists(called))
+
+    def test_sqlite_and_duckdb_stateless_local_reset_exit_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            for dbms in ("sqlite", "duckdb"):
+                result = self.run_reset(["--dbms", dbms], td)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_embedded_container_mode_restarts_stopped_container_and_handles_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            started_flag = os.path.join(td, "started")
+            probe_sql_file = os.path.join(td, "probe.sql")
+            self.write_mock(
+                td,
+                "docker",
+                f"""if [ "$1" = "ps" ]; then
+    if [ -f {started_flag} ]; then
+        echo "occam-target-duckdb"
+    fi
+    exit 0
+fi
+if [ "$1" = "start" ] && [ "$2" = "occam-target-duckdb" ]; then
+    : > {started_flag}
+    exit 0
+fi
+if [ "$1" = "exec" ] && [ "$2" = "-i" ] && [ "$3" = "occam-target-duckdb" ] && [ "$4" = "occam-exec" ]; then
+    cat > {probe_sql_file}
+    exit 0
+fi
+exit 1
+""",
+            )
+            result = self.run_reset(
+                ["--dbms", "duckdb", "--container-name", "occam-target-duckdb", "--max-wait", "2"],
+                td,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.exists(started_flag))
+            with open(probe_sql_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read().strip(), "SELECT 1;")
+
+            # Running container whose occam-exec fails must NOT pass reset even if `true` would
+            self.write_mock(
+                td,
+                "docker",
+                """if [ "$1" = "ps" ]; then
+    echo "broken-sqlite"
+    exit 0
+fi
+if [ "$1" = "exec" ] && [ "$3" = "true" ]; then
+    exit 0
+fi
+exit 127
+""",
+            )
+            broken_res = self.run_reset(
+                ["--dbms", "sqlite", "--container-name", "broken-sqlite", "--max-wait", "1"],
+                td,
+            )
+            self.assertNotEqual(broken_res.returncode, 0)
+            self.assertIn("not ready", broken_res.stderr)
+
+            # Unresponsive container must fail nonzero after --max-wait
+            self.write_mock(
+                td,
+                "docker",
+                "exit 1\n",
+            )
+            fail_res = self.run_reset(
+                ["--dbms", "sqlite", "--container-name", "dead-sqlite", "--max-wait", "1"],
+                td,
+            )
+            self.assertNotEqual(fail_res.returncode, 0)
+            self.assertIn("not ready", fail_res.stderr)
 
 
 if __name__ == "__main__":
