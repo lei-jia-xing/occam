@@ -337,3 +337,138 @@ theorem closeSet_filter_reduction (G : DAG) (P : Program) (roots : List StmtId)
     (hne : closeSet G roots ≠ P.stmts) :
     (closeSet G roots).length < P.stmts.length ∧ isValidClosure G (closeSet G roots) :=
   ⟨sublist_length_lt hsub hne, closeSet_isValidClosure G roots hroots⟩
+
+/-- A statement owns the bytes from its start to the next statement's start,
+    or to end of input. Bytes before the first statement are a separate leading. -/
+abbrev StatementBytes := StmtId × List UInt8
+
+/-- Render candidate SQL from immutable statement segments. -/
+def renderSegments (leading : List UInt8) (segments : List StatementBytes)
+    (keep : StmtId → Bool) : List UInt8 :=
+  leading ++ ((segments.filter (fun s => keep s.1)).flatMap Prod.snd)
+
+/-- When a later candidate keeps only currently retained statements, rendering
+    can scan the compact retained segment list instead of the original list. -/
+theorem renderSegments_compact (leading : List UInt8) (segments : List StatementBytes)
+    (current keep : StmtId → Bool)
+    (hsubset : ∀ id, keep id = true → current id = true) :
+    renderSegments leading (segments.filter (fun s => current s.1)) keep =
+      renderSegments leading segments keep := by
+  unfold renderSegments
+  congr 2
+  induction segments with
+  | nil => rfl
+  | cons s rest ih =>
+    cases hk : keep s.1 with
+    | false => cases hc : current s.1 <;> simp [hk, hc, ih]
+    | true => simp [hk, hsubset s.1 hk, ih]
+
+/-- Candidate length can be computed from metadata without concatenating SQL. -/
+theorem renderSegments_length (leading : List UInt8) (segments : List StatementBytes)
+    (keep : StmtId → Bool) :
+    (renderSegments leading segments keep).length =
+      leading.length + (((segments.filter (fun s => keep s.1)).map
+        (fun s => s.2.length)).sum) := by
+  unfold renderSegments
+  simp only [List.length_append]
+  congr 1
+  generalize segments.filter (fun s => keep s.1) = retained
+  induction retained with
+  | nil => rfl
+  | cons s rest ih => simp [ih]
+
+/-- The byte savings equal the total length of segments removed from the
+    current candidate. This rule needs neither candidate to be rendered. -/
+theorem renderSegments_deleted_length (leading : List UInt8) (segments : List StatementBytes)
+    (current keep : StmtId → Bool)
+    (hsubset : ∀ id, keep id = true → current id = true) :
+    (renderSegments leading segments current).length =
+      (renderSegments leading segments keep).length +
+        (((segments.filter (fun s => current s.1 && !keep s.1)).map
+          (fun s => s.2.length)).sum) := by
+  simp only [renderSegments_length]
+  rw [Nat.add_assoc]
+  congr 1
+  induction segments with
+  | nil => rfl
+  | cons s rest ih =>
+    cases hk : keep s.1 with
+    | false =>
+      cases hc : current s.1 <;> simp [hk, hc, ih] <;> omega
+    | true => simp [hk, hsubset s.1 hk, ih, Nat.add_assoc]
+
+/-- Model the byte-surgery cursor. Retained bytes form an unflushed run;
+    removing a statement flushes the run and moves the cursor past its bytes. -/
+def renderSegmentRuns (keep : StmtId → Bool) (pending : List UInt8) :
+    List StatementBytes → List UInt8
+  | [] => pending
+  | (id, bytes) :: rest =>
+    if keep id then
+      renderSegmentRuns keep (pending ++ bytes) rest
+    else
+      pending ++ renderSegmentRuns keep [] rest
+
+theorem renderSegmentRuns_eq (keep : StmtId → Bool) (pending : List UInt8)
+    (segments : List StatementBytes) :
+    renderSegmentRuns keep pending segments = renderSegments pending segments keep := by
+  induction segments generalizing pending with
+  | nil => simp [renderSegmentRuns, renderSegments]
+  | cons s rest ih =>
+    obtain ⟨id, bytes⟩ := s
+    cases hk : keep id <;> simp [renderSegmentRuns, renderSegments, ih, hk, List.append_assoc]
+
+/-- Try a strictly smaller candidate before running the ordinary search.
+    The proposal source can be any function of the current SQL. -/
+def probeProposal (oracle : Oracle Program) (current proposal : Program)
+    (fallback : Unit → Program) : Program :=
+  if measure proposal < measure current && oracle proposal then proposal else fallback ()
+
+theorem probeProposal_rejected (oracle : Oracle Program) (current proposal : Program)
+    (fallback : Unit → Program) (hreject : oracle proposal = false) :
+    probeProposal oracle current proposal fallback = fallback () := by
+  simp [probeProposal, hreject]
+
+theorem probeProposal_valid_step (oracle : Oracle Program) (current proposal : Program)
+    (fallback : Unit → Program) (hcurrent : oracle current = true)
+    (hsmaller : measure proposal < measure current)
+    (haccept : oracle proposal = true) :
+    Step oracle current (probeProposal oracle current proposal fallback) := by
+  simpa [probeProposal, Step, hsmaller, haccept] using hcurrent
+
+/-- Retrying with a more conservative proposal preserves the ordinary
+    fallback if both proposals reject. -/
+theorem probeProposal_retry_rejected (oracle : Oracle Program)
+    (current primary retry : Program) (fallback : Unit → Program)
+    (hprimary : oracle primary = false) (hretry : oracle retry = false) :
+    probeProposal oracle current primary
+      (fun _ => probeProposal oracle current retry fallback) = fallback () := by
+  simp [probeProposal, hprimary, hretry]
+
+/-- A dominated proposal can be discarded before consulting the oracle. -/
+theorem probeProposal_not_smaller (oracle : Oracle Program) (current proposal : Program)
+    (fallback : Unit → Program) (h : measure current ≤ measure proposal) :
+    probeProposal oracle current proposal fallback = fallback () := by
+  simp [probeProposal, Nat.not_lt.mpr h]
+
+/-- A candidate retaining a particular statement must pay at least that
+    statement's segment length, regardless of which other statements remain. -/
+theorem renderSegments_retained_lower_bound (leading : List UInt8) (segments : List StatementBytes)
+    (keep : StmtId → Bool) (segment : StatementBytes)
+    (hmem : segment ∈ segments) (hkeep : keep segment.1 = true) :
+    segment.2.length ≤ (renderSegments leading segments keep).length := by
+  rw [renderSegments_length]
+  have hweight : segment.2.length ∈
+      (segments.filter (fun s => keep s.1)).map (fun s => s.2.length) :=
+    List.mem_map.2 ⟨segment, List.mem_filter.2 ⟨hmem, hkeep⟩, rfl⟩
+  have hsum : ∀ (weights : List Nat) (n : Nat), n ∈ weights → n ≤ weights.sum := by
+    intro weights
+    induction weights with
+    | nil => simp
+    | cons first rest ih =>
+      intro n hn
+      rcases List.mem_cons.1 hn with heq | hin
+      · simp [heq]
+      · have h := ih n hin
+        simp only [List.sum_cons]
+        omega
+  exact Nat.le_trans (hsum _ _ hweight) (Nat.le_add_left _ _)

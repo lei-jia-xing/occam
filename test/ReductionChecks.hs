@@ -129,6 +129,78 @@ tests =
                 "the first candidate is the backward slice of the result statement"
                 [sql, expected]
                 (take 2 attempted)
+        , testCase "A relaxed global slice requires oracle acceptance" $ do
+            let sql = "CREATE TABLE noise (x INT);SELECT sum(1);"
+                proposal = "SELECT sum(1);"
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                locate bytes = pure (if bytes == sql then Just (ResultStatement 2 1) else Nothing)
+                run acceptsProposal = do
+                    candidates <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' candidates (candidate :)
+                        pure $
+                            if candidate == sql || (acceptsProposal && candidate == proposal)
+                                then OracleAccepted
+                                else OracleRejected
+                    ReductionResult result _ <-
+                        reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+                    attempted <- reverse <$> readIORef candidates
+                    assertEqual "relaxed slice is the first proposal" [sql, proposal] (take 2 attempted)
+                    pure result
+            assertEqual "accepted proposal is used" proposal =<< run True
+            assertEqual "rejected proposal is discarded" sql =<< run False
+        , testCase "Rejected relaxed slice retries with opaque roots" $ do
+            let primary = "SELECT sum(1);"
+                retry = "SELECT sum(2);" <> primary
+                sql = "CREATE TABLE noise (x INT);" <> retry
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                locate bytes = pure (if bytes == sql then Just (ResultStatement 3 2) else Nothing)
+            attempts <- newIORef []
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' attempts (candidate :)
+                pure (if candidate == sql || candidate == retry then OracleAccepted else OracleRejected)
+            ReductionResult reduced _ <-
+                reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+            tested <- reverse <$> readIORef attempts
+            assertEqual "the retry retains the opaque producer" retry reduced
+            assertEqual "both proposals are independently checked" [sql, primary, retry] (take 3 tested)
+        , testCase "Prefix slice cannot displace a smaller accepted seed" $ do
+            let create = "CREATE TABLE t(x INT);"
+                noise = "CREATE TABLE noise(x INT);"
+                earlier = "SELECT x FROM t;"
+                seed = "SELECT 1000;"
+                prefix = "SELECT 0;" <> create <> noise <> earlier
+                sql = prefix <> seed
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                locate bytes = pure (if bytes == sql then Just (ResultStatement 5 4) else Nothing)
+            attempts <- newIORef []
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' attempts (candidate :)
+                pure
+                    (if candidate `elem` [sql, seed, prefix, create <> earlier] then OracleAccepted else OracleRejected)
+            ReductionResult result _ <-
+                reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+            tested <- readIORef attempts
+            assertEqual "the smaller accepted seed survives" seed result
+            assertBool "the prefix is observed" (prefix `elem` tested)
+            assertBool
+                "the larger slice is skipped even if it would accept"
+                ((create <> earlier) `notElem` tested)
+        , testCase "Accepted seed can dominate the entire prefix search" $ do
+            let earlier = "CREATE TABLE noise(x INT);"
+                seed = "SELECT 1;"
+                sql = earlier <> seed
+                config = defaultReductionConfig {reductionDialect = SQLite}
+                locate bytes = pure (if bytes == sql then Just (ResultStatement 2 1) else Nothing)
+            attempts <- newIORef []
+            pool <- outcomePool $ \candidate -> do
+                modifyIORef' attempts (candidate :)
+                pure (if candidate `elem` [sql, seed, earlier] then OracleAccepted else OracleRejected)
+            ReductionResult result _ <-
+                reduceSQLWithResultSlicing locate (const (pure ())) config nullLogger pool sql
+            tested <- readIORef attempts
+            assertEqual "the accepted seed survives" seed result
+            assertBool "the prefix cannot improve it" (earlier `notElem` tested)
         , testCase "Unaligned result statement metadata follows the last-statement search" $ do
             let sql = "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);"
                 expected = "SELECT 42 AS answer;"

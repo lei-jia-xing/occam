@@ -3,8 +3,11 @@ module Occam.Slicer (
     backwardSliceMany,
     backwardSliceFast,
     backwardSliceManyFast,
+    closeFromBoundary,
+    successorIndex,
 ) where
 
+import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
@@ -53,12 +56,34 @@ backwardSliceManyFast roots DependencyGraph {..}
                         else goLegacy (visited `Set.union` newNodes) (Set.foldl' (flip (:)) rest newNodes)
             legacyVisited = goLegacy legacyRoots (Set.toList legacyRoots)
          in IntSet.fromList (map unStatementId (Set.toList legacyVisited))
-    | otherwise = goFast roots (IntSet.toList roots)
+    | otherwise = visitPredecessors graphFastEdges roots roots
+
+successorIndex :: IntMap IntSet -> IntMap IntSet
+successorIndex = IntMap.foldlWithKey' addEdges IntMap.empty
     where
-        goFast !visited [] = visited
-        goFast !visited (curr : rest) =
-            let deps = IntMap.findWithDefault IntSet.empty curr graphFastEdges
+        addEdges index dependent =
+            IntSet.foldl'
+                (\acc predecessor -> IntMap.insertWith IntSet.union predecessor (IntSet.singleton dependent) acc)
+                index
+
+-- | Close a subset of an already closed set by scanning its deleted vertices.
+closeFromBoundary :: IntMap IntSet -> IntMap IntSet -> IntSet -> IntSet -> IntSet
+closeFromBoundary predecessors successors kept deleted =
+    visitPredecessors predecessors (IntSet.union kept boundary) boundary
+    where
+        boundary = IntSet.filter touchesKept deleted
+        touchesKept sid =
+            not (IntSet.disjoint kept (IntMap.findWithDefault IntSet.empty sid successors))
+
+-- Vertices already in the retained set need no visit when starting from the
+-- boundary, since all their missing direct predecessors are boundary roots.
+visitPredecessors :: IntMap IntSet -> IntSet -> IntSet -> IntSet
+visitPredecessors predecessors initialVisited roots = go initialVisited (IntSet.toList roots)
+    where
+        go !visited [] = visited
+        go !visited (curr : rest) =
+            let deps = IntMap.findWithDefault IntSet.empty curr predecessors
                 newNodes = deps `IntSet.difference` visited
              in if IntSet.null newNodes
-                    then goFast visited rest
-                    else goFast (visited `IntSet.union` newNodes) (IntSet.foldl' (flip (:)) rest newNodes)
+                    then go visited rest
+                    else go (visited `IntSet.union` newNodes) (IntSet.foldl' (flip (:)) rest newNodes)

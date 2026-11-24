@@ -354,3 +354,198 @@ theorem closeSet_via_boundary (G : DAG) (kept boundary : List StmtId)
   · rintro (hx | hx)
     · exact roots_subset_closeSet G kept hx
     · exact closeSet_minimal G boundary _ hboundaryInClosure hclosed hx
+
+/-- Suppress predecessor edges whose destination is already kept. -/
+def missingPredecessorDAG (G : DAG) (kept : List StmtId) : DAG where
+  stmts := G.stmts
+  deps v := (G.deps v).filter (fun u => u ∉ kept)
+  deps_temporal v hv u hu := G.deps_temporal v hv u (List.mem_filter.1 hu).1
+
+/-- The boundary walk may stop at retained vertices. Any missing predecessors
+    behind those vertices are already included among the boundary roots. -/
+theorem closeSet_via_missing_predecessors (G : DAG) (kept boundary : List StmtId)
+    (hkept : kept ⊆ G.stmts)
+    (hboundary : ∀ u, u ∈ boundary ↔ u ∉ kept ∧ ∃ v ∈ kept, u ∈ G.deps v)
+    (x : StmtId) :
+    x ∈ closeSet G kept ↔
+      x ∈ kept ∨ x ∈ closeSet (missingPredecessorDAG G kept) boundary := by
+  let missing := missingPredecessorDAG G kept
+  have hboundaryStmts : boundary ⊆ missing.stmts := by
+    intro u hu
+    obtain ⟨_, v, hv, hdep⟩ := (hboundary u).1 hu
+    exact (G.deps_temporal v (hkept hv) u hdep).2
+  have hboundaryInClosure : boundary ⊆ closeSet G kept := by
+    intro u hu
+    obtain ⟨_, v, hv, hdep⟩ := (hboundary u).1 hu
+    exact closeSet_isValidClosure G kept hkept v (roots_subset_closeSet G kept hv) u hdep
+  have hkeepUnion : kept ⊆ kept ++ closeSet missing boundary :=
+    fun _ hv => List.mem_append.2 (Or.inl hv)
+  constructor
+  · intro hx
+    have hclosedUnion : isValidClosure G (kept ++ closeSet missing boundary) := by
+      intro v hv u hdep
+      by_cases hu : u ∈ kept
+      · exact hkeepUnion hu
+      · apply List.mem_append.2 ∘ Or.inr
+        rcases List.mem_append.1 hv with hv | hv
+        · exact roots_subset_closeSet missing boundary ((hboundary u).2 ⟨hu, v, hv, hdep⟩)
+        · apply closeSet_isValidClosure missing boundary hboundaryStmts v hv u
+          exact List.mem_filter.2 ⟨hdep, by simpa using hu⟩
+    exact List.mem_append.1 (closeSet_minimal G kept _ hkeepUnion hclosedUnion hx)
+  · rintro (hx | hx)
+    · exact roots_subset_closeSet G kept hx
+    · apply closeSet_minimal missing boundary _ hboundaryInClosure _ hx
+      intro v hv u hu
+      exact closeSet_isValidClosure G kept hkept v hv u (List.mem_filter.1 hu).1
+
+/-- A graph can replace a direct edge by a path without losing reachability. -/
+theorem reachable_of_edge_paths (G H : DAG)
+    (hpaths : ∀ v u, u ∈ G.deps v → Reachable H u v)
+    {u v : StmtId} (h : Reachable G u v) : Reachable H u v := by
+  induction h with
+  | refl => exact Reachable.refl
+  | @step v w hw _ ih => exact reachable_trans H ih (hpaths v w hw)
+
+/-- An edge-pruned graph with a replacement path for every original edge
+    yields the same candidate closures for every valid root set. -/
+theorem closeSet_eq_of_edge_pruning (G H : DAG) (roots : List StmtId)
+    (hG : roots ⊆ G.stmts) (hH : roots ⊆ H.stmts)
+    (hsub : ∀ v u, u ∈ H.deps v → u ∈ G.deps v)
+    (hpaths : ∀ v u, u ∈ G.deps v → Reachable H u v)
+    (x : StmtId) : x ∈ closeSet G roots ↔ x ∈ closeSet H roots := by
+  rw [closeSet_reachability G hG, closeSet_reachability H hH]
+  constructor
+  · rintro ⟨r, hr, hx⟩
+    exact ⟨r, hr, reachable_of_edge_paths G H hpaths hx⟩
+  · rintro ⟨r, hr, hx⟩
+    exact ⟨r, hr, reachable_of_edge_paths H G
+      (fun v u h => Reachable.step (hsub v u h) Reachable.refl) hx⟩
+
+/-- All two-hop shortcuts may be removed at once. Even if a witness edge
+    is also removed, it spans fewer statement IDs than the shortcut. -/
+theorem closeSet_eq_of_two_hop_pruning (G H : DAG) (roots : List StmtId)
+    (hG : roots ⊆ G.stmts) (hH : roots ⊆ H.stmts)
+    (hsub : ∀ v u, u ∈ H.deps v → u ∈ G.deps v)
+    (hpruned : ∀ v ∈ G.stmts, ∀ u ∈ G.deps v,
+      u ∈ H.deps v ∨ ∃ w ∈ G.deps v, u ∈ G.deps w)
+    (x : StmtId) : x ∈ closeSet G roots ↔ x ∈ closeSet H roots := by
+  have hpaths : ∀ n v u, v - u = n → v ∈ G.stmts → u ∈ G.deps v → Reachable H u v := by
+    intro n
+    induction n using Nat.strongRecOn with
+    | ind n ih =>
+      intro v u hspan hv hu
+      rcases hpruned v hv u hu with hkept | ⟨w, hw, huw⟩
+      · exact Reachable.step hkept Reachable.refl
+      · obtain ⟨hwv, hwm⟩ := G.deps_temporal v hv w hw
+        have huwlt : u < w := (G.deps_temporal w hwm u huw).1
+        subst n
+        have leftSpan : w - u < v - u := by
+          simp only [StmtId] at *
+          omega
+        have rightSpan : v - w < v - u := by
+          simp only [StmtId] at *
+          omega
+        exact reachable_trans H
+          (ih (w - u) leftSpan w u rfl hwm huw)
+          (ih (v - w) rightSpan v w rfl hv hw)
+  constructor
+  · intro hx
+    rw [closeSet_reachability G hG] at hx
+    obtain ⟨r, hr, hreach⟩ := hx
+    rw [closeSet_reachability H hH]
+    refine ⟨r, hr, ?_⟩
+    have hlocal : ∀ v ∈ G.stmts, Reachable G x v → Reachable H x v := by
+      intro v hv h
+      induction h with
+      | refl => exact Reachable.refl
+      | @step v w hw _ ih =>
+        have hwm := (G.deps_temporal v hv w hw).2
+        exact reachable_trans H (ih hwm) (hpaths (v - w) v w rfl hv hw)
+    exact hlocal r (hG hr) hreach
+  · intro hx
+    rw [closeSet_reachability H hH] at hx
+    obtain ⟨r, hr, hreach⟩ := hx
+    rw [closeSet_reachability G hG]
+    exact ⟨r, hr, reachable_of_edge_paths H G
+      (fun v u h => Reachable.step (hsub v u h) Reachable.refl) hreach⟩
+
+/-- Remove a direct edge if the original graph has a two-edge witness. -/
+def pruneTwoHopEdges (G : DAG) : DAG where
+  stmts := G.stmts
+  deps v := (G.deps v).filter fun u => !(G.deps v).any fun w => (G.deps w).contains u
+  deps_temporal v hv u hu := G.deps_temporal v hv u (List.mem_filter.1 hu).1
+
+theorem closeSet_pruneTwoHopEdges (G : DAG) (roots : List StmtId)
+    (hroots : roots ⊆ G.stmts) (x : StmtId) :
+    x ∈ closeSet G roots ↔ x ∈ closeSet (pruneTwoHopEdges G) roots := by
+  apply closeSet_eq_of_two_hop_pruning G (pruneTwoHopEdges G) roots hroots hroots
+  · intro v u hu
+    exact (List.mem_filter.1 hu).1
+  · intro v _ u hu
+    change (u ∈ (G.deps v).filter
+      (fun u => !(G.deps v).any (fun w => (G.deps w).contains u))) ∨ _
+    by_cases witness : (G.deps v).any (fun w => (G.deps w).contains u) = true
+    · exact Or.inr (by simpa using witness)
+    · exact Or.inl (List.mem_filter.2 ⟨hu, by simpa using witness⟩)
+
+/-- Use at most one witness per vertex. The chosen witness is retained by
+    temporal ordering, and only predecessors shared with it are removed. -/
+def pruneViaWitness (G : DAG) (witness : StmtId → StmtId) : DAG where
+  stmts := G.stmts
+  deps v :=
+    if witness v ∈ G.deps v then
+      (G.deps v).filter (fun u => u ∉ G.deps (witness v))
+    else
+      G.deps v
+  deps_temporal v hv u hu := by
+    apply G.deps_temporal v hv u
+    split at hu
+    · exact (List.mem_filter.1 hu).1
+    · exact hu
+
+theorem closeSet_pruneViaWitness (G : DAG) (witness : StmtId → StmtId)
+    (roots : List StmtId) (hroots : roots ⊆ G.stmts) (x : StmtId) :
+    x ∈ closeSet G roots ↔ x ∈ closeSet (pruneViaWitness G witness) roots := by
+  apply closeSet_eq_of_two_hop_pruning G (pruneViaWitness G witness) roots hroots hroots
+  · intro v u hu
+    change u ∈ (if witness v ∈ G.deps v then
+      (G.deps v).filter (fun u => u ∉ G.deps (witness v)) else G.deps v) at hu
+    split at hu
+    · exact (List.mem_filter.1 hu).1
+    · exact hu
+  · intro v _ u hu
+    change u ∈ (if witness v ∈ G.deps v then
+      (G.deps v).filter (fun u => u ∉ G.deps (witness v)) else G.deps v) ∨ _
+    split
+    · rename_i hw
+      by_cases hdep : u ∈ G.deps (witness v)
+      · exact Or.inr ⟨witness v, hw, hdep⟩
+      · exact Or.inl (List.mem_filter.2 ⟨hu, by simpa using hdep⟩)
+    · exact Or.inl hu
+
+/-- Validating a projected closure needs only a containment check. If the
+    projection is closed and still contains the roots, minimality forces it
+    to contain the entire original closure. -/
+theorem projected_closeSet_closed_iff_subset (G : DAG) (roots current : List StmtId)
+    (hroots : roots ⊆ G.stmts) (hcurrent : roots ⊆ current) :
+    isValidClosure G ((closeSet G roots).filter (fun u => u ∈ current)) ↔
+      closeSet G roots ⊆ current := by
+  constructor
+  · intro hclosed u hu
+    have hprojected : roots ⊆ (closeSet G roots).filter (fun v => v ∈ current) := by
+      intro v hv
+      exact List.mem_filter.2 ⟨roots_subset_closeSet G roots hv, by simpa using hcurrent hv⟩
+    have hu' := closeSet_minimal G roots _ hprojected hclosed hu
+    simpa using (List.mem_filter.1 hu').2
+  · intro hsubset v hv u hdep
+    have hu := closeSet_isValidClosure G roots hroots v (List.mem_filter.1 hv).1 u hdep
+    exact List.mem_filter.2 ⟨hu, by simpa using hsubset hu⟩
+
+/-- Adding opaque statements to the proposal roots can only add statements
+    to the proposal closure. -/
+theorem closeSet_mono_roots (G : DAG) (roots larger : List StmtId)
+    (hlarger : larger ⊆ G.stmts) (hsubset : roots ⊆ larger) :
+    closeSet G roots ⊆ closeSet G larger :=
+  closeSet_minimal G roots (closeSet G larger)
+    (fun _ hr => roots_subset_closeSet G larger (hsubset hr))
+    (closeSet_isValidClosure G larger hlarger)

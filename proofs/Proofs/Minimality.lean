@@ -342,3 +342,148 @@ theorem isClosureOneMinimal_of_isOneMinimal (G : DAG) (O : Oracle (List StmtId))
   intro s hs
   rw [hrem_closed s hs]
   exact Or.inl (hmin.2 s hs)
+
+/-- Filtering conclusive rejections by candidate bytes preserves the first
+    accepted candidate, including its position relative to other accepts. -/
+theorem find?_skip_known_rejections {Candidate Key : Type}
+    (candidates : List Candidate) (key : Candidate → Key)
+    (oracle rejected : Key → Bool)
+    (sound : ∀ k, rejected k = true → oracle k = false) :
+    (candidates.filter (fun c => !rejected (key c))).find? (oracle ∘ key) =
+      candidates.find? (oracle ∘ key) := by
+  rw [List.find?_filter]
+  congr 1
+  funext c
+  cases h : rejected (key c)
+  · rfl
+  · simpa using (sound _ h).symm
+
+/-- A deletion rejected for the old program can succeed after another
+    deletion. This predicate accepts only the original, the intermediate
+    candidate, and the candidate following both deletions. -/
+theorem rejected_deletion_can_succeed_after_shrink :
+    ∃ (oracle : List StmtId → Bool) (before after : List StmtId) (first next : StmtId),
+      oracle before = true ∧ first ∈ before ∧ next ∈ before ∧
+      after = removeStmt next before ∧ oracle after = true ∧ first ∈ after ∧
+      oracle (removeStmt first before) = false ∧ oracle (removeStmt first after) = true := by
+  refine ⟨(fun ids => ids == [1, 2, 3] || ids == [1, 3] || ids == [3]),
+    [1, 2, 3], [1, 3], 1, 2, ?_⟩
+  decide
+
+/-- An all-rejected candidate prefix returns the newly accepted key when
+    exactly one of its keys changes verdict. -/
+theorem find?_flip_rejected {Key : Type} [DecidableEq Key]
+    (oracle : Key → Bool) (rejected : List Key) (missing : Key)
+    (hall : ∀ k ∈ rejected, oracle k = false) (hmem : missing ∈ rejected) :
+    rejected.find? (fun k => if k = missing then true else oracle k) = some missing := by
+  induction rejected with
+  | nil => simp at hmem
+  | cons k rest ih =>
+    have hk := hall k (by simp)
+    by_cases heq : k = missing
+    · simp [heq]
+    · have hrest : missing ∈ rest := (List.mem_cons.1 hmem).resolve_left (Ne.symm heq)
+      rw [List.find?_cons, ite_eq_right heq, hk]
+      exact ih (fun j hj => hall j (by simp [hj])) hrest
+
+/-- An unobserved key earlier than the first acceptance cannot be skipped by
+    an equivalent black-box search. Two oracles agree on every observed key
+    but choose different candidates. -/
+theorem find?_unobserved_rejection_is_necessary {Key : Type} [DecidableEq Key]
+    (oracle : Key → Bool) (earlier later : List Key) (observed : List Key)
+    (chosen missing : Key)
+    (hreject : ∀ k ∈ earlier, oracle k = false) (haccept : oracle chosen = true)
+    (hmem : missing ∈ earlier) (hunobserved : missing ∉ observed) :
+    ∃ other : Key → Bool,
+      (∀ k ∈ observed, other k = oracle k) ∧
+      (earlier ++ chosen :: later).find? oracle = some chosen ∧
+      (earlier ++ chosen :: later).find? other = some missing ∧ missing ≠ chosen := by
+  let other := fun k => if k = missing then true else oracle k
+  have hnone : earlier.find? oracle = none :=
+    List.find?_eq_none.2 (fun k hk => by simp [hreject k hk])
+  refine ⟨other, ?_, ?_, ?_, ?_⟩
+  · intro k hk
+    have hne : k ≠ missing := fun heq => hunobserved (heq ▸ hk)
+    simp [other, hne]
+  · simp [List.find?_append, hnone, haccept]
+  · change (earlier ++ chosen :: later).find? (fun k => if k = missing then true else oracle k) = _
+    rw [List.find?_append, find?_flip_rejected oracle earlier missing hreject hmem]
+    rfl
+  · intro heq
+    have hfalse := hreject missing hmem
+    rw [heq, haccept] at hfalse
+    exact Bool.noConfusion hfalse
+
+/-- The same indistinguishability remains when an entire search pass rejects.
+    A missing observation can hide an accepted candidate. -/
+theorem find?_unobserved_failure_is_necessary {Key : Type} [DecidableEq Key]
+    (candidates observed : List Key) (missing : Key)
+    (hmem : missing ∈ candidates) (hunobserved : missing ∉ observed) :
+    ∃ oracle other : Key → Bool,
+      (∀ k ∈ observed, other k = oracle k) ∧
+      candidates.find? oracle = none ∧ candidates.find? other = some missing := by
+  let oracle : Key → Bool := fun _ => false
+  let other := fun k => if k = missing then true else oracle k
+  refine ⟨oracle, other, ?_, ?_, find?_flip_rejected oracle candidates missing (by simp [oracle]) hmem⟩
+  · intro k hk
+    have hne : k ≠ missing := fun heq => hunobserved (heq ▸ hk)
+    simp [other, hne]
+  · exact List.find?_eq_none.2 (by simp [oracle])
+
+/-- At partition sizes 4, 2, and 1, all contiguous chunk deletions can
+    reject even when retaining the last size-2 chunk succeeds. A final
+    single-statement audit cannot recover this missed candidate. -/
+theorem complements_can_miss_accepted_suffix :
+    ∃ oracle : List StmtId → Bool,
+      let input : List StmtId := [1, 2, 3, 4, 5, 6, 7, 8]
+      let suffix : List StmtId := [7, 8]
+      oracle input = true ∧ oracle suffix = true ∧
+      ([4, 2, 1] : List Nat).all (fun width =>
+        (List.range (8 / width)).all (fun i =>
+          !oracle ((input.take (i * width)) ++ input.drop ((i + 1) * width)))) = true ∧
+      auditPass oracle input = none := by
+  refine ⟨(fun ids => ids == [1, 2, 3, 4, 5, 6, 7, 8] || ids == [7, 8]), ?_⟩
+  decide
+
+/-- Keep the last result set from a list of statement observations. -/
+def lastStatementResult {Result : Type} (observations : List (Option Result)) : Option Result :=
+  observations.foldl (fun last next => next.or last) none
+
+/-- A native certificate that every statement in an exact prefix produced
+    no result is sufficient to reject that prefix for a result contract. -/
+theorem result_prefix_rejects_of_no_observations {Result : Type}
+    (observations : List (Option Result)) (expected : Result)
+    (noResults : ∀ observation ∈ observations, observation = none) :
+    lastStatementResult observations ≠ some expected := by
+  have allNone : lastStatementResult observations = none := by
+    induction observations with
+    | nil => rfl
+    | cons first rest ih =>
+      have hfirst := noResults first (by simp)
+      have hrest := ih (fun observation hmem => noResults observation (by simp [hmem]))
+      simpa [lastStatementResult, hfirst] using hrest
+  simp [allNone]
+
+/-- Statement count and last-result position do not identify the first
+    result. Two traces can agree on both yet differ on a prefix verdict. -/
+theorem last_result_location_does_not_certify_no_result_prefix :
+    ∃ a b : List (Option Nat),
+      a.length = b.length ∧ a.getLast? = some (some 7) ∧ b.getLast? = some (some 7) ∧
+      lastStatementResult a = lastStatementResult b ∧
+      lastStatementResult (a.take 1) ≠ lastStatementResult (b.take 1) := by
+  refine ⟨[some 7, some 7], [none, some 7], ?_⟩
+  decide
+
+/-- Deleting a preceding statement can change the observation of a
+    retained statement. A no-result flag from the full run needs a
+    context-invariance proof before it can reject arbitrary subsequences. -/
+theorem observed_no_result_need_not_survive_deletion :
+    ∃ step : Bool → Bool → Bool × Option Nat,
+      let first := step false false
+      let second := step first.1 true
+      let originalResult := step second.1 false
+      second.2 = none ∧ originalResult.2 = some 7 ∧ (step false true).2 = some 7 := by
+  refine ⟨(fun state stmt =>
+    if stmt then (state, if state then none else some 7)
+    else (true, if state then some 7 else none)), ?_⟩
+  decide

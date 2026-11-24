@@ -54,7 +54,7 @@ import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.List (find, partition, sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isNothing, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -63,9 +63,12 @@ import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (
+    BarrierScope (GlobalScope),
     Ident (..),
     OracleOutcome (..),
     ResultStatement (..),
+    ScopedBarrier (barrierScope),
+    SemanticFacts (factBarriers),
     SessionInit (..),
     Span (..),
     Statement (..),
@@ -76,6 +79,7 @@ import Occam.Core (
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
+    buildGraph,
  )
 import Occam.Facts (editCategoryName)
 import Occam.Logger (Logger, logDebug', logInfo', logWarn, nullLogger)
@@ -113,6 +117,8 @@ import Occam.Slicer (
     backwardSliceFast,
     backwardSliceMany,
     backwardSliceManyFast,
+    closeFromBoundary,
+    successorIndex,
  )
 
 -- | Column co-reduction mode: disabled, single-site, or atomic multi-site bundles.
@@ -475,6 +481,15 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
         initialSetIsClosed = isValidClosureFast graph (statementIdsInt initialStatements)
+        predecessors = graphFastEdges graph
+        successors = successorIndex predecessors
+        closeCandidate current seed
+            | initialSetIsClosed
+            , not (IntMap.null predecessors)
+            , let deleted = current `IntSet.difference` seed
+            , IntSet.size deleted < IntSet.size seed =
+                closeFromBoundary predecessors successors seed deleted
+            | otherwise = closeSetFast graph seed
         buildCandidate currentInts seedInts = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
             cached <- readIORef closureCache
@@ -484,14 +499,15 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
                         modifyIORef' closureStats (\stats -> stats {closureCacheHits = closureCacheHits stats + 1})
                         pure result
                     Nothing -> do
-                        let result = closeSetFast graph seedInts
+                        let result = closeCandidate currentInts seedInts
                         modifyIORef' closureCache (HashMap.insert seedInts result)
                         pure result
             -- A seed is a subset of the current set. If the initial set was
             -- closed, the seed closure stays inside it, and each accepted
             -- closure keeps the same invariant for the next search pass.
-            let keptInts
-                    | initialSetIsClosed = closedInts
+            let contained = initialSetIsClosed || closedInts `IntSet.isSubsetOf` currentInts
+                keptInts
+                    | contained = closedInts
                     | otherwise = closedInts `IntSet.intersection` currentInts
                 added = keptInts `IntSet.difference` seedInts
                 gainedBytes = sum [IntMap.findWithDefault 0 sid weights | sid <- IntSet.toList added]
@@ -503,9 +519,8 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
                         , closureGainBytes = closureGainBytes stats + gainedBytes
                         }
                 )
-            if initialSetIsClosed || isValidClosureFast graph keptInts
-                then pure (Just keptInts)
-                else pure Nothing
+            -- A closed projection containing the seed must contain its entire closure.
+            pure (if contained then Just closedInts else Nothing)
     result <-
         searchStatements
             policy
@@ -926,6 +941,7 @@ findInterestingPrefixThrough pool baseSQL statements limit =
 data SQLAnalysis = SQLAnalysis
     { analyzedStatements :: ![Statement]
     , analyzedGraph :: !DependencyGraph
+    , analyzedSession :: !SessionInit
     }
 
 analyzeSQL :: StatementParser -> Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
@@ -954,7 +970,12 @@ analyzeSQL parse logger dialect sql = do
         , ("barrier_edges", toJSON barrierEdges)
         , ("dialect", toJSON (T.pack (show dialect)))
         ]
-    pure SQLAnalysis {analyzedStatements = statements, analyzedGraph = graph}
+    pure
+        SQLAnalysis
+            { analyzedStatements = statements
+            , analyzedGraph = graph
+            , analyzedSession = initialSession
+            }
 
 -- | Slice SQL statements using a precomputed dependency analysis.
 sliceWithAnalysis ::
@@ -968,46 +989,72 @@ sliceWithAnalysis logger pool analysis observedResult sql =
     case seedTarget of
         Nothing -> keep sql
         Just seedStatement -> do
-            let (seedRetained, seedCandidateRaw) = sliceFor seedStatement
-            seedCandidate <- timeStatementBuild (poolMetricsStore pool) seedCandidateRaw
-            seedAccepted <-
-                if BS.length seedCandidate < BS.length sql
+            let (conservativeRetained, conservativeBytes) = sliceFor graph seedStatement
+                useRelaxed =
+                    BS.length conservativeBytes >= BS.length sql
+                        && graphHasGlobalBarrier graph
+                        && isJust resultTarget
+                primary
+                    | useRelaxed = sliceFor proposalGraph seedStatement
+                    | otherwise = (conservativeRetained, conservativeBytes)
+                primaryStrategy
+                    | useRelaxed = "result-statement-without-global-barriers"
+                    | otherwise = seedStrategy
+                trySeed (retained, candidateRaw) = do
+                    candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
+                    if BS.length candidate < BS.length sql
+                        then do
+                            reportCandidateCount pool candidate (length retained)
+                            oracleAccepts (poolOracle pool) candidate
+                        else pure False
+            primaryAccepted <- trySeed primary
+            (seedAccepted, (seedRetained, seedCandidate), strategy) <-
+                if useRelaxed && not primaryAccepted
                     then do
-                        reportCandidateCount pool seedCandidate (length seedRetained)
-                        oracleAccepts (poolOracle pool) seedCandidate
-                    else pure False
+                        let roots = IntSet.insert (unStatementId (stmtId seedStatement)) opaqueRoots
+                            retainingOpaque = renderSlice (backwardSliceManyFast roots proposalGraph)
+                        accepted <- if snd retainingOpaque == snd primary then pure False else trySeed retainingOpaque
+                        pure (accepted, retainingOpaque, "result-statement-with-opaque-roots")
+                    else pure (primaryAccepted, primary, primaryStrategy)
             let prefixLimit = case (seedAccepted, resultTarget) of
                     (True, Just (index, _)) -> index
                     _ -> length statements
-                tryPrefix bestCandidate = do
-                    (maybeTarget, prefixTests) <- findInterestingPrefixThrough pool sql statements prefixLimit
-                    case maybeTarget of
-                        Nothing -> pure bestCandidate
-                        Just (targetStatement, prefixSQL, prefixLength) -> do
-                            let (retained, candidateRaw) = sliceFor targetStatement
-                            candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
-                            if BS.length candidate >= BS.length sql
-                                then pure bestCandidate
-                                else do
-                                    let reusedPrefixResult = candidate == prefixSQL
-                                    ok <-
-                                        if reusedPrefixResult
-                                            then pure True
-                                            else do
-                                                reportCandidateCount pool candidate (length retained)
-                                                oracleAccepts (poolOracle pool) candidate
-                                    logDebug'
-                                        logger
-                                        "reducer"
-                                        "Prefix oracle result considered for backward slice"
-                                        [ ("prefix_tests", toJSON prefixTests)
-                                        , ("prefix_length", toJSON prefixLength)
-                                        , ("prefix_result_reused", toJSON reusedPrefixResult)
-                                        ]
-                                    let bestLen = maybe (BS.length sql) BS.length bestCandidate
-                                    if ok && BS.length candidate < bestLen
-                                        then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
-                                        else pure bestCandidate
+                tryPrefix bestCandidate
+                    | Just best <- bestCandidate
+                    , prefixSlicesCannotImprove prefixLimit (BS.length best) = do
+                        recordGeneratedSkipped (poolMetricsStore pool) "prefix-search-cannot-improve"
+                        pure bestCandidate
+                    | otherwise = do
+                        (maybeTarget, prefixTests) <- findInterestingPrefixThrough pool sql statements prefixLimit
+                        case maybeTarget of
+                            Nothing -> pure bestCandidate
+                            Just (targetStatement, prefixSQL, prefixLength) -> do
+                                let (retained, candidateRaw) = sliceFor graph targetStatement
+                                candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
+                                let bestLen = maybe (BS.length sql) BS.length bestCandidate
+                                if BS.length candidate >= bestLen
+                                    then do
+                                        recordGeneratedSkipped (poolMetricsStore pool) "prefix-slice-cannot-improve"
+                                        pure bestCandidate
+                                    else do
+                                        let reusedPrefixResult = candidate == prefixSQL
+                                        ok <-
+                                            if reusedPrefixResult
+                                                then pure True
+                                                else do
+                                                    reportCandidateCount pool candidate (length retained)
+                                                    oracleAccepts (poolOracle pool) candidate
+                                        logDebug'
+                                            logger
+                                            "reducer"
+                                            "Prefix oracle result considered for backward slice"
+                                            [ ("prefix_tests", toJSON prefixTests)
+                                            , ("prefix_length", toJSON prefixLength)
+                                            , ("prefix_result_reused", toJSON reusedPrefixResult)
+                                            ]
+                                        if ok
+                                            then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                            else pure bestCandidate
             let initialBest = if seedAccepted then Just seedCandidate else Nothing
             better <- tryPrefix initialBest
             case better of
@@ -1015,7 +1062,7 @@ sliceWithAnalysis logger pool analysis observedResult sql =
                     | Just result /= initialBest -> keep result
                 _ ->
                     if seedAccepted
-                        then acceptSlice seedStrategy seedStatement seedRetained seedCandidate >>= keep
+                        then acceptSlice strategy seedStatement seedRetained seedCandidate >>= keep
                         else keep sql
     where
         statements = analyzedStatements analysis
@@ -1031,10 +1078,37 @@ sliceWithAnalysis logger pool analysis observedResult sql =
             Nothing -> (lastMay statements, "last-statement")
         keep result =
             pure (result, if result == sql then Just analysis else Nothing)
-        sliceFor target =
-            let sliceInts = backwardSliceFast (unStatementId (stmtId target)) graph
-                retained = filter (\s -> IntSet.member (unStatementId (stmtId s)) sliceInts) statements
-             in (retained, cutRemovedStatementInts sql statements sliceInts)
+        -- Use the relaxed graph only to propose candidate bytes. A global
+        -- barrier can carry real effects, so the oracle still decides.
+        statementFacts =
+            [ (stmtId stmt, facts)
+            | stmt <- statements
+            , Just facts <- [Map.lookup (stmtId stmt) (graphFacts graph)]
+            ]
+        isGlobal = (== GlobalScope) . barrierScope
+        opaqueRoots =
+            IntSet.fromList
+                [unStatementId sid | (sid, facts) <- statementFacts, any isGlobal (factBarriers facts)]
+        proposalGraph =
+            buildGraph
+                (analyzedSession analysis)
+                [ (sid, facts {factBarriers = filter (not . isGlobal) (factBarriers facts)})
+                | (sid, facts) <- statementFacts
+                ]
+        sliceFor dependencyGraph target =
+            renderSlice (backwardSliceFast (unStatementId (stmtId target)) dependencyGraph)
+        renderSlice sliceInts =
+            ( filter (\s -> IntSet.member (unStatementId (stmtId s)) sliceInts) statements
+            , cutRemovedStatementInts sql statements sliceInts
+            )
+        -- Every backward slice retains its root and therefore its source
+        -- bytes through the next statement start. If no root can beat the
+        -- incumbent, the prefix search cannot contribute an improvement.
+        prefixSlicesCannotImprove limit incumbent =
+            let starts = map (spanStartByte . stmtSpan) statements
+                ends = drop 1 starts ++ [BS.length sql]
+             in and (zipWith (<=) (0 : starts) (starts ++ [BS.length sql]))
+                    && all (>= incumbent) (take limit (zipWith (-) ends starts))
         acceptSlice strategy target retained candidate = do
             let StatementId targetId = stmtId target
             logInfo'

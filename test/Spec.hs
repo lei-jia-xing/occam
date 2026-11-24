@@ -11,6 +11,7 @@ import Data.ByteString.Lazy qualified as BSL
 import Data.Char (isSpace)
 import Data.Graph qualified as Graph
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IntSet qualified as IntSet
 import Data.List (isInfixOf, subsequences)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
@@ -1899,8 +1900,12 @@ prop_closeSetReachability (SmallFactGraph rawFacts) =
     let graph = buildFactGraph rawFacts
         expectedByTarget = backwardReachabilityOracle graph
         rootSets = map Set.fromList (subsequences (Set.toList (graphStmts graph)))
+        predecessors = graphFastEdges graph
+        successors = successorIndex predecessors
+        asInts = IntSet.fromList . map unStatementId . Set.toList
+        allIds = asInts (graphStmts graph)
         mismatches =
-            [ (roots, actual, expected)
+            [ (roots, actual, boundaryActual, expected)
             | roots <- rootSets
             , let actual = closeSet graph roots
                   expected =
@@ -1908,10 +1913,13 @@ prop_closeSetReachability (SmallFactGraph rawFacts) =
                         [ Map.findWithDefault Set.empty root expectedByTarget
                         | root <- Set.toList roots
                         ]
-            , actual /= expected
+                  kept = asInts roots
+                  boundaryActual =
+                    closeFromBoundary predecessors successors kept (allIds `IntSet.difference` kept)
+            , actual /= expected || boundaryActual /= asInts expected
             ]
      in counterexample
-            ("closeSet differs from reachability (roots, actual, expected): " ++ show mismatches)
+            ("closeSet differs from reachability (roots, actual, boundary actual, expected): " ++ show mismatches)
             (null mismatches)
 
 propertyTests :: TestTree
