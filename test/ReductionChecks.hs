@@ -46,6 +46,7 @@ import Occam.Reducer (
     StageEvent (..),
     StatementSearchPolicy (..),
     applyParserEdits,
+    closureDdmin,
     defaultReductionConfig,
     findInterestingPrefix,
     reduceSQL,
@@ -55,6 +56,7 @@ import Occam.Reducer (
     selectIndependentEdits,
     statementAudit,
     statementDdmin,
+    statementDdminWithOrder,
  )
 import System.Exit (ExitCode (..))
 import Test.Tasty (TestTree, testGroup)
@@ -295,6 +297,45 @@ tests =
                 case (elemIndex complement tested, elemIndex expected tested) of
                     (Just complementOrdinal, Just subsetOrdinal) -> complementOrdinal < subsetOrdinal
                     _ -> False
+        , testCase "Closure search validates candidates from a nonclosed input set" $ do
+            let prefix = "CREATE TABLE t(x INT);"
+                dependent = "SELECT x FROM t;"
+                independent = "SELECT 1;"
+                sql = prefix <> dependent <> independent
+            parsed <- parseSQL (defaultParseOptions SQLite) sql
+            case parsed of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right input -> do
+                    let units = parsedUnits input
+                        graph = analyzeStatements (parsedInitialSession input) units
+                        supplied = map unitStatement (drop 1 units)
+                    attempts <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' attempts (candidate :)
+                        pure OracleAccepted
+                    _ <- closureDdmin pool sql supplied graph
+                    tested <- readIORef attempts
+                    assertBool
+                        "a candidate with no missing predecessors is tried"
+                        ((prefix <> independent) `elem` tested)
+                    assertBool
+                        "a candidate with a missing predecessor is skipped"
+                        ((prefix <> dependent) `notElem` tested)
+        , testCase "Byte-weighted singleton deletion resumes and wraps around" $ do
+            let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                firstAccepted = "SELECT 10;SELECT 20;SELECT 30;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                nextDeletion = "SELECT 10;SELECT 20;SELECT 30;SELECT 60;SELECT 70;SELECT 80;"
+                afterWrap = "SELECT 20;SELECT 30;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+            attempts <- newIORef []
+            pool <- outcomePool $ \sql -> do
+                modifyIORef' attempts (sql :)
+                pure (if sql `elem` [original, firstAccepted, afterWrap] then OracleAccepted else OracleRejected)
+            reduced <- statementDdminWithOrder StatementByteWeighted SQLite pool original
+            assertEqual "the earlier deletion is retried on the smaller script" afterWrap reduced
+            tested <- reverse <$> readIORef attempts
+            let afterFirst = drop 1 (dropWhile (/= firstAccepted) tested)
+            assertEqual "search resumes after the removed statement" [nextDeletion] (take 1 afterFirst)
+            assertBool "search wraps back to the first statement" (afterWrap `elem` afterFirst)
         , testCase "Single-statement audit can miss a nonadjacent pair" $ do
             let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
                 original = BSC.concat statements

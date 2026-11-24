@@ -49,7 +49,7 @@ import Data.ByteString qualified as BS
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.List (find, partition, sortOn)
@@ -304,6 +304,27 @@ parseUnitsOrThrow store options sql = do
         Left parserError -> ioError (userError ("SQL parser transport failure: " ++ show parserError))
         Right result -> pure (parsedInitialSession result, parsedUnits result, parsedColumns result)
 
+type StatementParser = ByteString -> IO (SessionInit, [StatementUnit])
+
+parseStatements :: Maybe MetricsStore -> SQLDialect -> StatementParser
+parseStatements store dialect sql = do
+    (session, units, _) <- parseUnitsOrThrow store (defaultParseOptions dialect) sql
+    pure (session, units)
+
+-- Share the latest statement parse between reduction stages. Reparse after
+-- any byte change, since statement boundaries and session facts may change.
+reuseStatementParse :: StatementParser -> IO StatementParser
+reuseStatementParse parse = do
+    latest <- newIORef Nothing
+    pure $ \sql -> do
+        cached <- readIORef latest
+        case cached of
+            Just (previous, parsed) | previous == sql -> pure parsed
+            _ -> do
+                parsed <- parse sql
+                writeIORef latest (Just (sql, parsed))
+                pure parsed
+
 -- | Parse options for syntax-level rewrites.
 syntaxParseOptions :: SQLDialect -> ParseOptions
 syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True, parseSyntaxEdits = True}
@@ -453,7 +474,8 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
-        buildCandidate current seedInts = do
+        initialSetIsClosed = isValidClosureFast graph (statementIdsInt initialStatements)
+        buildCandidate currentInts seedInts = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
             cached <- readIORef closureCache
             closedInts <-
@@ -465,8 +487,12 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
                         let result = closeSetFast graph seedInts
                         modifyIORef' closureCache (HashMap.insert seedInts result)
                         pure result
-            let currentInts = statementIdsInt current
-                keptInts = closedInts `IntSet.intersection` currentInts
+            -- A seed is a subset of the current set. If the initial set was
+            -- closed, the seed closure stays inside it, and each accepted
+            -- closure keeps the same invariant for the next search pass.
+            let keptInts
+                    | initialSetIsClosed = closedInts
+                    | otherwise = closedInts `IntSet.intersection` currentInts
                 added = keptInts `IntSet.difference` seedInts
                 gainedBytes = sum [IntMap.findWithDefault 0 sid weights | sid <- IntSet.toList added]
             modifyIORef'
@@ -477,8 +503,8 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
                         , closureGainBytes = closureGainBytes stats + gainedBytes
                         }
                 )
-            if isValidClosureFast graph keptInts
-                then pure (Just (filter (\s -> IntSet.member (unStatementId (stmtId s)) keptInts) current))
+            if initialSetIsClosed || isValidClosureFast graph keptInts
+                then pure (Just keptInts)
                 else pure Nothing
     result <-
         searchStatements
@@ -548,11 +574,10 @@ searchStatements policy buildCandidate pool baseSQL allStatements initialStateme
         allStatements
         initialStatements
 
-type CandidateBuilder = [Statement] -> IntSet.IntSet -> IO (Maybe [Statement])
+type CandidateBuilder = IntSet.IntSet -> IntSet.IntSet -> IO (Maybe IntSet.IntSet)
 
 plainCandidate :: CandidateBuilder
-plainCandidate current keptInts =
-    pure (Just (filter (\s -> IntSet.member (unStatementId (stmtId s)) keptInts) current))
+plainCandidate _ keptInts = pure (Just keptInts)
 
 -- | Classified seeds: previously accepted seeds commit; fresh seeds test in order.
 data SeedToken
@@ -568,31 +593,58 @@ searchDDMin ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin policy feedback buildCandidate pool baseSQL allStatements = go 2
+searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
+    go
+        2
+        Nothing
+        (BS.length (cutRemovedStatementInts baseSQL allStatements (statementIdsInt initial)))
+        initial
     where
         jobs = poolJobCount pool
-        go _ [] = pure []
-        go granularity current = do
+        go _ _ _ [] = pure []
+        go granularity resumeAfter currentLen current = do
             let n = min (length current) (max 1 granularity)
-                chunks = case policy of
-                    StatementByteWeighted -> partitionStatementsByBytes n current
-                    _ -> partitionChunks n current
                 currentInts = statementIdsInt current
-                currentSQL = cutRemovedStatementInts baseSQL allStatements currentInts
-                currentLen = BS.length currentSQL
-                subset = (2, trySubsets current currentInts currentLen chunks)
-                complement = (max 2 (n - 1), tryComplements current currentInts currentLen chunks)
-                schedule = if policy == StatementSubsetFirst then [subset, complement] else [complement, subset]
-            trySchedule current n schedule
+                chunks count = case policy of
+                    StatementByteWeighted -> partitionStatementsByBytes count current
+                    _ -> partitionChunks count current
+                lanes count =
+                    let groups = chunks count
+                        resume = policy == StatementByteWeighted
+                        orderedGroups
+                            | resume
+                            , Just anchor <- resumeAfter =
+                                -- Keep every candidate in the pass, wrapping back to earlier groups.
+                                let (before, after) = span (all ((<= anchor) . stmtId)) groups
+                                 in after ++ before
+                            | otherwise = groups
+                     in ( (2, False, trySubsets current currentInts currentLen groups)
+                        , (max 2 (count - 1), resume, tryComplements current currentInts currentLen orderedGroups)
+                        )
+                counts = granularities (length current) n
+                schedule = case policy of
+                    StatementSubsetFirst -> concatMap (\count -> let (subset, complement) = lanes count in [subset, complement]) counts
+                    _ -> concatMap (\count -> let (subset, complement) = lanes count in [complement, subset]) counts
+            trySchedule current currentLen schedule
 
-        trySchedule current n []
-            | n < length current = go (min (length current) (2 * n)) current
-            | otherwise = pure current
-        trySchedule current n ((next, search) : rest) = do
+        granularities limit n
+            | n < limit = n : granularities limit (min limit (2 * n))
+            | otherwise = [n]
+
+        trySchedule current _ [] = pure current
+        trySchedule current currentLen ((next, resume, search) : rest) = do
             reduced <- search
             case reduced of
-                Just accepted -> go next accepted
-                Nothing -> trySchedule current n rest
+                Just (accepted, saved) ->
+                    let anchor
+                            | resume
+                            , Just (removed, remaining) <-
+                                IntSet.minView (statementIdsInt current `IntSet.difference` statementIdsInt accepted)
+                            , IntSet.null remaining =
+                                Just (StatementId removed)
+                            | otherwise = Nothing
+                     in go next anchor (currentLen - saved) accepted
+                Nothing -> trySchedule current currentLen rest
 
         trySubsets current currentInts currentLen chunks =
             trySeeds TagStatementSubset current currentInts currentLen (map statementIdsInt chunks)
@@ -622,11 +674,11 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements = go 2
                 testAndContinue batch rest barrier = do
                     accepted <- testBatch tag currentLen batch
                     case accepted of
-                        Just kept -> pure (Just kept)
+                        Just result -> pure (Just result)
                         Nothing -> case barrier of
                             Just (kept, saved) -> do
                                 recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
-                                pure (Just kept)
+                                pure (Just (kept, saved))
                             Nothing -> pull rest
 
         testBatch _ _ [] = pure Nothing
@@ -637,8 +689,9 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements = go 2
             mapM_ recordRetired retired
             case listToMaybe [candidate | (candidate, (outcome, _)) <- retired, outcome == OracleAccepted] of
                 Just (kept, sql) -> do
-                    recordAcceptedBytesSaved (poolMetricsStore pool) tag (currentLen - BS.length sql)
-                    pure (Just kept)
+                    let saved = currentLen - BS.length sql
+                    recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
+                    pure (Just (kept, saved))
                 Nothing -> pure Nothing
 
         recordRetired ((_, sql), (outcome, _)) =
@@ -648,11 +701,15 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements = go 2
         classifySeed tag current currentInts currentLen seedInts
             | seedInts == currentInts = pure Nothing
             | otherwise = do
-                maybeKept <- buildCandidate current seedInts
-                case maybeKept of
+                projection <- buildCandidate currentInts seedInts
+                case projection of
                     Nothing -> pure Nothing
-                    Just kept -> do
-                        let projected = statementIdsInt kept
+                    Just projected
+                        | projected == currentInts -> do
+                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                            pure Nothing
+                    Just projected -> do
+                        let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
                         candidateSQL <-
                             timeTaggedStatementBuild
                                 (poolMetricsStore pool)
@@ -681,12 +738,17 @@ statementDdmin = statementDdminWithOrder StatementSubsetFirst
 
 statementDdminWithOrder ::
     StatementSearchPolicy -> SQLDialect -> OraclePool -> ByteString -> IO ByteString
-statementDdminWithOrder policy dialect pool initialSQL = do
+statementDdminWithOrder policy dialect pool =
+    statementDdminWithParser policy (parseStatements (poolMetricsStore pool) dialect) pool
+
+statementDdminWithParser ::
+    StatementSearchPolicy -> StatementParser -> OraclePool -> ByteString -> IO ByteString
+statementDdminWithParser policy parse pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then pure initialSQL
         else do
-            (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
+            (_, units) <- parse initialSQL
             let allStatements = map unitStatement units
             reduced <-
                 searchStatements policy plainCandidate pool initialSQL allStatements allStatements
@@ -698,12 +760,17 @@ statementAudit dialect pool initialSQL = fst <$> statementAuditWithLogger nullLo
 
 statementAuditWithLogger ::
     Logger -> SQLDialect -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
-statementAuditWithLogger logger dialect pool initialSQL = do
+statementAuditWithLogger logger dialect pool =
+    statementAuditWithParser logger (parseStatements (poolMetricsStore pool) dialect) pool
+
+statementAuditWithParser ::
+    Logger -> StatementParser -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
+statementAuditWithParser logger parse pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     outcome <-
         if initialOK
             then do
-                (_, units, _) <- parseUnitsOrThrow (poolMetricsStore pool) (defaultParseOptions dialect) initialSQL
+                (_, units) <- parse initialSQL
                 let statements = map unitStatement units
                 loop initialSQL statements (statementIdsInt statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
@@ -861,10 +928,10 @@ data SQLAnalysis = SQLAnalysis
     , analyzedGraph :: !DependencyGraph
     }
 
-analyzeSQL :: Maybe MetricsStore -> Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
-analyzeSQL store logger dialect sql = do
+analyzeSQL :: StatementParser -> Logger -> SQLDialect -> ByteString -> IO SQLAnalysis
+analyzeSQL parse logger dialect sql = do
     started <- getMonotonicTimeNSec
-    (initialSession, units, _) <- parseUnitsOrThrow store (defaultParseOptions dialect) sql
+    (initialSession, units) <- parse sql
     let statements = map unitStatement units
         graph = analyzeStatements initialSession units
     graph `seq` pure ()
@@ -1035,9 +1102,11 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
         then do
             logWarn logger "reducer" "Initial SQL candidate failed oracle check"
             pure (ReductionResult initialSQL Nothing)
-        else loop (1 :: Int) initialSQL Nothing
+        else do
+            parse <- reuseStatementParse (parseStatements (poolMetricsStore pool) (reductionDialect config))
+            loop parse (1 :: Int) initialSQL Nothing
     where
-        loop iteration currentSQL priorEvidence = do
+        loop parse iteration currentSQL priorEvidence = do
             logInfo'
                 logger
                 "reducer"
@@ -1046,9 +1115,17 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
                 , ("current_bytes", toJSON (BS.length currentSQL))
                 ]
             (nextSQL, evidence) <-
-                reduceIterationWithEvidence resultStatement reporter config logger pool currentSQL priorEvidence
+                reduceIterationWithEvidence
+                    resultStatement
+                    reporter
+                    config
+                    logger
+                    pool
+                    parse
+                    currentSQL
+                    priorEvidence
             if BS.length nextSQL < BS.length currentSQL
-                then loop (iteration + 1) nextSQL evidence
+                then loop parse (iteration + 1) nextSQL evidence
                 else do
                     logInfo'
                         logger
@@ -1069,14 +1146,15 @@ reduceIterationWithEvidence ::
     ReductionConfig ->
     Logger ->
     OraclePool ->
+    StatementParser ->
     ByteString ->
     Maybe ReductionEvidence ->
     IO (ByteString, Maybe ReductionEvidence)
-reduceIterationWithEvidence resultStatement reporter config logger pool initialSQL priorEvidence = do
+reduceIterationWithEvidence resultStatement reporter config logger pool parse initialSQL priorEvidence = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedReductionStage reporter logger StageSlicing initialSQL do
-                analysis <- analyzeSQL (poolMetricsStore pool) logger (reductionDialect config) initialSQL
+                analysis <- analyze initialSQL
                 observedResult <- resultStatement initialSQL
                 sliceWithAnalysis logger pool analysis observedResult initialSQL
             else pure (initialSQL, Nothing)
@@ -1101,7 +1179,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                 pure (out, ())
             else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
                 out <-
-                    statementDdminWithOrder (reductionStatementSearch config) (reductionDialect config) pool searchInput
+                    statementDdminWithParser (reductionStatementSearch config) parse pool searchInput
                 pure (out, ())
     fallback <-
         if reductionClosure config
@@ -1111,11 +1189,11 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
             else pure searched
     interleaveStages fallback
     where
-        analyze = analyzeSQL (poolMetricsStore pool) logger (reductionDialect config)
+        analyze = analyzeSQL parse logger (reductionDialect config)
 
         unrestrictedSearch sql =
             fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do
-                out <- statementDdminWithOrder (reductionStatementSearch config) (reductionDialect config) pool sql
+                out <- statementDdminWithParser (reductionStatementSearch config) parse pool sql
                 pure (out, ())
 
         interleaveStages base
@@ -1130,7 +1208,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
                 (True, False) -> do
                     (result, stats) <-
                         timedReductionStage reporter logger StageStatementAudit base do
-                            (r, s) <- statementAuditWithLogger logger (reductionDialect config) pool base
+                            (r, s) <- statementAuditWithParser logger parse pool base
                             pure (r, s)
                     pure (result, Just (ReductionEvidence result (auditMinimalityConfirmed stats)))
                 (False, True) -> do
@@ -1155,7 +1233,7 @@ reduceIterationWithEvidence resultStatement reporter config logger pool initialS
         interleaveFixedPoint iter current = do
             (afterAudit, auditStats) <-
                 timedReductionStage reporter logger StageStatementAudit current do
-                    (r, s) <- statementAuditWithLogger logger (reductionDialect config) pool current
+                    (r, s) <- statementAuditWithParser logger parse pool current
                     pure (r, s)
             afterSyntax <-
                 fst <$> timedReductionStage reporter logger StageIntraStatementRewrites afterAudit do
