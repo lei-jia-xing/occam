@@ -815,17 +815,44 @@ tests =
                     assertEqual (show dialect <> " candidate bytes and endpoint") full incremental
                 )
                 cases
+        , testCase "Trailing SELECT clause shifts preserve the full syntax-reparse candidate order" $ do
+            let original =
+                    "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12 ORDER BY a, b LIMIT 10; SELECT 12345 AS c;"
+                withoutLimit =
+                    "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12 ORDER BY a, b; SELECT 12345 AS c;"
+                withoutOrder =
+                    "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12; SELECT 12345 AS c;"
+                afterLiteralChange =
+                    "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12; SELECT 0 AS c;"
+                accepted = [original, withoutLimit, withoutOrder, afterLiteralChange]
+                run fullReparse = do
+                    candidates <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' candidates (candidate :)
+                        pure (if candidate `elem` accepted then OracleAccepted else OracleRejected)
+                    let cfg =
+                            defaultReductionConfig
+                                { reductionDialect = SQLite
+                                , reductionIntraStatement = True
+                                , reductionFullSyntaxReparse = fullReparse
+                                }
+                    reduced <- reduceSQLWithConfig cfg nullLogger pool original
+                    trace <- reverse <$> readIORef candidates
+                    pure (reduced, trace)
+            fast@(endpoint, _) <- run False
+            assertEqual "both trailing clauses and the later literal are removed" afterLiteralChange endpoint
+            assertEqual "same ordered candidate bytes" fast =<< run True
         , testCase "applyParserEdits and selectIndependentEdits enforce disjoint non-gluing boundaries" $ do
             let sql = "CREATE TABLE t (a VARCHAR(20) NOT NULL, b BIGINT DEFAULT 1);"
                 -- a: VARCHAR(20) [18..29) -> "INT", NOT NULL [29..38) -> ""
                 -- b: BIGINT [42..48) -> "INT", DEFAULT 1 [48..58) -> ""
-                eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type" False
-                eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type" False
-                eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint" False
-                eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type" False
-                eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint" False
-                gluedA = ParserEdit 18 23 "AA" EditExpression "test" False
-                gluedB = ParserEdit 23 29 "BB" EditExpression "test" False
+                eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type" False False
+                eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type" False False
+                eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint" False False
+                eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type" False False
+                eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint" False False
+                gluedA = ParserEdit 18 23 "AA" EditExpression "test" False False
+                gluedB = ParserEdit 23 29 "BB" EditExpression "test" False False
             assertEqual
                 "applyParserEdits applies adjacent replacement + deletion cleanly"
                 (Just "CREATE TABLE t (a INT, b INT);")
@@ -841,7 +868,7 @@ tests =
             assertEqual
                 "applyParserEdits rejects out-of-bounds spans"
                 Nothing
-                (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob" False])
+                (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob" False False])
             let selected = selectIndependentEdits [eTypeAText, eTypeA, gluedA, gluedB, eTypeB]
             assertEqual
                 "selectIndependentEdits picks highest-savings non-overlapping non-gluing set"

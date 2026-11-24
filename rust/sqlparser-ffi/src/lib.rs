@@ -13,6 +13,7 @@ mod columns;
 mod edits;
 mod ffi;
 mod ir;
+mod oracle;
 mod parser;
 mod pure;
 mod source;
@@ -117,6 +118,10 @@ struct NativeEdit {
     /// to strictly reduce result column arity).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     top_level_projection: bool,
+    /// When this clause ends the outer SELECT, deleting it preserves the
+    /// grammar and bindings of all surviving children.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    tail_clause: bool,
 }
 
 #[cfg(test)]

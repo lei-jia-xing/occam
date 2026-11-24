@@ -2860,6 +2860,39 @@ updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedB
                     (any (\site -> siteStart site >= oldStart && siteStart site < oldEnd) . targetSites)
                     currentBundles
 
+{- | Drop a parser-certified trailing SELECT clause. The parser certifies that
+it ends at a token boundary and cannot change the surviving query children.
+Any enclosing edit requires recomputation even though its children survive.
+-}
+shiftTailClauseSnapshot ::
+    SyntaxContext ->
+    [StatementUnit] ->
+    ParserEdit ->
+    Maybe ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+shiftTailClauseSnapshot context units edit
+    | syntaxMode context /= ColumnOff || not (parserEditTailClause edit) = Nothing
+    | otherwise = do
+        (before, unit : after) <- pure (break endsAtCut units)
+        facts <- unitFacts unit
+        let survivors = filter ((< cutStart) . parserEditStart) (factEdits facts)
+        if any ((> cutStart) . parserEditEnd) survivors
+            then Nothing
+            else
+                let statement = unitStatement unit
+                    Span start _ = stmtSpan statement
+                    shortened =
+                        statement {stmtSpan = Span start cutStart, stmtRaw = BS.take (cutStart - start) (stmtRaw statement)}
+                    updated = unit {unitStatement = shortened, unitFacts = Just facts {factEdits = survivors}}
+                    fresh = before ++ updated : map (shiftStatementUnit (cutStart - cutEnd)) after
+                    edits = concatMap (maybe [] (filter (syntaxShouldRun context) . factEdits) . unitFacts) fresh
+                 in Just (fresh, groupSyntaxEdits edits, [])
+    where
+        cutStart = parserEditStart edit
+        cutEnd = parserEditEnd edit
+        endsAtCut unit =
+            let Span start end = stmtSpan (unitStatement unit)
+             in start < cutStart && end == cutEnd
+
 {- | Exact zero-FFI span shift for an accepted scalar leaf literal edit during
 the final 'EditLiteral' sweep. Mirrors Rust @add_scalar_edit@ exactly for
 follow-up replacements on the edited literal and shifts all later spans by
@@ -3284,6 +3317,10 @@ exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category 
                             logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
                             (freshUnits, freshPhases, freshBundles) <- case candidate of
                                 SingleCandidate edit
+                                    | not (syntaxFullReparse context)
+                                    , category == EditClause
+                                    , Just shifted <- shiftTailClauseSnapshot context currentUnits edit ->
+                                        pure shifted
                                     | not (syntaxFullReparse context)
                                     , category == EditLiteral
                                     , Just shifted <- shiftLiteralSnapshot currentUnits currentPhases currentBundles edit ->

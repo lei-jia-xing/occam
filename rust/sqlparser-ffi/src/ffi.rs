@@ -134,6 +134,44 @@ unsafe fn put_bytes(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize)
     }
 }
 
+/// Returns an exact native cache key (mode 0) or DuckDB replay units (mode 1).
+/// An unsupported input has a null, empty result.
+///
+/// # Safety
+/// Input must point to valid bytes of the given length, and both output
+/// pointers must be writable. A nonempty result must be freed by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn occam_sql_oracle_source(
+    dialect: u32,
+    mode: u32,
+    data: *const u8,
+    len: usize,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) {
+    if data.is_null() || out_data.is_null() || out_len.is_null() {
+        return;
+    }
+    unsafe {
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let sql = std::str::from_utf8(std::slice::from_raw_parts(data, len)).ok()?;
+            let kind = dialect_from_code(dialect)?;
+            match mode {
+                0 => crate::oracle::cache_key(sql, kind),
+                1 if kind == DialectKind::DuckDB => {
+                    serde_json::to_vec(&crate::oracle::duckdb_replay_units(sql)?).ok()
+                }
+                _ => None,
+            }
+        }));
+        put_bytes(
+            payload.ok().flatten().unwrap_or_default(),
+            out_data,
+            out_len,
+        );
+    }
+}
+
 /// Parses SQL with a JSON-encoded `ParseConfig` and returns the binary-encoded `NativeResponse`.
 ///
 /// # Parameters

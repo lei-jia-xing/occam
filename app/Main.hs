@@ -32,6 +32,7 @@ import Occam.Evaluation (
     Stats (..),
     metricPolicyForReduction,
     parseSQLDialect,
+    runEvaluationRequestWithNativeObserver,
     runEvaluationRequestWithObserver,
     sqlDialectName,
  )
@@ -1063,7 +1064,10 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     result <-
         withCandidateWorkdir $ \tmpDir -> do
             let checkpointPath = tmpDir </> "occam-checkpoint.sql"
-            runEvaluationRequestWithObserver
+                runEvaluation
+                    | isNothing oracleCmd = runEvaluationRequestWithNativeObserver
+                    | otherwise = runEvaluationRequestWithObserver
+            runEvaluation
                 timeoutMicros
                 observer
                 EvaluationRequest

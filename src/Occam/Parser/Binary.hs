@@ -524,20 +524,17 @@ lblRemoveWindowPartitionByExpression = "remove-window_partition_by_expression"
 getVec :: Decoder a -> Decoder [a]
 getVec (Decoder item) = Decoder $ \bs len pos -> case unDec getInt32 bs len pos of
     (# err | #) -> (# err | #)
-    (# | (# count, pos0 #) #) ->
-        if count < 0 || count > I# (len -# pos0)
+    (# | (# I# count, pos0 #) #) ->
+        if isTrue# (count <# 0#) || isTrue# (len -# pos0 <# count)
             then (# "invalid vector length in binary stream" | #)
-            else case count of
-                0 -> (# | (# [], pos0 #) #)
-                1 -> case item bs len pos0 of
-                    (# err | #) -> (# err | #)
-                    (# | (# x, p1 #) #) -> (# | (# [x], p1 #) #)
-                _ -> go count [] pos0
+            else go count pos0
         where
-            go 0 acc p = (# | (# reverse acc, p #) #)
-            go k acc p = case item bs len p of
+            go 0# p = (# | (# [], p #) #)
+            go k p = case item bs len p of
                 (# err | #) -> (# err | #)
-                (# | (# x, p1 #) #) -> go (k - 1) (x : acc) p1
+                (# | (# x, p1 #) #) -> case go (k -# 1#) p1 of
+                    (# err | #) -> (# err | #)
+                    (# | (# xs, p2 #) #) -> (# | (# x : xs, p2 #) #)
 
 {-# INLINE getIdent #-}
 getIdent :: Decoder Ident
@@ -1087,7 +1084,8 @@ decodeParserEdit bs len pos =
                             then
                                 let !rawCat = BSU.unsafeIndex bs (I# posRep)
                                     !topProj = (rawCat .&. 0x80) /= 0
-                                 in case decodeEditCategory (rawCat .&. 0x7f) of
+                                    !tailClause = (rawCat .&. 0x40) /= 0
+                                 in case decodeEditCategory (rawCat .&. 0x3f) of
                                         (# err | #) -> (# err | #)
                                         (# | cat #) -> case decodeEditLabel bs len (posRep +# 1#) of
                                             (# err | #) -> (# err | #)
@@ -1101,6 +1099,7 @@ decodeParserEdit bs len pos =
                                                             , parserEditCategory = cat
                                                             , parserEditLabel = label
                                                             , parserEditTopProjection = topProj
+                                                            , parserEditTailClause = tailClause
                                                             }
                                                         , posNext
                                                       #)
@@ -1109,22 +1108,7 @@ decodeParserEdit bs len pos =
         else (# "unexpected end of binary stream" | #)
 
 getParserEditVec :: Decoder [ParserEdit]
-getParserEditVec = Decoder $ \bs len pos ->
-    let go 0 acc p = (# | (# reverse acc, p #) #)
-        go k acc p = case decodeParserEdit bs len p of
-            (# err | #) -> (# err | #)
-            (# | (# x, p1 #) #) -> go (k - 1) (x : acc) p1
-     in case unDec getInt32 bs len pos of
-            (# err | #) -> (# err | #)
-            (# | (# count, pos0 #) #) ->
-                if count < 0 || count > I# (len -# pos0)
-                    then (# "invalid vector length in binary stream" | #)
-                    else case count of
-                        0 -> (# | (# [], pos0 #) #)
-                        1 -> case decodeParserEdit bs len pos0 of
-                            (# err | #) -> (# err | #)
-                            (# | (# x, p1 #) #) -> (# | (# [x], p1 #) #)
-                        _ -> go count [] pos0
+getParserEditVec = getVec (Decoder decodeParserEdit)
 
 {-# INLINE getSemanticFacts #-}
 getSemanticFacts :: Decoder SemanticFacts

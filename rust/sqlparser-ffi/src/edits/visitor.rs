@@ -775,7 +775,34 @@ impl<'a> AnalysisVisitor<'a> {
             category,
             label: label.into(),
             top_level_projection: false,
+            tail_clause: false,
         });
+    }
+
+    fn mark_select_tail_clause(&mut self, query: &Query, new_edit: usize) {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return;
+        };
+        if self.statement_depth != 1
+            || query.with.is_some()
+            || select.into.is_some()
+            || !self
+                .mapped_span(select.select_token.0.span)
+                .is_some_and(|(start, _)| start == self.unit.start)
+        {
+            return;
+        }
+        if let Some(edit) = self.edits.get_mut(new_edit) {
+            // The cut must begin immediately after the surviving substantive
+            // token. In particular, an intervening comment can affect the end
+            // span of a neighbouring clause after this clause disappears.
+            let before = self
+                .tokens
+                .partition_point(|token| token.start < edit.start);
+            edit.tail_clause = before != 0
+                && self.tokens[before - 1].end == edit.start
+                && self.tokens[before - 1].kind != TokenKind::Whitespace;
+        }
     }
 
     fn source_slice(&self, span: Span) -> Option<&'a str> {
@@ -2435,6 +2462,7 @@ impl Visitor for AnalysisVisitor<'_> {
         let query_scope = self.query_source_scope(query);
         if let Some(order) = &query.order_by {
             if let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope) {
+                let edit_index = self.edits.len();
                 self.clause_edit_complete(
                     Keyword::ORDER,
                     body,
@@ -2449,6 +2477,16 @@ impl Visitor for AnalysisVisitor<'_> {
                     ],
                     "remove-order_by",
                 );
+                if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
+                    && exprs.iter().all(|item| {
+                        matches!(
+                            &item.expr,
+                            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                        )
+                    })
+                {
+                    self.mark_select_tail_clause(query, edit_index);
+                }
             }
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
                 && exprs.len() > 1
@@ -2459,7 +2497,16 @@ impl Visitor for AnalysisVisitor<'_> {
             }
         }
         if let Some(limit) = &query.limit_clause {
+            let edit_index = self.edits.len();
             self.limit_edits(query, limit);
+            if matches!(limit, LimitClause::LimitOffset {
+                limit: Some(Expr::Value(value)),
+                offset: None,
+                limit_by,
+            } if matches!(&value.value, sqlparser::ast::Value::Number(..)) && limit_by.is_empty())
+            {
+                self.mark_select_tail_clause(query, edit_index);
+            }
         }
         if let Some(fetch) = &query.fetch
             && let Some(scope) = query_scope

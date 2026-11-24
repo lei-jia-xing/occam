@@ -963,7 +963,9 @@ fn write_edit(w: &mut BinaryWriter, edit: &NativeEdit) {
     w.write_u32(edit.start as u32);
     w.write_u32(edit.end as u32);
     w.write_str(&edit.replacement);
-    let cat_byte = category_code(edit.category) | if edit.top_level_projection { 0x80 } else { 0 };
+    let cat_byte = category_code(edit.category)
+        | if edit.top_level_projection { 0x80 } else { 0 }
+        | if edit.tail_clause { 0x40 } else { 0 };
     w.write_u8(cat_byte);
     w.write_str(&edit.label);
 }

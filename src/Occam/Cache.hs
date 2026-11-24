@@ -5,6 +5,7 @@ module Occam.Cache (
     CacheEntry (..),
     Cache (..),
     newCache,
+    nativeCandidateKey,
     cacheLookup,
     cacheInstallInflight,
     cacheCompleteInflight,
@@ -18,6 +19,7 @@ module Occam.Cache (
 import Control.Concurrent (MVar, modifyMVar_, newMVar, readMVar)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -70,6 +72,18 @@ newCache precomputed = do
     joins <- newIORef 0
     pure
         Cache {cacheEntries = entries, cacheHitsRef = hits, cacheMissesRef = misses, cacheJoinsRef = joins}
+
+{- | Reserve the NUL-prefixed namespace for lexer-certified native keys. Escape
+a leading NUL on an exact key so even invalid SQL cannot alias this namespace.
+-}
+nativeCandidateKey :: (ByteString -> IO (Maybe ByteString)) -> ByteString -> IO ByteString
+nativeCandidateKey prove sql = do
+    canonical <- prove sql
+    pure $ case canonical of
+        Just key -> BS.append "\0\1" key
+        Nothing
+            | BS.isPrefixOf (BS.singleton 0) sql -> BS.cons 0 sql
+            | otherwise -> sql
 
 -- | Look up candidate bytes in the cache according to the cache mode.
 cacheLookup :: Cache -> CacheMode -> ByteString -> IO LookupResult

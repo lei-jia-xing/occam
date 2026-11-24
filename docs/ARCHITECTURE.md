@@ -61,8 +61,10 @@ All stages provide **local minimality guarantees**, not a global minimum.
 - A single ordered scheduler serves every search phase under a hard `--jobs N` concurrency cap (default `1`; the same scheduler runs at `N = 1`).
 - Candidates are tested in decision order in bounded windows: cache entries and execution permits are reserved in order before forking, so lookahead never steals a permit from an earlier candidate.
 - Retirement commits the earliest acceptance, surfaces the earliest inconclusive result or budget denial, then cancels and reaps losers. Completed-but-unselected physical work remains billed; killed tasks are counted as cancelled.
+- When a launched candidate has already published a decisive result, the scheduler leaves later slots empty while it retires the earlier candidates in order.
 - Progress, curve, and checkpoint updates occur only at ordered retirement, and every window drains fully before reparse, phase transition, or serial final validation.
 - With caching enabled (default), duplicate candidate bytes single-flight onto one in-flight execution (`cache_joins`). Timeouts, errors, and cancellations are never cached and never converted into rejections.
+- Native SQLite and DuckDB result oracles can also share a key for ordinary whitespace variations of explicitly aliased literal SELECTs. The Rust lexer preserves the original token bytes, and the oracle receives the original candidate.
 
 ---
 
@@ -77,6 +79,7 @@ All stages provide **local minimality guarantees**, not a global minimum.
 ### Candidate Workdir & Process Groups (`src/Occam/Oracle.hs`)
 
 - Each execution receives a fresh temporary directory exported as `OCCAM_WORKDIR`, `TMP`, `TMPDIR`, and `TEMP` (shared by `--reset` and `--oracle`). The caller's original working directory is exported as `OCCAM_ORIGINAL_CWD`.
+- Set the parent process's `TMPDIR` to a writable tmpfs directory to place these fresh per-candidate directories on tmpfs.
 - **Database isolation is the caller's responsibility**: `OCCAM_WORKDIR` provides filesystem hygiene only and never isolates a shared database under `--jobs > 1`. With `--jobs N`, both `--oracle` and `--reset` must safely support `N` concurrent independent runs with independent database state.
 - Each in-flight worker holds a scheduler slot from reset spawn through oracle exit and process-group reaping. On timeout or cancellation, the owned POSIX process group is killed before pipe helpers are joined so blocked writers cannot stall cleanup.
 - If an owned process leader cannot be reaped after `SIGKILL` (e.g., kernel `D`-state), Occam fails loudly and refuses further oracle executions. Descendants calling `setsid` escape process groups, and full Windows process-tree cleanup is outside the verified contract; process groups provide job control, not a security sandbox.

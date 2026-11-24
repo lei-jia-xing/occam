@@ -79,6 +79,18 @@ tests =
             assertEqual "late duplicate served from cache" 1 (cacheHits stats)
             attempts <- poolAttempts pool
             assertEqual "physical starts across both windows" 3 attempts
+        , testCase "refill stops beyond a completed decisive candidate" $ do
+            let execute candidate
+                    | candidate == "decision" = pure acceptDetails
+                    | otherwise = pure rejectDetails
+            pool <- testPool 3 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
+            _ <- testOrdered pool ["decision"]
+            outcomes <- testOrdered pool ["first", "second", "decision", "excess-1", "excess-2"]
+            assertEqual
+                "only the ordered prefix retires"
+                [(OracleRejected, False), (OracleRejected, False), (OracleAccepted, True)]
+                outcomes
+            assertEqual "no physical probes beyond the known decision" 3 =<< poolAttempts pool
         , testCase "reap failure in an unselected worker stops the pool" $ do
             poolRef <- newEmptyMVar
             let execute candidate

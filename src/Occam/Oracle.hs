@@ -26,12 +26,14 @@ module Occam.Oracle (
 ) where
 
 import Control.Concurrent (
+    MVar,
     forkIOWithUnmask,
     killThread,
     newEmptyMVar,
     putMVar,
     readMVar,
     threadDelay,
+    tryReadMVar,
  )
 import Control.Exception (
     Exception,
@@ -41,6 +43,7 @@ import Control.Exception (
     finally,
     handle,
     mask,
+    mask_,
     onException,
     throwIO,
     try,
@@ -61,7 +64,7 @@ import Data.Aeson.Encoding qualified as Encoding
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -113,7 +116,6 @@ import System.Process (
     ProcessHandle,
     StdStream (..),
     getPid,
-    getProcessExitCode,
     proc,
     shell,
     waitForProcess,
@@ -269,14 +271,15 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                     case mbIn of
                         Just hIn -> do
                             groupId <- getOwnedGroup ph
-                            reapedRef <- newIORef False
+                            reaper <- startProcessReaper ph
                             cleanedRef <- newIORef False
-                            let cleanup = do
-                                    alreadyCleaned <- atomicModifyIORef' cleanedRef (True,)
+                            let wait = waitForReaper reaper
+                                cleanup = mask_ $ do
+                                    alreadyCleaned <- readIORef cleanedRef
                                     unless alreadyCleaned $ do
-                                        leaderReaped <- readIORef reapedRef
-                                        reaped <- cleanupOwnedGroup leaderReaped groupId ph
+                                        reaped <- cleanupOwnedGroup groupId ph reaper
                                         unless reaped $ throwIO OracleReapFailed
+                                        writeIORef cleanedRef True
                             result <-
                                 ( do
                                     onStarted
@@ -287,13 +290,11 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                             ( if BS.length input <= inlinePipeWriteLimit
                                                 then do
                                                     writePipe hIn input
-                                                    exitCode <- waitForProcess ph
-                                                    writeIORef reapedRef True
+                                                    exitCode <- wait
                                                     cleanup
                                                     pure exitCode
                                                 else withWorker (writePipe hIn input) \writeInput -> do
-                                                    exitCode <- waitForProcess ph
-                                                    writeIORef reapedRef True
+                                                    exitCode <- wait
                                                     -- Kill remaining group members before joining the stdin writer.
                                                     cleanup
                                                     writeInput
@@ -315,6 +316,28 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                 , create_group = createProcessGroup
                 }
 
+-- The owner of waitpid must survive cancellation until System.Process records
+-- the exit code in its handle. Cancellation interrupts the MVar reader and
+-- kills the process group before joining this reaper.
+type ProcessReaper = MVar (Either IOException ExitCode)
+
+startProcessReaper :: ProcessHandle -> IO ProcessReaper
+startProcessReaper ph = do
+    result <- newEmptyMVar
+    _ <- forkIOWithUnmask $ \_ ->
+        tryIOException (uninterruptibleMask_ (waitForProcess ph)) >>= putMVar result
+    pure result
+
+waitForReaper :: ProcessReaper -> IO ExitCode
+waitForReaper reaper = readMVar reaper >>= either throwIO pure
+
+leaderReaped :: ProcessReaper -> IO Bool
+leaderReaped reaper = do
+    result <- tryReadMVar reaper
+    pure $ case result of
+        Just (Right _) -> True
+        _ -> False
+
 -- | Provide null output streams (/dev/null or NUL) for oracle execution.
 #ifdef mingw32_HOST_OS
 withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
@@ -326,12 +349,11 @@ createProcessGroup = False
 getOwnedGroup :: ProcessHandle -> IO ()
 getOwnedGroup _ = pure ()
 
-cleanupOwnedGroup :: Bool -> () -> ProcessHandle -> IO Bool
-cleanupOwnedGroup True _ _ = pure True
-cleanupOwnedGroup False _ ph = do
-    ignoreIOException (terminateProcess ph)
-    reaped <- timeout 1000000 (waitForProcess ph)
-    pure (isJust reaped)
+cleanupOwnedGroup :: () -> ProcessHandle -> ProcessReaper -> IO Bool
+cleanupOwnedGroup _ ph reaper = do
+    exited <- leaderReaped reaper
+    unless exited (ignoreIOException (terminateProcess ph))
+    isJust <$> timeout 1000000 (waitForReaper reaper)
 
 isCandidateOverrideKey :: String -> Bool
 isCandidateOverrideKey k = map toUpper k `elem` candidateOverrideKeys
@@ -349,26 +371,25 @@ getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
 getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
 
 -- | Terminate the owned process group and report whether the leader was reaped.
-cleanupOwnedGroup :: Bool -> Maybe ProcessID -> ProcessHandle -> IO Bool
-cleanupOwnedGroup leaderReaped mPid ph = mask $ \restore -> do
+cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> ProcessReaper -> IO Bool
+cleanupOwnedGroup mPid _ reaper = do
+    exited <- leaderReaped reaper
     case mPid of
         Nothing -> pure ()
         Just pid -> do
             alive <-
-                if leaderReaped
+                if exited
                     then isRight <$> tryIOException (signalProcessGroup nullSignal pid)
                     else pure True
             whenAlive alive $ do
                 termSent <- tryIOException (signalProcessGroup sigTERM pid)
                 case termSent of
-                    Right () -> uninterruptibleMask_ (waitForGroupTermination leaderReaped pid ph 50)
+                    Right () -> uninterruptibleMask_ (waitForGroupTermination exited pid reaper 50)
                     Left _ -> pure ()
                 ignoreIOException (signalProcessGroup sigKILL pid)
-    if leaderReaped
+    if exited
         then pure True
-        else do
-            reaped <- restore (timeout 1000000 (waitForProcess ph))
-            pure (isJust reaped)
+        else isJust <$> timeout 1000000 (waitForReaper reaper)
     where
         isRight (Right _) = True
         isRight (Left _) = False
@@ -376,22 +397,19 @@ cleanupOwnedGroup leaderReaped mPid ph = mask $ \restore -> do
         whenAlive False _ = pure ()
 
 -- | Wait for process group termination within a short grace period after SIGTERM.
-waitForGroupTermination :: Bool -> ProcessID -> ProcessHandle -> Int -> IO ()
-waitForGroupTermination leaderReaped pid ph remaining
+waitForGroupTermination :: Bool -> ProcessID -> ProcessReaper -> Int -> IO ()
+waitForGroupTermination alreadyExited pid reaper remaining
     | remaining <= 0 = pure ()
     | otherwise = do
-        leaderExited <-
-            if leaderReaped
-                then pure Nothing
-                else getProcessExitCode ph
-        case leaderExited of
-            Just _ -> pure ()
-            Nothing -> do
+        leaderExited <- if alreadyExited then pure False else leaderReaped reaper
+        if leaderExited
+            then pure ()
+            else do
                 groupAlive <- tryIOException (signalProcessGroup nullSignal pid)
                 case groupAlive of
                     Left _ -> pure ()
                     Right () ->
-                        threadDelay 1000 >> waitForGroupTermination leaderReaped pid ph (remaining - 1)
+                        threadDelay 1000 >> waitForGroupTermination alreadyExited pid reaper (remaining - 1)
 
 isCandidateOverrideKey :: String -> Bool
 isCandidateOverrideKey k = k `elem` candidateOverrideKeys

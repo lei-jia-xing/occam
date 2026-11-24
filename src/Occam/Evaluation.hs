@@ -18,6 +18,7 @@ module Occam.Evaluation (
     runEvaluatedReductionWithProgress,
     runEvaluationRequest,
     runEvaluationRequestWithObserver,
+    runEvaluationRequestWithNativeObserver,
     sqlDialectName,
 ) where
 
@@ -53,7 +54,7 @@ import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
 import Occam.AtomicFile (writeAtomicBytes)
-import Occam.Cache (CacheStats (..))
+import Occam.Cache (CacheStats (..), nativeCandidateKey)
 import Occam.Core (OracleOutcome (..))
 import Occam.Json (normalizeJsonFieldNames, snakeCaseOptions)
 import Occam.Logger (Logger (..), logDebug', logInfo')
@@ -76,14 +77,14 @@ import Occam.Oracle (
     oracleObservationMatches,
     resolveOracleContext,
  )
-import Occam.Parser (SQLDialect (..), countStatements, dialectName)
+import Occam.Parser (SQLDialect (..), countStatements, dialectName, nativeOracleCacheKey)
 import Occam.Pool (
     ExecutionBudgetReached (..),
     OraclePool,
     PoolConfig (..),
     closeOraclePool,
     mapPoolRetire,
-    newOraclePool,
+    newOraclePoolWithCacheKey,
     poolAttempts,
     poolCacheStats,
     poolCancelled,
@@ -406,7 +407,24 @@ runEvaluationRequest request = do
 
 runEvaluationRequestWithObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
-runEvaluationRequestWithObserver timeoutMicros observe EvaluationRequest {..} = do
+runEvaluationRequestWithObserver = runEvaluationRequestWithKey pure
+
+runEvaluationRequestWithNativeObserver ::
+    Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
+runEvaluationRequestWithNativeObserver micros observe request =
+    runEvaluationRequestWithKey
+        (nativeCandidateKey (nativeOracleCacheKey (requestDialect request)))
+        micros
+        observe
+        request
+
+runEvaluationRequestWithKey ::
+    (ByteString -> IO ByteString) ->
+    Int ->
+    EvaluationObserver ->
+    EvaluationRequest oracle ->
+    IO EvaluationResult
+runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest {..} = do
     let onProgress = requestOnProgress
         metricsPolicy = requestMetricsPolicy
         config = requestConfig
@@ -455,7 +473,8 @@ runEvaluationRequestWithObserver timeoutMicros observe EvaluationRequest {..} = 
     reductionStart <- ticks
     metricsStore <- traverse newMetricsStore metricsPolicy
     rawPool <-
-        newOraclePool
+        newOraclePoolWithCacheKey
+            candidateKey
             PoolConfig
                 { poolJobs = evaluationJobs config
                 , poolCacheEnabled = evaluationCacheEnabled config

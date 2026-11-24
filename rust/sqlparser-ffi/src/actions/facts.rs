@@ -2450,9 +2450,9 @@ pub(crate) fn merge_columns(merge: &Merge, rules: &ir::IdentifierRules) -> Vec<i
     columns
 }
 
-#[derive(Default)]
-pub(crate) struct NestedDml {
-    statements: Vec<Statement>,
+struct NestedDml<'a> {
+    facts: Vec<ir::NativeFacts>,
+    context: AnalysisContext<'a>,
     skip_root: bool,
     dml_depth: usize,
 }
@@ -2465,7 +2465,7 @@ pub(crate) fn is_dml_statement(statement: &Statement) -> bool {
     )
 }
 
-impl Visitor for NestedDml {
+impl Visitor for NestedDml<'_> {
     type Break = ();
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> std::ops::ControlFlow<Self::Break> {
@@ -2478,7 +2478,7 @@ impl Visitor for NestedDml {
             // collected statement discovers its own nested DML, so descending
             // here would analyze deeper statements once per ancestor.
             if self.dml_depth == 0 {
-                self.statements.push(statement.clone());
+                self.facts.push(analyze_statement(statement, self.context));
             }
             self.dml_depth += 1;
         }
@@ -2496,38 +2496,30 @@ impl Visitor for NestedDml {
     }
 }
 
-/// Collects outermost DML statements nested inside a `Query` (e.g. data-modifying CTEs).
-pub(crate) fn collect_dml_in_query(query: &Query) -> Vec<Statement> {
-    let mut collector = NestedDml::default();
-    let _ = query.visit(&mut collector);
-    collector.statements
-}
-
-/// Collects outermost DML statements nested inside a `Statement`, skipping the statement root itself.
-pub(crate) fn collect_dml_in_statement(statement: &Statement) -> Vec<Statement> {
-    let mut collector = NestedDml {
-        skip_root: true,
-        ..NestedDml::default()
-    };
-    let _ = statement.visit(&mut collector);
-    collector.statements
-}
-
-/// Analyzes nested statements and merges their operations and transaction/session effects into `facts`.
-pub(crate) fn merge_nested(
-    facts: &mut ir::NativeFacts,
-    statements: Vec<Statement>,
+/// Analyzes outermost nested DML directly while the visitor borrows each AST node.
+fn analyze_nested<T: Visit>(
+    node: &T,
     context: AnalysisContext<'_>,
-) {
-    // Nested analyses never collect column geometry: their spans belong to
-    // the parent unit but their bindings do not, and merged ops already feed
-    // the conservative reference fences.
-    let nested_context = AnalysisContext {
-        column_ir: false,
-        ..context
+    skip_root: bool,
+) -> Vec<ir::NativeFacts> {
+    let mut collector = NestedDml {
+        facts: Vec::new(),
+        // Nested spans belong to the host unit, but their bindings do not.
+        context: AnalysisContext {
+            column_ir: false,
+            syntax_edits: false,
+            ..context
+        },
+        skip_root,
+        dml_depth: 0,
     };
-    for statement in statements {
-        let nested = analyze_statement(&statement, nested_context);
+    let _ = node.visit(&mut collector);
+    collector.facts
+}
+
+/// Merges nested operations in source order after the enclosing operation.
+fn merge_nested(facts: &mut ir::NativeFacts, nested_facts: Vec<ir::NativeFacts>) {
+    for nested in nested_facts {
         facts.ops.extend(nested.ops);
         facts.session.extend(nested.session);
         facts.pre_tx.extend(nested.pre_tx);
@@ -4196,7 +4188,7 @@ pub(crate) fn analyze_statement(
     let mut column_singles: Vec<(usize, usize, &'static str)> = Vec::new();
     match statement {
         Statement::Query(query) => {
-            let nested = collect_dml_in_query(query);
+            let nested = analyze_nested(query, context, false);
             let read_mode = if nested.is_empty() && visitor.select_into_count == 0 {
                 classify_query_read_mode(query, &visitor, &context)
             } else {
@@ -4228,7 +4220,7 @@ pub(crate) fn analyze_statement(
                 }
             }
             add_unmodeled_barriers(&mut facts, &visitor, &[]);
-            merge_nested(&mut facts, nested, context);
+            merge_nested(&mut facts, nested);
         }
         Statement::CreateTable(create) => {
             // PostgreSQL partitioning and inheritance route child rows through
@@ -4264,7 +4256,7 @@ pub(crate) fn analyze_statement(
                 create
                     .query
                     .as_ref()
-                    .map(|query| collect_dml_in_query(query))
+                    .map(|query| analyze_nested(query, context, false))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -4342,7 +4334,7 @@ pub(crate) fn analyze_statement(
                 }
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-            merge_nested(&mut facts, nested, context);
+            merge_nested(&mut facts, nested);
             if context.column_ir {
                 let mut columns = Vec::with_capacity(create.columns.len());
                 for column in &create.columns {
@@ -4368,7 +4360,7 @@ pub(crate) fn analyze_statement(
             } else {
                 ir::ReadMode::Schema
             };
-            let nested = collect_dml_in_query(&create.query);
+            let nested = analyze_nested(create.query.as_ref(), context, false);
             if !create.materialized && !nested.is_empty() {
                 facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownView,
@@ -4435,7 +4427,7 @@ pub(crate) fn analyze_statement(
             }
             add_unmodeled_barriers(&mut facts, &visitor, &excluded);
             if create.materialized {
-                merge_nested(&mut facts, nested, context);
+                merge_nested(&mut facts, nested);
             }
         }
         Statement::CreateIndex(create) => {
@@ -4769,7 +4761,7 @@ pub(crate) fn analyze_statement(
         Statement::Insert(insert) => {
             let target_name = table_object_name(&insert.table);
             let target = target_name.and_then(|name| relation_ref(name, dialect, rules));
-            let nested = collect_dml_in_statement(statement);
+            let nested = analyze_nested(statement, context, true);
             let excluded: Vec<Span> = target_name
                 .map(|name| vec![name.span()])
                 .unwrap_or_default();
@@ -4797,7 +4789,7 @@ pub(crate) fn analyze_statement(
                         only: false,
                     }));
                     add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-                    merge_nested(&mut facts, nested, context);
+                    merge_nested(&mut facts, nested);
                 }
                 None => facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownDml,
@@ -4826,7 +4818,7 @@ pub(crate) fn analyze_statement(
                     })
                 })
                 .collect();
-            let nested = collect_dml_in_statement(statement);
+            let nested = analyze_nested(statement, context, true);
             // The target table's own rows and columns are read by the SET
             // expressions, WHERE clause, joins, and ON conditions. Only alias
             // designators that are not physical relations are excluded.
@@ -4866,7 +4858,7 @@ pub(crate) fn analyze_statement(
                     }));
                 }
                 add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-                merge_nested(&mut facts, nested, context);
+                merge_nested(&mut facts, nested);
             }
         }
         Statement::Delete(delete) => {
@@ -4878,7 +4870,7 @@ pub(crate) fn analyze_statement(
                         .map(|reference| (reference, target.source.only))
                 })
                 .collect();
-            let nested = collect_dml_in_statement(statement);
+            let nested = analyze_nested(statement, context, true);
             // A `DELETE` scans the target table, so its name is a real read.
             // Only alias designators (`DELETE a FROM t AS a`) are not physical
             // relations and must not become reads.
@@ -4906,13 +4898,13 @@ pub(crate) fn analyze_statement(
                     }));
                 }
                 add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-                merge_nested(&mut facts, nested, context);
+                merge_nested(&mut facts, nested);
             }
         }
         Statement::Merge(merge) => {
             let target_name = table_factor_name(&merge.table);
             let target = target_name.and_then(|name| relation_ref(name, dialect, rules));
-            let nested = collect_dml_in_statement(statement);
+            let nested = analyze_nested(statement, context, true);
             // The ON condition and source joins read the target table.
             let excluded: Vec<Span> = Vec::new();
             match target {
@@ -4928,7 +4920,7 @@ pub(crate) fn analyze_statement(
                         only: false,
                     }));
                     add_unmodeled_barriers(&mut facts, &visitor, &excluded);
-                    merge_nested(&mut facts, nested, context);
+                    merge_nested(&mut facts, nested);
                 }
                 None => facts.barriers.push(global_barrier(
                     ir::BarrierReason::UnknownDml,
@@ -5003,13 +4995,13 @@ pub(crate) fn analyze_statement(
                     }
                 }
                 (true, CopySource::Query(query)) => {
-                    let nested = collect_dml_in_query(query);
+                    let nested = analyze_nested(query, context, false);
                     let reads = visitor_reads(&visitor, &[], ir::ReadMode::Data);
                     for read in reads {
                         facts.ops.push(ir::CatalogOp::Read(read));
                     }
                     add_unmodeled_barriers(&mut facts, &visitor, &[]);
-                    merge_nested(&mut facts, nested, context);
+                    merge_nested(&mut facts, nested);
                 }
                 (
                     false,

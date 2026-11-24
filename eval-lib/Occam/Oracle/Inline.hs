@@ -17,8 +17,8 @@ import Occam.Core (ResultStatement, ResultTrace, traceResultStatement)
 import Occam.Evaluation (EvaluationObserver)
 import Occam.Oracle (OracleObservation (OracleFinished), OracleObservationDetails (..))
 import Occam.Oracle.DuckDB (
-    duckdbContractObservationWithTrace,
     generateDuckDBContractWithTrace,
+    prepareDuckDBContractObserverWithReplay,
  )
 import Occam.Oracle.Sqlite (
     generateSqliteContractWithTrace,
@@ -93,9 +93,14 @@ prepareResultOracleWithTraceAndFailures mFailCache rememberTrace dialect micros 
         SQLite ->
             fmap (first (\c -> prepareSqliteContractObserver micros c onFail))
                 <$> generateSqliteContractWithTrace micros sql
-        DuckDB ->
-            fmap (first (duckdbContractObservationWithTrace micros))
-                <$> generateDuckDBContractWithTrace micros sql
+        DuckDB -> do
+            result <- generateDuckDBContractWithTrace micros sql
+            traverse
+                ( \(contract, trace) -> do
+                    observe <- prepareDuckDBContractObserverWithReplay micros contract sql onFail
+                    pure (observe, trace)
+                )
+                result
         _ -> pure (Left "Result oracle requires SQLite or DuckDB")
     end <- getMonotonicTimeNSec
     case prepared of

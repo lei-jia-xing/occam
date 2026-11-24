@@ -9,9 +9,10 @@ module Occam.Parser.Native (
     nativeError,
     countStatementsRaw,
     dialectCode,
+    oracleSourceProof,
 ) where
 
-import Control.Exception (finally)
+import Control.Exception (finally, mask_)
 import Data.Aeson (
     FromJSON (..),
     Value (..),
@@ -88,6 +89,24 @@ foreign import ccall unsafe "occam_sql_count"
 
 foreign import ccall unsafe "occam_sql_free"
     c_freeSQL :: Ptr Word8 -> CSize -> IO ()
+
+foreign import ccall safe "occam_sql_oracle_source"
+    c_oracleSource ::
+        CUInt -> CUInt -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO ()
+
+oracleSourceProof :: SQLDialect -> CUInt -> ByteString -> IO (Maybe ByteString)
+oracleSourceProof dialect mode sql =
+    BSU.unsafeUseAsCStringLen sql \(input, size) ->
+        alloca \output -> alloca \len ->
+            mask_ do
+                poke output nullPtr
+                poke len 0
+                c_oracleSource (dialectCode dialect) mode (castPtr input) (fromIntegral size) output len
+                ptr <- peek output
+                bytes <- peek len
+                if ptr == nullPtr
+                    then pure Nothing
+                    else Just <$> (BS.packCStringLen (castPtr ptr, fromIntegral bytes) `finally` c_freeSQL ptr bytes)
 
 -- Native status codes shared with rust/sqlparser-ffi.
 nativeStatusInvalidArguments

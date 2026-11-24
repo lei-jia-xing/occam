@@ -4,6 +4,7 @@ module Occam.Pool (
     WindowOutcome,
     ExecutionBudgetReached (..),
     newOraclePool,
+    newOraclePoolWithCacheKey,
     closeOraclePool,
     withOraclePool,
     withPredicatePool,
@@ -36,6 +37,7 @@ import Control.Concurrent (
     putMVar,
     readMVar,
     takeMVar,
+    tryReadMVar,
     tryTakeMVar,
  )
 import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
@@ -132,6 +134,7 @@ data OraclePool = OraclePool
     , poolSlots :: !QSem
     , poolPermitsVar :: !(MVar (Maybe Int))
     , poolCacheData :: !Cache
+    , poolCandidateKey :: !(ByteString -> IO ByteString)
     , poolCacheModeData :: !CacheMode
     , poolMetricsData :: !(Maybe MetricsStore)
     , poolExecuteFn :: !(ByteString -> IO OracleObservationDetails)
@@ -148,13 +151,19 @@ data OraclePool = OraclePool
     }
 
 newOraclePool :: PoolConfig -> IO OraclePool
-newOraclePool PoolConfig {..}
+newOraclePool = newOraclePoolWithCacheKey pure
+
+newOraclePoolWithCacheKey :: (ByteString -> IO ByteString) -> PoolConfig -> IO OraclePool
+newOraclePoolWithCacheKey candidateKey PoolConfig {..}
     | poolJobs <= 0 = ioError (userError ("OraclePool jobs must be positive, got " ++ show poolJobs))
     | otherwise = do
         gate <- newMVar ()
         slots <- newQSem poolJobs
         permits <- newMVar poolPermits
-        cache <- newCache poolPrecomputed
+        let keyOf = if poolCacheEnabled then candidateKey else pure
+        precomputed <-
+            traverse (\(sql, observation) -> (,observation) <$> keyOf sql) (Map.toList poolPrecomputed)
+        cache <- newCache (Map.fromList precomputed)
         registry <- newMVar Map.empty
         index <- newIORef 0
         attempts <- newIORef 0
@@ -168,6 +177,7 @@ newOraclePool PoolConfig {..}
                 , poolSlots = slots
                 , poolPermitsVar = permits
                 , poolCacheData = cache
+                , poolCandidateKey = keyOf
                 , poolCacheModeData = if poolCacheEnabled then CacheEnabled else CacheDisabled
                 , poolMetricsData = poolMetrics
                 , poolExecuteFn = poolExecute
@@ -328,7 +338,8 @@ testOrderedTagged pool candidates =
 
         goSerial [] acc = pure (reverse acc)
         goSerial ((tag, candidate) : rest) acc = do
-            look <- cacheLookup (poolCacheData pool) (poolCacheModeData pool) candidate
+            key <- poolCandidateKey pool candidate
+            look <- cacheLookup (poolCacheData pool) (poolCacheModeData pool) key
             case look of
                 LookupHit observation -> retireSerial tag candidate observation True rest acc
                 LookupJoin _ -> ioError (userError "OraclePool serial path encountered in-flight join")
@@ -388,7 +399,7 @@ testOrderedTagged pool candidates =
                                             poolBillFn pool details
                                             let observation = detailedObservation details
                                             when (poolCacheModeData pool == CacheEnabled) $
-                                                for_ (admitObservation observation) (cacheInsertDone (poolCacheData pool) candidate)
+                                                for_ (admitObservation observation) (cacheInsertDone (poolCacheData pool) key)
                                             recordPhysicalCompletion (poolMetricsData pool) tag
                                             recordOracleTiming
                                                 (poolMetricsData pool)
@@ -434,18 +445,22 @@ runSlidingWindow pool initialCandidates = mask \restore -> do
             rt <- readIORef retiredThrough
             writeIORef activeRef Seq.empty
             settleAll pool [(ord, task) | (_, _, ord, task) <- toList remSeq] rt
-        fill !nextOrd pending = do
+        fill scanForDecision !nextOrd pending = do
             cur <- readIORef activeRef
             if Seq.length cur >= width
                 then pure (nextOrd, pending)
                 else case pending of
                     [] -> pure (nextOrd, [])
                     (tag, candidate) : rest -> do
-                        task <- launchTask pool nextOrd tag candidate
-                        modifyIORef' activeRef (Seq.|> (tag, candidate, nextOrd, task))
-                        fill (nextOrd + 1) rest
+                        stop <- if scanForDecision then windowHasDecision (toList cur) else pure False
+                        if stop
+                            then pure (nextOrd, pending)
+                            else do
+                                task <- launchTask pool nextOrd tag candidate
+                                modifyIORef' activeRef (Seq.|> (tag, candidate, nextOrd, task))
+                                fill False (nextOrd + 1) rest
         go !nextOrd pending prefix earlier = do
-            (nextOrd', pending') <- fill nextOrd pending
+            (nextOrd', pending') <- fill (nextOrd > 0) nextOrd pending
             cur <- readIORef activeRef
             case Seq.viewl cur of
                 Seq.EmptyL -> pure (reverse prefix)
@@ -464,7 +479,10 @@ runSlidingWindow pool initialCandidates = mask \restore -> do
                     index <- atomicModifyIORef' (poolIndexRef pool) (\n -> (n + 1, n))
                     restore (poolRetireFn pool index candidate outcome hit)
                     let prefix' = (outcome, hit) : prefix
-                        earlier' = IntMap.insert ordinal observation earlier
+                        -- A join is created only while its owner is in the
+                        -- same window, so no remaining task can need an older
+                        -- result after retiring this ordinal.
+                        earlier' = IntMap.insert ordinal observation (IntMap.delete (ordinal - width) earlier)
                     case outcome of
                         OracleAccepted -> do
                             settleRemaining
@@ -476,6 +494,23 @@ runSlidingWindow pool initialCandidates = mask \restore -> do
     outcomes <- go 0 initialCandidates [] IntMap.empty `onException` settleRemaining
     checkReapFailure pool
     pure outcomes
+
+-- Once a launched task has published a decision, any task beyond it is
+-- surplus. Pending earlier tasks still retire first, including any errors.
+windowHasDecision :: [(FamilyTag, ByteString, Int, WindowTask)] -> IO Bool
+windowHasDecision [] = pure False
+windowHasDecision ((_, _, _, task) : rest) = do
+    decided <- case task of
+        TaskImmediate observation _ -> pure (observationOutcome observation /= OracleRejected)
+        TaskDenied -> pure True
+        TaskJoined _ -> pure False
+        TaskPending _ result _ _ _ _ -> do
+            published <- tryReadMVar result
+            pure $ case published of
+                Nothing -> False
+                Just (Left _) -> True
+                Just (Right timed) -> observationOutcome (detailedObservation (timedDetails timed)) /= OracleRejected
+    if decided then pure True else windowHasDecision rest
 
 resolveSlidingTask ::
     IntMap.IntMap OracleObservation ->
@@ -495,8 +530,8 @@ resolveSlidingTask earlier task = case task of
 
 launchTask :: OraclePool -> Int -> FamilyTag -> ByteString -> IO WindowTask
 launchTask pool ordinal tag candidate = do
-    look <-
-        cacheLookup (poolCacheData pool) (poolCacheModeData pool) candidate
+    key <- poolCandidateKey pool candidate
+    look <- cacheLookup (poolCacheData pool) (poolCacheModeData pool) key
     case look of
         LookupHit observation -> pure (TaskImmediate observation True)
         LookupJoin owner -> pure (TaskJoined owner)
@@ -506,7 +541,7 @@ launchTask pool ordinal tag candidate = do
                 then pure TaskDenied
                 else do
                     when (poolCacheModeData pool == CacheEnabled) $
-                        cacheInstallInflight (poolCacheData pool) candidate ordinal
+                        cacheInstallInflight (poolCacheData pool) key ordinal
                     ( do
                             result <- newEmptyMVar
                             done <- newEmptyMVar
@@ -515,21 +550,27 @@ launchTask pool ordinal tag candidate = do
                             mask_ $ do
                                 tid <-
                                     forkIOWithUnmask $ \unmask -> do
-                                        outcome <- try (unmask (runWorker pool tag candidate ordinal startRef))
-                                        mask_ $ publishOutcome pool tag candidate ordinal startRef result done outcome
+                                        outcome <- try (unmask (runWorker pool tag candidate key ordinal startRef))
+                                        mask_ $ publishOutcome pool tag key ordinal startRef result done outcome
                                 atomicModifyIORef' (poolLiveRef pool) (\n -> (n + 1, ()))
                                 modifyMVar_ (poolRegistry pool) (pure . Map.insert tid (WorkerEntry done (killThread tid)))
                                 pure (TaskPending tid result done spent tag startRef)
                         )
                         `onException` ( do
                                             when (poolCacheModeData pool == CacheEnabled) $
-                                                cacheRemoveInflight (poolCacheData pool) candidate ordinal
+                                                cacheRemoveInflight (poolCacheData pool) key ordinal
                                             refundPermit (poolPermitsVar pool)
                                       )
 
 runWorker ::
-    OraclePool -> FamilyTag -> ByteString -> Int -> IORef (Maybe Word64) -> IO TimedObservation
-runWorker pool tag candidate ordinal startRef =
+    OraclePool ->
+    FamilyTag ->
+    ByteString ->
+    ByteString ->
+    Int ->
+    IORef (Maybe Word64) ->
+    IO TimedObservation
+runWorker pool tag candidate key ordinal startRef =
     bracket_ (waitQSem (poolSlots pool)) (signalQSem (poolSlots pool)) $ do
         startNs <- case poolMetricsData pool of
             Nothing -> pure 0
@@ -543,7 +584,7 @@ runWorker pool tag candidate ordinal startRef =
             poolBillFn pool profile
             let observation = detailedObservation profile
             when (poolCacheModeData pool == CacheEnabled) $
-                cacheCompleteInflight (poolCacheData pool) candidate ordinal (admitObservation observation)
+                cacheCompleteInflight (poolCacheData pool) key ordinal (admitObservation observation)
             wallMicros <- case poolMetricsData pool of
                 Nothing -> pure 0
                 Just _ -> wallSince startNs
@@ -560,7 +601,7 @@ publishOutcome ::
     MVar () ->
     Either SomeException TimedObservation ->
     IO ()
-publishOutcome pool tag candidate ordinal startRef result done outcome = mask_ $ do
+publishOutcome pool tag key ordinal startRef result done outcome = mask_ $ do
     case outcome of
         Right timed -> do
             recordPhysicalCompletion (poolMetricsData pool) tag
@@ -580,7 +621,7 @@ publishOutcome pool tag candidate ordinal startRef result done outcome = mask_ $
                 Nothing -> refundPermit (poolPermitsVar pool)
                 Just _ -> pure ()
             when (poolCacheModeData pool == CacheEnabled) $
-                cacheRemoveInflight (poolCacheData pool) candidate ordinal
+                cacheRemoveInflight (poolCacheData pool) key ordinal
             -- Record worker metrics at thread termination.
             wall <- case (poolMetricsData pool, started) of
                 (Just _, Just begin) -> wallSince begin

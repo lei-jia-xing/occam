@@ -21,16 +21,20 @@ module Occam.Parser (
     parseSQL,
     parseSQLTimed,
     countStatements,
+    nativeOracleCacheKey,
+    nativeDuckDBReplayUnits,
+    DuckDBReplayUnit (..),
     factDumpJson,
 ) where
 
 import Control.Exception (evaluate, finally, mask)
-import Data.Aeson (eitherDecodeStrict', encode)
+import Data.Aeson (FromJSON (..), eitherDecodeStrict', encode, withObject, (.:), (.:?))
 import Data.Bits ((.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
+import Data.Either (fromRight)
 import Data.Text qualified as T
 import Data.Word (Word64)
 import Foreign (alloca, castPtr, nullPtr, peek, poke)
@@ -56,6 +60,7 @@ import Occam.Parser.Native (
     countStatementsRaw,
     dialectCode,
     nativeError,
+    oracleSourceProof,
  )
 import Occam.Parser.Types (
     ParseOptions (..),
@@ -70,6 +75,25 @@ import Occam.Parser.Types (
     dialectName,
  )
 import Occam.Parser.Validate (makeUnits, validateColumns)
+
+data DuckDBReplayUnit = DuckDBReplayUnit
+    { replayUnitEnd :: !(Maybe Int)
+    , replayUnitKind :: !T.Text
+    , replayUnitTable :: !(Maybe T.Text)
+    }
+
+instance FromJSON DuckDBReplayUnit where
+    parseJSON = withObject "DuckDBReplayUnit" \o ->
+        DuckDBReplayUnit <$> o .:? "end" <*> o .: "kind" <*> o .:? "table"
+
+-- | Available only for native predicates and for source-independent result shapes.
+nativeOracleCacheKey :: SQLDialect -> ByteString -> IO (Maybe ByteString)
+nativeOracleCacheKey dialect = oracleSourceProof dialect 0
+
+nativeDuckDBReplayUnits :: ByteString -> IO [DuckDBReplayUnit]
+nativeDuckDBReplayUnits sql = do
+    bytes <- oracleSourceProof DuckDB 1 sql
+    pure $ maybe [] (fromRight [] . eitherDecodeStrict') bytes
 
 -- | Untimed parse; delegates to the single timed implementation.
 parseSQL :: ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
