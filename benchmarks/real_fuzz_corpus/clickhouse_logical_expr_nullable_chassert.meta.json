@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_logical_expr_nullable_chassert",
+  "file": "clickhouse_logical_expr_nullable_chassert.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse AST Fuzzer (PR #99980)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/116281",
+    "reporter": "qoega (ClickHouse AST fuzzer)",
+    "report_date": "2026-08-25",
+    "issue_id": "ClickHouse #116281",
+    "fixed_in_version": "ClickHouse 26.8.11.24 / 26.9.1.454"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.8.10-debug",
+    "compilation_flags": "Debug / ABORT_ON_LOGICAL_ERROR"
+  },
+  "crash_signature": {
+    "expected_signature": "Logical error: '!raw_type->isNullable\\(\\)'",
+    "assertion_message": "!raw_type->isNullable()",
+    "source_file": "src/Analyzer/Passes/LogicalExpressionOptimizerPass.cpp",
+    "source_line": 904,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT 1 AS x FROM t1 AS tx ARRAY JOIN [] AS a0 LEFT JOIN t1__fuzz_28 ON and(t1.c0 = a0, (SELECT t1.c0) > 0, t1.c0 != a0) FORMAT Null;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 378
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

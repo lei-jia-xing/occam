@@ -1,0 +1,37 @@
+{
+  "id": "pg_nocols_lateral_values_segfault",
+  "file": "pg_nocols_lateral_values_segfault.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "Fuzz / PostgreSQL Bug #17477 (commit 91a3a74c65)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/17477-0af3c6ac6b0a6ae0@postgresql.org",
+    "reporter": "Wang Ke (Zhejiang University)",
+    "report_date": "2022-05-09",
+    "issue_id": "BUG #17477",
+    "fixed_in_version": "PostgreSQL 13.7 (commit 91a3a74c65)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "13.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:terminat.*signal (?:6|11)|Segmentation fault|FailedAssertion)",
+    "assertion_message": "SEGV on null read in transformValuesClause (analyze.c:1512)",
+    "source_file": "src/backend/parser/analyze.c",
+    "source_line": 1512,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "SELECT * FROM nocols n, LATERAL (VALUES(n.*)) v;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 112
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

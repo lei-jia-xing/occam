@@ -1,0 +1,34 @@
+{
+  "id": "duckdb_info_schema_fk_bind_column",
+  "file": "duckdb_info_schema_fk_bind_column.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "DuckDB Metadata Query Bug Report",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/15897",
+    "reporter": "azmy60",
+    "report_date": "2025-01-24",
+    "issue_id": "duckdb/duckdb#15897"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.1.3",
+    "compilation_flags": "-DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Failed to bind column reference \\\"constraint_name\\\"",
+    "assertion_message": "Failed to bind column reference \"constraint_name\"",
+    "signal": "InternalException (assertion failure)"
+  },
+  "trigger": {
+    "statement": "SELECT (...) FROM information_schema.key_column_usage AS kcu JOIN information_schema.table_constraints AS tc ...;",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 1386
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

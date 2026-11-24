@@ -1,0 +1,5 @@
+CREATE TABLE v0 ( v1 INT ) ;
+INSERT INTO v0 ( v1 ) VALUES ( 9 ) ;
+UPDATE v0 SET v1 = 2 WHERE v1 IN ( SELECT v1 WHERE v1 = v1 OR ( v1 = -1 AND v1 = 28 ) ) ;
+INSERT INTO v0 ( v1 ) VALUES ( 60 ) , ( 0 ) ;
+SELECT RANK ( v1 ) OVER w , STD ( v1 ) OVER w FROM v0 WINDOW v2 AS ( PARTITION BY v1 ORDER BY v1 * 0 ) ;

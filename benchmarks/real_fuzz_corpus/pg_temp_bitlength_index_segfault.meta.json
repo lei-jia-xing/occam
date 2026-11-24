@@ -1,0 +1,35 @@
+{
+  "id": "pg_temp_bitlength_index_segfault",
+  "file": "pg_temp_bitlength_index_segfault.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer (OSDI 2020)",
+    "origin_url": "https://github.com/postgres/postgres/commit/c35b714caf",
+    "reporter": "Manuel Rigger",
+    "report_date": "2019-11-22",
+    "issue_id": "sqlancer/bugs PostgreSQL #195 (commit c35b714caf)",
+    "fixed_in_version": "PostgreSQL 12.2 (commit c35b714caf)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:terminat.*signal (?:6|11)|Segmentation fault|FailedAssertion)",
+    "assertion_message": "Segmentation fault when creating constant bit_length() index on TEMP ON COMMIT DELETE ROWS table",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "CREATE INDEX i0 ON t0(bit_length(''));",
+    "statement_index": 2
+  },
+  "metrics": {
+    "statement_count": 2,
+    "byte_count": 91
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

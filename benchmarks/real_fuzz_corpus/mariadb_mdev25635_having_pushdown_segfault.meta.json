@@ -1,0 +1,35 @@
+{
+  "id": "mariadb_mdev25635_having_pushdown_segfault",
+  "file": "mariadb_mdev25635_having_pushdown_segfault.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "randgen + SQLsmith (MariaDB fuzz.sql)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-25635",
+    "reporter": "Zuming Jiang",
+    "report_date": "2021-05-10",
+    "issue_id": "MDEV-25635",
+    "fixed_in_version": "MariaDB 10.5.11"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:mysqld got signal (?:6|11)|Assertion .* failed)",
+    "assertion_message": "mysqld got signal 11 (HAVING to derived WHERE pushdown crash)",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "WITH jennifer_0 AS (...) select subq_0.c2 as c0 from (...) as subq_0 where subq_0.c1 > subq_0.c0;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 758
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_alias_materialize_ttl_segv",
+  "file": "clickhouse_alias_materialize_ttl_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse AST Fuzzer (PR #99980)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/117327",
+    "reporter": "qoega (ClickHouse AST fuzzer)",
+    "report_date": "2026-08-31",
+    "issue_id": "ClickHouse #117327",
+    "fixed_in_version": "ClickHouse 26.9.1.445 (PR #117181)"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.8.44.3",
+    "compilation_flags": "Official release package (deb)"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV)",
+    "assertion_message": "SIGSEGV null mutex dereference at 0x4f8 in MutationsInterpreter::prepare",
+    "source_file": "src/Interpreters/MutationsInterpreter.cpp",
+    "source_line": 1386,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "ALTER TABLE av MATERIALIZE TTL;",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 209
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

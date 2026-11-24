@@ -1,0 +1,5 @@
+SET optimizer_switch="semijoin=off";
+CREATE TABLE t1(a INTEGER, b INTEGER);
+CREATE TABLE t2(c INTEGER);
+SELECT b FROM t1 HAVING 1 IN
+  (SELECT b FROM t2 WHERE c = 1);

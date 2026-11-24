@@ -1,0 +1,36 @@
+{
+  "id": "duckdb_iejoin_list_null_shared_ptr",
+  "file": "duckdb_iejoin_list_null_shared_ptr.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "SQL Query / IEJoin Fuzzer Report",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/27220",
+    "reporter": "ZhangJieee",
+    "report_date": "2026-10-14",
+    "issue_id": "duckdb/duckdb#27220"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.5.5",
+    "compilation_flags": "Official release CLI / -DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Attempted to dereference shared_ptr that is NULL",
+    "assertion_message": "INTERNAL Error: Attempted to dereference shared_ptr that is NULL!",
+    "source_file": "src/execution/operator/join/physical_iejoin.cpp",
+    "signal": "INTERNAL Error"
+  },
+  "trigger": {
+    "statement": "CREATE TABLE o AS SELECT l.a, r.v FROM l LEFT JOIN r ON l.a >= r.k AND l.a < r.k2;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 231
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on host duckdb v1.5.5 via harness/crash_oracle.py."
+  }
+}

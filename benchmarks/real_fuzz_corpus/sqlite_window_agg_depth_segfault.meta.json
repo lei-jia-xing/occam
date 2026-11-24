@@ -1,0 +1,37 @@
+{
+  "id": "sqlite_window_agg_depth_segfault",
+  "file": "sqlite_window_agg_depth_segfault.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "Fuzz / SQLite Bug Tracker (Fossil ticket 7a5279a25c57adf1, test/window1.test 53.0)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/c37577bb2d",
+    "reporter": "drh (SQLite team, ticket 7a5279a25c57adf1)",
+    "report_date": "2020-05-24",
+    "issue_id": "Ticket 7a5279a25c57adf1",
+    "fixed_in_version": "SQLite 3.32.2 (commit c37577bb2d)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Segmentation fault|SIGSEGV|signal 11)",
+    "assertion_message": "Segmentation fault (window rewrite Expr.op2 depth mismatch)",
+    "source_file": "src/window.c",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN a AS e ON a.c=e.c WHERE a.c=(SELECT (SELECT coalesce(lead(2) OVER(),0) + sum(d.c)) FROM a AS d WHERE a.c);",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 215
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

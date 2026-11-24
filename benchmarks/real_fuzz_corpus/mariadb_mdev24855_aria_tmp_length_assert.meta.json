@@ -1,0 +1,37 @@
+{
+  "id": "mariadb_mdev24855_aria_tmp_length_assert",
+  "file": "mariadb_mdev24855_aria_tmp_length_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "RQG (Random Query Generator)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-24855",
+    "reporter": "Elena Stepanova",
+    "report_date": "2021-02-12",
+    "issue_id": "MDEV-24855",
+    "fixed_in_version": "MariaDB 10.5.10"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "write_block_record: Assertion `length <= column->length' failed",
+    "assertion_message": "length <= column->length",
+    "source_file": "storage/maria/ma_blockrec.c",
+    "source_line": 2807,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT c, GROUP_CONCAT(CASE NULL WHEN 0 THEN a END, CASE 'foo' WHEN c THEN 1 END) AS f FROM t1 GROUP BY ExtractValue('<a></a>', '/a'), UUID();",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 238
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

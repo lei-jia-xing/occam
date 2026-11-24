@@ -1,0 +1,35 @@
+{
+  "id": "mysql_bug26542829_derived_datetime_range_assert",
+  "file": "mysql_bug26542829_derived_datetime_range_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "RQG / MySQL Derived Table Join Bug (commit 728e566656)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/728e566656",
+    "reporter": "MySQL Bug #26542829",
+    "report_date": "2020-06-29",
+    "issue_id": "Bug #26542829",
+    "fixed_in_version": "MySQL 8.0.21 (commit 728e566656)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion `!\\(check_datetime_range\\(ltime\\)\\)' failed",
+    "assertion_message": "!(check_datetime_range(ltime))",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT field1 FROM (SELECT alias1.c5 AS field1, alias1.c13 AS field2, alias1.c1 AS field4 FROM t1 AS alias1 RIGHT JOIN t2 AS alias2 ON alias1.pk = alias2.c12 ORDER BY field2) as dt;",
+    "statement_index": 6
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 2391
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "mariadb_mdev25295_duplicate_fulltext_index_assert",
+  "file": "mariadb_mdev25295_duplicate_fulltext_index_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "pquery (MariaDB QA Fuzzer)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-25295",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2021-03-30",
+    "issue_id": "MDEV-25295",
+    "fixed_in_version": "MariaDB 10.5.10"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "commit_cache_norebuild.*Assertion `\\(ctx->new_table->fts == __null\\) == \\(ctx->new_table->fts_doc_id_index == __null\\)' failed",
+    "assertion_message": "(ctx->new_table->fts == __null) == (ctx->new_table->fts_doc_id_index == __null)",
+    "source_file": "storage/innobase/handler/handler0alter.cc",
+    "source_line": 10588,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "CREATE FULLTEXT INDEX idx1 ON t (title,body);",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 261
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

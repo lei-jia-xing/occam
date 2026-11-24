@@ -1,0 +1,36 @@
+{
+  "id": "mysql_bug31361748_window_range_frame_assert",
+  "file": "mysql_bug31361748_window_range_frame_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "Fuzz / MySQL Window Function Bug Report (commit f69fe331c8)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/f69fe331c8",
+    "reporter": "MySQL Bug #31361748",
+    "report_date": "2020-09-04",
+    "issue_id": "Bug #31361748",
+    "fixed_in_version": "MySQL 8.0.22 (commit f69fe331c8)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion `w->frame_buffer\\(\\)->s->db_type\\(\\)->db_type == DB_TYPE_INNODB \\|\\| cnt <= 1",
+    "assertion_message": "w->frame_buffer()->s->db_type()->db_type == DB_TYPE_INNODB || cnt <= 1 || ...",
+    "source_file": "sql/sql_executor.cc",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT LAST_VALUE(b) RESPECT NULLS OVER (PARTITION BY b ORDER BY a RANGE BETWEEN 253 FOLLOWING AND 118 FOLLOWING) FROM t;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 354
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

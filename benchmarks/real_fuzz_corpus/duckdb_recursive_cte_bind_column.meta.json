@@ -1,0 +1,34 @@
+{
+  "id": "duckdb_recursive_cte_bind_column",
+  "file": "duckdb_recursive_cte_bind_column.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "DBMSTesting Recursive CTE Fuzz / Report",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/17286",
+    "reporter": "ChenglinTian (DBMSTesting)",
+    "report_date": "2025-04-29",
+    "issue_id": "duckdb/duckdb#17286"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.1.3",
+    "compilation_flags": "-DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Failed to bind column reference \\\"\\\"",
+    "assertion_message": "Failed to bind column reference \"\"",
+    "signal": "InternalException (assertion failure)"
+  },
+  "trigger": {
+    "statement": "WITH RECURSIVE aoc6_input(i) AS (...);",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 2119
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

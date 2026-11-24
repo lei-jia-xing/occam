@@ -1,0 +1,4 @@
+CREATE TABLE t0(c0 int);
+CREATE VIEW v0 AS SELECT * FROM t0;
+CREATE OR REPLACE VIEW v0 AS SELECT * FROM v0;
+SELECT * FROM information_schema.tables;

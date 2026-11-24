@@ -1,0 +1,35 @@
+{
+  "id": "pg_generated_like_defaults_segfault",
+  "file": "pg_generated_like_defaults_segfault.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer (OSDI 2020)",
+    "origin_url": "https://github.com/sqlancer/bugs",
+    "reporter": "Manuel Rigger",
+    "report_date": "2019-09-24",
+    "issue_id": "sqlancer/bugs PostgreSQL #136",
+    "fixed_in_version": "PostgreSQL 12.0"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12 Beta 2",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:terminat.*signal (?:6|11)|Segmentation fault|FailedAssertion)",
+    "assertion_message": "INSERT INTO causes segfault on LIKE ... INCLUDING DEFAULTS with STORED generated column",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "INSERT INTO t1(c0) VALUES(NULL);",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 154
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "clickhouse_json_shared_variant_size_segv",
+  "file": "clickhouse_json_shared_variant_size_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse AI / Fuzz Reproducer (confirmed 26.3..26.9, open)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/121079",
+    "reporter": "clickgapai",
+    "report_date": "2026-09-19",
+    "issue_id": "ClickHouse #121079"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.8.44.3",
+    "compilation_flags": "Official release package (deb)"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV)",
+    "assertion_message": "Received signal 11 (Segmentation fault) at address 0x58 reading shared-variant size0 subcolumn",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "SELECT jd.a.:`Array(JSON)`.size0 FROM t05215;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 493
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

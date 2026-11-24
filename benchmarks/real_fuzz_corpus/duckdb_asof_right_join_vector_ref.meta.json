@@ -1,0 +1,34 @@
+{
+  "id": "duckdb_asof_right_join_vector_ref",
+  "file": "duckdb_asof_right_join_vector_ref.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "SQLancer / PSU Grammar Fuzzer",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/15444",
+    "reporter": "Yu Liang (SteveLeungYL)",
+    "report_date": "2024-12-23",
+    "issue_id": "duckdb/duckdb#15444"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.1.3",
+    "compilation_flags": "-DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Vector::Reference used on vector of different type",
+    "assertion_message": "Vector::Reference used on vector of different type",
+    "signal": "InternalException (assertion failure)"
+  },
+  "trigger": {
+    "statement": "SELECT DISTINCT ON ( 'string' ) 'string' ident FROM v00 AS ta03, ( SELECT c01 < 'string' ) CROSS JOIN v00 AS ta04 ASOF RIGHT JOIN v00 AS ta05 USING ( c02, c01 );",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 287
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

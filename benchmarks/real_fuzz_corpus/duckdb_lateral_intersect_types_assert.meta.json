@@ -1,0 +1,36 @@
+{
+  "id": "duckdb_lateral_intersect_types_assert",
+  "file": "duckdb_lateral_intersect_types_assert.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "SQLancer / PSU Grammar Fuzzer",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/15526",
+    "reporter": "Yu Liang (SteveLeungYL)",
+    "report_date": "2025-01-02",
+    "issue_id": "duckdb/duckdb#15526"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.1.3",
+    "compilation_flags": "-DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Assertion triggered.*types == input\\.GetTypes\\(\\)",
+    "assertion_message": "types == input.GetTypes()",
+    "source_file": "src/common/types/column/column_data_collection.cpp",
+    "source_line": 794,
+    "signal": "InternalException (assertion failure)"
+  },
+  "trigger": {
+    "statement": "SELECT DISTINCT 'string' AS c01 FROM v00, LATERAL ( WITH ta02 AS MATERIALIZED ( SELECT 'string' ) ( SELECT 'string' ) INTERSECT ALL ( SELECT 'string' ) );",
+    "statement_index": 2
+  },
+  "metrics": {
+    "statement_count": 2,
+    "byte_count": 196
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

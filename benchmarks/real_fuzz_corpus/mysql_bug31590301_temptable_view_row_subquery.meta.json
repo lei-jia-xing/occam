@@ -1,0 +1,36 @@
+{
+  "id": "mysql_bug31590301_temptable_view_row_subquery",
+  "file": "mysql_bug31590301_temptable_view_row_subquery.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "Grammar Fuzzer (MySQL 8.0.20 bug report, commit 94c4e70daa)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/94c4e70daa",
+    "reporter": "MySQL Bug #31590301",
+    "report_date": "2020-09-02",
+    "issue_id": "Bug #31590301",
+    "fixed_in_version": "MySQL 8.0.22 (commit 94c4e70daa)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Assertion `!\\(thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW\\)' failed|Assertion `.*' failed|mysqld got signal (?:6|11))",
+    "assertion_message": "!(thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW)",
+    "source_file": "sql/item_subselect.cc",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "CREATE ALGORITHM = TEMPTABLE VIEW v3 AS SELECT * FROM v0 WHERE (v1, FALSE) IN ((-1, EXISTS (SELECT (-128, 'x', 72) <= (76, 'x', -1))), (-1, 'x'));",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 213
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

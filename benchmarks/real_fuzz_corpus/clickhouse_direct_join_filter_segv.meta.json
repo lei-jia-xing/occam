@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_direct_join_filter_segv",
+  "file": "clickhouse_direct_join_filter_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse AST Fuzzer (PR #104174)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/107272",
+    "reporter": "qoega (ClickHouse AST fuzzer)",
+    "report_date": "2026-06-11",
+    "issue_id": "ClickHouse #107272",
+    "fixed_in_version": "ClickHouse 26.6 (PR #104174)"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.5-release",
+    "compilation_flags": "Official release / debug build"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV|assertTypeEquality)",
+    "assertion_message": "SIGSEGV in ColumnString::compareAt / FilterTransform::doTransform with join_algorithm = 'direct'",
+    "source_file": "src/Processors/Transforms/FilterTransform.cpp",
+    "source_line": 179,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "SELECT count() FROM (SELECT r.value FROM lft AS l INNER JOIN rgt AS r ON l.id = r.id WHERE r.id = 1) SETTINGS join_algorithm = 'direct';",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 468
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

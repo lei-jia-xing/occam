@@ -1,0 +1,37 @@
+{
+  "id": "mariadb_mdev24072_instant_alter_vcols_assert",
+  "file": "mariadb_mdev24072_instant_alter_vcols_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "pquery (MariaDB QA Fuzzer)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-24072",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2020-10-31",
+    "issue_id": "MDEV-24072",
+    "fixed_in_version": "MariaDB 10.5.9"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "instant_alter_column_possible.*Assertion `ib_table\\.n_v_cols' failed",
+    "assertion_message": "ib_table.n_v_cols",
+    "source_file": "storage/innobase/handler/handler0alter.cc",
+    "source_line": 1467,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "ALTER TABLE t ADD d INT, ALGORITHM=INPLACE;",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 199
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

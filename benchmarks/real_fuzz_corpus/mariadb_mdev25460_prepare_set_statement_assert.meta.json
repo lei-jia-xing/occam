@@ -1,0 +1,37 @@
+{
+  "id": "mariadb_mdev25460_prepare_set_statement_assert",
+  "file": "mariadb_mdev25460_prepare_set_statement_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "pquery (MariaDB QA Fuzzer)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-25460",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2021-04-20",
+    "issue_id": "MDEV-25460",
+    "fixed_in_version": "MariaDB 10.5.14"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "Diagnostics_area::set_ok_status.*Assertion `!is_set\\(\\) \\|\\| \\(m_status == DA_OK_BULK && is_bulk_op\\(\\)\\)' failed",
+    "assertion_message": "!is_set() || (m_status == DA_OK_BULK && is_bulk_op())",
+    "source_file": "sql/sql_error.cc",
+    "source_line": 334,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "PREPARE s FROM 'SET STATEMENT binlog_format=ROW FOR SELECT * FROM b';",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 156
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

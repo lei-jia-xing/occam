@@ -1,0 +1,34 @@
+{
+  "id": "clickhouse_alter_sorting_key_cast_segv",
+  "file": "clickhouse_alter_sorting_key_cast_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse DDL Fuzz / Analyzer (open)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/121122",
+    "reporter": "clickgapai",
+    "report_date": "2026-09-20",
+    "issue_id": "ClickHouse #121122"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.8.44.3",
+    "compilation_flags": "Official release package (deb)"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV)",
+    "assertion_message": "SIGSEGV in SerializationNullable::serializeBinary after ALTER ADD COLUMN SETTINGS cast_keep_nullable = 1",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "INSERT INTO t_alter_key_type (k, x) VALUES (2, 7);",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 403
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

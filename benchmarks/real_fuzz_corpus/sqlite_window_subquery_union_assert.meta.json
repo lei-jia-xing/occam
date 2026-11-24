@@ -1,0 +1,38 @@
+{
+  "id": "sqlite_window_subquery_union_assert",
+  "file": "sqlite_window_subquery_union_assert.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "Fuzz / SQLite Bug Tracker (Fossil ticket 618156e3, test/window9.test 8.1-8.4)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/553948e514",
+    "reporter": "dan (SQLite team, ticket 618156e3)",
+    "report_date": "2020-03-16",
+    "issue_id": "Ticket 618156e3",
+    "fixed_in_version": "SQLite 3.32.0 (commit 553948e514)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "clearSelect: Assertion `p->pWin==0' failed",
+    "assertion_message": "p->pWin==0",
+    "source_file": "sqlite3.c",
+    "source_line": 127953,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT(SELECT x UNION SELECT sum( avg((SELECT x FROM v1)) ) OVER()) FROM v1;",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 358
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

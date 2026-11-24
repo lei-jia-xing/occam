@@ -1,0 +1,36 @@
+{
+  "id": "pg_self_ref_view_info_schema",
+  "file": "pg_self_ref_view_info_schema.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "SQLancer (OSDI 2020)",
+    "origin_url": "https://github.com/postgres/postgres/commit/4a0aab14dc",
+    "reporter": "Manuel Rigger",
+    "report_date": "2019-11-20",
+    "issue_id": "sqlancer/bugs PostgreSQL #187 (commit 4a0aab14dc)",
+    "fixed_in_version": "PostgreSQL 12.2 (commit 4a0aab14dc)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "12.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:terminat.*signal (?:6|11)|Segmentation fault)",
+    "assertion_message": "Stack overflow SIGSEGV in relation_is_updatable (rewriteHandler.c)",
+    "source_file": "src/backend/rewrite/rewriteHandler.c",
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "SELECT * FROM information_schema.tables;",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 149
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

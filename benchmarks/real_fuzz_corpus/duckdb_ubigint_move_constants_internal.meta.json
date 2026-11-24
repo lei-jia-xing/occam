@@ -1,0 +1,36 @@
+{
+  "id": "duckdb_ubigint_move_constants_internal",
+  "file": "duckdb_ubigint_move_constants_internal.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "Differential / Optimizer Fuzz & User Bug Report",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/28535",
+    "reporter": "prabh1512 (Prabhnoor, IIT Guwahati)",
+    "report_date": "2026-11-07",
+    "issue_id": "duckdb/duckdb#28535"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.5.5",
+    "compilation_flags": "Official release CLI / RelWithDebInfo"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Information loss on integer cast: value 18446744073709551615",
+    "assertion_message": "Information loss on integer cast: value 18446744073709551615 outside of target range [-9223372036854775808, 9223372036854775807]",
+    "source_file": "src/common/types/value.cpp",
+    "signal": "InternalException (exit code 1)"
+  },
+  "trigger": {
+    "statement": "SELECT count(*) FROM t WHERE x + 1 = 18446744073709551615;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 117
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on host duckdb v1.5.5 via harness/crash_oracle.py."
+  }
+}

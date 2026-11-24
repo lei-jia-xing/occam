@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_logical_expr_single_or_abort",
+  "file": "clickhouse_logical_expr_single_or_abort.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse AST Fuzzer",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/112654",
+    "reporter": "qoega (ClickHouse AST fuzzer)",
+    "report_date": "2026-07-30",
+    "issue_id": "ClickHouse #112654",
+    "fixed_in_version": "PR #107113"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.7-debug",
+    "compilation_flags": "Debug / ABORT_ON_LOGICAL_ERROR"
+  },
+  "crash_signature": {
+    "expected_signature": "Logical error: 'or_argument_nodes\\.size\\(\\) > 1'",
+    "assertion_message": "or_argument_nodes.size() > 1",
+    "source_file": "src/Analyzer/Passes/LogicalExpressionOptimizerPass.cpp",
+    "source_line": 1243,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT 1 AS x FROM t1 ARRAY JOIN [] AS a0 GLOBAL ALL INNER JOIN t1 AS t2 ON or(t2.c0 != a0) SETTINGS max_threads = 4;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 199
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

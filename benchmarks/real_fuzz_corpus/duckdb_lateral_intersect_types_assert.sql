@@ -1,0 +1,2 @@
+CREATE TABLE v00 AS ( SELECT 'string' );
+SELECT DISTINCT 'string' AS c01 FROM v00, LATERAL ( WITH ta02 AS MATERIALIZED ( SELECT 'string' ) ( SELECT 'string' ) INTERSECT ALL ( SELECT 'string' ) );

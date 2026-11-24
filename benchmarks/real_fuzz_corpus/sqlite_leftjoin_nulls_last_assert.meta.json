@@ -1,0 +1,38 @@
+{
+  "id": "sqlite_leftjoin_nulls_last_assert",
+  "file": "sqlite_leftjoin_nulls_last_assert.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "Fuzz / SQLite Bug Tracker (Fossil ticket e12a0ae526bb51c7, test/nulls1.test)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/7f05d52c4c",
+    "reporter": "drh (SQLite team, ticket e12a0ae526bb51c7)",
+    "report_date": "2020-03-02",
+    "issue_id": "Ticket e12a0ae526bb51c7",
+    "fixed_in_version": "SQLite 3.32.0 (commit 7f05d52c4c)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "sqlite3VdbeExec: Assertion `memIsValid\\(&aMem\\[pOp->p1\\]\\)' failed",
+    "assertion_message": "memIsValid(&aMem[pOp->p1])",
+    "source_file": "sqlite3.c",
+    "source_line": 85621,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT c FROM t1 LEFT JOIN t2 ON d=NULL ORDER BY d, c NULLS LAST;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 171
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

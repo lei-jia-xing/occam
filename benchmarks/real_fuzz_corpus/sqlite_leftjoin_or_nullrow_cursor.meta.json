@@ -1,0 +1,38 @@
+{
+  "id": "sqlite_leftjoin_or_nullrow_cursor",
+  "file": "sqlite_leftjoin_or_nullrow_cursor.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "Fuzz / SQLite Bug Tracker (Fossil ticket aa4378693018aa99, test/whereD.test)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/e8c4f03266",
+    "reporter": "drh (SQLite team, ticket aa4378693018aa99)",
+    "report_date": "2020-02-22",
+    "issue_id": "Ticket aa4378693018aa99",
+    "fixed_in_version": "SQLite 3.32.0 (commit e8c4f03266)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "sqlite3VdbeExec: Assertion `sqlite3BtreeCursorIsValid\\(pCrsr\\)' failed",
+    "assertion_message": "sqlite3BtreeCursorIsValid(pCrsr)",
+    "source_file": "sqlite3.c",
+    "source_line": 87489,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT t1.* FROM t1 LEFT JOIN t2 ON abs(t1.a)=abs(t2.b);",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 195
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "sqlite_fts3_segdir_corrupt",
+  "file": "sqlite_fts3_segdir_corrupt.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "OSS-Fuzz / SQLite FTS3 corruption fuzz (test/fts3corrupt4.test)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/7576a68c8c",
+    "reporter": "dan (SQLite team)",
+    "report_date": "2020-04-16",
+    "issue_id": "fts3corrupt4 (commit 7576a68c8c)",
+    "fixed_in_version": "SQLite 3.32.0 (commit 7576a68c8c)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "fts3SegWriterAdd: Assertion `nDoclist>0' failed",
+    "assertion_message": "nDoclist>0",
+    "source_file": "sqlite3.c",
+    "source_line": 177403,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "INSERT INTO f VALUES (0,x'00');",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 193
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

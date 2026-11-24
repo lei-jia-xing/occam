@@ -1,0 +1,35 @@
+{
+  "id": "clickhouse_join_order_restriction_logical_error",
+  "file": "clickhouse_join_order_restriction_logical_error.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "SQLancer / Join-Order Optimizer Fuzz",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/106426",
+    "reporter": "fm4v",
+    "report_date": "2026-06-04",
+    "issue_id": "ClickHouse #106426",
+    "fixed_in_version": "PR #101684"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.6.1.339-debug",
+    "compilation_flags": "Debug / ABORT_ON_LOGICAL_ERROR"
+  },
+  "crash_signature": {
+    "expected_signature": "Logical error:.*Join restriction violated",
+    "assertion_message": "Join restriction violated",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT * FROM t1, t3, t0 JOIN t3 AS right_0 ON (t1.c1 = right_0.c2) LEFT OUTER JOIN t3 AS right_1 ON (t1.c1 = right_1.c2) AND (right_1.c2 IS NULL) WHERE t1.c0 < t3.c1;",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 510
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

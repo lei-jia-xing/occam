@@ -263,7 +263,7 @@ class TestBatchEval(unittest.TestCase):
             self.assertEqual(r_cnt.returncode, 2)
             self.assertIn("isolated containers", r_cnt.stderr)
 
-            # 4. Full dry-run across all 14 real_fuzz_corpus cases x 6 profiles x 3 repeats
+            # 4. Full dry-run across all 71 real_fuzz_corpus cases x 6 profiles x 3 repeats
             plan_dir = os.path.join(td, "full_plan")
             r_dry = subprocess.run(
                 [
@@ -288,9 +288,13 @@ class TestBatchEval(unittest.TestCase):
             self.assertEqual(r_dry.returncode, 0, r_dry.stderr)
             with open(os.path.join(plan_dir, "plan.json"), encoding="utf-8") as handle:
                 plan = json.load(handle)
-            self.assertEqual(plan["case_count"], 14)
-            self.assertEqual(plan["total_jobs"], 252)
+            self.assertEqual(plan["case_count"], 71)
+            self.assertEqual(plan["total_jobs"], 1278)
             self.assertEqual(plan["jobs_workers"], 4)
+            self.assertEqual(
+                {c["dbms"] for c in plan["cases"]},
+                {"postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb"},
+            )
 
     def test_container_per_worker_parallel_batch_and_5replay_slippage_and_resume(self):
         """

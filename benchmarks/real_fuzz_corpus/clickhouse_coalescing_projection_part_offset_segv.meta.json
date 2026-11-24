@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_coalescing_projection_part_offset_segv",
+  "file": "clickhouse_coalescing_projection_part_offset_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse Production / LTS Crash Report (open for 25.8 backport)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/106929",
+    "reporter": "BorisTyshkevich",
+    "report_date": "2026-06-10",
+    "issue_id": "ClickHouse #106929",
+    "fixed_in_version": "ClickHouse 25.12.2.54 (PR #92925; affects 25.8..25.11)"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "25.8.24.21",
+    "compilation_flags": "Official release package (deb)"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV)",
+    "assertion_message": "SIGSEGV in MergeTreeSequentialSource::generate rebuilding _part_offset projection on CoalescingMergeTree",
+    "source_file": "src/Storages/MergeTree/MergeTask.cpp",
+    "source_line": 1430,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "OPTIMIZE TABLE tiny FINAL;",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 427
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

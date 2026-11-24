@@ -1,0 +1,36 @@
+{
+  "id": "mysql_bug31479282_json_mv_index_crash",
+  "file": "mysql_bug31479282_json_mv_index_crash.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "MySQL Bug Report / Regression Test (commit a112550236)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/a112550236",
+    "reporter": "Oracle MySQL Team (Bug #31479282)",
+    "report_date": "2020-09-16",
+    "issue_id": "Bug #31479282",
+    "fixed_in_version": "MySQL 8.0.22 (commit a112550236)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Assertion failure: data0data\\.cc:.*clust_len == 0|Assertion `.*' failed|mysqld got signal (?:6|11))",
+    "assertion_message": "Empty string in multi-valued JSON index treated as array marker (SIGSEGV / InnoDB assert)",
+    "source_file": "storage/innobase/data/data0data.cc",
+    "signal": "SIGABRT / SIGSEGV"
+  },
+  "trigger": {
+    "statement": "INSERT INTO t1 values (1000,  CONCAT('[\"\"]'));",
+    "statement_index": 2
+  },
+  "metrics": {
+    "statement_count": 2,
+    "byte_count": 201
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

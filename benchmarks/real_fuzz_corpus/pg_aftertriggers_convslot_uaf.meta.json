@@ -1,0 +1,37 @@
+{
+  "id": "pg_aftertriggers_convslot_uaf",
+  "file": "pg_aftertriggers_convslot_uaf.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "PostgreSQL Hackers Bug Report (commit 262eb990c7)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/39a71864-b120-5a5c-8cc5-c632b6f16761@amazon.com",
+    "reporter": "pgsql-hackers (fixed by Alvaro Herrera)",
+    "report_date": "2021-02-27",
+    "issue_id": "Commit 262eb990c7 (AfterTriggersTableData.storeslot UAF)",
+    "fixed_in_version": "PostgreSQL 13.3 (commit 262eb990c7)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "13.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:terminat.*signal (?:6|11)|Segmentation fault|FailedAssertion)",
+    "assertion_message": "Use-after-free SIGSEGV in execute_attr_map_slot (tupconvert.c:193)",
+    "source_file": "src/backend/access/common/tupconvert.c",
+    "source_line": 193,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "DELETE FROM parent;",
+    "statement_index": 10
+  },
+  "metrics": {
+    "statement_count": 10,
+    "byte_count": 795
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

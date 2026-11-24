@@ -1,0 +1,37 @@
+{
+  "id": "clickhouse_mv_loop_table_func_segv",
+  "file": "clickhouse_mv_loop_table_func_segv.sql",
+  "dialect": "clickhouse",
+  "provenance": {
+    "tool": "ClickHouse Crash / MV Loop Table Function Bug (fixed 26.11 via PR #129338)",
+    "origin_url": "https://github.com/ClickHouse/ClickHouse/issues/125023",
+    "reporter": "clickgapai",
+    "report_date": "2026-10-10",
+    "issue_id": "ClickHouse #125023",
+    "fixed_in_version": "ClickHouse 26.11.1.1418 (PR #129338)"
+  },
+  "target": {
+    "dbms": "clickhouse",
+    "version": "26.8.44.3",
+    "compilation_flags": "Official release package (deb)"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:Received signal\\s+(?:11|Segmentation fault)|Segmentation fault|signal 11|SIGSEGV)",
+    "assertion_message": "SIGSEGV in KeyCondition::KeyCondition from LoopSource::initLoop during MV INSERT",
+    "source_file": "src/Storages/MergeTree/KeyCondition.cpp",
+    "source_line": 1615,
+    "signal": "SIGSEGV (signal 11)"
+  },
+  "trigger": {
+    "statement": "INSERT INTO src VALUES (2), (3);",
+    "statement_index": 10
+  },
+  "metrics": {
+    "statement_count": 10,
+    "byte_count": 715
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

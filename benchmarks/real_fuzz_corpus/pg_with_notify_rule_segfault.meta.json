@@ -1,0 +1,36 @@
+{
+  "id": "pg_with_notify_rule_segfault",
+  "file": "pg_with_notify_rule_segfault.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "Grammar Fuzzer (PostgreSQL Bug #17094, commit 6edccac166)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/17094-bf15dff55eaf2e28@postgresql.org",
+    "reporter": "yaoguang chen (cyg0810@gmail.com)",
+    "report_date": "2021-07-08",
+    "issue_id": "BUG #17094",
+    "fixed_in_version": "PostgreSQL 13.4 (commit 6edccac166)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "13.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "(?:FailedAssertion.*!parse->rowMarks && parse->commandType == CMD_SELECT|terminat.*signal (?:6|11)|Segmentation fault)",
+    "assertion_message": "!parse->rowMarks && parse->commandType == CMD_SELECT",
+    "source_file": "src/backend/optimizer/plan/planner.c",
+    "signal": "SIGABRT / SIGSEGV"
+  },
+  "trigger": {
+    "statement": "WITH v2 AS ( INSERT INTO v0 VALUES ( 0 ) ) DELETE FROM v0 WHERE v3 = - - - - 48 ;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 229
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

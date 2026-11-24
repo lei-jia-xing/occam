@@ -1,0 +1,38 @@
+{
+  "id": "sqlite_alter_view_compound_orderby",
+  "file": "sqlite_alter_view_compound_orderby.sql",
+  "dialect": "sqlite",
+  "provenance": {
+    "tool": "Fuzz / SQLite Bug Tracker (Fossil ticket a10a14e9b4ba2)",
+    "origin_url": "https://github.com/sqlite/sqlite/commit/4db7ab53f9",
+    "reporter": "dan (SQLite team, ticket a10a14e9b4ba2)",
+    "report_date": "2020-04-03",
+    "issue_id": "Ticket a10a14e9b4ba2",
+    "fixed_in_version": "SQLite 3.32.0 (commit 4db7ab53f9)"
+  },
+  "target": {
+    "dbms": "sqlite",
+    "version": "3.31.0-debug",
+    "compilation_flags": "-DSQLITE_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "selectAddSubqueryTypeInfo: Assertion `p->selFlags & SF_Resolved' failed",
+    "assertion_message": "p->selFlags & SF_Resolved",
+    "source_file": "sqlite3.c",
+    "source_line": 133120,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "ALTER TABLE a RENAME TO e;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 141
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5,
+    "notes": "Live 5/5 replay verified on localhost/occam-target-sqlite:latest (SQLite 3.31.0-debug)."
+  }
+}

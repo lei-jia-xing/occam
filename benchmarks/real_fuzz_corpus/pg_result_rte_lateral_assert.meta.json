@@ -1,0 +1,37 @@
+{
+  "id": "pg_result_rte_lateral_assert",
+  "file": "pg_result_rte_lateral_assert.sql",
+  "dialect": "postgres",
+  "provenance": {
+    "tool": "Grammar Fuzzer (PostgreSQL Bug #17097, commit 9807b9aedc)",
+    "origin_url": "https://www.postgresql.org/message-id/flat/17097-3372ef9f798fc94f@postgresql.org",
+    "reporter": "yaoguang chen (cyg0810@gmail.com)",
+    "report_date": "2021-07-09",
+    "issue_id": "BUG #17097",
+    "fixed_in_version": "PostgreSQL 13.4 (commit 9807b9aedc)"
+  },
+  "target": {
+    "dbms": "postgres",
+    "version": "13.0",
+    "compilation_flags": "./configure --enable-cassert --enable-debug"
+  },
+  "crash_signature": {
+    "expected_signature": "FailedAssertion\\(\\\"false\\\", File: \\\".*(?:prepjointree|initsplan)\\.c\\\"",
+    "assertion_message": "false",
+    "source_file": "src/backend/optimizer/prep/prepjointree.c",
+    "source_line": 2164,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "CREATE TEMP VIEW v0 AS SELECT * FROM v0 WHERE v1 IN ( ... LATERAL COALESCE ( -1 , 27 , 0 , NULL , - - 77 ) v1 ... );",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 1072
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

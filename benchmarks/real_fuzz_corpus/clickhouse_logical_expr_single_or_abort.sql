@@ -1,0 +1,9 @@
+CREATE TABLE t1 (c0 Int32) ENGINE = Memory;
+INSERT INTO t1 VALUES (1), (2);
+
+SELECT 1 AS x
+FROM t1
+ARRAY JOIN [] AS a0
+GLOBAL ALL INNER JOIN t1 AS t2
+    ON or(t2.c0 != a0)
+SETTINGS max_threads = 4;

@@ -1,0 +1,34 @@
+{
+  "id": "duckdb_lateral_join_bind_column",
+  "file": "duckdb_lateral_join_bind_column.sql",
+  "dialect": "duckdb",
+  "provenance": {
+    "tool": "PostgreSQL / DuckDB LATERAL Differential Test",
+    "origin_url": "https://github.com/duckdb/duckdb/issues/16524",
+    "reporter": "onderkalaci",
+    "report_date": "2025-03-05",
+    "issue_id": "duckdb/duckdb#16524"
+  },
+  "target": {
+    "dbms": "duckdb",
+    "version": "v1.1.3",
+    "compilation_flags": "-DFORCE_ASSERT=1"
+  },
+  "crash_signature": {
+    "expected_signature": "INTERNAL Error: Failed to bind column reference \\\"x\\\"",
+    "assertion_message": "Failed to bind column reference \"x\"",
+    "signal": "InternalException (assertion failure)"
+  },
+  "trigger": {
+    "statement": "SELECT * FROM int8_tbl c LEFT JOIN ( ... ) ON c.q2 = ss2.q1, LATERAL (SELECT ss2.y OFFSET 0) ss3;",
+    "statement_index": 3
+  },
+  "metrics": {
+    "statement_count": 3,
+    "byte_count": 529
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "mysql_bug20794575_having_subquery_bits_assert",
+  "file": "mysql_bug20794575_having_subquery_bits_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "MySQL Optimizer Bug Report (fixed by WL#9384 commit 728e566656)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/728e566656",
+    "reporter": "MySQL Bug #20794575",
+    "report_date": "2020-06-29",
+    "issue_id": "Bug #20794575",
+    "fixed_in_version": "MySQL 8.0.21 (commit 728e566656)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion `bit < map->n_bits' failed",
+    "assertion_message": "bit < map->n_bits",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "SELECT b FROM t1 HAVING 1 IN (SELECT b FROM t2 WHERE c = 1);",
+    "statement_index": 4
+  },
+  "metrics": {
+    "statement_count": 4,
+    "byte_count": 167
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

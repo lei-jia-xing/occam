@@ -1,0 +1,3 @@
+CREATE TEMP TABLE nocols();
+INSERT INTO nocols DEFAULT VALUES;
+SELECT * FROM nocols n, LATERAL (VALUES(n.*)) v;

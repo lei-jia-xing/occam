@@ -1,0 +1,2 @@
+CREATE TEMP TABLE t0(c0 int) ON COMMIT DELETE ROWS;
+CREATE INDEX i0 ON t0(bit_length(''));

@@ -1,0 +1,37 @@
+{
+  "id": "mariadb_mdev26453_hash_index_temp_assert",
+  "file": "mariadb_mdev26453_hash_index_temp_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "pquery (MariaDB QA Fuzzer)",
+    "origin_url": "https://jira.mariadb.org/browse/MDEV-26453",
+    "reporter": "Roel Van de Paar",
+    "report_date": "2021-08-20",
+    "issue_id": "MDEV-26453",
+    "fixed_in_version": "MariaDB 10.5.14"
+  },
+  "target": {
+    "dbms": "mariadb",
+    "version": "10.5.8-debug",
+    "compilation_flags": "cmake -DCMAKE_BUILD_TYPE=Debug"
+  },
+  "crash_signature": {
+    "expected_signature": "row_upd_sec_index_entry.*: Assertion `0' failed",
+    "assertion_message": "0",
+    "source_file": "storage/innobase/row/row0upd.cc",
+    "source_line": 2051,
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "DELETE FROM t;",
+    "statement_index": 5
+  },
+  "metrics": {
+    "statement_count": 5,
+    "byte_count": 238
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "mysql_bug32206756_icp_is_error_assert",
+  "file": "mysql_bug32206756_icp_is_error_assert.sql",
+  "dialect": "mysql",
+  "provenance": {
+    "tool": "MySQL Fuzz / Optimizer Error-Propagation Bug (commit 7af629765f)",
+    "origin_url": "https://github.com/mysql/mysql-server/commit/7af629765f",
+    "reporter": "MySQL Bug #32206756",
+    "report_date": "2020-11-27",
+    "issue_id": "Bug #32206756",
+    "fixed_in_version": "MySQL 8.0.23 (commit 7af629765f)"
+  },
+  "target": {
+    "dbms": "mysql",
+    "version": "8.0.20-debug",
+    "compilation_flags": "cmake -DWITH_DEBUG=1"
+  },
+  "crash_signature": {
+    "expected_signature": "Assertion `(?:!current_thd->is_error\\(\\)|!thd\\(\\)->is_error\\(\\))' failed",
+    "assertion_message": "!current_thd->is_error()",
+    "source_file": "sql/item_cmpfunc.cc",
+    "signal": "SIGABRT (signal 6)"
+  },
+  "trigger": {
+    "statement": "CREATE TABLE insert_select AS SELECT t2.c AS field3 FROM t1, t2 WHERE t1.b = t2.b AND t1.a <> t2.pk;",
+    "statement_index": 7
+  },
+  "metrics": {
+    "statement_count": 7,
+    "byte_count": 388
+  },
+  "replay_verification": {
+    "requirement": "Must crash consecutively 5 out of 5 runs with identical crash signature on clean state",
+    "runs_required": 5
+  }
+}

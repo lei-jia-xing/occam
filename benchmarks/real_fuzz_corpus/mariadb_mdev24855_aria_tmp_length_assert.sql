@@ -1,0 +1,3 @@
+CREATE TABLE t1 (a BIT(5), c BINARY(179));
+INSERT INTO t1 VALUES (b'1100','foo'),(b'0','bar');
+SELECT c, GROUP_CONCAT(CASE NULL WHEN 0 THEN a END, CASE 'foo' WHEN c THEN 1 END) AS f FROM t1 GROUP BY ExtractValue('<a></a>', '/a'), UUID();
