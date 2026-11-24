@@ -1134,8 +1134,9 @@ getUnit = do
     start <- getInt32
     end <- getInt32
     parseError <- getOptional getText
+    cannotProduceResult <- getBool
     facts <- getOptional getFacts
-    pure (NativeUnit start end parseError facts)
+    pure (NativeUnit start end parseError cannotProduceResult facts)
 
 {-# INLINE getColumnSiteKind #-}
 getColumnSiteKind :: Decoder ColumnSiteKind

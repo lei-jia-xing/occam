@@ -29,12 +29,13 @@ module ResultBaseline (
     runStatementFallbackNoLocBaseline,
     runGroupProposalsBaseline,
     runGroupProposalsNoLocBaseline,
+    runEarlyRejectBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
 
 import Control.Monad (forM, forM_, mapAndUnzipM, unless, when, (>=>))
-import Data.Aeson (Value (Bool), encode, object, (.=))
+import Data.Aeson (Value (Bool, Number), encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -45,7 +46,7 @@ import Data.Text.Encoding (decodeUtf8)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Conc (getNumCapabilities)
 import Occam.AtomicFile (writeAtomicLazyBytes)
-import Occam.Core (OracleOutcome (OracleRejected), ResultStatement (..))
+import Occam.Core (OracleOutcome (OracleRejected), ResultStatement (..), traceResultStatement)
 import Occam.Dependency (analyzeStatements, graphHasGlobalBarrier)
 import Occam.Evaluation (
     EvaluationConfig (..),
@@ -66,7 +67,7 @@ import Occam.Oracle (
     oracleObservationMatches,
     withCandidateWorkdir,
  )
-import Occam.Oracle.Inline (newResultStatementTracker, prepareResultOracle)
+import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
 import Occam.Parser (
     ParsedSQL (..),
     SQLDialect (..),
@@ -86,7 +87,7 @@ import Occam.Reducer (
     StatementSearchPolicy (..),
     defaultRankedScheduleConfig,
     defaultReductionConfig,
-    reduceSQLWithResultSlicing,
+    reduceSQLWithResultTrace,
     statementRanked,
  )
 import System.Exit (die)
@@ -948,6 +949,61 @@ runGroupProposalsNoLocBaseline pairs wallLimit callLimit out =
         )
         groupProposalCohort
 
+duckdbFencedFixture :: Int -> Fixture
+duckdbFencedFixture size =
+    let inputRow i =
+            "INSERT INTO t VALUES ("
+                ++ show i
+                ++ "); CREATE TABLE noise_"
+                ++ show i
+                ++ "(x INT);"
+        query = "SELECT sum(x) AS answer FROM t;"
+        reference = "SELECT " ++ show (sum [1 .. size]) ++ "::HUGEINT AS answer;"
+     in Fixture
+            ("duckdb-fenced-statements-" ++ show size)
+            DuckDB
+            (BSC.pack (unlines ("CREATE TABLE t(x INT);" : map inputRow [1 .. size] ++ [query])))
+            (BSC.pack reference)
+            "SELECT 0::HUGEINT AS answer;"
+            (ResultStatement (2 * size + 2) (2 * size + 1))
+            True
+
+earlyRejectCohort :: [Fixture]
+earlyRejectCohort =
+    [ statementFixture False False 32
+    , statementFixture False True 32
+    , statementFixture False True 128
+    , statementFixture True True 32
+    , scatteredTablesFixture False 16
+    , scatteredTablesFixture True 16
+    , txNoopBlocksFixture True 16
+    , txSavepointMixFixture True 12
+    , noncontiguousTxWrapperFkFixture 1
+    , noncontiguousTxWrapperFkFixture 4
+    , subsetOnlyReturningFixture
+    , duckdbFencedFixture 16
+    ]
+        ++ fixtures
+
+runEarlyRejectBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runEarlyRejectBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm
+            "without-early-reject"
+            (\config -> config {reductionEarlyReject = False})
+            True
+        , serialArm
+            "with-early-reject"
+            (\config -> config {reductionEarlyReject = True})
+            True
+        )
+        earlyRejectCohort
+
 runProjectionPair ::
     String ->
     StatementSearchPolicy ->
@@ -1105,14 +1161,15 @@ runFixture ::
     Int -> Maybe Int -> Maybe Int -> [EvaluationStatus] -> (Arm, Arm) -> Fixture -> IO (Value, [String])
 runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixture {..} = do
     let config = defaultReductionConfig {reductionDialect = fixtureDialect}
-        prepare remember sql = prepareResultOracle remember fixtureDialect probeTimeout sql >>= require fixtureName
+        prepare remember sql = prepareResultOracleWithTrace remember fixtureDialect probeTimeout sql >>= require fixtureName
         assert = check . ((fixtureName ++ ": ") ++)
     parsed <- parseSQL (defaultParseOptions fixtureDialect) fixtureInput >>= require fixtureName
     let initialCount = length (parsedUnits parsed)
         graph = analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed)
     assert "unexpected global fence classification" (graphHasGlobalBarrier graph == fixtureFence)
     locationRef <- newIORef Nothing
-    (_, inputObserver) <- prepare (\_ -> writeIORef locationRef . Just) fixtureInput
+    (_, inputObserver) <-
+        prepare (\_ trace -> writeIORef locationRef (Just (traceResultStatement trace))) fixtureInput
     location <- readIORef locationRef
     assert "unexpected engine result location" (location == Just fixtureLocation)
     assert
@@ -1132,8 +1189,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
     let run arm = withCandidateWorkdir $ \dir -> do
             let reductionConfig = armConfig arm config
             policy <- require fixtureName (metricPolicyForReduction reductionConfig (armJobs arm))
-            -- Both arms collect location metadata, including when the policy ignores it.
-            (remember, locate) <- newResultStatementTracker True
+            -- Both arms collect trace metadata, including when the policy ignores it.
+            (remember, lookupTrace) <- newResultTraceTracker True
             start <- getMonotonicTimeNSec
             (preflight, observer) <- prepare remember fixtureInput
             end <- getMonotonicTimeNSec
@@ -1143,9 +1200,17 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             fallbackSkips <- newIORef (0 :: Int)
             groupNoncontigAccepts <- newIORef (0 :: Int)
             groupContigAccepts <- newIORef (0 :: Int)
+            earlyRejectCheckedRef <- newIORef (0 :: Int)
+            earlyRejectExactRef <- newIORef (0 :: Int)
+            earlyRejectNoResRef <- newIORef (0 :: Int)
+            earlyRejectNanosRef <- newIORef (0 :: Integer)
             let observed started = observer $ do
                     atomicModifyIORef' physicalCalls (\calls -> (calls + 1, ()))
                     started
+                getNumField :: (Eq k, Integral a) => k -> [(k, Value)] -> a
+                getNumField key fields = case lookup key fields of
+                    Just (Number n) -> round n
+                    _ -> 0
                 telemetryLogger =
                     Logger
                         defaultLogConfig
@@ -1158,6 +1223,11 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                                 case lookup "noncontiguous" fields of
                                     Just (Bool True) -> modifyIORef' groupNoncontigAccepts (+ 1)
                                     _ -> modifyIORef' groupContigAccepts (+ 1)
+                            when (msg == "Early rejection certificate summary") $ do
+                                modifyIORef' earlyRejectCheckedRef (+ getNumField "checked" fields)
+                                modifyIORef' earlyRejectExactRef (+ getNumField "exact_prefix_rejects" fields)
+                                modifyIORef' earlyRejectNoResRef (+ getNumField "no_result_rejects" fields)
+                                modifyIORef' earlyRejectNanosRef (+ getNumField "check_nanos" fields)
                         )
                         (pure ())
                 progress (ProgressCandidateAccepted bytes statements) = do
@@ -1172,8 +1242,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         )
                 progress _ = pure ()
                 select sql = do
-                    candidateLocation <- locate sql
-                    pure (if armObservedResult arm then candidateLocation else Nothing)
+                    candidateTrace <- lookupTrace sql
+                    pure (if armObservedResult arm then candidateTrace else Nothing)
             result <-
                 runEvaluationRequestWithObserver
                     probeTimeout
@@ -1201,7 +1271,7 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         , requestCheckpoint = dir </> "checkpoint.sql"
                         , requestAction = \report logger pool -> do
                             ReductionResult sql evidence <-
-                                reduceSQLWithResultSlicing select report reductionConfig logger pool fixtureInput
+                                reduceSQLWithResultTrace select report reductionConfig logger pool fixtureInput
                             pure (ReductionActionResult sql evidence)
                         }
             let sql = evaluatedSQL result
@@ -1217,6 +1287,10 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             skips <- readIORef fallbackSkips
             noncontigAccepts <- readIORef groupNoncontigAccepts
             contigAccepts <- readIORef groupContigAccepts
+            erChecked <- readIORef earlyRejectCheckedRef
+            erExact <- readIORef earlyRejectExactRef
+            erNoRes <- readIORef earlyRejectNoResRef
+            erNanos <- readIORef earlyRejectNanosRef
             let report =
                     object
                         [ "arm" .= armName arm
@@ -1229,6 +1303,10 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         , "ranked_fallback_skips" .= skips
                         , "group_noncontiguous_accepts" .= noncontigAccepts
                         , "group_contiguous_accepts" .= contigAccepts
+                        , "early_reject_checked" .= erChecked
+                        , "early_reject_exact_prefix" .= erExact
+                        , "early_reject_no_result" .= erNoRes
+                        , "early_reject_check_micros" .= (fromIntegral erNanos / (1000.0 :: Double))
                         , "best_accepted_curve" .= curve
                         , "evaluation_metrics" .= metrics
                         ]

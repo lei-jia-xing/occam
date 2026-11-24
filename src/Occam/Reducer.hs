@@ -39,6 +39,7 @@ module Occam.Reducer (
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
     reduceSQLWithResultSlicing,
+    reduceSQLWithResultTrace,
     ReductionResult (..),
     ReductionEvidence (..),
     ReductionStage (..),
@@ -54,6 +55,7 @@ module Occam.Reducer (
     findInterestingPrefix,
 ) where
 
+import Control.Exception.Safe (finally)
 import Control.Monad (forM, unless, void, when)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
@@ -74,11 +76,25 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import Occam.Certificate (
+    EarlyRejectCertifier (..),
+    EarlyRejectStats (..),
+    EarlyRejectTracker,
+    buildEarlyRejectCertifier,
+    checkEarlyRejectionBytesTracked,
+    checkEarlyRejectionIdsTracked,
+    emptyEarlyRejectCertifier,
+    newEarlyRejectTracker,
+    readEarlyRejectStats,
+    recordEarlyRejectBuildNanos,
+ )
 import Occam.Core (
     BarrierScope (GlobalScope),
+    EarlyRejectReason (..),
     Ident (..),
     OracleOutcome (..),
     ResultStatement (..),
+    ResultTrace (..),
     ScopedBarrier (barrierScope),
     SemanticFacts (factBarriers),
     SessionInit (..),
@@ -87,6 +103,7 @@ import Occam.Core (
     StatementId (..),
     nameText,
     oracleAccepts,
+    traceResultStatement,
  )
 import Occam.Dependency (
     DependencyGraph (..),
@@ -155,7 +172,11 @@ syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
 
 -- | Total policy description for the given reduction configuration.
 reductionSearchPolicy :: ReductionConfig -> T.Text
-reductionSearchPolicy config = syntax <> statement <> groupProposalsPolicy (reductionGroupProposals config)
+reductionSearchPolicy config =
+    syntax
+        <> statement
+        <> groupProposalsPolicy (reductionGroupProposals config)
+        <> earlyRejectPolicy (reductionEarlyReject config)
     where
         syntax
             | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
@@ -181,6 +202,10 @@ reductionSearchPolicy config = syntax <> statement <> groupProposalsPolicy (redu
 groupProposalsPolicy :: Bool -> T.Text
 groupProposalsPolicy False = ""
 groupProposalsPolicy True = "+group-proposals"
+
+earlyRejectPolicy :: Bool -> T.Text
+earlyRejectPolicy False = ""
+earlyRejectPolicy True = "+early-reject"
 
 literalBatchPolicy :: Bool -> T.Text
 literalBatchPolicy False = ""
@@ -341,6 +366,7 @@ statementSearchPolicyName (StatementRankedFallback cfg)
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
     , reductionGroupProposals :: !Bool
+    , reductionEarlyReject :: !Bool
     , reductionClosure :: !Bool
     , reductionStatementSearch :: !StatementSearchPolicy
     , reductionIntraStatement :: !Bool
@@ -360,6 +386,7 @@ defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
         , reductionGroupProposals = True
+        , reductionEarlyReject = True
         , reductionClosure = True
         , reductionStatementSearch = statementRankedFallback
         , reductionIntraStatement = False
@@ -624,6 +651,45 @@ statementIdsInt = IntSet.fromList . map (unStatementId . stmtId)
 statementSQL :: ByteString -> [Statement] -> [Statement] -> ByteString
 statementSQL = cutRemovedStatements
 
+recordEarlyRejectSkip :: Maybe MetricsStore -> EarlyRejectReason -> IO ()
+recordEarlyRejectSkip store EarlyRejectExactPrefix =
+    recordGeneratedSkipped store "early-reject-exact-prefix"
+recordEarlyRejectSkip store EarlyRejectNoResultStatement =
+    recordGeneratedSkipped store "early-reject-no-result"
+
+buildCertifierTracked ::
+    Bool ->
+    EarlyRejectTracker ->
+    ByteString ->
+    [StatementUnit] ->
+    Maybe ResultTrace ->
+    IO EarlyRejectCertifier
+buildCertifierTracked False _ _ _ _ = pure emptyEarlyRejectCertifier
+buildCertifierTracked True _ _ _ Nothing = pure emptyEarlyRejectCertifier
+buildCertifierTracked True tracker baseSQL units mTrace = do
+    t0 <- getMonotonicTimeNSec
+    let !cert = buildEarlyRejectCertifier baseSQL units mTrace
+        !_ = IntSet.size (certExactPrefixByteLens cert) + IntSet.size (certGuaranteedNonResult cert)
+    t1 <- getMonotonicTimeNSec
+    recordEarlyRejectBuildNanos tracker (t1 - t0)
+    pure cert
+
+logEarlyRejectStats :: Logger -> T.Text -> EarlyRejectTracker -> IO ()
+logEarlyRejectStats logger stage tracker = do
+    stats <- readEarlyRejectStats tracker
+    when (earlyRejectChecked stats > 0 || earlyRejectCheckNanos stats > 0) $
+        logInfo'
+            logger
+            "reducer"
+            "Early rejection certificate summary"
+            [ ("stage", toJSON stage)
+            , ("checked", toJSON (earlyRejectChecked stats))
+            , ("exact_prefix_rejects", toJSON (earlyRejectExactPrefix stats))
+            , ("no_result_rejects", toJSON (earlyRejectNoResult stats))
+            , ("check_nanos", toJSON (earlyRejectCheckNanos stats))
+            , ("check_micros", toJSON (fromIntegral (earlyRejectCheckNanos stats) / (1000.0 :: Double)))
+            ]
+
 -- | Closure-constrained delta debugging.
 closureDdmin :: OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
 closureDdmin = closureDdminWithLogger StatementSubsetFirst nullLogger
@@ -637,6 +703,28 @@ closureDdminWithLogger ::
     DependencyGraph ->
     IO [Statement]
 closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
+    tracker <- newEarlyRejectTracker
+    closureDdminWithCert
+        tracker
+        emptyEarlyRejectCertifier
+        policy
+        logger
+        pool
+        baseSQL
+        initialStatements
+        graph
+
+closureDdminWithCert ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
+    StatementSearchPolicy ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    [Statement] ->
+    DependencyGraph ->
+    IO [Statement]
+closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
@@ -682,7 +770,9 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
             -- A closed projection containing the seed must contain its entire closure.
             pure (if contained then Just closedInts else Nothing)
     result <-
-        searchStatements
+        searchStatementsWithCert
+            tracker
+            cert
             True
             policy
             buildCandidate
@@ -731,7 +821,9 @@ newtype Feedback = Feedback
 
 newFeedback :: IO Feedback
 newFeedback = Feedback <$> newIORef HashMap.empty
-searchStatements ::
+searchStatementsWithCert ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
     Bool ->
     StatementSearchPolicy ->
     CandidateBuilder ->
@@ -740,9 +832,11 @@ searchStatements ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements closureAware policy buildCandidate pool baseSQL allStatements initialStatements = do
+searchStatementsWithCert tracker cert closureAware policy buildCandidate pool baseSQL allStatements initialStatements = do
     feedback <- newFeedback
-    searchDDMin
+    searchDDMinWithCert
+        tracker
+        cert
         closureAware
         policy
         feedback
@@ -816,7 +910,9 @@ orderWindowCandidates WindowOrderWithinLaneProjected items =
         refill (LaneSubset : rest) cs ds (s : ss) = s : refill rest cs ds ss
         refill (_ : rest) cs ds ss = refill rest cs ds ss
 
-searchDDMin ::
+searchDDMinWithCert ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
     Bool ->
     StatementSearchPolicy ->
     Feedback ->
@@ -826,7 +922,7 @@ searchDDMin ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin closureAware policy feedback buildCandidate pool baseSQL allStatements initial =
+searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate pool baseSQL allStatements initial =
     go
         2
         emptyLaneState
@@ -1143,30 +1239,46 @@ searchDDMin closureAware policy feedback buildCandidate pool baseSQL allStatemen
                                     recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
                                 pure Nothing
                             else do
-                                let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
-                                candidateSQL <-
-                                    timeTaggedStatementBuild
-                                        (poolMetricsStore pool)
-                                        tag
-                                        (cutRemovedStatementInts baseSQL allStatements projected)
-                                let saved = currentLen - BS.length candidateSQL
-                                if saved <= 0
-                                    then do
-                                        when (projected /= seedInts) $
-                                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                                earlyId <- checkEarlyRejectionIdsTracked tracker cert projected
+                                case earlyId of
+                                    Just reason -> do
+                                        recordEarlyRejectSkip (poolMetricsStore pool) reason
                                         pure Nothing
-                                    else do
-                                        evaluated <- readIORef (fbEvaluated feedback)
-                                        case HashMap.lookup candidateSQL evaluated of
-                                            Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
-                                            Just CandidateRejected -> do
-                                                recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                    Nothing -> do
+                                        let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
+                                        candidateSQL <-
+                                            timeTaggedStatementBuild
+                                                (poolMetricsStore pool)
+                                                tag
+                                                (cutRemovedStatementInts baseSQL allStatements projected)
+                                        let saved = currentLen - BS.length candidateSQL
+                                        if saved <= 0
+                                            then do
                                                 when (projected /= seedInts) $
-                                                    recordGeneratedSkipped
-                                                        (poolMetricsStore pool)
-                                                        "closure-projection-duplicate"
+                                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
                                                 pure Nothing
-                                            Nothing -> pure (Just (SeedFresh kept candidateSQL))
+                                            else do
+                                                evaluated <- readIORef (fbEvaluated feedback)
+                                                case HashMap.lookup candidateSQL evaluated of
+                                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
+                                                    Just CandidateRejected -> do
+                                                        recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                                        when (projected /= seedInts) $
+                                                            recordGeneratedSkipped
+                                                                (poolMetricsStore pool)
+                                                                "closure-projection-duplicate"
+                                                        pure Nothing
+                                                    Nothing -> do
+                                                        earlyBytes <-
+                                                            checkEarlyRejectionBytesTracked tracker cert False candidateSQL
+                                                        case earlyBytes of
+                                                            Just reason -> do
+                                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                                                modifyIORef'
+                                                                    (fbEvaluated feedback)
+                                                                    (HashMap.insert candidateSQL CandidateRejected)
+                                                                pure Nothing
+                                                            Nothing -> pure (Just (SeedFresh kept candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
@@ -1180,14 +1292,37 @@ statementDdminWithOrder policy dialect pool =
 statementDdminWithParser ::
     StatementSearchPolicy -> StatementParser -> OraclePool -> ByteString -> IO ByteString
 statementDdminWithParser policy parse pool initialSQL = do
+    tracker <- newEarlyRejectTracker
+    statementDdminWithCert False tracker Nothing policy parse pool initialSQL
+
+statementDdminWithCert ::
+    Bool ->
+    EarlyRejectTracker ->
+    Maybe ResultTrace ->
+    StatementSearchPolicy ->
+    StatementParser ->
+    OraclePool ->
+    ByteString ->
+    IO ByteString
+statementDdminWithCert earlyReject tracker mTrace policy parse pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     if not initialOK
         then pure initialSQL
         else do
             (_, units) <- parse initialSQL
             let allStatements = map unitStatement units
+            cert <- buildCertifierTracked earlyReject tracker initialSQL units mTrace
             reduced <-
-                searchStatements False policy plainCandidate pool initialSQL allStatements allStatements
+                searchStatementsWithCert
+                    tracker
+                    cert
+                    False
+                    policy
+                    plainCandidate
+                    pool
+                    initialSQL
+                    allStatements
+                    allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
 -- | Repeated single-statement deletion until reaching a 1-minimal fixed point.
@@ -1202,13 +1337,27 @@ statementAuditWithLogger logger dialect pool =
 statementAuditWithParser ::
     Logger -> StatementParser -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
 statementAuditWithParser logger parse pool initialSQL = do
+    tracker <- newEarlyRejectTracker
+    statementAuditWithCert False tracker Nothing logger parse pool initialSQL
+
+statementAuditWithCert ::
+    Bool ->
+    EarlyRejectTracker ->
+    Maybe ResultTrace ->
+    Logger ->
+    StatementParser ->
+    OraclePool ->
+    ByteString ->
+    IO (ByteString, AuditStats)
+statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL = do
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
     outcome <-
         if initialOK
             then do
                 (_, units) <- parse initialSQL
                 let statements = map unitStatement units
-                loop initialSQL statements (statementIdsInt statements) 0 0 0
+                cert <- buildCertifierTracked earlyReject tracker initialSQL units mTrace
+                loop cert initialSQL statements (statementIdsInt statements) 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
     logAuditStats logger (snd outcome)
     pure outcome
@@ -1216,18 +1365,19 @@ statementAuditWithParser logger parse pool initialSQL = do
         jobs = poolJobCount pool
         -- The audit only removes whole statements, and those statements keep
         -- their original byte spans. Parse once, then track the retained set.
-        loop baseSQL allStatements kept passCount attemptCount removalCount
+        loop cert baseSQL allStatements kept passCount attemptCount removalCount
             | IntSet.null kept =
                 pure
                     ( renderKept baseSQL allStatements kept
                     , AuditStats passCount attemptCount removalCount True
                     )
             | otherwise = do
-                (nextKept, attempts, removals) <- auditPass baseSQL allStatements kept
+                (nextKept, attempts, removals) <- auditPass cert baseSQL allStatements kept
                 let nextPassCount = passCount + 1
                 if removals > 0
                     then
                         loop
+                            cert
                             baseSQL
                             allStatements
                             nextKept
@@ -1240,57 +1390,71 @@ statementAuditWithParser logger parse pool initialSQL = do
                             , AuditStats nextPassCount (attemptCount + attempts) removalCount True
                             )
 
-        auditPass baseSQL allStatements kept = go (renderKept baseSQL allStatements kept) kept allStatements 0 0
+        auditPass cert baseSQL allStatements kept =
+            go (renderKept baseSQL allStatements kept) kept allStatements 0 0
             where
                 go _ currentKept [] attempts removals = pure (currentKept, attempts, removals)
                 go currentSQL currentKept statements attempts removals = do
-                    let batch = take jobs [s | s <- statements, IntSet.member (unStatementId (stmtId s)) currentKept]
-                    case batch of
+                    let currentLen = BS.length currentSQL
+                    (testables, restStatements) <-
+                        collectBatch currentLen currentKept jobs [] statements
+                    case testables of
                         [] -> pure (currentKept, attempts, removals)
                         _ -> do
-                            let currentLen = BS.length currentSQL
-                            candidates <-
-                                mapM
-                                    ( \statement -> do
-                                        bytes <-
-                                            timeStatementBuild
-                                                (poolMetricsStore pool)
-                                                (renderKept baseSQL allStatements (IntSet.delete (unStatementId (stmtId statement)) currentKept))
-                                        pure (statement, bytes)
-                                    )
-                                    batch
-                            let testables =
-                                    [(statement, sql) | (statement, sql) <- candidates, BS.length sql < currentLen]
-                            if null testables
-                                then do
-                                    mapM_ (const (recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking")) batch
-                                    case lastMay batch of
-                                        Nothing -> pure (currentKept, attempts, removals)
-                                        Just lastStatement ->
-                                            go currentSQL currentKept (afterStatement lastStatement statements) attempts removals
-                                else do
-                                    mapM_ (\(_, sql) -> reportCandidateCount pool sql (IntSet.size currentKept - 1)) testables
-                                    outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
-                                    let retired = zip testables outcomes
-                                        tested = length outcomes
-                                    case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
-                                        Just (acceptedStatement, acceptedSQL) ->
-                                            go
-                                                acceptedSQL
-                                                (IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept)
-                                                (afterStatement acceptedStatement statements)
-                                                (attempts + tested)
-                                                (removals + 1)
-                                        Nothing ->
-                                            case lastMay batch of
-                                                Nothing -> pure (currentKept, attempts, removals)
-                                                Just lastStatement ->
-                                                    go
-                                                        currentSQL
-                                                        currentKept
-                                                        (afterStatement lastStatement statements)
-                                                        (attempts + tested)
-                                                        removals
+                            mapM_ (\(_, sql) -> reportCandidateCount pool sql (IntSet.size currentKept - 1)) testables
+                            outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
+                            let retired = zip testables outcomes
+                                tested = length outcomes
+                            case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
+                                Just (acceptedStatement, acceptedSQL) ->
+                                    go
+                                        acceptedSQL
+                                        (IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept)
+                                        (afterStatement acceptedStatement statements)
+                                        (attempts + tested)
+                                        (removals + 1)
+                                Nothing ->
+                                    go
+                                        currentSQL
+                                        currentKept
+                                        restStatements
+                                        (attempts + tested)
+                                        removals
+
+                collectBatch _ _ _ acc [] = pure (reverse acc, [])
+                collectBatch _ _ 0 acc rest = pure (reverse acc, rest)
+                collectBatch currentLen currentKept slots acc (statement : rest)
+                    | IntSet.notMember (unStatementId (stmtId statement)) currentKept =
+                        collectBatch currentLen currentKept slots acc rest
+                    | otherwise = do
+                        let keptAfter = IntSet.delete (unStatementId (stmtId statement)) currentKept
+                        earlyId <- checkEarlyRejectionIdsTracked tracker cert keptAfter
+                        case earlyId of
+                            Just reason -> do
+                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                collectBatch currentLen currentKept slots acc rest
+                            Nothing -> do
+                                bytes <-
+                                    timeStatementBuild
+                                        (poolMetricsStore pool)
+                                        (renderKept baseSQL allStatements keptAfter)
+                                if BS.length bytes >= currentLen
+                                    then do
+                                        recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking"
+                                        collectBatch currentLen currentKept slots acc rest
+                                    else do
+                                        earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False bytes
+                                        case earlyBytes of
+                                            Just reason -> do
+                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                                collectBatch currentLen currentKept slots acc rest
+                                            Nothing ->
+                                                collectBatch
+                                                    currentLen
+                                                    currentKept
+                                                    (slots - 1)
+                                                    ((statement, bytes) : acc)
+                                                    rest
 
                 afterStatement target = goAfter
                     where
@@ -1338,7 +1502,19 @@ findInterestingPrefix pool baseSQL statements =
 
 findInterestingPrefixThrough ::
     OraclePool -> ByteString -> [Statement] -> Int -> IO (Maybe (Statement, ByteString, Int), Int)
-findInterestingPrefixThrough pool baseSQL statements limit =
+findInterestingPrefixThrough pool baseSQL statements limit = do
+    tracker <- newEarlyRejectTracker
+    findInterestingPrefixThroughWithCert tracker emptyEarlyRejectCertifier pool baseSQL statements limit
+
+findInterestingPrefixThroughWithCert ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
+    OraclePool ->
+    ByteString ->
+    [Statement] ->
+    Int ->
+    IO (Maybe (Statement, ByteString, Int), Int)
+findInterestingPrefixThroughWithCert tracker cert pool baseSQL statements limit =
     go 1 limit Nothing 0
     where
         go !low !high best !tests
@@ -1346,21 +1522,36 @@ findInterestingPrefixThrough pool baseSQL statements limit =
             | otherwise = do
                 let mid = low + (high - low) `div` 2
                     prefix = take mid statements
-                candidate <- timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL statements prefix)
-                reportCandidateCount pool candidate (length prefix)
-                ok <- oracleAccepts (poolOracle pool) candidate
-                let tests' = tests + 1
-                if ok
-                    then case reverse prefix of
-                        statement : _ ->
-                            go low (mid - 1) (Just (statement, candidate, mid)) tests'
-                        [] ->
-                            go low (mid - 1) best tests'
-                    else go (mid + 1) high best tests'
+                    prefixInts = statementIdsInt prefix
+                earlyId <- checkEarlyRejectionIdsTracked tracker cert prefixInts
+                case earlyId of
+                    Just reason -> do
+                        recordEarlyRejectSkip (poolMetricsStore pool) reason
+                        go (mid + 1) high best tests
+                    Nothing -> do
+                        candidate <-
+                            timeStatementBuild (poolMetricsStore pool) (statementSQL baseSQL statements prefix)
+                        earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False candidate
+                        case earlyBytes of
+                            Just reason -> do
+                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                go (mid + 1) high best tests
+                            Nothing -> do
+                                reportCandidateCount pool candidate (length prefix)
+                                ok <- oracleAccepts (poolOracle pool) candidate
+                                let tests' = tests + 1
+                                if ok
+                                    then case reverse prefix of
+                                        statement : _ ->
+                                            go low (mid - 1) (Just (statement, candidate, mid)) tests'
+                                        [] ->
+                                            go low (mid - 1) best tests'
+                                    else go (mid + 1) high best tests'
 
 -- | Parsed statements plus their dependency graph for one exact candidate byte string.
 data SQLAnalysis = SQLAnalysis
-    { analyzedStatements :: ![Statement]
+    { analyzedUnits :: ![StatementUnit]
+    , analyzedStatements :: ![Statement]
     , analyzedGraph :: !DependencyGraph
     , analyzedSession :: !SessionInit
     }
@@ -1393,20 +1584,23 @@ analyzeSQL parse logger dialect sql = do
         ]
     pure
         SQLAnalysis
-            { analyzedStatements = statements
+            { analyzedUnits = units
+            , analyzedStatements = statements
             , analyzedGraph = graph
             , analyzedSession = initialSession
             }
 
 -- | Slice SQL statements using a precomputed dependency analysis.
 sliceWithAnalysis ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
     Logger ->
     OraclePool ->
     SQLAnalysis ->
     Maybe ResultStatement ->
     ByteString ->
     IO (ByteString, Maybe SQLAnalysis)
-sliceWithAnalysis logger pool analysis observedResult sql =
+sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
     case seedTarget of
         Nothing -> keep sql
         Just seedStatement -> do
@@ -1422,12 +1616,25 @@ sliceWithAnalysis logger pool analysis observedResult sql =
                     | useRelaxed = "result-statement-without-global-barriers"
                     | otherwise = seedStrategy
                 trySeed (retained, candidateRaw) = do
-                    candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
-                    if BS.length candidate < BS.length sql
-                        then do
-                            reportCandidateCount pool candidate (length retained)
-                            oracleAccepts (poolOracle pool) candidate
-                        else pure False
+                    let keptInts = statementIdsInt retained
+                    earlyId <- checkEarlyRejectionIdsTracked tracker cert keptInts
+                    case earlyId of
+                        Just reason -> do
+                            recordEarlyRejectSkip (poolMetricsStore pool) reason
+                            pure False
+                        Nothing -> do
+                            candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
+                            if BS.length candidate < BS.length sql
+                                then do
+                                    earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False candidate
+                                    case earlyBytes of
+                                        Just reason -> do
+                                            recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                            pure False
+                                        Nothing -> do
+                                            reportCandidateCount pool candidate (length retained)
+                                            oracleAccepts (poolOracle pool) candidate
+                                else pure False
             primaryAccepted <- trySeed primary
             (seedAccepted, (seedRetained, seedCandidate), strategy) <-
                 if useRelaxed && not primaryAccepted
@@ -1446,7 +1653,8 @@ sliceWithAnalysis logger pool analysis observedResult sql =
                         recordGeneratedSkipped (poolMetricsStore pool) "prefix-search-cannot-improve"
                         pure bestCandidate
                     | otherwise = do
-                        (maybeTarget, prefixTests) <- findInterestingPrefixThrough pool sql statements prefixLimit
+                        (maybeTarget, prefixTests) <-
+                            findInterestingPrefixThroughWithCert tracker cert pool sql statements prefixLimit
                         case maybeTarget of
                             Nothing -> pure bestCandidate
                             Just (targetStatement, prefixSQL, prefixLength) -> do
@@ -1545,13 +1753,15 @@ components, relation lifecycles, and transaction/savepoint boundaries.
 Rejected groups leave their members eligible for contiguous search and audit.
 -}
 proposeGroupDeletionsWithAnalysis ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
     Logger ->
     OraclePool ->
     SQLAnalysis ->
     Maybe ResultStatement ->
     ByteString ->
     IO ByteString
-proposeGroupDeletionsWithAnalysis logger pool analysis observedResult sql
+proposeGroupDeletionsWithAnalysis tracker cert logger pool analysis observedResult sql
     | length statements < 2 = pure sql
     | otherwise = do
         currentIntsRef <- newIORef (statementIdsInt statements)
@@ -1571,43 +1781,56 @@ proposeGroupDeletionsWithAnalysis logger pool analysis observedResult sql
                 if IntSet.null effectiveRemoved || IntSet.null keptInts
                     then pure False
                     else do
-                        candidateSQL <-
-                            timeTaggedStatementBuild
-                                (poolMetricsStore pool)
-                                TagStatementComplement
-                                (cutRemovedStatementInts sql statements keptInts)
-                        seen <- readIORef seenRef
-                        if BS.length candidateSQL >= BS.length currentSQL || HashSet.member candidateSQL seen
-                            then pure False
-                            else do
-                                reportCandidateCount pool candidateSQL (IntSet.size keptInts)
-                                outcomes <- testOrderedTagged pool [(TagStatementComplement, candidateSQL)]
-                                case outcomes of
-                                    (OracleAccepted, _) : _ -> do
-                                        let currentStmts =
-                                                filter
-                                                    (\s -> IntSet.member (unStatementId (stmtId s)) currentInts)
-                                                    statements
-                                            noncontig = isNoncontiguousIn currentStmts effectiveRemoved
-                                            saved = BS.length currentSQL - BS.length candidateSQL
-                                        recordAcceptedBytesSaved (poolMetricsStore pool) TagStatementComplement saved
-                                        writeIORef currentIntsRef keptInts
-                                        writeIORef currentSQLRef candidateSQL
-                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
-                                        logInfo'
-                                            logger
-                                            "reducer"
-                                            "Dependency group deletion accepted"
-                                            [ ("group_kind", toJSON (kind :: T.Text))
-                                            , ("group_label", toJSON label)
-                                            , ("noncontiguous", toJSON noncontig)
-                                            , ("statements_removed", toJSON (IntSet.size effectiveRemoved))
-                                            , ("bytes_saved", toJSON saved)
-                                            ]
-                                        pure True
-                                    _ -> do
-                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
-                                        pure False
+                        earlyId <- checkEarlyRejectionIdsTracked tracker cert keptInts
+                        case earlyId of
+                            Just reason -> do
+                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                pure False
+                            Nothing -> do
+                                candidateSQL <-
+                                    timeTaggedStatementBuild
+                                        (poolMetricsStore pool)
+                                        TagStatementComplement
+                                        (cutRemovedStatementInts sql statements keptInts)
+                                seen <- readIORef seenRef
+                                if BS.length candidateSQL >= BS.length currentSQL || HashSet.member candidateSQL seen
+                                    then pure False
+                                    else do
+                                        earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False candidateSQL
+                                        case earlyBytes of
+                                            Just reason -> do
+                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                                modifyIORef' seenRef (HashSet.insert candidateSQL)
+                                                pure False
+                                            Nothing -> do
+                                                reportCandidateCount pool candidateSQL (IntSet.size keptInts)
+                                                outcomes <- testOrderedTagged pool [(TagStatementComplement, candidateSQL)]
+                                                case outcomes of
+                                                    (OracleAccepted, _) : _ -> do
+                                                        let currentStmts =
+                                                                filter
+                                                                    (\s -> IntSet.member (unStatementId (stmtId s)) currentInts)
+                                                                    statements
+                                                            noncontig = isNoncontiguousIn currentStmts effectiveRemoved
+                                                            saved = BS.length currentSQL - BS.length candidateSQL
+                                                        recordAcceptedBytesSaved (poolMetricsStore pool) TagStatementComplement saved
+                                                        writeIORef currentIntsRef keptInts
+                                                        writeIORef currentSQLRef candidateSQL
+                                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
+                                                        logInfo'
+                                                            logger
+                                                            "reducer"
+                                                            "Dependency group deletion accepted"
+                                                            [ ("group_kind", toJSON (kind :: T.Text))
+                                                            , ("group_label", toJSON label)
+                                                            , ("noncontiguous", toJSON noncontig)
+                                                            , ("statements_removed", toJSON (IntSet.size effectiveRemoved))
+                                                            , ("bytes_saved", toJSON saved)
+                                                            ]
+                                                        pure True
+                                                    _ -> do
+                                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
+                                                        pure False
             splitGroupsByBytes gs =
                 let total = sum (map proposalBytes gs)
                     target = max 1 (total `div` 2)
@@ -1681,14 +1904,23 @@ proposeGroupDeletionsWithAnalysis logger pool analysis observedResult sql
         statements = analyzedStatements analysis
 
 closureSearchWithAnalysis ::
-    StatementSearchPolicy -> Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
-closureSearchWithAnalysis policy logger pool sql analysis =
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
+    StatementSearchPolicy ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    SQLAnalysis ->
+    IO ByteString
+closureSearchWithAnalysis tracker cert policy logger pool sql analysis =
     let statements = analyzedStatements analysis
      in if null statements
             then pure sql
             else do
                 retained <-
-                    closureDdminWithLogger
+                    closureDdminWithCert
+                        tracker
+                        cert
                         policy
                         logger
                         pool
@@ -1696,6 +1928,18 @@ closureSearchWithAnalysis policy logger pool sql analysis =
                         statements
                         (analyzedGraph analysis)
                 pure (statementSQL sql statements retained)
+
+data ObservedResultEvidence
+    = ObservedStatementOnly !ResultStatement
+    | ObservedFullTrace !ResultTrace
+
+evidenceResultStatement :: ObservedResultEvidence -> ResultStatement
+evidenceResultStatement (ObservedStatementOnly rs) = rs
+evidenceResultStatement (ObservedFullTrace tr) = traceResultStatement tr
+
+evidenceResultTrace :: ObservedResultEvidence -> Maybe ResultTrace
+evidenceResultTrace (ObservedStatementOnly _) = Nothing
+evidenceResultTrace (ObservedFullTrace tr) = Just tr
 
 -- | Reduce SQL test case using default configuration and dialect.
 reduceSQL :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
@@ -1724,7 +1968,30 @@ reduceSQLWithResultSlicing ::
     OraclePool ->
     ByteString ->
     IO ReductionResult
-reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQL = do
+reduceSQLWithResultSlicing resultStatement =
+    reduceSQLWithObservedResult (fmap (fmap ObservedStatementOnly) . resultStatement)
+
+-- | Use full native engine result traces for both slicing and sound early-rejection certificates.
+reduceSQLWithResultTrace ::
+    (ByteString -> IO (Maybe ResultTrace)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithResultTrace resultTrace =
+    reduceSQLWithObservedResult (fmap (fmap ObservedFullTrace) . resultTrace)
+
+reduceSQLWithObservedResult ::
+    (ByteString -> IO (Maybe ObservedResultEvidence)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL = do
     when (reductionColumnMode config /= ColumnOff && not (reductionIntraStatement config)) $
         ioError (userError "reductionColumnMode requires reductionIntraStatement")
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
@@ -1734,9 +2001,11 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
             pure (ReductionResult initialSQL Nothing)
         else do
             parse <- reuseStatementParse (parseStatements (poolMetricsStore pool) (reductionDialect config))
-            loop parse (1 :: Int) initialSQL Nothing
+            tracker <- newEarlyRejectTracker
+            loop parse tracker (1 :: Int) initialSQL Nothing
+                `finally` logEarlyRejectStats logger "reduction" tracker
     where
-        loop parse iteration currentSQL priorEvidence = do
+        loop parse tracker iteration currentSQL priorEvidence = do
             logInfo'
                 logger
                 "reducer"
@@ -1746,7 +2015,8 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
                 ]
             (nextSQL, evidence) <-
                 reduceIterationWithEvidence
-                    resultStatement
+                    observeResult
+                    tracker
                     reporter
                     config
                     logger
@@ -1755,7 +2025,7 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
                     currentSQL
                     priorEvidence
             if BS.length nextSQL < BS.length currentSQL
-                then loop parse (iteration + 1) nextSQL evidence
+                then loop parse tracker (iteration + 1) nextSQL evidence
                 else do
                     logInfo'
                         logger
@@ -1771,7 +2041,8 @@ reduceSQLWithResultSlicing resultStatement reporter config logger pool initialSQ
                     pure (ReductionResult currentSQL confirmed)
 
 reduceIterationWithEvidence ::
-    (ByteString -> IO (Maybe ResultStatement)) ->
+    (ByteString -> IO (Maybe ObservedResultEvidence)) ->
+    EarlyRejectTracker ->
     StageReporter ->
     ReductionConfig ->
     Logger ->
@@ -1780,28 +2051,49 @@ reduceIterationWithEvidence ::
     ByteString ->
     Maybe ReductionEvidence ->
     IO (ByteString, Maybe ReductionEvidence)
-reduceIterationWithEvidence resultStatement reporter config logger pool parse initialSQL priorEvidence = do
+reduceIterationWithEvidence observeResult tracker reporter config logger pool parse initialSQL priorEvidence = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedReductionStage reporter logger StageSlicing initialSQL do
                 analysis <- analyze initialSQL
-                observedResult <- resultStatement initialSQL
+                observed <- observeResult initialSQL
+                let observedStmt = fmap evidenceResultStatement observed
+                    observedTrace = observed >>= evidenceResultTrace
+                sliceCert <-
+                    buildCertifierTracked
+                        (reductionEarlyReject config)
+                        tracker
+                        initialSQL
+                        (analyzedUnits analysis)
+                        observedTrace
                 (afterSlice, sliceAnalysis) <-
-                    sliceWithAnalysis logger pool analysis observedResult initialSQL
+                    sliceWithAnalysis tracker sliceCert logger pool analysis observedStmt initialSQL
                 if reductionGroupProposals config
                     && not (maybe False ((== afterSlice) . evidenceBytes) priorEvidence)
                     then do
                         groupAnalysis <- maybe (analyze afterSlice) pure sliceAnalysis
                         groupObserved <-
                             if afterSlice == initialSQL
-                                then pure observedResult
-                                else resultStatement afterSlice
+                                then pure observed
+                                else observeResult afterSlice
+                        groupCert <-
+                            if afterSlice == initialSQL
+                                then pure sliceCert
+                                else
+                                    buildCertifierTracked
+                                        (reductionEarlyReject config)
+                                        tracker
+                                        afterSlice
+                                        (analyzedUnits groupAnalysis)
+                                        (groupObserved >>= evidenceResultTrace)
                         afterGroups <-
                             proposeGroupDeletionsWithAnalysis
+                                tracker
+                                groupCert
                                 logger
                                 pool
                                 groupAnalysis
-                                groupObserved
+                                (fmap evidenceResultStatement groupObserved)
                                 afterSlice
                         pure
                             ( afterGroups
@@ -1814,9 +2106,23 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
                     && not (maybe False ((== initialSQL) . evidenceBytes) priorEvidence)
                     then do
                         analysis <- analyze initialSQL
-                        observedResult <- resultStatement initialSQL
+                        observed <- observeResult initialSQL
+                        groupCert <-
+                            buildCertifierTracked
+                                (reductionEarlyReject config)
+                                tracker
+                                initialSQL
+                                (analyzedUnits analysis)
+                                (observed >>= evidenceResultTrace)
                         afterGroups <-
-                            proposeGroupDeletionsWithAnalysis logger pool analysis observedResult initialSQL
+                            proposeGroupDeletionsWithAnalysis
+                                tracker
+                                groupCert
+                                logger
+                                pool
+                                analysis
+                                (fmap evidenceResultStatement observed)
+                                initialSQL
                         pure (afterGroups, if afterGroups == initialSQL then Just analysis else Nothing)
                     else pure (initialSQL, Nothing)
     searchAnalysis <-
@@ -1865,11 +2171,28 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
                     case searchAnalysis of
                         Just cached | searchInput == sliced -> pure cached
                         _ -> analyze searchInput
-                out <- closureSearchWithAnalysis effectiveStatementPolicy logger pool searchInput analysis
+                mTrace <- lookupTraceForCert searchInput
+                cert <-
+                    buildCertifierTracked
+                        (reductionEarlyReject config)
+                        tracker
+                        searchInput
+                        (analyzedUnits analysis)
+                        mTrace
+                out <-
+                    closureSearchWithAnalysis tracker cert effectiveStatementPolicy logger pool searchInput analysis
                 pure (out, ())
             else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
+                mTrace <- lookupTraceForCert searchInput
                 out <-
-                    statementDdminWithParser effectiveStatementPolicy parse pool searchInput
+                    statementDdminWithCert
+                        (reductionEarlyReject config)
+                        tracker
+                        mTrace
+                        effectiveStatementPolicy
+                        parse
+                        pool
+                        searchInput
                 pure (out, ())
     fallback <-
         if reductionClosure config
@@ -1880,10 +2203,22 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
     interleaveStages fallback
     where
         analyze = analyzeSQL parse logger (reductionDialect config)
+        lookupTraceForCert sql
+            | reductionEarlyReject config = (>>= evidenceResultTrace) <$> observeResult sql
+            | otherwise = pure Nothing
 
         unrestrictedSearch statementPolicy sql =
             fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do
-                out <- statementDdminWithParser statementPolicy parse pool sql
+                mTrace <- lookupTraceForCert sql
+                out <-
+                    statementDdminWithCert
+                        (reductionEarlyReject config)
+                        tracker
+                        mTrace
+                        statementPolicy
+                        parse
+                        pool
+                        sql
                 pure (out, ())
 
         interleaveStages base
@@ -1898,7 +2233,16 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
                 (True, False) -> do
                     (result, stats) <-
                         timedReductionStage reporter logger StageStatementAudit base do
-                            (r, s) <- statementAuditWithParser logger parse pool base
+                            mTrace <- lookupTraceForCert base
+                            (r, s) <-
+                                statementAuditWithCert
+                                    (reductionEarlyReject config)
+                                    tracker
+                                    mTrace
+                                    logger
+                                    parse
+                                    pool
+                                    base
                             pure (r, s)
                     pure (result, Just (ReductionEvidence result (auditMinimalityConfirmed stats)))
                 (False, True) -> do
@@ -1923,7 +2267,16 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
         interleaveFixedPoint iter current = do
             (afterAudit, auditStats) <-
                 timedReductionStage reporter logger StageStatementAudit current do
-                    (r, s) <- statementAuditWithParser logger parse pool current
+                    mTrace <- lookupTraceForCert current
+                    (r, s) <-
+                        statementAuditWithCert
+                            (reductionEarlyReject config)
+                            tracker
+                            mTrace
+                            logger
+                            parse
+                            pool
+                            current
                     pure (r, s)
             afterSyntax <-
                 fst <$> timedReductionStage reporter logger StageIntraStatementRewrites afterAudit do

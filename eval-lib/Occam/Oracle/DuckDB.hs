@@ -10,6 +10,7 @@ module Occam.Oracle.DuckDB (
     generateDuckDBContract,
     generateDuckDBContractTimeout,
     generateDuckDBContractWithResultStatement,
+    generateDuckDBContractWithTrace,
     executeDuckDBCandidate,
     executeDuckDBCandidateTimeout,
     executeDuckDBCandidateDetailedTimeout,
@@ -18,6 +19,7 @@ module Occam.Oracle.DuckDB (
     duckdbContractObservation,
     duckdbContractObservationTimeout,
     duckdbContractObservationWithResultStatement,
+    duckdbContractObservationWithTrace,
     isDuckDBAvailable,
     defaultDuckDBCandidateTimeoutMicros,
 ) where
@@ -47,12 +49,14 @@ import Data.Aeson (
     (.:?),
     (.=),
  )
+import Data.Bifunctor (second)
 import Data.Bits (shiftL)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64, Int8)
+import Data.IntSet qualified as IntSet
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -65,7 +69,7 @@ import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, peekByteOff, peekElemOff, poke)
 import GHC.Float (castDoubleToWord64)
-import Occam.Core (Oracle, ResultStatement (..))
+import Occam.Core (Oracle, ResultStatement (..), ResultTrace (..), traceResultStatement)
 import Occam.Oracle (OracleObservation (..), observationOutcome)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
@@ -471,7 +475,7 @@ executeDuckDBCandidateDetailedTimeout micros sql =
     fmap (maybe [] (resultRows . fst)) <$> executeDuckDBResult micros sql
 
 executeDuckDBResult ::
-    Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultStatement)))
+    Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultTrace)))
 executeDuckDBResult micros sql
     | BS.elem 0 sql = pure (Left (DuckDBExecutionError "SQL contains a NUL byte"))
     | otherwise = do
@@ -481,7 +485,7 @@ executeDuckDBResult micros sql
             Right api -> executeWithAPI api micros sql
 
 executeWithAPI ::
-    DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultStatement)))
+    DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultTrace)))
 executeWithAPI api micros sql = do
     res <- try $
         alloca $ \dbPtr ->
@@ -556,12 +560,22 @@ executeWithAPI api micros sql = do
                 clear ptr = Exception.mask_ $ do
                     apiDestroyResult api ptr
                     fillBytes ptr 0 size
-                loop i current retained lastResult
+                loop i current retained firstResult lastResult resultIndices
                     | i >= n = case lastResult of
                         Nothing -> pure (Right Nothing)
                         Just index -> do
                             result <- observeRows retained
-                            pure (fmap (\rows -> Just (rows, ResultStatement (fromIntegral n) (fromIntegral index))) result)
+                            let trace =
+                                    ResultTrace
+                                        { traceStatementCount = fromIntegral n
+                                        , traceFirstResultIndex = fromIntegral (fromMaybe index firstResult)
+                                        , traceLastResultIndex = fromIntegral index
+                                        , traceResultIndices = resultIndices
+                                        , tracePrefixMatchIndices = IntSet.empty
+                                        , traceDeterministic = False
+                                        , traceEndByteOffsets = Nothing
+                                        }
+                            pure (fmap (\rows -> Just (rows, trace)) result)
                     | otherwise = do
                         executed <- bracket
                             (apiPrepareExtractedStatement api con ext i prepPtr)
@@ -581,12 +595,18 @@ executeWithAPI api micros sql = do
                                 | kind == 3 -> do
                                     -- DUCKDB_RESULT_TYPE_QUERY_RESULT
                                     clear retained
-                                    loop (i + 1) retained current (Just i)
+                                    loop
+                                        (i + 1)
+                                        retained
+                                        current
+                                        (Just (fromMaybe i firstResult))
+                                        (Just i)
+                                        (IntSet.insert (fromIntegral i) resultIndices)
                                 | otherwise -> do
                                     clear current
-                                    loop (i + 1) current retained lastResult
+                                    loop (i + 1) current retained firstResult lastResult resultIndices
             -- The buffers own the latest query result and the current execution.
-            withBuffer $ \current -> withBuffer $ \retained -> loop 0 current retained Nothing
+            withBuffer $ \current -> withBuffer $ \retained -> loop 0 current retained Nothing Nothing IntSet.empty
 
         errorText fallback action = do
             message <- action
@@ -677,11 +697,16 @@ generateDuckDBContract = generateDuckDBContractTimeout defaultDuckDBCandidateTim
 
 generateDuckDBContractTimeout :: Int -> ByteString -> IO (Either Text DuckDBContract)
 generateDuckDBContractTimeout micros sql =
-    fmap fst <$> generateDuckDBContractWithResultStatement micros sql
+    fmap fst <$> generateDuckDBContractWithTrace micros sql
 
 generateDuckDBContractWithResultStatement ::
     Int -> ByteString -> IO (Either Text (DuckDBContract, ResultStatement))
-generateDuckDBContractWithResultStatement micros sql = do
+generateDuckDBContractWithResultStatement micros sql =
+    fmap (second traceResultStatement) <$> generateDuckDBContractWithTrace micros sql
+
+generateDuckDBContractWithTrace ::
+    Int -> ByteString -> IO (Either Text (DuckDBContract, ResultTrace))
+generateDuckDBContractWithTrace micros sql = do
     res <- executeDuckDBResult micros sql
     pure $ case res of
         Left DuckDBTimeout -> Left "timeout"
@@ -689,7 +714,7 @@ generateDuckDBContractWithResultStatement micros sql = do
         Left (DuckDBUnsupportedResultTypes types) -> Left (unsupportedResultTypes types)
         Left (DuckDBInfrastructureError err) -> Left err
         Right Nothing -> Left "Input must produce a result set"
-        Right (Just (result, location)) ->
+        Right (Just (result, trace)) ->
             Right
                 ( DuckDBContract
                     { contractExpectedRows = resultRows result
@@ -698,7 +723,7 @@ generateDuckDBContractWithResultStatement micros sql = do
                     , contractStateSha256 = Nothing
                     , contractCheckState = False
                     }
-                , location
+                , trace
                 )
 
 duckdbContractOracleTimeout :: Int -> DuckDBContract -> Oracle
@@ -713,11 +738,16 @@ duckdbContractObservation = duckdbContractObservationTimeout defaultDuckDBCandid
 
 duckdbContractObservationTimeout :: Int -> DuckDBContract -> ByteString -> IO OracleObservation
 duckdbContractObservationTimeout micros contract candidate =
-    fst <$> duckdbContractObservationWithResultStatement micros contract candidate
+    fst <$> duckdbContractObservationWithTrace micros contract candidate
 
 duckdbContractObservationWithResultStatement ::
     Int -> DuckDBContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
-duckdbContractObservationWithResultStatement micros contract candidate
+duckdbContractObservationWithResultStatement micros contract candidate =
+    second (fmap traceResultStatement) <$> duckdbContractObservationWithTrace micros contract candidate
+
+duckdbContractObservationWithTrace ::
+    Int -> DuckDBContract -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
+duckdbContractObservationWithTrace micros contract candidate
     -- TODO: Define a reproducible database-state observation before accepting state contracts.
     | contractCheckState contract || isJust (contractStateSha256 contract) =
         pure (OracleIOFailed "DuckDB state contracts are unsupported", Nothing)
@@ -731,9 +761,9 @@ duckdbContractObservationWithResultStatement micros contract candidate
                 | otherwise -> (OracleIOFailed (unsupportedResultTypes types), Nothing)
             Left (DuckDBInfrastructureError err) -> (OracleIOFailed err, Nothing)
             Right observed
-                | Just (result, location) <- observed
+                | Just (result, trace) <- observed
                 , result == expected ->
-                    (OracleFinished ExitSuccess, Just location)
+                    (OracleFinished ExitSuccess, Just trace)
                 | otherwise -> (OracleFinished (ExitFailure 1), Nothing)
     where
         expected =

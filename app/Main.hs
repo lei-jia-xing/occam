@@ -51,7 +51,7 @@ import Occam.Oracle (
     shellOracleConfig,
     withCandidateWorkdir,
  )
-import Occam.Oracle.Inline (newResultStatementTracker, prepareResultOracle)
+import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
 import Occam.Parser (
     ParseOptions (..),
     ParserError (..),
@@ -75,7 +75,7 @@ import Occam.Reducer (
     columnModeName,
     convergedRankedScheduleConfig,
     defaultReductionConfig,
-    reduceSQLWithResultSlicing,
+    reduceSQLWithResultTrace,
     statementAuditWithLogger,
     statementDdminWithOrder,
     statementRankedFallback,
@@ -970,12 +970,13 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("strategy", toJSON (strategyName valStrategy))
         ]
 
-    (rememberResult, takeResult) <-
-        newResultStatementTracker (valStrategy == StrategyFull && valSlicing)
+    (rememberTrace, lookupTrace) <-
+        newResultTraceTracker
+            (valStrategy == StrategyFull && (valSlicing || reductionEarlyReject reductionConfig))
     let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
     (initialStart, initialEnd, preflightDetails, observer, preflightMicros) <-
         runPreflight totalBudgetMicros $ case oracleCmd of
-            Nothing -> prepareResultOracle rememberResult valDialect timeoutMicros initialSQL
+            Nothing -> prepareResultOracleWithTrace rememberTrace valDialect timeoutMicros initialSQL
             Just command -> do
                 let config = shellOracleConfig command timeoutMicros valResetCmd
                 prepared <- prepareOracle config initialSQL
@@ -1017,7 +1018,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     let reductionAction reporter reducerLogger pool = case valStrategy of
             StrategyFull -> do
                 ReductionResult sql evidence <-
-                    reduceSQLWithResultSlicing takeResult reporter reductionConfig reducerLogger pool initialSQL
+                    reduceSQLWithResultTrace lookupTrace reporter reductionConfig reducerLogger pool initialSQL
                 pure (ReductionActionResult sql evidence)
             StrategyDdminOnly -> do
                 sql <-

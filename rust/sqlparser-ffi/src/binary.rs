@@ -980,6 +980,7 @@ fn write_unit(w: &mut BinaryWriter, unit: &NativeUnit) {
     w.write_u32(unit.start as u32);
     w.write_u32(unit.end as u32);
     w.write_opt_str(unit.parse_error.as_deref());
+    w.write_bool(unit.cannot_produce_result);
     match &unit.facts {
         None => w.write_u8(0),
         Some(facts) => {

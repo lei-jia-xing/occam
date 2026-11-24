@@ -23,6 +23,7 @@ data StatementUnit = StatementUnit
     { unitStatement :: !Statement
     , unitFacts :: !(Maybe StatementFacts)
     , unitParseError :: !(Maybe Text)
+    , unitCannotProduceResult :: !Bool
     }
     deriving (Eq, Show)
 

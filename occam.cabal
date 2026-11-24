@@ -71,6 +71,7 @@ library
     exposed-modules:  Occam
                     , Occam.AtomicFile
                     , Occam.Cache
+                    , Occam.Certificate
                     , Occam.Core
                     , Occam.Facts
                     , Occam.Dependency
@@ -174,6 +175,7 @@ test-suite occam-test
                     , PoolChecks
                     , PoolMetricsChecks
                     , ReductionChecks
+                    , Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
                     , Occam.Oracle.DuckDB

@@ -79,6 +79,9 @@ struct NativeUnit {
     pub(crate) end: usize,
     /// Error message if sqlparser failed to parse this unit.
     pub(crate) parse_error: Option<String>,
+    /// True only when the cleanly parsed AST statement is strictly on the
+    /// context-independent zero-result allowlist (cannot return a query result set).
+    pub(crate) cannot_produce_result: bool,
     /// Semantic facts (reads, writes, DDL ops, edit candidates) extracted from the AST.
     pub(crate) facts: Option<NativeFacts>,
 }

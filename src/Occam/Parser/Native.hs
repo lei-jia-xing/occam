@@ -42,6 +42,7 @@ data NativeUnit = NativeUnit
     { nativeStart :: !Int
     , nativeEnd :: !Int
     , nativeParseError :: !(Maybe Text)
+    , nativeCannotProduceResult :: !Bool
     , nativeFacts :: !(Maybe NativeFacts)
     }
 
@@ -63,6 +64,7 @@ instance FromJSON NativeUnit where
             <$> objectValue .: "start"
             <*> objectValue .: "end"
             <*> objectValue .:? "parse_error"
+            <*> objectValue .:? "cannot_produce_result" .!= False
             <*> objectValue .:? "facts"
 
 instance FromJSON NativeFacts where

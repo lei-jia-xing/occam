@@ -46,7 +46,11 @@ makeUnits source = go 0 1 []
                             (Span start end)
                             (BSU.unsafeTake (end - start) (BSU.unsafeDrop start source))
                     facts = fmap makeFacts (nativeFacts native)
-                 in go end (index + 1) (StatementUnit statement facts (nativeParseError native) : acc) rest
+                 in go
+                        end
+                        (index + 1)
+                        (StatementUnit statement facts (nativeParseError native) (nativeCannotProduceResult native) : acc)
+                        rest
             where
                 start = nativeStart native
                 end = nativeEnd native

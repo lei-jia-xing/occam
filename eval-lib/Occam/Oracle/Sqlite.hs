@@ -8,6 +8,7 @@ module Occam.Oracle.Sqlite (
     generateSqliteContract,
     generateSqliteContractTimeout,
     generateSqliteContractWithResultStatement,
+    generateSqliteContractWithTrace,
     executeSqliteCandidate,
     executeSqliteCandidateTimeout,
     executeSqliteCandidateDetailedTimeout,
@@ -16,6 +17,7 @@ module Occam.Oracle.Sqlite (
     sqliteContractObservation,
     sqliteContractObservationTimeout,
     sqliteContractObservationWithResultStatement,
+    sqliteContractObservationWithTrace,
     splitStatements,
     sqlDataToValue,
 ) where
@@ -50,6 +52,7 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Char (isSpace)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IntSet qualified as IntSet
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -80,19 +83,21 @@ import Foreign (
     FunPtr,
     Ptr,
     alloca,
+    allocaArray,
     castPtr,
     free,
     malloc,
     nullFunPtr,
     nullPtr,
     peek,
+    peekArray,
     plusPtr,
     poke,
  )
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import GHC.Float (castDoubleToWord64)
-import Occam.Core (Oracle, ResultStatement (..))
+import Occam.Core (Oracle, ResultStatement (..), ResultTrace (..), traceResultStatement)
 import Occam.Oracle (OracleObservation (..), observationOutcome)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Exit (ExitCode (..))
@@ -203,7 +208,7 @@ classifySqliteException err =
 -- | Execute candidate SQL against an in-memory SQLite database with timeout.
 executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteError [[Value]])
 executeSqliteCandidateDetailedTimeout micros sql =
-    fmap (maybe [] (resultRows . fst)) <$> executeSqliteResult micros sql
+    fmap (maybe [] (resultRows . srLastResult)) <$> executeSqliteRun micros sql
 
 data SqliteConn = SqliteConn
     { scDb :: !Direct.Database
@@ -212,10 +217,11 @@ data SqliteConn = SqliteConn
     , scDmlTainted :: !(IORef Bool)
     }
 
-dirtyTemp, dirtyDml, dirtyConnCounter :: CInt
+dirtyTemp, dirtyDml, dirtyConnCounter, dirtyNondet :: CInt
 dirtyTemp = 4
 dirtyDml = 8
 dirtyConnCounter = 16
+dirtyNondet = 32
 
 maxPooledConns :: Int
 maxPooledConns = 16
@@ -240,6 +246,9 @@ foreign import ccall safe "occam_sqlite_next_result"
         Ptr CDatabase ->
         CString ->
         CString ->
+        CString ->
+        CInt ->
+        Ptr CInt ->
         CInt ->
         Ptr CString ->
         Ptr (Ptr CStatement) ->
@@ -307,39 +316,101 @@ withPooledSqliteConn action = mask $ \restore -> do
     releaseSqliteConn keep conn
     pure val
 
+data SqliteRun = SqliteRun
+    { srLastResult :: !ResultSet
+    , srLastIndex :: !Int
+    , srResults :: ![(Int, ResultSet)]
+    , srStatementCount :: !Int
+    , srDeterministic :: !Bool
+    , srEndOffsets :: !(Maybe [Int])
+    }
+
+buildSqliteTrace :: ResultSet -> SqliteRun -> ResultTrace
+buildSqliteTrace expected SqliteRun {..} =
+    ResultTrace
+        { traceStatementCount = srStatementCount
+        , traceFirstResultIndex = maybe srLastIndex fst (listHead srResults)
+        , traceLastResultIndex = srLastIndex
+        , traceResultIndices = IntSet.fromList (map fst srResults)
+        , tracePrefixMatchIndices = prefixMatches 0 Nothing srResults IntSet.empty
+        , traceDeterministic = srDeterministic
+        , traceEndByteOffsets = srEndOffsets
+        }
+    where
+        listHead [] = Nothing
+        listHead (x : _) = Just x
+        prefixMatches !k !latest pending !acc
+            | k >= srStatementCount = acc
+            | otherwise = case pending of
+                (ord, rs) : rest | ord == k ->
+                    let acc' = if rs == expected then IntSet.insert k acc else acc
+                     in prefixMatches (k + 1) (Just rs) rest acc'
+                _ ->
+                    let acc' = if latest == Just expected then IntSet.insert k acc else acc
+                     in prefixMatches (k + 1) latest pending acc'
+
 runCandidateOnConn ::
     Int ->
     ByteString ->
     SqliteConn ->
-    IO (Bool, Bool, Either SqliteError (Maybe (ResultSet, ResultStatement)))
+    IO (Bool, Bool, Either SqliteError (Maybe SqliteRun))
 runCandidateOnConn micros sql conn = do
     poke (scDirtyPtr conn) 0
     tainted <- readIORef (scDmlTainted conn)
     let db = scDb conn
+        maxOffsets = max 64 (BS.count 59 sql + 16)
     res <- try $
         timeout micros $
             interruptibly db $
                 BS.useAsCStringLen sql $ \(start, size) ->
-                    runStatements db (start `plusPtr` size) start 0 Nothing
+                    allocaArray maxOffsets $ \offsetsPtr ->
+                        runStatements db offsetsPtr maxOffsets start (start `plusPtr` size) start 0 []
     dirty <- peek (scDirtyPtr conn)
     when ((dirty .&. dirtyDml) /= 0) $
         writeIORef (scDmlTainted conn) True
     let poolable = (dirty .&. dirtyTemp) == 0
         counterPolluted = tainted && (dirty .&. dirtyConnCounter) /= 0
+        authorizerDet = (dirty .&. dirtyNondet) == 0
     case res of
         Left err ->
             case classifySqliteException err of
                 e@(SqliteExecutionError _) -> pure (poolable, counterPolluted, Left e)
                 e -> pure (False, False, Left e)
         Right Nothing -> pure (False, False, Left SqliteTimeout)
-        Right (Just result) -> pure (poolable, counterPolluted, Right result)
+        Right (Just (totalStmts, revResults, offsets)) ->
+            case revResults of
+                [] -> pure (poolable, counterPolluted, Right Nothing)
+                (lastIdx, lastRs) : _ -> do
+                    hasNondetKw <-
+                        if authorizerDet
+                            then
+                                (/= 0)
+                                    <$> BSU.unsafeUseAsCStringLen sql (\(ptr, len) -> c_hasNondetKeyword (castPtr ptr) (fromIntegral len))
+                            else pure True
+                    pure
+                        ( poolable
+                        , counterPolluted
+                        , Right $
+                            Just
+                                SqliteRun
+                                    { srLastResult = lastRs
+                                    , srLastIndex = lastIdx
+                                    , srResults = reverse revResults
+                                    , srStatementCount = totalStmts
+                                    , srDeterministic = authorizerDet && not hasNondetKw
+                                    , srEndOffsets = offsets
+                                    }
+                        )
 
 foreign import ccall unsafe "occam_sqlite_check_sql"
     c_checkSql :: Ptr Word8 -> CSize -> IO CInt
 
-executeSqliteResult ::
-    Int -> ByteString -> IO (Either SqliteError (Maybe (ResultSet, ResultStatement)))
-executeSqliteResult micros sql = do
+foreign import ccall unsafe "occam_sqlite_has_nondet_keyword"
+    c_hasNondetKeyword :: Ptr Word8 -> CSize -> IO CInt
+
+executeSqliteRun ::
+    Int -> ByteString -> IO (Either SqliteError (Maybe SqliteRun))
+executeSqliteRun micros sql = do
     checkStatus <- BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
         c_checkSql (castPtr ptr) (fromIntegral len)
     case checkStatus of
@@ -363,24 +434,36 @@ executeSqliteResult micros sql = do
 -- returning each result-bearing statement to Haskell.
 runStatements ::
     Direct.Database ->
+    Ptr CInt ->
+    Int ->
+    CString ->
     CString ->
     CString ->
     Int ->
-    Maybe (ResultSet, Int) ->
-    IO (Maybe (ResultSet, ResultStatement))
-runStatements db@(Direct.Database handle) end start0 ordinal0 previous0 =
+    [(Int, ResultSet)] ->
+    IO (Int, [(Int, ResultSet)], Maybe [Int])
+runStatements db@(Direct.Database handle) offsetsPtr maxOffsets base end start0 ordinal0 revResults0 =
     alloca $ \outTail ->
         alloca $ \outStmt ->
             alloca $ \outOrdinal ->
-                let go !start !ordinal previous
-                        | start >= end = pure (fmap (second (ResultStatement ordinal)) previous)
+                let finish !total revResults = do
+                        offsets <-
+                            if total <= maxOffsets
+                                then Just . map fromIntegral <$> peekArray total offsetsPtr
+                                else pure Nothing
+                        pure (total, revResults, offsets)
+                    go !start !ordinal revResults
+                        | start >= end = finish ordinal revResults
                         | otherwise = do
                             rc <-
                                 c_occamSqliteNextResult
                                     handle
+                                    base
                                     start
                                     end
                                     (fromIntegral ordinal)
+                                    offsetsPtr
+                                    (fromIntegral maxOffsets)
                                     outTail
                                     outStmt
                                     outOrdinal
@@ -388,21 +471,21 @@ runStatements db@(Direct.Database handle) end start0 ordinal0 previous0 =
                             stmtPtr <- peek outStmt
                             nextOrd <- fromIntegral <$> peek outOrdinal
                             case rc of
-                                0 -> pure (fmap (second (ResultStatement nextOrd)) previous)
+                                0 -> finish nextOrd revResults
                                 1 -> do
                                     let stmt = Direct.Statement stmtPtr
-                                    observed <-
+                                    rs <-
                                         ( do
                                             count <- columnCount stmt
                                             names <- forM [0 .. count - 1] $ \i -> do
                                                 name <- columnName stmt i
                                                 maybe (fail "SQLite omitted a result column name") pure name
                                             rows <- stepAll stmt
-                                            pure (Just (ResultSet names [] rows, nextOrd))
+                                            pure (ResultSet names [] rows)
                                         )
                                             `onException` c_sqlite3_finalize stmtPtr
                                     finalize stmt
-                                    go tailPtr (nextOrd + 1) observed
+                                    go tailPtr (nextOrd + 1) ((nextOrd, rs) : revResults)
                                 -1 -> do
                                     code <- Direct.errcode db
                                     Direct.Utf8 message <- Direct.errmsg db
@@ -414,7 +497,7 @@ runStatements db@(Direct.Database handle) end start0 ordinal0 previous0 =
                                         _ <- c_sqlite3_finalize stmtPtr
                                         pure ()
                                     throwIO (SQLError code (TE.decodeUtf8 message) "step")
-                 in go start0 ordinal0 previous0
+                 in go start0 ordinal0 revResults0
 
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidateTimeout micros sql = do
@@ -434,27 +517,33 @@ generateSqliteContract = generateSqliteContractTimeout defaultCandidateTimeoutMi
 
 generateSqliteContractTimeout :: Int -> ByteString -> IO (Either Text SqliteContract)
 generateSqliteContractTimeout micros sql =
-    fmap fst <$> generateSqliteContractWithResultStatement micros sql
+    fmap fst <$> generateSqliteContractWithTrace micros sql
 
 generateSqliteContractWithResultStatement ::
     Int -> ByteString -> IO (Either Text (SqliteContract, ResultStatement))
-generateSqliteContractWithResultStatement micros sql = do
-    res <- executeSqliteResult micros sql
+generateSqliteContractWithResultStatement micros sql =
+    fmap (second traceResultStatement) <$> generateSqliteContractWithTrace micros sql
+
+generateSqliteContractWithTrace ::
+    Int -> ByteString -> IO (Either Text (SqliteContract, ResultTrace))
+generateSqliteContractWithTrace micros sql = do
+    res <- executeSqliteRun micros sql
     pure $ case res of
         Left SqliteTimeout -> Left "timeout"
         Left (SqliteExecutionError err) -> Left err
         Left (SqliteInfrastructureError err) -> Left err
         Right Nothing -> Left "Input must produce a result set"
-        Right (Just (result, location)) ->
-            Right
-                ( SqliteContract
-                    { contractExpectedRows = resultRows result
-                    , contractExpectedColumns = resultColumns result
-                    , contractStateSha256 = Nothing
-                    , contractCheckState = False
-                    }
-                , location
-                )
+        Right (Just run) ->
+            let result = srLastResult run
+             in Right
+                    ( SqliteContract
+                        { contractExpectedRows = resultRows result
+                        , contractExpectedColumns = resultColumns result
+                        , contractStateSha256 = Nothing
+                        , contractCheckState = False
+                        }
+                    , buildSqliteTrace result run
+                    )
 
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate =
@@ -468,24 +557,29 @@ sqliteContractObservation = sqliteContractObservationTimeout defaultCandidateTim
 
 sqliteContractObservationTimeout :: Int -> SqliteContract -> ByteString -> IO OracleObservation
 sqliteContractObservationTimeout micros contract candidate =
-    fst <$> sqliteContractObservationWithResultStatement micros contract candidate
+    fst <$> sqliteContractObservationWithTrace micros contract candidate
 
 sqliteContractObservationWithResultStatement ::
     Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
-sqliteContractObservationWithResultStatement micros contract candidate
+sqliteContractObservationWithResultStatement micros contract candidate =
+    second (fmap traceResultStatement) <$> sqliteContractObservationWithTrace micros contract candidate
+
+sqliteContractObservationWithTrace ::
+    Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
+sqliteContractObservationWithTrace micros contract candidate
     -- TODO: Define a reproducible database-state observation before accepting state contracts.
     | contractCheckState contract || isJust (contractStateSha256 contract) =
         pure (OracleIOFailed "SQLite state contracts are unsupported", Nothing)
     | otherwise = do
-        res <- executeSqliteResult micros candidate
+        res <- executeSqliteRun micros candidate
         pure $ case res of
             Left SqliteTimeout -> (OracleTimedOut, Nothing)
             Left (SqliteExecutionError _) -> (OracleFinished (ExitFailure 1), Nothing)
             Left (SqliteInfrastructureError err) -> (OracleIOFailed err, Nothing)
             Right observed
-                | Just (result, location) <- observed
-                , result == expected ->
-                    (OracleFinished ExitSuccess, Just location)
+                | Just run <- observed
+                , srLastResult run == expected ->
+                    (OracleFinished ExitSuccess, Just (buildSqliteTrace expected run))
                 | otherwise -> (OracleFinished (ExitFailure 1), Nothing)
     where
         expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)

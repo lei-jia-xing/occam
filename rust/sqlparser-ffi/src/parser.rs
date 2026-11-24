@@ -324,10 +324,16 @@ fn walk_units(
                 }
                 Some(facts)
             };
+            let cannot_produce_result = tokenizer_error.is_none()
+                && !has_parse_error
+                && statement
+                    .as_ref()
+                    .is_some_and(statement_cannot_produce_result);
             emit(NativeUnit {
                 start,
                 end,
                 parse_error,
+                cannot_produce_result,
                 facts,
             });
         }
@@ -339,10 +345,102 @@ fn walk_units(
                 start,
                 end: source.len(),
                 parse_error,
+                cannot_produce_result: false,
                 facts: None,
             });
         }
         count += 1;
     }
     Ok(count)
+}
+
+/// Strict allowlist of top-level SQL AST statements whose grammar production
+/// cannot return a query result set in SQLite or DuckDB regardless of prior
+/// schema, triggers, views, or session context.
+fn statement_cannot_produce_result(statement: &Statement) -> bool {
+    match statement {
+        Statement::CreateTable(create) => create.query.is_none(),
+        Statement::CreateIndex(_)
+        | Statement::CreateView(_)
+        | Statement::CreateTrigger(_)
+        | Statement::CreateSchema { .. }
+        | Statement::Drop { .. }
+        | Statement::DropTrigger(_)
+        | Statement::AlterTable(_)
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. } => true,
+        Statement::StartTransaction { statements, .. } => statements.is_empty(),
+        Statement::Insert(insert) => insert.returning.is_none() && insert.output.is_none(),
+        Statement::Update(update) => update.returning.is_none() && update.output.is_none(),
+        Statement::Delete(delete) => delete.returning.is_none() && delete.output.is_none(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(dialect: DialectKind, sql: &str) -> Vec<bool> {
+        let units = parse_units(
+            sql,
+            &ParseConfig {
+                dialect,
+                server: Default::default(),
+                chunk_edits: false,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: false,
+            },
+        )
+        .expect("parse should succeed");
+        units.into_iter().map(|u| u.cannot_produce_result).collect()
+    }
+
+    #[test]
+    fn non_result_allowlist_classifies_ddl_dml_and_excludes_queries_and_returning() {
+        let sql = "\
+CREATE TABLE t(x INT);
+CREATE TABLE ctas AS SELECT 1;
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2) RETURNING x;
+UPDATE t SET x = 3;
+UPDATE t SET x = 4 RETURNING x;
+DELETE FROM t WHERE x = 1;
+DELETE FROM t WHERE x = 2 RETURNING x;
+CREATE INDEX idx_t ON t(x);
+BEGIN;
+SAVEPOINT s;
+ROLLBACK TO s;
+RELEASE s;
+COMMIT;
+PRAGMA foreign_keys = ON;
+SELECT x FROM t;
+EXPLAIN SELECT 1;";
+        let flags = classify(DialectKind::SQLite, sql);
+        assert_eq!(
+            flags,
+            vec![
+                true,  // CREATE TABLE
+                false, // CREATE TABLE AS SELECT (excluded)
+                true,  // INSERT
+                false, // INSERT RETURNING (excluded)
+                true,  // UPDATE
+                false, // UPDATE RETURNING (excluded)
+                true,  // DELETE
+                false, // DELETE RETURNING (excluded)
+                true,  // CREATE INDEX
+                true,  // BEGIN
+                true,  // SAVEPOINT
+                true,  // ROLLBACK TO
+                true,  // RELEASE
+                true,  // COMMIT
+                false, // PRAGMA (excluded)
+                false, // SELECT (excluded)
+                false, // EXPLAIN (excluded)
+            ]
+        );
+    }
 }

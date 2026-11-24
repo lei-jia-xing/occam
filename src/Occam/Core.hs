@@ -2,6 +2,9 @@ module Occam.Core (
     StatementId (..),
     Statement (..),
     ResultStatement (..),
+    ResultTrace (..),
+    traceResultStatement,
+    EarlyRejectReason (..),
     Span (..),
     Ident (..),
     Name (..),
@@ -89,6 +92,7 @@ import Data.Aeson (
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
 import Data.Hashable (Hashable)
+import Data.IntSet (IntSet)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -117,6 +121,30 @@ data ResultStatement = ResultStatement
     , resultStatementIndex :: !Int
     }
     deriving (Eq, Show)
+
+{- | Per-statement engine boundary and result-set evidence recorded during one
+deterministic execution of an accepted SQL script against a native oracle.
+-}
+data ResultTrace = ResultTrace
+    { traceStatementCount :: !Int
+    , traceFirstResultIndex :: !Int
+    , traceLastResultIndex :: !Int
+    , traceResultIndices :: !IntSet
+    , tracePrefixMatchIndices :: !IntSet
+    , traceDeterministic :: !Bool
+    , traceEndByteOffsets :: !(Maybe [Int])
+    }
+    deriving (Eq, Show)
+
+traceResultStatement :: ResultTrace -> ResultStatement
+traceResultStatement trace =
+    ResultStatement (traceStatementCount trace) (traceLastResultIndex trace)
+
+-- | Provable certificate class justifying early rejection without running the oracle.
+data EarlyRejectReason
+    = EarlyRejectExactPrefix
+    | EarlyRejectNoResultStatement
+    deriving (Eq, Ord, Show)
 
 newtype Ident = Ident {identText :: Text}
     deriving (Eq, Ord, Show)

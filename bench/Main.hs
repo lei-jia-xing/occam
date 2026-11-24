@@ -58,6 +58,7 @@ import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
 import ResultBaseline (
     runCombinedSyntaxBaseline,
+    runEarlyRejectBaseline,
     runGroupProposalsBaseline,
     runGroupProposalsNoLocBaseline,
     runLiteralBatchBaseline,
@@ -337,6 +338,7 @@ searchModes =
     , ("--statement-fallback-noloc-baseline", runStatementFallbackNoLocBaseline)
     , ("--group-proposals-baseline", runGroupProposalsBaseline)
     , ("--group-proposals-noloc-baseline", runGroupProposalsNoLocBaseline)
+    , ("--early-reject-baseline", runEarlyRejectBaseline)
     , ("--reparse-baseline", runReparseBaseline)
     , ("--worker-baseline", runWorkerBaseline)
     ]

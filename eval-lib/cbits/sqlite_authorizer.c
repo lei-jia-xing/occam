@@ -1,6 +1,44 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * Conservative ASCII case-insensitive scan for SQLite wall-clock keywords
+ * (CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP) that may bypass the
+ * SQLITE_FUNCTION authorizer callback.
+ */
+int occam_sqlite_has_nondet_keyword(const uint8_t *buf, size_t len) {
+    static const char k_time[] = "current_time";
+    static const char k_date[] = "current_date";
+    const size_t klen = 12;
+    if (len < klen) {
+        return 0;
+    }
+    for (size_t i = 0; i + klen <= len; i++) {
+        uint8_t b0 = buf[i];
+        if (b0 != 'c' && b0 != 'C') {
+            continue;
+        }
+        int match_time = 1;
+        int match_date = 1;
+        for (size_t j = 1; j < klen && (match_time || match_date); j++) {
+            uint8_t c = buf[i + j];
+            if (c >= 'A' && c <= 'Z') {
+                c = (uint8_t)(c + ('a' - 'A'));
+            }
+            if (match_time && c != (uint8_t)k_time[j]) {
+                match_time = 0;
+            }
+            if (match_date && c != (uint8_t)k_date[j]) {
+                match_date = 0;
+            }
+        }
+        if (match_time || match_date) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Returns 0 if valid UTF-8 without NUL, 1 if NUL byte present, 2 if invalid UTF-8. */
 int occam_sqlite_check_sql(const uint8_t *buf, size_t len) {
     size_t i = 0;
@@ -47,6 +85,7 @@ int occam_sqlite_check_sql(const uint8_t *buf, size_t len) {
 #define OCCAM_DIRTY_TEMP 4
 #define OCCAM_DIRTY_DML 8
 #define OCCAM_DIRTY_CONN_COUNTER 16
+#define OCCAM_DIRTY_NONDET 32
 
 static int ascii_eq_ci(const char *a, const char *b) {
     if (!a || !b) {
@@ -108,13 +147,15 @@ int occam_sqlite_authorizer(
                     *dirty |= OCCAM_DIRTY_PRAGMA;
                 }
             } else {
-                *dirty |= OCCAM_DIRTY_TEMP;
+                *dirty |= (OCCAM_DIRTY_TEMP | OCCAM_DIRTY_NONDET);
             }
             return 0;
         case 24: /* SQLITE_ATTACH */
         case 25: /* SQLITE_DETACH */
         case 29: /* SQLITE_CREATE_VTABLE */
         case 30: /* SQLITE_DROP_VTABLE */
+            *dirty |= (OCCAM_DIRTY_MAIN | OCCAM_DIRTY_TEMP | OCCAM_DIRTY_NONDET);
+            return 0;
         case 3:  /* SQLITE_CREATE_TEMP_INDEX */
         case 4:  /* SQLITE_CREATE_TEMP_TABLE */
         case 5:  /* SQLITE_CREATE_TEMP_TRIGGER */
@@ -134,11 +175,23 @@ int occam_sqlite_authorizer(
             if (cstr_is_temp(arg3)) {
                 *dirty |= OCCAM_DIRTY_TEMP;
             }
-            if (op == 31 && arg2 != NULL
-                && (ascii_eq_ci(arg2, "last_insert_rowid")
+            if (op == 31 && arg2 != NULL) {
+                if (ascii_eq_ci(arg2, "last_insert_rowid")
                     || ascii_eq_ci(arg2, "changes")
-                    || ascii_eq_ci(arg2, "total_changes"))) {
-                *dirty |= OCCAM_DIRTY_CONN_COUNTER;
+                    || ascii_eq_ci(arg2, "total_changes")) {
+                    *dirty |= OCCAM_DIRTY_CONN_COUNTER;
+                }
+                if (ascii_eq_ci(arg2, "random")
+                    || ascii_eq_ci(arg2, "randomblob")
+                    || ascii_eq_ci(arg2, "date")
+                    || ascii_eq_ci(arg2, "time")
+                    || ascii_eq_ci(arg2, "datetime")
+                    || ascii_eq_ci(arg2, "julianday")
+                    || ascii_eq_ci(arg2, "strftime")
+                    || ascii_eq_ci(arg2, "unixepoch")
+                    || ascii_eq_ci(arg2, "timediff")) {
+                    *dirty |= OCCAM_DIRTY_NONDET;
+                }
             }
             return 0;
         case 9:  /* SQLITE_DELETE */
@@ -214,9 +267,12 @@ int occam_sqlite_reset(sqlite3 *db, sqlite3 *tmpl, int *dirty_ptr) {
  */
 int occam_sqlite_next_result(
     sqlite3 *db,
+    const char *base,
     const char *start,
     const char *end,
     int ordinal,
+    int *end_offsets,
+    int max_offsets,
     const char **out_tail,
     sqlite3_stmt **out_stmt,
     int *out_ordinal
@@ -239,6 +295,9 @@ int occam_sqlite_next_result(
             }
             start = tail;
             continue;
+        }
+        if (end_offsets != NULL && ordinal >= 0 && ordinal < max_offsets) {
+            end_offsets[ordinal] = (int)(tail - base);
         }
         if (sqlite3_column_count(stmt) == 0) {
             while ((rc = sqlite3_step(stmt)) == 100) {
