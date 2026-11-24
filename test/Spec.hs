@@ -138,7 +138,19 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
-import System.Process (readCreateProcessWithExitCode, readProcess, readProcessWithExitCode, shell)
+import System.Process (
+    CreateProcess (..),
+    StdStream (..),
+    proc,
+    readCreateProcessWithExitCode,
+    readProcess,
+    readProcessWithExitCode,
+    shell,
+    terminateProcess,
+    waitForProcess,
+    withCreateProcess,
+ )
+import System.Timeout (timeout)
 import Test.QuickCheck (
     Arbitrary (..),
     Property,
@@ -273,11 +285,14 @@ tryListBin name = do
             pure (if exists then Just path else Nothing)
 
 runOccamCLI :: [String] -> IO (ExitCode, String, String)
-runOccamCLI cliArgs = do
+runOccamCLI cliArgs = runOccamCLIWithStdin cliArgs ""
+
+runOccamCLIWithStdin :: [String] -> String -> IO (ExitCode, String, String)
+runOccamCLIWithStdin cliArgs stdinData = do
     bin <- getOccamBinary
     if bin == "cabal"
-        then readProcessWithExitCode "cabal" (["run", "-v0", "occam", "--"] ++ cliArgs) ""
-        else readProcessWithExitCode bin cliArgs ""
+        then readProcessWithExitCode "cabal" (["run", "-v0", "occam", "--"] ++ cliArgs) stdinData
+        else readProcessWithExitCode bin cliArgs stdinData
 
 withCLIInput :: BS.ByteString -> (FilePath -> FilePath -> IO a) -> IO a
 withCLIInput sql action =
@@ -863,6 +878,45 @@ phase5Tests =
                 (code, _, err) <- runOccamCLI [input, "-c", "grep -q INSERT", "-j", "2", "--quiet", "--out", "-"]
                 assertEqual "reduction should succeed" ExitSuccess code
                 assertBool "warning should be suppressed by --quiet" (not ("state contamination" `isInfixOf` err))
+        , testCase "CLI reads stdin only with explicit '-' and rejects omitted input" $ do
+            (okCode, okOut, okErr) <-
+                runOccamCLIWithStdin
+                    ["-", "--dialect", "sqlite", "--result-oracle", "--quiet"]
+                    "CREATE TABLE noise (x INT);SELECT 42 AS answer;"
+            assertEqual ("explicit '-' stdin reduction failed: " ++ okErr) ExitSuccess okCode
+            assertEqual "explicit '-' reduced SQL mismatch" "SELECT 42 AS answer;" okOut
+
+            (missCode, _, missErr) <-
+                runOccamCLIWithStdin ["-c", "exit 0", "--quiet"] "SELECT 1;"
+            assertBool "omitted input must be rejected even when stdin is piped" (missCode /= ExitSuccess)
+            assertBool "missing input error should name INPUT.sql" ("Missing: INPUT.sql" `isInfixOf` missErr)
+        , testCase "CLI rejects --stats - stdout collision before reading stdin" $ do
+            bin <- getOccamBinary
+            let baseProc =
+                    if bin == "cabal"
+                        then proc "cabal" ["run", "-v0", "occam", "--", "-", "-c", "exit 0", "--stats", "-"]
+                        else proc bin ["-", "-c", "exit 0", "--stats", "-"]
+                cliProc =
+                    baseProc
+                        { std_in = CreatePipe
+                        , std_out = CreatePipe
+                        , std_err = CreatePipe
+                        }
+            withCreateProcess cliProc $ \mIn _ mErr ph -> do
+                -- Intentionally keep stdin open without EOF; validation must fail fast.
+                res <- timeout 10000000 (waitForProcess ph)
+                case res of
+                    Nothing -> do
+                        terminateProcess ph
+                        _ <- waitForProcess ph
+                        assertFailure "CLI blocked on stdin before rejecting --stats - collision"
+                    Just code -> do
+                        errText <- maybe (pure "") (fmap BSC.unpack . BSC.hGetContents) mErr
+                        assertEqual ("--stats - with stdout must exit 2: " ++ errText) (ExitFailure 2) code
+                        assertBool
+                            "wrong error for --stats - with stdout"
+                            ("--stats - cannot be combined" `isInfixOf` errText)
+                forM_ mIn hClose
         ]
 
 -- ----------------------------------------------------------------------------

@@ -926,10 +926,9 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         exitSuccess
 
     oracleCmd <- if valResultOracle then pure Nothing else Just <$> requireOracleCommand valOracleCmd
-    (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
-
     (writeToStdout, targetMinimalPath, statsPath) <-
         resolveOutputTargets valInputFile valOut valInPlace valStatsFile
+    (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
 
     ui <-
         newUI
