@@ -1,6 +1,6 @@
 # Real DBMS Fuzz Crash Corpus (PostgreSQL, MySQL, MariaDB, ClickHouse, SQLite & DuckDB)
 
-This directory contains **71 authentic, unreduced, multi-statement fuzz crash cases** extracted from official DBMS defect trackers and fuzzer reports across all 6 DBMS targets supported by `harness/`, directly fulfilling the validation requirements outlined in the undergraduate thesis specification (`/home/hunter/Documents/毕设课题规划_简约.docx`, Section 6.1: *测试集构建*).
+This directory contains **71 authentic, unreduced, multi-statement fuzz crash cases** extracted from official DBMS defect trackers and fuzzer reports across all 6 DBMS targets supported by [`harness/`](../../harness/README.md).
 
 | DBMS | Occam Dialect (`DBMS_TO_OCCAM_DIALECT`) | Case Count | Target Image / Version Focus | Local Live-5/5 Verification |
 | :--- | :--- | :---: | :--- | :--- |
@@ -15,7 +15,7 @@ This directory contains **71 authentic, unreduced, multi-statement fuzz crash ca
 
 ## 1. Selection Criteria & Methodology
 
-In accordance with the thesis specification and DBMS fuzzing research standards:
+All cases follow four criteria:
 1. **Authentic Provenance**: Every case originates directly from official DBMS bug trackers or commit regression tests (PostgreSQL `pgsql-bugs`/`pgsql-hackers`, MySQL Bugs & commits, MariaDB Jira `MDEV-*`, ClickHouse GitHub Issues & AST fuzzer, SQLite Fossil timeline/tickets, DuckDB GitHub Issues), discovered by leading DBMS fuzzers and bug-finding tools (**SQUIRREL**, **SQLsmith**, **SQLancer**, **pquery/RQG**, **ClickHouse AST fuzzer**, **OSS-Fuzz**).
 2. **Multi-Statement Dependency**: Every case in the corpus is an ordered multi-statement sequence (`statement_count >= 2`, typically 3–27 statements) combining schema setup (`CREATE TABLE`, `CREATE VIEW`, `CREATE INDEX`), state mutations (`INSERT`, `UPDATE`, `ALTER`), settings/views/rules, and a triggering query/DML. None are isolated 1-line crashes.
 3. **Deterministic Crash Signature & Self-Containment**: Each case specifies an `expected_signature` regex compatible with `harness/crash_oracle.py`, and avoids harness-incompatible state (no `USE test;`, no `default.` ClickHouse DB qualifiers, no mysqltest directives, no psql backslash meta-commands, and no global role/policy state that leaks past `harness/reset_db.sh`).
@@ -139,22 +139,21 @@ In accordance with the thesis specification and DBMS fuzzing research standards:
     - `s0` defined by statement 3, populated by `ANALYZE` (statement 4).
     - If `CREATE STATISTICS` or `ANALYZE` is removed, the query executes normally without crashing.
 ### 3.3 `pg_fuzzer_mcv_enhanced` (PostgreSQL)
-- **Origin**: In accordance with Section 6.1 of the thesis task book (*"冗余增强：在已经较短的真实用例中插入无关的建表、插数、查询语句，并在相关语句里加入冗余列与表达式，形成已知核心的样例"*), embeds the 5-statement `pg_fuzzer_mcv_clauses` core into 22 realistic multi-statement operations.
-- **Target**: PostgreSQL 12.0 on `occam-target-pg12`, compiled with `--enable-cassert --enable-debug`.
+- **Origin**: Redundancy-augmented variant embedding the 5-statement `pg_fuzzer_mcv_clauses` core into 22 realistic multi-statement operations (unrelated tables, inserts, views, indexes, and extra columns/expressions) with a known ground-truth core.
+- **Target**: PostgreSQL 12.0 (`REL_12_0`), compiled with `--enable-cassert --enable-debug`.
 - **SQL Structure** (22 statements):
   - **Users & Orders Subsystem**: `CREATE TABLE app_users`, `INSERT`, `CREATE TABLE orders`, `INSERT`, `CREATE VIEW active_users_summary`, `ALTER TABLE orders ADD COLUMN`, `UPDATE app_users`, `SELECT ... JOIN`.
   - **Sensor Telemetry & Indexing**: `CREATE TABLE sensor_readings`, `INSERT`, `CREATE INDEX`, `SELECT AVG(...)`.
   - **Inventory Subsystem & Mutation**: `CREATE TABLE inventory_items`, `INSERT`, `DELETE FROM orders`.
   - **Authentic Crash Core with Redundant Attributes**: `CREATE TABLE t0 (..., c_extra INT)`, 2 `INSERT` statements, `CREATE STATISTICS s0 ON c0, c2 FROM t0`, unreferenced subquery probing `SELECT COUNT(*)`, `ANALYZE;`, and the trigger query `SELECT * FROM t0 WHERE t0.c2 OR t0.c1 OR t0.c0;`.
-- **Why It Is Authentic & Verifiable**:
-  - Verified on live container `occam-target-pg12` with 5 consecutive clean replays, achieving 100% deterministic assertion reproduction (`FailedAssertion.*mcv.c:1553`).
+- **Why It Is Useful**:
+  - Previously verified on PostgreSQL 12.0 (`occam-target-pg12`) across 5 consecutive clean replays (`FailedAssertion.*mcv.c:1553`); listed as `Upstream` in the catalog above when no local PG container is present.
   - Provides an exact known ground-truth core for evaluating dependency slicing, statement-level ddmin, and IR-level column reduction against a realistic background database schema.
-
 
 ### 3.4 `pg_sqlsmith_partprune` (PostgreSQL)
 - **Origin**: Reported by Jaime Casanova (2ndQuadrant) to `pgsql-hackers` (Jul 24, 2018; diagnosed and fixed by Tom Lane in commit `59ef49d26d2`).
 - **Target**: PostgreSQL 11-devel (commit `1b957e59b92dc44c14708762f882d7910463a9ac`), compiled with `--enable-cassert --enable-debug`.
-- **SQL Structure** (22 statements, 112 lines, 4225 bytes):
+- **SQL Structure** (22 statements, 4616 bytes):
   - 3 initial `DROP TABLE IF EXISTS` cleanup statements.
   - 2 completely irrelevant table definitions (`actualizar_sistema`, `anexos`) created as background database schema.
   - 1 range-partitioned table (`radicado`) with nested hash subpartitions (`radicado2013`, `radicado2014`, `radicado2015`, `radicado2016` each having `part00` and `part01`).
@@ -162,7 +161,7 @@ In accordance with the thesis specification and DBMS fuzzing research standards:
   - 1 crashing complex query featuring `tablesample bernoulli (9.7)`, scalar subqueries against the irrelevant tables in the `SELECT` projection list, and a compound `WHERE` filter.
 - **Why It Is Authentic**:
   - Direct raw unreduced output of SQLsmith fuzzing against an existing relational schema.
-  - Perfectly models the exact multi-statement reduction scenario described in thesis Section 5.2: the reducer must prune unreferenced tables (`actualizar_sistema`, `anexos`), unnecessary partition branches, and redundant projections while preserving the exact planner assertion failure (`!(relid_subplan_map[rti] == 0)` in `partprune.c:244`).
+  - Exercises multi-statement reduction across unreferenced tables (`actualizar_sistema`, `anexos`), unnecessary partition branches, and redundant projections while preserving the exact planner assertion failure (`!(relid_subplan_map[rti] == 0)` in `partprune.c:244`).
 
 ### 3.5 `mysql_bug_91975` (MySQL)
 - **Origin**: Reported by Roel Van de Paar on `bugs.mysql.com`.
@@ -191,10 +190,10 @@ Each `.meta.json` file pairs with the raw `.sql` file to drive automated reducti
 occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
   --oracle "python3 harness/crash_oracle.py --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
   --reset "./harness/reset_db.sh --dbms postgres --container-name occam-target-pg" \
-  --dialect postgres \
+  --dialect postgresql \
   --timeout 10 \
   --jobs 1 \
-  --out /tmp/occam_reduced/
+  --out /tmp/occam-reduced.sql
 ```
 
 The oracle requires `--log-file` or `--container-name`; it does not treat client

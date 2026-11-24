@@ -208,10 +208,10 @@ python3 harness/crash_oracle.py \
 occam /path/to/crash_repro.sql \
   --oracle "python3 harness/crash_oracle.py --dbms postgres --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
   --reset "./harness/reset_db.sh --dbms postgres --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
-  --dialect postgres \
+  --dialect postgresql \
   --timeout 10 \
   --jobs 1 \
-  --out /tmp/occam_reduced/
+  --out /tmp/occam-reduced.sql
 ```
 
 `--timeout 10` belongs to Occam. Do not also pass a smaller `--timeout` to `crash_oracle.py`; a nonzero oracle exit is a rejection, not a timeout.

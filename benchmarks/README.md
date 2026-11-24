@@ -7,7 +7,7 @@ Occam benchmark architecture spans four distinct tiers:
 | 1 | In-process engine microbenchmarks (parse, DAG analysis, backward slice, span surgery, HAMT cache) | `bench/Main.hs` via `cabal bench` |
 | 2 | In-process native SQLite result oracle (`:memory:`, column names and typed rows) | `Occam.Oracle.Sqlite` |
 | 3 | Native corpus and scale timings, plus the paired result-slicing baseline | `bench/Main.hs` (`reduction/scale-064`, `reduction/corpus/*`) |
-| 4 | Real DBMS crash reproduction (PostgreSQL/MySQL/SQLite authentic bugs) | `benchmarks/real_fuzz_corpus/` + `harness/` |
+| 4 | Real DBMS crash reproduction (71 multi-statement cases across 6 DBMS targets) | `benchmarks/real_fuzz_corpus/` + `harness/` |
 
 ## Tiers 1–3: Native Haskell Benchmarks (`occam-bench`)
 
@@ -153,24 +153,15 @@ were equal within each arm in this run, excluding preflight and validation.
 The call counts are stable across repetitions. The elapsed ratios describe
 this machine and these fixtures.
 
-**NOTE** The count-mismatch fallback is tested by feeding mismatched counts and
-invalid ordinals to the reducer and comparing its search trace with A. The
-timed corpus uses actual engine observations with matching statement counts.
-The observed contract is the last result set, including its row order and
-column names. The validation scope is that contract.
+#### Notes & Limitations
 
-**FIX** The legacy `reduction-audit-validation` and
-`reduction-duckdb-validation` timings now validate the SQL returned by their
-audit. They still measure a direct reducer/audit probe with one final oracle
-call. Use the paired baseline to measure the shared evaluation path.
-
-**TODO** Add a naturally mismatched engine/frontend fixture when one is
-identified. Add larger inputs and isolate native DuckDB setup cost before
-using elapsed times to prioritize engine optimizations.
+- The count-mismatch fallback is tested by feeding mismatched counts and invalid ordinals to the reducer and comparing its search trace with A; the timed corpus uses actual engine observations with matching statement counts. The validated contract is the last result set (including row order and column names).
+- The legacy `reduction-audit-validation` and `reduction-duckdb-validation` timings validate the SQL returned by their audit, but measure a direct reducer/audit probe with one final oracle call. Use `--result-baseline` to measure the shared evaluation path.
+- Remaining measurement gaps: naturally mismatched engine/frontend fixtures, larger inputs, and isolating native DuckDB setup overhead.
 
 ## Tier 4: Real DBMS Crash Reproduction
 
-Authentic multi-statement PostgreSQL/MySQL/SQLite fuzz crashes with `.meta.json` provenance and crash signatures (see [real_fuzz_corpus/README.md](real_fuzz_corpus/README.md)).
+71 authentic multi-statement fuzz crashes across PostgreSQL, MySQL, MariaDB, ClickHouse, SQLite, and DuckDB with `.meta.json` provenance and crash signatures (see [real_fuzz_corpus/README.md](real_fuzz_corpus/README.md) and [harness/README.md](../harness/README.md)).
 
 Run Occam against a target crash:
 
@@ -178,10 +169,10 @@ Run Occam against a target crash:
 occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
   --oracle "python3 harness/crash_oracle.py --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
   --reset "./harness/reset_db.sh --dbms postgres --container-name occam-target-pg" \
-  --dialect postgres \
+  --dialect postgresql \
   --timeout 10 \
   --jobs 1 \
-  --out /tmp/occam_reduced/
+  --out /tmp/occam-reduced.sql
 ```
 
 The oracle requires `--log-file` or `--container-name`; client stderr is not
@@ -194,6 +185,6 @@ accepted as crash evidence. Use `--jobs 1` because the harness shares one
 # Haskell & Rust test suites + verification checks:
 make check
 
-# Crash oracle contract test:
-python3 harness/test_crash_oracle.py
+# Crash oracle & harness contract tests:
+make harness-check
 ```

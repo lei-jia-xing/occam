@@ -1,6 +1,6 @@
 # Upstream SQLParser Tracking & Dialect Discrepancies
 
-This document tracks syntax gaps, AST representation mismatches, and parsing limitations in upstream [`sqlparser-rs`](https://github.com/sqlparser-rs/sqlparser-rs) (currently pinned at `0.64.0`), along with Occam's current workarounds and proposed upstream PRs.
+This document tracks syntax gaps, AST representation mismatches, and parsing limitations in upstream [`sqlparser-rs`](https://github.com/sqlparser-rs/sqlparser-rs) (currently pinned at `0.64.0`), along with Occam's current workarounds and proposed upstream PRs. See [DIALECTS.md](DIALECTS.md) for overall dialect semantic coverage.
 
 ---
 
@@ -8,8 +8,8 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
 
 | ID | Dialect | Syntax Construct | Upstream Issue / AST Representation | Occam Impact | Current Workaround in Occam | Upstream PR / Solution Proposal |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **UP-01** | **MySQL** | Prefix Index (`INDEX (col(N))`) | Parsed generically as `Expr::Function` instead of key-part length prefix | Erroneously tripped `visitor.has_function` in DDL, raising `UnknownStatementBarrier` (global fence) | Structural recognition in [`rust/sqlparser-ffi/src/actions/facts.rs`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/src/actions/facts.rs#L483) via `index_length_prefix_ident` | Add `length: Option<u64>` to `sqlparser::ast::IndexColumn` in `sqlparser-rs` |
-| **UP-02** | **SQLite** | Virtual Tables (`CREATE VIRTUAL TABLE ... USING module(...)`) | Module arguments are unparsed strings/idents; schema not extracted | Marked as unmodeled syntax, raising global `UnknownStatementBarrier` and locking subsequent slicing | Lower barrier scope to `RelationScope(name)` in [`facts.rs`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/src/actions/facts.rs#L4642) | Provide structured column parsing for standard SQLite modules (`fts5`, `rtree`) |
+| **UP-01** | **MySQL** | Prefix Index (`INDEX (col(N))`) | Parsed generically as `Expr::Function` instead of key-part length prefix | Erroneously tripped `visitor.has_function` in DDL, raising `UnknownStatementBarrier` (global fence) | Structural recognition in [`facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs) via `index_length_prefix_ident` | Add `length: Option<u64>` to `sqlparser::ast::IndexColumn` in `sqlparser-rs` |
+| **UP-02** | **SQLite** | Virtual Tables (`CREATE VIRTUAL TABLE ... USING module(...)`) | Module arguments are unparsed strings/idents; schema not extracted | Marked as unmodeled syntax, raising global `UnknownStatementBarrier` and locking subsequent slicing | Lower barrier scope to `RelationScope(name)` in [`facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs) | Provide structured column parsing for standard SQLite modules (`fts5`, `rtree`) |
 | **UP-03** | **MySQL** | User & System Variables (`SET @var`, `SET @@var`) | Variable scopes (user vs session vs global) are parsed but lack unified semantics | Generates `UnknownSessionEffectBarrier(scope: Global)` | Scope narrowing: route user variables (`@var`) to `UserVariableScope` | Refine `sqlparser::ast::Statement::SetVariable` variable scoping |
 | **UP-04** | **PostgreSQL** | Dynamic / Dollar-Quoted Routine Bodies | Functions defined in dollar quotes (`$$ ... $$`) contain nested SQL not visited by AST visitor | Functions cannot be statically inspected for read/write effects | Treated as unmodeled routine fence | Pluggable inner statement parser for routine bodies |
 | **UP-05** | **PostgreSQL** | Extended Statistics (`CREATE STATISTICS s0 ON ... FROM t0`) | Grammar lacks `STATISTICS` branch in `parse_create`; throws `Expected: an object type after CREATE, found: STATISTICS` | Raises `GlobalScope SyntaxErrorBarrier`, freezing entire script (affects 10 real fuzz units) | Blocked on AST representation; tracked for upstream submission | Add `Statement::CreateStatistics` in `sqlparser-rs` under `PostgreSqlDialect` |
@@ -38,9 +38,9 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
   ```
   Because `OrderByExpr.expr` is an `Expr`, `col(10)` is parsed by `parse_expr()` into `Expr::Function`.
 - **Occam Workaround**:
-  [`index_length_prefix_ident`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/src/actions/facts.rs#L483) performs structural matching: single identifier name, exactly one unnamed unsigned integer argument, no window/filter/within-group clauses.
+  `index_length_prefix_ident` in [`rust/sqlparser-ffi/src/actions/facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs) performs structural matching: single identifier name, exactly one unnamed unsigned integer argument, no window/filter/within-group clauses.
 - **Corpus Evidence**:
-  Resolved false global barrier in [`benchmarks/real_fuzz_corpus/mysql_bug_91975.sql`](file:///home/hunter/Workspace/occam/benchmarks/real_fuzz_corpus/mysql_bug_91975.sql).
+  Resolved false global barrier in [`benchmarks/real_fuzz_corpus/mysql_bug_91975.sql`](../benchmarks/real_fuzz_corpus/mysql_bug_91975.sql).
 - **Proposed Upstream PR**:
   Extend `IndexColumn` in `sqlparser::ast`:
   ```rust
@@ -70,9 +70,9 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
   ```
   The column definitions are swallowed into unstructured identifier lists or string tokens.
 - **Occam Workaround / Plan**:
-  Extract the target `name`, register the table in the DDL catalog via `CatalogOp::DefineTable`, and lower the barrier scope to `RelationScope(name)` in [`facts.rs`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/src/actions/facts.rs#L4646).
+  Extract the target `name`, register the table in the DDL catalog via `CatalogOp::DefineTable`, and lower the barrier scope to `RelationScope(name)` in [`rust/sqlparser-ffi/src/actions/facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs).
 - **Corpus Evidence**:
-  Resolved in [`benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql`](file:///home/hunter/Workspace/occam/benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql), allowing independent virtual tables (e.g. `vt0` vs `vt1`) to be cleanly isolated and sliced away without whole-script global fencing.
+  Resolved in [`benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql`](../benchmarks/real_fuzz_corpus/sqlite_fuzz_fts5_savepoint.sql), allowing independent virtual tables (e.g. `vt0` vs `vt1`) to be cleanly isolated and sliced away without whole-script global fencing.
 
 ---
 
@@ -171,7 +171,7 @@ When upstream syntax limitations cause **parse failures (syntax errors or AST pa
    git clone https://github.com/sqlparser-rs/sqlparser-rs vendor/sqlparser-rs
    ```
 2. **Apply Local Patch**:
-   In [`rust/sqlparser-ffi/Cargo.toml`](file:///home/hunter/Workspace/occam/rust/sqlparser-ffi/Cargo.toml), add a patch override:
+   In [`rust/sqlparser-ffi/Cargo.toml`](../rust/sqlparser-ffi/Cargo.toml), add a patch override:
    ```toml
    [patch.crates-io]
    sqlparser = { path = "../../vendor/sqlparser-rs" }
