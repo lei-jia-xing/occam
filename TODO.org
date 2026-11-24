@@ -189,6 +189,24 @@
 - [X] Added thread-safe SQLite `:memory:` handle & static `FunPtr Authorizer` pooling (`sharedSqlitePool`, `sharedAuthorizer`, `sqlite3_backup` reset + dirty-bit tracking for `main`/`pragma`/`temp`) in `eval-lib/Occam/Oracle/Sqlite.hs`, and replaced per-statement `Control.Exception.Safe.bracket` with `Control.Exception.bracket`. Verified full isolation (tables, `TEMP` tables, `PRAGMA`s, open transactions, mid-script errors) in `test/Spec.hs`.
 - [X] Completed full migration to binary FFI protocol `OCCM\x02` (`Occam.Parser.Binary` / `rust/sqlparser-ffi/src/binary.rs`), encoding and decoding all `SemanticFacts` (`CatalogOp`, `SessionEffect`, `TxEffect`, `ScopedBarrier`) in pure binary with zero `serde_json` / `Data.Aeson` decoding in facts and edits extraction.
 
+** TODO [#B] Generalize statement candidate scheduling after dependency slicing
+- An eight-candidate window with projection before ranking used 674 calls versus 718 for unwindowed ranking on the 128-row precise graph with slicing disabled. Ranking by estimated bytes inside the same window used 679 calls. At cap 64 the validated checkpoints were 3568 B, 4146 B, and 3661 B, respectively. Exact scoring alone added calls on the precise 32-row, skewed precise 32-row, and savepoint fixtures. Keep the benchmark variants experimental.
+- Isolate prefetch and candidate ordering within the window. Compare interleaving with bounded re-ranking at fixed projection work and compare window sizes against the same fixtures. Track no-shrink and duplicate projected candidates before each probe.
+- Equal-weight singleton resumption used 901 calls versus 970 on the fenced 128-row graph-free fixture, with identical final SQL. On the skewed 32-row fixture, it improved the 64-call checkpoint from 1322 B to 1202 B. Compare bounded lane preference based on recent successful deletions with this fixed resumption rule. Preserve opportunities for each lane and include transaction-heavy inputs.
+- The graph-free ranked policy used 970 calls versus 1536 on the fenced 128-row fixture at identical output. Both arms used 643 with the full pipeline. Include fixtures where slicers and scheduled deletions compete for the same budget before changing defaults.
+
+*** TODO Generate noncontiguous deletion proposals from dependency groups
+- Group statements by relation, transaction, or dependency component. Start with groups that have weak ties to the observed result, such as the creation, writes, and indexes of an unrelated table spread across the script. Probe each proposed group with the oracle. A rejected group leaves its members eligible for other moves. Retain contiguous search and the final audit.
+- Compare against the current reducer at fixed call budgets and at completion. Record which accepted proposals were unavailable to contiguous partitions and which merely reached an existing result sooner. The relaxed dependency proposal already reduced the fenced 128-row fixture from 1656 to 643 calls at identical output.
+
+*** TODO Prove early rejection for native result oracles
+- Look for checkable certificates that a candidate cannot produce the contracted result, and validate them against the native engine. Begin with exact prefixes carrying engine boundary evidence. Absence of a result in the original execution does not certify arbitrary deletion subsequences, since earlier statements can change execution context.
+- Measure certificate coverage and net oracle savings, including checking cost. The fenced 128-row fixture spent 372 of its remaining 643 calls on subsets with zero accepts. Keep the ordinary oracle path for candidates outside the certificate's scope.
+
+*** TODO Qualify ranked scheduling when dependency analysis leaves substantial work
+- Test a ranked fallback after slicing stalls against the current byte-weighted strategy. Measure activation separately on precise graphs, global fences, and transaction-heavy cases. Include a fixture where only a subset succeeds and confirm final audit and validation.
+- Compare final size and physical calls at completion and accepted size at fixed budgets. The graph-free 128-row comparison went from 1536 calls to 970 with ranking and rotation, then to 901 with equal-weight resumption. The full pipeline showed no gain from the original ranked strategy on that fixture.
+
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (no server required)
 - [X] Target DBMS Dockerfiles prepared in `harness/`: `Dockerfile.target-sqlite` (release zip + Fossil snapshot ref, `SQLITE_DEBUG`, optional ASan), `Dockerfile.target-mariadb` (source `Debug`, optional ASan, crash supervisor), `Dockerfile.target-duckdb` (`RelWithDebInfo` + `FORCE_ASSERT=1`, optional ASan), `Dockerfile.target-clickhouse` (pinned official `.deb` packages, optional `-dbg`, crash supervisor), alongside existing `Dockerfile.target-pg` and `Dockerfile.target-mysql`.
