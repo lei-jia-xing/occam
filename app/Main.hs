@@ -73,10 +73,12 @@ import Occam.Reducer (
     StageEvent (..),
     StatementSearchPolicy (..),
     columnModeName,
+    convergedRankedScheduleConfig,
     defaultReductionConfig,
     reduceSQLWithResultSlicing,
     statementAuditWithLogger,
     statementDdminWithOrder,
+    statementRankedFallback,
     statementSearchPolicyName,
  )
 import Occam.UI (
@@ -679,8 +681,9 @@ statementOrderParser =
         (Explicit <$> eitherReader parseStatementOrder)
         ( long "statement-order"
             <> metavar "ORDER"
-            <> help "Statement ddmin search order: byte-weighted (default), complement-first, or subset-first"
-            <> completeWith ["byte-weighted", "complement-first", "subset-first"]
+            <> help
+                "Statement ddmin search order: ranked-fallback (default), ranked, byte-weighted, complement-first, or subset-first"
+            <> completeWith ["ranked-fallback", "ranked", "byte-weighted", "complement-first", "subset-first"]
         )
         <|> pure (rawStatementOrder defaultRawOptions)
 
@@ -731,10 +734,12 @@ parseJobs s = case reads s of
 
 parseStatementOrder :: String -> Either String StatementSearchPolicy
 parseStatementOrder s = case map toLower s of
+    "ranked-fallback" -> Right statementRankedFallback
+    "ranked" -> Right (StatementRankedWith convergedRankedScheduleConfig)
     "subset-first" -> Right StatementSubsetFirst
     "complement-first" -> Right StatementComplementFirst
     "byte-weighted" -> Right StatementByteWeighted
-    _ -> Left "Expected subset-first, complement-first, or byte-weighted"
+    _ -> Left "Expected ranked-fallback, ranked, byte-weighted, complement-first, or subset-first"
 
 parseColumnMode :: String -> Either String ColumnMode
 parseColumnMode s = case map toLower s of

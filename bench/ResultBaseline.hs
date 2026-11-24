@@ -12,11 +12,26 @@ module ResultBaseline (
     runStatementRankBaseline,
     runStatementInterleaveBaseline,
     runStatementRankedResumeBaseline,
+    runStatementRankedResumeTiesBaseline,
+    runStatementProjectedRankBaseline,
+    runStatementProjectionScoreBaseline,
+    runStatementWindowPrefetchBaseline,
+    runStatementWindowWithinLaneBaseline,
+    runStatementWindowCrossVsLaneBaseline,
+    runStatementWindowSize4Baseline,
+    runStatementWindowSize16Baseline,
+    runStatementBoundedPrefClosureBaseline,
+    runStatementResumeMonoBaseline,
+    runStatementLanePrefBaseline,
+    runStatementLanePrefQuota2Baseline,
+    runStatementLanePrefQuota8Baseline,
+    runStatementFallbackBaseline,
+    runStatementFallbackNoLocBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
 
-import Control.Monad (forM, forM_, mapAndUnzipM, unless, (>=>))
+import Control.Monad (forM, forM_, mapAndUnzipM, unless, when, (>=>))
 import Data.Aeson (Value, encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -42,7 +57,7 @@ import Occam.Evaluation (
     runEvaluationRequestWithObserver,
     sqlDialectName,
  )
-import Occam.Logger (nullLogger)
+import Occam.Logger (Logger (..), defaultLogConfig)
 import Occam.Oracle (
     OracleObservationDetails (..),
     observationOutcome,
@@ -58,11 +73,19 @@ import Occam.Parser (
     parseSQL,
  )
 import Occam.Reducer (
+    LaneOrdering (..),
+    LaneScheduling (..),
+    ProjectionWindow (..),
+    ProjectionWindowOrder (..),
+    RankedScheduleConfig (..),
     ReductionConfig (..),
     ReductionResult (..),
+    SingletonResume (..),
     StatementSearchPolicy (..),
+    defaultRankedScheduleConfig,
     defaultReductionConfig,
     reduceSQLWithResultSlicing,
+    statementRanked,
  )
 import System.Exit (die)
 import System.FilePath ((</>))
@@ -219,6 +242,128 @@ statementFixture skewed fenced size =
             "SELECT 0 AS answer;"
             (ResultStatement (2 * size + 2) (2 * size + 1))
             fenced
+
+shortNoiseFixture :: Bool -> Int -> Fixture
+shortNoiseFixture fenced size =
+    let inputRow i =
+            "INSERT INTO ledger(entry_value, note) VALUES ("
+                ++ show i
+                ++ ", 'required-payload-record-padding-0000'); CREATE TABLE n_"
+                ++ show i
+                ++ "(a);"
+        query
+            | fenced = "SELECT sum(entry_value) AS answer FROM ledger;"
+            | otherwise = "SELECT entry_value AS answer FROM ledger ORDER BY entry_value;"
+        reference
+            | fenced = "SELECT " ++ show (sum [1 .. size]) ++ " AS answer;"
+            | otherwise =
+                "WITH ledger(entry_value) AS (VALUES "
+                    ++ intercalate ", " ["(" ++ show i ++ ")" | i <- [1 .. size]]
+                    ++ ") "
+                    ++ query
+     in Fixture
+            ((if fenced then "short-noise-fenced-" else "short-noise-precise-") ++ show size)
+            SQLite
+            ( BSC.pack
+                (unlines ("CREATE TABLE ledger(entry_value INT, note TEXT);" : map inputRow [1 .. size] ++ [query]))
+            )
+            (BSC.pack reference)
+            "SELECT 0 AS answer;"
+            (ResultStatement (2 * size + 2) (2 * size + 1))
+            fenced
+
+txNoopBlocksFixture :: Bool -> Int -> Fixture
+txNoopBlocksFixture fenced size =
+    let block _ =
+            [ "BEGIN;"
+            , "UPDATE t SET x = x + 1;"
+            , "UPDATE t SET x = x - 1;"
+            , "COMMIT;"
+            ]
+        query = if fenced then "SELECT sum(x) AS answer FROM t;" else "SELECT x AS answer FROM t;"
+        stmts =
+            ["CREATE TABLE t(x INT);", "INSERT INTO t VALUES (42);"]
+                ++ concatMap block [1 .. size]
+                ++ [query]
+        total = 4 * size + 3
+     in Fixture
+            ((if fenced then "tx-noop-blocks-fenced-" else "tx-noop-blocks-precise-") ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            "SELECT 42 AS answer;"
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
+            fenced
+
+txNoopUpdatesFixture :: Bool -> Int -> Fixture
+txNoopUpdatesFixture fenced size =
+    let pair _ =
+            [ "UPDATE t SET x = x + 1;"
+            , "UPDATE t SET x = x - 1;"
+            ]
+        query = if fenced then "SELECT sum(x) AS answer FROM t;" else "SELECT x AS answer FROM t;"
+        stmts =
+            ["CREATE TABLE t(x INT);", "INSERT INTO t VALUES (42);"]
+                ++ concatMap pair [1 .. size]
+                ++ [query]
+        total = 2 * size + 3
+     in Fixture
+            ((if fenced then "tx-noop-updates-fenced-" else "tx-noop-updates-precise-") ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            "SELECT 42 AS answer;"
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
+            fenced
+
+txSavepointMixFixture :: Bool -> Int -> Fixture
+txSavepointMixFixture fenced size =
+    let block i =
+            [ "SAVEPOINT s_" ++ show i ++ ";"
+            , "UPDATE t SET x = 0;"
+            , "ROLLBACK TO s_" ++ show i ++ ";"
+            , "RELEASE s_" ++ show i ++ ";"
+            , "BEGIN;"
+            , "UPDATE t SET x = x + 1;"
+            , "UPDATE t SET x = x - 1;"
+            , "COMMIT;"
+            , "CREATE TABLE noise_" ++ show i ++ "(a INT);"
+            ]
+        query = if fenced then "SELECT sum(x) AS answer FROM t;" else "SELECT x AS answer FROM t;"
+        stmts =
+            ["CREATE TABLE t(x INT);", "INSERT INTO t VALUES (42);"]
+                ++ concatMap block [1 .. size]
+                ++ [query]
+        total = 9 * size + 3
+     in Fixture
+            ((if fenced then "tx-savepoint-mix-fenced-" else "tx-savepoint-mix-precise-") ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            "SELECT 42 AS answer;"
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
+            fenced
+
+subsetOnlyReturningFixture :: Fixture
+subsetOnlyReturningFixture =
+    let insertA :: Int -> String
+        insertA i = "INSERT INTO a(x) VALUES (" ++ show i ++ ") RETURNING 0 AS answer;"
+        stmts =
+            ["CREATE TABLE a(x INT, pad TEXT DEFAULT 'aaaaaaaaaaaaaaaaaaaa');"]
+                ++ map insertA [1 .. 3]
+                ++ [ "CREATE TABLE k(x INT, pad TEXT DEFAULT 'kkkkkkkkkkkk');"
+                   , "INSERT INTO k(x) VALUES (42) RETURNING x AS answer;"
+                   ]
+                ++ map insertA [4 .. 12]
+                ++ ["SELECT sum(a.x) + (SELECT x FROM k) - 78 AS answer FROM a;"]
+     in Fixture
+            "subset-only-returning-16"
+            SQLite
+            (BSC.pack (unlines stmts))
+            "SELECT 42 AS answer;"
+            "SELECT 0 AS answer;"
+            (ResultStatement 16 15)
+            True
 
 data Arm = Arm
     { armName :: String
@@ -397,33 +542,282 @@ runRankedComparison configure cases pairs wallLimit callLimit out =
         wallLimit
         callLimit
         (searchCensoredStatuses wallLimit callLimit)
-        ( serialArm "statement-byte-weighted" configure True
+        ( serialArm
+            "statement-byte-weighted"
+            (\config -> (configure config) {reductionStatementSearch = StatementByteWeighted})
+            True
         , serialArm
             "statement-ranked"
-            (\config -> (configure config) {reductionStatementSearch = StatementRanked})
+            (\config -> (configure config) {reductionStatementSearch = statementRanked})
             True
         )
         cases
 
+rankedPolicy :: (RankedScheduleConfig -> RankedScheduleConfig) -> StatementSearchPolicy
+rankedPolicy f = StatementRankedWith (f defaultRankedScheduleConfig)
+
+boundedPrefConfig :: Int -> RankedScheduleConfig
+boundedPrefConfig quota =
+    defaultRankedScheduleConfig
+        { rankedLaneScheduling = LaneBoundedPreference quota
+        , rankedSingletonResume = ResumeWeightMonotonic
+        , rankedFallbackMinStatements = 8
+        , rankedFallbackMaxShrinkPct = 10
+        }
+
+projectionCohort :: [Fixture]
+projectionCohort =
+    statementFixtures
+        ++ [statementFixture False False 128, statementFixture True False 32, statementFixture True True 32]
+        ++ fixtures
+
+lanePreferenceCohort :: [Fixture]
+lanePreferenceCohort =
+    statementFixtures
+        ++ [ statementFixture False True 128
+           , statementFixture True True 32
+           , shortNoiseFixture True 32
+           , shortNoiseFixture True 64
+           , txNoopBlocksFixture False 16
+           , txSavepointMixFixture False 12
+           , subsetOnlyReturningFixture
+           ]
+        ++ fixtures
+
+fallbackQualificationCohort :: [Fixture]
+fallbackQualificationCohort =
+    statementFixtures
+        ++ [ statementFixture False False 128
+           , statementFixture False True 128
+           , statementFixture True True 32
+           , shortNoiseFixture True 32
+           , txNoopUpdatesFixture False 16
+           , txNoopUpdatesFixture True 16
+           , txNoopBlocksFixture False 16
+           , txNoopBlocksFixture False 32
+           , txNoopBlocksFixture True 16
+           , txSavepointMixFixture False 12
+           , txSavepointMixFixture True 12
+           , subsetOnlyReturningFixture
+           ]
+        ++ fixtures
+
+fallbackNoLocCohort :: [Fixture]
+fallbackNoLocCohort =
+    [ statementFixture False False 32
+    , statementFixture False True 32
+    , statementFixture False True 128
+    , statementFixture True True 32
+    , shortNoiseFixture True 32
+    , txNoopUpdatesFixture False 16
+    , txNoopUpdatesFixture True 16
+    , txNoopBlocksFixture False 16
+    , txNoopBlocksFixture True 16
+    , txSavepointMixFixture True 12
+    , subsetOnlyReturningFixture
+    ]
+        ++ fixtures
+
 runStatementRankBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementRankBaseline = runRankedAblation StatementInterleaved
+runStatementRankBaseline =
+    runRankedAblation (rankedPolicy (\c -> c {rankedLaneOrdering = LaneOrderPartition}))
 
 runStatementInterleaveBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementInterleaveBaseline = runRankedAblation StatementRankedSerial
+runStatementInterleaveBaseline =
+    runRankedAblation (rankedPolicy (\c -> c {rankedLaneScheduling = LaneSerial}))
 
 runStatementRankedResumeBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementRankedResumeBaseline = runRankedAblation StatementRankedResume
+runStatementRankedResumeBaseline =
+    runRankedAblation (rankedPolicy (\c -> c {rankedSingletonResume = ResumeCursorOnly}))
 
-runRankedAblation :: StatementSearchPolicy -> Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runRankedAblation control pairs wallLimit callLimit out =
+runStatementRankedResumeTiesBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementRankedResumeTiesBaseline =
+    runRankedAblation (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
+
+runStatementProjectedRankBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementProjectedRankBaseline =
+    runProjectionPair
+        "estimated-bytes"
+        statementRanked
+        "projected-bytes"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
+
+runStatementProjectionScoreBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementProjectionScoreBaseline =
+    runProjectionPair
+        "window-estimated-bytes"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossEstimated}))
+        "projected-bytes"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
+
+runStatementWindowPrefetchBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementWindowPrefetchBaseline =
+    runProjectionPair
+        "unwindowed"
+        statementRanked
+        "window-8-preserve"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderPreserve}))
+
+runStatementWindowWithinLaneBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementWindowWithinLaneBaseline =
+    runProjectionPair
+        "window-8-preserve"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderPreserve}))
+        "window-8-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
+
+runStatementWindowCrossVsLaneBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementWindowCrossVsLaneBaseline =
+    runProjectionPair
+        "window-8-cross-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
+        "window-8-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
+
+runStatementWindowSize4Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementWindowSize4Baseline =
+    runProjectionPair
+        "window-4-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 4 WindowOrderWithinLaneProjected}))
+        "window-8-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
+
+runStatementWindowSize16Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementWindowSize16Baseline =
+    runProjectionPair
+        "window-16-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 16 WindowOrderWithinLaneProjected}))
+        "window-8-within-lane-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
+
+runStatementBoundedPrefClosureBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementBoundedPrefClosureBaseline =
+    runProjectionPair
+        "window-8-cross-projected"
+        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
+        "bounded-lane-pref-4"
+        (StatementRankedWith (boundedPrefConfig 4))
+
+runStatementResumeMonoBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementResumeMonoBaseline =
+    runGraphFreePair
+        "resume-stable-ties"
+        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
+        "resume-weight-monotonic"
+        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightMonotonic}))
+        lanePreferenceCohort
+
+runStatementLanePrefBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementLanePrefBaseline =
+    runGraphFreePair
+        "fixed-resume-ties"
+        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
+        "bounded-lane-pref-4"
+        (StatementRankedWith (boundedPrefConfig 4))
+        lanePreferenceCohort
+
+runStatementLanePrefQuota2Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementLanePrefQuota2Baseline =
+    runGraphFreePair
+        "bounded-lane-pref-2"
+        (StatementRankedWith (boundedPrefConfig 2))
+        "bounded-lane-pref-4"
+        (StatementRankedWith (boundedPrefConfig 4))
+        lanePreferenceCohort
+
+runStatementLanePrefQuota8Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementLanePrefQuota8Baseline =
+    runGraphFreePair
+        "bounded-lane-pref-8"
+        (StatementRankedWith (boundedPrefConfig 8))
+        "bounded-lane-pref-4"
+        (StatementRankedWith (boundedPrefConfig 4))
+        lanePreferenceCohort
+
+runStatementFallbackBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementFallbackBaseline pairs wallLimit callLimit out =
     runComparison
         pairs
         out
         wallLimit
         callLimit
         (searchCensoredStatuses wallLimit callLimit)
-        (arm "control" control, arm "ranked-interleaved" StatementRanked)
-        (statementFixtures ++ [statementFixture False True 128, statementFixture True True 32] ++ fixtures)
+        ( serialArm
+            "statement-byte-weighted"
+            (\config -> config {reductionStatementSearch = StatementByteWeighted})
+            True
+        , serialArm
+            "statement-ranked-fallback"
+            (\config -> config {reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)})
+            True
+        )
+        fallbackQualificationCohort
+
+runStatementFallbackNoLocBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementFallbackNoLocBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm
+            "statement-byte-weighted-noloc"
+            (\config -> config {reductionStatementSearch = StatementByteWeighted})
+            False
+        , serialArm
+            "statement-ranked-fallback-noloc"
+            (\config -> config {reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)})
+            False
+        )
+        fallbackNoLocCohort
+
+runProjectionPair ::
+    String ->
+    StatementSearchPolicy ->
+    String ->
+    StatementSearchPolicy ->
+    Int ->
+    Maybe Int ->
+    Maybe Int ->
+    FilePath ->
+    IO ()
+runProjectionPair controlName control treatmentName treatment pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        (arm controlName control, arm treatmentName treatment)
+        projectionCohort
+    where
+        arm name policy =
+            serialArm
+                name
+                (\config -> config {reductionSlicing = False, reductionStatementSearch = policy})
+                True
+
+runGraphFreePair ::
+    String ->
+    StatementSearchPolicy ->
+    String ->
+    StatementSearchPolicy ->
+    [Fixture] ->
+    Int ->
+    Maybe Int ->
+    Maybe Int ->
+    FilePath ->
+    IO ()
+runGraphFreePair controlName control treatmentName treatment cases pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        (arm controlName control, arm treatmentName treatment)
+        cases
     where
         arm name policy =
             serialArm
@@ -436,6 +830,15 @@ runRankedAblation control pairs wallLimit callLimit out =
                         }
                 )
                 True
+
+runRankedAblation :: StatementSearchPolicy -> Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runRankedAblation control =
+    runGraphFreePair
+        "control"
+        control
+        "ranked-interleaved"
+        statementRanked
+        (statementFixtures ++ [statementFixture False True 128, statementFixture True True 32] ++ fixtures)
 
 optimizedSyntax :: ReductionConfig -> ReductionConfig
 optimizedSyntax config =
@@ -560,9 +963,21 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             end <- getMonotonicTimeNSec
             physicalCalls <- newIORef (1 :: Int)
             accepted <- newIORef []
+            fallbackActivations <- newIORef (0 :: Int)
+            fallbackSkips <- newIORef (0 :: Int)
             let observed started = observer $ do
                     atomicModifyIORef' physicalCalls (\calls -> (calls + 1, ()))
                     started
+                telemetryLogger =
+                    Logger
+                        defaultLogConfig
+                        ( \_ _ msg _ -> do
+                            when (msg == "Ranked statement fallback activated") $
+                                modifyIORef' fallbackActivations (+ 1)
+                            when (msg == "Ranked statement fallback skipped") $
+                                modifyIORef' fallbackSkips (+ 1)
+                        )
+                        (pure ())
                 progress (ProgressCandidateAccepted bytes statements) = do
                     calls <- readIORef physicalCalls
                     now <- getMonotonicTimeNSec
@@ -599,7 +1014,7 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         , requestDialect = fixtureDialect
                         , requestOracleConfig = ()
                         , requestPreflightObservation = Just (detailedObservation preflight)
-                        , requestLogger = nullLogger
+                        , requestLogger = telemetryLogger
                         , requestInitialSQL = fixtureInput
                         , requestCheckpoint = dir </> "checkpoint.sql"
                         , requestAction = \report logger pool -> do
@@ -616,6 +1031,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             referenceAccepted <- matches expectedObserver sql
             executions <- readIORef physicalCalls
             curve <- reverse <$> readIORef accepted
+            activations <- readIORef fallbackActivations
+            skips <- readIORef fallbackSkips
             let report =
                     object
                         [ "arm" .= armName arm
@@ -624,6 +1041,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         , "reduced_statements" .= statements
                         , "reference_accepted" .= referenceAccepted
                         , "physical_oracle_executions" .= executions
+                        , "ranked_fallback_activations" .= activations
+                        , "ranked_fallback_skips" .= skips
                         , "best_accepted_curve" .= curve
                         , "evaluation_metrics" .= metrics
                         ]

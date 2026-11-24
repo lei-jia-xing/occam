@@ -62,13 +62,28 @@ import ResultBaseline (
     runReparseBaseline,
     runResultBaseline,
     runSearchBaseline,
+    runStatementBoundedPrefClosureBaseline,
+    runStatementFallbackBaseline,
+    runStatementFallbackNoLocBaseline,
     runStatementInterleaveBaseline,
+    runStatementLanePrefBaseline,
+    runStatementLanePrefQuota2Baseline,
+    runStatementLanePrefQuota8Baseline,
     runStatementOrderBaseline,
+    runStatementProjectedRankBaseline,
+    runStatementProjectionScoreBaseline,
     runStatementRankBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
     runStatementRankedResumeBaseline,
+    runStatementRankedResumeTiesBaseline,
+    runStatementResumeMonoBaseline,
     runStatementWeightBaseline,
+    runStatementWindowCrossVsLaneBaseline,
+    runStatementWindowPrefetchBaseline,
+    runStatementWindowSize16Baseline,
+    runStatementWindowSize4Baseline,
+    runStatementWindowWithinLaneBaseline,
     runStatementYieldBaseline,
     runValuesScheduleBaseline,
     runWorkerBaseline,
@@ -303,6 +318,21 @@ searchModes =
     , ("--statement-rank-ablation", runStatementRankBaseline)
     , ("--statement-interleave-ablation", runStatementInterleaveBaseline)
     , ("--statement-ranked-resume-ablation", runStatementRankedResumeBaseline)
+    , ("--statement-ranked-resume-ties-ablation", runStatementRankedResumeTiesBaseline)
+    , ("--statement-projected-rank-baseline", runStatementProjectedRankBaseline)
+    , ("--statement-projection-score-baseline", runStatementProjectionScoreBaseline)
+    , ("--statement-window-prefetch-baseline", runStatementWindowPrefetchBaseline)
+    , ("--statement-window-within-lane-baseline", runStatementWindowWithinLaneBaseline)
+    , ("--statement-window-cross-vs-lane-baseline", runStatementWindowCrossVsLaneBaseline)
+    , ("--statement-window-size-4-baseline", runStatementWindowSize4Baseline)
+    , ("--statement-window-size-16-baseline", runStatementWindowSize16Baseline)
+    , ("--statement-bounded-pref-closure-baseline", runStatementBoundedPrefClosureBaseline)
+    , ("--statement-resume-mono-baseline", runStatementResumeMonoBaseline)
+    , ("--statement-lane-pref-baseline", runStatementLanePrefBaseline)
+    , ("--statement-lane-pref-quota-2-baseline", runStatementLanePrefQuota2Baseline)
+    , ("--statement-lane-pref-quota-8-baseline", runStatementLanePrefQuota8Baseline)
+    , ("--statement-fallback-baseline", runStatementFallbackBaseline)
+    , ("--statement-fallback-noloc-baseline", runStatementFallbackNoLocBaseline)
     , ("--reparse-baseline", runReparseBaseline)
     , ("--worker-baseline", runWorkerBaseline)
     ]

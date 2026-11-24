@@ -1,6 +1,7 @@
 module ReductionChecks (tests) where
 
 import Control.Exception (IOException, try)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -21,7 +22,7 @@ import Occam.Core (
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (ParserEdit (..), ParserEditCategory (..), StatementUnit (..))
-import Occam.Logger (nullLogger)
+import Occam.Logger (Logger (..), defaultLogConfig, nullLogger)
 import Occam.Oracle (OracleObservation (..))
 import Occam.Parser (
     ParsedSQL (..),
@@ -40,13 +41,19 @@ import Occam.Pool (
  )
 import Occam.Reducer (
     ColumnMode (..),
+    LaneScheduling (..),
+    ProjectionWindow (..),
+    ProjectionWindowOrder (..),
+    RankedScheduleConfig (..),
     ReductionConfig (..),
     ReductionResult (..),
     ReductionStage (..),
+    SingletonResume (..),
     StageEvent (..),
     StatementSearchPolicy (..),
     applyParserEdits,
     closureDdmin,
+    defaultRankedScheduleConfig,
     defaultReductionConfig,
     findInterestingPrefix,
     reduceSQL,
@@ -54,9 +61,11 @@ import Occam.Reducer (
     reduceSQLWithEvidence,
     reduceSQLWithResultSlicing,
     selectIndependentEdits,
+    shouldActivateRankedFallback,
     statementAudit,
     statementDdmin,
     statementDdminWithOrder,
+    statementRanked,
  )
 import System.Exit (ExitCode (..))
 import Test.Tasty (TestTree, testGroup)
@@ -412,8 +421,151 @@ tests =
             let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
                 suffix = "SELECT 70;SELECT 80;"
             pool <- predicatePool (\candidate -> candidate == original || candidate == suffix)
-            reduced <- statementDdminWithOrder StatementRanked SQLite pool original
+            reduced <- statementDdminWithOrder statementRanked SQLite pool original
             assertEqual "the ranked subset lane is still searched" suffix reduced
+        , testCase "Bounded lane preference preserves subset lane opportunities" $ do
+            let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                suffix = "SELECT 70;SELECT 80;"
+                policy =
+                    StatementRankedWith
+                        defaultRankedScheduleConfig
+                            { rankedLaneScheduling = LaneBoundedPreference 4
+                            , rankedSingletonResume = ResumeWeightMonotonic
+                            }
+            pool <- predicatePool (\candidate -> candidate == original || candidate == suffix)
+            reduced <- statementDdminWithOrder policy SQLite pool original
+            assertEqual "bounded lane preference still finds subset-only reductions" suffix reduced
+        , testCase "Weight-monotonic singleton resumption avoids re-testing heavier required statements" $ do
+            let req i = BSC.pack ("SELECT 'required-payload-statement-" ++ show i ++ "';")
+                noise i = BSC.pack ("SELECT " ++ show i ++ ";")
+                stmts = concat [[req i, noise i] | i <- [1 :: Int .. 6]]
+                original = BSC.concat stmts
+                required = [req i | i <- [1 :: Int .. 6]]
+                expected = BSC.concat required
+                accepts candidate = all (`BSC.isInfixOf` candidate) required
+                runPolicy resumeMode = do
+                    calls <- newIORef (0 :: Int)
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' calls (+ 1)
+                        pure (if accepts candidate then OracleAccepted else OracleRejected)
+                    let policy =
+                            StatementRankedWith
+                                defaultRankedScheduleConfig
+                                    { rankedLaneScheduling = LaneBoundedPreference 4
+                                    , rankedSingletonResume = resumeMode
+                                    }
+                    reduced <- statementDdminWithOrder policy SQLite pool original
+                    count <- readIORef calls
+                    pure (reduced, count)
+            (reducedStable, callsStable) <- runPolicy ResumeWeightStableTies
+            (reducedMono, callsMono) <- runPolicy ResumeWeightMonotonic
+            assertEqual "stable ties reaches expected SQL" expected reducedStable
+            assertEqual "weight-monotonic reaches expected SQL" expected reducedMono
+            assertBool
+                ( "weight-monotonic resumption should use fewer probes on short noise (mono="
+                    ++ show callsMono
+                    ++ ", stable="
+                    ++ show callsStable
+                    ++ ")"
+                )
+                (callsMono < callsStable)
+        , testCase "Within-lane projected window preserves complement-before-subset slot order" $ do
+            let original =
+                    BSC.concat
+                        [ "CREATE TABLE a(x INT);"
+                        , "CREATE TABLE b(x INT);"
+                        , "CREATE TABLE c(x INT);"
+                        , "SELECT x FROM a;"
+                        , "SELECT x FROM b;"
+                        , "SELECT x FROM c;"
+                        ]
+                policy =
+                    StatementRankedWith
+                        defaultRankedScheduleConfig
+                            { rankedLaneScheduling = LaneBoundedPreference 4
+                            , rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected
+                            }
+            parsed <- parseSQL (defaultParseOptions SQLite) original
+            case parsed of
+                Left err -> assertFailure ("SQL parser transport error: " ++ show err)
+                Right input -> do
+                    let units = parsedUnits input
+                    testedRef <- newIORef []
+                    pool <- outcomePool $ \candidate -> do
+                        modifyIORef' testedRef (candidate :)
+                        pure (if candidate == original then OracleAccepted else OracleRejected)
+                    let config =
+                            defaultReductionConfig
+                                { reductionDialect = SQLite
+                                , reductionSlicing = False
+                                , reductionUnrestricted = False
+                                , reductionStatementSearch = policy
+                                }
+                    _ <- reduceSQLWithConfig config nullLogger pool original
+                    tested <- drop 1 . reverse <$> readIORef testedRef
+                    assertEqual "expected six statements" 6 (length units)
+                    case tested of
+                        [] -> assertFailure "closure search should probe at least one candidate"
+                        firstProbe : _ ->
+                            -- First probe should be a multi-statement complement, not a tiny 1-statement subset.
+                            assertBool
+                                ("expected complement before tiny subset, got: " ++ BSC.unpack firstProbe)
+                                (BS.length firstProbe > BS.length "CREATE TABLE a(x INT);")
+        , testCase "Ranked fallback activates only when slicing stalls with substantial work" $ do
+            let cfg = defaultRankedScheduleConfig {rankedFallbackMinStatements = 8, rankedFallbackMaxShrinkPct = 10}
+            assertBool
+                "activates on strict stall with >= 8 statements"
+                (shouldActivateRankedFallback cfg True 1000 1000 12)
+            assertBool
+                "activates on <= 10% shrink with >= 8 statements"
+                (shouldActivateRankedFallback cfg True 1000 920 12)
+            assertBool
+                "skips when slicing removed > 10%"
+                (not (shouldActivateRankedFallback cfg True 1000 500 12))
+            assertBool
+                "skips when remaining statements < threshold"
+                (not (shouldActivateRankedFallback cfg True 1000 1000 4))
+            assertBool
+                "skips when slicing is disabled"
+                (not (shouldActivateRankedFallback cfg False 1000 1000 20))
+            let original =
+                    BSC.concat
+                        [ "CREATE TABLE t(x INT);"
+                        , "INSERT INTO t VALUES (1);"
+                        , "INSERT INTO t VALUES (2);"
+                        , "INSERT INTO t VALUES (3);"
+                        , "INSERT INTO t VALUES (4);"
+                        , "INSERT INTO t VALUES (5);"
+                        , "INSERT INTO t VALUES (6);"
+                        , "SELECT sum(x) FROM t;"
+                        ]
+                fallbackPolicy =
+                    StatementRankedFallback
+                        defaultRankedScheduleConfig
+                            { rankedLaneScheduling = LaneBoundedPreference 4
+                            , rankedSingletonResume = ResumeWeightMonotonic
+                            , rankedFallbackMinStatements = 8
+                            , rankedFallbackMaxShrinkPct = 0
+                            }
+                config =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionStatementSearch = fallbackPolicy
+                        }
+            activations <- newIORef (0 :: Int)
+            let captureLogger =
+                    Logger
+                        defaultLogConfig
+                        ( \_ _ msg _ ->
+                            when (msg == "Ranked statement fallback activated") $
+                                modifyIORef' activations (+ 1)
+                        )
+                        (pure ())
+            pool <- predicatePool (== original)
+            reduced <- reduceSQLWithConfig config captureLogger pool original
+            assertEqual "irreducible script stays intact" original reduced
+            actCount <- readIORef activations
+            assertBool "ranked fallback activated after stalled slicing" (actCount >= 1)
         , testCase "Single-statement audit can miss a nonadjacent pair" $ do
             let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
                 original = BSC.concat statements

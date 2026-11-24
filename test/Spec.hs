@@ -548,7 +548,7 @@ phase5Tests =
                     assertEqual "default strategy" (Just (String "full")) (Map.lookup "strategy" defaults)
                     assertEqual
                         "default statement_order"
-                        (Just (String "byte-weighted"))
+                        (Just (String "ranked-fallback"))
                         (Map.lookup "statement_order" defaults)
                     assertEqual "default literal_batches" (Just (Bool False)) (Map.lookup "literal_batches" defaults)
                     assertEqual "default ast_batching" (Just (Bool False)) (Map.lookup "ast_batching" defaults)
@@ -817,6 +817,8 @@ phase5Tests =
                         , ""
                         ]
                 assertEqual "statement-order completion exit code" ExitSuccess ordCompCode
+                assertBool "completion includes ranked-fallback" ("ranked-fallback" `isInfixOf` ordCompOut)
+                assertBool "completion includes ranked" ("ranked" `isInfixOf` ordCompOut)
                 assertBool "completion includes subset-first" ("subset-first" `isInfixOf` ordCompOut)
                 assertBool "completion includes complement-first" ("complement-first" `isInfixOf` ordCompOut)
                 assertBool "completion includes byte-weighted" ("byte-weighted" `isInfixOf` ordCompOut)

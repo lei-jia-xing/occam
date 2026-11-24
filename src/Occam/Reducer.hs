@@ -1,6 +1,18 @@
 -- | SQL test case reduction pipeline combining slicing, ddmin, and intra-statement rewrites.
 module Occam.Reducer (
     ReductionConfig (..),
+    StatementLane (..),
+    LaneOrdering (..),
+    SingletonResume (..),
+    LaneScheduling (..),
+    ProjectionWindowOrder (..),
+    ProjectionWindow (..),
+    RankedScheduleConfig (..),
+    defaultRankedScheduleConfig,
+    convergedRankedScheduleConfig,
+    statementRanked,
+    statementRankedFallback,
+    shouldActivateRankedFallback,
     StatementSearchPolicy (..),
     statementSearchPolicyName,
     ColumnMode (..),
@@ -42,7 +54,7 @@ module Occam.Reducer (
     findInterestingPrefix,
 ) where
 
-import Control.Monad (when)
+import Control.Monad (forM, when)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -52,9 +64,9 @@ import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.List (find, partition, sortOn, transpose)
+import Data.List (find, partition, sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -151,10 +163,14 @@ reductionSearchPolicy config = syntax <> statement
             StatementSubsetFirst -> ""
             StatementComplementFirst -> "+complement-first"
             StatementByteWeighted -> "+complement-first-byte-weighted"
-            StatementRanked -> "+ranked-statements"
-            StatementInterleaved -> "+interleaved-statements"
-            StatementRankedSerial -> "+ranked-lanes"
-            StatementRankedResume -> "+ranked-resume"
+            StatementRankedWith cfg -> "+" <> rankedSchedulePolicyTag cfg
+            StatementRankedFallback cfg ->
+                "+fallback-"
+                    <> rankedSchedulePolicyTag cfg
+                    <> "-m"
+                    <> T.pack (show (rankedFallbackMinStatements cfg))
+                    <> "-s"
+                    <> T.pack (show (rankedFallbackMaxShrinkPct cfg))
 
 literalBatchPolicy :: Bool -> T.Text
 literalBatchPolicy False = ""
@@ -172,24 +188,144 @@ fullReparsePolicy :: Bool -> T.Text
 fullReparsePolicy False = ""
 fullReparsePolicy True = "+full-reparse"
 
+-- | Candidate family lane inside ranked statement scheduling.
+data StatementLane
+    = LaneComplement
+    | LaneSingleton
+    | LaneSubset
+    deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | How candidates are ordered inside each lane before cross-lane merging.
+data LaneOrdering
+    = LaneOrderPartition
+    | LaneOrderEstimatedBytes
+    deriving (Eq, Show)
+
+-- | How single-statement deletion resumes after an accepted singleton shrink.
+data SingletonResume
+    = ResumeNone
+    | ResumeCursorOnly
+    | ResumeWeightStableTies
+    | ResumeWeightMonotonic
+    deriving (Eq, Show)
+
+-- | How the three candidate lanes share probe slots across each pass.
+data LaneScheduling
+    = LaneSerial
+    | LaneRoundRobin
+    | LaneBoundedPreference !Int
+    deriving (Eq, Show)
+
+-- | Candidate ordering within a fixed-size closure-projection lookahead window.
+data ProjectionWindowOrder
+    = WindowOrderPreserve
+    | WindowOrderCrossEstimated
+    | WindowOrderCrossProjected
+    | WindowOrderWithinLaneProjected
+    deriving (Eq, Show)
+
+-- | Optional bounded lookahead window for closure projection before probing.
+data ProjectionWindow
+    = NoProjectionWindow
+    | ProjectionWindow !Int !ProjectionWindowOrder
+    deriving (Eq, Show)
+
+-- | Orthogonal configuration for generalized ranked statement scheduling.
+data RankedScheduleConfig = RankedScheduleConfig
+    { rankedLaneOrdering :: !LaneOrdering
+    , rankedLaneScheduling :: !LaneScheduling
+    , rankedSingletonResume :: !SingletonResume
+    , rankedProjectionWindow :: !ProjectionWindow
+    , rankedFallbackMinStatements :: !Int
+    , rankedFallbackMaxShrinkPct :: !Int
+    }
+    deriving (Eq, Show)
+
+defaultRankedScheduleConfig :: RankedScheduleConfig
+defaultRankedScheduleConfig =
+    RankedScheduleConfig
+        { rankedLaneOrdering = LaneOrderEstimatedBytes
+        , rankedLaneScheduling = LaneRoundRobin
+        , rankedSingletonResume = ResumeNone
+        , rankedProjectionWindow = NoProjectionWindow
+        , rankedFallbackMinStatements = 8
+        , rankedFallbackMaxShrinkPct = 0
+        }
+
+rankedSchedulePolicyTag :: RankedScheduleConfig -> T.Text
+rankedSchedulePolicyTag cfg = base <> resumeTag <> windowTag
+    where
+        base = case (rankedLaneOrdering cfg, rankedLaneScheduling cfg) of
+            (LaneOrderPartition, _) -> "interleaved-statements"
+            (LaneOrderEstimatedBytes, LaneSerial) -> "ranked-lanes"
+            (LaneOrderEstimatedBytes, LaneRoundRobin) -> "ranked-statements"
+            (LaneOrderEstimatedBytes, LaneBoundedPreference q) ->
+                "ranked-pref-" <> T.pack (show q)
+        resumeTag = case rankedSingletonResume cfg of
+            ResumeNone -> ""
+            ResumeCursorOnly -> "-resume"
+            ResumeWeightStableTies -> "-resume-ties"
+            ResumeWeightMonotonic -> "-resume-mono"
+        windowTag = case rankedProjectionWindow cfg of
+            NoProjectionWindow -> ""
+            ProjectionWindow w order ->
+                "-win"
+                    <> T.pack (show w)
+                    <> case order of
+                        WindowOrderPreserve -> "-preserve"
+                        WindowOrderCrossEstimated -> "-est"
+                        WindowOrderCrossProjected -> "-proj"
+                        WindowOrderWithinLaneProjected -> "-lane-proj"
+
+-- | Decide whether post-slicing fallback should switch from byte-weighted ddmin to ranked search.
+shouldActivateRankedFallback :: RankedScheduleConfig -> Bool -> Int -> Int -> Int -> Bool
+shouldActivateRankedFallback cfg slicingEnabled initialBytes slicedBytes remainingStmts =
+    slicingEnabled
+        && remainingStmts >= max 1 (rankedFallbackMinStatements cfg)
+        && initialBytes > 0
+        && removedBytes * 100 <= initialBytes * max 0 (rankedFallbackMaxShrinkPct cfg)
+    where
+        removedBytes = max 0 (initialBytes - slicedBytes)
+
 data StatementSearchPolicy
     = StatementSubsetFirst
     | StatementComplementFirst
     | StatementByteWeighted
-    | StatementRanked
-    | StatementInterleaved
-    | StatementRankedSerial
-    | StatementRankedResume
+    | StatementRankedWith !RankedScheduleConfig
+    | StatementRankedFallback !RankedScheduleConfig
     deriving (Eq, Show)
+
+convergedRankedScheduleConfig :: RankedScheduleConfig
+convergedRankedScheduleConfig =
+    defaultRankedScheduleConfig
+        { rankedLaneScheduling = LaneBoundedPreference 4
+        , rankedSingletonResume = ResumeWeightMonotonic
+        , rankedFallbackMinStatements = 8
+        , rankedFallbackMaxShrinkPct = 10
+        }
+
+statementRanked :: StatementSearchPolicy
+statementRanked = StatementRankedWith defaultRankedScheduleConfig
+
+statementRankedFallback :: StatementSearchPolicy
+statementRankedFallback = StatementRankedFallback convergedRankedScheduleConfig
 
 statementSearchPolicyName :: StatementSearchPolicy -> T.Text
 statementSearchPolicyName StatementSubsetFirst = "subset-first"
 statementSearchPolicyName StatementComplementFirst = "complement-first"
 statementSearchPolicyName StatementByteWeighted = "byte-weighted"
-statementSearchPolicyName StatementRanked = "ranked"
-statementSearchPolicyName StatementInterleaved = "interleaved"
-statementSearchPolicyName StatementRankedSerial = "ranked-lanes"
-statementSearchPolicyName StatementRankedResume = "ranked-resume"
+statementSearchPolicyName (StatementRankedWith cfg)
+    | cfg == convergedRankedScheduleConfig = "ranked"
+    | otherwise = rankedSchedulePolicyTag cfg
+statementSearchPolicyName (StatementRankedFallback cfg)
+    | cfg == convergedRankedScheduleConfig = "ranked-fallback"
+    | otherwise =
+        "fallback-"
+            <> rankedSchedulePolicyTag cfg
+            <> "-m"
+            <> T.pack (show (rankedFallbackMinStatements cfg))
+            <> "-s"
+            <> T.pack (show (rankedFallbackMaxShrinkPct cfg))
 
 -- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
@@ -213,7 +349,7 @@ defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
         , reductionClosure = True
-        , reductionStatementSearch = StatementByteWeighted
+        , reductionStatementSearch = statementRankedFallback
         , reductionIntraStatement = False
         , reductionLiteralBatches = False
         , reductionAstBatching = False
@@ -535,6 +671,7 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
             pure (if contained then Just closedInts else Nothing)
     result <-
         searchStatements
+            True
             policy
             buildCandidate
             pool
@@ -583,6 +720,7 @@ newtype Feedback = Feedback
 newFeedback :: IO Feedback
 newFeedback = Feedback <$> newIORef HashMap.empty
 searchStatements ::
+    Bool ->
     StatementSearchPolicy ->
     CandidateBuilder ->
     OraclePool ->
@@ -590,9 +728,10 @@ searchStatements ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatements policy buildCandidate pool baseSQL allStatements initialStatements = do
+searchStatements closureAware policy buildCandidate pool baseSQL allStatements initialStatements = do
     feedback <- newFeedback
     searchDDMin
+        closureAware
         policy
         feedback
         buildCandidate
@@ -611,7 +750,62 @@ data SeedToken
     = SeedAccepted ![Statement] !Int
     | SeedFresh ![Statement] !ByteString
 
+-- | Per-pass adaptive scheduling state carried across accepted reductions.
+data LaneState = LaneState
+    { lsLastAcceptedLane :: !(Maybe StatementLane)
+    , lsLaneStreak :: !Int
+    , lsResumeAnchor :: !(Maybe (StatementId, Int))
+    }
+
+emptyLaneState :: LaneState
+emptyLaneState = LaneState Nothing 0 Nothing
+
+data WindowCandidate = WindowCandidate
+    { wcLane :: !StatementLane
+    , wcTag :: !FamilyTag
+    , wcEstimatedSaved :: !Int
+    , wcProjectedSaved :: !Int
+    , wcToken :: !SeedToken
+    }
+
+dedupIntSets :: [IntSet.IntSet] -> [IntSet.IntSet]
+dedupIntSets = go HashSet.empty
+    where
+        go _ [] = []
+        go seen (s : rest)
+            | HashSet.member s seen = go seen rest
+            | otherwise = s : go (HashSet.insert s seen) rest
+
+mergeWeightedLanes :: [(Int, [a])] -> [a]
+mergeWeightedLanes = go False []
+    where
+        go _ [] [] = []
+        go progressed acc []
+            | progressed = go False [] (reverse acc)
+            | otherwise = []
+        go progressed acc ((q, xs) : rest) = case splitAt (max 1 q) xs of
+            ([], _) -> go progressed acc rest
+            (taken, remaining) -> taken ++ go True ((q, remaining) : acc) rest
+
+orderWindowCandidates :: ProjectionWindowOrder -> [WindowCandidate] -> [WindowCandidate]
+orderWindowCandidates WindowOrderPreserve items = items
+orderWindowCandidates WindowOrderCrossEstimated items = sortOn (Down . wcEstimatedSaved) items
+orderWindowCandidates WindowOrderCrossProjected items = sortOn (Down . wcProjectedSaved) items
+orderWindowCandidates WindowOrderWithinLaneProjected items =
+    refill (map wcLane items) sortedC sortedD sortedS
+    where
+        sortedFor lane = sortOn (Down . wcProjectedSaved) [c | c <- items, wcLane c == lane]
+        sortedC = sortedFor LaneComplement
+        sortedD = sortedFor LaneSingleton
+        sortedS = sortedFor LaneSubset
+        refill [] _ _ _ = []
+        refill (LaneComplement : rest) (c : cs) ds ss = c : refill rest cs ds ss
+        refill (LaneSingleton : rest) cs (d : ds) ss = d : refill rest cs ds ss
+        refill (LaneSubset : rest) cs ds (s : ss) = s : refill rest cs ds ss
+        refill (_ : rest) cs ds ss = refill rest cs ds ss
+
 searchDDMin ::
+    Bool ->
     StatementSearchPolicy ->
     Feedback ->
     CandidateBuilder ->
@@ -620,31 +814,34 @@ searchDDMin ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
+searchDDMin closureAware policy feedback buildCandidate pool baseSQL allStatements initial =
     go
         2
-        Nothing
+        emptyLaneState
         (BS.length (cutRemovedStatementInts baseSQL allStatements (statementIdsInt initial)))
         initial
     where
         jobs = poolJobCount pool
+        effectivePolicy = case policy of
+            StatementRankedFallback _ -> StatementByteWeighted
+            other -> other
         go _ _ _ [] = pure []
-        go granularity resumeAfter currentLen current = do
+        go granularity laneState currentLen current = do
             let n = min (length current) (max 1 granularity)
                 currentInts = statementIdsInt current
-                chunks count = case policy of
+                currentWeights =
+                    IntMap.fromList
+                        [(unStatementId (stmtId stmt), statementSpanBytes stmt) | stmt <- current]
+                chunks count = case effectivePolicy of
                     StatementByteWeighted -> partitionStatementsByBytes count current
-                    StatementRanked -> partitionStatementsByBytes count current
-                    StatementInterleaved -> partitionStatementsByBytes count current
-                    StatementRankedSerial -> partitionStatementsByBytes count current
-                    StatementRankedResume -> partitionStatementsByBytes count current
+                    StatementRankedWith _ -> partitionStatementsByBytes count current
                     _ -> partitionChunks count current
                 lanes count =
                     let groups = chunks count
-                        resume = policy == StatementByteWeighted
+                        resume = effectivePolicy == StatementByteWeighted
                         orderedGroups
                             | resume
-                            , Just anchor <- resumeAfter =
+                            , Just (anchor, _) <- lsResumeAnchor laneState =
                                 -- Keep every candidate in the pass, wrapping back to earlier groups.
                                 let (before, after) = span (all ((<= anchor) . stmtId)) groups
                                  in after ++ before
@@ -653,80 +850,219 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                         , (max 2 (count - 1), resume, tryComplements current currentInts currentLen orderedGroups)
                         )
                 counts = granularities (length current) n
-                schedule = case policy of
-                    StatementRanked -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
-                    StatementInterleaved -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
-                    StatementRankedSerial -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
-                    StatementRankedResume -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
-                    StatementSubsetFirst -> concatMap (\count -> let (subset, complement) = lanes count in [subset, complement]) counts
-                    _ -> concatMap (\count -> let (subset, complement) = lanes count in [complement, subset]) counts
-            trySchedule current currentLen schedule
+                schedule = case effectivePolicy of
+                    StatementRankedWith cfg ->
+                        rankedSchedule cfg laneState current currentInts currentWeights currentLen (map chunks counts)
+                    StatementSubsetFirst ->
+                        concatMap (\count -> let (subset, complement) = lanes count in [subset, complement]) counts
+                    _ ->
+                        concatMap (\count -> let (subset, complement) = lanes count in [complement, subset]) counts
+            trySchedule laneState current currentWeights currentLen schedule
 
-        -- Compare saved-byte estimates across granularities. Round-robin
-        -- the three ranked lanes so tiny subsets cannot starve other edits.
-        rankedSchedule resumeAfter current currentInts currentLen partitions =
-            [ (2, policy == StatementRankedResume, trySeeds tag current currentInts currentLen [seed])
-            | (tag, seed) <- scheduled
-            ]
+        -- Unified ranked scheduler: orthogonal lane ordering, lane quota
+        -- scheduling, singleton resumption, and optional bounded projection window.
+        rankedSchedule cfg laneState current currentInts weights currentLen partitions =
+            case (closureAware, rankedProjectionWindow cfg) of
+                (True, ProjectionWindow w order) ->
+                    [(2, resumes, tryProjectedWindow w order retainedBytes current currentInts currentLen scheduled)]
+                _ ->
+                    [(2, resumes, tryScheduledStream current currentInts currentLen scheduled)]
             where
-                weights =
-                    IntMap.fromList
-                        [(unStatementId (stmtId stmt), statementSpanBytes stmt) | stmt <- current]
-                retainedBytes = IntSet.foldl' (\total sid -> total + IntMap.findWithDefault 0 sid weights) 0
-                rank tag seeds =
-                    [(tag, seed) | seed <- if policy == StatementInterleaved then seeds else sortOn retainedBytes seeds]
-                queues = [complements, subsets, singletons]
-                scheduled
-                    | policy == StatementRankedSerial = concat queues
-                    | Just anchor <- resumeAfter
-                    , policy == StatementRankedResume =
-                        concat (transpose [resumeSingletons anchor, complements, subsets])
-                    | otherwise = concat (transpose queues)
+                resumes = rankedSingletonResume cfg /= ResumeNone
+                weightOf sid = IntMap.findWithDefault 0 sid weights
+                retainedBytes = IntSet.foldl' (\total sid -> total + weightOf sid) 0
+                rankLane lane tag seeds =
+                    let nonTrivial =
+                            dedupIntSets
+                                [seed | seed <- seeds, not (IntSet.null seed), seed /= currentInts]
+                        ordered = case rankedLaneOrdering cfg of
+                            LaneOrderPartition -> nonTrivial
+                            LaneOrderEstimatedBytes -> sortOn retainedBytes nonTrivial
+                     in [(lane, tag, seed) | seed <- ordered]
                 groups = map statementIdsInt (concat partitions)
                 complements =
-                    rank
+                    rankLane
+                        LaneComplement
                         TagStatementComplement
                         [currentInts `IntSet.difference` group | group <- groups, IntSet.size group > 1]
-                subsets = rank TagStatementSubset groups
+                -- Keep smallest subsets first: small subset byte strings remain
+                -- invariant across deletions and hit exact-byte memoization.
+                subsets = rankLane LaneSubset TagStatementSubset groups
+                orderedSids = IntSet.toList currentInts
+                singletonIds = case (rankedSingletonResume cfg, lsResumeAnchor laneState) of
+                    (ResumeCursorOnly, Just (StatementId anchorId, _)) ->
+                        let (before, after) = span (<= anchorId) orderedSids
+                         in after ++ before
+                    (ResumeWeightStableTies, Just (StatementId anchorId, _)) ->
+                        let (before, after) = span (<= anchorId) orderedSids
+                         in sortOn (Down . weightOf) (after ++ before)
+                    (ResumeWeightMonotonic, Just (StatementId anchorId, anchorWeight)) ->
+                        let sorted = sortOn (\sid -> (Down (weightOf sid), sid)) orderedSids
+                            (before, after) =
+                                span (\sid -> (Down (weightOf sid), sid) <= (Down anchorWeight, anchorId)) sorted
+                         in after ++ before
+                    _ -> case rankedLaneOrdering cfg of
+                        LaneOrderPartition -> orderedSids
+                        LaneOrderEstimatedBytes -> sortOn (Down . weightOf) orderedSids
                 singletons =
-                    rank
-                        TagStatementComplement
-                        [IntSet.delete sid currentInts | sid <- IntSet.toList currentInts]
-                resumeSingletons anchor =
-                    [(TagStatementComplement, IntSet.delete sid currentInts) | sid <- after ++ before]
+                    [ (LaneSingleton, TagStatementComplement, IntSet.delete sid currentInts)
+                    | sid <- singletonIds
+                    ]
+                laneQueue LaneComplement = complements
+                laneQueue LaneSingleton = singletons
+                laneQueue LaneSubset = subsets
+                scheduled = case rankedLaneScheduling cfg of
+                    LaneSerial -> complements ++ subsets ++ singletons
+                    LaneRoundRobin
+                        | resumes
+                        , Just _ <- lsResumeAnchor laneState ->
+                            mergeWeightedLanes [(1, singletons), (1, complements), (1, subsets)]
+                        | otherwise ->
+                            mergeWeightedLanes [(1, complements), (1, subsets), (1, singletons)]
+                    LaneBoundedPreference rawQuota ->
+                        let maxQuota = max 1 rawQuota
+                            baseOrder = [LaneComplement, LaneSingleton, LaneSubset]
+                         in case lsLastAcceptedLane laneState of
+                                Nothing ->
+                                    -- Test both halves of the initial 2-way split before singletons/subsets,
+                                    -- then interleave all three lanes fairly.
+                                    let (headC, restC) = splitAt (min 2 maxQuota) complements
+                                     in headC ++ mergeWeightedLanes [(1, singletons), (1, subsets), (1, restC)]
+                                Just LaneSingleton ->
+                                    -- Weight-monotonic resumption probes the next singleton first; on a miss,
+                                    -- yield immediately to multi-statement complements and subsets.
+                                    mergeWeightedLanes [(1, singletons), (1, complements), (1, subsets)]
+                                Just winLane ->
+                                    -- Coarse winning lanes (Complement / Subset) keep bounded cyclic preference
+                                    -- while preserving guaranteed slots for the other two lanes.
+                                    let winQuota = min maxQuota (1 + lsLaneStreak laneState)
+                                        others = [(1, laneQueue l) | l <- baseOrder, l /= winLane]
+                                     in mergeWeightedLanes ((winQuota, laneQueue winLane) : others)
+
+        -- Unwindowed ranked stream supporting ordered concurrency (`jobs >= 1`).
+        tryScheduledStream current currentInts currentLen = pull
+            where
+                pull [] = pure Nothing
+                pull seeds = collect jobs [] HashSet.empty seeds
+                collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
+                collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
+                collect n acc seen ((lane, tag, seedInts) : rest) = do
+                    token <- classifySeed Nothing tag current currentInts currentLen seedInts
+                    case token of
+                        Nothing -> collect n acc seen rest
+                        Just (SeedAccepted kept saved) ->
+                            testAndContinue (reverse acc) rest (Just (lane, tag, kept, saved))
+                        Just (SeedFresh kept sql)
+                            | HashSet.member sql seen -> collect n acc seen rest
+                            | otherwise ->
+                                collect (n - 1) ((lane, tag, kept, sql) : acc) (HashSet.insert sql seen) rest
+                testAndContinue batch rest barrier = do
+                    accepted <- testMixedBatch currentLen batch
+                    case accepted of
+                        Just result -> pure (Just result)
+                        Nothing -> case barrier of
+                            Just (lane, tag, kept, saved) -> do
+                                recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
+                                pure (Just (lane, kept, saved))
+                            Nothing -> pull rest
+
+        -- Bound speculative projection and rendering to a fixed window of W seeds.
+        -- Deduplicates projected IntSets before rendering and isolates window ordering.
+        tryProjectedWindow rawSize order retainedBytes current currentInts currentLen = search
+            where
+                wSize = max 1 rawSize
+                search [] = pure Nothing
+                search seeds = do
+                    let (window, remaining) = splitAt wSize seeds
+                    seenProjected <- newIORef HashSet.empty
+                    classified <- forM window $ \(lane, tag, seed) -> do
+                        token <- classifySeed (Just seenProjected) tag current currentInts currentLen seed
+                        pure $
+                            fmap
+                                ( \cand ->
+                                    WindowCandidate
+                                        { wcLane = lane
+                                        , wcTag = tag
+                                        , wcEstimatedSaved = currentLen - retainedBytes seed
+                                        , wcProjectedSaved = savedBytes cand
+                                        , wcToken = cand
+                                        }
+                                )
+                                token
+                    let ordered = orderWindowCandidates order (catMaybes classified)
+                    runWindow remaining ordered
+                savedBytes (SeedAccepted _ saved) = saved
+                savedBytes (SeedFresh _ sql) = currentLen - BS.length sql
+                runWindow remaining [] = search remaining
+                runWindow remaining items = collectWindow jobs [] HashSet.empty items
                     where
-                        (before, after) = span (<= unStatementId anchor) (IntSet.toList currentInts)
+                        collectWindow _ acc _ [] = testWindow (reverse acc) [] Nothing
+                        collectWindow 0 acc _ rest = testWindow (reverse acc) rest Nothing
+                        collectWindow n acc seen (cand : rest) = case wcToken cand of
+                            SeedAccepted kept saved ->
+                                testWindow (reverse acc) rest (Just (wcLane cand, wcTag cand, kept, saved))
+                            SeedFresh kept sql -> do
+                                tested <- readIORef (fbEvaluated feedback)
+                                if HashMap.member sql tested || HashSet.member sql seen
+                                    then do
+                                        recordGeneratedSkipped (poolMetricsStore pool) "projected-window-duplicate"
+                                        collectWindow n acc seen rest
+                                    else
+                                        collectWindow
+                                            (n - 1)
+                                            ((wcLane cand, wcTag cand, kept, sql) : acc)
+                                            (HashSet.insert sql seen)
+                                            rest
+                        testWindow batch rest barrier = do
+                            accepted <- testMixedBatch currentLen batch
+                            case accepted of
+                                Just result -> pure (Just result)
+                                Nothing -> case barrier of
+                                    Just (lane, tag, kept, saved) -> do
+                                        recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
+                                        pure (Just (lane, kept, saved))
+                                    Nothing -> runWindow remaining rest
 
         granularities limit n
             | n < limit = n : granularities limit (min limit (2 * n))
             | otherwise = [n]
 
-        trySchedule current _ [] = pure current
-        trySchedule current currentLen ((next, resume, search) : rest) = do
+        trySchedule _ current _ _ [] = pure current
+        trySchedule laneState current currentWeights currentLen ((next, resume, search) : rest) = do
             reduced <- search
             case reduced of
-                Just (accepted, saved) ->
-                    let anchor
+                Just (acceptedLane, accepted, saved) ->
+                    let removedInts = statementIdsInt current `IntSet.difference` statementIdsInt accepted
+                        anchor
                             | resume
-                            , Just (removed, remaining) <-
-                                IntSet.minView (statementIdsInt current `IntSet.difference` statementIdsInt accepted)
+                            , Just (removedId, remaining) <- IntSet.minView removedInts
                             , IntSet.null remaining =
-                                Just (StatementId removed)
+                                Just (StatementId removedId, IntMap.findWithDefault 0 removedId currentWeights)
                             | otherwise = Nothing
-                     in go next anchor (currentLen - saved) accepted
-                Nothing -> trySchedule current currentLen rest
+                        nextStreak
+                            | lsLastAcceptedLane laneState == Just acceptedLane = lsLaneStreak laneState + 1
+                            | otherwise = 1
+                        nextState =
+                            LaneState
+                                { lsLastAcceptedLane = Just acceptedLane
+                                , lsLaneStreak = nextStreak
+                                , lsResumeAnchor = anchor
+                                }
+                     in go next nextState (currentLen - saved) accepted
+                Nothing -> trySchedule laneState current currentWeights currentLen rest
 
         trySubsets current currentInts currentLen chunks =
-            trySeeds TagStatementSubset current currentInts currentLen (map statementIdsInt chunks)
+            trySeeds LaneSubset TagStatementSubset current currentInts currentLen (map statementIdsInt chunks)
         tryComplements current currentInts currentLen chunks =
             trySeeds
+                LaneComplement
                 TagStatementComplement
                 current
                 currentInts
                 currentLen
                 [currentInts `IntSet.difference` statementIdsInt chunk | chunk <- chunks]
 
-        trySeeds tag current currentInts currentLen = pull
+        trySeeds lane tag current currentInts currentLen = pull
             where
                 -- Pull and test eligible candidate windows incrementally.
                 pull [] = pure Nothing
@@ -734,41 +1070,41 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                 collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
                 collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
                 collect n acc seen (seedInts : rest) = do
-                    token <- classifySeed tag current currentInts currentLen seedInts
+                    token <- classifySeed Nothing tag current currentInts currentLen seedInts
                     case token of
                         Nothing -> collect (n - 1) acc seen rest
                         Just (SeedAccepted kept saved) -> testAndContinue (reverse acc) rest (Just (kept, saved))
                         Just (SeedFresh kept sql)
                             | HashSet.member sql seen -> collect (n - 1) acc seen rest
-                            | otherwise -> collect (n - 1) ((kept, sql) : acc) (HashSet.insert sql seen) rest
+                            | otherwise -> collect (n - 1) ((lane, tag, kept, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
-                    accepted <- testBatch tag currentLen batch
+                    accepted <- testMixedBatch currentLen batch
                     case accepted of
                         Just result -> pure (Just result)
                         Nothing -> case barrier of
                             Just (kept, saved) -> do
                                 recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
-                                pure (Just (kept, saved))
+                                pure (Just (lane, kept, saved))
                             Nothing -> pull rest
 
-        testBatch _ _ [] = pure Nothing
-        testBatch tag currentLen batch = do
-            mapM_ (\(kept, sql) -> reportCandidateCount pool sql (length kept)) batch
-            outcomes <- testOrderedTagged pool [(tag, sql) | (_, sql) <- batch]
+        testMixedBatch _ [] = pure Nothing
+        testMixedBatch currentLen batch = do
+            mapM_ (\(_, _, kept, sql) -> reportCandidateCount pool sql (length kept)) batch
+            outcomes <- testOrderedTagged pool [(tag, sql) | (_, tag, _, sql) <- batch]
             let retired = zip batch outcomes
             mapM_ recordRetired retired
             case listToMaybe [candidate | (candidate, (outcome, _)) <- retired, outcome == OracleAccepted] of
-                Just (kept, sql) -> do
+                Just (lane, tag, kept, sql) -> do
                     let saved = currentLen - BS.length sql
                     recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
-                    pure (Just (kept, saved))
+                    pure (Just (lane, kept, saved))
                 Nothing -> pure Nothing
 
-        recordRetired ((_, sql), (outcome, _)) =
+        recordRetired ((_, _, _, sql), (outcome, _)) =
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
              in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
-        classifySeed tag current currentInts currentLen seedInts
+        classifySeed maybeSeen tag current currentInts currentLen seedInts
             | seedInts == currentInts = pure Nothing
             | otherwise = do
                 projection <- buildCandidate currentInts seedInts
@@ -779,28 +1115,46 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                             recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
                             pure Nothing
                     Just projected -> do
-                        let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
-                        candidateSQL <-
-                            timeTaggedStatementBuild
-                                (poolMetricsStore pool)
-                                tag
-                                (cutRemovedStatementInts baseSQL allStatements projected)
-                        let saved = currentLen - BS.length candidateSQL
-                        if saved <= 0
+                        dupInWindow <- case maybeSeen of
+                            Nothing -> pure False
+                            Just seenRef -> do
+                                seen <- readIORef seenRef
+                                if HashSet.member projected seen
+                                    then pure True
+                                    else do
+                                        writeIORef seenRef (HashSet.insert projected seen)
+                                        pure False
+                        if dupInWindow
                             then do
+                                recordGeneratedSkipped (poolMetricsStore pool) "projected-window-duplicate"
                                 when (projected /= seedInts) $
-                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
                                 pure Nothing
                             else do
-                                evaluated <- readIORef (fbEvaluated feedback)
-                                case HashMap.lookup candidateSQL evaluated of
-                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
-                                    Just CandidateRejected -> do
-                                        recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
+                                candidateSQL <-
+                                    timeTaggedStatementBuild
+                                        (poolMetricsStore pool)
+                                        tag
+                                        (cutRemovedStatementInts baseSQL allStatements projected)
+                                let saved = currentLen - BS.length candidateSQL
+                                if saved <= 0
+                                    then do
                                         when (projected /= seedInts) $
-                                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
+                                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
                                         pure Nothing
-                                    Nothing -> pure (Just (SeedFresh kept candidateSQL))
+                                    else do
+                                        evaluated <- readIORef (fbEvaluated feedback)
+                                        case HashMap.lookup candidateSQL evaluated of
+                                            Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
+                                            Just CandidateRejected -> do
+                                                recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                                                when (projected /= seedInts) $
+                                                    recordGeneratedSkipped
+                                                        (poolMetricsStore pool)
+                                                        "closure-projection-duplicate"
+                                                pure Nothing
+                                            Nothing -> pure (Just (SeedFresh kept candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
@@ -821,7 +1175,7 @@ statementDdminWithParser policy parse pool initialSQL = do
             (_, units) <- parse initialSQL
             let allStatements = map unitStatement units
             reduced <-
-                searchStatements policy plainCandidate pool initialSQL allStatements allStatements
+                searchStatements False policy plainCandidate pool initialSQL allStatements allStatements
             pure (statementSQL initialSQL allStatements reduced)
 
 -- | Repeated single-statement deletion until reaching a 1-minimal fixed point.
@@ -1295,8 +1649,37 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
             reductionClosure config
                 && reductionUnrestricted config
                 && maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
+    effectiveStatementPolicy <- case reductionStatementSearch config of
+        StatementRankedFallback rankedCfg -> do
+            remainingStmts <- case searchAnalysis of
+                Just analysis -> pure (length (analyzedStatements analysis))
+                Nothing -> length . snd <$> parse sliced
+            let alreadyConfirmed = maybe False ((== sliced) . evidenceBytes) priorEvidence
+                activated =
+                    not alreadyConfirmed
+                        && shouldActivateRankedFallback
+                            rankedCfg
+                            (reductionSlicing config)
+                            (BS.length initialSQL)
+                            (BS.length sliced)
+                            remainingStmts
+                hasGlobalBarrier = maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
+            logInfo'
+                logger
+                "reducer"
+                (if activated then "Ranked statement fallback activated" else "Ranked statement fallback skipped")
+                [ ("activated", toJSON activated)
+                , ("already_confirmed", toJSON alreadyConfirmed)
+                , ("slicing_enabled", toJSON (reductionSlicing config))
+                , ("global_barrier", toJSON hasGlobalBarrier)
+                , ("bytes_before", toJSON (BS.length initialSQL))
+                , ("bytes_after", toJSON (BS.length sliced))
+                , ("statements_after", toJSON remainingStmts)
+                ]
+            pure (if activated then StatementRankedWith rankedCfg else StatementByteWeighted)
+        other -> pure other
     searchInput <-
-        if useEarlyUnrestricted then unrestrictedSearch sliced else pure sliced
+        if useEarlyUnrestricted then unrestrictedSearch effectiveStatementPolicy sliced else pure sliced
     (searched, ()) <-
         if reductionClosure config
             then timedReductionStage reporter logger StageClosureSearch searchInput do
@@ -1304,25 +1687,25 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
                     case searchAnalysis of
                         Just cached | searchInput == sliced -> pure cached
                         _ -> analyze searchInput
-                out <- closureSearchWithAnalysis (reductionStatementSearch config) logger pool searchInput analysis
+                out <- closureSearchWithAnalysis effectiveStatementPolicy logger pool searchInput analysis
                 pure (out, ())
             else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
                 out <-
-                    statementDdminWithParser (reductionStatementSearch config) parse pool searchInput
+                    statementDdminWithParser effectiveStatementPolicy parse pool searchInput
                 pure (out, ())
     fallback <-
         if reductionClosure config
             && reductionUnrestricted config
             && (not useEarlyUnrestricted || searched /= searchInput)
-            then unrestrictedSearch searched
+            then unrestrictedSearch effectiveStatementPolicy searched
             else pure searched
     interleaveStages fallback
     where
         analyze = analyzeSQL parse logger (reductionDialect config)
 
-        unrestrictedSearch sql =
+        unrestrictedSearch statementPolicy sql =
             fst <$> timedReductionStage reporter logger StageUnrestrictedFallback sql do
-                out <- statementDdminWithParser (reductionStatementSearch config) parse pool sql
+                out <- statementDdminWithParser statementPolicy parse pool sql
                 pure (out, ())
 
         interleaveStages base
