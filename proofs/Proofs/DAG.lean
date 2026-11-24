@@ -318,3 +318,39 @@ theorem closeSet_reachability (G : DAG) {u : StmtId} {roots : List StmtId} (hroo
     rw [closeSet, List.mem_eraseDups]
     apply List.mem_flatMap.2
     exact ⟨r, hr_roots, hu_slice⟩
+
+/-- To close a retained set, it suffices to close its missing direct predecessors.
+    A reverse-edge index can find this boundary by scanning the deleted vertices
+    instead of visiting every retained vertex. -/
+theorem closeSet_via_boundary (G : DAG) (kept boundary : List StmtId)
+    (hkept : kept ⊆ G.stmts)
+    (hboundary : ∀ u, u ∈ boundary ↔ u ∉ kept ∧ ∃ v ∈ kept, u ∈ G.deps v)
+    (x : StmtId) :
+    x ∈ closeSet G kept ↔ x ∈ kept ∨ x ∈ closeSet G boundary := by
+  have hboundaryStmts : boundary ⊆ G.stmts := by
+    intro u hu
+    obtain ⟨_, v, hv, hdep⟩ := (hboundary u).1 hu
+    exact (G.deps_temporal v (hkept hv) u hdep).2
+  have hclosed := closeSet_isValidClosure G kept hkept
+  have hboundaryInClosure : boundary ⊆ closeSet G kept := by
+    intro u hu
+    obtain ⟨_, v, hv, hdep⟩ := (hboundary u).1 hu
+    exact hclosed v (roots_subset_closeSet G kept hv) u hdep
+  constructor
+  · intro hx
+    have hsubset : kept ⊆ kept ++ closeSet G boundary := by
+      intro v hv
+      exact List.mem_append.2 (Or.inl hv)
+    have hclosedUnion : isValidClosure G (kept ++ closeSet G boundary) := by
+      intro v hv u hdep
+      rcases List.mem_append.1 hv with hv | hv
+      · by_cases hu : u ∈ kept
+        · exact hsubset hu
+        · exact List.mem_append.2 (Or.inr
+            (roots_subset_closeSet G boundary ((hboundary u).2 ⟨hu, v, hv, hdep⟩)))
+      · exact List.mem_append.2 (Or.inr
+          (closeSet_isValidClosure G boundary hboundaryStmts v hv u hdep))
+    exact List.mem_append.1 (closeSet_minimal G kept _ hsubset hclosedUnion hx)
+  · rintro (hx | hx)
+    · exact roots_subset_closeSet G kept hx
+    · exact closeSet_minimal G boundary _ hboundaryInClosure hclosed hx
