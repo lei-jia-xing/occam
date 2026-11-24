@@ -4,6 +4,7 @@ module Occam.Parser.Native (
     NativeUnit (..),
     NativeFacts (..),
     c_parseSQL,
+    c_parseSQLFlags,
     c_freeSQL,
     nativeError,
     countStatementsRaw,
@@ -75,6 +76,9 @@ instance FromJSON NativeFacts where
 
 foreign import ccall safe "occam_sql_parse"
     c_parseSQL :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt
+
+foreign import ccall safe "occam_sql_parse_flags"
+    c_parseSQLFlags :: CUInt -> CUInt -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt
 
 foreign import ccall unsafe "occam_sql_parse_error"
     c_parseError :: CInt -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt

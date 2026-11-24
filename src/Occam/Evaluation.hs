@@ -280,6 +280,7 @@ instance FromJSON EvaluationMetrics where
 
 data EvaluationResult = EvaluationResult
     { evaluatedSQL :: !ByteString
+    , evaluatedStatements :: !(Maybe Int)
     , evaluationMetrics :: !EvaluationMetrics
     }
     deriving (Eq, Show)
@@ -605,11 +606,20 @@ runEvaluationRequestWithObserver timeoutMicros observe EvaluationRequest {..} = 
                 , evaluationStages = stages
                 , evaluationCostAttribution = costAttribution
                 }
-    pure EvaluationResult {evaluatedSQL = finalSQL, evaluationMetrics = metrics}
+    pure
+        EvaluationResult
+            { evaluatedSQL = finalSQL
+            , evaluatedStatements =
+                if finalSQL == evalAccepted st
+                    then evalAcceptedStatements st
+                    else Nothing
+            , evaluationMetrics = metrics
+            }
 
 -- | Mutable reduction state shared across all execution phases.
 data EvalState = EvalState
     { evalAccepted :: !ByteString
+    , evalAcceptedStatements :: !(Maybe Int)
     , evalDatabase :: !Int
     , evalCompleted :: !Int
     , evalAcceptedCount :: !Int
@@ -645,6 +655,7 @@ initialEvalState :: ByteString -> Map ByteString Int -> EvalState
 initialEvalState initialSQL seedCounts =
     EvalState
         { evalAccepted = initialSQL
+        , evalAcceptedStatements = Map.lookup initialSQL seedCounts
         , evalDatabase = 0
         , evalCompleted = 0
         , evalAcceptedCount = 0
@@ -935,7 +946,7 @@ retireCandidate onProgress reductionStart checkpoint state callIndex candidate o
             else pure Nothing
     onProgress (ProgressCandidateTested (callIndex + 1) hit accepted)
     when accepted $ do
-        smaller <- checkpointIfSmaller state checkpoint candidate
+        smaller <- checkpointIfSmaller state checkpoint candidate statements
         when smaller $
             onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
     now <- ticks
@@ -971,12 +982,12 @@ stageSummary stage elapsed before after =
         , "bytes_after" .= after
         ]
 
-checkpointIfSmaller :: IORef EvalState -> FilePath -> ByteString -> IO Bool
-checkpointIfSmaller state path candidate = do
+checkpointIfSmaller :: IORef EvalState -> FilePath -> ByteString -> Maybe Int -> IO Bool
+checkpointIfSmaller state path candidate statements = do
     current <- evalAccepted <$> readIORef state
     if BS.length candidate < BS.length current
         then mask_ $ do
             writeAtomicBytes path candidate
-            modifyEvalState state (\s -> s {evalAccepted = candidate})
+            modifyEvalState state (\s -> s {evalAccepted = candidate, evalAcceptedStatements = statements})
             pure True
         else pure False

@@ -100,6 +100,7 @@ import System.Posix.DynamicLinker (
 
 type DuckdbDatabase = Ptr ()
 type DuckdbConnection = Ptr ()
+type DuckdbConfig = Ptr ()
 type DuckdbPreparedStatement = Ptr ()
 type DuckdbExtractedStatements = Ptr ()
 type IdxT = Word64
@@ -127,6 +128,10 @@ type Chunk = Ptr ()
 type Vector = Ptr ()
 
 type FnOpen = CString -> Ptr DuckdbDatabase -> IO CInt
+type FnCreateConfig = Ptr DuckdbConfig -> IO CInt
+type FnSetConfig = DuckdbConfig -> CString -> CString -> IO CInt
+type FnOpenExt = CString -> Ptr DuckdbDatabase -> DuckdbConfig -> Ptr CString -> IO CInt
+type FnDestroyConfig = Ptr DuckdbConfig -> IO ()
 type FnClose = Ptr DuckdbDatabase -> IO ()
 type FnConnect = DuckdbDatabase -> Ptr DuckdbConnection -> IO CInt
 type FnDisconnect = Ptr DuckdbConnection -> IO ()
@@ -152,6 +157,10 @@ type FnVectorData = Vector -> IO (Ptr ())
 type FnValidity = Vector -> IO (Ptr Word64)
 type FnRowValid = Ptr Word64 -> IdxT -> IO CBool
 foreign import ccall "dynamic" mkOpen :: FunPtr FnOpen -> FnOpen
+foreign import ccall "dynamic" mkCreateConfig :: FunPtr FnCreateConfig -> FnCreateConfig
+foreign import ccall "dynamic" mkSetConfig :: FunPtr FnSetConfig -> FnSetConfig
+foreign import ccall "dynamic" mkOpenExt :: FunPtr FnOpenExt -> FnOpenExt
+foreign import ccall "dynamic" mkDestroyConfig :: FunPtr FnDestroyConfig -> FnDestroyConfig
 foreign import ccall "dynamic" mkClose :: FunPtr FnClose -> FnClose
 foreign import ccall "dynamic" mkConnect :: FunPtr FnConnect -> FnConnect
 foreign import ccall "dynamic" mkDisconnect :: FunPtr FnDisconnect -> FnDisconnect
@@ -176,8 +185,16 @@ foreign import ccall "dynamic" mkVectorData :: FunPtr FnVectorData -> FnVectorDa
 foreign import ccall "dynamic" mkValidity :: FunPtr FnValidity -> FnValidity
 foreign import ccall "dynamic" mkRowValid :: FunPtr FnRowValid -> FnRowValid
 
+data DuckDBConfigOpen = DuckDBConfigOpen
+    { apiCreateConfig :: !FnCreateConfig
+    , apiSetConfig :: !FnSetConfig
+    , apiOpenExt :: !FnOpenExt
+    , apiDestroyConfig :: !FnDestroyConfig
+    }
+
 data DuckDBAPI = DuckDBAPI
     { apiOpen :: !FnOpen
+    , apiConfigOpen :: !(Maybe DuckDBConfigOpen)
     , apiClose :: !FnClose
     , apiConnect :: !FnConnect
     , apiDisconnect :: !FnDisconnect
@@ -342,7 +359,17 @@ loadSymbols libPath = withCString libPath $ \cLib -> do
                     if p == nullFunPtr
                         then fail ("GetProcAddress failed for symbol: " <> name)
                         else pure (mk (castFunPtr p))
+            let tryProc :: String -> (FunPtr a -> b) -> IO (Maybe b)
+                tryProc name mk = withCString name $ \cName -> do
+                    p <- c_GetProcAddress hMod cName
+                    pure (if p == nullFunPtr then Nothing else Just (mk (castFunPtr p)))
             apiOpen <- getProc "duckdb_open" mkOpen
+            apiConfigOpen <- do
+                c1 <- tryProc "duckdb_create_config" mkCreateConfig
+                c2 <- tryProc "duckdb_set_config" mkSetConfig
+                c3 <- tryProc "duckdb_open_ext" mkOpenExt
+                c4 <- tryProc "duckdb_destroy_config" mkDestroyConfig
+                pure (DuckDBConfigOpen <$> c1 <*> c2 <*> c3 <*> c4)
             apiClose <- getProc "duckdb_close" mkClose
             apiConnect <- getProc "duckdb_connect" mkConnect
             apiDisconnect <- getProc "duckdb_disconnect" mkDisconnect
@@ -378,7 +405,19 @@ loadSymbols libPath = do
         getSym name mk = do
             p <- dlsym dl name
             pure (mk (castFunPtr p))
+    let trySym :: String -> (FunPtr a -> b) -> IO (Maybe b)
+        trySym name mk = do
+            res <- try (dlsym dl name) :: IO (Either SomeException (FunPtr ()))
+            pure $ case res of
+                Right p -> Just (mk (castFunPtr p))
+                Left _ -> Nothing
     apiOpen <- getSym "duckdb_open" mkOpen
+    apiConfigOpen <- do
+        c1 <- trySym "duckdb_create_config" mkCreateConfig
+        c2 <- trySym "duckdb_set_config" mkSetConfig
+        c3 <- trySym "duckdb_open_ext" mkOpenExt
+        c4 <- trySym "duckdb_destroy_config" mkDestroyConfig
+        pure (DuckDBConfigOpen <$> c1 <*> c2 <*> c3 <*> c4)
     apiClose <- getSym "duckdb_close" mkClose
     apiConnect <- getSym "duckdb_connect" mkConnect
     apiDisconnect <- getSym "duckdb_disconnect" mkDisconnect
@@ -484,6 +523,24 @@ executeDuckDBResult micros sql
             Left err -> pure (Left err)
             Right api -> executeWithAPI api micros sql
 
+openMemoryDb :: DuckDBAPI -> Ptr DuckdbDatabase -> IO CInt
+openMemoryDb api dbPtr = case apiConfigOpen api of
+    Nothing -> apiOpen api nullPtr dbPtr
+    Just DuckDBConfigOpen {..} ->
+        alloca $ \cfgPtr ->
+            bracket
+                ( do
+                    st <- apiCreateConfig cfgPtr
+                    if st /= 0 then pure nullPtr else peek cfgPtr
+                )
+                (\cfg -> when (cfg /= nullPtr) (apiDestroyConfig cfgPtr))
+                $ \cfg ->
+                    if cfg == nullPtr
+                        then apiOpen api nullPtr dbPtr
+                        else do
+                            _ <- withCString "threads" $ \k -> withCString "1" $ \v -> apiSetConfig cfg k v
+                            apiOpenExt nullPtr dbPtr cfg nullPtr
+
 executeWithAPI ::
     DuckDBAPI -> Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultTrace)))
 executeWithAPI api micros sql = do
@@ -491,7 +548,7 @@ executeWithAPI api micros sql = do
         alloca $ \dbPtr ->
             bracket
                 ( do
-                    st <- apiOpen api nullPtr dbPtr
+                    st <- openMemoryDb api dbPtr
                     if st /= 0
                         then fail "Failed to initialize in-memory DuckDB database"
                         else peek dbPtr

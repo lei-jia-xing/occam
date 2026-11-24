@@ -322,6 +322,26 @@ tests =
                         Just OracleReapFailed -> pure ()
                         _ -> assertFailure ("unexpected worker error: " ++ displayException err)
                     _ -> assertFailure "serial worker did not surface OracleReapFailed"
+        , testCase "sliding window launches next candidate as soon as head rejects despite straggler" $ do
+            stragglerGate <- newEmptyMVar
+            thirdStarted <- newEmptyMVar
+            let execute candidate
+                    | candidate == "fast-head" = pure rejectDetails
+                    | candidate == "straggler" = takeMVar stragglerGate >> pure rejectDetails
+                    | candidate == "third" = putMVar thirdStarted () >> pure acceptDetails
+                    | otherwise = pure rejectDetails
+            pool <- testPool 2 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
+            resultVar <- newEmptyMVar
+            _ <- forkIO (testOrdered pool ["fast-head", "straggler", "third"] >>= putMVar resultVar)
+            -- Under stop-and-wait chunking, "third" could never start while "straggler" blocks.
+            started <- timeout 2000000 (takeMVar thirdStarted)
+            assertEqual "third candidate must start while straggler is still running" (Just ()) started
+            putMVar stragglerGate ()
+            outcomes <- takeMVar resultVar
+            assertEqual
+                "ordered outcomes preserved across sliding window"
+                [OracleRejected, OracleRejected, OracleAccepted]
+                (map fst outcomes)
         ]
 
 awaitBlockedOnException :: ThreadId -> IO ()

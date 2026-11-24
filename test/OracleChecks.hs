@@ -11,7 +11,8 @@ import TestSupport (withSentinelPath)
 #ifndef mingw32_HOST_OS
 import Control.Concurrent (threadDelay)
 import Data.Maybe (isJust)
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, findExecutable)
+import System.Process (CmdSpec (..))
 import System.Timeout (timeout)
 #endif
 
@@ -54,6 +55,20 @@ tests =
                 missing <-
                     observeExternalOracle (rawOracleConfig "/no/such/occam-oracle" [] 2000000 Nothing) BS.empty
                 assertBool "missing executable was not an infrastructure failure" (isInfrastructure missing)
+          , testCase "parseDirectCommand only accepts metacharacter-free non-builtin commands" $ do
+                assertEqual "simple binary" (Just ("/usr/bin/env", [])) (parseDirectCommand "/usr/bin/env")
+                assertEqual
+                    "binary with flags and equals in arg"
+                    (Just ("python3", ["check.py", "--mode=fast"]))
+                    (parseDirectCommand "  python3   check.py --mode=fast  ")
+                assertEqual "empty command" Nothing (parseDirectCommand "   ")
+                assertEqual "pipe requires shell" Nothing (parseDirectCommand "cat | grep x")
+                assertEqual "redirection requires shell" Nothing (parseDirectCommand "cat >/dev/null")
+                assertEqual "quotes require shell" Nothing (parseDirectCommand "grep -q 'SELECT 42;'")
+                assertEqual "semicolon requires shell" Nothing (parseDirectCommand "true; exit 0")
+                assertEqual "leading env assignment requires shell" Nothing (parseDirectCommand "FOO=1 ./oracle")
+                assertEqual "shell builtin requires shell" Nothing (parseDirectCommand "exit 1")
+                assertEqual "test builtin requires shell" Nothing (parseDirectCommand "test -f a")
           ]
             ++ posixTests
 
@@ -62,7 +77,20 @@ posixTests :: [TestTree]
 posixTests = []
 #else
 posixTests =
-    [ testCase "predicates may close stdin early without changing their exit verdict" $
+    [ testCase "resolveOracleContext upgrades direct ELF executables to RawCommand" $ do
+            mEnv <- findExecutable "env"
+            case mEnv of
+                Nothing -> pure ()
+                Just _ -> do
+                    ctx <- resolveOracleContext (shellOracleConfig "env true" 2000000 Nothing)
+                    case contextCmdSpec ctx of
+                        RawCommand _ ["true"] -> pure ()
+                        other -> assertFailure ("expected direct RawCommand for ELF binary, got: " ++ show other)
+                    ctxShell <- resolveOracleContext (shellOracleConfig "env true && true" 2000000 Nothing)
+                    case contextCmdSpec ctxShell of
+                        ShellCommand _ -> pure ()
+                        other -> assertFailure ("expected ShellCommand for shell syntax, got: " ++ show other)
+        , testCase "predicates may close stdin early without changing their exit verdict" $
             mapM_
                 ( \(exitStatus, expected) -> do
                     let command = "exec 0<&-; sleep 0.05; exit " ++ exitStatus

@@ -56,11 +56,13 @@ import Control.Exception (
  )
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
-import Data.Foldable (for_)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Foldable (for_, toList)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Sequence (Seq)
+import Data.Sequence qualified as Seq
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Cache (
@@ -118,9 +120,6 @@ data PoolConfig = PoolConfig
 
 -- | Retired decision in candidate order: outcome plus cache-hit flag.
 type WindowOutcome = (OracleOutcome, Bool)
-
-data WindowDecision = WindowAccept | WindowReject
-    deriving (Eq, Show)
 
 data WorkerEntry = WorkerEntry
     { entryDone :: !(MVar ())
@@ -325,15 +324,7 @@ testOrderedTagged pool candidates =
         jobs = poolJobsCount pool
         dispatch
             | jobs == 1 = goSerial candidates []
-            | otherwise = goChunks candidates []
-        goChunks [] acc = pure (reverse acc)
-        goChunks rest acc = do
-            let (window, remaining) = splitAt jobs rest
-            (outcomes, decision) <- testWindow pool window
-            let acc' = reverse outcomes ++ acc
-            case decision of
-                WindowAccept -> pure (reverse acc')
-                WindowReject -> goChunks remaining acc'
+            | otherwise = runSlidingWindow pool candidates
 
         goSerial [] acc = pure (reverse acc)
         goSerial ((tag, candidate) : rest) acc = do
@@ -429,25 +420,78 @@ testOrderedTagged pool candidates =
                 OracleInconclusive -> throwIO OracleInconclusiveError
                 OracleRejected -> goSerial rest acc'
 
-testWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO ([WindowOutcome], WindowDecision)
-testWindow pool tagged = mask \restore -> do
-    launched <- launchWindow pool tagged
-    -- Highest retired window ordinal (-1 if none).
-    retiredThrough <- newIORef (-1)
-    let items = [(tag, candidate, (ordinal, task)) | ((tag, candidate), (ordinal, task)) <- zip tagged launched]
-    outcome <-
-        restore (retireWindow pool items retiredThrough)
-            `onException` (readIORef retiredThrough >>= settleAll pool launched)
+{- | Bounded sliding-window ordered scheduler: keeps up to @jobs@ candidates in
+flight simultaneously while strictly retiring decisions in input order and
+immediately launching the next candidate on each head rejection.
+-}
+runSlidingWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO [WindowOutcome]
+runSlidingWindow pool initialCandidates = mask \restore -> do
+    let width = poolJobsCount pool
+    activeRef <- newIORef (Seq.empty :: Seq (FamilyTag, ByteString, Int, WindowTask))
+    retiredThrough <- newIORef (-1 :: Int)
+    let settleRemaining = do
+            remSeq <- readIORef activeRef
+            rt <- readIORef retiredThrough
+            writeIORef activeRef Seq.empty
+            settleAll pool [(ord, task) | (_, _, ord, task) <- toList remSeq] rt
+        fill !nextOrd pending = do
+            cur <- readIORef activeRef
+            if Seq.length cur >= width
+                then pure (nextOrd, pending)
+                else case pending of
+                    [] -> pure (nextOrd, [])
+                    (tag, candidate) : rest -> do
+                        task <- launchTask pool nextOrd tag candidate
+                        modifyIORef' activeRef (Seq.|> (tag, candidate, nextOrd, task))
+                        fill (nextOrd + 1) rest
+        go !nextOrd pending prefix earlier = do
+            (nextOrd', pending') <- fill nextOrd pending
+            cur <- readIORef activeRef
+            case Seq.viewl cur of
+                Seq.EmptyL -> pure (reverse prefix)
+                (tag, candidate, ordinal, task) Seq.:< restSeq -> do
+                    (observation, hit) <- restore (resolveSlidingTask earlier task)
+                    let outcome = observationOutcome observation
+                        verdict = case outcome of
+                            OracleAccepted -> RetiredAccept
+                            OracleRejected -> RetiredReject
+                            OracleInconclusive -> RetiredInconclusive
+                    -- Commit retirement before invoking callback and retire this worker cleanly.
+                    recordRetired (poolMetricsData pool) tag verdict
+                    writeIORef retiredThrough ordinal
+                    writeIORef activeRef restSeq
+                    settleOne pool ordinal (ordinal, task)
+                    index <- atomicModifyIORef' (poolIndexRef pool) (\n -> (n + 1, n))
+                    restore (poolRetireFn pool index candidate outcome hit)
+                    let prefix' = (outcome, hit) : prefix
+                        earlier' = IntMap.insert ordinal observation earlier
+                    case outcome of
+                        OracleAccepted -> do
+                            settleRemaining
+                            pure (reverse prefix')
+                        OracleInconclusive -> do
+                            settleRemaining
+                            throwIO OracleInconclusiveError
+                        OracleRejected -> go nextOrd' pending' prefix' earlier'
+    outcomes <- go 0 initialCandidates [] IntMap.empty `onException` settleRemaining
     checkReapFailure pool
-    pure outcome
+    pure outcomes
 
-launchWindow :: OraclePool -> [(FamilyTag, ByteString)] -> IO [(Int, WindowTask)]
-launchWindow pool window = mask_ (go 0 [] window)
-    where
-        go _ acc [] = pure (reverse acc)
-        go ordinal acc ((tag, candidate) : rest) = do
-            task <- launchTask pool ordinal tag candidate `onException` settleAll pool acc (-1)
-            go (ordinal + 1) ((ordinal, task) : acc) rest
+resolveSlidingTask ::
+    IntMap.IntMap OracleObservation ->
+    WindowTask ->
+    IO (OracleObservation, Bool)
+resolveSlidingTask earlier task = case task of
+    TaskImmediate observation hit -> pure (observation, hit)
+    TaskJoined owner -> case IntMap.lookup owner earlier of
+        Just observation -> pure (observation, True)
+        Nothing -> ioError (userError "OraclePool join owner retired out of order")
+    TaskDenied -> throwIO (ExecutionBudgetReached ())
+    TaskPending _ result _ _ _ _ -> do
+        published <- readMVar result
+        case published of
+            Right timed -> pure (detailedObservation (timedDetails timed), False)
+            Left err -> throwIO err
 
 launchTask :: OraclePool -> Int -> FamilyTag -> ByteString -> IO WindowTask
 launchTask pool ordinal tag candidate = do
@@ -555,90 +599,30 @@ admitObservation observation = case observationAdmission observation of
     CacheAdmit -> Just observation
     CacheReject -> Nothing
 
-retireWindow ::
-    OraclePool ->
-    [(FamilyTag, ByteString, (Int, WindowTask))] ->
-    IORef Int ->
-    IO ([WindowOutcome], WindowDecision)
-retireWindow pool items retiredThrough = go items [] IntMap.empty
-    where
-        launched = [(ordinal, task) | (_, _, (ordinal, task)) <- items]
-        settleThrough = readIORef retiredThrough >>= settleAll pool launched
-        go [] prefix _ = do
-            settleThrough
-            pure (reverse prefix, WindowReject)
-        go ((tag, candidate, (ordinal, task)) : rest) prefix earlier = do
-            (observation, hit) <- resolveTask pool launched retiredThrough earlier task
-            let outcome = observationOutcome observation
-                verdict = case outcome of
-                    OracleAccepted -> RetiredAccept
-                    OracleRejected -> RetiredReject
-                    OracleInconclusive -> RetiredInconclusive
-            -- Commit retirement before invoking callback.
-            mask_ $ do
-                recordRetired (poolMetricsData pool) tag verdict
-                writeIORef retiredThrough ordinal
-            index <- atomicModifyIORef' (poolIndexRef pool) (\n -> (n + 1, n))
-            poolRetireFn pool index candidate outcome hit
-            let prefix' = (outcome, hit) : prefix
-                earlier' = IntMap.insert ordinal observation earlier
-            case outcome of
-                OracleAccepted -> do
-                    settleThrough
-                    pure (reverse prefix', WindowAccept)
-                OracleInconclusive -> do
-                    settleThrough
-                    throwIO OracleInconclusiveError
-                OracleRejected -> go rest prefix' earlier'
-
-resolveTask ::
-    OraclePool ->
-    [(Int, WindowTask)] ->
-    IORef Int ->
-    IntMap.IntMap OracleObservation ->
-    WindowTask ->
-    IO (OracleObservation, Bool)
-resolveTask pool launched retiredThrough earlier task = case task of
-    TaskImmediate observation hit -> pure (observation, hit)
-    TaskJoined owner -> case IntMap.lookup owner earlier of
-        Just observation -> pure (observation, True)
-        Nothing -> ioError (userError "OraclePool join owner retired out of order")
-    TaskDenied -> do
-        settleThrough
-        throwIO (ExecutionBudgetReached ())
-    TaskPending _ result _ _ _ _ -> do
-        published <- readMVar result
-        case published of
-            Right timed -> pure (detailedObservation (timedDetails timed), False)
-            Left err -> do
-                settleThrough
-                throwIO err
-    where
-        settleThrough = readIORef retiredThrough >>= settleAll pool launched
-
 -- | Cancel unretired tasks and join all workers in the window.
 settleAll :: OraclePool -> [(Int, WindowTask)] -> Int -> IO ()
-settleAll pool launched retiredThrough = mapM_ settleOne launched
-    where
-        settleOne (ordinal, TaskPending tid result done spent tag _) = do
-            first <- tryTakeMVar spent
-            case first of
-                Nothing -> readMVar done
-                Just () -> do
-                    killThread tid
-                    readMVar done
-                    published <- readMVar result
-                    case published of
-                        Right timed
-                            | ordinal <= retiredThrough -> pure ()
-                            | otherwise ->
-                                recordCompletedUnselected
-                                    (poolMetricsData pool)
-                                    tag
-                                    (timedExecWallMicros timed)
-                        Left _ -> pure ()
-                    modifyMVar_ (poolRegistry pool) (pure . Map.delete tid)
-        settleOne _ = pure ()
+settleAll pool launched retiredThrough = mapM_ (settleOne pool retiredThrough) launched
+
+settleOne :: OraclePool -> Int -> (Int, WindowTask) -> IO ()
+settleOne pool retiredThrough (ordinal, TaskPending tid result done spent tag _) = do
+    first <- tryTakeMVar spent
+    case first of
+        Nothing -> readMVar done
+        Just () -> do
+            when (ordinal > retiredThrough) (killThread tid)
+            readMVar done
+            published <- readMVar result
+            case published of
+                Right timed
+                    | ordinal <= retiredThrough -> pure ()
+                    | otherwise ->
+                        recordCompletedUnselected
+                            (poolMetricsData pool)
+                            tag
+                            (timedExecWallMicros timed)
+                Left _ -> pure ()
+            modifyMVar_ (poolRegistry pool) (pure . Map.delete tid)
+settleOne _ _ _ = pure ()
 
 reservePermit :: MVar (Maybe Int) -> IO Bool
 reservePermit permits = modifyMVar permits reserve

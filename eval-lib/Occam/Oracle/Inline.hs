@@ -3,6 +3,7 @@ module Occam.Oracle.Inline (
     newResultTraceTracker,
     prepareResultOracle,
     prepareResultOracleWithTrace,
+    prepareResultOracleWithTraceAndFailures,
 ) where
 
 import Data.Bifunctor (first)
@@ -11,6 +12,7 @@ import Data.IORef (atomicModifyIORef', newIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import GHC.Clock (getMonotonicTimeNSec)
+import Occam.Certificate (FailingPrefixCache, recordFailingPrefix)
 import Occam.Core (ResultStatement, ResultTrace, traceResultStatement)
 import Occam.Evaluation (EvaluationObserver)
 import Occam.Oracle (OracleObservation (OracleFinished), OracleObservationDetails (..))
@@ -20,7 +22,7 @@ import Occam.Oracle.DuckDB (
  )
 import Occam.Oracle.Sqlite (
     generateSqliteContractWithTrace,
-    sqliteContractObservationWithTrace,
+    prepareSqliteContractObserver,
  )
 import Occam.Parser (SQLDialect (..))
 import System.Exit (ExitCode (ExitSuccess))
@@ -75,11 +77,21 @@ prepareResultOracleWithTrace ::
     Int ->
     BS.ByteString ->
     IO (Either Text (OracleObservationDetails, EvaluationObserver))
-prepareResultOracleWithTrace rememberTrace dialect micros sql = do
+prepareResultOracleWithTrace = prepareResultOracleWithTraceAndFailures Nothing
+
+prepareResultOracleWithTraceAndFailures ::
+    Maybe FailingPrefixCache ->
+    (BS.ByteString -> ResultTrace -> IO ()) ->
+    SQLDialect ->
+    Int ->
+    BS.ByteString ->
+    IO (Either Text (OracleObservationDetails, EvaluationObserver))
+prepareResultOracleWithTraceAndFailures mFailCache rememberTrace dialect micros sql = do
     start <- getMonotonicTimeNSec
+    let onFail = maybe (const (pure ())) recordFailingPrefix mFailCache
     prepared <- case dialect of
         SQLite ->
-            fmap (first (sqliteContractObservationWithTrace micros))
+            fmap (first (\c -> prepareSqliteContractObserver micros c onFail))
                 <$> generateSqliteContractWithTrace micros sql
         DuckDB ->
             fmap (first (duckdbContractObservationWithTrace micros))

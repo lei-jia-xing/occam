@@ -4,6 +4,7 @@ module Occam.Oracle (
     OracleConfig (..),
     shellOracleConfig,
     rawOracleConfig,
+    parseDirectCommand,
     OracleContext (..),
     resolveOracleContext,
     executeReset,
@@ -20,6 +21,7 @@ module Occam.Oracle (
     observationOutcome,
     OracleReapFailed (..),
     prepareOracle,
+    prepareOracleWithContext,
     withCandidateWorkdir,
 ) where
 
@@ -59,17 +61,36 @@ import Data.Aeson.Encoding qualified as Encoding
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import System.Directory (findExecutable, getCurrentDirectory, makeAbsolute)
+import Occam.Core (OracleOutcome (..))
+import System.Directory (
+    doesFileExist,
+    executable,
+    findExecutable,
+    getCurrentDirectory,
+    getPermissions,
+    makeAbsolute,
+ )
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator)
-import System.IO (Handle, IOMode (WriteMode), hClose, hFlush, hSetBinaryMode, withFile)
+import System.IO (
+    Handle,
+    IOMode (ReadMode, WriteMode),
+    hClose,
+    hFlush,
+    hSetBinaryMode,
+    withBinaryFile,
+    withFile,
+ )
+import System.IO.Error (isResourceVanishedError)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 #ifdef mingw32_HOST_OS
 import Data.Char (toUpper)
 import System.Process (
@@ -99,9 +120,6 @@ import System.Process (
     withCreateProcess,
  )
 #endif
-import Occam.Core (OracleOutcome (..))
-import System.IO.Error (isResourceVanishedError)
-import System.Timeout (timeout)
 
 -- | Run a database/environment reset command in an owned process group.
 executeReset :: Maybe String -> IO Bool
@@ -110,10 +128,11 @@ executeReset (Just cmd) =
     handle (\(_ :: IOException) -> pure False) $
         withCandidateWorkdir \workDir -> do
             childEnv <- candidateEnvironment workDir
+            spec <- resolveShellCommand cmd
             result <-
                 runProcessGroup
                     defaultResetTimeoutMicros
-                    ((shell cmd) {env = Just childEnv})
+                    ((cmdSpecToProcess spec) {env = Just childEnv})
                     BS.empty
             pure $ case result of
                 Just ExitSuccess -> True
@@ -130,11 +149,106 @@ data OracleObservationDetails = OracleObservationDetails
 defaultResetTimeoutMicros :: Int
 defaultResetTimeoutMicros = 30000000
 
+-- | Guaranteed non-blocking pipe write bound (POSIX PIPE_BUF = 4096).
+inlinePipeWriteLimit :: Int
+inlinePipeWriteLimit = 4096
+
 -- | Thrown when an oracle or reset process group cannot be cleanly reaped.
 data OracleReapFailed = OracleReapFailed
     deriving (Show)
 
 instance Exception OracleReapFailed
+
+{- | Parse a shell command string into a direct executable + arguments when it
+contains strictly no shell syntax, metacharacters, assignments, or POSIX
+builtins. Conservative: returns 'Nothing' for any syntax that requires a shell.
+-}
+parseDirectCommand :: String -> Maybe (FilePath, [String])
+parseDirectCommand cmd
+    | any isShellMeta cmd = Nothing
+    | otherwise = case splitSpaces cmd of
+        [] -> Nothing
+        bin : args
+            | '=' `elem` bin -> Nothing
+            | bin `elem` posixShellBuiltins -> Nothing
+            | otherwise -> Just (bin, args)
+    where
+        isShellMeta c =
+            c < ' '
+                || c == '\DEL'
+                || c `elem` ("|&;()<>$`\\\"'*?[~#{}" :: String)
+        splitSpaces = filter (not . null) . go
+            where
+                go [] = []
+                go s =
+                    let (tok, rest) = break (== ' ') s
+                     in tok : go (dropWhile (== ' ') rest)
+        posixShellBuiltins :: [String]
+        posixShellBuiltins =
+            [ "."
+            , ":"
+            , "["
+            , "!"
+            , "alias"
+            , "bg"
+            , "break"
+            , "builtin"
+            , "case"
+            , "cd"
+            , "command"
+            , "continue"
+            , "do"
+            , "done"
+            , "echo"
+            , "elif"
+            , "else"
+            , "esac"
+            , "eval"
+            , "exec"
+            , "exit"
+            , "export"
+            , "false"
+            , "fc"
+            , "fg"
+            , "fi"
+            , "for"
+            , "function"
+            , "getopts"
+            , "hash"
+            , "if"
+            , "in"
+            , "jobs"
+            , "kill"
+            , "let"
+            , "local"
+            , "printf"
+            , "pwd"
+            , "read"
+            , "readonly"
+            , "return"
+            , "set"
+            , "shift"
+            , "source"
+            , "test"
+            , "then"
+            , "time"
+            , "times"
+            , "trap"
+            , "true"
+            , "type"
+            , "typeset"
+            , "ulimit"
+            , "umask"
+            , "unalias"
+            , "unset"
+            , "until"
+            , "wait"
+            , "while"
+            ]
+
+cmdSpecToProcess :: CmdSpec -> CreateProcess
+cmdSpecToProcess (ShellCommand cmd) = shell cmd
+cmdSpecToProcess (RawCommand bin args) = proc bin args
 
 runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe ExitCode)
 runProcessGroup timeoutMicros command input =
@@ -155,9 +269,14 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                     case mbIn of
                         Just hIn -> do
                             groupId <- getOwnedGroup ph
+                            reapedRef <- newIORef False
+                            cleanedRef <- newIORef False
                             let cleanup = do
-                                    reaped <- cleanupOwnedGroup groupId ph
-                                    unless reaped $ throwIO OracleReapFailed
+                                    alreadyCleaned <- atomicModifyIORef' cleanedRef (True,)
+                                    unless alreadyCleaned $ do
+                                        leaderReaped <- readIORef reapedRef
+                                        reaped <- cleanupOwnedGroup leaderReaped groupId ph
+                                        unless reaped $ throwIO OracleReapFailed
                             result <-
                                 ( do
                                     onStarted
@@ -165,12 +284,20 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                     restore $
                                         timeout
                                             timeoutMicros
-                                            ( withWorker (writePipe hIn input) \writeInput -> do
-                                                exitCode <- waitForProcess ph
-                                                -- Kill remaining group members before joining the stdin writer.
-                                                cleanup
-                                                writeInput
-                                                pure exitCode
+                                            ( if BS.length input <= inlinePipeWriteLimit
+                                                then do
+                                                    writePipe hIn input
+                                                    exitCode <- waitForProcess ph
+                                                    writeIORef reapedRef True
+                                                    cleanup
+                                                    pure exitCode
+                                                else withWorker (writePipe hIn input) \writeInput -> do
+                                                    exitCode <- waitForProcess ph
+                                                    writeIORef reapedRef True
+                                                    -- Kill remaining group members before joining the stdin writer.
+                                                    cleanup
+                                                    writeInput
+                                                    pure exitCode
                                             )
                                             -- Kill the process group on timeout before unwinding.
                                             `onException` cleanup
@@ -192,23 +319,29 @@ runProcessGroupWithStart onStarted timeoutMicros command input
 #ifdef mingw32_HOST_OS
 withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
 withNullOutput use = withFile "NUL" WriteMode \h -> use (UseHandle h) (UseHandle h)
-#else
-withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
-withNullOutput use = withFile "/dev/null" WriteMode \h -> use (UseHandle h) (UseHandle h)
-#endif
-#ifdef mingw32_HOST_OS
+
 createProcessGroup :: Bool
 createProcessGroup = False
 
 getOwnedGroup :: ProcessHandle -> IO ()
 getOwnedGroup _ = pure ()
 
-cleanupOwnedGroup :: () -> ProcessHandle -> IO Bool
-cleanupOwnedGroup _ ph = do
+cleanupOwnedGroup :: Bool -> () -> ProcessHandle -> IO Bool
+cleanupOwnedGroup True _ _ = pure True
+cleanupOwnedGroup False _ ph = do
     ignoreIOException (terminateProcess ph)
     reaped <- timeout 1000000 (waitForProcess ph)
     pure (isJust reaped)
+
+isCandidateOverrideKey :: String -> Bool
+isCandidateOverrideKey k = map toUpper k `elem` candidateOverrideKeys
+
+resolveShellCommand :: String -> IO CmdSpec
+resolveShellCommand = pure . ShellCommand
 #else
+withNullOutput :: (StdStream -> StdStream -> IO a) -> IO a
+withNullOutput use = withFile "/dev/null" WriteMode \h -> use (UseHandle h) (UseHandle h)
+
 createProcessGroup :: Bool
 createProcessGroup = True
 
@@ -216,25 +349,41 @@ getOwnedGroup :: ProcessHandle -> IO (Maybe ProcessID)
 getOwnedGroup ph = handle (\(_ :: IOException) -> pure Nothing) (getPid ph)
 
 -- | Terminate the owned process group and report whether the leader was reaped.
-cleanupOwnedGroup :: Maybe ProcessID -> ProcessHandle -> IO Bool
-cleanupOwnedGroup mPid ph = mask $ \restore -> do
+cleanupOwnedGroup :: Bool -> Maybe ProcessID -> ProcessHandle -> IO Bool
+cleanupOwnedGroup leaderReaped mPid ph = mask $ \restore -> do
     case mPid of
         Nothing -> pure ()
         Just pid -> do
-            termSent <- tryIOException (signalProcessGroup sigTERM pid)
-            case termSent of
-                Right () -> uninterruptibleMask_ (waitForGroupTermination pid ph 50)
-                Left _ -> pure ()
-            ignoreIOException (signalProcessGroup sigKILL pid)
-    reaped <- restore (timeout 1000000 (waitForProcess ph))
-    pure (isJust reaped)
+            alive <-
+                if leaderReaped
+                    then isRight <$> tryIOException (signalProcessGroup nullSignal pid)
+                    else pure True
+            whenAlive alive $ do
+                termSent <- tryIOException (signalProcessGroup sigTERM pid)
+                case termSent of
+                    Right () -> uninterruptibleMask_ (waitForGroupTermination leaderReaped pid ph 50)
+                    Left _ -> pure ()
+                ignoreIOException (signalProcessGroup sigKILL pid)
+    if leaderReaped
+        then pure True
+        else do
+            reaped <- restore (timeout 1000000 (waitForProcess ph))
+            pure (isJust reaped)
+    where
+        isRight (Right _) = True
+        isRight (Left _) = False
+        whenAlive True action = action
+        whenAlive False _ = pure ()
 
 -- | Wait for process group termination within a short grace period after SIGTERM.
-waitForGroupTermination :: ProcessID -> ProcessHandle -> Int -> IO ()
-waitForGroupTermination pid ph remaining
+waitForGroupTermination :: Bool -> ProcessID -> ProcessHandle -> Int -> IO ()
+waitForGroupTermination leaderReaped pid ph remaining
     | remaining <= 0 = pure ()
     | otherwise = do
-        leaderExited <- getProcessExitCode ph
+        leaderExited <-
+            if leaderReaped
+                then pure Nothing
+                else getProcessExitCode ph
         case leaderExited of
             Just _ -> pure ()
             Nothing -> do
@@ -242,7 +391,43 @@ waitForGroupTermination pid ph remaining
                 case groupAlive of
                     Left _ -> pure ()
                     Right () ->
-                        threadDelay 1000 >> waitForGroupTermination pid ph (remaining - 1)
+                        threadDelay 1000 >> waitForGroupTermination leaderReaped pid ph (remaining - 1)
+
+isCandidateOverrideKey :: String -> Bool
+isCandidateOverrideKey k = k `elem` candidateOverrideKeys
+
+-- | Verify a file is directly executable by execve (ELF binary or #! script).
+isDirectExecFile :: FilePath -> IO Bool
+isDirectExecFile path =
+    handle (\(_ :: IOException) -> pure False) $ do
+        exists <- doesFileExist path
+        if not exists
+            then pure False
+            else do
+                perms <- getPermissions path
+                if not (executable perms)
+                    then pure False
+                    else do
+                        header <- withBinaryFile path ReadMode (`BS.hGet` 4)
+                        pure (BS.isPrefixOf (BS.pack [0x7f, 0x45, 0x4c, 0x46]) header || BS.isPrefixOf "#!" header)
+
+-- | Upgrade a shell command without shell syntax into a direct RawCommand when
+-- the resolved target is an executable ELF binary or #! script.
+resolveShellCommand :: String -> IO CmdSpec
+resolveShellCommand cmd = case parseDirectCommand cmd of
+    Nothing -> pure (ShellCommand cmd)
+    Just (bin, args) -> do
+        resolved <-
+            if isAbsolute bin || any isPathSeparator bin
+                then do
+                    exists <- doesFileExist bin
+                    if exists then Just <$> makeAbsolute bin else pure Nothing
+                else findExecutable bin >>= traverse makeAbsolute
+        case resolved of
+            Just absPath -> do
+                direct <- isDirectExecFile absPath
+                pure (if direct then RawCommand absPath args else ShellCommand cmd)
+            Nothing -> pure (ShellCommand cmd)
 #endif
 
 -- | Fork an asynchronous helper action ensuring guaranteed cleanup and join.
@@ -287,21 +472,14 @@ withCandidateWorkdir :: (FilePath -> IO a) -> IO a
 withCandidateWorkdir = withSystemTempDirectory "occam-candidate-"
 
 resolveExecutable :: FilePath -> IO FilePath
-resolveExecutable executable
-    | isAbsolute executable || any isPathSeparator executable = makeAbsolute executable
+resolveExecutable executablePath
+    | isAbsolute executablePath || any isPathSeparator executablePath = makeAbsolute executablePath
     | otherwise = do
-        found <- findExecutable executable
-        maybe (pure executable) makeAbsolute found
+        found <- findExecutable executablePath
+        maybe (pure executablePath) makeAbsolute found
 
 candidateOverrideKeys :: [String]
 candidateOverrideKeys = ["OCCAM_WORKDIR", "OCCAM_ORIGINAL_CWD", "TMPDIR", "TMP", "TEMP"]
-
-isCandidateOverrideKey :: String -> Bool
-#ifdef mingw32_HOST_OS
-isCandidateOverrideKey k = map toUpper k `elem` candidateOverrideKeys
-#else
-isCandidateOverrideKey k = k `elem` candidateOverrideKeys
-#endif
 
 candidateOverrides :: FilePath -> FilePath -> [(String, String)]
 candidateOverrides workDir originalDir =
@@ -322,9 +500,14 @@ candidateEnvironment workDir = do
     originalDir <- getCurrentDirectory
     pure (candidateOverrides workDir originalDir ++ base)
 
+candidateEnvironmentWith :: OracleContext -> FilePath -> [(String, String)]
+candidateEnvironmentWith OracleContext {..} workDir =
+    candidateOverrides workDir contextOriginalDir ++ contextBaseEnvironment
+
 -- | Base launch context resolved once per reduction.
 data OracleContext = OracleContext
     { contextCmdSpec :: !CmdSpec
+    , contextResetSpec :: !(Maybe CmdSpec)
     , contextBaseEnvironment :: ![(String, String)]
     , contextOriginalDir :: !FilePath
     }
@@ -336,19 +519,17 @@ resolveOracleContext OracleConfig {..} = do
         RawCommand bin args -> do
             resolvedBin <- resolveExecutable bin
             pure (RawCommand resolvedBin args)
-        ShellCommand cmd -> pure (ShellCommand cmd)
+        ShellCommand cmd -> resolveShellCommand cmd
+    resetSpec <- traverse resolveShellCommand oracleResetCommand
     base <- baseEnvironment
     originalDir <- getCurrentDirectory
     pure
         OracleContext
             { contextCmdSpec = spec
+            , contextResetSpec = resetSpec
             , contextBaseEnvironment = base
             , contextOriginalDir = originalDir
             }
-
-candidateEnvironmentWith :: OracleContext -> FilePath -> [(String, String)]
-candidateEnvironmentWith OracleContext {..} workDir =
-    candidateOverrides workDir contextOriginalDir ++ contextBaseEnvironment
 
 elapsedMicros :: Word64 -> Word64 -> Int
 elapsedMicros start end = fromIntegral ((end - start) `div` 1000)
@@ -404,11 +585,12 @@ observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} conte
                         result <-
                             if remaining <= 0
                                 then pure (Right Nothing)
-                                else
+                                else do
+                                    let resetProc = maybe (shell command) cmdSpecToProcess (contextResetSpec context)
                                     tryIOException $
                                         runProcessGroup
                                             remaining
-                                            ((shell command) {env = Just childEnv})
+                                            (resetProc {env = Just childEnv})
                                             BS.empty
                         resetEnded <- getMonotonicTimeNSec
                         let duration = elapsedMicros resetStarted resetEnded
@@ -419,9 +601,7 @@ observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} conte
                     Right (Just code)
                         | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
                         | otherwise -> do
-                            let cmdProcess = case contextCmdSpec context of
-                                    ShellCommand cmd -> shell cmd
-                                    RawCommand bin args -> proc bin args
+                            let cmdProcess = cmdSpecToProcess (contextCmdSpec context)
                             oracleStarted <- getMonotonicTimeNSec
                             remaining <- remainingMicros
                             if remaining <= 0
@@ -554,10 +734,17 @@ data OracleObservation
 
 -- | Refuse inputs that do not satisfy the supplied predicate before reduction.
 prepareOracle :: OracleConfig -> ByteString -> IO (Either Text OracleObservationDetails)
-prepareOracle cfg sql
+prepareOracle cfg sql = do
+    context <- resolveOracleContext cfg
+    prepareOracleWithContext cfg context sql
+
+-- | Variant of 'prepareOracle' reusing a pre-resolved 'OracleContext'.
+prepareOracleWithContext ::
+    OracleConfig -> OracleContext -> ByteString -> IO (Either Text OracleObservationDetails)
+prepareOracleWithContext cfg context sql
     | oracleTimeoutMicros cfg <= 0 = pure (Left "--timeout must be positive")
     | otherwise = do
-        details <- observeExternalOracleDetailed cfg sql
+        details <- observeExternalOracleDetailedWithContext (pure ()) cfg context sql
         pure $ case detailedObservation details of
             OracleFinished ExitSuccess -> Right details
             OracleFinished _ -> Left "Initial input does not satisfy the oracle predicate."

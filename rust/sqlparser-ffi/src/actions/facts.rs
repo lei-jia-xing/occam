@@ -4061,6 +4061,14 @@ pub(crate) fn analyze_statement(
         return analyze_statement(statement, context);
     }
     let AnalysisContext { dialect, rules, .. } = context;
+    if context.syntax_only && !context.column_ir {
+        let mut visitor = AnalysisVisitor::new(context);
+        let _ = statement.visit(&mut visitor);
+        return ir::NativeFacts {
+            edits: visitor.edits,
+            ..ir::NativeFacts::default()
+        };
+    }
     let mut visitor = AnalysisVisitor::new(context);
     if matches!(statement, Statement::Explain { .. }) {
         // Plain EXPLAIN only inspects catalog metadata and statistics, but it

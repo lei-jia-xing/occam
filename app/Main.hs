@@ -19,6 +19,8 @@ import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
 import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
+import Occam.Certificate (newFailingPrefixCache)
+import Occam.Core (SessionInit)
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -46,17 +48,19 @@ import Occam.Logger (
 import Occam.Oracle (
     OracleObservationDetails (..),
     observeExternalOracleDetailedWithContext,
-    prepareOracle,
+    prepareOracleWithContext,
     resolveOracleContext,
     shellOracleConfig,
     withCandidateWorkdir,
  )
-import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
+import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTraceAndFailures)
 import Occam.Parser (
     ParseOptions (..),
+    ParsedSQL (..),
     ParserError (..),
     SQLDialect (..),
     ServerConfig (..),
+    StatementUnit,
     countStatements,
     defaultParseOptions,
     dialectName,
@@ -75,7 +79,7 @@ import Occam.Reducer (
     columnModeName,
     convergedRankedScheduleConfig,
     defaultReductionConfig,
-    reduceSQLWithResultTrace,
+    reduceSQLWithResultTraceFull,
     statementAuditWithLogger,
     statementDdminWithOrder,
     statementRankedFallback,
@@ -928,7 +932,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     oracleCmd <- if valResultOracle then pure Nothing else Just <$> requireOracleCommand valOracleCmd
     (writeToStdout, targetMinimalPath, statsPath) <-
         resolveOutputTargets valInputFile valOut valInPlace valStatsFile
-    (initialSQL, initialStmts, initialBytes) <- loadInitialInput logger valDialect valInputFile
+    (initialSQL, initialStmts, initialBytes, initialParsed) <-
+        loadInitialInput logger valDialect (valStrategy == StrategyFull) valInputFile
 
     ui <-
         newUI
@@ -972,17 +977,27 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     (rememberTrace, lookupTrace) <-
         newResultTraceTracker
             (valStrategy == StrategyFull && (valSlicing || reductionEarlyReject reductionConfig))
+    failPrefixCache <-
+        if isNothing oracleCmd && valStrategy == StrategyFull && reductionEarlyReject reductionConfig
+            then Just <$> newFailingPrefixCache
+            else pure Nothing
     let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
     (initialStart, initialEnd, preflightDetails, observer, preflightMicros) <-
         runPreflight totalBudgetMicros $ case oracleCmd of
-            Nothing -> prepareResultOracleWithTrace rememberTrace valDialect timeoutMicros initialSQL
+            Nothing ->
+                prepareResultOracleWithTraceAndFailures
+                    failPrefixCache
+                    rememberTrace
+                    valDialect
+                    timeoutMicros
+                    initialSQL
             Just command -> do
                 let config = shellOracleConfig command timeoutMicros valResetCmd
-                prepared <- prepareOracle config initialSQL
+                context <- resolveOracleContext config
+                prepared <- prepareOracleWithContext config context initialSQL
                 case prepared of
                     Left err -> pure (Left err)
-                    Right details -> do
-                        context <- resolveOracleContext config
+                    Right details ->
                         pure (Right (details, \started -> observeExternalOracleDetailedWithContext started config context))
     let budgetConfig =
             configuredBudget
@@ -1017,7 +1032,15 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     let reductionAction reporter reducerLogger pool = case valStrategy of
             StrategyFull -> do
                 ReductionResult sql evidence <-
-                    reduceSQLWithResultTrace lookupTrace reporter reductionConfig reducerLogger pool initialSQL
+                    reduceSQLWithResultTraceFull
+                        initialParsed
+                        failPrefixCache
+                        lookupTrace
+                        reporter
+                        reductionConfig
+                        reducerLogger
+                        pool
+                        initialSQL
                 pure (ReductionActionResult sql evidence)
             StrategyDdminOnly -> do
                 sql <-
@@ -1066,9 +1089,11 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 then fromIntegral totalHits / fromIntegral totalLookups
                 else 0.0
     reducedStmts <-
-        if reducedSQL == initialSQL
-            then pure initialStmts
-            else countStatementsForCLI logger valDialect reducedSQL
+        case evaluatedStatements result of
+            Just count -> pure count
+            Nothing
+                | reducedSQL == initialSQL -> pure initialStmts
+                | otherwise -> countStatementsForCLI logger valDialect reducedSQL
     let reducedBytes = BS.length reducedSQL
         ratio =
             if initialBytes > 0
@@ -1160,8 +1185,13 @@ requireOracleCommand Nothing = do
     hPutStrLn stderr " note: specify predicate with -c or --oracle (e.g. -c './check.sh')"
     exitCliError
 
-loadInitialInput :: Logger -> SQLDialect -> FilePath -> IO (BS.ByteString, Int, Int)
-loadInitialInput logger dialect inputFile = do
+loadInitialInput ::
+    Logger ->
+    SQLDialect ->
+    Bool ->
+    FilePath ->
+    IO (BS.ByteString, Int, Int, Maybe (BS.ByteString, (SessionInit, [StatementUnit])))
+loadInitialInput logger dialect reuseInitialParse inputFile = do
     sql <-
         if inputFile == "-"
             then BS.getContents
@@ -1173,8 +1203,25 @@ loadInitialInput logger dialect inputFile = do
                     hPutStrLn stderr ("error: " ++ msg)
                     exitFailure
                 BS.readFile inputFile
-    statements <- countStatementsForCLI logger dialect sql
-    pure (sql, statements, BS.length sql)
+    if reuseInitialParse
+        then do
+            parsed <- parseSQL (defaultParseOptions dialect) sql
+            case parsed of
+                Left err -> do
+                    let message = "SQL parser failed while counting statements: " <> T.pack (show err)
+                    logError logger "parser" message
+                    hPutStrLn stderr ("error: " ++ T.unpack message)
+                    exitFailure
+                Right p ->
+                    pure
+                        ( sql
+                        , length (parsedUnits p)
+                        , BS.length sql
+                        , Just (sql, (parsedInitialSession p, parsedUnits p))
+                        )
+        else do
+            statements <- countStatementsForCLI logger dialect sql
+            pure (sql, statements, BS.length sql, Nothing)
 
 buildReductionConfig ::
     Bool ->

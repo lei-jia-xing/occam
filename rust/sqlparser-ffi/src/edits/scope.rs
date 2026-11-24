@@ -67,6 +67,7 @@ pub(crate) struct AnalysisContext<'a> {
     pub(crate) chunk_edits: bool,
     pub(crate) column_ir: bool,
     pub(crate) syntax_edits: bool,
+    pub(crate) syntax_only: bool,
     /// Whether pure built-in functions ([`crate::pure`]) may lift routine fences.
     ///
     /// Disabled (`false`) script-wide whenever any routine DDL statement or parse error

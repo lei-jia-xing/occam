@@ -13,6 +13,7 @@ fn parse(sql: &str, dialect: DialectKind) -> Result<Vec<NativeUnit>, String> {
             column_ir: false,
             column_bundles: false,
             syntax_edits: true,
+            syntax_only: false,
         },
     )
 }
@@ -27,6 +28,7 @@ fn parse_chunks(sql: &str, dialect: DialectKind) -> Result<Vec<NativeUnit>, Stri
             column_ir: false,
             column_bundles: false,
             syntax_edits: true,
+            syntax_only: false,
         },
     )
 }
@@ -436,6 +438,7 @@ fn invalid_utf8_is_rejected_at_the_ffi_boundary() {
         column_ir: false,
         column_bundles: false,
         syntax_edits: true,
+        syntax_only: false,
     })
     .unwrap();
     let mut output: *mut u8 = std::ptr::null_mut();
@@ -1701,6 +1704,7 @@ fn session_init_resolves_the_dialect_foreign_key_default() {
         column_ir: false,
         column_bundles: false,
         syntax_edits: true,
+        syntax_only: false,
     };
     assert!(
         !crate::ffi::session_init(&config(DialectKind::SQLite, None)).foreign_key_checks,
@@ -2761,6 +2765,7 @@ fn syntax_edit_gate_drops_only_edits() {
             column_ir: false,
             column_bundles: false,
             syntax_edits: false,
+            syntax_only: false,
         },
     )
     .expect("parse");

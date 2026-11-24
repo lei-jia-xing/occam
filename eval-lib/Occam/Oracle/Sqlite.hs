@@ -18,6 +18,7 @@ module Occam.Oracle.Sqlite (
     sqliteContractObservationTimeout,
     sqliteContractObservationWithResultStatement,
     sqliteContractObservationWithTrace,
+    prepareSqliteContractObserver,
     splitStatements,
     sqlDataToValue,
 ) where
@@ -34,9 +35,11 @@ import Control.Exception.Safe (
 import Control.Monad (forM, unless, when)
 import Data.Aeson (
     FromJSON (..),
+    Result (..),
     ToJSON (..),
     Value (..),
     eitherDecodeStrict',
+    fromJSON,
     object,
     withObject,
     (.!=),
@@ -44,20 +47,24 @@ import Data.Aeson (
     (.:?),
     (.=),
  )
+import Data.Aeson.KeyMap qualified as KM
 import Data.Bifunctor (second)
-import Data.Bits ((.&.))
+import Data.Bits ((.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Char (isSpace)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Int (Int64)
 import Data.IntSet qualified as IntSet
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Database.SQLite3 (
     SQLData (..),
     SQLError (..),
@@ -210,14 +217,18 @@ executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteE
 executeSqliteCandidateDetailedTimeout micros sql =
     fmap (maybe [] (resultRows . srLastResult)) <$> executeSqliteRun micros sql
 
+data SqliteCache
+
 data SqliteConn = SqliteConn
     { scDb :: !Direct.Database
     , scTemplate :: !Direct.Database
     , scDirtyPtr :: !(Ptr CInt)
+    , scCachePtr :: !(Ptr SqliteCache)
     , scDmlTainted :: !(IORef Bool)
     }
 
-dirtyTemp, dirtyDml, dirtyConnCounter, dirtyNondet :: CInt
+dirtyPragma, dirtyTemp, dirtyDml, dirtyConnCounter, dirtyNondet :: CInt
+dirtyPragma = 2
 dirtyTemp = 4
 dirtyDml = 8
 dirtyConnCounter = 16
@@ -241,6 +252,46 @@ foreign import ccall unsafe "sqlite3_set_authorizer"
 foreign import ccall safe "occam_sqlite_reset"
     c_occamSqliteReset :: Ptr CDatabase -> Ptr CDatabase -> Ptr CInt -> IO CInt
 
+foreign import ccall unsafe "occam_sqlite_cache_create"
+    c_occamSqliteCacheCreate :: IO (Ptr SqliteCache)
+
+foreign import ccall unsafe "occam_sqlite_cache_destroy"
+    c_occamSqliteCacheDestroy :: Ptr SqliteCache -> IO ()
+
+foreign import ccall safe "occam_sqlite_run_and_match"
+    c_occamSqliteRunAndMatch ::
+        Ptr CDatabase ->
+        Ptr CInt ->
+        Ptr SqliteCache ->
+        Ptr Word8 ->
+        CSize ->
+        Ptr Word8 ->
+        CSize ->
+        Int64 ->
+        CInt ->
+        Ptr CInt ->
+        Ptr CInt ->
+        Ptr CInt ->
+        Ptr CInt ->
+        Ptr Word8 ->
+        CInt ->
+        Ptr CInt ->
+        Ptr CInt ->
+        IO CInt
+
+foreign import ccall safe "occam_sqlite_build_ckpts"
+    c_occamSqliteBuildCkpts ::
+        Ptr CDatabase ->
+        Ptr CDatabase ->
+        Ptr CInt ->
+        Ptr SqliteCache ->
+        Ptr Word8 ->
+        CSize ->
+        Ptr Word8 ->
+        CSize ->
+        CInt ->
+        IO CInt
+
 foreign import ccall safe "occam_sqlite_next_result"
     c_occamSqliteNextResult ::
         Ptr CDatabase ->
@@ -263,7 +314,13 @@ createSqliteConn = do
     db <- openFreshMemoryDb
     tmpl <- openFreshMemoryDb `onException` close db
     dirtyPtr <- malloc `onException` (close tmpl >> close db)
-    let cleanup = free dirtyPtr >> close tmpl >> close db
+    cachePtr <- c_occamSqliteCacheCreate `onException` (free dirtyPtr >> close tmpl >> close db)
+    let cleanup = do
+            when (cachePtr /= nullPtr) (c_occamSqliteCacheDestroy cachePtr)
+            free dirtyPtr
+            close tmpl
+            close db
+    when (cachePtr == nullPtr) (cleanup >> fail "Could not allocate SQLite checkpoint cache")
     poke dirtyPtr 0
     -- Keep the engine baseline aligned with SQLite parser session defaults.
     exec db "PRAGMA foreign_keys = OFF;" `onException` cleanup
@@ -273,12 +330,20 @@ createSqliteConn = do
     if status /= 0
         then cleanup >> fail "Could not install SQLite authorizer"
         else
-            pure SqliteConn {scDb = db, scTemplate = tmpl, scDirtyPtr = dirtyPtr, scDmlTainted = dmlTainted}
+            pure
+                SqliteConn
+                    { scDb = db
+                    , scTemplate = tmpl
+                    , scDirtyPtr = dirtyPtr
+                    , scCachePtr = cachePtr
+                    , scDmlTainted = dmlTainted
+                    }
 
 destroySqliteConn :: SqliteConn -> IO ()
 destroySqliteConn SqliteConn {..} = do
     let Direct.Database dbPtr = scDb
     _ <- setAuthorizer dbPtr nullFunPtr nullPtr
+    c_occamSqliteCacheDestroy scCachePtr
     free scDirtyPtr
     close scTemplate
     close scDb
@@ -540,6 +605,28 @@ generateSqliteContractWithTrace micros sql = do
         Right (Just run) -> do
             let result = srLastResult run
             trace <- buildSqliteTrace sql result run
+            -- Pre-warm prefix checkpoints on a pooled connection for large clean deterministic scripts.
+            when (traceDeterministic trace && traceStatementCount trace >= 8) $
+                case encodeSqliteExpected result of
+                    Nothing -> pure ()
+                    Just expBytes ->
+                        withPooledSqliteConn $ \conn -> do
+                            let Direct.Database dbPtr = scDb conn
+                                Direct.Database tmplPtr = scTemplate conn
+                            ok <- BSU.unsafeUseAsCStringLen sql $ \(sqlPtr, sqlLen) ->
+                                BSU.unsafeUseAsCStringLen expBytes $ \(expPtr, expLen) ->
+                                    (/= 0)
+                                        <$> c_occamSqliteBuildCkpts
+                                            dbPtr
+                                            tmplPtr
+                                            (scDirtyPtr conn)
+                                            (scCachePtr conn)
+                                            (castPtr sqlPtr)
+                                            (fromIntegral sqlLen)
+                                            (castPtr expPtr)
+                                            (fromIntegral expLen)
+                                            (fromIntegral (traceStatementCount trace))
+                            pure (ok, ())
             pure $
                 Right
                     ( SqliteContract
@@ -550,6 +637,239 @@ generateSqliteContractWithTrace micros sql = do
                         }
                     , trace
                     )
+
+-- | Encode a SQLite ResultSet into the compact binary format for C-side matching.
+encodeSqliteExpected :: ResultSet -> Maybe ByteString
+encodeSqliteExpected (ResultSet cols _ rows) = do
+    let colCount = length cols
+    rowBuilders <- mapM (encodeRow colCount) rows
+    let header =
+            BB.word32LE (fromIntegral colCount)
+                <> BB.word32LE (fromIntegral (length rows))
+                <> mconcat (map encodeColName cols)
+    pure (BL.toStrict (BB.toLazyByteString (header <> mconcat rowBuilders)))
+    where
+        encodeColName name =
+            let bs = TE.encodeUtf8 name
+             in BB.word32LE (fromIntegral (BS.length bs)) <> BB.byteString bs
+        encodeRow expectedCols row
+            | length row /= expectedCols = Nothing
+            | otherwise = mconcat <$> mapM encodeVal row
+        encodeVal Null = Just (BB.word8 5)
+        encodeVal (String t) =
+            let bs = TE.encodeUtf8 t
+             in Just (BB.word8 3 <> BB.word32LE (fromIntegral (BS.length bs)) <> BB.byteString bs)
+        encodeVal v@(Number _) = case fromJSON v of
+            Success (n :: Int64) -> Just (BB.word8 1 <> BB.int64LE n)
+            Error _ -> Nothing
+        encodeVal (Object o)
+            | KM.size o == 1
+            , Just fv <- KM.lookup "float64_bits" o = case fromJSON fv of
+                Success (bits :: Word64) -> Just (BB.word8 2 <> BB.word64LE bits)
+                Error _ -> Nothing
+            | KM.size o == 1
+            , Just bv <- KM.lookup "blob" o = case fromJSON bv of
+                Success (bytes :: [Word8]) ->
+                    let bs = BS.pack bytes
+                     in Just (BB.word8 4 <> BB.word32LE (fromIntegral (BS.length bs)) <> BB.byteString bs)
+                Error _ -> Nothing
+            | otherwise = Nothing
+        encodeVal _ = Nothing
+
+matchCandidateOnConn ::
+    Int ->
+    ByteString ->
+    ByteString ->
+    Bool ->
+    (ByteString -> IO ()) ->
+    SqliteConn ->
+    IO (Bool, Bool, (OracleObservation, Maybe ResultTrace))
+matchCandidateOnConn micros expectedBytes sql allowCkpt onFailingPrefix conn = do
+    poke (scDirtyPtr conn) 0
+    tainted <- readIORef (scDmlTainted conn)
+    let db = scDb conn
+        Direct.Database dbPtr = db
+        Direct.Database tmplPtr = scTemplate conn
+        maxOffsets = max 64 (BS.count 59 sql + 16)
+    res <-
+        try $
+            interruptibly db $
+                BSU.unsafeUseAsCStringLen sql $ \(sqlPtr, sqlLen) ->
+                    BSU.unsafeUseAsCStringLen expectedBytes $ \(expPtr, expLen) ->
+                        alloca $ \stmtCountPtr ->
+                            alloca $ \firstResPtr ->
+                                alloca $ \lastResPtr ->
+                                    allocaArray maxOffsets $ \offsetsPtr ->
+                                        allocaArray maxOffsets $ \flagsPtr ->
+                                            alloca $ \usedCkptDmlPtr ->
+                                                alloca $ \failEndPtr -> do
+                                                    status <-
+                                                        c_occamSqliteRunAndMatch
+                                                            dbPtr
+                                                            (scDirtyPtr conn)
+                                                            (scCachePtr conn)
+                                                            (castPtr sqlPtr)
+                                                            (fromIntegral sqlLen)
+                                                            (castPtr expPtr)
+                                                            (fromIntegral expLen)
+                                                            (fromIntegral micros)
+                                                            (if allowCkpt then 1 else 0)
+                                                            stmtCountPtr
+                                                            firstResPtr
+                                                            lastResPtr
+                                                            offsetsPtr
+                                                            flagsPtr
+                                                            (fromIntegral maxOffsets)
+                                                            usedCkptDmlPtr
+                                                            failEndPtr
+                                                    stmtCount <- fromIntegral <$> peek stmtCountPtr
+                                                    firstRes <- fromIntegral <$> peek firstResPtr
+                                                    lastRes <- fromIntegral <$> peek lastResPtr
+                                                    usedCkptDml <- (/= 0) <$> peek usedCkptDmlPtr
+                                                    failEnd <- fromIntegral <$> peek failEndPtr
+                                                    if status == 0
+                                                        then do
+                                                            (offsets, flags) <-
+                                                                if stmtCount <= maxOffsets
+                                                                    then do
+                                                                        rawOffsets <- peekArray stmtCount offsetsPtr
+                                                                        rawFlags <- peekArray stmtCount flagsPtr
+                                                                        pure (Just (map fromIntegral rawOffsets), rawFlags)
+                                                                    else pure (Nothing, [])
+                                                            pure (status, stmtCount, firstRes, lastRes, offsets, flags, usedCkptDml, failEnd)
+                                                        else pure (status, stmtCount, firstRes, lastRes, Nothing, [], usedCkptDml, failEnd)
+    dirty <- peek (scDirtyPtr conn)
+    when ((dirty .&. dirtyDml) /= 0) $
+        writeIORef (scDmlTainted conn) True
+    let poolable = (dirty .&. dirtyTemp) == 0
+        authorizerDet = (dirty .&. dirtyNondet) == 0
+    case res of
+        Left (err :: SomeException) ->
+            pure (False, False, (OracleIOFailed (T.pack (displayException err)), Nothing))
+        Right (status, stmtCount, firstRes, lastRes, offsets, flags, usedCkptDml, failEnd) ->
+            let counterPolluted = (tainted || usedCkptDml) && (dirty .&. dirtyConnCounter) /= 0
+             in case status of
+                    0 -> do
+                        deterministic <-
+                            if authorizerDet
+                                then BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
+                                    (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
+                                else pure False
+                        let (resIdxList, prefMatchList) = decodeResultFlags flags
+                            trace =
+                                ResultTrace
+                                    { traceStatementCount = stmtCount
+                                    , traceFirstResultIndex = if firstRes >= 0 then firstRes else lastRes
+                                    , traceLastResultIndex = lastRes
+                                    , traceResultIndices = IntSet.fromDistinctAscList resIdxList
+                                    , tracePrefixMatchIndices = IntSet.fromDistinctAscList prefMatchList
+                                    , traceDeterministic = deterministic
+                                    , traceEndByteOffsets = offsets
+                                    }
+                        keepConn <-
+                            if allowCkpt
+                                && not counterPolluted
+                                && poolable
+                                && deterministic
+                                && stmtCount >= 8
+                                && (dirty .&. (dirtyTemp .|. dirtyPragma .|. dirtyConnCounter .|. dirtyNondet)) == 0
+                                then do
+                                    resetOk <- (/= 0) <$> c_occamSqliteReset dbPtr tmplPtr (scDirtyPtr conn)
+                                    if not resetOk
+                                        then pure False
+                                        else BSU.unsafeUseAsCStringLen sql $ \(sqlPtr, sqlLen) ->
+                                            BSU.unsafeUseAsCStringLen expectedBytes $ \(expPtr, expLen) ->
+                                                (/= 0)
+                                                    <$> c_occamSqliteBuildCkpts
+                                                        dbPtr
+                                                        tmplPtr
+                                                        (scDirtyPtr conn)
+                                                        (scCachePtr conn)
+                                                        (castPtr sqlPtr)
+                                                        (fromIntegral sqlLen)
+                                                        (castPtr expPtr)
+                                                        (fromIntegral expLen)
+                                                        (fromIntegral stmtCount)
+                                else pure poolable
+                        pure (keepConn, counterPolluted, (OracleFinished ExitSuccess, Just trace))
+                    1 -> pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
+                    2 -> do
+                        when
+                            ( not counterPolluted
+                                && failEnd > 0
+                                && failEnd <= BS.length sql
+                                && (dirty .&. (dirtyTemp .|. dirtyNondet)) == 0
+                            )
+                            $ do
+                                let prefix = BS.take failEnd sql
+                                isDetPrefix <- BSU.unsafeUseAsCStringLen prefix $ \(ptr, len) ->
+                                    (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
+                                when isDetPrefix (onFailingPrefix prefix)
+                        pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
+                    3 -> pure (False, False, (OracleTimedOut, Nothing))
+                    _ -> pure (False, False, (OracleIOFailed "SQLite execution infrastructure error", Nothing))
+    where
+        decodeResultFlags = go 0 False [] []
+            where
+                go _ _ resAcc prefAcc [] = (reverse resAcc, reverse prefAcc)
+                go !k !matches resAcc prefAcc (f : fs)
+                    | (f .&. 1) /= 0 =
+                        let !m = (f .&. 2) /= 0
+                         in go (k + 1) m (k : resAcc) (if m then k : prefAcc else prefAcc) fs
+                    | matches = go (k + 1) True resAcc (k : prefAcc) fs
+                    | otherwise = go (k + 1) False resAcc prefAcc fs
+
+{- | Prepare a reusable fast SQLite contract observer that pre-encodes expected
+results once into binary form for zero-allocation C-side matching and
+optionally reports deterministic semicolon-terminated failing prefixes.
+-}
+prepareSqliteContractObserver ::
+    Int ->
+    SqliteContract ->
+    (ByteString -> IO ()) ->
+    (ByteString -> IO (OracleObservation, Maybe ResultTrace))
+prepareSqliteContractObserver micros contract onFailingPrefix
+    -- TODO: Define a reproducible database-state observation before accepting state contracts.
+    | contractCheckState contract || isJust (contractStateSha256 contract) =
+        const (pure (OracleIOFailed "SQLite state contracts are unsupported", Nothing))
+    | Just expectedBytes <- encodeSqliteExpected expected = \candidate -> do
+        checkStatus <- BSU.unsafeUseAsCStringLen candidate $ \(ptr, len) ->
+            c_checkSql (castPtr ptr) (fromIntegral len)
+        case checkStatus of
+            1 -> pure (OracleFinished (ExitFailure 1), Nothing)
+            2 ->
+                pure $ case TE.decodeUtf8' candidate of
+                    Left err -> (OracleIOFailed (T.pack (show err)), Nothing)
+                    Right _ -> (OracleIOFailed "Invalid UTF-8", Nothing)
+            _ -> do
+                (retryFresh, outcome) <- withPooledSqliteConn $ \conn -> do
+                    (keepConn, counterPolluted, res) <-
+                        matchCandidateOnConn micros expectedBytes candidate True onFailingPrefix conn
+                    pure (keepConn, (counterPolluted, res))
+                if retryFresh
+                    then bracket createSqliteConn destroySqliteConn $ \freshConn -> do
+                        (_, _, freshRes) <-
+                            matchCandidateOnConn micros expectedBytes candidate False onFailingPrefix freshConn
+                        pure freshRes
+                    else pure outcome
+    | otherwise = sqliteContractObservationFallback micros expected
+    where
+        expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)
+
+sqliteContractObservationFallback ::
+    Int -> ResultSet -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
+sqliteContractObservationFallback micros expected candidate = do
+    res <- executeSqliteRun micros candidate
+    case res of
+        Left SqliteTimeout -> pure (OracleTimedOut, Nothing)
+        Left (SqliteExecutionError _) -> pure (OracleFinished (ExitFailure 1), Nothing)
+        Left (SqliteInfrastructureError err) -> pure (OracleIOFailed err, Nothing)
+        Right observed
+            | Just run <- observed
+            , srLastResult run == expected -> do
+                trace <- buildSqliteTrace candidate expected run
+                pure (OracleFinished ExitSuccess, Just trace)
+            | otherwise -> pure (OracleFinished (ExitFailure 1), Nothing)
 
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate =
@@ -572,21 +892,5 @@ sqliteContractObservationWithResultStatement micros contract candidate =
 
 sqliteContractObservationWithTrace ::
     Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
-sqliteContractObservationWithTrace micros contract candidate
-    -- TODO: Define a reproducible database-state observation before accepting state contracts.
-    | contractCheckState contract || isJust (contractStateSha256 contract) =
-        pure (OracleIOFailed "SQLite state contracts are unsupported", Nothing)
-    | otherwise = do
-        res <- executeSqliteRun micros candidate
-        case res of
-            Left SqliteTimeout -> pure (OracleTimedOut, Nothing)
-            Left (SqliteExecutionError _) -> pure (OracleFinished (ExitFailure 1), Nothing)
-            Left (SqliteInfrastructureError err) -> pure (OracleIOFailed err, Nothing)
-            Right observed
-                | Just run <- observed
-                , srLastResult run == expected -> do
-                    trace <- buildSqliteTrace candidate expected run
-                    pure (OracleFinished ExitSuccess, Just trace)
-                | otherwise -> pure (OracleFinished (ExitFailure 1), Nothing)
-    where
-        expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)
+sqliteContractObservationWithTrace micros contract =
+    prepareSqliteContractObserver micros contract (const (pure ()))

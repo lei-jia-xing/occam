@@ -193,6 +193,63 @@ pub unsafe extern "C" fn occam_sql_parse(
     }
 }
 
+/// Fast path for parsing SQL with default server settings using compact integer flags,
+/// avoiding JSON config serialization/deserialization on every call.
+///
+/// Flag bits:
+/// - `1 << 0`: `chunk_edits`
+/// - `1 << 1`: `column_ir`
+/// - `1 << 2`: `column_bundles`
+/// - `1 << 3`: `syntax_edits`
+/// - `1 << 4`: `syntax_only`
+///
+/// # Safety
+/// Same pointer validity requirements as [`occam_sql_parse`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn occam_sql_parse_flags(
+    dialect_code: u32,
+    flags: u32,
+    data: *const u8,
+    len: usize,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    unsafe {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if out_data.is_null() || out_len.is_null() {
+                return Err(1);
+            }
+            if data.is_null() && len != 0 {
+                return Err(1);
+            }
+            let dialect = dialect_from_code(dialect_code).ok_or(2)?;
+            let config = ParseConfig {
+                dialect,
+                server: Default::default(),
+                chunk_edits: (flags & 1) != 0,
+                column_ir: (flags & 2) != 0,
+                column_bundles: (flags & 4) != 0,
+                syntax_edits: (flags & 8) != 0,
+                syntax_only: (flags & 16) != 0,
+            };
+            let bytes = if len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data, len)
+            };
+            let sql = std::str::from_utf8(bytes).map_err(|_| 3)?;
+            let payload = facts_binary(sql, &config).ok_or(4)?;
+            put_bytes(payload, out_data, out_len);
+            Ok(())
+        }));
+        match result {
+            Ok(Err(code)) => code,
+            Err(_) => 5,
+            Ok(Ok(())) => 0,
+        }
+    }
+}
+
 /// Converts a native parser status code into an owned UTF-8 error message buffer.
 ///
 /// # Parameters
@@ -369,6 +426,7 @@ mod tests {
             column_ir: false,
             column_bundles: false,
             syntax_edits: true,
+            syntax_only: false,
         };
         let init = session_init(&config);
         assert_eq!(init.namespace_prefix[0].0, "Tenant");
@@ -410,6 +468,7 @@ mod tests {
             column_ir,
             column_bundles,
             syntax_edits: true,
+            syntax_only: false,
         };
         let json = facts_json(sql, &config).expect("facts json");
         serde_json::from_slice(&json).expect("response json")
@@ -455,5 +514,214 @@ mod tests {
             Some(&serde_json::Value::from("a"))
         );
         assert!(targets[0].get("blocked").expect("blocked").is_null());
+    }
+
+    #[test]
+    fn parse_flags_matches_json_config_ffi_exactly() {
+        let sql = concat!(
+            "CREATE TABLE t(a INT, b TEXT);\n",
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c;\n",
+            "INSERT INTO t VALUES (1, 'hello');\n",
+        );
+        for &(flags, chunk_edits, column_ir, column_bundles, syntax_edits, syntax_only) in &[
+            (0u32, false, false, false, false, false),
+            (1u32, true, false, false, false, false),
+            (8u32, false, false, false, true, false),
+            (9u32, true, false, false, true, false),
+            (15u32, true, true, true, true, false),
+            (25u32, true, false, false, true, true),
+        ] {
+            let config = ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: crate::ir::ServerConfig::default(),
+                chunk_edits,
+                column_ir,
+                column_bundles,
+                syntax_edits,
+                syntax_only,
+            };
+            let cfg_bytes = serde_json::to_vec(&config).expect("serialize config");
+            let mut json_ptr = std::ptr::null_mut();
+            let mut json_len = 0;
+            let rc_json = unsafe {
+                occam_sql_parse(
+                    cfg_bytes.as_ptr(),
+                    cfg_bytes.len(),
+                    sql.as_ptr(),
+                    sql.len(),
+                    &mut json_ptr,
+                    &mut json_len,
+                )
+            };
+            assert_eq!(rc_json, 0);
+            let json_out = unsafe { std::slice::from_raw_parts(json_ptr, json_len).to_vec() };
+            unsafe { occam_sql_free(json_ptr, json_len) };
+
+            let mut flags_ptr = std::ptr::null_mut();
+            let mut flags_len = 0;
+            let rc_flags = unsafe {
+                occam_sql_parse_flags(
+                    3, // SQLite
+                    flags,
+                    sql.as_ptr(),
+                    sql.len(),
+                    &mut flags_ptr,
+                    &mut flags_len,
+                )
+            };
+            assert_eq!(rc_flags, 0);
+            let flags_out = unsafe { std::slice::from_raw_parts(flags_ptr, flags_len).to_vec() };
+            unsafe { occam_sql_free(flags_ptr, flags_len) };
+
+            assert_eq!(flags_out, json_out, "flags={flags} mismatch");
+        }
+    }
+
+    #[test]
+    fn syntax_edits_disabled_preserves_spans_and_semantic_facts() {
+        let sql = concat!(
+            "CREATE TABLE t(a INT, b TEXT);\n",
+            "WITH cte(x) AS (SELECT a FROM t WHERE a > 0) SELECT x FROM cte;\n",
+            "INSERT INTO t VALUES (1, 'ok');\n",
+            "SELECT * FROM t; SELECT 'unterminated\n",
+        );
+        let mk = |syntax_edits| ParseConfig {
+            dialect: DialectKind::SQLite,
+            server: crate::ir::ServerConfig::default(),
+            chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits,
+            syntax_only: false,
+        };
+        let with_edits = parse_units(sql, &mk(true)).expect("with syntax_edits");
+        let without_edits = parse_units(sql, &mk(false)).expect("without syntax_edits");
+        assert_eq!(with_edits.len(), without_edits.len());
+        for (a, b) in with_edits.iter().zip(without_edits.iter()) {
+            assert_eq!(a.start, b.start);
+            assert_eq!(a.end, b.end);
+            assert_eq!(a.parse_error, b.parse_error);
+            assert_eq!(a.cannot_produce_result, b.cannot_produce_result);
+            assert_eq!(a.facts.is_some(), b.facts.is_some());
+            if let (Some(fa), Some(fb)) = (&a.facts, &b.facts) {
+                assert!(fb.edits.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&fa.ops).unwrap(),
+                    serde_json::to_value(&fb.ops).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&fa.barriers).unwrap(),
+                    serde_json::to_value(&fb.barriers).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&fa.pre_tx).unwrap(),
+                    serde_json::to_value(&fb.pre_tx).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&fa.post_tx).unwrap(),
+                    serde_json::to_value(&fb.post_tx).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_only_preserves_all_edits_and_skips_semantic_ops() {
+        let sql = concat!(
+            "CREATE TABLE t(a INT, b TEXT);\n",
+            "INSERT INTO t VALUES (1, 'hello'), (2, 'world');\n",
+            "WITH cte AS (SELECT a, b FROM t WHERE a > 0) SELECT a, b FROM cte ORDER BY a;\n",
+        );
+        let full = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: Default::default(),
+                chunk_edits: true,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
+                syntax_only: false,
+            },
+        )
+        .expect("full parse");
+        let fast = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: Default::default(),
+                chunk_edits: true,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
+                syntax_only: true,
+            },
+        )
+        .expect("syntax_only parse");
+        assert_eq!(full.len(), fast.len());
+        for (a, b) in full.iter().zip(fast.iter()) {
+            assert_eq!(a.start, b.start);
+            assert_eq!(a.end, b.end);
+            assert_eq!(a.cannot_produce_result, b.cannot_produce_result);
+            let fa = a.facts.as_ref().expect("full facts");
+            let fb = b.facts.as_ref().expect("fast facts");
+            assert_eq!(fa.edits, fb.edits);
+            assert!(fb.ops.is_empty());
+            assert!(fb.barriers.is_empty());
+        }
+    }
+
+    #[test]
+    fn top_level_projection_flag_marks_only_outer_wildcard_free_select() {
+        let sql = concat!(
+            "WITH c AS (SELECT x, y FROM t) SELECT a, b FROM c;\n",
+            "SELECT *, a FROM t;\n",
+            "SELECT a, b FROM t UNION SELECT c, d FROM u;\n",
+            "CREATE VIEW v AS SELECT a, b FROM t;\n",
+        );
+        let units = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: Default::default(),
+                chunk_edits: true,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
+                syntax_only: true,
+            },
+        )
+        .expect("parse");
+        // Unit 0: CTE inner SELECT (x, y) must NOT be flagged; outer SELECT (a, b) MUST be flagged.
+        let u0_edits = &units[0].facts.as_ref().unwrap().edits;
+        let flagged: Vec<&str> = u0_edits
+            .iter()
+            .filter(|e| e.top_level_projection)
+            .map(|e| &sql[e.start..e.end])
+            .collect();
+        let unflagged_proj: Vec<&str> = u0_edits
+            .iter()
+            .filter(|e| !e.top_level_projection && e.label.starts_with("remove-select_expression"))
+            .map(|e| &sql[e.start..e.end])
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            2,
+            "expected outer a and b flagged: {flagged:?}"
+        );
+        assert!(flagged.iter().all(|s| s.contains('a') || s.contains('b')));
+        assert_eq!(
+            unflagged_proj.len(),
+            2,
+            "expected inner CTE x and y unflagged: {unflagged_proj:?}"
+        );
+        // Units 1 (wildcard), 2 (UNION), 3 (CREATE VIEW): zero flagged edits.
+        for idx in [1, 2, 3] {
+            let edits = &units[idx].facts.as_ref().unwrap().edits;
+            assert!(
+                edits.iter().all(|e| !e.top_level_projection),
+                "unit {idx} should have no top_level_projection edits"
+            );
+        }
     }
 }

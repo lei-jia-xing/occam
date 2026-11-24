@@ -26,6 +26,11 @@ pub struct ParseConfig {
     /// Off by default: dependency/semantic facts are unaffected.
     #[serde(default)]
     pub syntax_edits: bool,
+    /// Skip semantic dependency extraction (ops, barriers, session, tx effects)
+    /// when only syntactic edits are needed (intra-statement rewrite passes).
+    /// Ignored when `column_ir` or `column_bundles` is enabled.
+    #[serde(default)]
+    pub syntax_only: bool,
 }
 /// Server/session configuration that is independent of a particular SQL text.
 #[derive(Clone, Debug, Serialize, Deserialize)]

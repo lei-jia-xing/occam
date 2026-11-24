@@ -144,6 +144,9 @@ traceResultStatement trace =
 data EarlyRejectReason
     = EarlyRejectExactPrefix
     | EarlyRejectNoResultStatement
+    | EarlyRejectFailingPrefix
+    | EarlyRejectMissingDefinition
+    | EarlyRejectColumnArityMismatch
     deriving (Eq, Ord, Show)
 
 newtype Ident = Ident {identText :: Text}

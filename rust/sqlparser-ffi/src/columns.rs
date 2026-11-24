@@ -1508,6 +1508,7 @@ mod tests {
                 column_ir: true,
                 column_bundles: true,
                 syntax_edits: true,
+                syntax_only: false,
             },
         )
         .expect("parse");

@@ -10,7 +10,7 @@ module Occam.Facts (
     parseEditCategoryName,
 ) where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), withObject, withText, (.:))
+import Data.Aeson (FromJSON (..), ToJSON (..), withObject, withText, (.!=), (.:), (.:?))
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -75,6 +75,7 @@ data ParserEdit = ParserEdit
     , parserEditReplacement :: !ByteString
     , parserEditCategory :: !ParserEditCategory
     , parserEditLabel :: !Text
+    , parserEditTopProjection :: !Bool
     }
     deriving (Eq, Show)
 
@@ -86,6 +87,7 @@ instance FromJSON ParserEdit where
             <*> (TE.encodeUtf8 <$> objectValue .: "replacement")
             <*> objectValue .: "category"
             <*> objectValue .: "label"
+            <*> objectValue .:? "top_level_projection" .!= False
 
 data ColumnSiteKind
     = CreateDefSite

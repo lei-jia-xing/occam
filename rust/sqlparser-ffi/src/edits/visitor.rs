@@ -56,6 +56,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     unit: ByteSpan,
     chunk_edits: bool,
     syntax_edits: bool,
+    top_level_select_ptr: Option<*const Select>,
 }
 impl<'a> AnalysisVisitor<'a> {
     pub(crate) fn new(context: AnalysisContext<'a>) -> Self {
@@ -94,6 +95,7 @@ impl<'a> AnalysisVisitor<'a> {
             unit: context.unit,
             chunk_edits: context.chunk_edits,
             syntax_edits: context.syntax_edits,
+            top_level_select_ptr: None,
         }
     }
 
@@ -772,6 +774,7 @@ impl<'a> AnalysisVisitor<'a> {
             replacement: replacement.to_owned(),
             category,
             label: label.into(),
+            top_level_projection: false,
         });
     }
 
@@ -1185,6 +1188,9 @@ impl<'a> AnalysisVisitor<'a> {
     }
     fn cte_query_source_span(&self, cte: &sqlparser::ast::Cte) -> Option<(usize, usize)> {
         let range = self.mapped_span(cte.query.span())?;
+        if self.tokens.is_empty() {
+            return Some(range);
+        }
         let pair = self.matching_parentheses(range.0, range.1, 0)?;
         Some((pair.start, pair.end))
     }
@@ -2390,28 +2396,30 @@ impl Visitor for AnalysisVisitor<'_> {
                 names,
                 body_spans,
             });
-            self.list_edits("remove-cte", &with.cte_tables, |visitor, cte| {
-                visitor.cte_source_span(cte)
-            });
-            let body_start = with
-                .cte_tables
-                .last()
-                .and_then(|cte| self.cte_source_span(cte))
-                .and_then(|(_, end)| {
-                    let index = self.tokens.partition_point(|token| token.end <= end);
-                    self.next_significant(index, self.source.len())
-                        .map(|(_, token)| token.start)
+            if self.syntax_edits {
+                self.list_edits("remove-cte", &with.cte_tables, |visitor, cte| {
+                    visitor.cte_source_span(cte)
                 });
-            if let (Some((with_start, _)), Some(body_start)) =
-                (self.mapped_span(with.with_token.0.span), body_start)
-            {
-                self.add_edit_bytes(
-                    with_start,
-                    body_start,
-                    "",
-                    NativeEditCategory::List,
-                    "remove-with",
-                );
+                let body_start = with
+                    .cte_tables
+                    .last()
+                    .and_then(|cte| self.cte_source_span(cte))
+                    .and_then(|(_, end)| {
+                        let index = self.tokens.partition_point(|token| token.end <= end);
+                        self.next_significant(index, self.source.len())
+                            .map(|(_, token)| token.start)
+                    });
+                if let (Some((with_start, _)), Some(body_start)) =
+                    (self.mapped_span(with.with_token.0.span), body_start)
+                {
+                    self.add_edit_bytes(
+                        with_start,
+                        body_start,
+                        "",
+                        NativeEditCategory::List,
+                        "remove-with",
+                    );
+                }
             }
         } else {
             self.scopes.push(CteScope {
@@ -2421,6 +2429,9 @@ impl Visitor for AnalysisVisitor<'_> {
             });
         }
         self.record_table_commands(&query.body);
+        if !self.syntax_edits {
+            return std::ops::ControlFlow::Continue(());
+        }
         let query_scope = self.query_source_scope(query);
         if let Some(order) = &query.order_by {
             if let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope) {
@@ -2542,11 +2553,23 @@ impl Visitor for AnalysisVisitor<'_> {
                 });
             }
         }
+        if !self.syntax_edits {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let is_top_proj = self
+            .top_level_select_ptr
+            .is_some_and(|ptr| std::ptr::eq(ptr, select as *const Select));
+        let edits_before = self.edits.len();
         self.list_edits(
             "remove-select_expression",
             &select.projection,
             |visitor, item| visitor.select_item_source_span(item),
         );
+        if is_top_proj {
+            for edit in &mut self.edits[edits_before..] {
+                edit.top_level_projection = true;
+            }
+        }
         self.distinct_edits(select);
         self.list_edits("remove-from-relation", &select.from, |visitor, table| {
             visitor.table_with_joins_source_span(table)
@@ -2615,6 +2638,23 @@ impl Visitor for AnalysisVisitor<'_> {
         self.statement_depth += 1;
         if nested_dml && self.gate_nested_dml {
             self.nested_dml_depth += 1;
+        }
+        if !self.syntax_edits {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if self.statement_depth == 1
+            && let Statement::Query(query) = statement
+            && let SetExpr::Select(select) = query.body.as_ref()
+            && select.into.is_none()
+            && select.projection.len() >= 2
+            && !select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            })
+        {
+            self.top_level_select_ptr = Some(select.as_ref() as *const Select);
         }
         match statement {
             Statement::CreateTable(create) => {
@@ -2982,6 +3022,7 @@ impl Visitor for AnalysisVisitor<'_> {
                     .collect();
                 self.columns.push((parts, scope));
             }
+            _ if !self.syntax_edits => {}
             Expr::BinaryOp { left, right, .. } => {
                 if let Some((start, end)) = self.expression_source_span(expr) {
                     for replacement in [
@@ -3346,7 +3387,9 @@ impl Visitor for AnalysisVisitor<'_> {
     }
 
     fn pre_visit_value(&mut self, value: &ValueWithSpan) -> std::ops::ControlFlow<Self::Break> {
-        self.add_scalar_edit(value);
+        if self.syntax_edits {
+            self.add_scalar_edit(value);
+        }
         std::ops::ControlFlow::Continue(())
     }
 }

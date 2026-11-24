@@ -73,6 +73,7 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
             column_ir: false,
             column_bundles: false,
             syntax_edits: false,
+            syntax_only: false,
         },
         false,
         |_| {},
@@ -107,12 +108,14 @@ fn walk_units(
     let mut tokens = Vec::with_capacity((source.len() / 4).max(16));
     let tokenizer_error = tokenizer.tokenize_with_location_into_buf(&mut tokens).err();
     let source_map = detailed.then(|| SourceMap::new(source));
-    let mut positions = match &source_map {
-        Some(source_map) => token_positions(&tokens, source_map)?,
-        None => Vec::new(),
+    let need_tokens =
+        detailed && (config.syntax_edits || config.column_ir || config.column_bundles);
+    let mut positions = match (&source_map, need_tokens) {
+        (Some(source_map), true) => token_positions(&tokens, source_map)?,
+        _ => Vec::new(),
     };
-    let lexical_suffix = match (&tokenizer_error, detailed) {
-        (Some(error), true) => {
+    let lexical_suffix = match (&tokenizer_error, detailed, need_tokens) {
+        (Some(error), true, true) => {
             let prefix_len = positions
                 .iter()
                 .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
@@ -130,7 +133,44 @@ fn walk_units(
             positions.truncate(prefix_len);
             Some((start, Some(error.to_string())))
         }
-        (Some(_), false) => {
+        (Some(error), true, false) => {
+            let source_map = source_map
+                .as_ref()
+                .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
+            let prefix_len = tokens
+                .iter()
+                .rposition(|token| token.token == Token::SemiColon)
+                .map_or(0, |index| index + 1);
+            let start = match tokens
+                .iter()
+                .skip(prefix_len)
+                .find(|token| !matches!(token.token, Token::Whitespace(_)))
+            {
+                Some(token) => {
+                    source_map
+                        .span(token.span)
+                        .ok_or_else(|| "sqlparser returned an unmappable token span".to_string())?
+                        .start
+                }
+                None => match tokens.last() {
+                    Some(token) => {
+                        source_map
+                            .span(token.span)
+                            .ok_or_else(|| {
+                                "sqlparser returned an unmappable token span".to_string()
+                            })?
+                            .end
+                    }
+                    None => 0,
+                },
+            };
+            if start >= source.len() {
+                return Err("sqlparser returned an empty tokenizer error unit".to_string());
+            }
+            tokens.truncate(prefix_len);
+            Some((start, Some(error.to_string())))
+        }
+        (Some(_), false, _) => {
             let prefix_len = tokens
                 .iter()
                 .rposition(|token| token.token == Token::SemiColon)
@@ -138,11 +178,12 @@ fn walk_units(
             tokens.truncate(prefix_len);
             Some((0, None))
         }
-        (None, _) => None,
+        (None, _, _) => None,
     };
 
     // The parser retains the tokens used for delimiter recovery. Detailed
     // parsing alone needs byte positions and structural token metadata.
+    let token_count = tokens.len();
     let delimiter_at = |parser: &Parser<'_>, index| {
         let token = parser.token_at(index);
         (token.token == Token::SemiColon).then_some(token.span.start)
@@ -224,9 +265,9 @@ fn walk_units(
         // In detailed mode, determine the unit's end byte offset:
         // - At EOF on unparsed trailing content, span to the end of the input source.
         // - Otherwise, find the last substantive token (excluding trailing whitespace/semicolons/EOF).
-        let end = match detailed {
-            true if at_eof && statement.is_none() && lexical_suffix.is_none() => source.len(),
-            true => positions
+        let end = match (detailed, need_tokens) {
+            (true, _) if at_eof && statement.is_none() && lexical_suffix.is_none() => source.len(),
+            (true, true) => positions
                 .iter()
                 .take(current_index.saturating_add(1))
                 .rev()
@@ -239,7 +280,34 @@ fn walk_units(
                 })
                 .map(|token| token.end)
                 .ok_or_else(|| "sqlparser returned an unmappable statement end".to_string())?,
-            false => 0,
+            (true, false) => {
+                let source_map = source_map
+                    .as_ref()
+                    .ok_or_else(|| "source_map missing in detailed parse mode".to_string())?;
+                let mut found = None;
+                if token_count > 0 {
+                    let max_idx = current_index.min(token_count - 1);
+                    for idx in (0..=max_idx).rev() {
+                        let tok = parser.token_at(idx);
+                        if matches!(
+                            tok.token,
+                            Token::Whitespace(_) | Token::SemiColon | Token::EOF
+                        ) {
+                            continue;
+                        }
+                        let span = source_map.span(tok.span).ok_or_else(|| {
+                            "sqlparser returned an unmappable statement end".to_string()
+                        })?;
+                        if span.start < start {
+                            break;
+                        }
+                        found = Some(span.end);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| "sqlparser returned an unmappable statement end".to_string())?
+            }
+            (false, _) => 0,
         };
         if detailed && end < start {
             return Err("sqlparser returned an invalid statement boundary".to_string());
@@ -291,12 +359,18 @@ fn walk_units(
                 let statement = statement.as_ref().ok_or_else(|| {
                     "sqlparser returned no statement for error-free unit".to_string()
                 })?;
-                let rel_start =
-                    positions[pos_cursor..].partition_point(|token| token.start < start);
-                let token_start = pos_cursor + rel_start;
-                let rel_end = positions[token_start..].partition_point(|token| token.end <= end);
-                let token_end = token_start + rel_end;
-                pos_cursor = token_end;
+                let unit_tokens = if need_tokens {
+                    let rel_start =
+                        positions[pos_cursor..].partition_point(|token| token.start < start);
+                    let token_start = pos_cursor + rel_start;
+                    let rel_end =
+                        positions[token_start..].partition_point(|token| token.end <= end);
+                    let token_end = token_start + rel_end;
+                    pos_cursor = token_end;
+                    &positions[token_start..token_end]
+                } else {
+                    &[]
+                };
                 let facts = analyze_statement(
                     statement,
                     AnalysisContext {
@@ -304,11 +378,12 @@ fn walk_units(
                         rules: &rules,
                         source,
                         source_map,
-                        tokens: &positions[token_start..token_end],
+                        tokens: unit_tokens,
                         unit: ByteSpan { start, end },
                         chunk_edits: config.chunk_edits,
                         column_ir: config.column_ir || config.column_bundles,
                         syntax_edits: config.syntax_edits,
+                        syntax_only: config.syntax_only,
                         pure_table_enabled,
                     },
                 );
@@ -396,6 +471,7 @@ mod tests {
                 column_ir: false,
                 column_bundles: false,
                 syntax_edits: false,
+                syntax_only: false,
             },
         )
         .expect("parse should succeed");

@@ -2430,6 +2430,43 @@ tests =
             let sliceExists = backwardSlice (StatementId 4) graphExists
             assertBool "EXISTS check does not depend on UPDATE S3" (not (has (StatementId 3) sliceExists))
             assertBool "EXISTS check preserves INSERT S2" (has (StatementId 2) sliceExists)
+        , testCase "Online transitive reduction keeps O(N) edges while preserving exact backward slices" $ do
+            let inserts = ["INSERT INTO t VALUES (" <> BSC.pack (show i) <> ", 10);" | i <- [1 .. 200 :: Int]]
+                insertSql =
+                    BSC.unlines
+                        ("CREATE TABLE t (id INT, a INT);" : inserts ++ ["SELECT COUNT(*) FROM t;"])
+            insertGraph <- analyze PostgreSQL insertSql
+            let countSlice = backwardSlice (StatementId 202) insertGraph
+            assertBool
+                ("expected O(N) edge count for 200 inserts (< 600), got " ++ show (graphEdgeCount insertGraph))
+                (graphEdgeCount insertGraph < 600)
+            assertEqual
+                "COUNT(*) backward slice retains CREATE TABLE, all 200 INSERTs, and itself"
+                (Set.fromList (map StatementId [1 .. 202]))
+                countSlice
+
+            let updates =
+                    [ "UPDATE t SET a = " <> BSC.pack (show i) <> " WHERE id = 1;"
+                    | i <- [1 .. 200 :: Int]
+                    ]
+                updateSql =
+                    BSC.unlines
+                        ( "CREATE TABLE t (id INT, a INT);"
+                            : "INSERT INTO t VALUES (1, 10);"
+                            : updates
+                            ++ ["SELECT a FROM t;"]
+                        )
+            updateGraph <- analyze PostgreSQL updateSql
+            let readSlice = backwardSlice (StatementId 203) updateGraph
+            assertBool
+                ( "expected O(N) edge count for 200 filtered updates (< 1000), got "
+                    ++ show (graphEdgeCount updateGraph)
+                )
+                (graphEdgeCount updateGraph < 1000)
+            assertEqual
+                "SELECT a backward slice retains CREATE TABLE, INSERT, all 200 UPDATEs, and itself"
+                (Set.fromList (map StatementId [1 .. 203]))
+                readSlice
         , testProperty
             "generated SQLite catalog transitions match a table snapshot model"
             prop_catalogTransitions

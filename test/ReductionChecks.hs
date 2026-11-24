@@ -703,6 +703,41 @@ tests =
                         (not ("CREATE INDEX" `BSC.isInfixOf` reduced))
                     verdict <- sqliteContractOracle contract reduced
                     assertEqual "reduced SQL preserves native SQLite contract" OracleAccepted verdict
+        , testCase "Relaxed slicing preserves pre-slice transaction block bodies for group proposals" $ do
+            let txBlock =
+                    [ "BEGIN;"
+                    , "UPDATE t SET x = x + 1;"
+                    , "UPDATE t SET x = x - 1;"
+                    , "COMMIT;"
+                    ]
+                sql =
+                    BSC.unlines
+                        ( "CREATE TABLE t(x INT);"
+                            : "INSERT INTO t VALUES (42);"
+                            : "ANALYZE;"
+                            : concat (replicate 16 txBlock)
+                            ++ ["SELECT x AS answer FROM t;"]
+                        )
+            (remember, lookupTrace) <- newResultTraceTracker True
+            prepared <- prepareResultOracleWithTrace remember SQLite 500000 sql
+            (_, observer) <- either (assertFailure . show) pure prepared
+            callsRef <- newIORef (0 :: Int)
+            let decide cand = do
+                    modifyIORef' callsRef (+ 1)
+                    details <- observer (pure ()) cand
+                    pure (observationOutcome (detailedObservation details))
+            pool <- outcomePool decide
+            let cfg =
+                    defaultReductionConfig
+                        { reductionDialect = SQLite
+                        , reductionGroupProposals = True
+                        }
+            ReductionResult out _ <-
+                reduceSQLWithResultTrace lookupTrace (const (pure ())) cfg nullLogger pool sql
+            calls <- readIORef callsRef
+            assertBool "removes coupled no-op UPDATE pairs" (not ("UPDATE" `BSC.isInfixOf` out))
+            assertBool "removes ANALYZE fence" (not ("ANALYZE" `BSC.isInfixOf` out))
+            assertBool ("expected <= 12 oracle calls, got " ++ show calls) (calls <= 12)
         , testCase "Single-statement audit can miss a nonadjacent pair" $ do
             let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
                 original = BSC.concat statements
@@ -784,13 +819,13 @@ tests =
             let sql = "CREATE TABLE t (a VARCHAR(20) NOT NULL, b BIGINT DEFAULT 1);"
                 -- a: VARCHAR(20) [18..29) -> "INT", NOT NULL [29..38) -> ""
                 -- b: BIGINT [42..48) -> "INT", DEFAULT 1 [48..58) -> ""
-                eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type"
-                eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type"
-                eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint"
-                eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type"
-                eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint"
-                gluedA = ParserEdit 18 23 "AA" EditExpression "test"
-                gluedB = ParserEdit 23 29 "BB" EditExpression "test"
+                eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type" False
+                eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type" False
+                eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint" False
+                eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type" False
+                eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint" False
+                gluedA = ParserEdit 18 23 "AA" EditExpression "test" False
+                gluedB = ParserEdit 23 29 "BB" EditExpression "test" False
             assertEqual
                 "applyParserEdits applies adjacent replacement + deletion cleanly"
                 (Just "CREATE TABLE t (a INT, b INT);")
@@ -806,7 +841,7 @@ tests =
             assertEqual
                 "applyParserEdits rejects out-of-bounds spans"
                 Nothing
-                (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob"])
+                (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob" False])
             let selected = selectIndependentEdits [eTypeAText, eTypeA, gluedA, gluedB, eTypeB]
             assertEqual
                 "selectIndependentEdits picks highest-savings non-overlapping non-gluing set"
@@ -1683,6 +1718,21 @@ tests =
                         , "CREATE TABLE b AS SELECT x FROM a;"
                         , "SELECT answer FROM v WHERE 0;"
                         ]
+                    , BSC.unlines
+                        [ "CREATE TABLE t(x INT);"
+                        , "CREATE TABLE u(y INT);"
+                        , "INSERT INTO u VALUES (10);"
+                        , "ALTER TABLE u RENAME TO t2;"
+                        , "WITH t AS (SELECT 1 AS x) SELECT x + (SELECT y FROM t2) AS answer FROM t;"
+                        ]
+                    , BSC.unlines
+                        [ "CREATE TABLE t(x INT);"
+                        , "BEGIN;"
+                        , "INSERT INTO t VALUES (42);"
+                        , "COMMIT;"
+                        , "DROP TABLE IF EXISTS missing_tbl;"
+                        , "SELECT x AS answer FROM t;"
+                        ]
                     ]
             sqliteCheckedRef <- newIORef (0 :: Int)
             forM_ sqliteScripts $ \sql -> do
@@ -1844,6 +1894,84 @@ tests =
                 assertBool "must preserve keep table" (BSC.isInfixOf "CREATE TABLE keep" out)
                 assertBool "must preserve keep insert" (BSC.isInfixOf "INSERT INTO keep" out)
                 assertBool "must remove noise table" (not (BSC.isInfixOf "noise" out))
+        , testCase
+            "Column-arity certificate skips outer projection deletions while preserving inner CTE pruning"
+            $ do
+                let sql =
+                        BSC.unlines
+                            [ "CREATE TABLE t(a INT, b INT, c INT);"
+                            , "INSERT INTO t VALUES (1, 2, 3);"
+                            , "WITH cte AS (SELECT a, b, c, 99 AS unused_cte_col FROM t) SELECT a, b, c FROM cte;"
+                            ]
+                    runWith earlyReject = do
+                        (remember, lookupTrace) <- newResultTraceTracker True
+                        prepared <- prepareResultOracleWithTrace remember SQLite 500000 sql
+                        (_, observer) <- either (assertFailure . show) pure prepared
+                        callsRef <- newIORef (0 :: Int)
+                        arityHitsRef <- newIORef (0 :: Int)
+                        let logger =
+                                Logger
+                                    defaultLogConfig
+                                    ( \_ _ msg fields ->
+                                        when (msg == "Early rejection certificate summary") $ do
+                                            let getInt k = case lookup k fields of
+                                                    Just (Number n) -> round n
+                                                    _ -> (0 :: Int)
+                                            modifyIORef' arityHitsRef (+ getInt "column_arity_rejects")
+                                    )
+                                    (pure ())
+                            decide cand = do
+                                modifyIORef' callsRef (+ 1)
+                                details <- observer (pure ()) cand
+                                pure (observationOutcome (detailedObservation details))
+                        pool <- outcomePool decide
+                        let cfg =
+                                defaultReductionConfig
+                                    { reductionDialect = SQLite
+                                    , reductionIntraStatement = True
+                                    , reductionEarlyReject = earlyReject
+                                    }
+                        ReductionResult out _ <-
+                            reduceSQLWithResultTrace lookupTrace (const (pure ())) cfg logger pool sql
+                        calls <- readIORef callsRef
+                        hits <- readIORef arityHitsRef
+                        pure (out, calls, hits)
+                (outOff, callsOff, hitsOff) <- runWith False
+                (outOn, callsOn, hitsOn) <- runWith True
+                assertEqual "column-arity certificate preserves exact reduced SQL" outOff outOn
+                assertEqual "disabled early rejection records zero arity hits" 0 hitsOff
+                assertBool ("expected column_arity_rejects > 0, got " ++ show hitsOn) (hitsOn > 0)
+                assertBool "inner CTE still pruned unused column" (not ("unused_cte_col" `BSC.isInfixOf` outOn))
+                assertBool
+                    ("expected strictly fewer oracle calls: on=" ++ show callsOn ++ " off=" ++ show callsOff)
+                    (callsOn < callsOff)
+        , testCase "Deferred literal leaf span-shift matches full syntax reparse exactly on multi-row VALUES" $ do
+            let rows =
+                    [ "(" <> BSC.pack (show i) <> ", 'payload_string_value_" <> BSC.pack (show i) <> "')"
+                    | i <- [1 .. 24 :: Int]
+                    ]
+                sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t(id INT, label TEXT);"
+                        , "INSERT INTO t VALUES " <> BS.intercalate ", " rows <> ";"
+                        , "SELECT sum(id), count(*) FROM t;"
+                        ]
+            contractRes <- generateSqliteContract sql
+            contract <- either (assertFailure . show) pure contractRes
+            let runWith fullReparse = do
+                    pool <- outcomePool (sqliteContractOracle contract)
+                    let cfg =
+                            defaultReductionConfig
+                                { reductionDialect = SQLite
+                                , reductionIntraStatement = True
+                                , reductionFullSyntaxReparse = fullReparse
+                                }
+                    reduceSQLWithConfig cfg nullLogger pool sql
+            fullOut <- runWith True
+            fastOut <- runWith False
+            assertEqual "deferred literal leaf shift matches full reparse byte-for-byte" fullOut fastOut
+            verdict <- sqliteContractOracle contract fastOut
+            assertEqual "deferred literal output preserves SQLite contract" OracleAccepted verdict
         ]
 
 countOrFail :: SQLDialect -> ByteString -> IO Int

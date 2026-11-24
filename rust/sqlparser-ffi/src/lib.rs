@@ -112,6 +112,11 @@ struct NativeEdit {
     category: NativeEditCategory,
     /// Descriptive label identifying the reduction rule (e.g. "remove-clause", "simplify-in_list").
     label: Cow<'static, str>,
+    /// True only when this edit removes one or more projection items from the
+    /// outermost wildcard-free SELECT of a top-level Query statement (guaranteed
+    /// to strictly reduce result column arity).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    top_level_projection: bool,
 }
 
 #[cfg(test)]

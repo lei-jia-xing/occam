@@ -8,6 +8,9 @@ module Occam.Proposals (
     isNoncontiguousIn,
     buildRelaxedGraph,
     extractDeletionProposalPlan,
+    extractDeletionProposalPlanWithExtraTx,
+    extractTransactionGroups,
+    projectTransactionBlocks,
 ) where
 
 import Data.HashSet qualified as HashSet
@@ -119,7 +122,20 @@ extractDeletionProposalPlan ::
     DependencyGraph ->
     Maybe ResultStatement ->
     GroupProposalPlan
-extractDeletionProposalPlan initialSession statements graph observedResult
+extractDeletionProposalPlan initialSession statements graph observedResult =
+    extractDeletionProposalPlanWithExtraTx initialSession statements graph observedResult []
+
+{- | Extract tiered deletion proposal groups, merging additional projected
+transaction/savepoint block bodies preserved across relaxed slicing.
+-}
+extractDeletionProposalPlanWithExtraTx ::
+    SessionInit ->
+    [Statement] ->
+    DependencyGraph ->
+    Maybe ResultStatement ->
+    [(Text, IntSet)] ->
+    GroupProposalPlan
+extractDeletionProposalPlanWithExtraTx initialSession statements graph observedResult extraTxBlocks
     | length statements < 2 =
         GroupProposalPlan [] [] [] [] []
     | otherwise =
@@ -172,7 +188,7 @@ extractDeletionProposalPlan initialSession statements graph observedResult
             (txBlocksRaw, txWrappersRaw) = extractTransactionGroups statements graph targetId
             txBlocks =
                 [ mkGroup GroupTxBlock label stmts
-                | (label, stmts) <- txBlocksRaw
+                | (label, stmts) <- txBlocksRaw ++ extraTxBlocks
                 , validGroup stmts
                 ]
             txWrappers =
@@ -374,3 +390,39 @@ extractTransactionGroups statements graph targetId =
         popSavepoint spKey ((k, i, s, rb) : rest)
             | k == spKey = Just (i, s, rb, rest)
             | otherwise = popSavepoint spKey rest
+
+{- | Project pre-slice transaction/savepoint blocks onto surviving post-slice
+statements when slicing stripped transaction wrappers (e.g., @BEGIN@/@COMMIT@)
+while retaining coupled body statements 1-to-1.
+-}
+projectTransactionBlocks ::
+    [Statement] ->
+    DependencyGraph ->
+    Maybe ResultStatement ->
+    [Statement] ->
+    [Statement] ->
+    [(Text, IntSet)]
+projectTransactionBlocks preStatements preGraph preObserved retainedStatements postStatements
+    | length retainedStatements /= length postStatements = []
+    | otherwise =
+        let preTargetId = selectTargetId preStatements preObserved
+            (preTxBlocks, _) = extractTransactionGroups preStatements preGraph preTargetId
+            idMap =
+                IntMap.fromList
+                    ( zip
+                        (map (unStatementId . stmtId) retainedStatements)
+                        (map (unStatementId . stmtId) postStatements)
+                    )
+            projectSet =
+                IntSet.foldl'
+                    ( \acc preSid ->
+                        case IntMap.lookup preSid idMap of
+                            Just postSid -> IntSet.insert postSid acc
+                            Nothing -> acc
+                    )
+                    IntSet.empty
+         in [ (label, projected)
+            | (label, preIds) <- preTxBlocks
+            , let projected = projectSet preIds
+            , IntSet.size projected >= 2
+            ]

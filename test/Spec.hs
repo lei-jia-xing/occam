@@ -14,7 +14,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.IntSet qualified as IntSet
 import Data.List (isInfixOf, subsequences)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import DependencyChecks qualified
@@ -56,6 +56,7 @@ import Occam.Core (
     ReadFact (..),
     ReadMode (..),
     ResultStatement (..),
+    ResultTrace (..),
     SemanticFacts (..),
     SessionInit (..),
     Statement (stmtRaw),
@@ -96,6 +97,8 @@ import Occam.Oracle.Sqlite (
     executeSqliteCandidate,
     generateSqliteContract,
     generateSqliteContractWithResultStatement,
+    generateSqliteContractWithTrace,
+    prepareSqliteContractObserver,
     splitStatements,
     sqliteContractObservation,
     sqliteContractObservationTimeout,
@@ -1440,6 +1443,57 @@ sqliteOracleTests =
                 case res of
                     Left err -> assertFailure ("concurrent SQLite pool error: " ++ show err)
                     Right () -> pure ()
+        , testCase
+            "SQLite binary matcher and prefix checkpoints preserve exact types, DML counters, and failing prefixes"
+            $ do
+                -- 1. Binary matcher distinguishes -0.0 vs +0.0, empty vs non-empty blobs, NULL, text, and int.
+                let typedSql = "SELECT 1 AS i, -0.0 AS f, 'hi' AS s, X'' AS b0, X'00ff' AS b1, NULL AS n;"
+                typedRes <- generateSqliteContract typedSql
+                case typedRes of
+                    Left err -> assertFailure (T.unpack err)
+                    Right contract -> do
+                        assertEqual "exact typed row matches" OracleAccepted =<< sqliteContractOracle contract typedSql
+                        assertEqual
+                            "+0.0 differs from -0.0"
+                            OracleRejected
+                            =<< sqliteContractOracle
+                                contract
+                                "SELECT 1 AS i, 0.0 AS f, 'hi' AS s, X'' AS b0, X'00ff' AS b1, NULL AS n;"
+                        assertEqual
+                            "non-empty blob differs from empty blob"
+                            OracleRejected
+                            =<< sqliteContractOracle
+                                contract
+                                "SELECT 1 AS i, -0.0 AS f, 'hi' AS s, X'00' AS b0, X'00ff' AS b1, NULL AS n;"
+                -- 2. Prefix checkpoints (>= 8 stmts) preserve exact results, DML counters, and failing-prefix capture.
+                let setup =
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, x INT);"
+                            : ["INSERT INTO t(x) VALUES (" <> BSC.pack (show i) <> ");" | i <- [1 .. 20 :: Int]]
+                    script = BSC.unlines (setup ++ ["SELECT sum(x), last_insert_rowid() FROM t;"])
+                contractRes <- generateSqliteContractWithTrace 500000 script
+                case contractRes of
+                    Left err -> assertFailure (T.unpack err)
+                    Right (contract, trace) -> do
+                        assertBool
+                            "script is deterministic and >= 8 stmts"
+                            (traceDeterministic trace && traceStatementCount trace >= 22)
+                        failsRef <- newIORef ([] :: [BS.ByteString])
+                        let observe = prepareSqliteContractObserver 500000 contract (\p -> modifyIORef' failsRef (p :))
+                        (obsOk, mTrOk) <- observe script
+                        assertEqual
+                            "checkpointed exact match with last_insert_rowid() succeeds"
+                            (OracleFinished ExitSuccess)
+                            obsOk
+                        assertBool "checkpointed exact match preserves trace" (isJust mTrOk)
+                        -- Missing CREATE TABLE causes SQL error on first INSERT; failing prefix must be recorded.
+                        let broken = BSC.unlines (drop 1 setup ++ ["SELECT sum(x), last_insert_rowid() FROM t;"])
+                        (obsBad, _) <- observe broken
+                        assertEqual "missing table rejects cleanly" (OracleFinished (ExitFailure 1)) obsBad
+                        recorded <- readIORef failsRef
+                        assertBool "deterministic semicolon-terminated failing prefix recorded" (not (null recorded))
+                        assertBool
+                            "recorded prefix is a prefix of the broken script"
+                            (all (`BS.isPrefixOf` broken) recorded)
         ]
     where
         isLeft (Left _) = True

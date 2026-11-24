@@ -487,3 +487,82 @@ theorem observed_no_result_need_not_survive_deletion :
     if stmt then (state, if state then none else some 7)
     else (true, if state then some 7 else none)), ?_⟩
   decide
+
+/-!
+## Soundness of Additional Native Early-Rejection Certificates
+
+We formalize the abstract soundness properties of:
+1. `EarlyRejectFailingPrefix`: deterministic fail-stop prefix errors propagate
+   to every extension `prefix ++ suffix`.
+2. `EarlyRejectColumnArityMismatch`: reducing the column arity of the final
+   result-producing statement (when all trailing statements produce `none`)
+   strictly violates the contract result equality.
+3. `find?_skip_known_rejections` composes any sound certificate with ordered
+   search and 1-minimality audit without altering the first accepted candidate.
+-/
+
+/-- Outcome of executing a SQL script against a fresh native result oracle:
+    either a fail-stop SQL error, or clean completion with per-statement
+    optional result sets. -/
+inductive NativeExecOutcome (Result : Type) where
+  | error
+  | ok (observations : List (Option Result))
+  deriving DecidableEq
+
+/-- A native result contract accepts iff execution succeeds without error and
+    the last produced result set equals `expected`. -/
+def nativeContractAccepts {Result : Type} [DecidableEq Result]
+    (expected : Result) : NativeExecOutcome Result → Bool
+  | .error => false
+  | .ok obs => decide (lastStatementResult obs = some expected)
+
+/-- Soundness of `EarlyRejectFailingPrefix`: under a deterministic fail-stop
+    engine where any error on a complete statement prefix `p` aborts before
+    executing any trailing statements `s`, every extension `p ++ s` is rejected
+    by any result contract. -/
+theorem failing_prefix_rejects_extension {Stmt Result : Type} [DecidableEq Result]
+    (exec : List Stmt → NativeExecOutcome Result) (expected : Result)
+    (failStop : ∀ p s, exec p = .error → exec (p ++ s) = .error)
+    (p s : List Stmt) (hErr : exec p = .error) :
+    nativeContractAccepts expected (exec (p ++ s)) = false := by
+  rw [failStop p s hErr]
+  rfl
+
+/-- Appending trailing statements that produce no result (`none`) leaves
+    `lastStatementResult` unchanged. -/
+theorem lastStatementResult_append_all_none {Result : Type}
+    (init trailing : List (Option Result))
+    (hNone : ∀ obs ∈ trailing, obs = none) :
+    lastStatementResult (init ++ trailing) = lastStatementResult init := by
+  unfold lastStatementResult
+  rw [List.foldl_append]
+  induction trailing generalizing init with
+  | nil => rfl
+  | cons x xs ih =>
+    have hx : x = none := hNone x (by simp)
+    have hxs : ∀ obs ∈ xs, obs = none := fun obs hmem => hNone obs (by simp [hmem])
+    simp only [List.foldl_cons, hx]
+    have hor : Option.or none (List.foldl (fun last next => next.or last) none init) =
+        List.foldl (fun last next => next.or last) none init := rfl
+    rw [hor]
+    exact ih init hxs
+
+/-- Soundness of `EarlyRejectColumnArityMismatch`: if the final result-producing
+    statement produces a result `res` whose column arity differs from
+    `arity expected` and all trailing statements produce `none`, the script is
+    guaranteed rejected by the native result contract. -/
+theorem column_arity_mismatch_rejects {Result : Type} [DecidableEq Result]
+    (arity : Result → Nat) (expected actual : Result)
+    (prefixObs trailingObs : List (Option Result))
+    (hTrailing : ∀ obs ∈ trailingObs, obs = none)
+    (hArity : arity actual ≠ arity expected) :
+    nativeContractAccepts expected (.ok (prefixObs ++ [some actual] ++ trailingObs)) = false := by
+  simp only [nativeContractAccepts]
+  rw [lastStatementResult_append_all_none (prefixObs ++ [some actual]) trailingObs hTrailing]
+  have hLast : lastStatementResult (prefixObs ++ [some actual]) = some actual := by
+    unfold lastStatementResult
+    rw [List.foldl_append]
+    rfl
+  rw [hLast]
+  have hNe : actual ≠ expected := fun hEq => hArity (congrArg arity hEq)
+  simp [hNe]

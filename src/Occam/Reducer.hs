@@ -40,6 +40,8 @@ module Occam.Reducer (
     reduceSQLWithEvidence,
     reduceSQLWithResultSlicing,
     reduceSQLWithResultTrace,
+    reduceSQLWithResultTraceSeeded,
+    reduceSQLWithResultTraceFull,
     ReductionResult (..),
     ReductionEvidence (..),
     ReductionStage (..),
@@ -80,11 +82,14 @@ import Occam.Certificate (
     EarlyRejectCertifier (..),
     EarlyRejectStats (..),
     EarlyRejectTracker,
+    FailingPrefixCache,
     buildEarlyRejectCertifier,
     checkEarlyRejectionBytesTracked,
     checkEarlyRejectionIdsTracked,
+    checkEarlyRejectionSyntaxEditTracked,
     emptyEarlyRejectCertifier,
     newEarlyRejectTracker,
+    newEarlyRejectTrackerWithFailures,
     readEarlyRejectStats,
     recordEarlyRejectBuildNanos,
  )
@@ -145,8 +150,9 @@ import Occam.Proposals (
     DeletionProposalGroup (..),
     GroupProposalPlan (..),
     buildRelaxedGraph,
-    extractDeletionProposalPlan,
+    extractDeletionProposalPlanWithExtraTx,
     isNoncontiguousIn,
+    projectTransactionBlocks,
  )
 import Occam.Slicer (
     backwardSliceFast,
@@ -506,8 +512,11 @@ parseStatements store dialect sql = do
 
 -- Share the latest analysis within a reduction, keyed by exact SQL bytes.
 reuseLatestSQL :: (ByteString -> IO a) -> IO (ByteString -> IO a)
-reuseLatestSQL analyze = do
-    latest <- newIORef Nothing
+reuseLatestSQL = reuseLatestSQLWithSeed Nothing
+
+reuseLatestSQLWithSeed :: Maybe (ByteString, a) -> (ByteString -> IO a) -> IO (ByteString -> IO a)
+reuseLatestSQLWithSeed initialSeed analyze = do
+    latest <- newIORef initialSeed
     pure $ \sql -> do
         cached <- readIORef latest
         case cached of
@@ -517,17 +526,27 @@ reuseLatestSQL analyze = do
                 writeIORef latest (Just (sql, result))
                 pure result
 
--- | Parse options for syntax-level rewrites.
+-- | Parse options for syntax-level rewrites (skips unused semantic dependency extraction).
 syntaxParseOptions :: SQLDialect -> ParseOptions
-syntaxParseOptions dialect = (defaultParseOptions dialect) {parseChunkEdits = True, parseSyntaxEdits = True}
+syntaxParseOptions dialect =
+    (defaultParseOptions dialect)
+        { parseChunkEdits = True
+        , parseSyntaxEdits = True
+        , parseSyntaxOnly = True
+        }
 
 -- | Single-point column sites only: no bundle planning or payload.
 columnSingleParseOptions :: SQLDialect -> ParseOptions
-columnSingleParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True}
+columnSingleParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True, parseSyntaxOnly = False}
 
 -- | Full atomic bundles; implies single-point geometry.
 columnAtomicParseOptions :: SQLDialect -> ParseOptions
-columnAtomicParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True, parseColumnBundles = True}
+columnAtomicParseOptions dialect =
+    (syntaxParseOptions dialect)
+        { parseColumnIR = True
+        , parseColumnBundles = True
+        , parseSyntaxOnly = False
+        }
 
 columnParseOptions :: ColumnMode -> SQLDialect -> ParseOptions
 columnParseOptions ColumnOff = syntaxParseOptions
@@ -655,6 +674,12 @@ recordEarlyRejectSkip store EarlyRejectExactPrefix =
     recordGeneratedSkipped store "early-reject-exact-prefix"
 recordEarlyRejectSkip store EarlyRejectNoResultStatement =
     recordGeneratedSkipped store "early-reject-no-result"
+recordEarlyRejectSkip store EarlyRejectFailingPrefix =
+    recordGeneratedSkipped store "early-reject-failing-prefix"
+recordEarlyRejectSkip store EarlyRejectMissingDefinition =
+    recordGeneratedSkipped store "early-reject-missing-definition"
+recordEarlyRejectSkip store EarlyRejectColumnArityMismatch =
+    recordGeneratedSkipped store "early-reject-column-arity"
 
 buildCertifierTracked ::
     Bool ->
@@ -668,7 +693,10 @@ buildCertifierTracked True _ _ _ Nothing = pure emptyEarlyRejectCertifier
 buildCertifierTracked True tracker baseSQL units mTrace = do
     t0 <- getMonotonicTimeNSec
     let !cert = buildEarlyRejectCertifier baseSQL units mTrace
-        !_ = IntSet.size (certExactPrefixByteLens cert) + IntSet.size (certGuaranteedNonResult cert)
+        !_ =
+            IntSet.size (certExactPrefixByteLens cert)
+                + IntSet.size (certGuaranteedNonResult cert)
+                + IntMap.size (certMissingDefReqs cert)
     t1 <- getMonotonicTimeNSec
     recordEarlyRejectBuildNanos tracker (t1 - t0)
     pure cert
@@ -685,6 +713,9 @@ logEarlyRejectStats logger stage tracker = do
             , ("checked", toJSON (earlyRejectChecked stats))
             , ("exact_prefix_rejects", toJSON (earlyRejectExactPrefix stats))
             , ("no_result_rejects", toJSON (earlyRejectNoResult stats))
+            , ("failing_prefix_rejects", toJSON (earlyRejectFailingPrefix stats))
+            , ("missing_definition_rejects", toJSON (earlyRejectMissingDef stats))
+            , ("column_arity_rejects", toJSON (earlyRejectColumnArity stats))
             , ("check_nanos", toJSON (earlyRejectCheckNanos stats))
             , ("check_micros", toJSON (fromIntegral (earlyRejectCheckNanos stats) / (1000.0 :: Double)))
             ]
@@ -725,11 +756,31 @@ closureDdminWithCert ::
     IO [Statement]
 closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
+    fullRootsCache <- newIORef Nothing
     closureStats <- newIORef (ClosureStats 0 0 0 0)
     let weights = IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
         initialSetIsClosed = isValidClosureFast graph (statementIdsInt initialStatements)
         predecessors = graphFastEdges graph
         successors = successorIndex predecessors
+        computeFullSliceRoots currentInts =
+            let sinks =
+                    IntSet.filter
+                        (\v -> IntSet.disjoint currentInts (IntMap.findWithDefault IntSet.empty v successors))
+                        currentInts
+             in case IntSet.minView sinks of
+                    Just (sink, rest)
+                        | IntSet.null rest
+                        , backwardSliceFast sink graph == currentInts ->
+                            IntSet.singleton sink
+                    _ -> IntSet.empty
+        fullSliceRootsFor currentInts = do
+            cached <- readIORef fullRootsCache
+            case cached of
+                Just (cachedCurrent, roots) | cachedCurrent == currentInts -> pure roots
+                _ -> do
+                    let !roots = computeFullSliceRoots currentInts
+                    writeIORef fullRootsCache (Just (currentInts, roots))
+                    pure roots
         closeCandidate current seed
             | initialSetIsClosed
             , not (IntMap.null predecessors)
@@ -739,35 +790,42 @@ closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements g
             | otherwise = closeSetFast graph seed
         buildCandidate currentInts seedInts = do
             modifyIORef' closureStats (\stats -> stats {closureRequests = closureRequests stats + 1})
-            cached <- readIORef closureCache
-            closedInts <-
-                case HashMap.lookup seedInts cached of
-                    Just result -> do
-                        modifyIORef' closureStats (\stats -> stats {closureCacheHits = closureCacheHits stats + 1})
-                        pure result
-                    Nothing -> do
-                        let result = closeCandidate currentInts seedInts
-                        modifyIORef' closureCache (HashMap.insert seedInts result)
-                        pure result
-            -- A seed is a subset of the current set. If the initial set was
-            -- closed, the seed closure stays inside it, and each accepted
-            -- closure keeps the same invariant for the next search pass.
-            let contained = initialSetIsClosed || closedInts `IntSet.isSubsetOf` currentInts
-                keptInts
-                    | contained = closedInts
-                    | otherwise = closedInts `IntSet.intersection` currentInts
-                added = keptInts `IntSet.difference` seedInts
-                gainedBytes = sum [IntMap.findWithDefault 0 sid weights | sid <- IntSet.toList added]
-            modifyIORef'
-                closureStats
-                ( \stats ->
-                    stats
-                        { closureGainStatements = closureGainStatements stats + IntSet.size added
-                        , closureGainBytes = closureGainBytes stats + gainedBytes
-                        }
-                )
-            -- A closed projection containing the seed must contain its entire closure.
-            pure (if contained then Just closedInts else Nothing)
+            fullRoots <-
+                if initialSetIsClosed && not (IntMap.null predecessors)
+                    then fullSliceRootsFor currentInts
+                    else pure IntSet.empty
+            if not (IntSet.disjoint seedInts fullRoots)
+                then pure (Just currentInts)
+                else do
+                    cached <- readIORef closureCache
+                    closedInts <-
+                        case HashMap.lookup seedInts cached of
+                            Just result -> do
+                                modifyIORef' closureStats (\stats -> stats {closureCacheHits = closureCacheHits stats + 1})
+                                pure result
+                            Nothing -> do
+                                let result = closeCandidate currentInts seedInts
+                                modifyIORef' closureCache (HashMap.insert seedInts result)
+                                pure result
+                    -- A seed is a subset of the current set. If the initial set was
+                    -- closed, the seed closure stays inside it, and each accepted
+                    -- closure keeps the same invariant for the next search pass.
+                    let contained = initialSetIsClosed || closedInts `IntSet.isSubsetOf` currentInts
+                        keptInts
+                            | contained = closedInts
+                            | otherwise = closedInts `IntSet.intersection` currentInts
+                        added = keptInts `IntSet.difference` seedInts
+                        gainedBytes = sum [IntMap.findWithDefault 0 sid weights | sid <- IntSet.toList added]
+                    modifyIORef'
+                        closureStats
+                        ( \stats ->
+                            stats
+                                { closureGainStatements = closureGainStatements stats + IntSet.size added
+                                , closureGainBytes = closureGainBytes stats + gainedBytes
+                                }
+                        )
+                    -- A closed projection containing the seed must contain its entire closure.
+                    pure (if contained then Just closedInts else Nothing)
     result <-
         searchStatementsWithCert
             tracker
@@ -1600,10 +1658,10 @@ sliceWithAnalysis ::
     SQLAnalysis ->
     Maybe ResultStatement ->
     ByteString ->
-    IO (ByteString, Maybe SQLAnalysis)
+    IO (ByteString, Maybe SQLAnalysis, Maybe [Statement])
 sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
     case seedTarget of
-        Nothing -> keep sql
+        Nothing -> keep sql Nothing
         Just seedStatement -> do
             let (conservativeRetained, conservativeBytes) = sliceFor graph seedStatement
                 useRelaxed =
@@ -1649,7 +1707,7 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
                     (True, Just (index, _)) -> index
                     _ -> length statements
                 tryPrefix bestCandidate
-                    | Just best <- bestCandidate
+                    | Just (best, _) <- bestCandidate
                     , prefixSlicesCannotImprove prefixLimit (BS.length best) = do
                         recordGeneratedSkipped (poolMetricsStore pool) "prefix-search-cannot-improve"
                         pure bestCandidate
@@ -1661,7 +1719,7 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
                             Just (targetStatement, prefixSQL, prefixLength) -> do
                                 let (retained, candidateRaw) = sliceFor graph targetStatement
                                 candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
-                                let bestLen = maybe (BS.length sql) BS.length bestCandidate
+                                let bestLen = maybe (BS.length sql) (BS.length . fst) bestCandidate
                                 if BS.length candidate >= bestLen
                                     then do
                                         recordGeneratedSkipped (poolMetricsStore pool) "prefix-slice-cannot-improve"
@@ -1683,17 +1741,21 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
                                             , ("prefix_result_reused", toJSON reusedPrefixResult)
                                             ]
                                         if ok
-                                            then Just <$> acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                            then do
+                                                accepted <- acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                                pure (Just (accepted, retained))
                                             else pure bestCandidate
-            let initialBest = if seedAccepted then Just seedCandidate else Nothing
+            let initialBest = if seedAccepted then Just (seedCandidate, seedRetained) else Nothing
             better <- tryPrefix initialBest
             case better of
-                Just result
-                    | Just result /= initialBest -> keep result
+                Just (result, retained)
+                    | Just result /= fmap fst initialBest -> keep result (Just retained)
                 _ ->
                     if seedAccepted
-                        then acceptSlice strategy seedStatement seedRetained seedCandidate >>= keep
-                        else keep sql
+                        then do
+                            accepted <- acceptSlice strategy seedStatement seedRetained seedCandidate
+                            keep accepted (Just seedRetained)
+                        else keep sql Nothing
     where
         statements = analyzedStatements analysis
         graph = analyzedGraph analysis
@@ -1706,8 +1768,8 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
         (seedTarget, seedStrategy) = case resultTarget of
             Just (_, stmt) -> (Just stmt, "result-statement")
             Nothing -> (lastMay statements, "last-statement")
-        keep result =
-            pure (result, if result == sql then Just analysis else Nothing)
+        keep result retained =
+            pure (result, if result == sql then Just analysis else Nothing, retained)
         -- Use the relaxed graph only to propose candidate bytes. A global
         -- barrier can carry real effects, so the oracle still decides.
         statementFacts =
@@ -1760,20 +1822,22 @@ proposeGroupDeletionsWithAnalysis ::
     OraclePool ->
     SQLAnalysis ->
     Maybe ResultStatement ->
+    [(T.Text, IntSet.IntSet)] ->
     ByteString ->
     IO ByteString
-proposeGroupDeletionsWithAnalysis tracker cert logger pool analysis observedResult sql
+proposeGroupDeletionsWithAnalysis tracker cert logger pool analysis observedResult extraTxBlocks sql
     | length statements < 2 = pure sql
     | otherwise = do
         currentIntsRef <- newIORef (statementIdsInt statements)
         currentSQLRef <- newIORef sql
         seenRef <- newIORef (HashSet.singleton sql)
         let plan =
-                extractDeletionProposalPlan
+                extractDeletionProposalPlanWithExtraTx
                     (analyzedSession analysis)
                     statements
                     (analyzedGraph analysis)
                     observedResult
+                    extraTxBlocks
             tryDelete kind label removed = do
                 currentInts <- readIORef currentIntsRef
                 currentSQL <- readIORef currentSQLRef
@@ -1981,8 +2045,36 @@ reduceSQLWithResultTrace ::
     OraclePool ->
     ByteString ->
     IO ReductionResult
-reduceSQLWithResultTrace resultTrace =
-    reduceSQLWithObservedResult (fmap (fmap ObservedFullTrace) . resultTrace)
+reduceSQLWithResultTrace = reduceSQLWithResultTraceSeeded Nothing
+
+-- | Variant of 'reduceSQLWithResultTrace' reusing an existing initial parse when bytes match.
+reduceSQLWithResultTraceSeeded ::
+    Maybe (ByteString, (SessionInit, [StatementUnit])) ->
+    (ByteString -> IO (Maybe ResultTrace)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithResultTraceSeeded initialParsed = reduceSQLWithResultTraceFull initialParsed Nothing
+
+-- | Full native result-trace entrypoint reusing an initial parse and dynamic failing-prefix cache.
+reduceSQLWithResultTraceFull ::
+    Maybe (ByteString, (SessionInit, [StatementUnit])) ->
+    Maybe FailingPrefixCache ->
+    (ByteString -> IO (Maybe ResultTrace)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithResultTraceFull initialParsed mFailCache resultTrace =
+    reduceSQLWithObservedResultSeeded
+        initialParsed
+        mFailCache
+        (fmap (fmap ObservedFullTrace) . resultTrace)
 
 reduceSQLWithObservedResult ::
     (ByteString -> IO (Maybe ObservedResultEvidence)) ->
@@ -1992,7 +2084,19 @@ reduceSQLWithObservedResult ::
     OraclePool ->
     ByteString ->
     IO ReductionResult
-reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL = do
+reduceSQLWithObservedResult = reduceSQLWithObservedResultSeeded Nothing Nothing
+
+reduceSQLWithObservedResultSeeded ::
+    Maybe (ByteString, (SessionInit, [StatementUnit])) ->
+    Maybe FailingPrefixCache ->
+    (ByteString -> IO (Maybe ObservedResultEvidence)) ->
+    StageReporter ->
+    ReductionConfig ->
+    Logger ->
+    OraclePool ->
+    ByteString ->
+    IO ReductionResult
+reduceSQLWithObservedResultSeeded initialParsed mFailCache observeResult reporter config logger pool initialSQL = do
     when (reductionColumnMode config /= ColumnOff && not (reductionIntraStatement config)) $
         ioError (userError "reductionColumnMode requires reductionIntraStatement")
     initialOK <- oracleAccepts (poolOracle pool) initialSQL
@@ -2001,13 +2105,18 @@ reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL
             logWarn logger "reducer" "Initial SQL candidate failed oracle check"
             pure (ReductionResult initialSQL Nothing)
         else do
-            parse <- reuseLatestSQL (parseStatements (poolMetricsStore pool) (reductionDialect config))
+            parse <-
+                reuseLatestSQLWithSeed
+                    initialParsed
+                    (parseStatements (poolMetricsStore pool) (reductionDialect config))
             analyze <- reuseLatestSQL (analyzeSQL parse logger (reductionDialect config))
-            tracker <- newEarlyRejectTracker
-            loop parse analyze tracker (1 :: Int) initialSQL Nothing
+            tracker <-
+                newEarlyRejectTrackerWithFailures
+                    (if reductionEarlyReject config then mFailCache else Nothing)
+            loop parse analyze tracker (1 :: Int) initialSQL Nothing False
                 `finally` logEarlyRejectStats logger "reduction" tracker
     where
-        loop parse analyze tracker iteration currentSQL priorEvidence = do
+        loop parse analyze tracker iteration currentSQL priorEvidence priorFullFixedPoint = do
             logInfo'
                 logger
                 "reducer"
@@ -2015,7 +2124,7 @@ reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL
                 [ ("iteration", toJSON iteration)
                 , ("current_bytes", toJSON (BS.length currentSQL))
                 ]
-            (nextSQL, evidence) <-
+            (nextSQL, evidence, fullFixedPoint) <-
                 reduceIterationWithEvidence
                     observeResult
                     tracker
@@ -2027,8 +2136,9 @@ reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL
                     analyze
                     currentSQL
                     priorEvidence
+                    priorFullFixedPoint
             if BS.length nextSQL < BS.length currentSQL
-                then loop parse analyze tracker (iteration + 1) nextSQL evidence
+                then loop parse analyze tracker (iteration + 1) nextSQL evidence fullFixedPoint
                 else do
                     logInfo'
                         logger
@@ -2054,8 +2164,9 @@ reduceIterationWithEvidence ::
     (ByteString -> IO SQLAnalysis) ->
     ByteString ->
     Maybe ReductionEvidence ->
-    IO (ByteString, Maybe ReductionEvidence)
-reduceIterationWithEvidence observeResult tracker reporter config logger pool parse analyze initialSQL priorEvidence = do
+    Bool ->
+    IO (ByteString, Maybe ReductionEvidence, Bool)
+reduceIterationWithEvidence observeResult tracker reporter config logger pool parse analyze initialSQL priorEvidence priorFullFixedPoint = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedReductionStage reporter logger StageSlicing initialSQL do
@@ -2070,12 +2181,22 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
                         initialSQL
                         (analyzedUnits analysis)
                         observedTrace
-                (afterSlice, sliceAnalysis) <-
+                (afterSlice, sliceAnalysis, sliceRetained) <-
                     sliceWithAnalysis tracker sliceCert logger pool analysis observedStmt initialSQL
                 if reductionGroupProposals config
                     && not (maybe False ((== afterSlice) . evidenceBytes) priorEvidence)
                     then do
                         groupAnalysis <- maybe (analyze afterSlice) pure sliceAnalysis
+                        let extraTxBlocks = case sliceRetained of
+                                Just retained
+                                    | afterSlice /= initialSQL ->
+                                        projectTransactionBlocks
+                                            (analyzedStatements analysis)
+                                            (analyzedGraph analysis)
+                                            observedStmt
+                                            retained
+                                            (analyzedStatements groupAnalysis)
+                                _ -> []
                         groupObserved <-
                             if afterSlice == initialSQL
                                 then pure observed
@@ -2098,6 +2219,7 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
                                 pool
                                 groupAnalysis
                                 (fmap evidenceResultStatement groupObserved)
+                                extraTxBlocks
                                 afterSlice
                         pure
                             ( afterGroups
@@ -2126,85 +2248,90 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
                                 pool
                                 analysis
                                 (fmap evidenceResultStatement observed)
+                                []
                                 initialSQL
                         pure (afterGroups, if afterGroups == initialSQL then Just analysis else Nothing)
                     else pure (initialSQL, Nothing)
-    searchAnalysis <-
-        if reductionClosure config && reductionUnrestricted config
-            then Just <$> maybe (analyze sliced) pure reusableAnalysis
-            else pure reusableAnalysis
-    let useEarlyUnrestricted =
-            reductionClosure config
-                && reductionUnrestricted config
-                && maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
-    effectiveStatementPolicy <- case reductionStatementSearch config of
-        StatementRankedFallback rankedCfg -> do
-            remainingStmts <- case searchAnalysis of
-                Just analysis -> pure (length (analyzedStatements analysis))
-                Nothing -> length . snd <$> parse sliced
-            let alreadyConfirmed = maybe False ((== sliced) . evidenceBytes) priorEvidence
-                activated =
-                    not alreadyConfirmed
-                        && shouldActivateRankedFallback
-                            rankedCfg
-                            (reductionSlicing config)
-                            (BS.length initialSQL)
-                            (BS.length sliced)
-                            remainingStmts
-                hasGlobalBarrier = maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
-            logInfo'
-                logger
-                "reducer"
-                (if activated then "Ranked statement fallback activated" else "Ranked statement fallback skipped")
-                [ ("activated", toJSON activated)
-                , ("already_confirmed", toJSON alreadyConfirmed)
-                , ("slicing_enabled", toJSON (reductionSlicing config))
-                , ("global_barrier", toJSON hasGlobalBarrier)
-                , ("bytes_before", toJSON (BS.length initialSQL))
-                , ("bytes_after", toJSON (BS.length sliced))
-                , ("statements_after", toJSON remainingStmts)
-                ]
-            pure (if activated then StatementRankedWith rankedCfg else StatementByteWeighted)
-        other -> pure other
-    searchInput <-
-        if useEarlyUnrestricted then unrestrictedSearch effectiveStatementPolicy sliced else pure sliced
-    (searched, ()) <-
-        if reductionClosure config
-            then timedReductionStage reporter logger StageClosureSearch searchInput do
-                analysis <-
-                    case searchAnalysis of
-                        Just cached | searchInput == sliced -> pure cached
-                        _ -> analyze searchInput
-                mTrace <- lookupTraceForCert searchInput
-                cert <-
-                    buildCertifierTracked
-                        (reductionEarlyReject config)
-                        tracker
-                        searchInput
-                        (analyzedUnits analysis)
-                        mTrace
-                out <-
-                    closureSearchWithAnalysis tracker cert effectiveStatementPolicy logger pool searchInput analysis
-                pure (out, ())
-            else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
-                mTrace <- lookupTraceForCert searchInput
-                out <-
-                    statementDdminWithCert
-                        (reductionEarlyReject config)
-                        tracker
-                        mTrace
-                        effectiveStatementPolicy
-                        parse
-                        pool
-                        searchInput
-                pure (out, ())
-    fallback <-
-        if reductionClosure config
-            && reductionUnrestricted config
-            && (not useEarlyUnrestricted || searched /= searchInput)
-            then unrestrictedSearch effectiveStatementPolicy searched
-            else pure searched
-    interleaveStages fallback
+    if priorFullFixedPoint && maybe False ((== sliced) . evidenceBytes) priorEvidence
+        then pure (sliced, priorEvidence, True)
+        else do
+            searchAnalysis <-
+                if reductionClosure config && reductionUnrestricted config
+                    then Just <$> maybe (analyze sliced) pure reusableAnalysis
+                    else pure reusableAnalysis
+            let useEarlyUnrestricted =
+                    reductionClosure config
+                        && reductionUnrestricted config
+                        && maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
+            effectiveStatementPolicy <- case reductionStatementSearch config of
+                StatementRankedFallback rankedCfg -> do
+                    remainingStmts <- case searchAnalysis of
+                        Just analysis -> pure (length (analyzedStatements analysis))
+                        Nothing -> length . snd <$> parse sliced
+                    let alreadyConfirmed = maybe False ((== sliced) . evidenceBytes) priorEvidence
+                        activated =
+                            not alreadyConfirmed
+                                && shouldActivateRankedFallback
+                                    rankedCfg
+                                    (reductionSlicing config)
+                                    (BS.length initialSQL)
+                                    (BS.length sliced)
+                                    remainingStmts
+                        hasGlobalBarrier = maybe False (graphHasGlobalBarrier . analyzedGraph) searchAnalysis
+                    logInfo'
+                        logger
+                        "reducer"
+                        (if activated then "Ranked statement fallback activated" else "Ranked statement fallback skipped")
+                        [ ("activated", toJSON activated)
+                        , ("already_confirmed", toJSON alreadyConfirmed)
+                        , ("slicing_enabled", toJSON (reductionSlicing config))
+                        , ("global_barrier", toJSON hasGlobalBarrier)
+                        , ("bytes_before", toJSON (BS.length initialSQL))
+                        , ("bytes_after", toJSON (BS.length sliced))
+                        , ("statements_after", toJSON remainingStmts)
+                        ]
+                    pure (if activated then StatementRankedWith rankedCfg else StatementByteWeighted)
+                other -> pure other
+            searchInput <-
+                if useEarlyUnrestricted then unrestrictedSearch effectiveStatementPolicy sliced else pure sliced
+            (searched, ()) <-
+                if reductionClosure config
+                    then timedReductionStage reporter logger StageClosureSearch searchInput do
+                        analysis <-
+                            case searchAnalysis of
+                                Just cached | searchInput == sliced -> pure cached
+                                _ -> analyze searchInput
+                        mTrace <- lookupTraceForCert searchInput
+                        cert <-
+                            buildCertifierTracked
+                                (reductionEarlyReject config)
+                                tracker
+                                searchInput
+                                (analyzedUnits analysis)
+                                mTrace
+                        out <-
+                            closureSearchWithAnalysis tracker cert effectiveStatementPolicy logger pool searchInput analysis
+                        pure (out, ())
+                    else timedReductionStage reporter logger StageGraphFreeSearch searchInput do
+                        mTrace <- lookupTraceForCert searchInput
+                        out <-
+                            statementDdminWithCert
+                                (reductionEarlyReject config)
+                                tracker
+                                mTrace
+                                effectiveStatementPolicy
+                                parse
+                                pool
+                                searchInput
+                        pure (out, ())
+            fallback <-
+                if reductionClosure config
+                    && reductionUnrestricted config
+                    && (not useEarlyUnrestricted || searched /= searchInput)
+                    then unrestrictedSearch effectiveStatementPolicy searched
+                    else pure searched
+            (out, ev) <- interleaveStages fallback
+            pure (out, ev, out == sliced)
     where
         lookupTraceForCert sql
             | reductionEarlyReject config = (>>= evidenceResultTrace) <$> observeResult sql
@@ -2253,6 +2380,9 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
                         timedReductionStage reporter logger StageIntraStatementRewrites base do
                             r <-
                                 reduceSyntaxWithDialect
+                                    (reductionEarlyReject config)
+                                    tracker
+                                    lookupTraceForCert
                                     logger
                                     (columnParseOptions (reductionColumnMode config) (reductionDialect config))
                                     pool
@@ -2285,6 +2415,9 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
                 fst <$> timedReductionStage reporter logger StageIntraStatementRewrites afterAudit do
                     out <-
                         reduceSyntaxWithDialect
+                            (reductionEarlyReject config)
+                            tracker
+                            lookupTraceForCert
                             logger
                             (columnParseOptions (reductionColumnMode config) (reductionDialect config))
                             pool
@@ -2339,6 +2472,10 @@ data SyntaxContext = SyntaxContext
     , syntaxAdaptiveValues :: !Bool
     , syntaxFullReparse :: !Bool
     , syntaxOptions :: !ParseOptions
+    , syntaxEarlyReject :: !Bool
+    , syntaxTracker :: !EarlyRejectTracker
+    , syntaxCert :: !EarlyRejectCertifier
+    , syntaxLookupTrace :: ByteString -> IO (Maybe ResultTrace)
     }
 
 data SyntaxCandidate
@@ -2456,6 +2593,9 @@ syntaxCategoryOrderName :: ColumnMode -> T.Text
 syntaxCategoryOrderName = T.intercalate "," . map editCategoryName . syntaxCategoryOrder
 
 reduceSyntaxWithDialect ::
+    Bool ->
+    EarlyRejectTracker ->
+    (ByteString -> IO (Maybe ResultTrace)) ->
     Logger ->
     ParseOptions ->
     OraclePool ->
@@ -2467,7 +2607,7 @@ reduceSyntaxWithDialect ::
     Bool ->
     ByteString ->
     IO ByteString
-reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches astBatching adaptiveValues fullReparse initialSQL = do
+reduceSyntaxWithDialect earlyReject tracker lookupTrace logger options pool shouldRun mode literalBatches astBatching adaptiveValues fullReparse initialSQL = do
     let context =
             SyntaxContext
                 { syntaxLogger = logger
@@ -2480,6 +2620,10 @@ reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches astBat
                 , syntaxAdaptiveValues = adaptiveValues
                 , syntaxFullReparse = fullReparse
                 , syntaxOptions = options
+                , syntaxEarlyReject = earlyReject
+                , syntaxTracker = tracker
+                , syntaxCert = emptyEarlyRejectCertifier
+                , syntaxLookupTrace = lookupTrace
                 }
     logDebug'
         logger
@@ -2506,14 +2650,23 @@ reduceSyntaxWithDialect logger options pool shouldRun mode literalBatches astBat
 runSyntaxFixedPoint :: SyntaxContext -> IORef SyntaxStats -> ByteString -> IO ByteString
 runSyntaxFixedPoint context stats currentSQL = do
     (startUnits, phases, bundles) <- parseSyntaxSnapshot context currentSQL
+    mTrace <- syntaxLookupTrace context currentSQL
+    cert <-
+        buildCertifierTracked
+            (syntaxEarlyReject context)
+            (syntaxTracker context)
+            currentSQL
+            startUnits
+            mTrace
+    let context' = context {syntaxCert = cert}
     sweepSyntaxCategories
-        context
+        context'
         stats
         currentSQL
         startUnits
         phases
         bundles
-        (syntaxCategoryOrder (syntaxMode context))
+        (syntaxCategoryOrder (syntaxMode context'))
         False
 
 sweepSyntaxCategories ::
@@ -2600,14 +2753,22 @@ shiftColumnTarget threshold delta target =
 -- | Parse a single modified statement in isolation and shift its spans back to global coordinates.
 parseSingleUnit ::
     SyntaxContext ->
+    ParserEditCategory ->
     StatementUnit ->
     ParserEdit ->
     IO (Maybe (StatementUnit, Int))
-parseSingleUnit context oldUnit edit = do
+parseSingleUnit context category oldUnit edit = do
     let Span start_k end_k = stmtSpan (unitStatement oldUnit)
         oldRaw = stmtRaw (unitStatement oldUnit)
         localStart = parserEditStart edit - start_k
         localEnd = parserEditEnd edit - start_k
+        -- After EditList has completed in the current sweep, any accepted edit
+        -- forces a full cycle restart (runSyntaxFixedPoint), so chunk edits are
+        -- never consumed for the rest of this cycle.
+        singleOptions
+            | category `elem` [EditConstraint, EditType, EditExpression, EditLiteral] =
+                (syntaxOptions context) {parseChunkEdits = False}
+            | otherwise = syntaxOptions context
     if localStart < 0 || localEnd > BS.length oldRaw || localStart >= localEnd
         then pure Nothing
         else do
@@ -2621,8 +2782,8 @@ parseSingleUnit context oldUnit edit = do
             parsed <-
                 parseSQLTimed
                     (syntaxStore context)
-                    (kindOfOptions (syntaxOptions context))
-                    (syntaxOptions context)
+                    (kindOfOptions singleOptions)
+                    singleOptions
                     newRaw
             case parsed of
                 Right result
@@ -2643,14 +2804,15 @@ parseSingleUnit context oldUnit edit = do
 -- | Incrementally update syntax snapshot by reparsing only the modified statement.
 updateSyntaxSnapshot ::
     SyntaxContext ->
+    ParserEditCategory ->
     [StatementUnit] ->
     [ColumnTarget] ->
     ParserEdit ->
     ByteString ->
     IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
-updateSyntaxSnapshot context _ _ _ acceptedBytes
+updateSyntaxSnapshot context _ _ _ _ acceptedBytes
     | syntaxFullReparse context = parseSyntaxSnapshot context acceptedBytes
-updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
+updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedBytes = do
     let editStart = parserEditStart edit
         editEnd = parserEditEnd edit
         targetUnit =
@@ -2666,7 +2828,7 @@ updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
             | hasAffectedBundleSite oldUnit ->
                 parseSyntaxSnapshot context acceptedBytes
             | otherwise -> do
-                singleResult <- parseSingleUnit context oldUnit edit
+                singleResult <- parseSingleUnit context category oldUnit edit
                 case singleResult of
                     Nothing -> parseSyntaxSnapshot context acceptedBytes
                     Just (updatedUnit, delta) -> do
@@ -2697,6 +2859,74 @@ updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes = do
              in any
                     (any (\site -> siteStart site >= oldStart && siteStart site < oldEnd) . targetSites)
                     currentBundles
+
+{- | Exact zero-FFI span shift for an accepted scalar leaf literal edit during
+the final 'EditLiteral' sweep. Mirrors Rust @add_scalar_edit@ exactly for
+follow-up replacements on the edited literal and shifts all later spans by
+@delta@. Returns 'Nothing' if any edit partially overlaps the edited span.
+-}
+shiftLiteralSnapshot ::
+    [StatementUnit] ->
+    [(ParserEditCategory, [ParserEdit])] ->
+    [ColumnTarget] ->
+    ParserEdit ->
+    Maybe ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+shiftLiteralSnapshot currentUnits currentPhases currentBundles edit
+    | parserEditCategory edit /= EditLiteral || parserEditLabel edit /= "simplify-literal" = Nothing
+    | any partialOverlap literals = Nothing
+    | otherwise = Just (freshUnits, freshPhases, freshBundles)
+    where
+        editStart = parserEditStart edit
+        editEnd = parserEditEnd edit
+        repl = parserEditReplacement edit
+        newEnd = editStart + BS.length repl
+        delta = newEnd - editEnd
+        literals = phaseCandidates EditLiteral currentPhases
+        sameSpan x = parserEditStart x == editStart && parserEditEnd x == editEnd
+        partialOverlap x =
+            not (sameSpan x) && parserEditStart x < editEnd && editStart < parserEditEnd x
+        followUps =
+            let table =
+                    if BS.isPrefixOf "'" repl
+                        then ["''", "'0'", "NULL", "0"]
+                        else ["0", "1", "NULL", "FALSE", "TRUE", "''"]
+             in [ edit
+                    { parserEditStart = editStart
+                    , parserEditEnd = newEnd
+                    , parserEditReplacement = r
+                    }
+                | r <- table
+                , BS.length r < BS.length repl
+                ]
+        updateLiterals _ [] = []
+        updateLiterals inserted (x : xs)
+            | sameSpan x =
+                if inserted
+                    then updateLiterals True xs
+                    else followUps ++ updateLiterals True xs
+            | parserEditStart x >= editEnd =
+                shiftParserEdit delta x : updateLiterals inserted xs
+            | otherwise = x : updateLiterals inserted xs
+        freshLiterals = updateLiterals False literals
+        freshPhases =
+            [ if cat == EditLiteral then (EditLiteral, freshLiterals) else (cat, es)
+            | (cat, es) <- currentPhases
+            ]
+        updateUnit u =
+            let stmt = unitStatement u
+                Span s e = stmtSpan stmt
+             in if editStart >= s && editEnd <= e
+                    then
+                        let newRaw = replaceSpan (editStart - s) (editEnd - s) repl (stmtRaw stmt)
+                         in u {unitStatement = stmt {stmtSpan = Span s (e + delta), stmtRaw = newRaw}}
+                    else
+                        if delta /= 0 && s > editStart
+                            then shiftStatementUnit delta u
+                            else u
+        freshUnits = map updateUnit currentUnits
+        freshBundles
+            | delta == 0 || null currentBundles = currentBundles
+            | otherwise = map (shiftColumnTarget editEnd delta) currentBundles
 
 -- | Parse a full snapshot into units, ordered edit buckets, and unblocked column bundles.
 parseSyntaxSnapshot ::
@@ -2793,7 +3023,7 @@ exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: In
         search _ _ [] = pure (sql, units, phases, bundles)
         search ordinal misses remaining = do
             let (eligible, deferred) = splitAt misses remaining
-            (window, nextOrdinal, rest) <- fillSyntaxWindow context sql ordinal eligible
+            (window, nextOrdinal, rest) <- fillSyntaxWindow context units sql ordinal eligible
             (tested, elapsed, accepted) <- testSyntaxWindow context (length units) window
             modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
             case accepted of
@@ -2805,7 +3035,8 @@ exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: In
                         [ ("bytes_before", toJSON (BS.length sql))
                         , ("bytes_after", toJSON (BS.length bytes))
                         ]
-                    (nextUnits, nextPhases, nextBundles) <- updateSyntaxSnapshot context units bundles edit bytes
+                    (nextUnits, nextPhases, nextBundles) <-
+                        updateSyntaxSnapshot context EditLiteral units bundles edit bytes
                     exhaustLiteralBatches context stats bytes nextUnits nextPhases nextBundles
                 _ -> search nextOrdinal (misses - tested) (rest ++ deferred)
 
@@ -2956,22 +3187,30 @@ exhaustIndependentAstBatches context stats initSQL initUnits initPhases initBund
                         || HashSet.member candidateBytes seenRejected ->
                         search sql units phases bundles seenRejected misses rest
                     | otherwise -> do
-                        let candidate = BatchCandidate category batch
-                        (tested, elapsed, accepted) <-
-                            testSyntaxWindow context (length units) [(0, candidate, candidateBytes)]
-                        modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
-                        case accepted of
-                            Just (_, _, bytes) -> do
-                                logAcceptedSyntaxEdit context candidate sql bytes
-                                (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
-                                    Just patch -> updateSyntaxSnapshot context units bundles patch bytes
-                                    Nothing -> parseSyntaxSnapshot context bytes
-                                go bytes nextUnits nextPhases nextBundles seenRejected
-                            Nothing ->
-                                let (left, right) = splitAt (length batch `div` 2) batch
-                                    subdivisions = [sub | sub <- [left, right], length sub >= 2]
-                                    seen' = HashSet.insert candidateBytes seenRejected
-                                 in search sql units phases bundles seen' (misses - 1) (subdivisions ++ rest)
+                        earlyBytes <-
+                            checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True candidateBytes
+                        case earlyBytes of
+                            Just reason -> do
+                                recordEarlyRejectSkip (syntaxStore context) reason
+                                let seen' = HashSet.insert candidateBytes seenRejected
+                                search sql units phases bundles seen' misses rest
+                            Nothing -> do
+                                let candidate = BatchCandidate category batch
+                                (tested, elapsed, accepted) <-
+                                    testSyntaxWindow context (length units) [(0, candidate, candidateBytes)]
+                                modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+                                case accepted of
+                                    Just (_, _, bytes) -> do
+                                        logAcceptedSyntaxEdit context candidate sql bytes
+                                        (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
+                                            Just patch -> updateSyntaxSnapshot context category units bundles patch bytes
+                                            Nothing -> parseSyntaxSnapshot context bytes
+                                        go bytes nextUnits nextPhases nextBundles seenRejected
+                                    Nothing ->
+                                        let (left, right) = splitAt (length batch `div` 2) batch
+                                            subdivisions = [sub | sub <- [left, right], length sub >= 2]
+                                            seen' = HashSet.insert candidateBytes seenRejected
+                                         in search sql units phases bundles seen' (misses - 1) (subdivisions ++ rest)
 
         singleUnitPatch sql units batch = case sortOn parserEditStart batch of
             first : rest@(_ : _) ->
@@ -3033,7 +3272,8 @@ exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category 
         sweep changed _ currentSQL currentUnits currentPhases currentBundles [] =
             pure (currentSQL, currentUnits, currentPhases, currentBundles, changed)
         sweep changed ordinal currentSQL currentUnits currentPhases currentBundles candidates = do
-            (windowTasks, nextOrdinal, rest) <- fillSyntaxWindow context currentSQL ordinal candidates
+            (windowTasks, nextOrdinal, rest) <-
+                fillSyntaxWindow context currentUnits currentSQL ordinal candidates
             if null windowTasks
                 then sweep changed nextOrdinal currentSQL currentUnits currentPhases currentBundles rest
                 else do
@@ -3044,8 +3284,12 @@ exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category 
                             logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
                             (freshUnits, freshPhases, freshBundles) <- case candidate of
                                 SingleCandidate edit
+                                    | not (syntaxFullReparse context)
+                                    , category == EditLiteral
+                                    , Just shifted <- shiftLiteralSnapshot currentUnits currentPhases currentBundles edit ->
+                                        pure shifted
                                     | category /= EditColumn ->
-                                        updateSyntaxSnapshot context currentUnits currentBundles edit acceptedBytes
+                                        updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedBytes
                                 _ -> parseSyntaxSnapshot context acceptedBytes
                             let freshCandidates =
                                     drop acceptedOrdinal (stream freshPhases freshBundles)
@@ -3125,26 +3369,43 @@ valuesChunkEdits deferred edits@(edit : rest)
 phaseCandidates :: ParserEditCategory -> [(ParserEditCategory, [ParserEdit])] -> [ParserEdit]
 phaseCandidates category = fromMaybe [] . lookup category
 
--- | Fill one oracle window, skipping candidates that do not strictly shrink.
+-- | Fill one oracle window, skipping non-shrinking and early-certified-rejected candidates.
 fillSyntaxWindow ::
     SyntaxContext ->
+    [StatementUnit] ->
     ByteString ->
     Int ->
     [SyntaxCandidate] ->
     IO ([(Int, SyntaxCandidate, ByteString)], Int, [SyntaxCandidate])
-fillSyntaxWindow context currentSQL startOrdinal = fill (poolJobCount (syntaxPool context)) startOrdinal []
+fillSyntaxWindow context currentUnits currentSQL startOrdinal = fill (poolJobCount (syntaxPool context)) startOrdinal []
     where
         fill _ ordinal acc [] = pure (reverse acc, ordinal, [])
         fill 0 ordinal acc rest = pure (reverse acc, ordinal, rest)
         fill remaining ordinal acc (candidate : rest) = do
-            (built, buildMicros) <- timeSyntaxCandidateBuild context currentSQL candidate
-            case built of
-                Nothing -> do
-                    recordGeneratedSkipped (syntaxStore context) "nonshrinking"
+            earlyEdit <- case candidate of
+                SingleCandidate edit ->
+                    checkEarlyRejectionSyntaxEditTracked (syntaxTracker context) currentUnits (syntaxCert context) edit
+                _ -> pure Nothing
+            case earlyEdit of
+                Just reason -> do
+                    recordEarlyRejectSkip (syntaxStore context) reason
                     fill remaining (ordinal + 1) acc rest
-                Just bytes -> do
-                    recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
-                    fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
+                Nothing -> do
+                    (built, buildMicros) <- timeSyntaxCandidateBuild context currentSQL candidate
+                    case built of
+                        Nothing -> do
+                            recordGeneratedSkipped (syntaxStore context) "nonshrinking"
+                            fill remaining (ordinal + 1) acc rest
+                        Just bytes -> do
+                            recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
+                            earlyBytes <-
+                                checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True bytes
+                            case earlyBytes of
+                                Just reason -> do
+                                    recordEarlyRejectSkip (syntaxStore context) reason
+                                    fill remaining (ordinal + 1) acc rest
+                                Nothing ->
+                                    fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
 
 -- | Assemble candidate bytes with optional build timing.
 timeSyntaxCandidateBuild ::

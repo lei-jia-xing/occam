@@ -94,18 +94,27 @@ import Occam.Dependency.State (
     writeSignature,
  )
 
--- Write-state application
+-- Write-state application.
+-- Online transitive reduction: before 'writeRelation' applies 'applyWriteState',
+-- 'relationWriteDeps' emits direct edges from @sid@ to all prior
+-- @relCardinalityWrites@ (for INSERT, MERGE via @relDataWrites@ superset, and
+-- filtered DELETE) and to all prior @relColumnWrites@ of each written column
+-- (for filtered UPDATE). Replacing those frontier sets with @Set.singleton sid@
+-- therefore preserves exact transitive reachability ('backwardSlice',
+-- 'closeSet', 'isValidClosure') while reducing O(N^2) write cliques to O(N)
+-- chains. @relDataWrites@ is intentionally preserved untouched so direct-edge
+-- queries on @ReadData@ retain every contributing write.
 applyWriteState :: StatementId -> WriteKind -> [Ident] -> RelationState -> RelationState
 applyWriteState sid kind columns relation =
     case kind of
         InsertWrite _ ->
             relation
                 & relDataWritesL %~ Set.insert sid
-                & relCardinalityWritesL %~ Set.insert sid
+                & relCardinalityWritesL .~ Set.singleton sid
         MergeWrite ->
             relation
                 & relDataWritesL %~ Set.insert sid
-                & relCardinalityWritesL %~ Set.insert sid
+                & relCardinalityWritesL .~ Set.singleton sid
         DeleteWrite scope
             | scope == DeleteAllRows ->
                 relation
@@ -115,7 +124,7 @@ applyWriteState sid kind columns relation =
             | otherwise ->
                 relation
                     & relDataWritesL %~ Set.insert sid
-                    & relCardinalityWritesL %~ Set.insert sid
+                    & relCardinalityWritesL .~ Set.singleton sid
         UpdateWrite scope
             | scope == UpdateAllRows ->
                 if null columns
@@ -136,7 +145,7 @@ applyWriteState sid kind columns relation =
                     & relColumnWritesL
                         %~ ( \current ->
                                 foldl'
-                                    (\m column -> Map.insertWith Set.union column (Set.singleton sid) m)
+                                    (\m column -> Map.insert column (Set.singleton sid) m)
                                     current
                                     columns
                            )
