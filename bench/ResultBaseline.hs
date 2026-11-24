@@ -9,6 +9,9 @@ module ResultBaseline (
     runStatementWeightBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
+    runStatementRankBaseline,
+    runStatementInterleaveBaseline,
+    runStatementRankedResumeBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
@@ -401,6 +404,38 @@ runRankedComparison configure cases pairs wallLimit callLimit out =
             True
         )
         cases
+
+runStatementRankBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementRankBaseline = runRankedAblation StatementInterleaved
+
+runStatementInterleaveBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementInterleaveBaseline = runRankedAblation StatementRankedSerial
+
+runStatementRankedResumeBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementRankedResumeBaseline = runRankedAblation StatementRankedResume
+
+runRankedAblation :: StatementSearchPolicy -> Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runRankedAblation control pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        (arm "control" control, arm "ranked-interleaved" StatementRanked)
+        (statementFixtures ++ [statementFixture False True 128, statementFixture True True 32] ++ fixtures)
+    where
+        arm name policy =
+            serialArm
+                name
+                ( \config ->
+                    config
+                        { reductionSlicing = False
+                        , reductionClosure = False
+                        , reductionStatementSearch = policy
+                        }
+                )
+                True
 
 optimizedSyntax :: ReductionConfig -> ReductionConfig
 optimizedSyntax config =

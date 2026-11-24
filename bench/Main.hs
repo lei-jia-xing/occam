@@ -62,9 +62,12 @@ import ResultBaseline (
     runReparseBaseline,
     runResultBaseline,
     runSearchBaseline,
+    runStatementInterleaveBaseline,
     runStatementOrderBaseline,
+    runStatementRankBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
+    runStatementRankedResumeBaseline,
     runStatementWeightBaseline,
     runStatementYieldBaseline,
     runValuesScheduleBaseline,
@@ -297,6 +300,9 @@ searchModes =
     , ("--statement-weight-baseline", runStatementWeightBaseline)
     , ("--statement-ranked-baseline", runStatementRankedBaseline)
     , ("--statement-ranked-graph-free-baseline", runStatementRankedGraphFreeBaseline)
+    , ("--statement-rank-ablation", runStatementRankBaseline)
+    , ("--statement-interleave-ablation", runStatementInterleaveBaseline)
+    , ("--statement-ranked-resume-ablation", runStatementRankedResumeBaseline)
     , ("--reparse-baseline", runReparseBaseline)
     , ("--worker-baseline", runWorkerBaseline)
     ]

@@ -152,6 +152,9 @@ reductionSearchPolicy config = syntax <> statement
             StatementComplementFirst -> "+complement-first"
             StatementByteWeighted -> "+complement-first-byte-weighted"
             StatementRanked -> "+ranked-statements"
+            StatementInterleaved -> "+interleaved-statements"
+            StatementRankedSerial -> "+ranked-lanes"
+            StatementRankedResume -> "+ranked-resume"
 
 literalBatchPolicy :: Bool -> T.Text
 literalBatchPolicy False = ""
@@ -174,6 +177,9 @@ data StatementSearchPolicy
     | StatementComplementFirst
     | StatementByteWeighted
     | StatementRanked
+    | StatementInterleaved
+    | StatementRankedSerial
+    | StatementRankedResume
     deriving (Eq, Show)
 
 statementSearchPolicyName :: StatementSearchPolicy -> T.Text
@@ -181,6 +187,9 @@ statementSearchPolicyName StatementSubsetFirst = "subset-first"
 statementSearchPolicyName StatementComplementFirst = "complement-first"
 statementSearchPolicyName StatementByteWeighted = "byte-weighted"
 statementSearchPolicyName StatementRanked = "ranked"
+statementSearchPolicyName StatementInterleaved = "interleaved"
+statementSearchPolicyName StatementRankedSerial = "ranked-lanes"
+statementSearchPolicyName StatementRankedResume = "ranked-resume"
 
 -- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
@@ -626,6 +635,9 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                 chunks count = case policy of
                     StatementByteWeighted -> partitionStatementsByBytes count current
                     StatementRanked -> partitionStatementsByBytes count current
+                    StatementInterleaved -> partitionStatementsByBytes count current
+                    StatementRankedSerial -> partitionStatementsByBytes count current
+                    StatementRankedResume -> partitionStatementsByBytes count current
                     _ -> partitionChunks count current
                 lanes count =
                     let groups = chunks count
@@ -642,23 +654,34 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                         )
                 counts = granularities (length current) n
                 schedule = case policy of
-                    StatementRanked -> rankedSchedule current currentInts currentLen (map chunks counts)
+                    StatementRanked -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
+                    StatementInterleaved -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
+                    StatementRankedSerial -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
+                    StatementRankedResume -> rankedSchedule resumeAfter current currentInts currentLen (map chunks counts)
                     StatementSubsetFirst -> concatMap (\count -> let (subset, complement) = lanes count in [subset, complement]) counts
                     _ -> concatMap (\count -> let (subset, complement) = lanes count in [complement, subset]) counts
             trySchedule current currentLen schedule
 
         -- Compare saved-byte estimates across granularities. Round-robin
         -- the three ranked lanes so tiny subsets cannot starve other edits.
-        rankedSchedule current currentInts currentLen partitions =
-            [ (2, False, trySeeds tag current currentInts currentLen [seed])
-            | (tag, seed) <- concat (transpose [complements, subsets, singletons])
+        rankedSchedule resumeAfter current currentInts currentLen partitions =
+            [ (2, policy == StatementRankedResume, trySeeds tag current currentInts currentLen [seed])
+            | (tag, seed) <- scheduled
             ]
             where
                 weights =
                     IntMap.fromList
                         [(unStatementId (stmtId stmt), statementSpanBytes stmt) | stmt <- current]
                 retainedBytes = IntSet.foldl' (\total sid -> total + IntMap.findWithDefault 0 sid weights) 0
-                rank tag seeds = [(tag, seed) | seed <- sortOn retainedBytes seeds]
+                rank tag seeds =
+                    [(tag, seed) | seed <- if policy == StatementInterleaved then seeds else sortOn retainedBytes seeds]
+                queues = [complements, subsets, singletons]
+                scheduled
+                    | policy == StatementRankedSerial = concat queues
+                    | Just anchor <- resumeAfter
+                    , policy == StatementRankedResume =
+                        concat (transpose [resumeSingletons anchor, complements, subsets])
+                    | otherwise = concat (transpose queues)
                 groups = map statementIdsInt (concat partitions)
                 complements =
                     rank
@@ -669,6 +692,10 @@ searchDDMin policy feedback buildCandidate pool baseSQL allStatements initial =
                     rank
                         TagStatementComplement
                         [IntSet.delete sid currentInts | sid <- IntSet.toList currentInts]
+                resumeSingletons anchor =
+                    [(TagStatementComplement, IntSet.delete sid currentInts) | sid <- after ++ before]
+                    where
+                        (before, after) = span (<= unStatementId anchor) (IntSet.toList currentInts)
 
         granularities limit n
             | n < limit = n : granularities limit (min limit (2 * n))
