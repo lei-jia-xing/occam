@@ -102,15 +102,18 @@ newtype Decoder a = Decoder
 
 instance Functor Decoder where
     {-# INLINE fmap #-}
+    fmap :: (a -> b) -> Decoder a -> Decoder b
     fmap f (Decoder g) = Decoder $ \bs len pos -> case g bs len pos of
         (# e | #) -> (# e | #)
         (# | (# a, pos' #) #) -> (# | (# f a, pos' #) #)
 
 instance Applicative Decoder where
     {-# INLINE pure #-}
+    pure :: a -> Decoder a
     pure a = Decoder $ \_ _ pos -> (# | (# a, pos #) #)
 
     {-# INLINE (<*>) #-}
+    (<*>) :: Decoder (a -> b) -> Decoder a -> Decoder b
     Decoder gf <*> Decoder ga = Decoder $ \bs len pos -> case gf bs len pos of
         (# e | #) -> (# e | #)
         (# | (# f, pos1 #) #) -> case ga bs len pos1 of
@@ -119,12 +122,14 @@ instance Applicative Decoder where
 
 instance Monad Decoder where
     {-# INLINE (>>=) #-}
+    (>>=) :: Decoder a -> (a -> Decoder b) -> Decoder b
     Decoder ga >>= f = Decoder $ \bs len pos -> case ga bs len pos of
         (# e | #) -> (# e | #)
         (# | (# a, pos1 #) #) -> unDec (f a) bs len pos1
 
 instance MonadFail Decoder where
     {-# INLINE fail #-}
+    fail :: String -> Decoder a
     fail msg = Decoder $ \_ _ _ -> (# T.pack msg | #)
 
 -- | Decode a binary native parser response payload (without the magic header).
