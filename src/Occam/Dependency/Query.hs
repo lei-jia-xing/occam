@@ -328,28 +328,7 @@ relationReadDeps session catalog key mode columns only =
                                 relationDefinitionDeps catalog current
                                     `Set.union` relationIndexDeps catalog relation
                             dataDeps =
-                                case currentMode of
-                                    ReadData ->
-                                        case currentCols of
-                                            Nothing ->
-                                                relDataWrites relation
-                                                    `Set.union` Set.unions (Map.elems (relColumnWrites relation))
-                                            Just cols
-                                                | Set.null cols ->
-                                                    relDataWrites relation
-                                                | otherwise ->
-                                                    relDataWrites relation
-                                                        `Set.union` relationColumnWriteDeps
-                                                            session
-                                                            catalog
-                                                            current
-                                                            relation
-                                                            (Set.toList cols)
-                                    ReadRowCount ->
-                                        relCardinalityWrites relation
-                                    ReadRowExistence ->
-                                        relCardinalityWrites relation
-                                    ReadSchema -> Set.empty
+                                readModeDataDeps session catalog current relation currentMode currentCols
                             -- View sources are evaluated with ReadData for column dependencies.
                             sourceDeps =
                                 if relKind relation == ViewRelation
@@ -374,6 +353,33 @@ relationReadDeps session catalog key mode columns only =
                                 `Set.union` dataDeps
                                 `Set.union` sourceDeps
                                 `Set.union` childDeps
+
+readModeDataDeps ::
+    SessionState ->
+    Catalog ->
+    RelationKey ->
+    RelationState ->
+    ReadMode ->
+    Maybe (Set.Set Ident) ->
+    Set.Set StatementId
+readModeDataDeps session catalog current relation mode cols = case mode of
+    ReadSchema -> Set.empty
+    ReadRowCount -> relCardinalityWrites relation
+    ReadRowExistence -> relCardinalityWrites relation
+    ReadData -> case cols of
+        Nothing ->
+            relDataWrites relation
+                `Set.union` Set.unions (Map.elems (relColumnWrites relation))
+        Just cs
+            | Set.null cs -> relDataWrites relation
+            | otherwise ->
+                relDataWrites relation
+                    `Set.union` relationColumnWriteDeps
+                        session
+                        catalog
+                        current
+                        relation
+                        (Set.toList cs)
 
 relationWriteDeps ::
     SessionState -> Catalog -> RelationKey -> WriteKind -> [Ident] -> Set StatementId

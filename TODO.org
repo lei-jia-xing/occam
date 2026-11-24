@@ -262,6 +262,57 @@
   - The local scheduler stops refilling beyond a published decisive outcome, retires candidates in order, and retains only results within the lookahead width for joins. An independent process reaper prevents interruption between the OS reap and recording the exit code.
   - Three local synthetic runs per width with 12 required statements, 36 removable statements, and 12/40 ms accepting/rejecting delays all validated the same 278-byte endpoint. Median reduction times for jobs 1/4/8 were 3.60/2.79/3.34 s. Median physical attempts were 63/165/283 and cancellations 0/94/193. Stage 2 measurements await independent DBMS instances per probe.
 
+** TODO [#B] Follow-up performance work from the local exploration at `6b3a4fe`
+- The figures below come from local microbenchmarks and synthetic scripts. Three changes have isolated before/after prototypes. The remaining measurements establish the current cost to compare against.
+- For changes intended to preserve search behavior, compare candidate bytes, ordered retirements, verdicts, and final validation. Record physical probes and cancellations separately when changing the scheduling pipeline.
+
+*** Priorities with local measurements
+- [X] Keep SQLite prefix checkpoints when the new candidate shares their exact prefix. `occam_sqlite_build_ckpts` currently rebuilds after accepted suffix-only changes. The prototype retained the existing slots when the longest saved prefix matched byte for byte. Median cost fell from 410–561 µs to 56–70 µs per probe for 32 inserts, and from 1.18–1.42 ms to 0.59–0.73 ms for 256 inserts. Verify prefix changes, connection reset, deadlines, and trace parity before landing.
+- [X] Index statement deletion boundaries once per source snapshot. The indexed singleton-deletion prototype produced identical bytes for every test deletion. On 4,096 statements, construction fell from 108 µs to 7.6 µs per candidate. Both versions allocated about 98 KB per candidate. Check comment and delimiter ownership and cover sparse and dense removals.
+- [X] Look up deletion plans before rendering candidates. A script with 4,096 identical required inserts recorded 6 physical probes, 4,096 cache hits, and about 578 MB allocated with stats. Cache immutable snapshot and removal-plan pairs, and recognize byte-identical deletions within runs of adjacent identical units and trivia. Preserve exact-byte checks across snapshots and the existing behavior with caching disabled.
+- [X] Feed the ordered scheduler continuously from the reducer. `trySeeds`, `statementAuditWithCert`, and `fillSyntaxWindow` currently submit bounded batches. In a 96-probe synthetic workload with short probes at 2.5 ms and adjacent 12 ms probes across batch boundaries, continuous submission reduced wall time from 300 to 192 ms at jobs 4 and from 152 to 96 ms at jobs 8. The evenly spaced slow-probe case gained little. Compare both patterns, preserve budget reservation and retirement order, and verify cancellation and reaping.
+- [X] Index failing prefixes with a compressed byte trie. `checkFailingPrefix` hashes the candidate prefix at each recorded length. For a 32 KiB miss, the current check took about 4.5 µs with 32 lengths and 680 µs with 512. Preserve exact byte matching, the cache bound, and concurrent registration behavior.
+- [X] Intern repeated identifiers in the binary FFI response. For 2,048 same-shape SELECTs, the facts payload was 186 KB and two repeated encoded identifiers accounted for 90 KB. Compare wire size, Rust encoding, Haskell allocation, and decoded fact parity.
+- [X] Gate full evaluation curves and cost attribution on their consumers. The 4,096-insert audit allocated about 578 MB with `--stats` and 528 MB without it. The evaluator still collects the full curve in the latter case. Preserve summary counters, progress, and the stats schema.
+- [X] Measure nursery sizing for batch throughput and peak RSS. On 4,096 noise statements, `-A4m` used about 76 MiB peak RSS versus 101 MiB at `-A32m`, with both runs around 132 ms and the same output. Check more workload sizes before changing the default.
+
+*** Statement search and rejection certificates
+- [X] Carry the current kept-statement count through audit and derive the candidate count from the deletion, avoiding repeated `IntSet.size` scans.
+- [X] Index which retained statements rely on a unique remaining definition. Update the index after accepted removals and cross-check it against the full certificate scan.
+- [X] Deduplicate exact closure projections within the immutable source snapshot before rendering SQL. Preserve the current candidate order.
+- [X] Maintain cumulative byte weights for partitioning and reuse boundaries within a search pass. Check partition parity with uneven statement sizes.
+
+*** Intra-statement reduction
+- [X] Store unit-local edit offsets and maintain source offsets with prefix sums, so unrelated suffix units keep their geometry after an accepted edit.
+- [X] Keep per-unit category buckets and update only the changed unit after a single-unit reparse.
+- [X] Index category streams by cumulative edit count to resume at the existing ordinal without walking from the beginning.
+- [X] Extend Rust-certified local span updates to more edit shapes. Compare the full candidate stream with reparsing and retain oracle checks for candidate verdicts.
+
+*** Parser and dependency graph
+- [X] Add a span-and-error parse mode for `audit-only` and `ddmin-only`, and reuse the initial parsed count. Preserve parser recovery and statement boundaries.
+- [X] Share compatible AST traversals during semantic fact extraction. Check fact equality for each supported dialect.
+- [X] Encode common syntax-edit labels as numeric IDs and resolve them to shared labels when decoding. Cover uncommon labels and check wire compatibility.
+- [X] Build integer adjacency directly for parser-issued statement IDs and derive the public `Map`/`Set` views on demand. At 512 statements, graph construction allocated about 3.1 MB and the close-set microbenchmark took about 0.7 µs.
+- [X] Index schema barrier touchers by name suffix and preserve the existing match rule in both directions.
+
+*** Native result oracles
+- [X] Restore the requested SQLite checkpoint directly when the connection can transition safely to it. Preserve cleanup of transactions, pragmas, temporary objects, and connection-local counters.
+- [X] Include SQLite checkpoint preparation in the probe deadline and verify clean cancellation and connection reuse.
+- [X] Construct complete native result traces only when slicing, certificates, or another consumer needs them. Preserve the exact oracle verdict in each mode.
+- [X] Evaluate opening DuckDB with the required configuration already applied. Verify access restrictions and configuration locking on supported native versions.
+- [X] Measure a shorter DuckDB execution path for proven single statements. Preserve the result kind, error classification, and timeout behavior.
+- [X] Read a warm DuckDB checkpoint without taking the cold-start lock, and reduce JSON allocation in the Rust-to-Haskell suffix proof. Verify concurrent connection isolation and trace parity.
+
+*** Cache, scheduler, and evaluation
+- [X] Calculate the candidate fingerprint during byte materialization and retain exact equality checks on hits. Current cache-hit latency grew from 0.10 µs at 32 bytes to 6.3 µs at 32 KiB and 24 µs at 128 KiB.
+- [X] Check the raw leading bytes before validating all UTF-8 for native whitespace-key eligibility. Preserve exact keys for out-of-scope input.
+- [X] Track the first published decisive ordinal for the current window, avoiding a window scan on every refill. Preserve ordered retirement and worker settlement.
+- [X] Amortize cancellation registration on the serial probe path. Preserve the pool-close and timeout behavior.
+- [X] Carry statement counts and result traces with candidate retirement, replacing SQL-keyed side tables where the lifetime permits it. Cover cache hits and cancellation.
+- [X] Combine compatible per-probe metrics updates while preserving accounting of physical, cancelled, unselected, and retired work.
+- [X] Use direct JSON encoding for stats and evaluation records while preserving the existing JSON schema.
+- [X] Use in-memory checkpoints for CLI paths that do not require persistence. Preserve external checkpoint recovery, signal handling, and final output semantics.
+
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (no server required)
 - [X] Target DBMS Dockerfiles prepared in `harness/`: `Dockerfile.target-sqlite` (release zip + Fossil snapshot ref, `SQLITE_DEBUG`, optional ASan), `Dockerfile.target-mariadb` (source `Debug`, optional ASan, crash supervisor), `Dockerfile.target-duckdb` (`RelWithDebInfo` + `FORCE_ASSERT=1`, optional ASan), `Dockerfile.target-clickhouse` (pinned official `.deb` packages, optional `-dbg`, crash supervisor), alongside existing `Dockerfile.target-pg` and `Dockerfile.target-mysql`.

@@ -154,12 +154,28 @@ pub unsafe extern "C" fn occam_sql_oracle_source(
     }
     unsafe {
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            let sql = std::str::from_utf8(std::slice::from_raw_parts(data, len)).ok()?;
+            let bytes = std::slice::from_raw_parts(data, len);
             let kind = dialect_from_code(dialect)?;
             match mode {
-                0 => crate::oracle::cache_key(sql, kind),
+                0 => {
+                    // Check raw leading bytes before validating full UTF-8 for native whitespace key.
+                    if !matches!(kind, DialectKind::SQLite | DialectKind::DuckDB) {
+                        return None;
+                    }
+                    let mut cursor = 0;
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    let remaining = &bytes[cursor..];
+                    if remaining.len() < 6 || !remaining[..6].eq_ignore_ascii_case(b"select") {
+                        return None;
+                    }
+                    let sql = std::str::from_utf8(bytes).ok()?;
+                    crate::oracle::cache_key(sql, kind)
+                }
                 1 if kind == DialectKind::DuckDB => {
-                    serde_json::to_vec(&crate::oracle::duckdb_replay_units(sql)?).ok()
+                    let sql = std::str::from_utf8(bytes).ok()?;
+                    crate::oracle::duckdb_replay_units_binary(sql)
                 }
                 _ => None,
             }
@@ -269,6 +285,7 @@ pub unsafe extern "C" fn occam_sql_parse_flags(
                 column_bundles: (flags & 4) != 0,
                 syntax_edits: (flags & 8) != 0,
                 syntax_only: (flags & 16) != 0,
+                span_only: (flags & 32) != 0,
             };
             let bytes = if len == 0 {
                 &[][..]
@@ -465,6 +482,7 @@ mod tests {
             column_bundles: false,
             syntax_edits: true,
             syntax_only: false,
+            span_only: false,
         };
         let init = session_init(&config);
         assert_eq!(init.namespace_prefix[0].0, "Tenant");
@@ -507,6 +525,7 @@ mod tests {
             column_bundles,
             syntax_edits: true,
             syntax_only: false,
+            span_only: false,
         };
         let json = facts_json(sql, &config).expect("facts json");
         serde_json::from_slice(&json).expect("response json")
@@ -577,6 +596,7 @@ mod tests {
                 column_bundles,
                 syntax_edits,
                 syntax_only,
+                span_only: false,
             };
             let cfg_bytes = serde_json::to_vec(&config).expect("serialize config");
             let mut json_ptr = std::ptr::null_mut();
@@ -631,6 +651,7 @@ mod tests {
             column_bundles: false,
             syntax_edits,
             syntax_only: false,
+            span_only: false,
         };
         let with_edits = parse_units(sql, &mk(true)).expect("with syntax_edits");
         let without_edits = parse_units(sql, &mk(false)).expect("without syntax_edits");
@@ -680,6 +701,7 @@ mod tests {
                 column_bundles: false,
                 syntax_edits: true,
                 syntax_only: false,
+                span_only: false,
             },
         )
         .expect("full parse");
@@ -693,6 +715,7 @@ mod tests {
                 column_bundles: false,
                 syntax_edits: true,
                 syntax_only: true,
+                span_only: false,
             },
         )
         .expect("syntax_only parse");
@@ -727,6 +750,7 @@ mod tests {
                 column_bundles: false,
                 syntax_edits: true,
                 syntax_only: true,
+                span_only: false,
             },
         )
         .expect("parse");

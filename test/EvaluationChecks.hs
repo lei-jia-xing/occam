@@ -540,6 +540,7 @@ tests =
                         , requestInitialSQL = initial
                         , requestCheckpoint = checkpoint
                         , requestAction = action
+                        , requestCollectCurve = True
                         }
             let metrics = evaluationMetrics result
             assertEqual "request run returns the accepted candidate" candidate (evaluatedSQL result)

@@ -57,6 +57,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     chunk_edits: bool,
     syntax_edits: bool,
     top_level_select_ptr: Option<*const Select>,
+    pub(crate) sequences: Option<SequenceVisitor<'a>>,
 }
 impl<'a> AnalysisVisitor<'a> {
     pub(crate) fn new(context: AnalysisContext<'a>) -> Self {
@@ -96,6 +97,7 @@ impl<'a> AnalysisVisitor<'a> {
             chunk_edits: context.chunk_edits,
             syntax_edits: context.syntax_edits,
             top_level_select_ptr: None,
+            sequences: None,
         }
     }
 
@@ -2512,6 +2514,7 @@ impl Visitor for AnalysisVisitor<'_> {
             && let Some(scope) = query_scope
             && let Some(body) = self.fetch_source_span(fetch, scope)
         {
+            let edit_index = self.edits.len();
             self.clause_edit_complete(
                 Keyword::FETCH,
                 body,
@@ -2519,6 +2522,7 @@ impl Visitor for AnalysisVisitor<'_> {
                 &[Keyword::FOR, Keyword::SETTINGS, Keyword::FORMAT],
                 "remove-fetch",
             );
+            self.mark_select_tail_clause(query, edit_index);
         }
         if let SetExpr::Values(values) = query.body.as_ref()
             && values.rows.len() > 1
@@ -3004,6 +3008,9 @@ impl Visitor for AnalysisVisitor<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let Some(sequences) = &mut self.sequences {
+            let _ = sequences.pre_visit_expr(expr);
+        }
         // Expressions inside an ignored root (PostgreSQL `PARTITION BY`
         // schemes, MySQL index length prefixes) never fence: the scheme
         // keyword and the length prefix lower as `Function` but name no

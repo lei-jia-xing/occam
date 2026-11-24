@@ -74,6 +74,7 @@ pub(super) fn count_units(source: &str, kind: DialectKind) -> Result<usize, Stri
             column_bundles: false,
             syntax_edits: false,
             syntax_only: false,
+            span_only: false,
         },
         false,
         |_| {},
@@ -353,7 +354,7 @@ fn walk_units(
                 parse_error,
                 has_parse_error,
             } = unit;
-            let facts = if has_parse_error {
+            let facts = if has_parse_error || config.span_only {
                 None
             } else {
                 let statement = statement.as_ref().ok_or_else(|| {
@@ -472,6 +473,7 @@ mod tests {
                 column_bundles: false,
                 syntax_edits: false,
                 syntax_only: false,
+                span_only: false,
             },
         )
         .expect("parse should succeed");

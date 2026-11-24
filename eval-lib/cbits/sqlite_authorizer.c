@@ -666,6 +666,14 @@ int occam_sqlite_run_and_match(
     int last_matched = 0;
     const occam_sqlite_ckpt *matched_ckpt = NULL;
 
+    occam_sqlite_deadline dl;
+    dl.deadline_ns = occam_monotonic_ns() + (timeout_micros > 0 ? timeout_micros * 1000LL : 0);
+    dl.timed_out = 0;
+    if (timeout_micros <= 0) {
+        return 3;
+    }
+    sqlite3_progress_handler(db, 1000, occam_sqlite_progress_cb, &dl);
+
     /* Find longest matching deterministic semicolon-terminated prefix checkpoint. */
     if (allow_ckpt_use && cache->num_ckpts > 0 && cache->base_sql != NULL) {
         for (int i = cache->num_ckpts - 1; i >= 0; i--) {
@@ -686,14 +694,6 @@ int occam_sqlite_run_and_match(
             }
         }
     }
-
-    occam_sqlite_deadline dl;
-    dl.deadline_ns = occam_monotonic_ns() + (timeout_micros > 0 ? timeout_micros * 1000LL : 0);
-    dl.timed_out = 0;
-    if (timeout_micros <= 0) {
-        return 3;
-    }
-    sqlite3_progress_handler(db, 1000, occam_sqlite_progress_cb, &dl);
 
     int sql_limit = sqlite3_limit(db, 1 /* SQLITE_LIMIT_SQL_LENGTH */, -1);
     int status = 1;
@@ -832,6 +832,44 @@ int occam_sqlite_build_ckpts(
     if (cache->base_sql != NULL && cache->base_len == sql_len &&
         memcmp(cache->base_sql, sql, sql_len) == 0 && cache->num_ckpts > 0) {
         return 1;
+    }
+
+    /* Retain valid prefix checkpoints if new candidate shares prefix byte-for-byte. */
+    int retained = 0;
+    if (cache->base_sql != NULL && cache->num_ckpts > 0) {
+        while (retained < cache->num_ckpts) {
+            occam_sqlite_ckpt *slot = &cache->ckpts[retained];
+            if (slot->prefix_len <= sql_len &&
+                memcmp(cache->base_sql, sql, slot->prefix_len) == 0) {
+                retained++;
+            } else {
+                break;
+            }
+        }
+        for (int i = retained; i < cache->num_ckpts; i++) {
+            if (cache->ckpts[i].db) {
+                sqlite3_close(cache->ckpts[i].db);
+                cache->ckpts[i].db = NULL;
+            }
+            free(cache->ckpts[i].end_offsets);
+            cache->ckpts[i].end_offsets = NULL;
+            free(cache->ckpts[i].result_flags);
+            cache->ckpts[i].result_flags = NULL;
+        }
+        cache->num_ckpts = retained;
+    }
+
+    if (retained > 0) {
+        if (!cache_ensure_sql_buf(cache, sql, sql_len)) {
+            return 0;
+        }
+        uint8_t *new_base = (uint8_t *)realloc(cache->base_sql, sql_len);
+        if (new_base) {
+            cache->base_sql = new_base;
+            memcpy(cache->base_sql, sql, sql_len);
+            cache->base_len = sql_len;
+            return 1;
+        }
     }
 
     occam_sqlite_cache_clear_ckpts(cache);

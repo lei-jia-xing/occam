@@ -67,7 +67,9 @@ import Occam.Parser (
     dialectName,
     factDumpJson,
     parseSQL,
+    spanOnlyOptions,
  )
+import Occam.Pool (poolMetricsStore)
 import Occam.Reducer (
     AuditStats (..),
     ColumnMode (..),
@@ -80,9 +82,11 @@ import Occam.Reducer (
     columnModeName,
     convergedRankedScheduleConfig,
     defaultReductionConfig,
+    parseStatementsFast,
     reduceSQLWithResultTraceFull,
-    statementAuditWithLogger,
-    statementDdminWithOrder,
+    reuseLatestSQLWithSeed,
+    statementAuditWithParser,
+    statementDdminWithParser,
     statementRankedFallback,
     statementSearchPolicyName,
  )
@@ -128,7 +132,6 @@ import System.Directory (
  )
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath ((</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
 
@@ -933,8 +936,12 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
     oracleCmd <- if valResultOracle then pure Nothing else Just <$> requireOracleCommand valOracleCmd
     (writeToStdout, targetMinimalPath, statsPath) <-
         resolveOutputTargets valInputFile valOut valInPlace valStatsFile
+    let (reuseParse, spanOnly) = case valStrategy of
+            StrategyFull -> (True, False)
+            StrategyDdminOnly -> (True, True)
+            StrategyAuditOnly -> (True, True)
     (initialSQL, initialStmts, initialBytes, initialParsed) <-
-        loadInitialInput logger valDialect (valStrategy == StrategyFull) valInputFile
+        loadInitialInput logger valDialect reuseParse spanOnly valInputFile
 
     ui <-
         newUI
@@ -975,9 +982,9 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         , ("strategy", toJSON (strategyName valStrategy))
         ]
 
+    let needTraces = valStrategy == StrategyFull && (valSlicing || reductionEarlyReject reductionConfig)
     (rememberTrace, lookupTrace) <-
-        newResultTraceTracker
-            (valStrategy == StrategyFull && (valSlicing || reductionEarlyReject reductionConfig))
+        newResultTraceTracker needTraces
     failPrefixCache <-
         if isNothing oracleCmd && valStrategy == StrategyFull && reductionEarlyReject reductionConfig
             then Just <$> newFailingPrefixCache
@@ -987,6 +994,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         runPreflight totalBudgetMicros $ case oracleCmd of
             Nothing ->
                 prepareResultOracleWithTraceAndFailures
+                    needTraces
                     failPrefixCache
                     rememberTrace
                     valDialect
@@ -1044,26 +1052,34 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                         initialSQL
                 pure (ReductionActionResult sql evidence)
             StrategyDdminOnly -> do
+                parse <-
+                    reuseLatestSQLWithSeed
+                        initialParsed
+                        (parseStatementsFast (poolMetricsStore pool) (reductionDialect reductionConfig))
                 sql <-
-                    statementDdminWithOrder
+                    statementDdminWithParser
                         (reductionStatementSearch reductionConfig)
-                        (reductionDialect reductionConfig)
+                        parse
                         pool
                         initialSQL
                 pure (ReductionActionResult sql Nothing)
             StrategyAuditOnly -> do
+                parse <-
+                    reuseLatestSQLWithSeed
+                        initialParsed
+                        (parseStatementsFast (poolMetricsStore pool) (reductionDialect reductionConfig))
                 auditStart <- toInteger <$> getMonotonicTimeNSec
                 reporter (StageStarted StageStatementAudit)
                 (sql, stats) <-
-                    statementAuditWithLogger reducerLogger (reductionDialect reductionConfig) pool initialSQL
+                    statementAuditWithParser reducerLogger parse pool initialSQL
                 auditEnd <- toInteger <$> getMonotonicTimeNSec
                 let elapsed = fromIntegral (auditEnd - auditStart) / 1000000000 :: Double
                 reporter (StageFinished StageStatementAudit elapsed (BS.length initialSQL) (BS.length sql))
                 pure (ReductionActionResult sql (Just (ReductionEvidence sql (auditMinimalityConfirmed stats))))
 
     result <-
-        withCandidateWorkdir $ \tmpDir -> do
-            let checkpointPath = tmpDir </> "occam-checkpoint.sql"
+        withCandidateWorkdir $ \_ -> do
+            let checkpointPath = ""
                 runEvaluation
                     | isNothing oracleCmd = runEvaluationRequestWithNativeObserver
                     | otherwise = runEvaluationRequestWithObserver
@@ -1081,6 +1097,7 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                     , requestInitialSQL = initialSQL
                     , requestCheckpoint = checkpointPath
                     , requestAction = reductionAction
+                    , requestCollectCurve = isJust valStatsFile
                     }
 
     let reducedSQL = evaluatedSQL result
@@ -1193,9 +1210,10 @@ loadInitialInput ::
     Logger ->
     SQLDialect ->
     Bool ->
+    Bool ->
     FilePath ->
     IO (BS.ByteString, Int, Int, Maybe (BS.ByteString, (SessionInit, [StatementUnit])))
-loadInitialInput logger dialect reuseInitialParse inputFile = do
+loadInitialInput logger dialect reuseInitialParse spanOnly inputFile = do
     sql <-
         if inputFile == "-"
             then BS.getContents
@@ -1209,7 +1227,8 @@ loadInitialInput logger dialect reuseInitialParse inputFile = do
                 BS.readFile inputFile
     if reuseInitialParse
         then do
-            parsed <- parseSQL (defaultParseOptions dialect) sql
+            let options = if spanOnly then spanOnlyOptions dialect else defaultParseOptions dialect
+            parsed <- parseSQL options sql
             case parsed of
                 Left err -> do
                     let message = "SQL parser failed while counting statements: " <> T.pack (show err)

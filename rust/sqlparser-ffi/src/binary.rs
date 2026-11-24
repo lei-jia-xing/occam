@@ -20,9 +20,77 @@ use crate::{NativeEdit, NativeEditCategory, NativeResponse, NativeUnit};
 /// 5-byte magic header prefix (`b"OCCM\x02"`) identifying the Occam binary response format version 2.
 pub const OCCM_MAGIC: &[u8; 5] = b"OCCM\x02";
 
+pub const COMMON_LABELS: &[&str] = &[
+    "remove-column_constraint",
+    "remove-cte",
+    "remove-cte-chunk",
+    "remove-distinct",
+    "remove-distinct_on_expression",
+    "remove-fetch",
+    "remove-from-relation",
+    "remove-from-relation-chunk",
+    "remove-function_argument",
+    "remove-function_argument-chunk",
+    "remove-group_by",
+    "remove-group_by_expression",
+    "remove-having",
+    "remove-in_list",
+    "remove-in_list-chunk",
+    "remove-join",
+    "remove-limit",
+    "remove-list-chunk",
+    "remove-offset",
+    "remove-order_by",
+    "remove-order_by_expression",
+    "remove-returning",
+    "remove-returning_expression",
+    "remove-select_expression",
+    "remove-select_expression-chunk",
+    "remove-table_constraint",
+    "remove-tuple_item",
+    "remove-tuple_item-chunk",
+    "remove-update_assignment",
+    "remove-values_row",
+    "remove-values_row-chunk",
+    "remove-where",
+    "remove-window_frame",
+    "remove-window_order_by",
+    "remove-window_order_by_expression",
+    "remove-window_partition_by",
+    "remove-window_partition_by_expression",
+    "remove-with",
+    "simplify-between",
+    "simplify-binary_expression",
+    "simplify-case_else",
+    "simplify-case_literal",
+    "simplify-case_result",
+    "simplify-cast",
+    "simplify-cast_literal",
+    "simplify-data_type",
+    "simplify-exists",
+    "simplify-function_literal",
+    "simplify-function_to_argument",
+    "simplify-in_list",
+    "simplify-in_subquery",
+    "simplify-is_null",
+    "simplify-like",
+    "simplify-literal",
+    "simplify-parenthesized_expression",
+    "simplify-set_operation_left",
+    "simplify-set_operation_right",
+    "simplify-unary_expression",
+    "simplify-window_spec_empty",
+    "remove-column_create_def",
+    "remove-column_insert_item",
+    "remove-column_values_item",
+    "drop-column",
+];
+
 /// A byte buffer builder for serializing primitive types and structured payloads in little-endian order.
 pub struct BinaryWriter {
     buf: Vec<u8>,
+    ident_map: std::collections::HashMap<String, u32>,
+    ident_list: Vec<String>,
 }
 
 impl Default for BinaryWriter {
@@ -36,6 +104,8 @@ impl BinaryWriter {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(4096),
+            ident_map: std::collections::HashMap::new(),
+            ident_list: Vec::new(),
         }
     }
 
@@ -106,7 +176,16 @@ impl BinaryWriter {
 }
 
 fn write_ident(w: &mut BinaryWriter, ident: &Ident) {
-    w.write_str(&ident.0);
+    let id = match w.ident_map.get(&ident.0) {
+        Some(&id) => id,
+        None => {
+            let id = w.ident_list.len() as u32;
+            w.ident_map.insert(ident.0.clone(), id);
+            w.ident_list.push(ident.0.clone());
+            id
+        }
+    };
+    w.write_u32(id);
 }
 
 fn write_name(w: &mut BinaryWriter, name: &Name) {
@@ -967,7 +1046,12 @@ fn write_edit(w: &mut BinaryWriter, edit: &NativeEdit) {
         | if edit.top_level_projection { 0x80 } else { 0 }
         | if edit.tail_clause { 0x40 } else { 0 };
     w.write_u8(cat_byte);
-    w.write_str(&edit.label);
+    if let Some(pos) = COMMON_LABELS.iter().position(|&l| l == edit.label.as_ref()) {
+        w.write_u8(pos as u8);
+    } else {
+        w.write_u8(255);
+        w.write_str(&edit.label);
+    }
 }
 
 fn write_facts(w: &mut BinaryWriter, facts: &NativeFacts) {
@@ -1019,11 +1103,18 @@ fn write_column_target(w: &mut BinaryWriter, target: &ColumnTarget) {
 /// Serializes the entire [`NativeResponse`] payload into pure binary OCCM v2 format.
 pub(crate) fn encode_native_response(response: &NativeResponse) -> Vec<u8> {
     let mut w = BinaryWriter::new();
-    w.buf.extend_from_slice(OCCM_MAGIC);
     write_session_init(&mut w, &response.initial_session);
     w.write_vec(&response.units, write_unit);
     w.write_vec(&response.columns, write_column_target);
-    w.into_bytes()
+
+    let mut out = BinaryWriter::new();
+    out.buf.extend_from_slice(OCCM_MAGIC);
+    out.write_u32(w.ident_list.len() as u32);
+    for ident in &w.ident_list {
+        out.write_str(ident);
+    }
+    out.buf.extend_from_slice(&w.buf);
+    out.into_bytes()
 }
 
 #[cfg(test)]

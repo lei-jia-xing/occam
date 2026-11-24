@@ -82,6 +82,7 @@ data ParseOptions = ParseOptions
     , parseColumnBundles :: !Bool
     , parseSyntaxEdits :: !Bool
     , parseSyntaxOnly :: !Bool
+    , parseSpanOnly :: !Bool
     }
     deriving (Eq, Show)
 
@@ -96,6 +97,7 @@ defaultParseOptions dialect =
         , parseColumnBundles = False
         , parseSyntaxEdits = False
         , parseSyntaxOnly = False
+        , parseSpanOnly = False
         }
 
 instance ToJSON ServerConfig where
@@ -125,6 +127,7 @@ instance ToJSON ParseOptions where
             , "column_bundles" .= parseColumnBundles options
             , "syntax_edits" .= parseSyntaxEdits options
             , "syntax_only" .= parseSyntaxOnly options
+            , "span_only" .= parseSpanOnly options
             ]
 
 data ParserErrorKind

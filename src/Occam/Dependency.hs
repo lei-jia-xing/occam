@@ -56,6 +56,7 @@ import Occam.Dependency.State (
     evalToState,
     initialEval,
     initialScanState,
+    nameLast,
  )
 import Occam.Dependency.Transaction (
     applyTxEffects,
@@ -126,14 +127,14 @@ analyzeStatements initialSession units =
 -- | Construct a dependency graph from extracted statement facts.
 buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
-    let (finalState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
-            foldl' step (initialScanState initialSession, Map.empty, 0, 0, 0) stmtFacts
-        -- A slice often visits only a small part of the graph. Convert each
-        -- predecessor set on first use and share it with subsequent searches.
-        fastEdges =
-            IntMap.fromDistinctAscList
-                [ (unStatementId sid, IntSet.fromDistinctAscList (map unStatementId (Set.toAscList deps)))
-                | (sid, deps) <- Map.toList edges
+    let (finalState, fastEdges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
+            foldl' step (initialScanState initialSession, IntMap.empty, 0, 0, 0) stmtFacts
+        !edgeCount = sum (map IntSet.size (IntMap.elems fastEdges))
+        -- Derive public Map/Set views on demand
+        edges =
+            Map.fromDistinctAscList
+                [ (StatementId sid, Set.fromDistinctAscList (map StatementId (IntSet.toAscList preds)))
+                | (sid, preds) <- IntMap.toAscList fastEdges
                 ]
      in DependencyGraph
             { graphStmts = Set.fromList (map fst stmtFacts)
@@ -144,13 +145,13 @@ buildGraph initialSession stmtFacts =
             , graphBarrierActions = barrierActionCount
             , graphBarrierStatements = barrierStmtCount
             , graphBarrierEdges = barrierEdgeCount
-            , graphEdgeCount = sum (map Set.size (Map.elems edges))
+            , graphEdgeCount = edgeCount
             }
 
 step ::
-    (ScanState, Map StatementId (Set StatementId), Int, Int, Int) ->
+    (ScanState, IntMap IntSet, Int, Int, Int) ->
     (StatementId, SemanticFacts) ->
-    (ScanState, Map StatementId (Set StatementId), Int, Int, Int)
+    (ScanState, IntMap IntSet, Int, Int, Int)
 step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) (sid, facts) =
     let
         (state1, _) = ensureFrame priorState
@@ -171,7 +172,8 @@ step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount)
         (deps, state7, newBarrierEdges, hasBarrier, barrierActions) =
             finalizeStatement sid eval3 sessionTouched priorState state6
         state8 = finishStatement sid state7
-        edges' = Map.insert sid deps edges
+        !fastDeps = IntSet.fromDistinctAscList (map unStatementId (Set.toAscList deps))
+        edges' = IntMap.insert (unStatementId sid) fastDeps edges
      in
         ( state8
         , edges'
@@ -266,10 +268,27 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
         addToucher !acc key = Map.insertWith (\_ old -> Set.insert sid old) key sidSet acc
         touchers1 = Set.foldl' addToucher (scanTouchers priorState) (evalTouches eval)
         touchers = foldl' addToucher touchers1 registrationKeys
+        addSchemaToucher (!byLast, !emptySet) = \case
+            SchemaBarrierKey name -> case nameLast name of
+                Nothing -> (byLast, Set.insert sid emptySet)
+                Just ident ->
+                    let !m = Map.findWithDefault Map.empty ident byLast
+                        !m' = Map.insertWith (\_ old -> Set.insert sid old) name sidSet m
+                     in (Map.insert ident m' byLast, emptySet)
+            _ -> (byLast, emptySet)
+        (!schemaTouchers1, !schemaEmpty1) =
+            Set.foldl'
+                addSchemaToucher
+                (scanSchemaTouchersByLast priorState, scanSchemaTouchersEmpty priorState)
+                (evalTouches eval)
+        (!schemaTouchers, !schemaEmpty) =
+            foldl' addSchemaToucher (schemaTouchers1, schemaEmpty1) registrationKeys
         state' =
             resolutionState
                 { scanLastBarriers = lastBarriers
                 , scanTouchers = touchers
+                , scanSchemaTouchersByLast = schemaTouchers
+                , scanSchemaTouchersEmpty = schemaEmpty
                 , scanPriorStatements = Set.insert sid (scanPriorStatements priorState)
                 }
         hasBarrier = not (null declared) || sessionTouched

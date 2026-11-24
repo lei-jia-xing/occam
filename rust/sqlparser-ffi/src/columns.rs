@@ -1509,6 +1509,7 @@ mod tests {
                 column_bundles: true,
                 syntax_edits: true,
                 syntax_only: false,
+                span_only: false,
             },
         )
         .expect("parse");

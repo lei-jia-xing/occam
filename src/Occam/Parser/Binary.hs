@@ -12,6 +12,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Int (Int64)
+import Data.IntMap.Strict (IntMap)
+import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -97,55 +99,75 @@ binaryMagic = "OCCM\x02"
 
 -- | Zero-allocation unboxed direct-style decoder over a strict 'ByteString' cursor.
 newtype Decoder a = Decoder
-    { unDec :: ByteString -> Int# -> Int# -> (# Text | (# a, Int# #) #)
+    { unDec :: IntMap Text -> ByteString -> Int# -> Int# -> (# Text | (# a, Int# #) #)
     }
 
 instance Functor Decoder where
     {-# INLINE fmap #-}
     fmap :: (a -> b) -> Decoder a -> Decoder b
-    fmap f (Decoder g) = Decoder $ \bs len pos -> case g bs len pos of
+    fmap f (Decoder g) = Decoder $ \idents bs len pos -> case g idents bs len pos of
         (# e | #) -> (# e | #)
         (# | (# a, pos' #) #) -> (# | (# f a, pos' #) #)
 
 instance Applicative Decoder where
     {-# INLINE pure #-}
     pure :: a -> Decoder a
-    pure a = Decoder $ \_ _ pos -> (# | (# a, pos #) #)
+    pure a = Decoder $ \_ _ _ pos -> (# | (# a, pos #) #)
 
     {-# INLINE (<*>) #-}
     (<*>) :: Decoder (a -> b) -> Decoder a -> Decoder b
-    Decoder gf <*> Decoder ga = Decoder $ \bs len pos -> case gf bs len pos of
+    Decoder gf <*> Decoder ga = Decoder $ \idents bs len pos -> case gf idents bs len pos of
         (# e | #) -> (# e | #)
-        (# | (# f, pos1 #) #) -> case ga bs len pos1 of
+        (# | (# f, pos1 #) #) -> case ga idents bs len pos1 of
             (# e | #) -> (# e | #)
             (# | (# a, pos2 #) #) -> (# | (# f a, pos2 #) #)
 
 instance Monad Decoder where
     {-# INLINE (>>=) #-}
     (>>=) :: Decoder a -> (a -> Decoder b) -> Decoder b
-    Decoder ga >>= f = Decoder $ \bs len pos -> case ga bs len pos of
+    Decoder ga >>= f = Decoder $ \idents bs len pos -> case ga idents bs len pos of
         (# e | #) -> (# e | #)
-        (# | (# a, pos1 #) #) -> unDec (f a) bs len pos1
+        (# | (# a, pos1 #) #) -> unDec (f a) idents bs len pos1
 
 instance MonadFail Decoder where
     {-# INLINE fail #-}
     fail :: String -> Decoder a
-    fail msg = Decoder $ \_ _ _ -> (# T.pack msg | #)
+    fail msg = Decoder $ \_ _ _ _ -> (# T.pack msg | #)
 
 -- | Decode a binary native parser response payload (without the magic header).
 decodeBinaryResponse :: ByteString -> Either Text NativeResponse
 decodeBinaryResponse bytes =
     let !(I# len) = BS.length bytes
-     in case unDec getResponse bytes len 0# of
+     in case unDec decodeAll IntMap.empty bytes len 0# of
             (# err | #) -> Left err
             (# | (# response, pos #) #) ->
                 if I# pos == BS.length bytes
                     then Right response
                     else Left "trailing unparsed bytes in binary response"
+    where
+        decodeAll = do
+            count <- getWord32le
+            identList <- getVecFixed (fromIntegral count) getText
+            let !idents = IntMap.fromDistinctAscList (zip [0 ..] identList)
+            withIdents idents getResponse
+
+withIdents :: IntMap Text -> Decoder a -> Decoder a
+withIdents idents (Decoder f) = Decoder $ \_ bs len pos -> f idents bs len pos
+
+getVecFixed :: Int -> Decoder a -> Decoder [a]
+getVecFixed !n item = Decoder $ \idents bs len pos ->
+    let go 0# p = (# | (# [], p #) #)
+        go k p = case unDec item idents bs len p of
+            (# err | #) -> (# err | #)
+            (# | (# x, p1 #) #) -> case go (k -# 1#) p1 of
+                (# err | #) -> (# err | #)
+                (# | (# xs, p2 #) #) -> (# | (# x : xs, p2 #) #)
+        !(I# count#) = n
+     in go count# pos
 
 {-# INLINE getWord8 #-}
 getWord8 :: Decoder Word8
-getWord8 = Decoder $ \bs len pos ->
+getWord8 = Decoder $ \_ bs len pos ->
     if isTrue# (pos <# len)
         then
             let !b = BSU.unsafeIndex bs (I# pos)
@@ -163,7 +185,7 @@ decodeWord32LE bs i =
 
 {-# INLINE getWord32le #-}
 getWord32le :: Decoder Word32
-getWord32le = Decoder $ \bs len pos ->
+getWord32le = Decoder $ \_ bs len pos ->
     if isTrue# (pos +# 4# <=# len)
         then
             let !w = decodeWord32LE bs (I# pos)
@@ -180,7 +202,7 @@ getBool = (/= 0) <$> getWord8
 
 {-# INLINE getInt64 #-}
 getInt64 :: Decoder Integer
-getInt64 = Decoder $ \bs len pos ->
+getInt64 = Decoder $ \_ bs len pos ->
     if isTrue# (pos +# 8# <=# len)
         then
             let !i = I# pos
@@ -208,7 +230,7 @@ getInt64 = Decoder $ \bs len pos ->
 
 {-# INLINE getText #-}
 getText :: Decoder Text
-getText = Decoder $ \bs len pos -> case unDec getInt32 bs len pos of
+getText = Decoder $ \idents bs len pos -> case unDec getInt32 idents bs len pos of
     (# err | #) -> (# err | #)
     (# | (# n@(I# n#), pos1 #) #) ->
         if n < 0 || n > I# (len -# pos1)
@@ -226,22 +248,28 @@ getText = Decoder $ \bs len pos -> case unDec getInt32 bs len pos of
 {-# INLINE decodeEditLabel #-}
 decodeEditLabel :: ByteString -> Int# -> Int# -> (# Text | (# Text, Int# #) #)
 decodeEditLabel bs len pos =
-    if isTrue# (pos +# 4# <=# len)
+    if isTrue# (pos <# len)
         then
-            let !n@(I# n#) = fromIntegral (decodeWord32LE bs (I# pos))
-                !pos1 = pos +# 4#
-             in if n < 0 || n > I# (len -# pos1)
-                    then (# "unexpected end of binary stream" | #)
-                    else
-                        if n == 0
-                            then (# | (# T.empty, pos1 #) #)
-                            else
-                                let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos1) bs)
-                                 in case internEditLabel n slice of
-                                        Just !txt -> (# | (# txt, pos1 +# n# #) #)
-                                        Nothing -> case TE.decodeUtf8' slice of
-                                            Left exc -> (# T.pack ("invalid UTF-8 in binary stream: " ++ show exc) | #)
-                                            Right !txt -> (# | (# txt, pos1 +# n# #) #)
+            let !code = BSU.unsafeIndex bs (I# pos)
+                !pos1 = pos +# 1#
+             in case commonLabel code of
+                    Just !lbl -> (# | (# lbl, pos1 #) #)
+                    Nothing ->
+                        if isTrue# (pos1 +# 4# <=# len)
+                            then
+                                let !n@(I# n#) = fromIntegral (decodeWord32LE bs (I# pos1))
+                                    !pos2 = pos1 +# 4#
+                                 in if n < 0 || n > I# (len -# pos2)
+                                        then (# "unexpected end of binary stream" | #)
+                                        else
+                                            if n == 0
+                                                then (# | (# T.empty, pos2 #) #)
+                                                else
+                                                    let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos2) bs)
+                                                     in case TE.decodeUtf8' slice of
+                                                            Left exc -> (# T.pack ("invalid UTF-8 in binary stream: " ++ show exc) | #)
+                                                            Right !txt -> (# | (# txt, pos2 +# n# #) #)
+                            else (# "unexpected end of binary stream" | #)
         else (# "unexpected end of binary stream" | #)
 
 -- | Intern common edit replacements without retaining slices of the FFI buffer.
@@ -282,247 +310,76 @@ repOne = "1"
 repQuotedZero = "'0'"
 repNull = "NULL"
 
-internEditLabel :: Int -> ByteString -> Maybe Text
-internEditLabel 10 s
-    | s == "remove-cte" = Just lblRemoveCte
-    | otherwise = Nothing
-internEditLabel 11 s
-    | s == "remove-with" = Just lblRemoveWith
-    | s == "remove-join" = Just lblRemoveJoin
-    | otherwise = Nothing
-internEditLabel 12 s
-    | s == "remove-where" = Just lblRemoveWhere
-    | s == "remove-limit" = Just lblRemoveLimit
-    | s == "remove-fetch" = Just lblRemoveFetch
-    | otherwise = Nothing
-internEditLabel 13 s
-    | s == "remove-offset" = Just lblRemoveOffset
-    | s == "remove-having" = Just lblRemoveHaving
-    | s == "simplify-cast" = Just lblSimplifyCast
-    | s == "simplify-like" = Just lblSimplifyLike
-    | otherwise = Nothing
-internEditLabel 14 s
-    | s == "remove-in_list" = Just lblRemoveInList
-    | otherwise = Nothing
-internEditLabel 15 s
-    | s == "remove-order_by" = Just lblRemoveOrderBy
-    | s == "remove-group_by" = Just lblRemoveGroupBy
-    | s == "remove-distinct" = Just lblRemoveDistinct
-    | s == "simplify-exists" = Just lblSimplifyExists
-    | s == "simplify-is_null" = Just lblSimplifyIsNull
-    | otherwise = Nothing
-internEditLabel 16 s
-    | s == "simplify-literal" = Just lblSimplifyLiteral
-    | s == "simplify-between" = Just lblSimplifyBetween
-    | s == "simplify-in_list" = Just lblSimplifyInList
-    | s == "remove-cte-chunk" = Just lblRemoveCteChunk
-    | s == "remove-returning" = Just lblRemoveReturning
-    | otherwise = Nothing
-internEditLabel 17 s
-    | s == "remove-values_row" = Just lblRemoveValuesRow
-    | s == "remove-tuple_item" = Just lblRemoveTupleItem
-    | s == "remove-list-chunk" = Just lblRemoveListChunk
-    | otherwise = Nothing
-internEditLabel 18 s
-    | s == "simplify-data_type" = Just lblSimplifyDataType
-    | s == "simplify-case_else" = Just lblSimplifyCaseElse
-    | otherwise = Nothing
-internEditLabel 19 s
-    | s == "simplify-in_subquery" = Just lblSimplifyInSubquery
-    | s == "simplify-case_result" = Just lblSimplifyCaseResult
-    | otherwise = Nothing
-internEditLabel 20 s
-    | s == "simplify-case_literal" = Just lblSimplifyCaseLiteral
-    | s == "simplify-cast_literal" = Just lblSimplifyCastLiteral
-    | s == "remove-in_list-chunk" = Just lblRemoveInListChunk
-    | s == "remove-from-relation" = Just lblRemoveFromRelation
-    | s == "remove-window_frame" = Just lblRemoveWindowFrame
-    | otherwise = Nothing
-internEditLabel 22 s
-    | s == "simplify-scalar-subquery" = Just lblSimplifyScalarSubquery
-    | s == "remove-tuple_item-chunk" = Just lblRemoveTupleItemChunk
-    | s == "remove-table_constraint" = Just lblRemoveTableConstraint
-    | otherwise = Nothing
-internEditLabel 23 s
-    | s == "remove-values_row-chunk" = Just lblRemoveValuesRowChunk
-    | s == "remove-column_constraint" = Just lblRemoveColumnConstraint
-    | s == "remove-column_create_def" = Just lblRemoveColumnCreateDef
-    | s == "remove-window_order_by" = Just lblRemoveWindowOrderBy
-    | s == "remove-update_assignment" = Just lblRemoveUpdateAssignment
-    | s == "simplify-unary_expression" = Just lblSimplifyUnaryExpression
-    | otherwise = Nothing
-internEditLabel 24 s
-    | s == "remove-select_expression" = Just lblRemoveSelectExpression
-    | s == "remove-function_argument" = Just lblRemoveFunctionArgument
-    | s == "remove-column_insert_item" = Just lblRemoveColumnInsertItem
-    | s == "remove-column_values_item" = Just lblRemoveColumnValuesItem
-    | s == "simplify-function_literal" = Just lblSimplifyFunctionLiteral
-    | otherwise = Nothing
-internEditLabel 25 s
-    | s == "simplify-binary_expression" = Just lblSimplifyBinaryExpression
-    | s == "simplify-window_spec_empty" = Just lblSimplifyWindowSpecEmpty
-    | s == "remove-order_by_expression" = Just lblRemoveOrderByExpression
-    | s == "remove-group_by_expression" = Just lblRemoveGroupByExpression
-    | otherwise = Nothing
-internEditLabel 26 s
-    | s == "remove-from-relation-chunk" = Just lblRemoveFromRelationChunk
-    | s == "remove-window_partition_by" = Just lblRemoveWindowPartitionBy
-    | s == "simplify-set_operation_left" = Just lblSimplifySetOperationLeft
-    | otherwise = Nothing
-internEditLabel 27 s
-    | s == "simplify-set_operation_right" = Just lblSimplifySetOperationRight
-    | s == "remove-returning_expression" = Just lblRemoveReturningExpression
-    | otherwise = Nothing
-internEditLabel 28 s
-    | s == "simplify-function_to_argument" = Just lblSimplifyFunctionToArgument
-    | s == "remove-distinct_on_expression" = Just lblRemoveDistinctOnExpression
-    | otherwise = Nothing
-internEditLabel 30 s
-    | s == "remove-select_expression-chunk" = Just lblRemoveSelectExpressionChunk
-    | s == "remove-function_argument-chunk" = Just lblRemoveFunctionArgumentChunk
-    | otherwise = Nothing
-internEditLabel 33 s
-    | s == "simplify-parenthesized_expression" = Just lblSimplifyParenthesizedExpression
-    | otherwise = Nothing
-internEditLabel 34 s
-    | s == "remove-window_order_by_expression" = Just lblRemoveWindowOrderByExpression
-    | otherwise = Nothing
-internEditLabel 37 s
-    | s == "remove-window_partition_by_expression" = Just lblRemoveWindowPartitionByExpression
-    | otherwise = Nothing
-internEditLabel _ _ = Nothing
-
-lblRemoveCte
-    , lblRemoveWith
-    , lblRemoveJoin
-    , lblRemoveWhere
-    , lblRemoveLimit
-    , lblRemoveFetch
-    , lblRemoveOffset
-    , lblRemoveHaving
-    , lblSimplifyCast
-    , lblSimplifyLike
-    , lblRemoveInList
-    , lblRemoveOrderBy
-    , lblRemoveGroupBy
-    , lblRemoveDistinct
-    , lblSimplifyExists
-    , lblSimplifyIsNull
-    , lblSimplifyLiteral
-    , lblSimplifyBetween
-    , lblSimplifyInList
-    , lblRemoveCteChunk
-    , lblRemoveReturning
-    , lblRemoveValuesRow
-    , lblRemoveTupleItem
-    , lblRemoveListChunk
-    , lblSimplifyDataType
-    , lblSimplifyCaseElse
-    , lblSimplifyInSubquery
-    , lblSimplifyCaseResult
-    , lblSimplifyCaseLiteral
-    , lblSimplifyCastLiteral
-    , lblRemoveInListChunk
-    , lblRemoveFromRelation
-    , lblRemoveWindowFrame
-    , lblSimplifyScalarSubquery
-    , lblRemoveTupleItemChunk
-    , lblRemoveTableConstraint
-    , lblRemoveValuesRowChunk
-    , lblRemoveColumnConstraint
-    , lblRemoveColumnCreateDef
-    , lblRemoveWindowOrderBy
-    , lblRemoveUpdateAssignment
-    , lblSimplifyUnaryExpression
-    , lblRemoveSelectExpression
-    , lblRemoveFunctionArgument
-    , lblRemoveColumnInsertItem
-    , lblRemoveColumnValuesItem
-    , lblSimplifyFunctionLiteral
-    , lblSimplifyBinaryExpression
-    , lblSimplifyWindowSpecEmpty
-    , lblRemoveOrderByExpression
-    , lblRemoveGroupByExpression
-    , lblRemoveFromRelationChunk
-    , lblRemoveWindowPartitionBy
-    , lblSimplifySetOperationLeft
-    , lblSimplifySetOperationRight
-    , lblRemoveReturningExpression
-    , lblSimplifyFunctionToArgument
-    , lblRemoveDistinctOnExpression
-    , lblRemoveSelectExpressionChunk
-    , lblRemoveFunctionArgumentChunk
-    , lblSimplifyParenthesizedExpression
-    , lblRemoveWindowOrderByExpression
-    , lblRemoveWindowPartitionByExpression ::
-        Text
-lblRemoveCte = "remove-cte"
-lblRemoveWith = "remove-with"
-lblRemoveJoin = "remove-join"
-lblRemoveWhere = "remove-where"
-lblRemoveLimit = "remove-limit"
-lblRemoveFetch = "remove-fetch"
-lblRemoveOffset = "remove-offset"
-lblRemoveHaving = "remove-having"
-lblSimplifyCast = "simplify-cast"
-lblSimplifyLike = "simplify-like"
-lblRemoveInList = "remove-in_list"
-lblRemoveOrderBy = "remove-order_by"
-lblRemoveGroupBy = "remove-group_by"
-lblRemoveDistinct = "remove-distinct"
-lblSimplifyExists = "simplify-exists"
-lblSimplifyIsNull = "simplify-is_null"
-lblSimplifyLiteral = "simplify-literal"
-lblSimplifyBetween = "simplify-between"
-lblSimplifyInList = "simplify-in_list"
-lblRemoveCteChunk = "remove-cte-chunk"
-lblRemoveReturning = "remove-returning"
-lblRemoveValuesRow = "remove-values_row"
-lblRemoveTupleItem = "remove-tuple_item"
-lblRemoveListChunk = "remove-list-chunk"
-lblSimplifyDataType = "simplify-data_type"
-lblSimplifyCaseElse = "simplify-case_else"
-lblSimplifyInSubquery = "simplify-in_subquery"
-lblSimplifyCaseResult = "simplify-case_result"
-lblSimplifyCaseLiteral = "simplify-case_literal"
-lblSimplifyCastLiteral = "simplify-cast_literal"
-lblRemoveInListChunk = "remove-in_list-chunk"
-lblRemoveFromRelation = "remove-from-relation"
-lblRemoveWindowFrame = "remove-window_frame"
-lblSimplifyScalarSubquery = "simplify-scalar-subquery"
-lblRemoveTupleItemChunk = "remove-tuple_item-chunk"
-lblRemoveTableConstraint = "remove-table_constraint"
-lblRemoveValuesRowChunk = "remove-values_row-chunk"
-lblRemoveColumnConstraint = "remove-column_constraint"
-lblRemoveColumnCreateDef = "remove-column_create_def"
-lblRemoveWindowOrderBy = "remove-window_order_by"
-lblRemoveUpdateAssignment = "remove-update_assignment"
-lblSimplifyUnaryExpression = "simplify-unary_expression"
-lblRemoveSelectExpression = "remove-select_expression"
-lblRemoveFunctionArgument = "remove-function_argument"
-lblRemoveColumnInsertItem = "remove-column_insert_item"
-lblRemoveColumnValuesItem = "remove-column_values_item"
-lblSimplifyFunctionLiteral = "simplify-function_literal"
-lblSimplifyBinaryExpression = "simplify-binary_expression"
-lblSimplifyWindowSpecEmpty = "simplify-window_spec_empty"
-lblRemoveOrderByExpression = "remove-order_by_expression"
-lblRemoveGroupByExpression = "remove-group_by_expression"
-lblRemoveFromRelationChunk = "remove-from-relation-chunk"
-lblRemoveWindowPartitionBy = "remove-window_partition_by"
-lblSimplifySetOperationLeft = "simplify-set_operation_left"
-lblSimplifySetOperationRight = "simplify-set_operation_right"
-lblRemoveReturningExpression = "remove-returning_expression"
-lblSimplifyFunctionToArgument = "simplify-function_to_argument"
-lblRemoveDistinctOnExpression = "remove-distinct_on_expression"
-lblRemoveSelectExpressionChunk = "remove-select_expression-chunk"
-lblRemoveFunctionArgumentChunk = "remove-function_argument-chunk"
-lblSimplifyParenthesizedExpression = "simplify-parenthesized_expression"
-lblRemoveWindowOrderByExpression = "remove-window_order_by_expression"
-lblRemoveWindowPartitionByExpression = "remove-window_partition_by_expression"
+commonLabel :: Word8 -> Maybe Text
+commonLabel = \case
+    0 -> Just "remove-column_constraint"
+    1 -> Just "remove-cte"
+    2 -> Just "remove-cte-chunk"
+    3 -> Just "remove-distinct"
+    4 -> Just "remove-distinct_on_expression"
+    5 -> Just "remove-fetch"
+    6 -> Just "remove-from-relation"
+    7 -> Just "remove-from-relation-chunk"
+    8 -> Just "remove-function_argument"
+    9 -> Just "remove-function_argument-chunk"
+    10 -> Just "remove-group_by"
+    11 -> Just "remove-group_by_expression"
+    12 -> Just "remove-having"
+    13 -> Just "remove-in_list"
+    14 -> Just "remove-in_list-chunk"
+    15 -> Just "remove-join"
+    16 -> Just "remove-limit"
+    17 -> Just "remove-list-chunk"
+    18 -> Just "remove-offset"
+    19 -> Just "remove-order_by"
+    20 -> Just "remove-order_by_expression"
+    21 -> Just "remove-returning"
+    22 -> Just "remove-returning_expression"
+    23 -> Just "remove-select_expression"
+    24 -> Just "remove-select_expression-chunk"
+    25 -> Just "remove-table_constraint"
+    26 -> Just "remove-tuple_item"
+    27 -> Just "remove-tuple_item-chunk"
+    28 -> Just "remove-update_assignment"
+    29 -> Just "remove-values_row"
+    30 -> Just "remove-values_row-chunk"
+    31 -> Just "remove-where"
+    32 -> Just "remove-window_frame"
+    33 -> Just "remove-window_order_by"
+    34 -> Just "remove-window_order_by_expression"
+    35 -> Just "remove-window_partition_by"
+    36 -> Just "remove-window_partition_by_expression"
+    37 -> Just "remove-with"
+    38 -> Just "simplify-between"
+    39 -> Just "simplify-binary_expression"
+    40 -> Just "simplify-case_else"
+    41 -> Just "simplify-case_literal"
+    42 -> Just "simplify-case_result"
+    43 -> Just "simplify-cast"
+    44 -> Just "simplify-cast_literal"
+    45 -> Just "simplify-data_type"
+    46 -> Just "simplify-exists"
+    47 -> Just "simplify-function_literal"
+    48 -> Just "simplify-function_to_argument"
+    49 -> Just "simplify-in_list"
+    50 -> Just "simplify-in_subquery"
+    51 -> Just "simplify-is_null"
+    52 -> Just "simplify-like"
+    53 -> Just "simplify-literal"
+    54 -> Just "simplify-parenthesized_expression"
+    55 -> Just "simplify-set_operation_left"
+    56 -> Just "simplify-set_operation_right"
+    57 -> Just "simplify-unary_expression"
+    58 -> Just "simplify-window_spec_empty"
+    59 -> Just "remove-column_create_def"
+    60 -> Just "remove-column_insert_item"
+    61 -> Just "remove-column_values_item"
+    62 -> Just "drop-column"
+    _ -> Nothing
 
 {-# INLINE getVec #-}
 getVec :: Decoder a -> Decoder [a]
-getVec (Decoder item) = Decoder $ \bs len pos -> case unDec getInt32 bs len pos of
+getVec (Decoder item) = Decoder $ \idents bs len pos -> case unDec getInt32 idents bs len pos of
     (# err | #) -> (# err | #)
     (# | (# I# count, pos0 #) #) ->
         if isTrue# (count <# 0#) || isTrue# (len -# pos0 <# count)
@@ -530,7 +387,7 @@ getVec (Decoder item) = Decoder $ \bs len pos -> case unDec getInt32 bs len pos 
             else go count pos0
         where
             go 0# p = (# | (# [], p #) #)
-            go k p = case item bs len p of
+            go k p = case item idents bs len p of
                 (# err | #) -> (# err | #)
                 (# | (# x, p1 #) #) -> case go (k -# 1#) p1 of
                     (# err | #) -> (# err | #)
@@ -538,7 +395,12 @@ getVec (Decoder item) = Decoder $ \bs len pos -> case unDec getInt32 bs len pos 
 
 {-# INLINE getIdent #-}
 getIdent :: Decoder Ident
-getIdent = Ident <$> getText
+getIdent = do
+    idx <- getWord32le
+    Decoder $ \idents _ _ pos ->
+        case IntMap.lookup (fromIntegral idx) idents of
+            Just txt -> (# | (# Ident txt, pos #) #)
+            Nothing -> (# "invalid interned identifier index" | #)
 
 {-# INLINE getName #-}
 getName :: Decoder Name
@@ -1070,8 +932,8 @@ decodeEditCategory 6 = (# | EditLiteral #)
 decodeEditCategory code = (# T.pack ("unknown parser edit category code: " ++ show code) | #)
 
 {-# INLINE decodeParserEdit #-}
-decodeParserEdit :: ByteString -> Int# -> Int# -> (# Text | (# ParserEdit, Int# #) #)
-decodeParserEdit bs len pos =
+decodeParserEdit :: IntMap Text -> ByteString -> Int# -> Int# -> (# Text | (# ParserEdit, Int# #) #)
+decodeParserEdit _idents bs len pos =
     if isTrue# (pos +# 8# <=# len)
         then
             let !i = I# pos

@@ -22,7 +22,7 @@ import Occam.Oracle.DuckDB (
  )
 import Occam.Oracle.Sqlite (
     generateSqliteContractWithTrace,
-    prepareSqliteContractObserver,
+    prepareSqliteContractObserverWithTrace,
  )
 import Occam.Parser (SQLDialect (..))
 import System.Exit (ExitCode (ExitSuccess))
@@ -77,21 +77,22 @@ prepareResultOracleWithTrace ::
     Int ->
     BS.ByteString ->
     IO (Either Text (OracleObservationDetails, EvaluationObserver))
-prepareResultOracleWithTrace = prepareResultOracleWithTraceAndFailures Nothing
+prepareResultOracleWithTrace = prepareResultOracleWithTraceAndFailures True Nothing
 
 prepareResultOracleWithTraceAndFailures ::
+    Bool ->
     Maybe FailingPrefixCache ->
     (BS.ByteString -> ResultTrace -> IO ()) ->
     SQLDialect ->
     Int ->
     BS.ByteString ->
     IO (Either Text (OracleObservationDetails, EvaluationObserver))
-prepareResultOracleWithTraceAndFailures mFailCache rememberTrace dialect micros sql = do
+prepareResultOracleWithTraceAndFailures needTrace mFailCache rememberTrace dialect micros sql = do
     start <- getMonotonicTimeNSec
     let onFail = maybe (const (pure ())) recordFailingPrefix mFailCache
     prepared <- case dialect of
         SQLite ->
-            fmap (first (\c -> prepareSqliteContractObserver micros c onFail))
+            fmap (first (\c -> prepareSqliteContractObserverWithTrace needTrace micros c onFail))
                 <$> generateSqliteContractWithTrace micros sql
         DuckDB -> do
             result <- generateDuckDBContractWithTrace micros sql

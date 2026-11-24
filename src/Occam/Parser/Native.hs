@@ -13,6 +13,8 @@ module Occam.Parser.Native (
 ) where
 
 import Control.Exception (finally, mask_)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Aeson (
     FromJSON (..),
     Value (..),
@@ -95,18 +97,19 @@ foreign import ccall safe "occam_sql_oracle_source"
         CUInt -> CUInt -> Ptr Word8 -> CSize -> Ptr (Ptr Word8) -> Ptr CSize -> IO ()
 
 oracleSourceProof :: SQLDialect -> CUInt -> ByteString -> IO (Maybe ByteString)
-oracleSourceProof dialect mode sql =
-    BSU.unsafeUseAsCStringLen sql \(input, size) ->
-        alloca \output -> alloca \len ->
-            mask_ do
-                poke output nullPtr
-                poke len 0
-                c_oracleSource (dialectCode dialect) mode (castPtr input) (fromIntegral size) output len
-                ptr <- peek output
-                bytes <- peek len
-                if ptr == nullPtr
-                    then pure Nothing
-                    else Just <$> (BS.packCStringLen (castPtr ptr, fromIntegral bytes) `finally` c_freeSQL ptr bytes)
+oracleSourceProof dialect mode sql = evalContT do
+    (input, size) <- ContT $ BSU.unsafeUseAsCStringLen sql
+    output <- ContT alloca
+    len <- ContT alloca
+    liftIO $ mask_ do
+        poke output nullPtr
+        poke len 0
+        c_oracleSource (dialectCode dialect) mode (castPtr input) (fromIntegral size) output len
+        ptr <- peek output
+        bytes <- peek len
+        if ptr == nullPtr
+            then pure Nothing
+            else Just <$> (BS.packCStringLen (castPtr ptr, fromIntegral bytes) `finally` c_freeSQL ptr bytes)
 
 -- Native status codes shared with rust/sqlparser-ffi.
 nativeStatusInvalidArguments
@@ -163,8 +166,10 @@ dialectCode Teradata = 15
 
 -- | Decode the native error message for a non-zero parse status.
 nativeError :: CInt -> IO ParserError
-nativeError status =
-    alloca \messagePointer -> alloca \messageLength -> do
+nativeError status = evalContT do
+    messagePointer <- ContT alloca
+    messageLength <- ContT alloca
+    liftIO do
         poke messagePointer nullPtr
         poke messageLength 0
         errorStatus <- c_parseError status messagePointer messageLength
@@ -184,14 +189,15 @@ nativeError status =
 
 -- | Untimed statement count plus raw pointer decoding.
 countStatementsRaw :: ByteString -> CUInt -> IO (Either ParserError Int)
-countStatementsRaw sql code =
-    BSU.unsafeUseAsCStringLen sql \(input, inputLength) ->
-        alloca \countPointer -> do
-            poke countPointer 0
-            status <- c_countSQL (castPtr input) (fromIntegral inputLength) code countPointer
-            if status /= 0
-                then Left <$> simpleNativeError status
-                else Right . fromIntegral <$> peek countPointer
+countStatementsRaw sql code = evalContT do
+    (input, inputLength) <- ContT $ BSU.unsafeUseAsCStringLen sql
+    countPointer <- ContT alloca
+    liftIO do
+        poke countPointer 0
+        status <- c_countSQL (castPtr input) (fromIntegral inputLength) code countPointer
+        if status /= 0
+            then Left <$> simpleNativeError status
+            else Right . fromIntegral <$> peek countPointer
 
 simpleNativeError :: CInt -> IO ParserError
 simpleNativeError status =

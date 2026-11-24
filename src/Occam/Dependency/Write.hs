@@ -564,36 +564,31 @@ applyParentActions sid eval key kind columns =
                         eval
                         (allForeignKeys catalog)
                 else
-                    -- TRUNCATE without CASCADE depends on referencing tables and FK constraints.
-                    foldl'
-                        ( \current (_, state, foreignKey) ->
-                            if parentMatches state foreignKey
-                                then
-                                    let childKey = constraintStateTable state
-                                        constraintDeps =
-                                            Set.fromList
-                                                ( catMaybes
-                                                    [ constraintDefinition state
-                                                    , constraintRestoredBy state
-                                                    ]
-                                                )
-                                        childDeps =
-                                            relationReadDeps
-                                                session
-                                                catalog
-                                                childKey
-                                                ReadSchema
-                                                []
-                                                False
-                                     in addDeps (childDeps `Set.union` constraintDeps) current
-                                else current
-                        )
-                        eval
-                        (allForeignKeys catalog)
+                    foldl' addForeignKeyDep eval (allForeignKeys catalog)
         _ -> eval
     where
         catalog = evalCatalog eval
         session = evalSession eval
+        addForeignKeyDep current (_, state, foreignKey)
+            | parentMatches state foreignKey =
+                let childKey = constraintStateTable state
+                    constraintDeps =
+                        Set.fromList
+                            ( catMaybes
+                                [ constraintDefinition state
+                                , constraintRestoredBy state
+                                ]
+                            )
+                    childDeps =
+                        relationReadDeps
+                            session
+                            catalog
+                            childKey
+                            ReadSchema
+                            []
+                            False
+                 in addDeps (childDeps `Set.union` constraintDeps) current
+            | otherwise = current
 
         parentMatches _state foreignKey =
             key

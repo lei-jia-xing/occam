@@ -1273,6 +1273,7 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                             ReductionResult sql evidence <-
                                 reduceSQLWithResultTrace select report reductionConfig logger pool fixtureInput
                             pure (ReductionActionResult sql evidence)
+                        , requestCollectCurve = True
                         }
             let sql = evaluatedSQL result
                 metrics = evaluationMetrics result

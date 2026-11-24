@@ -41,6 +41,8 @@ import Control.Concurrent (
 import Control.Exception qualified as Exception
 import Control.Exception.Safe (SomeException, bracket, displayException, try)
 import Control.Monad (filterM, forM, when, zipWithM)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Aeson (
     FromJSON (..),
     Result (Error, Success),
@@ -537,10 +539,12 @@ convertCell api (colType, values, validity) row = do
             low <- peekByteOff values offset :: IO Word64
             high <- peekByteOff values (offset + 8) :: IO Word64
             pure (Number (fromInteger ((highInteger high `shiftL` 64) + toInteger low)))
-        readBytes = alloca $ \sizePtr -> do
-            ptr <- vectorBytes (apiStringData api) values row sizePtr
-            size <- peek sizePtr
-            if size == 0 then pure BS.empty else BS.packCStringLen (ptr, fromIntegral size)
+        readBytes = evalContT do
+            sizePtr <- ContT alloca
+            liftIO do
+                ptr <- vectorBytes (apiStringData api) values row sizePtr
+                size <- peek sizePtr
+                if size == 0 then pure BS.empty else BS.packCStringLen (ptr, fromIntegral size)
 
 executeDuckDBCandidateDetailedTimeout :: Int -> ByteString -> IO (Either DuckDBError [[Value]])
 executeDuckDBCandidateDetailedTimeout micros sql =
@@ -583,20 +587,27 @@ executeDuckDBResultWithReplay observe db onFailure micros sql
 openMemoryDb :: DuckDBAPI -> Ptr DuckdbDatabase -> IO CInt
 openMemoryDb api dbPtr = case apiConfigOpen api of
     Nothing -> apiOpen api nullPtr dbPtr
-    Just DuckDBConfigOpen {..} ->
-        alloca $ \cfgPtr ->
-            bracket
-                ( do
-                    st <- apiCreateConfig cfgPtr
-                    if st /= 0 then pure nullPtr else peek cfgPtr
-                )
-                (\cfg -> when (cfg /= nullPtr) (apiDestroyConfig cfgPtr))
-                $ \cfg ->
-                    if cfg == nullPtr
-                        then apiOpen api nullPtr dbPtr
-                        else do
-                            _ <- withCString "threads" $ \k -> withCString "1" $ \v -> apiSetConfig cfg k v
-                            apiOpenExt nullPtr dbPtr cfg nullPtr
+    Just DuckDBConfigOpen {..} -> evalContT do
+        cfgPtr <- ContT alloca
+        cfg <-
+            ContT $
+                bracket
+                    ( do
+                        st <- apiCreateConfig cfgPtr
+                        if st /= 0 then pure nullPtr else peek cfgPtr
+                    )
+                    (\c -> when (c /= nullPtr) (apiDestroyConfig cfgPtr))
+        if cfg == nullPtr
+            then liftIO $ apiOpen api nullPtr dbPtr
+            else do
+                let setOption key val = do
+                        k <- ContT $ withCString key
+                        v <- ContT $ withCString val
+                        liftIO $ apiSetConfig cfg k v
+                _ <- setOption "threads" "1"
+                _ <- setOption "enable_external_access" "false"
+                _ <- setOption "lock_configuration" "true"
+                liftIO $ apiOpenExt nullPtr dbPtr cfg nullPtr
 
 executeWithAPI ::
     DuckDBAPI ->
@@ -615,40 +626,45 @@ executeWithAPI api observe existing onFailure micros sql = do
         Left (err :: SomeException) -> Left (DuckDBInfrastructureError (T.pack (displayException err)))
         Right inner -> inner
     where
-        run configureDb db =
-            alloca $ \conPtr ->
-                bracket
-                    ( do
-                        st <- apiConnect api db conPtr
-                        if st /= 0
-                            then fail "Failed to connect to in-memory DuckDB database"
-                            else peek conPtr
-                    )
-                    (\_ -> apiDisconnect api conPtr)
-                    $ \con -> do
-                        mRes <- executeInterruptibly micros (apiInterrupt api con) $ do
-                            when configureDb (configure con)
-                            runStatements con
-                        pure (fromMaybe (Left DuckDBTimeout) mRes)
+        run configureDb db = evalContT do
+            conPtr <- ContT alloca
+            con <-
+                ContT $
+                    bracket
+                        ( do
+                            st <- apiConnect api db conPtr
+                            if st /= 0
+                                then fail "Failed to connect to in-memory DuckDB database"
+                                else peek conPtr
+                        )
+                        (\_ -> apiDisconnect api conPtr)
+            liftIO do
+                mRes <- executeInterruptibly micros (apiInterrupt api con) do
+                    let needsConfigure = configureDb && not (isJust (apiConfigOpen api))
+                    when needsConfigure (configure con)
+                    runStatements con
+                pure (fromMaybe (Left DuckDBTimeout) mRes)
 
         withExtracted ::
             DuckdbConnection ->
             ByteString ->
             (IdxT -> DuckdbExtractedStatements -> CString -> IO b) ->
             IO b
-        withExtracted con bytes use =
-            BSC.useAsCString bytes $ \sqlCStr ->
-                alloca $ \extPtr ->
+        withExtracted con bytes use = evalContT do
+            sqlCStr <- ContT $ BSC.useAsCString bytes
+            extPtr <- ContT alloca
+            (n, ext) <-
+                ContT $
                     bracket
                         ( do
-                            n <- apiExtractStatements api con sqlCStr extPtr
-                            ext <- peek extPtr
-                            pure (n, ext)
+                            num <- apiExtractStatements api con sqlCStr extPtr
+                            extracted <- peek extPtr
+                            pure (num, extracted)
                         )
                         (\_ -> apiDestroyExtracted api extPtr)
-                        $ \(n, ext) -> do
-                            cErr <- apiExtractStatementsError api ext
-                            use n ext cErr
+            liftIO do
+                cErr <- apiExtractStatementsError api ext
+                use n ext cErr
 
         runStatements con = withExtracted con sql $ \n ext cErr ->
             if cErr /= nullPtr
@@ -659,88 +675,137 @@ executeWithAPI api observe existing onFailure micros sql = do
                         else executeExtractedStatements con ext n
 
         -- NOTE: In-memory connections can otherwise read or modify external files.
-        configure con = withCString "SET enable_external_access = false; SET lock_configuration = true;" $ \settings ->
-            withResult (apiQuery api con settings) $ \status _ ->
-                when (status /= 0) (fail "Could not disable and lock DuckDB external access")
+        configure con = evalContT do
+            settings <- ContT $ withCString "SET enable_external_access = false; SET lock_configuration = true;"
+            status <- ContT $ \use -> withResult (apiQuery api con settings) (\s _ -> use s)
+            liftIO $ when (status /= 0) (fail "Could not disable and lock DuckDB external access")
 
         withResult :: (Ptr DuckDBResult -> IO CInt) -> (CInt -> Ptr DuckDBResult -> IO a) -> IO a
         withResult execute use = do
             size <- resultSize
-            allocaBytes (fromIntegral size) $ \ptr ->
-                bracket (execute ptr) (const (apiDestroyResult api ptr)) (`use` ptr)
+            evalContT do
+                ptr <- ContT $ allocaBytes (fromIntegral size)
+                status <- ContT $ bracket (execute ptr) (const (apiDestroyResult api ptr))
+                liftIO $ use status ptr
 
-        executeExtractedStatements con ext n = alloca $ \prepPtr -> do
-            size <- fromIntegral <$> resultSize
-            let withBuffer = bracket (callocBytes size) $ \ptr -> do
-                    apiDestroyResult api ptr
-                    free ptr
-                clear ptr = Exception.mask_ $ do
-                    apiDestroyResult api ptr
-                    fillBytes ptr 0 size
-                loop i current retained firstResult lastResult resultIndices
-                    | i >= n = case lastResult of
-                        Nothing -> pure (Right Nothing)
-                        Just index -> do
-                            result <- observe api retained
+        executeExtractedStatements con ext 1 = evalContT do
+            prepPtr <- ContT alloca
+            size <- liftIO $ fromIntegral <$> resultSize
+            current <- ContT $ bracket (callocBytes size) (\ptr -> apiDestroyResult api ptr >> free ptr)
+            status <-
+                ContT $
+                    bracket
+                        (apiPrepareExtractedStatement api con ext 0 prepPtr)
+                        (const (apiDestroyPrepare api prepPtr))
+            liftIO do
+                prep <- peek prepPtr
+                executed <-
+                    if status /= 0
+                        then Left . DuckDBExecutionError <$> errorText "Prepare error" (apiPrepareError api prep)
+                        else do
+                            execStatus <- apiExecutePrepared api prep current
+                            if execStatus /= 0
+                                then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api current)
+                                else Right <$> resultKind (apiResultKind api) current
+                case executed of
+                    Left err@(DuckDBExecutionError message) -> do
+                        let exactBoundary prefix =
+                                withExtracted con prefix $ \count _ errPtr ->
+                                    pure (count == 1 && errPtr == nullPtr)
+                        onFailure 1 0 exactBoundary message
+                        pure (Left err)
+                    Left err -> pure (Left err)
+                    Right kind
+                        | kind == 3 -> do
+                            result <- observe api current
                             let trace =
                                     ResultTrace
-                                        { traceStatementCount = fromIntegral n
-                                        , traceFirstResultIndex = fromIntegral (fromMaybe index firstResult)
-                                        , traceLastResultIndex = fromIntegral index
-                                        , traceResultIndices = resultIndices
+                                        { traceStatementCount = 1
+                                        , traceFirstResultIndex = 0
+                                        , traceLastResultIndex = 0
+                                        , traceResultIndices = IntSet.singleton 0
                                         , tracePrefixMatchIndices = IntSet.empty
                                         , traceDeterministic = False
                                         , traceEndByteOffsets = Nothing
                                         }
                             pure (fmap (\rows -> Just (rows, trace)) result)
-                    | otherwise = do
-                        executed <- bracket
-                            (apiPrepareExtractedStatement api con ext i prepPtr)
-                            (const (apiDestroyPrepare api prepPtr))
-                            $ \status -> do
-                                prep <- peek prepPtr
-                                if status /= 0
-                                    then Left . DuckDBExecutionError <$> errorText "Prepare error" (apiPrepareError api prep)
-                                    else do
-                                        execStatus <- apiExecutePrepared api prep current
-                                        if execStatus /= 0
-                                            then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api current)
-                                            else Right <$> resultKind (apiResultKind api) current
-                        case executed of
-                            Left err@(DuckDBExecutionError message) -> do
-                                let exactBoundary prefix =
-                                        withExtracted con prefix $ \count _ errPtr ->
-                                            pure (count == i + 1 && errPtr == nullPtr)
-                                onFailure (fromIntegral n) (fromIntegral i) exactBoundary message
-                                pure (Left err)
-                            Left err -> pure (Left err)
-                            Right kind
-                                | kind == 3 -> do
-                                    -- DUCKDB_RESULT_TYPE_QUERY_RESULT
-                                    clear retained
-                                    loop
-                                        (i + 1)
-                                        retained
-                                        current
-                                        (Just (fromMaybe i firstResult))
-                                        (Just i)
-                                        (IntSet.insert (fromIntegral i) resultIndices)
-                                | otherwise -> do
-                                    clear current
-                                    loop (i + 1) current retained firstResult lastResult resultIndices
-            -- The buffers own the latest query result and the current execution.
-            withBuffer $ \current -> withBuffer $ \retained -> loop 0 current retained Nothing Nothing IntSet.empty
+                        | otherwise -> pure (Right Nothing)
+        executeExtractedStatements con ext n = evalContT do
+            prepPtr <- ContT alloca
+            size <- liftIO $ fromIntegral <$> resultSize
+            liftIO do
+                let withBuffer = bracket (callocBytes size) $ \ptr -> do
+                        apiDestroyResult api ptr
+                        free ptr
+                    clear ptr = Exception.mask_ $ do
+                        apiDestroyResult api ptr
+                        fillBytes ptr 0 size
+                    loop i current retained firstResult lastResult resultIndices
+                        | i >= n = case lastResult of
+                            Nothing -> pure (Right Nothing)
+                            Just index -> do
+                                result <- observe api retained
+                                let trace =
+                                        ResultTrace
+                                            { traceStatementCount = fromIntegral n
+                                            , traceFirstResultIndex = fromIntegral (fromMaybe index firstResult)
+                                            , traceLastResultIndex = fromIntegral index
+                                            , traceResultIndices = resultIndices
+                                            , tracePrefixMatchIndices = IntSet.empty
+                                            , traceDeterministic = False
+                                            , traceEndByteOffsets = Nothing
+                                            }
+                                pure (fmap (\rows -> Just (rows, trace)) result)
+                        | otherwise = do
+                            executed <- bracket
+                                (apiPrepareExtractedStatement api con ext i prepPtr)
+                                (const (apiDestroyPrepare api prepPtr))
+                                $ \status -> do
+                                    prep <- peek prepPtr
+                                    if status /= 0
+                                        then Left . DuckDBExecutionError <$> errorText "Prepare error" (apiPrepareError api prep)
+                                        else do
+                                            execStatus <- apiExecutePrepared api prep current
+                                            if execStatus /= 0
+                                                then Left . DuckDBExecutionError <$> errorText "Execution error" (apiResultError api current)
+                                                else Right <$> resultKind (apiResultKind api) current
+                            case executed of
+                                Left err@(DuckDBExecutionError message) -> do
+                                    let exactBoundary prefix =
+                                            withExtracted con prefix $ \count _ errPtr ->
+                                                pure (count == i + 1 && errPtr == nullPtr)
+                                    onFailure (fromIntegral n) (fromIntegral i) exactBoundary message
+                                    pure (Left err)
+                                Left err -> pure (Left err)
+                                Right kind
+                                    | kind == 3 -> do
+                                        -- DUCKDB_RESULT_TYPE_QUERY_RESULT
+                                        clear retained
+                                        loop
+                                            (i + 1)
+                                            retained
+                                            current
+                                            (Just (fromMaybe i firstResult))
+                                            (Just i)
+                                            (IntSet.insert (fromIntegral i) resultIndices)
+                                    | otherwise -> do
+                                        clear current
+                                        loop (i + 1) current retained firstResult lastResult resultIndices
+                -- The buffers own the latest query result and the current execution.
+                withBuffer $ \current -> withBuffer $ \retained -> loop 0 current retained Nothing Nothing IntSet.empty
 
         errorText fallback action = do
             message <- action
             if message == nullPtr then pure fallback else T.pack <$> peekCString message
 
 openFreshDatabase :: DuckDBAPI -> IO DuckdbDatabase
-openFreshDatabase api = alloca $ \dbPtr -> do
-    st <- openMemoryDb api dbPtr
-    if st /= 0
-        then fail "Failed to initialize in-memory DuckDB database"
-        else peek dbPtr
+openFreshDatabase api = evalContT do
+    dbPtr <- ContT alloca
+    liftIO do
+        st <- openMemoryDb api dbPtr
+        if st /= 0
+            then fail "Failed to initialize in-memory DuckDB database"
+            else peek dbPtr
 
 closeDatabase :: DuckDBAPI -> DuckdbDatabase -> IO ()
 closeDatabase api db = with db (apiClose api)
@@ -772,22 +837,24 @@ observeRows api ptr = do
         else pure (Left (DuckDBUnsupportedResultTypes columnTypes))
     where
         readChunks columnTypes accumulated = do
-            chunkRows <- alloca $ \chunkPtr -> do
-                bracket
-                    (do chunk <- fetchChunk (apiFetchChunk api) ptr; poke chunkPtr chunk; pure chunk)
-                    (\chunk -> when (chunk /= nullPtr) (mkDestroyChunk (apiDestroyChunk api) chunkPtr))
-                    $ \chunk ->
-                        if chunk == nullPtr
-                            then pure Nothing
-                            else do
-                                size <- mkChunkSize (apiChunkSize api) chunk
-                                vectors <- forM columnTypes $ \(ty, col) -> do
-                                    vector <- mkChunkVector (apiChunkVector api) chunk col
-                                    values <- mkVectorData (apiVectorData api) vector
-                                    validity <- mkValidity (apiValidity api) vector
-                                    pure (ty, values, validity)
-                                Just
-                                    <$> forM (takeWhile (< size) [0 ..]) (\row -> mapM (\vector -> convertCell api vector row) vectors)
+            chunkRows <- evalContT do
+                chunkPtr <- ContT alloca
+                chunk <-
+                    ContT $
+                        bracket
+                            (do chunk <- fetchChunk (apiFetchChunk api) ptr; poke chunkPtr chunk; pure chunk)
+                            (\c -> when (c /= nullPtr) (mkDestroyChunk (apiDestroyChunk api) chunkPtr))
+                if chunk == nullPtr
+                    then pure Nothing
+                    else liftIO do
+                        size <- mkChunkSize (apiChunkSize api) chunk
+                        vectors <- forM columnTypes $ \(ty, col) -> do
+                            vector <- mkChunkVector (apiChunkVector api) chunk col
+                            values <- mkVectorData (apiVectorData api) vector
+                            validity <- mkValidity (apiValidity api) vector
+                            pure (ty, values, validity)
+                        Just
+                            <$> forM (takeWhile (< size) [0 ..]) (\row -> mapM (\vector -> convertCell api vector row) vectors)
             case chunkRows of
                 Nothing -> pure (concat (reverse accumulated))
                 Just rows -> readChunks columnTypes (rows : accumulated)
@@ -945,12 +1012,15 @@ prepareDuckDBContractObserverWithReplay micros contract baseline reportFailure =
                 if null tailUnits || not (all readOnly tailUnits)
                     then fresh
                     else do
-                        checkpoint <- modifyMVar saved $ \current -> case current of
-                            Nothing -> do
-                                budget <- remaining
-                                loaded <- buildReplayCheckpoint prefix budget
-                                pure (loaded, loaded)
-                            Just _ -> pure (current, current)
+                        mCurrent <- tryReadMVar saved
+                        checkpoint <- case mCurrent of
+                            Just loaded@(Just _) -> pure loaded
+                            _ -> modifyMVar saved $ \current -> case current of
+                                Nothing -> do
+                                    budget <- remaining
+                                    loaded <- buildReplayCheckpoint prefix budget
+                                    pure (loaded, loaded)
+                                Just _ -> pure (current, current)
                         case checkpoint of
                             Nothing -> fresh
                             Just db -> withForeignPtr db $ \database -> do
@@ -1058,8 +1128,10 @@ matchResult types names expected api ptr = do
         else
             if actualTypes /= types || actualNames /= names
                 then pure (Right False)
-                else withArrayLen types $ \count columnTypes ->
-                    BSU.unsafeUseAsCStringLen expected $ \(buf, size) -> do
+                else evalContT do
+                    (count, columnTypes) <- ContT $ \use -> withArrayLen types (curry use)
+                    (buf, size) <- ContT $ BSU.unsafeUseAsCStringLen expected
+                    liftIO do
                         result <-
                             matchRows
                                 (apiFetchChunk api)

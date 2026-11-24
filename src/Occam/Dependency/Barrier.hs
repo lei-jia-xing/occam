@@ -33,6 +33,7 @@ import Occam.Dependency.State (
     SequenceKey,
     SessionState,
     TriggerKey,
+    nameLast,
     nameSuffix,
  )
 
@@ -103,10 +104,22 @@ lastBarrierDeps state = foldl' addLast Set.empty
 
 touchersForBarrier :: ScanState -> BarrierKey -> Set StatementId
 touchersForBarrier state = \case
-    SchemaBarrierKey left ->
-        Set.unions
-            [ touchers
-            | (SchemaBarrierKey right, touchers) <- Map.toList (scanTouchers state)
-            , nameSuffix left right || nameSuffix right left
-            ]
+    SchemaBarrierKey left -> case nameLast left of
+        Nothing ->
+            Set.unions
+                ( scanSchemaTouchersEmpty state
+                    : [ touchers
+                      | subMap <- Map.elems (scanSchemaTouchersByLast state)
+                      , touchers <- Map.elems subMap
+                      ]
+                )
+        Just ident ->
+            let !matchingByLast = case Map.lookup ident (scanSchemaTouchersByLast state) of
+                    Nothing -> []
+                    Just subMap ->
+                        [ touchers
+                        | (right, touchers) <- Map.toList subMap
+                        , nameSuffix left right || nameSuffix right left
+                        ]
+             in Set.unions (scanSchemaTouchersEmpty state : matchingByLast)
     key -> Map.findWithDefault Set.empty key (scanTouchers state)

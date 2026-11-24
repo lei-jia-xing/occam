@@ -420,6 +420,8 @@ data ScanState = ScanState
     , scanLastTransactionExit :: !(Maybe StatementId)
     , scanLastBarriers :: !(Map BarrierKey StatementId)
     , scanTouchers :: !(Map BarrierKey (Set StatementId))
+    , scanSchemaTouchersByLast :: !(Map Ident (Map Name (Set StatementId)))
+    , scanSchemaTouchersEmpty :: !(Set StatementId)
     , scanPriorStatements :: !(Set StatementId)
     }
 
@@ -435,6 +437,8 @@ initialScanState initSession =
                 , scanLastTransactionExit = Nothing
                 , scanLastBarriers = Map.empty
                 , scanTouchers = Map.empty
+                , scanSchemaTouchersByLast = Map.empty
+                , scanSchemaTouchersEmpty = Set.empty
                 , scanPriorStatements = Set.empty
                 }
      in if sessAutocommit session

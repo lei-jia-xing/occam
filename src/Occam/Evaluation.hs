@@ -31,12 +31,14 @@ import Control.Exception.Safe (
     toException,
     try,
  )
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
     Value,
+    defaultOptions,
     genericParseJSON,
+    genericToEncoding,
     genericToJSON,
     object,
     withText,
@@ -226,6 +228,7 @@ data EvaluationPoint = EvaluationPoint
 
 instance ToJSON EvaluationPoint where
     toJSON = genericToJSON snakeCaseOptions
+    toEncoding = genericToEncoding snakeCaseOptions
 
 instance FromJSON EvaluationPoint where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
@@ -275,6 +278,7 @@ data EvaluationMetrics = EvaluationMetrics
 
 instance ToJSON EvaluationMetrics where
     toJSON = genericToJSON snakeCaseOptions
+    toEncoding = genericToEncoding snakeCaseOptions
 
 instance FromJSON EvaluationMetrics where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
@@ -309,7 +313,11 @@ data Stats = Stats
     , elapsed_seconds :: !Double
     }
     deriving stock (Eq, Show, Generic)
-    deriving anyclass (ToJSON, FromJSON)
+    deriving anyclass (FromJSON)
+
+instance ToJSON Stats where
+    toJSON = genericToJSON defaultOptions
+    toEncoding = genericToEncoding defaultOptions
 
 -- | Reducer result containing reduced SQL and optional fixed-point evidence.
 data ReductionActionResult = ReductionActionResult
@@ -334,6 +342,7 @@ data EvaluationRequest oracle = EvaluationRequest
     , requestInitialSQL :: !ByteString
     , requestCheckpoint :: !FilePath
     , requestAction :: !ReductionAction
+    , requestCollectCurve :: !Bool
     }
 
 type Ticks = Integer
@@ -396,6 +405,7 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
             , requestInitialSQL = initialSQL
             , requestCheckpoint = checkpoint
             , requestAction = action
+            , requestCollectCurve = True
             }
 
 runEvaluationRequest :: EvaluationRequest OracleConfig -> IO EvaluationResult
@@ -434,6 +444,7 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
         initialSQL = requestInitialSQL
         checkpoint = requestCheckpoint
         action = requestAction
+        collectCurve = requestCollectCurve
     when (evaluationJobs config <= 0) $
         ioError (userError ("Evaluation jobs must be positive, got " ++ show (evaluationJobs config)))
     startedAt <- ticks
@@ -447,7 +458,7 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
                 Left _ -> Map.empty
                 Right count -> Map.singleton initialSQL count
     state <- newIORef (initialEvalState initialSQL seedCounts)
-    writeAtomicBytes checkpoint initialSQL
+    unless (null checkpoint) $ writeAtomicBytes checkpoint initialSQL
     let oracleTimeout = max 1 (toInteger timeoutMicros)
         validationSlack = max 1000 (min 10000 (oracleTimeout `div` 100))
         perValidationReserve = oracleTimeout + validationSlack
@@ -484,7 +495,7 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
                 , poolExecute =
                     observe (modifyEvalState state (\s -> s {evalDatabase = evalDatabase s + 1}))
                 , poolBill = recordReductionObservation state
-                , poolRetire = retireCandidate onProgress reductionStart checkpoint state
+                , poolRetire = retireCandidate onProgress reductionStart checkpoint state collectCurve
                 , poolReportCount =
                     Just
                         (\bytes count -> modifyEvalState state (\s -> s {evalCounts = Map.insert bytes count (evalCounts s)}))
@@ -504,9 +515,9 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
         if remainingCalls == Just 0
             then do
                 closeOraclePool pool
-                costs <- traverse snapshotMetrics metricsStore
+                costs <- if collectCurve then traverse snapshotMetrics metricsStore else pure Nothing
                 pure (Left (toException (ExecutionBudgetReached ())), 0, costs)
-            else runReductionPhase env state pool metricsStore reporter action
+            else runReductionPhase env state pool metricsStore collectCurve reporter action
     (status, failure, skipValidation) <- case reductionOutcome of
         Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
         Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
@@ -621,7 +632,7 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
                     if validationPassed && auditCompleted && auditResultIsFinal
                         then StatementDeletionOneMinimal
                         else MinimalityNotEstablished
-                , evaluationCurve = curve
+                , evaluationCurve = if collectCurve then curve else []
                 , evaluationStages = stages
                 , evaluationCostAttribution = costAttribution
                 }
@@ -728,10 +739,11 @@ runReductionPhase ::
     IORef EvalState ->
     OraclePool ->
     Maybe MetricsStore ->
+    Bool ->
     StageReporter ->
     ReductionAction ->
     IO (Either SomeException (Maybe ReductionActionResult), Double, Maybe MetricsSnapshot)
-runReductionPhase env state pool metricsStore reporter action = do
+runReductionPhase env state pool metricsStore collectCurve reporter action = do
     reductionBudget <- case envTotalDeadline env of
         Nothing -> pure Nothing
         Just deadline -> do
@@ -745,8 +757,8 @@ runReductionPhase env state pool metricsStore reporter action = do
             Just micros -> timeout (boundedTimeout micros) (runAction `finally` closeOraclePool pool)
     reductionEnd <- ticks
     let reductionSeconds = seconds (envReductionStart env) reductionEnd
-    -- Snapshot cost attribution after workers are drained.
-    costAttribution <- traverse snapshotMetrics metricsStore
+    -- Snapshot cost attribution after workers are drained when requested.
+    costAttribution <- if collectCurve then traverse snapshotMetrics metricsStore else pure Nothing
     pure (outcome, reductionSeconds, costAttribution)
     where
         runAction = do
@@ -876,22 +888,13 @@ runValidationPhase env state finalSQL skipValidation callLimit
                                 Just profile -> do
                                     let observation = detailedObservation profile
                                         micros = fromIntegral
-                                    modifyEvalState
-                                        state
-                                        ( \s ->
-                                            s
-                                                { evalValidationResetSeconds =
-                                                    evalValidationResetSeconds s + micros (resetElapsedMicros profile) / 1000000
-                                                }
-                                        )
-                                    modifyEvalState
-                                        state
-                                        ( \s ->
-                                            s
-                                                { evalValidationOracleSeconds =
-                                                    evalValidationOracleSeconds s + maybe 0 micros (oracleElapsedMicros profile) / 1000000
-                                                }
-                                        )
+                                    modifyEvalState state \s ->
+                                        s
+                                            { evalValidationResetSeconds =
+                                                evalValidationResetSeconds s + micros (resetElapsedMicros profile) / 1000000
+                                            , evalValidationOracleSeconds =
+                                                evalValidationOracleSeconds s + maybe 0 micros (oracleElapsedMicros profile) / 1000000
+                                            }
                                     recordValidationOutcome state observation
                                     case observationOutcome observation of
                                         OracleAccepted -> pure (Just OracleAccepted)
@@ -951,12 +954,13 @@ retireCandidate ::
     Ticks ->
     FilePath ->
     IORef EvalState ->
+    Bool ->
     Int ->
     ByteString ->
     OracleOutcome ->
     Bool ->
     IO ()
-retireCandidate onProgress reductionStart checkpoint state callIndex candidate outcome hit = do
+retireCandidate onProgress reductionStart checkpoint state collectCurve callIndex candidate outcome hit = do
     let accepted = outcome == OracleAccepted
     -- Retrieve cached statement count for accepted candidate.
     statements <-
@@ -968,20 +972,22 @@ retireCandidate onProgress reductionStart checkpoint state callIndex candidate o
         smaller <- checkpointIfSmaller state checkpoint candidate statements
         when smaller $
             onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
-    now <- ticks
-    modifyEvalState state \s ->
-        s
-            { evalCurve =
-                EvaluationPoint
-                    { pointElapsedSeconds = seconds reductionStart now
-                    , pointCallIndex = callIndex + 1
-                    , pointCandidateBytes = BS.length candidate
-                    , pointCandidateStatements = statements
-                    , pointCacheHit = hit
-                    , pointAccepted = accepted
-                    }
-                    : evalCurve s
-            }
+    modifyEvalState state \s -> s {evalCounts = Map.delete candidate (evalCounts s)}
+    when collectCurve $ do
+        now <- ticks
+        modifyEvalState state \s ->
+            s
+                { evalCurve =
+                    EvaluationPoint
+                        { pointElapsedSeconds = seconds reductionStart now
+                        , pointCallIndex = callIndex + 1
+                        , pointCandidateBytes = BS.length candidate
+                        , pointCandidateStatements = statements
+                        , pointCacheHit = hit
+                        , pointAccepted = accepted
+                        }
+                        : evalCurve s
+                }
 
 -- | Route reducer stage events to UI progress and per-stage summaries.
 evalStageReporter :: (EvaluationProgress -> IO ()) -> IORef EvalState -> StageReporter
@@ -1006,7 +1012,7 @@ checkpointIfSmaller state path candidate statements = do
     current <- evalAccepted <$> readIORef state
     if BS.length candidate < BS.length current
         then mask_ $ do
-            writeAtomicBytes path candidate
+            unless (null path) $ writeAtomicBytes path candidate
             modifyEvalState state (\s -> s {evalAccepted = candidate, evalAcceptedStatements = statements})
             pure True
         else pure False

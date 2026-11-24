@@ -14,6 +14,7 @@ fn parse(sql: &str, dialect: DialectKind) -> Result<Vec<NativeUnit>, String> {
             column_bundles: false,
             syntax_edits: true,
             syntax_only: false,
+            span_only: false,
         },
     )
 }
@@ -29,6 +30,7 @@ fn parse_chunks(sql: &str, dialect: DialectKind) -> Result<Vec<NativeUnit>, Stri
             column_bundles: false,
             syntax_edits: true,
             syntax_only: false,
+            span_only: false,
         },
     )
 }
@@ -439,6 +441,7 @@ fn invalid_utf8_is_rejected_at_the_ffi_boundary() {
         column_bundles: false,
         syntax_edits: true,
         syntax_only: false,
+        span_only: false,
     })
     .unwrap();
     let mut output: *mut u8 = std::ptr::null_mut();
@@ -1705,6 +1708,7 @@ fn session_init_resolves_the_dialect_foreign_key_default() {
         column_bundles: false,
         syntax_edits: true,
         syntax_only: false,
+        span_only: false,
     };
     assert!(
         !crate::ffi::session_init(&config(DialectKind::SQLite, None)).foreign_key_checks,
@@ -2766,6 +2770,7 @@ fn syntax_edit_gate_drops_only_edits() {
             column_bundles: false,
             syntax_edits: false,
             syntax_only: false,
+            span_only: false,
         },
     )
     .expect("parse");
@@ -2791,6 +2796,33 @@ fn syntax_edit_gate_drops_only_edits() {
             )
         };
         assert_eq!(shape(fa), shape(fb));
+    }
+}
+
+#[test]
+fn span_only_skips_fact_extraction_and_preserves_spans() {
+    let sql = "CREATE TABLE t(a INT, b INT);\nINSERT INTO t(a, b) VALUES (1, 2), (3, 4);\nSELECT a FROM t ORDER BY a;";
+    let full = parse(sql, DialectKind::SQLite).expect("parse");
+    let fast = parse_units(
+        sql,
+        &ParseConfig {
+            dialect: DialectKind::SQLite,
+            server: ServerConfig::default(),
+            chunk_edits: false,
+            column_ir: false,
+            column_bundles: false,
+            syntax_edits: false,
+            syntax_only: false,
+            span_only: true,
+        },
+    )
+    .expect("span_only parse");
+    assert_eq!(full.len(), fast.len());
+    for (a, b) in full.iter().zip(fast.iter()) {
+        assert_eq!((a.start, a.end), (b.start, b.end));
+        assert_eq!(a.cannot_produce_result, b.cannot_produce_result);
+        assert_eq!(a.parse_error, b.parse_error);
+        assert!(b.facts.is_none(), "span_only must emit None for facts");
     }
 }
 

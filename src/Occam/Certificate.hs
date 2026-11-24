@@ -26,8 +26,6 @@ module Occam.Certificate (
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.HashSet (HashSet)
-import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
@@ -66,13 +64,113 @@ import Occam.Core (
  )
 import Occam.Facts (ParserEdit (..), StatementFacts (..), StatementUnit (..))
 
+data ByteTrie
+    = TrieEmpty
+    | TrieEdge !ByteString !ByteTrie
+    | TrieBranch !Bool !(IntMap ByteTrie)
+    deriving (Eq, Show)
+
+matchTrie :: ByteTrie -> ByteString -> Bool
+matchTrie TrieEmpty _ = False
+matchTrie (TrieEdge edge child) candidate =
+    let !edgeLen = BS.length edge
+     in BS.length candidate >= edgeLen
+            && BS.take edgeLen candidate == edge
+            && matchTrie child (BS.drop edgeLen candidate)
+matchTrie (TrieBranch isTerminal children) candidate
+    | isTerminal = True
+    | BS.null candidate = False
+    | otherwise =
+        let !b = fromIntegral (BS.head candidate)
+         in case IntMap.lookup b children of
+                Just child -> matchTrie child (BS.tail candidate)
+                Nothing -> False
+
+insertTrie :: ByteString -> ByteTrie -> (ByteTrie, Bool)
+insertTrie bs TrieEmpty
+    | BS.null bs = (TrieBranch True IntMap.empty, True)
+    | otherwise = (TrieEdge bs (TrieBranch True IntMap.empty), True)
+insertTrie bs (TrieEdge edge child)
+    | bs == edge =
+        case child of
+            TrieBranch True _ -> (TrieEdge edge child, False)
+            TrieBranch False m -> (TrieEdge edge (TrieBranch True m), True)
+            TrieEmpty -> (TrieEdge edge (TrieBranch True IntMap.empty), True)
+            TrieEdge {} ->
+                let b = fromIntegral (BS.head (edgeOf child))
+                 in (TrieEdge edge (TrieBranch True (IntMap.singleton b child)), True)
+    | otherwise =
+        let !commonLen = commonPrefixLength bs edge
+         in if commonLen == BS.length edge
+                then
+                    let (child', ins) = insertTrie (BS.drop commonLen bs) child
+                     in (TrieEdge edge child', ins)
+                else
+                    if commonLen == 0
+                        then
+                            let !b1 = fromIntegral (BS.head bs)
+                                !b2 = fromIntegral (BS.head edge)
+                                !c1 = makeEdge (BS.tail bs) (TrieBranch True IntMap.empty)
+                                !c2 = makeEdge (BS.tail edge) child
+                                !m = IntMap.fromList [(b1, c1), (b2, c2)]
+                             in (TrieBranch False m, True)
+                        else
+                            let !common = BS.take commonLen edge
+                                !edgeRest = BS.drop commonLen edge
+                                !bsRest = BS.drop commonLen bs
+                                !b2 = fromIntegral (BS.head edgeRest)
+                                !c2 = makeEdge (BS.tail edgeRest) child
+                                !branch =
+                                    if BS.null bsRest
+                                        then TrieBranch True (IntMap.singleton b2 c2)
+                                        else
+                                            let !b1 = fromIntegral (BS.head bsRest)
+                                                !c1 = makeEdge (BS.tail bsRest) (TrieBranch True IntMap.empty)
+                                                !m = IntMap.fromList [(b1, c1), (b2, c2)]
+                                             in TrieBranch False m
+                             in (TrieEdge common branch, True)
+    where
+        edgeOf (TrieEdge e _) = e
+        edgeOf _ = BS.empty
+
+        makeEdge rest c
+            | BS.null rest = c
+            | otherwise = TrieEdge rest c
+
+        commonPrefixLength s1 s2 =
+            let !l1 = BS.length s1
+                !l2 = BS.length s2
+                !maxL = min l1 l2
+                go !i
+                    | i < maxL && BS.index s1 i == BS.index s2 i = go (i + 1)
+                    | otherwise = i
+             in go 0
+insertTrie bs (TrieBranch isTerm children)
+    | BS.null bs =
+        if isTerm
+            then (TrieBranch isTerm children, False)
+            else (TrieBranch True children, True)
+    | otherwise =
+        let !b = fromIntegral (BS.head bs)
+            !rest = BS.tail bs
+         in case IntMap.lookup b children of
+                Nothing ->
+                    let !newChild =
+                            if BS.null rest
+                                then TrieBranch True IntMap.empty
+                                else TrieEdge rest (TrieBranch True IntMap.empty)
+                     in (TrieBranch isTerm (IntMap.insert b newChild children), True)
+                Just existing ->
+                    let (updatedChild, inserted) = insertTrie rest existing
+                     in (TrieBranch isTerm (IntMap.insert b updatedChild children), inserted)
+
 {- | Bounded, thread-safe memo of semicolon-terminated deterministic SQL error
 prefixes observed during native result-oracle execution. Any future candidate
 sharing an exact recorded byte prefix is guaranteed to encounter the same error
 and fail the contract.
 -}
 data FailingPrefixCache = FailingPrefixCache
-    { fpMapRef :: !(IORef (IntMap (HashSet ByteString)))
+    { fpTrieRef :: !(IORef ByteTrie)
     , fpCountRef :: !(IORef Int)
     }
 
@@ -80,7 +178,7 @@ maxFailingPrefixes :: Int
 maxFailingPrefixes = 512
 
 newFailingPrefixCache :: IO FailingPrefixCache
-newFailingPrefixCache = FailingPrefixCache <$> newIORef IntMap.empty <*> newIORef 0
+newFailingPrefixCache = FailingPrefixCache <$> newIORef TrieEmpty <*> newIORef 0
 
 recordFailingPrefix :: FailingPrefixCache -> ByteString -> IO ()
 recordFailingPrefix FailingPrefixCache {..} prefix
@@ -90,28 +188,16 @@ recordFailingPrefix FailingPrefixCache {..} prefix
         if count >= maxFailingPrefixes
             then pure ()
             else do
-                let !len = BS.length prefix
-                inserted <- atomicModifyIORef' fpMapRef $ \m ->
-                    case IntMap.lookup len m of
-                        Just set | HashSet.member prefix set -> (m, False)
-                        Just set -> (IntMap.insert len (HashSet.insert prefix set) m, True)
-                        Nothing -> (IntMap.insert len (HashSet.singleton prefix) m, True)
+                inserted <- atomicModifyIORef' fpTrieRef $ \trie ->
+                    let (trie', ins) = insertTrie prefix trie
+                     in (trie', ins)
                 when inserted $
                     atomicModifyIORef' fpCountRef (\n -> (n + 1, ()))
 
 checkFailingPrefix :: FailingPrefixCache -> ByteString -> IO Bool
 checkFailingPrefix FailingPrefixCache {..} candidate = do
-    m <- readIORef fpMapRef
-    if IntMap.null m
-        then pure False
-        else
-            let !candLen = BS.length candidate
-                go [] = False
-                go ((prefixLen, prefixes) : rest)
-                    | prefixLen > candLen = False
-                    | HashSet.member (BS.take prefixLen candidate) prefixes = True
-                    | otherwise = go rest
-             in pure (go (IntMap.toAscList m))
+    trie <- readIORef fpTrieRef
+    pure (matchTrie trie candidate)
 
 -- | Precomputed early-rejection certificates anchored to one accepted base SQL script.
 data EarlyRejectCertifier = EarlyRejectCertifier
@@ -123,6 +209,7 @@ data EarlyRejectCertifier = EarlyRejectCertifier
     , certNonResultReady :: !Bool
     , certGuaranteedNonResult :: !IntSet
     , certMissingDefReqs :: !(IntMap [IntSet])
+    , certUniqueDefiners :: !(IntMap IntSet)
     , certProtectedResultIndex :: !(Maybe (Int, Int))
     {- ^ @(expectedUnitCount, lastResultIndex)@ when every trailing unit
     strictly after @lastResultIndex@ satisfies 'unitCannotProduceResult'.
@@ -141,6 +228,7 @@ emptyEarlyRejectCertifier =
         , certNonResultReady = False
         , certGuaranteedNonResult = IntSet.empty
         , certMissingDefReqs = IntMap.empty
+        , certUniqueDefiners = IntMap.empty
         , certProtectedResultIndex = Nothing
         }
 
@@ -224,6 +312,7 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
         , certNonResultReady = nonResultReady
         , certGuaranteedNonResult = guaranteedNonResult
         , certMissingDefReqs = missingDefReqs
+        , certUniqueDefiners = uniqueDefiners
         , certProtectedResultIndex = protectedResultIndex
         }
     where
@@ -236,6 +325,25 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
         nextStarts =
             map (Just . spanStartByte . stmtSpan . unitStatement) (drop 1 units)
                 ++ repeat Nothing
+
+        uniqueDefiners =
+            IntMap.foldlWithKey'
+                ( \acc sid reqs ->
+                    foldl'
+                        ( \m req ->
+                            if IntSet.size req == 1
+                                then
+                                    let defSid = IntSet.findMin req
+                                     in if defSid /= sid
+                                            then IntMap.insertWith IntSet.union defSid (IntSet.singleton sid) m
+                                            else m
+                                else m
+                        )
+                        acc
+                        reqs
+                )
+                IntMap.empty
+                missingDefReqs
 
         (prefixByteLens, prefixLengths) =
             case traceEndByteOffsets trace of
@@ -459,15 +567,22 @@ checkEarlyRejectionIds cert keptInts
     , keptInts `IntSet.isSubsetOf` certGuaranteedNonResult cert =
         Just EarlyRejectNoResultStatement
     | not (IntMap.null (certMissingDefReqs cert))
-    , hasMissingDefinition (certMissingDefReqs cert) keptInts =
+    , hasMissingDefinition cert keptInts =
         Just EarlyRejectMissingDefinition
     | otherwise = Nothing
     where
-        hasMissingDefinition reqMap kept =
-            IntSet.foldr checkSid False kept
+        hasMissingDefinition c kept =
+            anyMissingUniqueDef || IntSet.foldr checkSid False kept
             where
+                anyMissingUniqueDef =
+                    IntMap.foldrWithKey'
+                        ( \defSid dependents acc ->
+                            acc || (IntSet.notMember defSid kept && not (IntSet.disjoint kept dependents))
+                        )
+                        False
+                        (certUniqueDefiners c)
                 checkSid sid rest =
-                    case IntMap.lookup sid reqMap of
+                    case IntMap.lookup sid (certMissingDefReqs c) of
                         Nothing -> rest
                         Just reqs -> any (IntSet.disjoint kept) reqs || rest
 

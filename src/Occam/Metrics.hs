@@ -20,6 +20,7 @@ module Occam.Metrics (
     recordCandidateBuildTiming,
     recordAcceptedBytesSaved,
     recordOracleTiming,
+    recordPhysicalCompletionAndTiming,
 ) where
 
 import Data.Aeson (
@@ -352,6 +353,22 @@ recordOracleTiming metricsStore tag mOracle mReset =
         bumpFamily store tag \counters ->
             counters
                 { oracleMicros = case mOracle of
+                    Nothing -> oracleMicros counters
+                    Just n -> Just (maybe n (+ n) (oracleMicros counters))
+                , resetMicros = case mReset of
+                    Nothing -> resetMicros counters
+                    Just n -> Just (maybe n (+ n) (resetMicros counters))
+                }
+
+-- | Atomically record both physical completion and oracle timings in a single update.
+recordPhysicalCompletionAndTiming ::
+    Maybe MetricsStore -> FamilyTag -> Maybe Int -> Maybe Int -> IO ()
+recordPhysicalCompletionAndTiming metricsStore tag mOracle mReset =
+    withMetricsStore metricsStore \store ->
+        bumpFamily store tag \counters ->
+            counters
+                { physicalCompletions = physicalCompletions counters + 1
+                , oracleMicros = case mOracle of
                     Nothing -> oracleMicros counters
                     Just n -> Just (maybe n (+ n) (oracleMicros counters))
                 , resetMicros = case mReset of

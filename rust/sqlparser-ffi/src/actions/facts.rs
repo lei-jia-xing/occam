@@ -4107,6 +4107,29 @@ pub(crate) fn analyze_statement(
             _ => {}
         }
     }
+    let need_shared_sequences = matches!(
+        statement,
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_)
+            | Statement::Call(_)
+            | Statement::Copy { .. }
+    );
+    if need_shared_sequences {
+        let mut seq_visitor = SequenceVisitor::new(dialect, rules, context.pure_table_enabled);
+        if context.pure_table_enabled
+            && matches!(dialect, DialectKind::MySql)
+            && let Statement::Insert(insert) = statement
+            && let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on
+        {
+            seq_visitor
+                .ignored_function_roots
+                .extend(values_marker_spans(assignments));
+        }
+        visitor.sequences = Some(seq_visitor);
+    }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
     // Set only by the inert-pragma branch below, whose recorded variables are
@@ -4117,8 +4140,12 @@ pub(crate) fn analyze_statement(
     // though creation and removal of the sequence itself are transactional.
     let transactional = sequence_transactional(dialect)
         && !matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift);
-    let sequences =
-        sequence_effects_for_statement(statement, dialect, rules, context.pure_table_enabled);
+    let sequences = match visitor.sequences.take() {
+        Some(seq) => seq,
+        None => {
+            sequence_effects_for_statement(statement, dialect, rules, context.pure_table_enabled)
+        }
+    };
     for sequence in sequences.writes {
         facts
             .ops

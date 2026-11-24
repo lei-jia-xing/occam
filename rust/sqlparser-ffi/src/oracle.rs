@@ -260,3 +260,33 @@ pub(super) fn duckdb_replay_units(sql: &str) -> Option<Vec<ReplayUnit>> {
     }
     Some(units)
 }
+
+pub(super) fn duckdb_replay_units_binary(sql: &str) -> Option<Vec<u8>> {
+    let units = duckdb_replay_units(sql)?;
+    let mut buf = Vec::with_capacity(9 + units.len() * 24);
+    buf.extend_from_slice(b"OCCM\x03");
+    buf.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for u in &units {
+        let end_val: i64 = match u.end {
+            Some(e) => e as i64,
+            None => -1,
+        };
+        buf.extend_from_slice(&end_val.to_le_bytes());
+        let kind_byte: u8 = match u.kind {
+            "create" => 1,
+            "insert" => 2,
+            "query" => 3,
+            _ => 0,
+        };
+        buf.push(kind_byte);
+        match &u.table {
+            None => buf.push(0),
+            Some(tbl) => {
+                buf.push(1);
+                buf.extend_from_slice(&(tbl.len() as u32).to_le_bytes());
+                buf.extend_from_slice(tbl.as_bytes());
+            }
+        }
+    }
+    Some(buf)
+}

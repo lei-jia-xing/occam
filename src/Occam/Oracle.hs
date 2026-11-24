@@ -49,7 +49,9 @@ import Control.Exception (
     try,
     uninterruptibleMask_,
  )
-import Control.Monad (unless)
+import Control.Monad (unless, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (callCC, evalContT)
 import Data.Aeson (
     FromJSON (..),
     FromJSONKey (..),
@@ -280,28 +282,23 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                                         reaped <- cleanupOwnedGroup groupId ph reaper
                                         unless reaped $ throwIO OracleReapFailed
                                         writeIORef cleanedRef True
+                            let runCandidate
+                                    | BS.length input <= inlinePipeWriteLimit = do
+                                        writePipe hIn input
+                                        exitCode <- wait
+                                        cleanup
+                                        pure exitCode
+                                    | otherwise = withWorker (writePipe hIn input) \writeInput -> do
+                                        exitCode <- wait
+                                        -- Kill remaining group members before joining the stdin writer.
+                                        cleanup
+                                        writeInput
+                                        pure exitCode
                             result <-
                                 ( do
                                     onStarted
                                     hSetBinaryMode hIn True
-                                    restore $
-                                        timeout
-                                            timeoutMicros
-                                            ( if BS.length input <= inlinePipeWriteLimit
-                                                then do
-                                                    writePipe hIn input
-                                                    exitCode <- wait
-                                                    cleanup
-                                                    pure exitCode
-                                                else withWorker (writePipe hIn input) \writeInput -> do
-                                                    exitCode <- wait
-                                                    -- Kill remaining group members before joining the stdin writer.
-                                                    cleanup
-                                                    writeInput
-                                                    pure exitCode
-                                            )
-                                            -- Kill the process group on timeout before unwinding.
-                                            `onException` cleanup
+                                    restore $ timeout timeoutMicros runCandidate `onException` cleanup
                                 )
                                     `onException` cleanup
                             cleanup
@@ -613,37 +610,35 @@ observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} conte
                         resetEnded <- getMonotonicTimeNSec
                         let duration = elapsedMicros resetStarted resetEnded
                         pure (result, duration)
-                case resetResult of
-                    Left err -> pure (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
-                    Right Nothing -> pure (OracleTimedOut, resetElapsed, Nothing)
-                    Right (Just code)
-                        | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
-                        | otherwise -> do
-                            let cmdProcess = cmdSpecToProcess (contextCmdSpec context)
-                            oracleStarted <- getMonotonicTimeNSec
-                            remaining <- remainingMicros
-                            if remaining <= 0
-                                then pure (OracleTimedOut, resetElapsed, Nothing)
-                                else do
-                                    oracleResult <-
-                                        tryIOException $
-                                            runProcessGroupWithStart
-                                                onOracleStarted
-                                                remaining
-                                                (cmdProcess {env = Just childEnv})
-                                                sql
-                                    oracleEnded <- getMonotonicTimeNSec
-                                    let oracleElapsed = elapsedMicros oracleStarted oracleEnded
-                                    pure
-                                        ( case oracleResult of
-                                            Left err -> OracleIOFailed (T.pack (show err))
-                                            Right (_, Nothing) -> OracleTimedOut
-                                            Right (_, Just code') -> OracleFinished code'
-                                        , resetElapsed
-                                        , case oracleResult of
-                                            Right (True, _) -> Just oracleElapsed
-                                            _ -> Nothing
-                                        )
+                evalContT $ callCC \exit -> do
+                    case resetResult of
+                        Left err -> exit (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
+                        Right Nothing -> exit (OracleTimedOut, resetElapsed, Nothing)
+                        Right (Just code)
+                            | code /= ExitSuccess -> exit (OracleResetFailed, resetElapsed, Nothing)
+                            | otherwise -> pure ()
+                    let cmdProcess = cmdSpecToProcess (contextCmdSpec context)
+                    oracleStarted <- liftIO getMonotonicTimeNSec
+                    remaining <- liftIO remainingMicros
+                    when (remaining <= 0) $ exit (OracleTimedOut, resetElapsed, Nothing)
+                    oracleResult <-
+                        liftIO $
+                            tryIOException $
+                                runProcessGroupWithStart
+                                    onOracleStarted
+                                    remaining
+                                    (cmdProcess {env = Just childEnv})
+                                    sql
+                    oracleEnded <- liftIO getMonotonicTimeNSec
+                    let oracleElapsed = elapsedMicros oracleStarted oracleEnded
+                        obs = case oracleResult of
+                            Left err -> OracleIOFailed (T.pack (show err))
+                            Right (_, Nothing) -> OracleTimedOut
+                            Right (_, Just code') -> OracleFinished code'
+                        mOracleElapsed = case oracleResult of
+                            Right (True, _) -> Just oracleElapsed
+                            _ -> Nothing
+                    pure (obs, resetElapsed, mOracleElapsed)
             case attempt of
                 Left err -> finish (OracleIOFailed (T.pack (show err))) 0 Nothing
                 Right (observation, resetElapsed, oracleElapsed) ->

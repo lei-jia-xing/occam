@@ -34,6 +34,8 @@ module Occam.Reducer (
     selectIndependentEdits,
     independentEditBatches,
     partitionChunks,
+    partitionStatementsByBytes,
+    partitionStatementsByWeights,
     reduceSQL,
     reduceSQLWithLogger,
     reduceSQLWithConfig,
@@ -51,17 +53,24 @@ module Occam.Reducer (
     nullStageReporter,
     statementDdmin,
     statementDdminWithOrder,
+    statementDdminWithParser,
     statementAudit,
     statementAuditWithLogger,
+    statementAuditWithParser,
+    parseStatementsFast,
+    reuseLatestSQLWithSeed,
     AuditStats (..),
     findInterestingPrefix,
 ) where
 
 import Control.Exception.Safe (finally)
 import Control.Monad (forM, unless, void, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable (for_, toList)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
@@ -72,6 +81,8 @@ import Data.List (find, partition, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Ord (Down (..))
+import Data.Sequence (Seq)
+import Data.Sequence qualified as Seq
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -137,6 +148,7 @@ import Occam.Parser (
     defaultParseOptions,
     defaultSQLDialect,
     parseSQLTimed,
+    spanOnlyOptions,
  )
 import Occam.Pool (
     OraclePool,
@@ -510,6 +522,15 @@ parseStatements store dialect sql = do
     (session, units, _) <- parseUnitsOrThrow store (defaultParseOptions dialect) sql
     pure (session, units)
 
+parseStatementsFast :: Maybe MetricsStore -> SQLDialect -> StatementParser
+parseStatementsFast store dialect sql = do
+    (session, units, _) <- parseUnitsOrThrow store (spanOnlyOptions dialect) sql
+    pure (session, units)
+
+-- | Monadic early exit in 'ContT', discarding the continuation and returning immediately.
+earlyExit :: (Monad m) => r -> ContT r m a
+earlyExit r = ContT (\_ -> pure r)
+
 -- Share the latest analysis within a reduction, keyed by exact SQL bytes.
 reuseLatestSQL :: (ByteString -> IO a) -> IO (ByteString -> IO a)
 reuseLatestSQL = reuseLatestSQLWithSeed Nothing
@@ -619,6 +640,46 @@ cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
     cutRemovedStatementInts baseSQL allStatements (statementIdsInt keptStatements)
 
+-- | Indexed singleton deletion boundaries for a statement snapshot.
+data StatementSnapshot = StatementSnapshot
+    { snapSQL :: !ByteString
+    , snapOffsets :: !(IntMap.IntMap (Int, Int))
+    }
+
+buildStatementSnapshot :: ByteString -> [Statement] -> IntSet.IntSet -> StatementSnapshot
+buildStatementSnapshot baseSQL allStatements keptInts =
+    let !sourceLength = BS.length baseSQL
+        !firstStart = case allStatements of
+            s : _ -> spanStartByte (stmtSpan s)
+            [] -> 0
+        computeSpans [] = []
+        computeSpans (s : rest) =
+            let Span start _ = stmtSpan s
+                nextStart = case rest of
+                    n : _ -> spanStartByte (stmtSpan n)
+                    [] -> sourceLength
+             in (s, nextStart - start) : computeSpans rest
+
+        spans = computeSpans allStatements
+
+        buildOffsets [] !m !_ = m
+        buildOffsets ((s, len) : rest) !m !off
+            | IntSet.member (unStatementId (stmtId s)) keptInts =
+                let !m' = IntMap.insert (unStatementId (stmtId s)) (off, len) m
+                 in buildOffsets rest m' (off + len)
+            | otherwise = buildOffsets rest m off
+
+        !offsets = buildOffsets spans IntMap.empty firstStart
+        !currentSQL = cutRemovedStatementInts baseSQL allStatements keptInts
+     in StatementSnapshot currentSQL offsets
+
+renderSingletonDeletion :: StatementSnapshot -> Statement -> Maybe ByteString
+renderSingletonDeletion StatementSnapshot {..} stmt =
+    case IntMap.lookup (unStatementId (stmtId stmt)) snapOffsets of
+        Nothing -> Nothing
+        Just (!off, !len) ->
+            Just (BS.take off snapSQL <> BS.drop (off + len) snapSQL)
+
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]
 partitionChunks n xs
@@ -637,21 +698,27 @@ each remaining group even when a single unusually large statement dominates.
 -}
 partitionStatementsByBytes :: Int -> [Statement] -> [[Statement]]
 partitionStatementsByBytes groups statements =
-    go groups (length statements) (sum (map statementSpanBytes statements)) statements
+    partitionStatementsByWeights
+        groups
+        [(s, statementSpanBytes s) | s <- statements]
+        (sum (map statementSpanBytes statements))
+
+partitionStatementsByWeights :: Int -> [(Statement, Int)] -> Int -> [[Statement]]
+partitionStatementsByWeights groups statementsWithWeights totalBytes =
+    go groups (length statementsWithWeights) totalBytes statementsWithWeights
     where
         go _ _ _ [] = []
-        go remaining _ _ rest | remaining <= 1 = [rest]
-        go remaining count bytes (first : rest) =
+        go remaining _ _ rest | remaining <= 1 = [map fst rest]
+        go remaining count bytes ((firstStmt, firstWeight) : rest) =
             let target = (bytes + remaining - 1) `div` remaining
                 (chunk, next, consumed, weight) =
-                    consume target (count - remaining) [first] (1 :: Int) (statementSpanBytes first) rest
+                    consume target (count - remaining) [firstStmt] (1 :: Int) firstWeight rest
              in chunk : go (remaining - 1) (count - consumed) (bytes - weight) next
-        consume target slots taken consumed weight (next : rest)
+        consume target slots taken consumed weight ((nextStmt, nextWeight) : rest)
             | slots > 0
             , weight < target
-            , let nextWeight = statementSpanBytes next
             , abs (target - weight - nextWeight) <= target - weight =
-                consume target (slots - 1) (next : taken) (consumed + 1) (weight + nextWeight) rest
+                consume target (slots - 1) (nextStmt : taken) (consumed + 1) (weight + nextWeight) rest
         consume _ _ taken consumed weight rest = (reverse taken, rest, consumed, weight)
 
 statementSpanBytes :: Statement -> Int
@@ -994,12 +1061,14 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
         go granularity laneState currentLen current = do
             let n = min (length current) (max 1 granularity)
                 currentInts = statementIdsInt current
+                stmtWithWeights = [(stmt, statementSpanBytes stmt) | stmt <- current]
                 currentWeights =
                     IntMap.fromList
-                        [(unStatementId (stmtId stmt), statementSpanBytes stmt) | stmt <- current]
+                        [(unStatementId (stmtId stmt), w) | (stmt, w) <- stmtWithWeights]
+                totalSpanBytes = sum (map snd stmtWithWeights)
                 chunks count = case effectivePolicy of
-                    StatementByteWeighted -> partitionStatementsByBytes count current
-                    StatementRankedWith _ -> partitionStatementsByBytes count current
+                    StatementByteWeighted -> partitionStatementsByWeights count stmtWithWeights totalSpanBytes
+                    StatementRankedWith _ -> partitionStatementsByWeights count stmtWithWeights totalSpanBytes
                     _ -> partitionChunks count current
                 lanes count =
                     let groups = chunks count
@@ -1227,21 +1296,25 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                 currentLen
                 [currentInts `IntSet.difference` statementIdsInt chunk | chunk <- chunks]
 
-        trySeeds lane tag current currentInts currentLen = pull
+        trySeeds lane tag current currentInts currentLen seeds = do
+            seenProjectionsRef <- newIORef HashSet.empty
+            pull seenProjectionsRef seeds
             where
+                batchLimit = max 64 (jobs * 16)
                 -- Pull and test eligible candidate windows incrementally.
-                pull [] = pure Nothing
-                pull seeds = collect jobs [] HashSet.empty seeds
-                collect _ acc _ [] = testAndContinue (reverse acc) [] Nothing
-                collect 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
-                collect n acc seen (seedInts : rest) = do
-                    token <- classifySeed Nothing tag current currentInts currentLen seedInts
+                pull _ [] = pure Nothing
+                pull seenProj s = collect seenProj batchLimit [] HashSet.empty s
+                collect _ _ acc _ [] = testAndContinue (reverse acc) [] Nothing
+                collect _ 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
+                collect seenProj n acc seen (seedInts : rest) = do
+                    token <- classifySeed (Just seenProj) tag current currentInts currentLen seedInts
                     case token of
-                        Nothing -> collect (n - 1) acc seen rest
+                        Nothing -> collect seenProj (n - 1) acc seen rest
                         Just (SeedAccepted kept saved) -> testAndContinue (reverse acc) rest (Just (kept, saved))
                         Just (SeedFresh kept count sql)
-                            | HashSet.member sql seen -> collect (n - 1) acc seen rest
-                            | otherwise -> collect (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
+                            | HashSet.member sql seen -> collect seenProj (n - 1) acc seen rest
+                            | otherwise ->
+                                collect seenProj (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
                     accepted <- testMixedBatch currentLen batch
                     case accepted of
@@ -1250,7 +1323,9 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                             Just (kept, saved) -> do
                                 recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
                                 pure (Just (lane, kept, saved))
-                            Nothing -> pull rest
+                            Nothing -> do
+                                seenProj <- newIORef HashSet.empty
+                                pull seenProj rest
 
         testMixedBatch _ [] = pure Nothing
         testMixedBatch currentLen batch = do
@@ -1271,73 +1346,70 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
 
         classifySeed maybeSeen tag current currentInts currentLen seedInts
             | seedInts == currentInts = pure Nothing
-            | otherwise = do
-                projection <- buildCandidate currentInts seedInts
-                case projection of
-                    Nothing -> pure Nothing
-                    Just projected
-                        | projected == currentInts -> do
-                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
-                            pure Nothing
-                    Just projected -> do
-                        dupInWindow <- case maybeSeen of
-                            Nothing -> pure False
-                            Just seenRef -> do
-                                seen <- readIORef seenRef
-                                if HashSet.member projected seen
-                                    then pure True
-                                    else do
-                                        writeIORef seenRef (HashSet.insert projected seen)
-                                        pure False
-                        if dupInWindow
-                            then do
-                                recordGeneratedSkipped (poolMetricsStore pool) "projected-window-duplicate"
-                                when (projected /= seedInts) $
-                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
-                                pure Nothing
+            | otherwise = evalContT do
+                projection <- liftIO $ buildCandidate currentInts seedInts
+                projected <- case projection of
+                    Nothing -> earlyExit Nothing
+                    Just p
+                        | p == currentInts -> do
+                            liftIO $ recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                            earlyExit Nothing
+                        | otherwise -> pure p
+                dupInWindow <- liftIO $ case maybeSeen of
+                    Nothing -> pure False
+                    Just seenRef -> do
+                        seen <- readIORef seenRef
+                        if HashSet.member projected seen
+                            then pure True
                             else do
-                                earlyId <- checkEarlyRejectionIdsTracked tracker cert projected
-                                case earlyId of
-                                    Just reason -> do
-                                        recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                        pure Nothing
-                                    Nothing -> do
-                                        let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
-                                        candidateSQL <-
-                                            timeTaggedStatementBuild
-                                                (poolMetricsStore pool)
-                                                tag
-                                                (cutRemovedStatementInts baseSQL allStatements projected)
-                                        let saved = currentLen - BS.length candidateSQL
-                                        if saved <= 0
-                                            then do
-                                                when (projected /= seedInts) $
-                                                    recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
-                                                pure Nothing
-                                            else do
-                                                evaluated <- readIORef (fbEvaluated feedback)
-                                                case HashMap.lookup candidateSQL evaluated of
-                                                    Just CandidateAccepted -> pure (Just (SeedAccepted kept saved))
-                                                    Just CandidateRejected -> do
-                                                        recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
-                                                        when (projected /= seedInts) $
-                                                            recordGeneratedSkipped
-                                                                (poolMetricsStore pool)
-                                                                "closure-projection-duplicate"
-                                                        pure Nothing
-                                                    Nothing -> do
-                                                        earlyBytes <-
-                                                            checkEarlyRejectionBytesTracked tracker cert False candidateSQL
-                                                        case earlyBytes of
-                                                            Just reason -> do
-                                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                                                modifyIORef'
-                                                                    (fbEvaluated feedback)
-                                                                    (HashMap.insert candidateSQL CandidateRejected)
-                                                                pure Nothing
-                                                            Nothing ->
-                                                                let count = IntSet.size (IntSet.intersection currentInts projected)
-                                                                 in pure (Just (SeedFresh kept count candidateSQL))
+                                writeIORef seenRef (HashSet.insert projected seen)
+                                pure False
+                when dupInWindow do
+                    liftIO do
+                        recordGeneratedSkipped (poolMetricsStore pool) "projected-window-duplicate"
+                        when (projected /= seedInts) $
+                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
+                    earlyExit Nothing
+
+                earlyId <- liftIO $ checkEarlyRejectionIdsTracked tracker cert projected
+                for_ earlyId \reason -> do
+                    liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                    earlyExit Nothing
+
+                let kept = filter (\s -> IntSet.member (unStatementId (stmtId s)) projected) current
+                candidateSQL <-
+                    liftIO $
+                        timeTaggedStatementBuild
+                            (poolMetricsStore pool)
+                            tag
+                            (cutRemovedStatementInts baseSQL allStatements projected)
+                let saved = currentLen - BS.length candidateSQL
+                when (saved <= 0) do
+                    liftIO $
+                        when (projected /= seedInts) $
+                            recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-no-shrink"
+                    earlyExit Nothing
+
+                evaluated <- liftIO $ readIORef (fbEvaluated feedback)
+                case HashMap.lookup candidateSQL evaluated of
+                    Just CandidateAccepted -> earlyExit (Just (SeedAccepted kept saved))
+                    Just CandidateRejected -> do
+                        liftIO do
+                            recordGeneratedSkipped (poolMetricsStore pool) "duplicate-bytes"
+                            when (projected /= seedInts) $
+                                recordGeneratedSkipped (poolMetricsStore pool) "closure-projection-duplicate"
+                        earlyExit Nothing
+                    Nothing -> pure ()
+
+                earlyBytes <- liftIO $ checkEarlyRejectionBytesTracked tracker cert False candidateSQL
+                for_ earlyBytes \reason -> do
+                    liftIO do
+                        recordEarlyRejectSkip (poolMetricsStore pool) reason
+                        modifyIORef' (fbEvaluated feedback) (HashMap.insert candidateSQL CandidateRejected)
+                    earlyExit Nothing
+
+                let count = IntSet.size (IntSet.intersection currentInts projected)
+                pure (Just (SeedFresh kept count candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
@@ -1346,7 +1418,7 @@ statementDdmin = statementDdminWithOrder StatementSubsetFirst
 statementDdminWithOrder ::
     StatementSearchPolicy -> SQLDialect -> OraclePool -> ByteString -> IO ByteString
 statementDdminWithOrder policy dialect pool =
-    statementDdminWithParser policy (parseStatements (poolMetricsStore pool) dialect) pool
+    statementDdminWithParser policy (parseStatementsFast (poolMetricsStore pool) dialect) pool
 
 statementDdminWithParser ::
     StatementSearchPolicy -> StatementParser -> OraclePool -> ByteString -> IO ByteString
@@ -1391,7 +1463,7 @@ statementAudit dialect pool initialSQL = fst <$> statementAuditWithLogger nullLo
 statementAuditWithLogger ::
     Logger -> SQLDialect -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
 statementAuditWithLogger logger dialect pool =
-    statementAuditWithParser logger (parseStatements (poolMetricsStore pool) dialect) pool
+    statementAuditWithParser logger (parseStatementsFast (poolMetricsStore pool) dialect) pool
 
 statementAuditWithParser ::
     Logger -> StatementParser -> OraclePool -> ByteString -> IO (ByteString, AuditStats)
@@ -1415,23 +1487,27 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
             then do
                 (_, units) <- parse initialSQL
                 let statements = map unitStatement units
+                    !initialKept = statementIdsInt statements
+                    !initialCount = length statements
                 cert <- buildCertifierTracked earlyReject tracker initialSQL units mTrace
-                loop cert initialSQL statements (statementIdsInt statements) 0 0 0
+                loop cert initialSQL statements initialKept initialCount 0 0 0
             else pure (initialSQL, AuditStats 0 0 0 False)
     logAuditStats logger (snd outcome)
     pure outcome
     where
         jobs = poolJobCount pool
+        batchLimit = max 64 (jobs * 16)
         -- The audit only removes whole statements, and those statements keep
         -- their original byte spans. Parse once, then track the retained set.
-        loop cert baseSQL allStatements kept passCount attemptCount removalCount
-            | IntSet.null kept =
+        loop cert baseSQL allStatements kept !keptCount passCount attemptCount removalCount
+            | keptCount <= 0 || IntSet.null kept =
                 pure
                     ( renderKept baseSQL allStatements kept
                     , AuditStats passCount attemptCount removalCount True
                     )
             | otherwise = do
-                (nextKept, attempts, removals) <- auditPass cert baseSQL allStatements kept
+                (nextKept, nextKeptCount, attempts, removals) <-
+                    auditPass cert baseSQL allStatements kept keptCount
                 let nextPassCount = passCount + 1
                 if removals > 0
                     then
@@ -1440,6 +1516,7 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
                             baseSQL
                             allStatements
                             nextKept
+                            nextKeptCount
                             nextPassCount
                             (attemptCount + attempts)
                             (removalCount + removals)
@@ -1449,71 +1526,103 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
                             , AuditStats nextPassCount (attemptCount + attempts) removalCount True
                             )
 
-        auditPass cert baseSQL allStatements kept =
-            go (renderKept baseSQL allStatements kept) kept allStatements 0 0
+        auditPass cert baseSQL allStatements kept keptCount =
+            let !initSnap = buildStatementSnapshot baseSQL allStatements kept
+             in go initSnap (snapSQL initSnap) kept keptCount allStatements 0 0
             where
-                go _ currentKept [] attempts removals = pure (currentKept, attempts, removals)
-                go currentSQL currentKept statements attempts removals = do
+                go _ _ currentKept !currentCount [] attempts removals =
+                    pure (currentKept, currentCount, attempts, removals)
+                go snap currentSQL currentKept !currentCount statements attempts removals = do
                     let currentLen = BS.length currentSQL
                     (testables, restStatements) <-
-                        collectBatch currentLen currentKept jobs [] statements
+                        collectBatch snap currentLen currentKept currentCount batchLimit Nothing [] statements
                     case testables of
-                        [] -> pure (currentKept, attempts, removals)
+                        [] -> pure (currentKept, currentCount, attempts, removals)
                         _ -> do
-                            mapM_ (\(_, sql) -> reportCandidateCount pool sql (IntSet.size currentKept - 1)) testables
+                            let candCount = currentCount - 1
+                            mapM_ (\(_, sql) -> reportCandidateCount pool sql candCount) testables
                             outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
                             let retired = zip testables outcomes
                                 tested = length outcomes
                             case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
-                                Just (acceptedStatement, acceptedSQL) ->
+                                Just (acceptedStatement, acceptedSQL) -> do
+                                    let nextKept = IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept
+                                        nextCount = currentCount - 1
+                                        nextSnap = buildStatementSnapshot baseSQL allStatements nextKept
                                     go
+                                        nextSnap
                                         acceptedSQL
-                                        (IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept)
+                                        nextKept
+                                        nextCount
                                         (afterStatement acceptedStatement statements)
                                         (attempts + tested)
                                         (removals + 1)
                                 Nothing ->
                                     go
+                                        snap
                                         currentSQL
                                         currentKept
+                                        currentCount
                                         restStatements
                                         (attempts + tested)
                                         removals
 
-                collectBatch _ _ _ acc [] = pure (reverse acc, [])
-                collectBatch _ _ 0 acc rest = pure (reverse acc, rest)
-                collectBatch currentLen currentKept slots acc (statement : rest)
+                collectBatch _ _ _ _ _ _ acc [] = pure (reverse acc, [])
+                collectBatch _ _ _ _ 0 _ acc rest = pure (reverse acc, rest)
+                collectBatch snap currentLen currentKept currentCount slots mLastCandidate acc (statement : rest)
                     | IntSet.notMember (unStatementId (stmtId statement)) currentKept =
-                        collectBatch currentLen currentKept slots acc rest
+                        collectBatch snap currentLen currentKept currentCount slots mLastCandidate acc rest
                     | otherwise = do
-                        let keptAfter = IntSet.delete (unStatementId (stmtId statement)) currentKept
-                        earlyId <- checkEarlyRejectionIdsTracked tracker cert keptAfter
-                        case earlyId of
-                            Just reason -> do
-                                recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                collectBatch currentLen currentKept slots acc rest
-                            Nothing -> do
-                                bytes <-
-                                    timeStatementBuild
-                                        (poolMetricsStore pool)
-                                        (renderKept baseSQL allStatements keptAfter)
-                                if BS.length bytes >= currentLen
-                                    then do
-                                        recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking"
-                                        collectBatch currentLen currentKept slots acc rest
-                                    else do
-                                        earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False bytes
-                                        case earlyBytes of
-                                            Just reason -> do
-                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                                collectBatch currentLen currentKept slots acc rest
-                                            Nothing ->
-                                                collectBatch
-                                                    currentLen
-                                                    currentKept
-                                                    (slots - 1)
-                                                    ((statement, bytes) : acc)
-                                                    rest
+                        (nextLast, mBytes) <- stepCandidate statement mLastCandidate
+                        case mBytes of
+                            Nothing ->
+                                collectBatch snap currentLen currentKept currentCount slots nextLast acc rest
+                            Just bytes ->
+                                collectBatch
+                                    snap
+                                    currentLen
+                                    currentKept
+                                    currentCount
+                                    (slots - 1)
+                                    nextLast
+                                    ((statement, bytes) : acc)
+                                    rest
+                    where
+                        stepCandidate stmt mLast = evalContT do
+                            let keptAfter = IntSet.delete (unStatementId (stmtId stmt)) currentKept
+                            earlyId <- liftIO $ checkEarlyRejectionIdsTracked tracker cert keptAfter
+                            for_ earlyId \reason -> do
+                                liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                earlyExit (mLast, Nothing)
+                            let sid = unStatementId (stmtId stmt)
+                            (bytes, nextLast) <- liftIO $ renderCandidate stmt sid keptAfter mLast
+                            when (BS.length bytes >= currentLen) do
+                                liftIO $ recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking"
+                                earlyExit (nextLast, Nothing)
+                            earlyBytes <- liftIO $ checkEarlyRejectionBytesTracked tracker cert False bytes
+                            for_ earlyBytes \reason -> do
+                                liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                                earlyExit (nextLast, Nothing)
+                            pure (nextLast, Just bytes)
+
+                        renderCandidate stmt sid keptAfter mLast = case mLast of
+                            Just (prevStmt, prevOff, prevLen, prevBytes)
+                                | Just (off, len) <- IntMap.lookup sid (snapOffsets snap)
+                                , off == prevOff + prevLen
+                                , len == prevLen
+                                , stmtRaw stmt == stmtRaw prevStmt ->
+                                    pure (prevBytes, Just (stmt, off, len, prevBytes))
+                            _ -> do
+                                rendered <- case renderSingletonDeletion snap stmt of
+                                    Just b -> pure b
+                                    Nothing ->
+                                        timeStatementBuild
+                                            (poolMetricsStore pool)
+                                            (renderKept baseSQL allStatements keptAfter)
+                                let nextLast = case IntMap.lookup sid (snapOffsets snap) of
+                                        Just (off, len) -> Just (stmt, off, len, rendered)
+                                        Nothing -> Nothing
+                                pure (rendered, nextLast)
 
                 afterStatement target = goAfter
                     where
@@ -1674,26 +1783,21 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
                 primaryStrategy
                     | useRelaxed = "result-statement-without-global-barriers"
                     | otherwise = seedStrategy
-                trySeed (retained, candidateRaw) = do
+                trySeed (retained, candidateRaw) = evalContT do
                     let keptInts = statementIdsInt retained
-                    earlyId <- checkEarlyRejectionIdsTracked tracker cert keptInts
-                    case earlyId of
-                        Just reason -> do
-                            recordEarlyRejectSkip (poolMetricsStore pool) reason
-                            pure False
-                        Nothing -> do
-                            candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
-                            if BS.length candidate < BS.length sql
-                                then do
-                                    earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False candidate
-                                    case earlyBytes of
-                                        Just reason -> do
-                                            recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                            pure False
-                                        Nothing -> do
-                                            reportCandidateCount pool candidate (length retained)
-                                            oracleAccepts (poolOracle pool) candidate
-                                else pure False
+                    earlyId <- liftIO $ checkEarlyRejectionIdsTracked tracker cert keptInts
+                    for_ earlyId \reason -> do
+                        liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                        earlyExit False
+                    candidate <- liftIO $ timeStatementBuild (poolMetricsStore pool) candidateRaw
+                    when (BS.length candidate >= BS.length sql) (earlyExit False)
+                    earlyBytes <- liftIO $ checkEarlyRejectionBytesTracked tracker cert False candidate
+                    for_ earlyBytes \reason -> do
+                        liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                        earlyExit False
+                    liftIO do
+                        reportCandidateCount pool candidate (length retained)
+                        oracleAccepts (poolOracle pool) candidate
             primaryAccepted <- trySeed primary
             (seedAccepted, (seedRetained, seedCandidate), strategy) <-
                 if useRelaxed && not primaryAccepted
@@ -1711,40 +1815,41 @@ sliceWithAnalysis tracker cert logger pool analysis observedResult sql =
                     , prefixSlicesCannotImprove prefixLimit (BS.length best) = do
                         recordGeneratedSkipped (poolMetricsStore pool) "prefix-search-cannot-improve"
                         pure bestCandidate
-                    | otherwise = do
+                    | otherwise = evalContT do
                         (maybeTarget, prefixTests) <-
-                            findInterestingPrefixThroughWithCert tracker cert pool sql statements prefixLimit
-                        case maybeTarget of
-                            Nothing -> pure bestCandidate
-                            Just (targetStatement, prefixSQL, prefixLength) -> do
-                                let (retained, candidateRaw) = sliceFor graph targetStatement
-                                candidate <- timeStatementBuild (poolMetricsStore pool) candidateRaw
-                                let bestLen = maybe (BS.length sql) (BS.length . fst) bestCandidate
-                                if BS.length candidate >= bestLen
-                                    then do
-                                        recordGeneratedSkipped (poolMetricsStore pool) "prefix-slice-cannot-improve"
-                                        pure bestCandidate
+                            liftIO $
+                                findInterestingPrefixThroughWithCert tracker cert pool sql statements prefixLimit
+                        (targetStatement, prefixSQL, prefixLength) <- case maybeTarget of
+                            Nothing -> earlyExit bestCandidate
+                            Just target -> pure target
+                        let (retained, candidateRaw) = sliceFor graph targetStatement
+                        candidate <- liftIO $ timeStatementBuild (poolMetricsStore pool) candidateRaw
+                        let bestLen = maybe (BS.length sql) (BS.length . fst) bestCandidate
+                        when (BS.length candidate >= bestLen) do
+                            liftIO $ recordGeneratedSkipped (poolMetricsStore pool) "prefix-slice-cannot-improve"
+                            earlyExit bestCandidate
+                        let reusedPrefixResult = candidate == prefixSQL
+                        ok <-
+                            liftIO $
+                                if reusedPrefixResult
+                                    then pure True
                                     else do
-                                        let reusedPrefixResult = candidate == prefixSQL
-                                        ok <-
-                                            if reusedPrefixResult
-                                                then pure True
-                                                else do
-                                                    reportCandidateCount pool candidate (length retained)
-                                                    oracleAccepts (poolOracle pool) candidate
-                                        logDebug'
-                                            logger
-                                            "reducer"
-                                            "Prefix oracle result considered for backward slice"
-                                            [ ("prefix_tests", toJSON prefixTests)
-                                            , ("prefix_length", toJSON prefixLength)
-                                            , ("prefix_result_reused", toJSON reusedPrefixResult)
-                                            ]
-                                        if ok
-                                            then do
-                                                accepted <- acceptSlice "first-interesting-prefix" targetStatement retained candidate
-                                                pure (Just (accepted, retained))
-                                            else pure bestCandidate
+                                        reportCandidateCount pool candidate (length retained)
+                                        oracleAccepts (poolOracle pool) candidate
+                        liftIO $
+                            logDebug'
+                                logger
+                                "reducer"
+                                "Prefix oracle result considered for backward slice"
+                                [ ("prefix_tests", toJSON prefixTests)
+                                , ("prefix_length", toJSON prefixLength)
+                                , ("prefix_result_reused", toJSON reusedPrefixResult)
+                                ]
+                        if ok
+                            then do
+                                accepted <- liftIO $ acceptSlice "first-interesting-prefix" targetStatement retained candidate
+                                pure (Just (accepted, retained))
+                            else pure bestCandidate
             let initialBest = if seedAccepted then Just (seedCandidate, seedRetained) else Nothing
             better <- tryPrefix initialBest
             case better of
@@ -1838,64 +1943,61 @@ proposeGroupDeletionsWithAnalysis tracker cert logger pool analysis observedResu
                     (analyzedGraph analysis)
                     observedResult
                     extraTxBlocks
-            tryDelete kind label removed = do
-                currentInts <- readIORef currentIntsRef
-                currentSQL <- readIORef currentSQLRef
+            tryDelete kind label removed = evalContT do
+                currentInts <- liftIO $ readIORef currentIntsRef
+                currentSQL <- liftIO $ readIORef currentSQLRef
                 let effectiveRemoved = removed `IntSet.intersection` currentInts
                     keptInts = currentInts `IntSet.difference` effectiveRemoved
-                if IntSet.null effectiveRemoved || IntSet.null keptInts
-                    then pure False
-                    else do
-                        earlyId <- checkEarlyRejectionIdsTracked tracker cert keptInts
-                        case earlyId of
-                            Just reason -> do
-                                recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                pure False
-                            Nothing -> do
-                                candidateSQL <-
-                                    timeTaggedStatementBuild
-                                        (poolMetricsStore pool)
-                                        TagStatementComplement
-                                        (cutRemovedStatementInts sql statements keptInts)
-                                seen <- readIORef seenRef
-                                if BS.length candidateSQL >= BS.length currentSQL || HashSet.member candidateSQL seen
-                                    then pure False
-                                    else do
-                                        earlyBytes <- checkEarlyRejectionBytesTracked tracker cert False candidateSQL
-                                        case earlyBytes of
-                                            Just reason -> do
-                                                recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                                modifyIORef' seenRef (HashSet.insert candidateSQL)
-                                                pure False
-                                            Nothing -> do
-                                                reportCandidateCount pool candidateSQL (IntSet.size keptInts)
-                                                outcomes <- testOrderedTagged pool [(TagStatementComplement, candidateSQL)]
-                                                case outcomes of
-                                                    (OracleAccepted, _) : _ -> do
-                                                        let currentStmts =
-                                                                filter
-                                                                    (\s -> IntSet.member (unStatementId (stmtId s)) currentInts)
-                                                                    statements
-                                                            noncontig = isNoncontiguousIn currentStmts effectiveRemoved
-                                                            saved = BS.length currentSQL - BS.length candidateSQL
-                                                        recordAcceptedBytesSaved (poolMetricsStore pool) TagStatementComplement saved
-                                                        writeIORef currentIntsRef keptInts
-                                                        writeIORef currentSQLRef candidateSQL
-                                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
-                                                        logInfo'
-                                                            logger
-                                                            "reducer"
-                                                            "Dependency group deletion accepted"
-                                                            [ ("group_kind", toJSON (kind :: T.Text))
-                                                            , ("group_label", toJSON label)
-                                                            , ("noncontiguous", toJSON noncontig)
-                                                            , ("statements_removed", toJSON (IntSet.size effectiveRemoved))
-                                                            , ("bytes_saved", toJSON saved)
-                                                            ]
-                                                        pure True
-                                                    _ -> do
-                                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
-                                                        pure False
+                when (IntSet.null effectiveRemoved || IntSet.null keptInts) (earlyExit False)
+                earlyId <- liftIO $ checkEarlyRejectionIdsTracked tracker cert keptInts
+                for_ earlyId \reason -> do
+                    liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
+                    earlyExit False
+                candidateSQL <-
+                    liftIO $
+                        timeTaggedStatementBuild
+                            (poolMetricsStore pool)
+                            TagStatementComplement
+                            (cutRemovedStatementInts sql statements keptInts)
+                seen <- liftIO $ readIORef seenRef
+                when
+                    (BS.length candidateSQL >= BS.length currentSQL || HashSet.member candidateSQL seen)
+                    (earlyExit False)
+                earlyBytes <- liftIO $ checkEarlyRejectionBytesTracked tracker cert False candidateSQL
+                for_ earlyBytes \reason -> do
+                    liftIO do
+                        recordEarlyRejectSkip (poolMetricsStore pool) reason
+                        modifyIORef' seenRef (HashSet.insert candidateSQL)
+                    earlyExit False
+                liftIO do
+                    reportCandidateCount pool candidateSQL (IntSet.size keptInts)
+                    outcomes <- testOrderedTagged pool [(TagStatementComplement, candidateSQL)]
+                    case outcomes of
+                        (OracleAccepted, _) : _ -> do
+                            let currentStmts =
+                                    filter
+                                        (\s -> IntSet.member (unStatementId (stmtId s)) currentInts)
+                                        statements
+                                noncontig = isNoncontiguousIn currentStmts effectiveRemoved
+                                saved = BS.length currentSQL - BS.length candidateSQL
+                            recordAcceptedBytesSaved (poolMetricsStore pool) TagStatementComplement saved
+                            writeIORef currentIntsRef keptInts
+                            writeIORef currentSQLRef candidateSQL
+                            modifyIORef' seenRef (HashSet.insert candidateSQL)
+                            logInfo'
+                                logger
+                                "reducer"
+                                "Dependency group deletion accepted"
+                                [ ("group_kind", toJSON (kind :: T.Text))
+                                , ("group_label", toJSON label)
+                                , ("noncontiguous", toJSON noncontig)
+                                , ("statements_removed", toJSON (IntSet.size effectiveRemoved))
+                                , ("bytes_saved", toJSON saved)
+                                ]
+                            pure True
+                        _ -> do
+                            modifyIORef' seenRef (HashSet.insert candidateSQL)
+                            pure False
             splitGroupsByBytes gs =
                 let total = sum (map proposalBytes gs)
                     target = max 1 (total `div` 2)
@@ -1925,39 +2027,35 @@ proposeGroupDeletionsWithAnalysis tracker cert logger pool analysis observedResu
                         acceptedAll <- tryDelete (tierKind <> "-union") "union" allRemoved
                         unless acceptedAll $ do
                             missesRef <- newIORef (1 :: Int)
-                            let bisect gs = do
+                            let recordAttempt ok =
+                                    if ok then writeIORef missesRef 0 else modifyIORef' missesRef (+ 1)
+                                bisect gs = do
                                     misses <- readIORef missesRef
                                     when (misses < maxMisses) $ case gs of
                                         [] -> pure ()
                                         [g] -> do
                                             ok <- tryDelete tierKind (proposalLabel g) (proposalStatements g)
-                                            if ok
-                                                then writeIORef missesRef 0
-                                                else modifyIORef' missesRef (+ 1)
-                                        _ -> do
-                                            let (leftGs, rightGs) = splitGroupsByBytes gs
-                                                leftSet = IntSet.unions (map proposalStatements leftGs)
-                                                rightSet = IntSet.unions (map proposalStatements rightGs)
-                                            okLeft <- tryDelete (tierKind <> "-bisect") "left-half" leftSet
-                                            if okLeft
-                                                then do
-                                                    writeIORef missesRef 0
-                                                    bisect rightGs
-                                                else do
-                                                    modifyIORef' missesRef (+ 1)
-                                                    missesAfterLeft <- readIORef missesRef
-                                                    when (missesAfterLeft < maxMisses) $ do
-                                                        okRight <-
-                                                            tryDelete (tierKind <> "-bisect") "right-half" rightSet
-                                                        if okRight
-                                                            then do
-                                                                writeIORef missesRef 0
-                                                                bisect leftGs
-                                                            else do
-                                                                modifyIORef' missesRef (+ 1)
-                                                                unless stopOnBothHalvesFail $ do
-                                                                    when (length leftGs > 1) (bisect leftGs)
-                                                                    when (length rightGs > 1) (bisect rightGs)
+                                            recordAttempt ok
+                                        _ -> bisectSplit gs
+                                bisectSplit gs = do
+                                    let (leftGs, rightGs) = splitGroupsByBytes gs
+                                        leftSet = IntSet.unions (map proposalStatements leftGs)
+                                        rightSet = IntSet.unions (map proposalStatements rightGs)
+                                    okLeft <- tryDelete (tierKind <> "-bisect") "left-half" leftSet
+                                    recordAttempt okLeft
+                                    if okLeft
+                                        then bisect rightGs
+                                        else tryRightHalf leftGs rightGs rightSet
+                                tryRightHalf leftGs rightGs rightSet = do
+                                    misses <- readIORef missesRef
+                                    when (misses < maxMisses) $ do
+                                        okRight <- tryDelete (tierKind <> "-bisect") "right-half" rightSet
+                                        recordAttempt okRight
+                                        if okRight
+                                            then bisect leftGs
+                                            else unless stopOnBothHalvesFail $ do
+                                                when (length leftGs > 1) (bisect leftGs)
+                                                when (length rightGs > 1) (bisect rightGs)
                             bisect active
         probeTier 8 False "weak-group" (planWeakGroups plan)
         probeTier 6 False "weak-tx-block" (planWeakTxBlocks plan)
@@ -2833,24 +2931,31 @@ updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedB
                     Nothing -> parseSyntaxSnapshot context acceptedBytes
                     Just (updatedUnit, delta) -> do
                         let targetId = stmtId (unitStatement oldUnit)
-                            updateUnit u
-                                | stmtId (unitStatement u) == targetId = updatedUnit
-                                | delta /= 0
-                                , spanStartByte (stmtSpan (unitStatement u)) > spanStartByte (stmtSpan (unitStatement oldUnit)) =
-                                    shiftStatementUnit delta u
-                                | otherwise = u
-                            freshUnits = map updateUnit currentUnits
-                            freshEdits =
-                                concatMap
-                                    (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
-                                    freshUnits
+                            (before, targetAndAfter) =
+                                break (\u -> stmtId (unitStatement u) == targetId) currentUnits
+                            after = case targetAndAfter of
+                                _ : rest -> rest
+                                [] -> []
+                            shiftedAfter =
+                                if delta == 0
+                                    then after
+                                    else map (shiftStatementUnit delta) after
+                            freshUnits = before ++ updatedUnit : shiftedAfter
+                            shouldRun = syntaxShouldRun context
+                            beforeBuckets = map (categorizeUnitEdits shouldRun) before
+                            updatedBuckets = categorizeUnitEdits shouldRun updatedUnit
+                            afterBuckets =
+                                if delta == 0
+                                    then map (categorizeUnitEdits shouldRun) after
+                                    else map (shiftUnitBuckets delta . categorizeUnitEdits shouldRun) after
+                            freshPhases = assembleCategoryPhases (beforeBuckets ++ [updatedBuckets] ++ afterBuckets)
                             oldEnd = spanEndByte (stmtSpan (unitStatement oldUnit))
                             freshBundles
                                 | delta == 0 || null currentBundles = currentBundles
                                 | otherwise = map (shiftColumnTarget oldEnd delta) currentBundles
                         pure
                             ( freshUnits
-                            , groupSyntaxEdits freshEdits
+                            , freshPhases
                             , freshBundles
                             )
     where
@@ -2879,19 +2984,37 @@ shiftTailClauseSnapshot context units edit
             then Nothing
             else
                 let statement = unitStatement unit
-                    Span start _ = stmtSpan statement
+                    Span start end = stmtSpan statement
+                    raw = stmtRaw statement
+                    trailer = BS.drop (cutEnd - start) raw
+                    shortenedRaw = BS.concat [BS.take (cutStart - start) raw, trailer]
+                    delta = cutStart - cutEnd
                     shortened =
-                        statement {stmtSpan = Span start cutStart, stmtRaw = BS.take (cutStart - start) (stmtRaw statement)}
+                        statement {stmtSpan = Span start (end + delta), stmtRaw = shortenedRaw}
                     updated = unit {unitStatement = shortened, unitFacts = Just facts {factEdits = survivors}}
-                    fresh = before ++ updated : map (shiftStatementUnit (cutStart - cutEnd)) after
-                    edits = concatMap (maybe [] (filter (syntaxShouldRun context) . factEdits) . unitFacts) fresh
-                 in Just (fresh, groupSyntaxEdits edits, [])
+                    shiftedAfter =
+                        if delta == 0
+                            then after
+                            else map (shiftStatementUnit delta) after
+                    fresh = before ++ updated : shiftedAfter
+                    shouldRun = syntaxShouldRun context
+                    beforeBuckets = map (categorizeUnitEdits shouldRun) before
+                    updatedBuckets = categorizeUnitEdits shouldRun updated
+                    afterBuckets =
+                        if delta == 0
+                            then map (categorizeUnitEdits shouldRun) after
+                            else map (shiftUnitBuckets delta . categorizeUnitEdits shouldRun) after
+                    freshPhases = assembleCategoryPhases (beforeBuckets ++ [updatedBuckets] ++ afterBuckets)
+                 in Just (fresh, freshPhases, [])
     where
         cutStart = parserEditStart edit
         cutEnd = parserEditEnd edit
         endsAtCut unit =
             let Span start end = stmtSpan (unitStatement unit)
-             in start < cutStart && end == cutEnd
+                raw = stmtRaw (unitStatement unit)
+                trailer = BS.drop (cutEnd - start) raw
+             in start < cutStart && cutEnd <= end && BS.all isTrivia trailer
+        isTrivia b = b == 59 || b == 32 || b == 10 || b == 13 || b == 9
 
 {- | Exact zero-FFI span shift for an accepted scalar leaf literal edit during
 the final 'EditLiteral' sweep. Mirrors Rust @add_scalar_edit@ exactly for
@@ -3030,6 +3153,85 @@ groupSyntaxEdits edits =
              in case classifyExpressionEdit e of
                     UnwrapExpressionEdit -> (e : unwrap, aggr)
                     AggressiveExpressionEdit -> (unwrap, e : aggr)
+
+data UnitBuckets = UnitBuckets
+    { ubSafeClauses :: ![ParserEdit]
+    , ubStructClauses :: ![ParserEdit]
+    , ubFragClauses :: ![ParserEdit]
+    , ubLists :: ![ParserEdit]
+    , ubColumns :: ![ParserEdit]
+    , ubConstraints :: ![ParserEdit]
+    , ubTypes :: ![ParserEdit]
+    , ubUnwrapExprs :: ![ParserEdit]
+    , ubAggrExprs :: ![ParserEdit]
+    , ubLiterals :: ![ParserEdit]
+    }
+
+emptyUnitBuckets :: UnitBuckets
+emptyUnitBuckets =
+    UnitBuckets [] [] [] [] [] [] [] [] [] []
+
+addUnitEdit :: ParserEdit -> UnitBuckets -> UnitBuckets
+addUnitEdit e !ub = case parserEditCategory e of
+    EditClause -> case classifyClauseEdit e of
+        SafeClauseEdit -> ub {ubSafeClauses = e : ubSafeClauses ub}
+        StructuralClauseEdit -> ub {ubStructClauses = e : ubStructClauses ub}
+        FragileClauseEdit -> ub {ubFragClauses = e : ubFragClauses ub}
+    EditList -> ub {ubLists = e : ubLists ub}
+    EditColumn -> ub {ubColumns = e : ubColumns ub}
+    EditConstraint -> ub {ubConstraints = e : ubConstraints ub}
+    EditType -> ub {ubTypes = e : ubTypes ub}
+    EditExpression -> case classifyExpressionEdit e of
+        UnwrapExpressionEdit -> ub {ubUnwrapExprs = e : ubUnwrapExprs ub}
+        AggressiveExpressionEdit -> ub {ubAggrExprs = e : ubAggrExprs ub}
+    EditLiteral -> ub {ubLiterals = e : ubLiterals ub}
+
+categorizeUnitEdits :: (ParserEdit -> Bool) -> StatementUnit -> UnitBuckets
+categorizeUnitEdits shouldRun unit =
+    let edits = filter shouldRun (maybe [] factEdits (unitFacts unit))
+     in foldr addUnitEdit emptyUnitBuckets edits
+
+shiftUnitBuckets :: Int -> UnitBuckets -> UnitBuckets
+shiftUnitBuckets 0 ub = ub
+shiftUnitBuckets delta ub =
+    UnitBuckets
+        { ubSafeClauses = map (shiftParserEdit delta) (ubSafeClauses ub)
+        , ubStructClauses = map (shiftParserEdit delta) (ubStructClauses ub)
+        , ubFragClauses = map (shiftParserEdit delta) (ubFragClauses ub)
+        , ubLists = map (shiftParserEdit delta) (ubLists ub)
+        , ubColumns = map (shiftParserEdit delta) (ubColumns ub)
+        , ubConstraints = map (shiftParserEdit delta) (ubConstraints ub)
+        , ubTypes = map (shiftParserEdit delta) (ubTypes ub)
+        , ubUnwrapExprs = map (shiftParserEdit delta) (ubUnwrapExprs ub)
+        , ubAggrExprs = map (shiftParserEdit delta) (ubAggrExprs ub)
+        , ubLiterals = map (shiftParserEdit delta) (ubLiterals ub)
+        }
+
+assembleCategoryPhases :: [UnitBuckets] -> [(ParserEditCategory, [ParserEdit])]
+assembleCategoryPhases buckets =
+    [
+        ( EditClause
+        , concatMap ubSafeClauses buckets
+            ++ concatMap ubStructClauses buckets
+            ++ concatMap ubFragClauses buckets
+        )
+    , (EditList, concatMap ubLists buckets)
+    , (EditColumn, concatMap ubColumns buckets)
+    , (EditConstraint, concatMap ubConstraints buckets)
+    , (EditType, concatMap ubTypes buckets)
+    , (EditExpression, concatMap ubUnwrapExprs buckets ++ concatMap ubAggrExprs buckets)
+    , (EditLiteral, concatMap ubLiterals buckets)
+    ]
+
+newtype IndexedCandidates = IndexedCandidates (Seq SyntaxCandidate)
+
+indexCandidates :: [SyntaxCandidate] -> IndexedCandidates
+indexCandidates = IndexedCandidates . Seq.fromList
+
+sliceCandidatesFrom :: Int -> IndexedCandidates -> [SyntaxCandidate]
+sliceCandidatesFrom !n (IndexedCandidates s)
+    | n <= 0 = toList s
+    | otherwise = toList (Seq.drop n s)
 
 {- | Try literal batches before the regular single-edit sweep. A rejection of
 a batch leaves its smaller partitions and the single-edit sweep eligible.
@@ -3213,37 +3415,36 @@ exhaustIndependentAstBatches context stats initSQL initUnits initPhases initBund
         search sql units phases bundles _ misses _ | misses <= 0 = pure (sql, units, phases, bundles)
         search sql units phases bundles _ _ [] = pure (sql, units, phases, bundles)
         search sql units phases bundles seenRejected misses (batch : rest) =
-            case applyParserEdits sql batch of
-                Nothing -> search sql units phases bundles seenRejected misses rest
-                Just candidateBytes
-                    | BS.length candidateBytes >= BS.length sql
-                        || HashSet.member candidateBytes seenRejected ->
-                        search sql units phases bundles seenRejected misses rest
-                    | otherwise -> do
-                        earlyBytes <-
-                            checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True candidateBytes
-                        case earlyBytes of
-                            Just reason -> do
-                                recordEarlyRejectSkip (syntaxStore context) reason
-                                let seen' = HashSet.insert candidateBytes seenRejected
-                                search sql units phases bundles seen' misses rest
-                            Nothing -> do
-                                let candidate = BatchCandidate category batch
-                                (tested, elapsed, accepted) <-
-                                    testSyntaxWindow context (length units) [(0, candidate, candidateBytes)]
-                                modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
-                                case accepted of
-                                    Just (_, _, bytes) -> do
-                                        logAcceptedSyntaxEdit context candidate sql bytes
-                                        (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
-                                            Just patch -> updateSyntaxSnapshot context category units bundles patch bytes
-                                            Nothing -> parseSyntaxSnapshot context bytes
-                                        go bytes nextUnits nextPhases nextBundles seenRejected
-                                    Nothing ->
-                                        let (left, right) = splitAt (length batch `div` 2) batch
-                                            subdivisions = [sub | sub <- [left, right], length sub >= 2]
-                                            seen' = HashSet.insert candidateBytes seenRejected
-                                         in search sql units phases bundles seen' (misses - 1) (subdivisions ++ rest)
+            evalContT do
+                candidateBytes <- case applyParserEdits sql batch of
+                    Just b
+                        | BS.length b < BS.length sql && not (HashSet.member b seenRejected) ->
+                            pure b
+                    _ -> earlyExit =<< liftIO (search sql units phases bundles seenRejected misses rest)
+                earlyBytes <-
+                    liftIO $
+                        checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True candidateBytes
+                for_ earlyBytes \reason -> do
+                    liftIO $ recordEarlyRejectSkip (syntaxStore context) reason
+                    let seen' = HashSet.insert candidateBytes seenRejected
+                    earlyExit =<< liftIO (search sql units phases bundles seen' misses rest)
+                liftIO do
+                    let candidate = BatchCandidate category batch
+                    (tested, elapsed, accepted) <-
+                        testSyntaxWindow context (length units) [(0, candidate, candidateBytes)]
+                    modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+                    case accepted of
+                        Just (_, _, bytes) -> do
+                            logAcceptedSyntaxEdit context candidate sql bytes
+                            (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
+                                Just patch -> updateSyntaxSnapshot context category units bundles patch bytes
+                                Nothing -> parseSyntaxSnapshot context bytes
+                            go bytes nextUnits nextPhases nextBundles seenRejected
+                        Nothing ->
+                            let (left, right) = splitAt (length batch `div` 2) batch
+                                subdivisions = [sub | sub <- [left, right], length sub >= 2]
+                                seen'' = HashSet.insert candidateBytes seenRejected
+                             in search sql units phases bundles seen'' (misses - 1) (subdivisions ++ rest)
 
         singleUnitPatch sql units batch = case sortOn parserEditStart batch of
             first : rest@(_ : _) ->
@@ -3329,7 +3530,7 @@ exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category 
                                         updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedBytes
                                 _ -> parseSyntaxSnapshot context acceptedBytes
                             let freshCandidates =
-                                    drop acceptedOrdinal (stream freshPhases freshBundles)
+                                    sliceCandidatesFrom acceptedOrdinal (indexCandidates (stream freshPhases freshBundles))
                             sweep
                                 True
                                 acceptedOrdinal
@@ -3414,35 +3615,39 @@ fillSyntaxWindow ::
     Int ->
     [SyntaxCandidate] ->
     IO ([(Int, SyntaxCandidate, ByteString)], Int, [SyntaxCandidate])
-fillSyntaxWindow context currentUnits currentSQL startOrdinal = fill (poolJobCount (syntaxPool context)) startOrdinal []
+fillSyntaxWindow context currentUnits currentSQL startOrdinal =
+    let batchLimit = max 64 (poolJobCount (syntaxPool context) * 16)
+     in fill batchLimit startOrdinal []
     where
         fill _ ordinal acc [] = pure (reverse acc, ordinal, [])
         fill 0 ordinal acc rest = pure (reverse acc, ordinal, rest)
         fill remaining ordinal acc (candidate : rest) = do
-            earlyEdit <- case candidate of
+            stepCandidate candidate >>= \case
+                Nothing -> fill remaining (ordinal + 1) acc rest
+                Just bytes -> fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
+
+        stepCandidate candidate = evalContT do
+            earlyEdit <- liftIO $ case candidate of
                 SingleCandidate edit ->
                     checkEarlyRejectionSyntaxEditTracked (syntaxTracker context) currentUnits (syntaxCert context) edit
                 _ -> pure Nothing
-            case earlyEdit of
-                Just reason -> do
-                    recordEarlyRejectSkip (syntaxStore context) reason
-                    fill remaining (ordinal + 1) acc rest
+            for_ earlyEdit \reason -> do
+                liftIO $ recordEarlyRejectSkip (syntaxStore context) reason
+                earlyExit Nothing
+            (built, buildMicros) <- liftIO $ timeSyntaxCandidateBuild context currentSQL candidate
+            bytes <- case built of
                 Nothing -> do
-                    (built, buildMicros) <- timeSyntaxCandidateBuild context currentSQL candidate
-                    case built of
-                        Nothing -> do
-                            recordGeneratedSkipped (syntaxStore context) "nonshrinking"
-                            fill remaining (ordinal + 1) acc rest
-                        Just bytes -> do
-                            recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
-                            earlyBytes <-
-                                checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True bytes
-                            case earlyBytes of
-                                Just reason -> do
-                                    recordEarlyRejectSkip (syntaxStore context) reason
-                                    fill remaining (ordinal + 1) acc rest
-                                Nothing ->
-                                    fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
+                    liftIO $ recordGeneratedSkipped (syntaxStore context) "nonshrinking"
+                    earlyExit Nothing
+                Just b -> pure b
+            liftIO $ recordCandidateBuildTiming (syntaxStore context) (candidateTag candidate) buildMicros
+            earlyBytes <-
+                liftIO $
+                    checkEarlyRejectionBytesTracked (syntaxTracker context) (syntaxCert context) True bytes
+            for_ earlyBytes \reason -> do
+                liftIO $ recordEarlyRejectSkip (syntaxStore context) reason
+                earlyExit Nothing
+            pure (Just bytes)
 
 -- | Assemble candidate bytes with optional build timing.
 timeSyntaxCandidateBuild ::

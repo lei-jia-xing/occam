@@ -31,6 +31,10 @@ pub struct ParseConfig {
     /// Ignored when `column_ir` or `column_bundles` is enabled.
     #[serde(default)]
     pub syntax_only: bool,
+    /// Skip all fact and edit extraction, producing only statement byte spans,
+    /// parse error indicators, and cannot-produce-result flags.
+    #[serde(default)]
+    pub span_only: bool,
 }
 /// Server/session configuration that is independent of a particular SQL text.
 #[derive(Clone, Debug, Serialize, Deserialize)]
