@@ -78,6 +78,7 @@ library
                     , Occam.Logger
                     , Occam.Metrics
                     , Occam.Oracle
+                    , Occam.Proposals
                     , Occam.Reducer
                     , Occam.Slicer
                     , Occam.Parser

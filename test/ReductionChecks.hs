@@ -6,6 +6,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IntSet qualified as IntSet
 import Data.List (elemIndex, tails)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
@@ -24,6 +25,7 @@ import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (ParserEdit (..), ParserEditCategory (..), StatementUnit (..))
 import Occam.Logger (Logger (..), defaultLogConfig, nullLogger)
 import Occam.Oracle (OracleObservation (..))
+import Occam.Oracle.Sqlite (generateSqliteContract, sqliteContractOracle)
 import Occam.Parser (
     ParsedSQL (..),
     ParserError (..),
@@ -38,6 +40,12 @@ import Occam.Pool (
     PoolConfig (..),
     newOraclePool,
     observationDetails,
+ )
+import Occam.Proposals (
+    DeletionProposalGroup (..),
+    GroupProposalPlan (..),
+    extractDeletionProposalPlan,
+    isNoncontiguousIn,
  )
 import Occam.Reducer (
     ColumnMode (..),
@@ -566,6 +574,107 @@ tests =
             assertEqual "irreducible script stays intact" original reduced
             actCount <- readIORef activations
             assertBool "ranked fallback activated after stalled slicing" (actCount >= 1)
+        , testCase "Dependency group proposals extract noncontiguous scattered tables and tx wrappers" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t(x INT);"
+                        , "CREATE TABLE noise_a(k INT);"
+                        , "BEGIN;"
+                        , "INSERT INTO t VALUES (42);"
+                        , "INSERT INTO noise_a VALUES (1);"
+                        , "COMMIT;"
+                        , "CREATE INDEX idx_noise_a ON noise_a(k);"
+                        , "SELECT sum(x) AS answer FROM t;"
+                        ]
+            parsed <- parseSQL (defaultParseOptions SQLite) sql
+            case parsed of
+                Left err -> assertFailure ("parse failed: " ++ show err)
+                Right input -> do
+                    let units = parsedUnits input
+                        stmts = map unitStatement units
+                        graph = analyzeStatements (parsedInitialSession input) units
+                        plan =
+                            extractDeletionProposalPlan
+                                (parsedInitialSession input)
+                                stmts
+                                graph
+                                (Just (ResultStatement 8 7))
+                        weakSets = map proposalStatements (planWeakGroups plan)
+                        allWrapperCandidates =
+                            map proposalStatements (planWeakGroups plan ++ planTxWrappers plan)
+                    assertBool
+                        "identifies noncontiguous set {2,5,7}"
+                        (isNoncontiguousIn stmts (IntSet.fromList [2, 5, 7]))
+                    assertBool
+                        "identifies contiguous set {3,4,5}"
+                        (not (isNoncontiguousIn stmts (IntSet.fromList [3, 4, 5])))
+                    assertBool
+                        ("expected scattered noise_a group {2,5,7} in weak groups: " ++ show weakSets)
+                        (IntSet.fromList [2, 5, 7] `elem` weakSets)
+                    assertBool
+                        ("expected noncontiguous BEGIN/COMMIT wrapper {3,6}: " ++ show allWrapperCandidates)
+                        (IntSet.fromList [3, 6] `elem` allWrapperCandidates)
+        , testCase "Noncontiguous tx-wrapper proposal removes BEGIN/COMMIT unreachable by contiguous ddmin" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE p(id INT PRIMARY KEY);"
+                        , "CREATE TABLE c(pid INT REFERENCES p(id) ON DELETE CASCADE);"
+                        , "BEGIN;"
+                        , "INSERT INTO p VALUES (1), (2);"
+                        , "INSERT INTO c VALUES (1), (2);"
+                        , "COMMIT;"
+                        , "PRAGMA foreign_keys = ON;"
+                        , "DELETE FROM p WHERE id = 1;"
+                        , "SELECT count(*) AS answer FROM c;"
+                        ]
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure ("contract failed: " ++ show err)
+                Right contract -> do
+                    let runWith useGroups = do
+                            pool <- outcomePool (sqliteContractOracle contract)
+                            let cfg =
+                                    defaultReductionConfig
+                                        { reductionDialect = SQLite
+                                        , reductionGroupProposals = useGroups
+                                        }
+                            reduceSQLWithConfig cfg nullLogger pool sql
+                    withoutGroups <- runWith False
+                    withGroups <- runWith True
+                    assertBool "baseline contiguous search retains BEGIN" ("BEGIN;" `BSC.isInfixOf` withoutGroups)
+                    assertBool "group proposals remove BEGIN" (not ("BEGIN;" `BSC.isInfixOf` withGroups))
+                    assertBool "group proposals remove COMMIT" (not ("COMMIT;" `BSC.isInfixOf` withGroups))
+                    assertBool
+                        "group proposals reach strictly smaller SQL"
+                        (BS.length withGroups < BS.length withoutGroups)
+                    verdict <- sqliteContractOracle contract withGroups
+                    assertEqual "reduced SQL preserves native SQLite contract" OracleAccepted verdict
+        , testCase "Rejected dependency group leaves its members eligible for contiguous search" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t(x INT);"
+                        , "CREATE TABLE aux(y INT);"
+                        , "INSERT INTO t VALUES (40);"
+                        , "INSERT INTO aux VALUES (2);"
+                        , "CREATE INDEX idx_aux ON aux(y);"
+                        , "SELECT sum(x) + (SELECT sum(y) FROM aux) AS answer FROM t;"
+                        ]
+            contractRes <- generateSqliteContract sql
+            case contractRes of
+                Left err -> assertFailure ("contract failed: " ++ show err)
+                Right contract -> do
+                    pool <- outcomePool (sqliteContractOracle contract)
+                    let cfg =
+                            defaultReductionConfig
+                                { reductionDialect = SQLite
+                                , reductionGroupProposals = True
+                                }
+                    reduced <- reduceSQLWithConfig cfg nullLogger pool sql
+                    assertBool
+                        "dead index on required aux table is still deleted"
+                        (not ("CREATE INDEX" `BSC.isInfixOf` reduced))
+                    verdict <- sqliteContractOracle contract reduced
+                    assertEqual "reduced SQL preserves native SQLite contract" OracleAccepted verdict
         , testCase "Single-statement audit can miss a nonadjacent pair" $ do
             let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
                 original = BSC.concat statements

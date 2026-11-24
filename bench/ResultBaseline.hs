@@ -27,12 +27,14 @@ module ResultBaseline (
     runStatementLanePrefQuota8Baseline,
     runStatementFallbackBaseline,
     runStatementFallbackNoLocBaseline,
+    runGroupProposalsBaseline,
+    runGroupProposalsNoLocBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
 
 import Control.Monad (forM, forM_, mapAndUnzipM, unless, when, (>=>))
-import Data.Aeson (Value, encode, object, (.=))
+import Data.Aeson (Value (Bool), encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -363,6 +365,109 @@ subsetOnlyReturningFixture =
             "SELECT 42 AS answer;"
             "SELECT 0 AS answer;"
             (ResultStatement 16 15)
+            True
+
+scatteredTablesFixture :: Bool -> Int -> Fixture
+scatteredTablesFixture fenced size =
+    let phase1 i =
+            ["CREATE TABLE noise_" ++ show i ++ "(k INT, v TEXT);", "INSERT INTO t VALUES (" ++ show i ++ ");"]
+        phase2 i = ["INSERT INTO noise_" ++ show i ++ " VALUES (" ++ show i ++ ", 'row');"]
+        phase3 i = ["CREATE INDEX idx_noise_" ++ show i ++ " ON noise_" ++ show i ++ "(k);"]
+        phase4 i = ["UPDATE noise_" ++ show i ++ " SET v = 'updated';"]
+        query = if fenced then "SELECT sum(x) AS answer FROM t;" else "SELECT x AS answer FROM t ORDER BY x;"
+        reference
+            | fenced = "SELECT " ++ show (sum [1 .. size]) ++ " AS answer;"
+            | otherwise =
+                "WITH t(x) AS (VALUES "
+                    ++ intercalate ", " ["(" ++ show i ++ ")" | i <- [1 .. size]]
+                    ++ ") "
+                    ++ query
+        stmts =
+            ["CREATE TABLE t(x INT);"]
+                ++ concatMap phase1 [1 .. size]
+                ++ concatMap phase2 [1 .. size]
+                ++ concatMap phase3 [1 .. size]
+                ++ concatMap phase4 [1 .. size]
+                ++ [query]
+        total = 5 * size + 2
+     in Fixture
+            ((if fenced then "scattered-tables-fenced-" else "scattered-tables-precise-") ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            (BSC.pack reference)
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
+            fenced
+
+scatteredDeadReadFixture :: Int -> Fixture
+scatteredDeadReadFixture size =
+    let creates i = ["CREATE TABLE shadow_" ++ show i ++ "(x INT);", "INSERT INTO t VALUES (" ++ show i ++ ");"]
+        copies i = ["INSERT INTO shadow_" ++ show i ++ " SELECT x FROM t;"]
+        indexes i = ["CREATE INDEX idx_shadow_" ++ show i ++ " ON shadow_" ++ show i ++ "(x);"]
+        stmts =
+            ["CREATE TABLE t(x INT);"]
+                ++ concatMap creates [1 .. size]
+                ++ concatMap copies [1 .. size]
+                ++ concatMap indexes [1 .. size]
+                ++ ["SELECT sum(x) AS answer FROM t;"]
+        total = 4 * size + 2
+     in Fixture
+            ("scattered-dead-read-" ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            (BSC.pack ("SELECT " ++ show (sum [1 .. size]) ++ " AS answer;"))
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
+            True
+
+noncontiguousTxWrapperFkFixture :: Int -> Fixture
+noncontiguousTxWrapperFkFixture wrappers =
+    let block i =
+            [ "BEGIN;"
+            , "INSERT INTO p VALUES (" ++ show (2 * i - 1) ++ "), (" ++ show (2 * i) ++ ");"
+            , "INSERT INTO c VALUES (" ++ show (2 * i - 1) ++ "), (" ++ show (2 * i) ++ ");"
+            , "COMMIT;"
+            ]
+        stmts =
+            [ "CREATE TABLE p(id INT PRIMARY KEY);"
+            , "CREATE TABLE c(pid INT REFERENCES p(id) ON DELETE CASCADE);"
+            ]
+                ++ concatMap block [1 .. wrappers]
+                ++ [ "PRAGMA foreign_keys = ON;"
+                   , "DELETE FROM p WHERE id = 1;"
+                   , "SELECT count(*) AS answer FROM c;"
+                   , "CREATE TABLE tail(x INT);"
+                   ]
+        total = 4 * wrappers + 6
+        expectedCount = 2 * wrappers - 1
+     in Fixture
+            ("noncontiguous-tx-wrapper-fk-" ++ show wrappers)
+            SQLite
+            (BSC.pack (unlines stmts))
+            (BSC.pack ("SELECT " ++ show expectedCount ++ " AS answer;"))
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 2))
+            False
+
+requiredTxBlocksFixture :: Int -> Fixture
+requiredTxBlocksFixture size =
+    let block i =
+            [ "BEGIN;"
+            , "INSERT INTO t VALUES (" ++ show i ++ ");"
+            , "COMMIT;"
+            ]
+        stmts =
+            ["CREATE TABLE t(x INT);"]
+                ++ concatMap block [1 .. size]
+                ++ ["SELECT sum(x) AS answer FROM t;"]
+        total = 3 * size + 2
+     in Fixture
+            ("required-tx-blocks-fenced-" ++ show size)
+            SQLite
+            (BSC.pack (unlines stmts))
+            (BSC.pack ("SELECT " ++ show (sum [1 .. size]) ++ " AS answer;"))
+            "SELECT 0 AS answer;"
+            (ResultStatement total (total - 1))
             True
 
 data Arm = Arm
@@ -744,11 +849,17 @@ runStatementFallbackBaseline pairs wallLimit callLimit out =
         (searchCensoredStatuses wallLimit callLimit)
         ( serialArm
             "statement-byte-weighted"
-            (\config -> config {reductionStatementSearch = StatementByteWeighted})
+            ( \config -> config {reductionGroupProposals = False, reductionStatementSearch = StatementByteWeighted}
+            )
             True
         , serialArm
             "statement-ranked-fallback"
-            (\config -> config {reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)})
+            ( \config ->
+                config
+                    { reductionGroupProposals = False
+                    , reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)
+                    }
+            )
             True
         )
         fallbackQualificationCohort
@@ -763,14 +874,79 @@ runStatementFallbackNoLocBaseline pairs wallLimit callLimit out =
         (searchCensoredStatuses wallLimit callLimit)
         ( serialArm
             "statement-byte-weighted-noloc"
-            (\config -> config {reductionStatementSearch = StatementByteWeighted})
+            ( \config -> config {reductionGroupProposals = False, reductionStatementSearch = StatementByteWeighted}
+            )
             False
         , serialArm
             "statement-ranked-fallback-noloc"
-            (\config -> config {reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)})
+            ( \config ->
+                config
+                    { reductionGroupProposals = False
+                    , reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)
+                    }
+            )
             False
         )
         fallbackNoLocCohort
+
+groupProposalCohort :: [Fixture]
+groupProposalCohort =
+    [ statementFixture False False 32
+    , statementFixture False True 32
+    , statementFixture False True 128
+    , skewedFenced32
+    , scatteredTablesFixture False 16
+    , scatteredTablesFixture True 16
+    , scatteredDeadReadFixture 8
+    , noncontiguousTxWrapperFkFixture 1
+    , noncontiguousTxWrapperFkFixture 4
+    , txNoopBlocksFixture False 16
+    , txNoopBlocksFixture True 16
+    , txSavepointMixFixture True 12
+    , requiredTxBlocksFixture 16
+    , subsetOnlyReturningFixture
+    ]
+        ++ fixtures
+    where
+        skewedFenced32 = statementFixture True True 32
+
+runGroupProposalsBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runGroupProposalsBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm
+            "without-group-proposals"
+            (\config -> config {reductionGroupProposals = False})
+            True
+        , serialArm
+            "with-group-proposals"
+            (\config -> config {reductionGroupProposals = True})
+            True
+        )
+        groupProposalCohort
+
+runGroupProposalsNoLocBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runGroupProposalsNoLocBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm
+            "without-group-proposals-noloc"
+            (\config -> config {reductionGroupProposals = False})
+            False
+        , serialArm
+            "with-group-proposals-noloc"
+            (\config -> config {reductionGroupProposals = True})
+            False
+        )
+        groupProposalCohort
 
 runProjectionPair ::
     String ->
@@ -965,17 +1141,23 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             accepted <- newIORef []
             fallbackActivations <- newIORef (0 :: Int)
             fallbackSkips <- newIORef (0 :: Int)
+            groupNoncontigAccepts <- newIORef (0 :: Int)
+            groupContigAccepts <- newIORef (0 :: Int)
             let observed started = observer $ do
                     atomicModifyIORef' physicalCalls (\calls -> (calls + 1, ()))
                     started
                 telemetryLogger =
                     Logger
                         defaultLogConfig
-                        ( \_ _ msg _ -> do
+                        ( \_ _ msg fields -> do
                             when (msg == "Ranked statement fallback activated") $
                                 modifyIORef' fallbackActivations (+ 1)
                             when (msg == "Ranked statement fallback skipped") $
                                 modifyIORef' fallbackSkips (+ 1)
+                            when (msg == "Dependency group deletion accepted") $
+                                case lookup "noncontiguous" fields of
+                                    Just (Bool True) -> modifyIORef' groupNoncontigAccepts (+ 1)
+                                    _ -> modifyIORef' groupContigAccepts (+ 1)
                         )
                         (pure ())
                 progress (ProgressCandidateAccepted bytes statements) = do
@@ -1033,6 +1215,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             curve <- reverse <$> readIORef accepted
             activations <- readIORef fallbackActivations
             skips <- readIORef fallbackSkips
+            noncontigAccepts <- readIORef groupNoncontigAccepts
+            contigAccepts <- readIORef groupContigAccepts
             let report =
                     object
                         [ "arm" .= armName arm
@@ -1043,6 +1227,8 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                         , "physical_oracle_executions" .= executions
                         , "ranked_fallback_activations" .= activations
                         , "ranked_fallback_skips" .= skips
+                        , "group_noncontiguous_accepts" .= noncontigAccepts
+                        , "group_contiguous_accepts" .= contigAccepts
                         , "best_accepted_curve" .= curve
                         , "evaluation_metrics" .= metrics
                         ]

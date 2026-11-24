@@ -54,7 +54,7 @@ module Occam.Reducer (
     findInterestingPrefix,
 ) where
 
-import Control.Monad (forM, when)
+import Control.Monad (forM, unless, void, when)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -91,7 +91,6 @@ import Occam.Core (
 import Occam.Dependency (
     DependencyGraph (..),
     analyzeStatements,
-    buildGraph,
  )
 import Occam.Facts (editCategoryName)
 import Occam.Logger (Logger, logDebug', logInfo', logWarn, nullLogger)
@@ -125,6 +124,13 @@ import Occam.Pool (
     reportCandidateCount,
     testOrderedTagged,
  )
+import Occam.Proposals (
+    DeletionProposalGroup (..),
+    GroupProposalPlan (..),
+    buildRelaxedGraph,
+    extractDeletionProposalPlan,
+    isNoncontiguousIn,
+ )
 import Occam.Slicer (
     backwardSliceFast,
     backwardSliceMany,
@@ -149,7 +155,7 @@ syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
 
 -- | Total policy description for the given reduction configuration.
 reductionSearchPolicy :: ReductionConfig -> T.Text
-reductionSearchPolicy config = syntax <> statement
+reductionSearchPolicy config = syntax <> statement <> groupProposalsPolicy (reductionGroupProposals config)
     where
         syntax
             | not (reductionIntraStatement config) = syntaxPolicyName ColumnOff
@@ -171,6 +177,10 @@ reductionSearchPolicy config = syntax <> statement
                     <> T.pack (show (rankedFallbackMinStatements cfg))
                     <> "-s"
                     <> T.pack (show (rankedFallbackMaxShrinkPct cfg))
+
+groupProposalsPolicy :: Bool -> T.Text
+groupProposalsPolicy False = ""
+groupProposalsPolicy True = "+group-proposals"
 
 literalBatchPolicy :: Bool -> T.Text
 literalBatchPolicy False = ""
@@ -330,6 +340,7 @@ statementSearchPolicyName (StatementRankedFallback cfg)
 -- | Reduction pipeline configuration options.
 data ReductionConfig = ReductionConfig
     { reductionSlicing :: !Bool
+    , reductionGroupProposals :: !Bool
     , reductionClosure :: !Bool
     , reductionStatementSearch :: !StatementSearchPolicy
     , reductionIntraStatement :: !Bool
@@ -348,6 +359,7 @@ defaultReductionConfig :: ReductionConfig
 defaultReductionConfig =
     ReductionConfig
         { reductionSlicing = True
+        , reductionGroupProposals = True
         , reductionClosure = True
         , reductionStatementSearch = statementRankedFallback
         , reductionIntraStatement = False
@@ -1498,12 +1510,7 @@ sliceWithAnalysis logger pool analysis observedResult sql =
         opaqueRoots =
             IntSet.fromList
                 [unStatementId sid | (sid, facts) <- statementFacts, any isGlobal (factBarriers facts)]
-        proposalGraph =
-            buildGraph
-                (analyzedSession analysis)
-                [ (sid, facts {factBarriers = filter (not . isGlobal) (factBarriers facts)})
-                | (sid, facts) <- statementFacts
-                ]
+        proposalGraph = buildRelaxedGraph (analyzedSession analysis) statements graph
         sliceFor dependencyGraph target =
             renderSlice (backwardSliceFast (unStatementId (stmtId target)) dependencyGraph)
         renderSlice sliceInts =
@@ -1532,6 +1539,146 @@ sliceWithAnalysis logger pool analysis observedResult sql =
                 , ("bytes_after", toJSON (BS.length candidate))
                 ]
             pure candidate
+
+{- | Probe tiered noncontiguous deletion proposals derived from dependency
+components, relation lifecycles, and transaction/savepoint boundaries.
+Rejected groups leave their members eligible for contiguous search and audit.
+-}
+proposeGroupDeletionsWithAnalysis ::
+    Logger ->
+    OraclePool ->
+    SQLAnalysis ->
+    Maybe ResultStatement ->
+    ByteString ->
+    IO ByteString
+proposeGroupDeletionsWithAnalysis logger pool analysis observedResult sql
+    | length statements < 2 = pure sql
+    | otherwise = do
+        currentIntsRef <- newIORef (statementIdsInt statements)
+        currentSQLRef <- newIORef sql
+        seenRef <- newIORef (HashSet.singleton sql)
+        let plan =
+                extractDeletionProposalPlan
+                    (analyzedSession analysis)
+                    statements
+                    (analyzedGraph analysis)
+                    observedResult
+            tryDelete kind label removed = do
+                currentInts <- readIORef currentIntsRef
+                currentSQL <- readIORef currentSQLRef
+                let effectiveRemoved = removed `IntSet.intersection` currentInts
+                    keptInts = currentInts `IntSet.difference` effectiveRemoved
+                if IntSet.null effectiveRemoved || IntSet.null keptInts
+                    then pure False
+                    else do
+                        candidateSQL <-
+                            timeTaggedStatementBuild
+                                (poolMetricsStore pool)
+                                TagStatementComplement
+                                (cutRemovedStatementInts sql statements keptInts)
+                        seen <- readIORef seenRef
+                        if BS.length candidateSQL >= BS.length currentSQL || HashSet.member candidateSQL seen
+                            then pure False
+                            else do
+                                reportCandidateCount pool candidateSQL (IntSet.size keptInts)
+                                outcomes <- testOrderedTagged pool [(TagStatementComplement, candidateSQL)]
+                                case outcomes of
+                                    (OracleAccepted, _) : _ -> do
+                                        let currentStmts =
+                                                filter
+                                                    (\s -> IntSet.member (unStatementId (stmtId s)) currentInts)
+                                                    statements
+                                            noncontig = isNoncontiguousIn currentStmts effectiveRemoved
+                                            saved = BS.length currentSQL - BS.length candidateSQL
+                                        recordAcceptedBytesSaved (poolMetricsStore pool) TagStatementComplement saved
+                                        writeIORef currentIntsRef keptInts
+                                        writeIORef currentSQLRef candidateSQL
+                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
+                                        logInfo'
+                                            logger
+                                            "reducer"
+                                            "Dependency group deletion accepted"
+                                            [ ("group_kind", toJSON (kind :: T.Text))
+                                            , ("group_label", toJSON label)
+                                            , ("noncontiguous", toJSON noncontig)
+                                            , ("statements_removed", toJSON (IntSet.size effectiveRemoved))
+                                            , ("bytes_saved", toJSON saved)
+                                            ]
+                                        pure True
+                                    _ -> do
+                                        modifyIORef' seenRef (HashSet.insert candidateSQL)
+                                        pure False
+            splitGroupsByBytes gs =
+                let total = sum (map proposalBytes gs)
+                    target = max 1 (total `div` 2)
+                    go _ accGroups [] = (reverse accGroups, [])
+                    go _ accGroups [x] = (reverse (x : accGroups), [])
+                    go !acc accGroups (x : xs)
+                        | acc + proposalBytes x >= target && not (null accGroups) =
+                            (reverse accGroups, x : xs)
+                        | otherwise = go (acc + proposalBytes x) (x : accGroups) xs
+                 in case gs of
+                        [] -> ([], [])
+                        [x] -> ([x], [])
+                        _ ->
+                            let (l, r) = go 0 [] gs
+                             in if null r then splitAt (length gs `div` 2) gs else (l, r)
+            probeTier maxMisses stopOnBothHalvesFail tierKind rawGroups = do
+                currentInts <- readIORef currentIntsRef
+                let active =
+                        filter
+                            (not . IntSet.null . IntSet.intersection currentInts . proposalStatements)
+                            rawGroups
+                case active of
+                    [] -> pure ()
+                    [single] -> void (tryDelete tierKind (proposalLabel single) (proposalStatements single))
+                    _ -> do
+                        let allRemoved = IntSet.unions (map proposalStatements active)
+                        acceptedAll <- tryDelete (tierKind <> "-union") "union" allRemoved
+                        unless acceptedAll $ do
+                            missesRef <- newIORef (1 :: Int)
+                            let bisect gs = do
+                                    misses <- readIORef missesRef
+                                    when (misses < maxMisses) $ case gs of
+                                        [] -> pure ()
+                                        [g] -> do
+                                            ok <- tryDelete tierKind (proposalLabel g) (proposalStatements g)
+                                            if ok
+                                                then writeIORef missesRef 0
+                                                else modifyIORef' missesRef (+ 1)
+                                        _ -> do
+                                            let (leftGs, rightGs) = splitGroupsByBytes gs
+                                                leftSet = IntSet.unions (map proposalStatements leftGs)
+                                                rightSet = IntSet.unions (map proposalStatements rightGs)
+                                            okLeft <- tryDelete (tierKind <> "-bisect") "left-half" leftSet
+                                            if okLeft
+                                                then do
+                                                    writeIORef missesRef 0
+                                                    bisect rightGs
+                                                else do
+                                                    modifyIORef' missesRef (+ 1)
+                                                    missesAfterLeft <- readIORef missesRef
+                                                    when (missesAfterLeft < maxMisses) $ do
+                                                        okRight <-
+                                                            tryDelete (tierKind <> "-bisect") "right-half" rightSet
+                                                        if okRight
+                                                            then do
+                                                                writeIORef missesRef 0
+                                                                bisect leftGs
+                                                            else do
+                                                                modifyIORef' missesRef (+ 1)
+                                                                unless stopOnBothHalvesFail $ do
+                                                                    when (length leftGs > 1) (bisect leftGs)
+                                                                    when (length rightGs > 1) (bisect rightGs)
+                            bisect active
+        probeTier 8 False "weak-group" (planWeakGroups plan)
+        probeTier 6 False "weak-tx-block" (planWeakTxBlocks plan)
+        probeTier 3 True "strong-tx-block" (planStrongTxBlocks plan)
+        probeTier 8 False "tx-wrapper" (planTxWrappers plan)
+        probeTier 4 True "indirect-relation" (planIndirectRelations plan)
+        readIORef currentSQLRef
+    where
+        statements = analyzedStatements analysis
 
 closureSearchWithAnalysis ::
     StatementSearchPolicy -> Logger -> OraclePool -> ByteString -> SQLAnalysis -> IO ByteString
@@ -1639,8 +1786,39 @@ reduceIterationWithEvidence resultStatement reporter config logger pool parse in
             then timedReductionStage reporter logger StageSlicing initialSQL do
                 analysis <- analyze initialSQL
                 observedResult <- resultStatement initialSQL
-                sliceWithAnalysis logger pool analysis observedResult initialSQL
-            else pure (initialSQL, Nothing)
+                (afterSlice, sliceAnalysis) <-
+                    sliceWithAnalysis logger pool analysis observedResult initialSQL
+                if reductionGroupProposals config
+                    && not (maybe False ((== afterSlice) . evidenceBytes) priorEvidence)
+                    then do
+                        groupAnalysis <- maybe (analyze afterSlice) pure sliceAnalysis
+                        groupObserved <-
+                            if afterSlice == initialSQL
+                                then pure observedResult
+                                else resultStatement afterSlice
+                        afterGroups <-
+                            proposeGroupDeletionsWithAnalysis
+                                logger
+                                pool
+                                groupAnalysis
+                                groupObserved
+                                afterSlice
+                        pure
+                            ( afterGroups
+                            , if afterGroups == afterSlice then Just groupAnalysis else Nothing
+                            )
+                    else pure (afterSlice, sliceAnalysis)
+            else
+                if reductionGroupProposals config
+                    && reductionClosure config
+                    && not (maybe False ((== initialSQL) . evidenceBytes) priorEvidence)
+                    then do
+                        analysis <- analyze initialSQL
+                        observedResult <- resultStatement initialSQL
+                        afterGroups <-
+                            proposeGroupDeletionsWithAnalysis logger pool analysis observedResult initialSQL
+                        pure (afterGroups, if afterGroups == initialSQL then Just analysis else Nothing)
+                    else pure (initialSQL, Nothing)
     searchAnalysis <-
         if reductionClosure config && reductionUnrestricted config
             then Just <$> maybe (analyze sliced) pure reusableAnalysis
