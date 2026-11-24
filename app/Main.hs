@@ -1065,7 +1065,10 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             if totalLookups > 0
                 then fromIntegral totalHits / fromIntegral totalLookups
                 else 0.0
-    reducedStmts <- countStatementsForCLI logger valDialect reducedSQL
+    reducedStmts <-
+        if reducedSQL == initialSQL
+            then pure initialStmts
+            else countStatementsForCLI logger valDialect reducedSQL
     let reducedBytes = BS.length reducedSQL
         ratio =
             if initialBytes > 0

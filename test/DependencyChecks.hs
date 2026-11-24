@@ -686,6 +686,25 @@ tests =
             assertBool "Query does not depend on t_in_tx" (not (has (StatementId 3) queryDeps))
             assertBool "Query does not depend on INSERT" (not (has (StatementId 4) queryDeps))
             assertBool "Query does not depend on COMMIT" (not (has (StatementId 5) queryDeps))
+        , testCase "ON COMMIT DELETE ROWS clears write dependencies after rollback and commit" $ do
+            let sql =
+                    BSC.unlines
+                        [ "CREATE TEMP TABLE t (x INT) ON COMMIT DELETE ROWS;"
+                        , "BEGIN;"
+                        , "INSERT INTO t VALUES (1);"
+                        , "ROLLBACK;"
+                        , "BEGIN;"
+                        , "INSERT INTO t VALUES (2);"
+                        , "SELECT x FROM t;"
+                        , "COMMIT;"
+                        , "SELECT x FROM t;"
+                        ]
+            graph <- analyze PostgreSQL sql
+            let beforeCommit = dependenciesFor (StatementId 7) graph
+                afterCommit = dependenciesFor (StatementId 9) graph
+            assertBool "the active write is needed before commit" (has (StatementId 6) beforeCommit)
+            assertBool "the active write is cleared on commit" (not (has (StatementId 6) afterCommit))
+            assertBool "the temporary table still exists" (has (StatementId 1) afterCommit)
         , testCase "MERGE statement extracts precise writes on target and reads on source" $ do
             let sql =
                     BSC.unlines

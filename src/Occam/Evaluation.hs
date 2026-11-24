@@ -27,6 +27,7 @@ import Control.Exception.Safe (
     finally,
     fromException,
     mask_,
+    toException,
     try,
  )
 import Control.Monad (when)
@@ -480,7 +481,12 @@ runEvaluationRequestWithObserver timeoutMicros observe EvaluationRequest {..} = 
                 }
         reporter = evalStageReporter onProgress state
     (reductionOutcome, reductionSeconds, costAttribution) <-
-        runReductionPhase env state pool metricsStore reporter action
+        if remainingCalls == Just 0
+            then do
+                closeOraclePool pool
+                costs <- traverse snapshotMetrics metricsStore
+                pure (Left (toException (ExecutionBudgetReached ())), 0, costs)
+            else runReductionPhase env state pool metricsStore reporter action
     (status, failure, skipValidation) <- case reductionOutcome of
         Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
         Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)

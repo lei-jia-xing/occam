@@ -504,19 +504,18 @@ parseStatements store dialect sql = do
     (session, units, _) <- parseUnitsOrThrow store (defaultParseOptions dialect) sql
     pure (session, units)
 
--- Share the latest statement parse between reduction stages. Reparse after
--- any byte change, since statement boundaries and session facts may change.
-reuseStatementParse :: StatementParser -> IO StatementParser
-reuseStatementParse parse = do
+-- Share the latest analysis within a reduction, keyed by exact SQL bytes.
+reuseLatestSQL :: (ByteString -> IO a) -> IO (ByteString -> IO a)
+reuseLatestSQL analyze = do
     latest <- newIORef Nothing
     pure $ \sql -> do
         cached <- readIORef latest
         case cached of
-            Just (previous, parsed) | previous == sql -> pure parsed
+            Just (previous, result) | previous == sql -> pure result
             _ -> do
-                parsed <- parse sql
-                writeIORef latest (Just (sql, parsed))
-                pure parsed
+                result <- analyze sql
+                writeIORef latest (Just (sql, result))
+                pure result
 
 -- | Parse options for syntax-level rewrites.
 syntaxParseOptions :: SQLDialect -> ParseOptions
@@ -854,7 +853,7 @@ plainCandidate _ keptInts = pure (Just keptInts)
 -- | Classified seeds: previously accepted seeds commit; fresh seeds test in order.
 data SeedToken
     = SeedAccepted ![Statement] !Int
-    | SeedFresh ![Statement] !ByteString
+    | SeedFresh [Statement] !Int !ByteString
 
 -- | Per-pass adaptive scheduling state carried across accepted reductions.
 data LaneState = LaneState
@@ -1060,10 +1059,10 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                         Nothing -> collect n acc seen rest
                         Just (SeedAccepted kept saved) ->
                             testAndContinue (reverse acc) rest (Just (lane, tag, kept, saved))
-                        Just (SeedFresh kept sql)
+                        Just (SeedFresh kept count sql)
                             | HashSet.member sql seen -> collect n acc seen rest
                             | otherwise ->
-                                collect (n - 1) ((lane, tag, kept, sql) : acc) (HashSet.insert sql seen) rest
+                                collect (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
                     accepted <- testMixedBatch currentLen batch
                     case accepted of
@@ -1100,7 +1099,7 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                     let ordered = orderWindowCandidates order (catMaybes classified)
                     runWindow remaining ordered
                 savedBytes (SeedAccepted _ saved) = saved
-                savedBytes (SeedFresh _ sql) = currentLen - BS.length sql
+                savedBytes (SeedFresh _ _ sql) = currentLen - BS.length sql
                 runWindow remaining [] = search remaining
                 runWindow remaining items = collectWindow jobs [] HashSet.empty items
                     where
@@ -1109,7 +1108,7 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                         collectWindow n acc seen (cand : rest) = case wcToken cand of
                             SeedAccepted kept saved ->
                                 testWindow (reverse acc) rest (Just (wcLane cand, wcTag cand, kept, saved))
-                            SeedFresh kept sql -> do
+                            SeedFresh kept count sql -> do
                                 tested <- readIORef (fbEvaluated feedback)
                                 if HashMap.member sql tested || HashSet.member sql seen
                                     then do
@@ -1118,7 +1117,7 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                                     else
                                         collectWindow
                                             (n - 1)
-                                            ((wcLane cand, wcTag cand, kept, sql) : acc)
+                                            ((wcLane cand, wcTag cand, kept, count, sql) : acc)
                                             (HashSet.insert sql seen)
                                             rest
                         testWindow batch rest barrier = do
@@ -1182,9 +1181,9 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                     case token of
                         Nothing -> collect (n - 1) acc seen rest
                         Just (SeedAccepted kept saved) -> testAndContinue (reverse acc) rest (Just (kept, saved))
-                        Just (SeedFresh kept sql)
+                        Just (SeedFresh kept count sql)
                             | HashSet.member sql seen -> collect (n - 1) acc seen rest
-                            | otherwise -> collect (n - 1) ((lane, tag, kept, sql) : acc) (HashSet.insert sql seen) rest
+                            | otherwise -> collect (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
                 testAndContinue batch rest barrier = do
                     accepted <- testMixedBatch currentLen batch
                     case accepted of
@@ -1197,18 +1196,18 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
 
         testMixedBatch _ [] = pure Nothing
         testMixedBatch currentLen batch = do
-            mapM_ (\(_, _, kept, sql) -> reportCandidateCount pool sql (length kept)) batch
-            outcomes <- testOrderedTagged pool [(tag, sql) | (_, tag, _, sql) <- batch]
+            mapM_ (\(_, _, _, count, sql) -> reportCandidateCount pool sql count) batch
+            outcomes <- testOrderedTagged pool [(tag, sql) | (_, tag, _, _, sql) <- batch]
             let retired = zip batch outcomes
             mapM_ recordRetired retired
             case listToMaybe [candidate | (candidate, (outcome, _)) <- retired, outcome == OracleAccepted] of
-                Just (lane, tag, kept, sql) -> do
+                Just (lane, tag, kept, _, sql) -> do
                     let saved = currentLen - BS.length sql
                     recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
                     pure (Just (lane, kept, saved))
                 Nothing -> pure Nothing
 
-        recordRetired ((_, _, _, sql), (outcome, _)) =
+        recordRetired ((_, _, _, _, sql), (outcome, _)) =
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
              in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
@@ -1278,7 +1277,9 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                                                                     (fbEvaluated feedback)
                                                                     (HashMap.insert candidateSQL CandidateRejected)
                                                                 pure Nothing
-                                                            Nothing -> pure (Just (SeedFresh kept candidateSQL))
+                                                            Nothing ->
+                                                                let count = IntSet.size (IntSet.intersection currentInts projected)
+                                                                 in pure (Just (SeedFresh kept count candidateSQL))
 
 -- | Graph-free statement ddmin over original top-level statement byte spans.
 statementDdmin :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
@@ -2000,12 +2001,13 @@ reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL
             logWarn logger "reducer" "Initial SQL candidate failed oracle check"
             pure (ReductionResult initialSQL Nothing)
         else do
-            parse <- reuseStatementParse (parseStatements (poolMetricsStore pool) (reductionDialect config))
+            parse <- reuseLatestSQL (parseStatements (poolMetricsStore pool) (reductionDialect config))
+            analyze <- reuseLatestSQL (analyzeSQL parse logger (reductionDialect config))
             tracker <- newEarlyRejectTracker
-            loop parse tracker (1 :: Int) initialSQL Nothing
+            loop parse analyze tracker (1 :: Int) initialSQL Nothing
                 `finally` logEarlyRejectStats logger "reduction" tracker
     where
-        loop parse tracker iteration currentSQL priorEvidence = do
+        loop parse analyze tracker iteration currentSQL priorEvidence = do
             logInfo'
                 logger
                 "reducer"
@@ -2022,10 +2024,11 @@ reduceSQLWithObservedResult observeResult reporter config logger pool initialSQL
                     logger
                     pool
                     parse
+                    analyze
                     currentSQL
                     priorEvidence
             if BS.length nextSQL < BS.length currentSQL
-                then loop parse tracker (iteration + 1) nextSQL evidence
+                then loop parse analyze tracker (iteration + 1) nextSQL evidence
                 else do
                     logInfo'
                         logger
@@ -2048,10 +2051,11 @@ reduceIterationWithEvidence ::
     Logger ->
     OraclePool ->
     StatementParser ->
+    (ByteString -> IO SQLAnalysis) ->
     ByteString ->
     Maybe ReductionEvidence ->
     IO (ByteString, Maybe ReductionEvidence)
-reduceIterationWithEvidence observeResult tracker reporter config logger pool parse initialSQL priorEvidence = do
+reduceIterationWithEvidence observeResult tracker reporter config logger pool parse analyze initialSQL priorEvidence = do
     (sliced, reusableAnalysis) <-
         if reductionSlicing config
             then timedReductionStage reporter logger StageSlicing initialSQL do
@@ -2202,7 +2206,6 @@ reduceIterationWithEvidence observeResult tracker reporter config logger pool pa
             else pure searched
     interleaveStages fallback
     where
-        analyze = analyzeSQL parse logger (reductionDialect config)
         lookupTraceForCert sql
             | reductionEarlyReject config = (>>= evidenceResultTrace) <$> observeResult sql
             | otherwise = pure Nothing

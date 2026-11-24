@@ -7,8 +7,8 @@ module Occam.Dependency (
     cascadeWrites,
 ) where
 
-import Data.IntMap.Strict (IntMap)
-import Data.IntMap.Strict qualified as IntMap
+import Data.IntMap.Lazy (IntMap)
+import Data.IntMap.Lazy qualified as IntMap
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
 import Data.Map.Strict (Map)
@@ -128,9 +128,11 @@ buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
     let (finalState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
             foldl' step (initialScanState initialSession, Map.empty, 0, 0, 0) stmtFacts
+        -- A slice often visits only a small part of the graph. Convert each
+        -- predecessor set on first use and share it with subsequent searches.
         fastEdges =
-            IntMap.fromList
-                [ (unStatementId sid, IntSet.fromList (map unStatementId (Set.toList deps)))
+            IntMap.fromDistinctAscList
+                [ (unStatementId sid, IntSet.fromDistinctAscList (map unStatementId (Set.toAscList deps)))
                 | (sid, deps) <- Map.toList edges
                 ]
      in DependencyGraph

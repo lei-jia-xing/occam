@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 
 /*
  * Conservative ASCII case-insensitive scan for SQLite wall-clock keywords
@@ -210,6 +211,7 @@ typedef struct sqlite3_stmt sqlite3_stmt;
 typedef struct sqlite3_backup sqlite3_backup;
 
 extern int sqlite3_get_autocommit(sqlite3 *);
+extern int sqlite3_limit(sqlite3 *, int id, int newVal);
 extern int sqlite3_exec(sqlite3 *, const char *sql, int (*callback)(void *, int, char **, char **), void *, char **errmsg);
 extern sqlite3_backup *sqlite3_backup_init(sqlite3 *pDest, const char *zDestName, sqlite3 *pSource, const char *zSourceName);
 extern int sqlite3_backup_step(sqlite3_backup *p, int nPage);
@@ -277,11 +279,17 @@ int occam_sqlite_next_result(
     sqlite3_stmt **out_stmt,
     int *out_ordinal
 ) {
+    int sql_limit = sqlite3_limit(db, 1 /* SQLITE_LIMIT_SQL_LENGTH */, -1);
     while (start < end) {
         sqlite3_stmt *stmt = NULL;
         const char *tail = start;
         ptrdiff_t rem = end - start;
-        int nbyte = rem > 0x7fffffff ? 0x7fffffff : (int)rem;
+        /* Haskell provides a NUL at end. Include it to avoid SQLite copying
+         * the entire remaining script for each prepare. Keep SQLite's
+         * length check for buffers exceeding its configured SQL limit. */
+        int nbyte = rem <= sql_limit && rem < INT_MAX
+            ? (int)rem + 1
+            : (rem > INT_MAX ? INT_MAX : (int)rem);
         int rc = sqlite3_prepare_v2(db, start, nbyte, &stmt, &tail);
         if (rc != 0) {
             *out_stmt = NULL;

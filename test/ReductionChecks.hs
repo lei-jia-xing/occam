@@ -46,6 +46,8 @@ import Occam.Oracle.DuckDB (
  )
 import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
 import Occam.Oracle.Sqlite (
+    SqliteError (..),
+    executeSqliteCandidateDetailedTimeout,
     generateSqliteContract,
     generateSqliteContractWithTrace,
     sqliteContractOracle,
@@ -1502,6 +1504,14 @@ tests =
             assertBool "keeps required table t with column a" (BSC.isInfixOf "a INT" reduced)
             assertBool "unneeded column b is dropped" (not (BSC.isInfixOf "b INT" reduced))
             assertBool "keeps scoped barrier" (BSC.isInfixOf "CREATE VIRTUAL TABLE vt" reduced)
+        , testCase "SQLite releases statements after a timeout during execution" $ do
+            let query =
+                    "WITH RECURSIVE r(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM r WHERE x < 1000000000) SELECT sum(x) FROM r;"
+            forM_ [query, "CREATE TABLE t AS " <> query] $ \sql -> do
+                outcome <- executeSqliteCandidateDetailedTimeout 50000 sql
+                assertEqual "long execution reaches its timeout" (Left SqliteTimeout) outcome
+            recovered <- executeSqliteCandidateDetailedTimeout 1000000 "SELECT 42;"
+            assertEqual "subsequent SQLite run succeeds" (Right [[Number 42]]) recovered
         , testCase
             "Early-rejection exact-prefix certificate distinguishes mismatching and matching SQLite prefixes"
             $ do

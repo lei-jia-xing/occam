@@ -107,7 +107,10 @@ fn walk_units(
     let mut tokens = Vec::with_capacity((source.len() / 4).max(16));
     let tokenizer_error = tokenizer.tokenize_with_location_into_buf(&mut tokens).err();
     let source_map = detailed.then(|| SourceMap::new(source));
-    let mut positions = token_positions(&tokens, source_map.as_ref())?;
+    let mut positions = match &source_map {
+        Some(source_map) => token_positions(&tokens, source_map)?,
+        None => Vec::new(),
+    };
     let lexical_suffix = match (&tokenizer_error, detailed) {
         (Some(error), true) => {
             let prefix_len = positions
@@ -128,17 +131,22 @@ fn walk_units(
             Some((start, Some(error.to_string())))
         }
         (Some(_), false) => {
-            let prefix_len = positions
+            let prefix_len = tokens
                 .iter()
-                .rposition(|token| matches!(token.kind, TokenKind::Semicolon))
+                .rposition(|token| token.token == Token::SemiColon)
                 .map_or(0, |index| index + 1);
             tokens.truncate(prefix_len);
-            positions.truncate(prefix_len);
             Some((0, None))
         }
         (None, _) => None,
     };
 
+    // The parser retains the tokens used for delimiter recovery. Detailed
+    // parsing alone needs byte positions and structural token metadata.
+    let delimiter_at = |parser: &Parser<'_>, index| {
+        let token = parser.token_at(index);
+        (token.token == Token::SemiColon).then_some(token.span.start)
+    };
     let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     let mut count = 0;
     let mut pending: Vec<PendingUnit> = if detailed {
@@ -155,13 +163,12 @@ fn walk_units(
             break;
         }
         let first_location = first.span.start;
-        let first_index = positions.partition_point(|token| token.span.start < first_location);
-        let Some(first_position) = positions.get(first_index).filter(|token| {
-            token.span.start == first_location && !matches!(token.kind, TokenKind::Whitespace)
-        }) else {
-            return Err("sqlparser returned an unmappable statement start".to_string());
+        let start = match &source_map {
+            Some(source_map) => source_map
+                .offset(first_location)
+                .ok_or_else(|| "sqlparser returned an unmappable statement start".to_string())?,
+            None => 0,
         };
-        let start = first_position.start;
         let parsed = if kind == DialectKind::SQLite {
             parse_sqlite_foreign_keys(&mut parser).unwrap_or_else(|| parser.parse_statement())
         } else {
@@ -172,9 +179,7 @@ fn walk_units(
         let statement = match parsed {
             Ok(statement) => {
                 let current_index = parser.get_current_index();
-                let delimiter_consumed = positions
-                    .get(current_index)
-                    .is_some_and(|token| matches!(token.kind, TokenKind::Semicolon));
+                let delimiter_consumed = delimiter_at(&parser, current_index).is_some();
                 let next = parser.peek_token_ref();
                 let missing_delimiter = !delimiter_consumed
                     && next.token != Token::EOF
@@ -194,9 +199,8 @@ fn walk_units(
             }
             Err(error) => {
                 let current_index = parser.get_current_index();
-                let delimiter_consumed = positions.get(current_index).is_some_and(|token| {
-                    matches!(token.kind, TokenKind::Semicolon) && token.span.start >= first_location
-                });
+                let delimiter_consumed = delimiter_at(&parser, current_index)
+                    .is_some_and(|location| location >= first_location);
                 if !delimiter_consumed {
                     while parser.peek_token_ref().token != Token::EOF
                         && parser.peek_token_ref().token != Token::SemiColon
@@ -213,9 +217,8 @@ fn walk_units(
         };
 
         let current_index = parser.get_current_index();
-        let delimiter_consumed = positions.get(current_index).is_some_and(|token| {
-            matches!(token.kind, TokenKind::Semicolon) && token.span.start >= first_location
-        });
+        let delimiter_consumed =
+            delimiter_at(&parser, current_index).is_some_and(|location| location >= first_location);
         let delimiter_pending = parser.peek_token_ref().token == Token::SemiColon;
         let at_eof = parser.peek_token_ref().token == Token::EOF;
         // In detailed mode, determine the unit's end byte offset:

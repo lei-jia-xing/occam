@@ -102,7 +102,7 @@ module Occam.Dependency.State (
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -257,6 +257,8 @@ data DefinitionState = DefinitionState
 
 data Catalog = Catalog
     { catalogRelations :: !(Map RelationKey RelationState)
+    , -- True if this catalog or a restored snapshot may contain ON COMMIT actions.
+      catalogMayHaveOnCommit :: !Bool
     , catalogRelationsByLast :: !(Map Ident (Set RelationKey))
     , catalogIndexes :: !(Map IndexKey IndexState)
     , catalogTriggers :: !(Map TriggerKey TriggerState)
@@ -275,6 +277,7 @@ emptyCatalog :: Catalog
 emptyCatalog =
     Catalog
         { catalogRelations = Map.empty
+        , catalogMayHaveOnCommit = False
         , catalogRelationsByLast = Map.empty
         , catalogIndexes = Map.empty
         , catalogTriggers = Map.empty
@@ -705,6 +708,7 @@ insertRelation key relation catalog =
                         Map.insertWith Set.union ident (Set.singleton key) (catalogRelationsByLast catalog)
      in catalog
             { catalogRelations = rels'
+            , catalogMayHaveOnCommit = catalogMayHaveOnCommit catalog || isJust (relOnCommit relation)
             , catalogRelationsByLast = byLast'
             , catalogChildRelations = children'
             }

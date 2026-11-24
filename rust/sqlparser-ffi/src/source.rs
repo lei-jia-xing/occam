@@ -26,7 +26,7 @@ impl ByteSpan {
 pub(super) struct SourceMap {
     source_len: usize,
     line_starts: Vec<usize>,
-    non_ascii_lines: Option<Vec<Vec<usize>>>,
+    non_ascii_lines: Option<Vec<Option<Vec<usize>>>>,
 }
 
 impl SourceMap {
@@ -47,19 +47,24 @@ impl SourceMap {
                 non_ascii_lines: None,
             }
         } else {
-            let mut lines = Vec::with_capacity(source.len() / 32 + 1);
-            lines.push(vec![0]);
-            for (index, ch) in source.char_indices() {
-                let end = index + ch.len_utf8();
-                if ch == '\n' {
-                    lines.push(vec![end]);
-                } else {
-                    lines.last_mut().unwrap().push(end);
-                }
+            let mut start = 0;
+            let mut line_starts = Vec::with_capacity(source.len() / 32 + 1);
+            let mut lines = Vec::with_capacity(line_starts.capacity());
+            for line in source.split('\n') {
+                line_starts.push(start);
+                // ASCII columns are already byte offsets. Build a per-column
+                // index only for the lines that actually contain UTF-8.
+                lines.push((!line.is_ascii()).then(|| {
+                    line.char_indices()
+                        .map(|(index, _)| start + index)
+                        .chain(std::iter::once(start + line.len()))
+                        .collect()
+                }));
+                start += line.len() + 1;
             }
             Self {
                 source_len: source.len(),
-                line_starts: Vec::new(),
+                line_starts,
                 non_ascii_lines: Some(lines),
             }
         }
@@ -69,20 +74,19 @@ impl SourceMap {
     pub(super) fn offset(&self, location: Location) -> Option<usize> {
         let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
         let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
-        if let Some(lines) = &self.non_ascii_lines {
-            lines.get(line)?.get(column).copied()
-        } else {
-            let start = *self.line_starts.get(line)?;
-            let line_end = match self.line_starts.get(line + 1) {
-                Some(&next_start) => next_start - 1,
-                None => self.source_len,
-            };
-            if column <= line_end - start {
-                Some(start + column)
-            } else {
-                None
-            }
+        if let Some(Some(offsets)) = self
+            .non_ascii_lines
+            .as_ref()
+            .and_then(|lines| lines.get(line))
+        {
+            return offsets.get(column).copied();
         }
+        let start = *self.line_starts.get(line)?;
+        let line_end = match self.line_starts.get(line + 1) {
+            Some(&next_start) => next_start - 1,
+            None => self.source_len,
+        };
+        (column <= line_end - start).then(|| start + column)
     }
 
     /// Converts an AST `Span` into a `ByteSpan`.
@@ -129,7 +133,6 @@ pub(super) enum TokenKind {
 
 #[derive(Clone, Copy)]
 pub(super) struct TokenPosition {
-    pub(super) span: Span,
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) kind: TokenKind,
@@ -161,7 +164,6 @@ impl TokenPosition {
             _ => TokenKind::Other,
         };
         Ok(Self {
-            span: token.span,
             start,
             end,
             kind,
@@ -177,14 +179,11 @@ impl TokenPosition {
 /// Maps token locations into byte spans and resolves matching parenthesis pairs.
 pub(super) fn token_positions(
     tokens: &[TokenWithSpan],
-    source_map: Option<&SourceMap>,
+    source_map: &SourceMap,
 ) -> Result<Vec<TokenPosition>, String> {
     let mut positions = Vec::with_capacity(tokens.len());
     for token in tokens {
-        positions.push(TokenPosition::new(token, source_map)?);
-    }
-    if source_map.is_none() {
-        return Ok(positions);
+        positions.push(TokenPosition::new(token, Some(source_map))?);
     }
     let mut openings = Vec::with_capacity(16);
     for index in 0..positions.len() {

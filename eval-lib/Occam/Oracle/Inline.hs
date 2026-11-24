@@ -48,14 +48,16 @@ newResultTraceTracker False = pure (\_ _ -> pure (), const (pure Nothing))
 newResultTraceTracker True = do
     tracesRef <- newIORef Map.empty
     let rememberTrace sql trace =
-            atomicModifyIORef' tracesRef (\traces -> (Map.insert sql trace traces, ()))
+            atomicModifyIORef' tracesRef (\traces -> (Map.insert (BS.length sql, sql) trace traces, ()))
         -- Keep the current SQL trace across stages within the same iteration while
-        -- pruning strictly larger superseded candidates.
+        -- pruning strictly larger superseded candidates. Length comes first
+        -- in the key so a single tree boundary separates the two groups.
         lookupTrace sql =
-            atomicModifyIORef' tracesRef $ \traces ->
-                ( Map.filterWithKey (\candidate _ -> BS.length candidate <= BS.length sql) traces
-                , Map.lookup sql traces
-                )
+            let size = BS.length sql
+             in atomicModifyIORef' tracesRef $ \traces ->
+                    ( Map.takeWhileAntitone ((<= size) . fst) traces
+                    , Map.lookup (size, sql) traces
+                    )
     pure (rememberTrace, lookupTrace)
 
 prepareResultOracle ::

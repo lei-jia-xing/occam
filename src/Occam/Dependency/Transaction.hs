@@ -296,31 +296,33 @@ rollbackFrame sid state =
                     }
 
 applyOnCommit :: Int -> SessionState -> Catalog -> Catalog
-applyOnCommit transactionId session catalog =
-    let relations =
-            Map.map
-                ( \relation ->
-                    case relOnCommit relation of
-                        Just OnCommitDeleteRows ->
-                            relation
-                                { relDataWrites = Set.empty
-                                , relCardinalityWrites = Set.empty
-                                , relColumnWrites = Map.empty
-                                }
-                        _ -> relation
-                )
-                (catalogRelations catalog)
-        dropKeys =
-            [ key
-            | (key, relation) <- Map.toList relations
-            , relOnCommit relation == Just OnCommitDrop
-            , relOnCommitFrameId relation == Just transactionId
-            ]
-        catalog1 = catalog {catalogRelations = relations}
-     in foldl'
-            (flip (removeRelationCascade session DropCascade))
-            catalog1
-            dropKeys
+applyOnCommit transactionId session catalog
+    | not (catalogMayHaveOnCommit catalog) = catalog
+    | otherwise =
+        let relations =
+                Map.map
+                    ( \relation ->
+                        case relOnCommit relation of
+                            Just OnCommitDeleteRows ->
+                                relation
+                                    { relDataWrites = Set.empty
+                                    , relCardinalityWrites = Set.empty
+                                    , relColumnWrites = Map.empty
+                                    }
+                            _ -> relation
+                    )
+                    (catalogRelations catalog)
+            dropKeys =
+                [ key
+                | (key, relation) <- Map.toList relations
+                , relOnCommit relation == Just OnCommitDrop
+                , relOnCommitFrameId relation == Just transactionId
+                ]
+            catalog1 = catalog {catalogRelations = relations}
+         in foldl'
+                (flip (removeRelationCascade session DropCascade))
+                catalog1
+                dropKeys
 
 -- ----------------------------------------------------------------------------
 -- Transactional rollback
@@ -341,6 +343,7 @@ restoreCatalog sid snapshot current =
             | otherwise = rebuildRelationsByLast rels
      in Catalog
             { catalogRelations = rels
+            , catalogMayHaveOnCommit = catalogMayHaveOnCommit snapshot || catalogMayHaveOnCommit current
             , catalogRelationsByLast = relsByLast
             , catalogIndexes =
                 restoreIndexMap sid snapshot current

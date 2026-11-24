@@ -321,33 +321,40 @@ data SqliteRun = SqliteRun
     , srLastIndex :: !Int
     , srResults :: ![(Int, ResultSet)]
     , srStatementCount :: !Int
-    , srDeterministic :: !Bool
+    , srAuthorizerDeterministic :: !Bool
     , srEndOffsets :: !(Maybe [Int])
     }
 
-buildSqliteTrace :: ResultSet -> SqliteRun -> ResultTrace
-buildSqliteTrace expected SqliteRun {..} =
-    ResultTrace
-        { traceStatementCount = srStatementCount
-        , traceFirstResultIndex = maybe srLastIndex fst (listHead srResults)
-        , traceLastResultIndex = srLastIndex
-        , traceResultIndices = IntSet.fromList (map fst srResults)
-        , tracePrefixMatchIndices = prefixMatches 0 Nothing srResults IntSet.empty
-        , traceDeterministic = srDeterministic
-        , traceEndByteOffsets = srEndOffsets
-        }
+buildSqliteTrace :: ByteString -> ResultSet -> SqliteRun -> IO ResultTrace
+buildSqliteTrace sql expected SqliteRun {..} = do
+    deterministic <-
+        if srAuthorizerDeterministic
+            then BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
+                (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
+            else pure False
+    pure
+        ResultTrace
+            { traceStatementCount = srStatementCount
+            , traceFirstResultIndex = maybe srLastIndex fst (listHead srResults)
+            , traceLastResultIndex = srLastIndex
+            , traceResultIndices = IntSet.fromDistinctAscList (map fst srResults)
+            , tracePrefixMatchIndices = IntSet.fromDistinctAscList (prefixMatches 0 False srResults)
+            , traceDeterministic = deterministic
+            , traceEndByteOffsets = srEndOffsets
+            }
     where
         listHead [] = Nothing
         listHead (x : _) = Just x
-        prefixMatches !k !latest pending !acc
-            | k >= srStatementCount = acc
-            | otherwise = case pending of
-                (ord, rs) : rest | ord == k ->
-                    let acc' = if rs == expected then IntSet.insert k acc else acc
-                     in prefixMatches (k + 1) (Just rs) rest acc'
-                _ ->
-                    let acc' = if latest == Just expected then IntSet.insert k acc else acc
-                     in prefixMatches (k + 1) latest pending acc'
+        prefixMatches !k !matches pending
+            | k >= srStatementCount = []
+            | otherwise =
+                case pending of
+                    (ord, rs) : rest | ord == k -> emit (rs == expected) rest
+                    _ -> emit matches pending
+            where
+                emit matched results
+                    | matched = k : prefixMatches (k + 1) matched results
+                    | otherwise = prefixMatches (k + 1) matched results
 
 runCandidateOnConn ::
     Int ->
@@ -362,9 +369,9 @@ runCandidateOnConn micros sql conn = do
     res <- try $
         timeout micros $
             interruptibly db $
-                BS.useAsCStringLen sql $ \(start, size) ->
+                BS.useAsCString sql $ \start ->
                     allocaArray maxOffsets $ \offsetsPtr ->
-                        runStatements db offsetsPtr maxOffsets start (start `plusPtr` size) start 0 []
+                        runStatements db offsetsPtr maxOffsets start (start `plusPtr` BS.length sql) start 0 []
     dirty <- peek (scDirtyPtr conn)
     when ((dirty .&. dirtyDml) /= 0) $
         writeIORef (scDmlTainted conn) True
@@ -380,13 +387,7 @@ runCandidateOnConn micros sql conn = do
         Right (Just (totalStmts, revResults, offsets)) ->
             case revResults of
                 [] -> pure (poolable, counterPolluted, Right Nothing)
-                (lastIdx, lastRs) : _ -> do
-                    hasNondetKw <-
-                        if authorizerDet
-                            then
-                                (/= 0)
-                                    <$> BSU.unsafeUseAsCStringLen sql (\(ptr, len) -> c_hasNondetKeyword (castPtr ptr) (fromIntegral len))
-                            else pure True
+                (lastIdx, lastRs) : _ ->
                     pure
                         ( poolable
                         , counterPolluted
@@ -397,7 +398,7 @@ runCandidateOnConn micros sql conn = do
                                     , srLastIndex = lastIdx
                                     , srResults = reverse revResults
                                     , srStatementCount = totalStmts
-                                    , srDeterministic = authorizerDet && not hasNondetKw
+                                    , srAuthorizerDeterministic = authorizerDet
                                     , srEndOffsets = offsets
                                     }
                         )
@@ -454,7 +455,9 @@ runStatements db@(Direct.Database handle) offsetsPtr maxOffsets base end start0 
                         pure (total, revResults, offsets)
                     go !start !ordinal revResults
                         | start >= end = finish ordinal revResults
-                        | otherwise = do
+                        -- C may return a live statement even when stepping failed.
+                        -- Keep ownership transfer and finalization masked.
+                        | otherwise = mask $ \restore -> do
                             rc <-
                                 c_occamSqliteNextResult
                                     handle
@@ -471,21 +474,22 @@ runStatements db@(Direct.Database handle) offsetsPtr maxOffsets base end start0 
                             stmtPtr <- peek outStmt
                             nextOrd <- fromIntegral <$> peek outOrdinal
                             case rc of
-                                0 -> finish nextOrd revResults
+                                0 -> restore (finish nextOrd revResults)
                                 1 -> do
                                     let stmt = Direct.Statement stmtPtr
                                     rs <-
-                                        ( do
-                                            count <- columnCount stmt
-                                            names <- forM [0 .. count - 1] $ \i -> do
-                                                name <- columnName stmt i
-                                                maybe (fail "SQLite omitted a result column name") pure name
-                                            rows <- stepAll stmt
-                                            pure (ResultSet names [] rows)
-                                        )
+                                        restore
+                                            ( do
+                                                count <- columnCount stmt
+                                                names <- forM [0 .. count - 1] $ \i -> do
+                                                    name <- columnName stmt i
+                                                    maybe (fail "SQLite omitted a result column name") pure name
+                                                rows <- stepAll stmt
+                                                pure (ResultSet names [] rows)
+                                            )
                                             `onException` c_sqlite3_finalize stmtPtr
                                     finalize stmt
-                                    go tailPtr (nextOrd + 1) ((nextOrd, rs) : revResults)
+                                    restore (go tailPtr (nextOrd + 1) ((nextOrd, rs) : revResults))
                                 -1 -> do
                                     code <- Direct.errcode db
                                     Direct.Utf8 message <- Direct.errmsg db
@@ -528,21 +532,23 @@ generateSqliteContractWithTrace ::
     Int -> ByteString -> IO (Either Text (SqliteContract, ResultTrace))
 generateSqliteContractWithTrace micros sql = do
     res <- executeSqliteRun micros sql
-    pure $ case res of
-        Left SqliteTimeout -> Left "timeout"
-        Left (SqliteExecutionError err) -> Left err
-        Left (SqliteInfrastructureError err) -> Left err
-        Right Nothing -> Left "Input must produce a result set"
-        Right (Just run) ->
+    case res of
+        Left SqliteTimeout -> pure (Left "timeout")
+        Left (SqliteExecutionError err) -> pure (Left err)
+        Left (SqliteInfrastructureError err) -> pure (Left err)
+        Right Nothing -> pure (Left "Input must produce a result set")
+        Right (Just run) -> do
             let result = srLastResult run
-             in Right
+            trace <- buildSqliteTrace sql result run
+            pure $
+                Right
                     ( SqliteContract
                         { contractExpectedRows = resultRows result
                         , contractExpectedColumns = resultColumns result
                         , contractStateSha256 = Nothing
                         , contractCheckState = False
                         }
-                    , buildSqliteTrace result run
+                    , trace
                     )
 
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
@@ -572,14 +578,15 @@ sqliteContractObservationWithTrace micros contract candidate
         pure (OracleIOFailed "SQLite state contracts are unsupported", Nothing)
     | otherwise = do
         res <- executeSqliteRun micros candidate
-        pure $ case res of
-            Left SqliteTimeout -> (OracleTimedOut, Nothing)
-            Left (SqliteExecutionError _) -> (OracleFinished (ExitFailure 1), Nothing)
-            Left (SqliteInfrastructureError err) -> (OracleIOFailed err, Nothing)
+        case res of
+            Left SqliteTimeout -> pure (OracleTimedOut, Nothing)
+            Left (SqliteExecutionError _) -> pure (OracleFinished (ExitFailure 1), Nothing)
+            Left (SqliteInfrastructureError err) -> pure (OracleIOFailed err, Nothing)
             Right observed
                 | Just run <- observed
-                , srLastResult run == expected ->
-                    (OracleFinished ExitSuccess, Just (buildSqliteTrace expected run))
-                | otherwise -> (OracleFinished (ExitFailure 1), Nothing)
+                , srLastResult run == expected -> do
+                    trace <- buildSqliteTrace candidate expected run
+                    pure (OracleFinished ExitSuccess, Just trace)
+                | otherwise -> pure (OracleFinished (ExitFailure 1), Nothing)
     where
         expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)

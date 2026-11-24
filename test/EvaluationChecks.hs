@@ -223,7 +223,7 @@ tests =
                                 , evaluationPreflightResetMicros = Just (resetElapsedMicros details)
                                 , evaluationPreflightOracleMicros = oracleElapsedMicros details
                                 }
-                        action _ _ pool = poolOracle pool candidate >> pure (ReductionActionResult candidate Nothing)
+                        action _ _ _ = fail "reduction must not start after preflight exhausts the execution cap"
                     result <- withCheckpoint $ \checkpoint -> do
                         value <-
                             runEvaluatedReduction
