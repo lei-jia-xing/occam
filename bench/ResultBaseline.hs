@@ -7,6 +7,8 @@ module ResultBaseline (
     runStatementYieldBaseline,
     runStatementOrderBaseline,
     runStatementWeightBaseline,
+    runStatementRankedBaseline,
+    runStatementRankedGraphFreeBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
@@ -360,6 +362,45 @@ runStatementWeightBaseline pairs wallLimit callLimit out =
             True
         )
         (statementFixtures ++ [statementFixture True fenced 32 | fenced <- [False, True]])
+
+runStatementRankedBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementRankedBaseline =
+    runRankedComparison
+        id
+        ( statementFixtures
+            ++ [statementFixture False True 128, statementFixture True True 32]
+            ++ searchFixtures
+            ++ fixtures
+        )
+
+runStatementRankedGraphFreeBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runStatementRankedGraphFreeBaseline =
+    runRankedComparison
+        (\config -> config {reductionSlicing = False, reductionClosure = False})
+        (statementFixtures ++ [statementFixture False True 128, statementFixture True True 32] ++ fixtures)
+
+runRankedComparison ::
+    (ReductionConfig -> ReductionConfig) ->
+    [Fixture] ->
+    Int ->
+    Maybe Int ->
+    Maybe Int ->
+    FilePath ->
+    IO ()
+runRankedComparison configure cases pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm "statement-byte-weighted" configure True
+        , serialArm
+            "statement-ranked"
+            (\config -> (configure config) {reductionStatementSearch = StatementRanked})
+            True
+        )
+        cases
 
 optimizedSyntax :: ReductionConfig -> ReductionConfig
 optimizedSyntax config =

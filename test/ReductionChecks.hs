@@ -408,6 +408,12 @@ tests =
             let afterFirst = drop 1 (dropWhile (/= firstAccepted) tested)
             assertEqual "search resumes after the removed statement" [nextDeletion] (take 1 afterFirst)
             assertBool "search wraps back to the first statement" (afterWrap `elem` afterFirst)
+        , testCase "Ranked scheduling keeps a subset that complements and single deletions miss" $ do
+            let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
+                suffix = "SELECT 70;SELECT 80;"
+            pool <- predicatePool (\candidate -> candidate == original || candidate == suffix)
+            reduced <- statementDdminWithOrder StatementRanked SQLite pool original
+            assertEqual "the ranked subset lane is still searched" suffix reduced
         , testCase "Single-statement audit can miss a nonadjacent pair" $ do
             let statements = ["SELECT 10;", "SELECT 20;", "SELECT 30;", "SELECT 40;"]
                 original = BSC.concat statements
