@@ -23,168 +23,31 @@ module Occam.Certificate (
     checkEarlyRejectionSyntaxEditTracked,
 ) where
 
-import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
-import Data.Set qualified as Set
-import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Word (Word64, Word8)
 import GHC.Clock (getMonotonicTimeNSec)
+import Occam.Certificate.MissingDef (buildMissingDefReqs)
+import Occam.Certificate.PrefixCache (
+    FailingPrefixCache,
+    checkFailingPrefix,
+    newFailingPrefixCache,
+    recordFailingPrefix,
+ )
 import Occam.Core (
-    BarrierReason (..),
-    BarrierScope (..),
-    CatalogOp (..),
-    DataWrite (..),
     EarlyRejectReason (..),
-    Ident (..),
-    Name (..),
-    NameRef (..),
-    ReadFact (..),
-    ReadMode (..),
-    RenameOp (..),
     ResultTrace (..),
-    ScopedBarrier (..),
-    SemanticFacts (..),
-    SequenceDef (..),
     Span (..),
     Statement (..),
     StatementId (..),
-    TableDef (..),
-    TxEffect (..),
-    ViewDef (..),
  )
-import Occam.Facts (ParserEdit (..), StatementFacts (..), StatementUnit (..))
-
-data ByteTrie
-    = TrieEmpty
-    | TrieEdge !ByteString !ByteTrie
-    | TrieBranch !Bool !(IntMap ByteTrie)
-    deriving (Eq, Show)
-
-matchTrie :: ByteTrie -> ByteString -> Bool
-matchTrie TrieEmpty _ = False
-matchTrie (TrieEdge edge child) candidate =
-    let !edgeLen = BS.length edge
-     in BS.length candidate >= edgeLen
-            && BS.take edgeLen candidate == edge
-            && matchTrie child (BS.drop edgeLen candidate)
-matchTrie (TrieBranch isTerminal children) candidate
-    | isTerminal = True
-    | BS.null candidate = False
-    | otherwise =
-        let !b = fromIntegral (BS.head candidate)
-         in case IntMap.lookup b children of
-                Just child -> matchTrie child (BS.tail candidate)
-                Nothing -> False
-
-insertTrie :: ByteString -> ByteTrie -> (ByteTrie, Bool)
-insertTrie bs TrieEmpty
-    | BS.null bs = (TrieBranch True IntMap.empty, True)
-    | otherwise = (TrieEdge bs (TrieBranch True IntMap.empty), True)
-insertTrie bs (TrieEdge edge child)
-    | bs == edge = insertExactEdge edge child
-    | commonLen == BS.length edge =
-        let (child', ins) = insertTrie (BS.drop commonLen bs) child
-         in (TrieEdge edge child', ins)
-    | commonLen == 0 =
-        let !b1 = fromIntegral (BS.head bs)
-            !b2 = fromIntegral (BS.head edge)
-            !c1 = makeEdge (BS.tail bs) (TrieBranch True IntMap.empty)
-            !c2 = makeEdge (BS.tail edge) child
-         in (TrieBranch False (IntMap.fromList [(b1, c1), (b2, c2)]), True)
-    | otherwise = splitEdgeAt commonLen bs edge child
-    where
-        !commonLen = commonPrefixLength bs edge
-insertTrie bs (TrieBranch isTerm children)
-    | BS.null bs = (TrieBranch True children, not isTerm)
-    | otherwise =
-        let !b = fromIntegral (BS.head bs)
-            !rest = BS.tail bs
-            (updatedChild, inserted) = case IntMap.lookup b children of
-                Nothing -> (makeEdge rest (TrieBranch True IntMap.empty), True)
-                Just existing -> insertTrie rest existing
-         in (TrieBranch isTerm (IntMap.insert b updatedChild children), inserted)
-
-insertExactEdge :: ByteString -> ByteTrie -> (ByteTrie, Bool)
-insertExactEdge edge child = case child of
-    TrieBranch True _ -> (TrieEdge edge child, False)
-    TrieBranch False m -> (TrieEdge edge (TrieBranch True m), True)
-    TrieEmpty -> (TrieEdge edge (TrieBranch True IntMap.empty), True)
-    TrieEdge e _ ->
-        let !b = fromIntegral (BS.head e)
-         in (TrieEdge edge (TrieBranch True (IntMap.singleton b child)), True)
-
-splitEdgeAt :: Int -> ByteString -> ByteString -> ByteTrie -> (ByteTrie, Bool)
-splitEdgeAt commonLen bs edge child
-    | BS.null bsRest = (TrieEdge common (TrieBranch True (IntMap.singleton b2 c2)), True)
-    | otherwise =
-        let !b1 = fromIntegral (BS.head bsRest)
-            !c1 = makeEdge (BS.tail bsRest) (TrieBranch True IntMap.empty)
-            !branch = TrieBranch False (IntMap.fromList [(b1, c1), (b2, c2)])
-         in (TrieEdge common branch, True)
-    where
-        !common = BS.take commonLen edge
-        !edgeRest = BS.drop commonLen edge
-        !bsRest = BS.drop commonLen bs
-        !b2 = fromIntegral (BS.head edgeRest)
-        !c2 = makeEdge (BS.tail edgeRest) child
-
-makeEdge :: ByteString -> ByteTrie -> ByteTrie
-makeEdge rest c
-    | BS.null rest = c
-    | otherwise = TrieEdge rest c
-
-commonPrefixLength :: ByteString -> ByteString -> Int
-commonPrefixLength s1 s2 = go 0
-    where
-        !maxL = min (BS.length s1) (BS.length s2)
-        go !i
-            | i < maxL && BS.index s1 i == BS.index s2 i = go (i + 1)
-            | otherwise = i
-
-{- | Bounded, thread-safe memo of semicolon-terminated deterministic SQL error
-prefixes observed during native result-oracle execution. Any future candidate
-sharing an exact recorded byte prefix is guaranteed to encounter the same error
-and fail the contract.
--}
-data FailingPrefixCache = FailingPrefixCache
-    { fpTrieRef :: !(IORef ByteTrie)
-    , fpCountRef :: !(IORef Int)
-    }
-
-maxFailingPrefixes :: Int
-maxFailingPrefixes = 512
-
-newFailingPrefixCache :: IO FailingPrefixCache
-newFailingPrefixCache = FailingPrefixCache <$> newIORef TrieEmpty <*> newIORef 0
-
-recordFailingPrefix :: FailingPrefixCache -> ByteString -> IO ()
-recordFailingPrefix FailingPrefixCache {..} prefix
-    | BS.null prefix = pure ()
-    | otherwise = do
-        count <- readIORef fpCountRef
-        if count >= maxFailingPrefixes
-            then pure ()
-            else do
-                inserted <- atomicModifyIORef' fpTrieRef $ \trie ->
-                    let (trie', ins) = insertTrie prefix trie
-                     in (trie', ins)
-                when inserted $
-                    atomicModifyIORef' fpCountRef (\n -> (n + 1, ()))
-
-checkFailingPrefix :: FailingPrefixCache -> ByteString -> IO Bool
-checkFailingPrefix FailingPrefixCache {..} candidate = do
-    trie <- readIORef fpTrieRef
-    pure (matchTrie trie candidate)
+import Occam.Facts (ParserEdit (..), StatementUnit (..))
 
 -- | Precomputed early-rejection certificates anchored to one accepted base SQL script.
 data EarlyRejectCertifier = EarlyRejectCertifier
@@ -383,158 +246,6 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
                 || nonResultReady
                 || not (IntMap.null missingDefReqs)
                 || isJust protectedResultIndex
-
-data MissingDefAcc = MissingDefAcc
-    { mdaRelDefs :: !(Map Text IntSet)
-    , mdaTxOpens :: !IntSet
-    , mdaSpOpens :: !(Map Text IntSet)
-    , mdaOpaqueDdl :: !IntSet
-    , mdaOpaqueTx :: !IntSet
-    , mdaReqs :: !(IntMap [IntSet])
-    }
-
--- | Precompute per-statement required prior definers/openers in source order.
-buildMissingDefReqs :: [StatementUnit] -> IntMap [IntSet]
-buildMissingDefReqs =
-    mdaReqs . foldl' stepMissingDefUnit emptyAcc
-    where
-        emptyAcc = MissingDefAcc Map.empty IntSet.empty Map.empty IntSet.empty IntSet.empty IntMap.empty
-
-stepMissingDefUnit :: MissingDefAcc -> StatementUnit -> MissingDefAcc
-stepMissingDefUnit acc unit = case unitFacts unit of
-    Nothing ->
-        acc
-            { mdaOpaqueDdl = IntSet.insert sid (mdaOpaqueDdl acc)
-            , mdaOpaqueTx = IntSet.insert sid (mdaOpaqueTx acc)
-            }
-    Just facts -> stepMissingDefFacts sid acc facts
-    where
-        !sid = unStatementId (stmtId (unitStatement unit))
-
-stepMissingDefFacts :: Int -> MissingDefAcc -> StatementFacts -> MissingDefAcc
-stepMissingDefFacts sid acc facts =
-    MissingDefAcc
-        { mdaRelDefs = relDefs'
-        , mdaTxOpens = txOpens'
-        , mdaSpOpens = spOpens'
-        , mdaOpaqueDdl =
-            if any isOpaqueDdlBarrier barriers then IntSet.insert sid (mdaOpaqueDdl acc) else mdaOpaqueDdl acc
-        , mdaOpaqueTx =
-            if any isOpaqueTxBarrier barriers then IntSet.insert sid (mdaOpaqueTx acc) else mdaOpaqueTx acc
-        , mdaReqs = if null allReqs then mdaReqs acc else IntMap.insert sid allReqs (mdaReqs acc)
-        }
-    where
-        sem = factSemantics facts
-        ops = factOps sem
-        barriers = factBarriers sem
-        txs = factPreTx sem ++ factPostTx sem
-        -- Never require referenced relations inside deferred view/trigger DDL or DROP.
-        skipRelReqs = any isDeferredOrDropOp ops
-        selfDefined = Set.fromList (concatMap opDefinedRelNames ops)
-        refRels
-            | skipRelReqs = []
-            | otherwise =
-                Set.toList (Set.fromList (concatMap opReferencedRelNames ops) `Set.difference` selfDefined)
-        relReqs =
-            [ IntSet.union defs (mdaOpaqueDdl acc)
-            | rel <- refRels
-            , Just defs <- [Map.lookup rel (mdaRelDefs acc)]
-            ]
-        txReqs =
-            [ req
-            | tx <- txs
-            , Just req <- [txRequirement tx (mdaTxOpens acc) (mdaSpOpens acc) (mdaOpaqueTx acc)]
-            ]
-        allReqs = dedupIntSetsSmall (relReqs ++ txReqs)
-        relDefs' =
-            foldl'
-                (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m)
-                (mdaRelDefs acc)
-                (Set.toList selfDefined)
-        (txOpens', spOpens') = foldl' (recordTxOpener sid) (mdaTxOpens acc, mdaSpOpens acc) txs
-
-isDeferredOrDropOp :: CatalogOp -> Bool
-isDeferredOrDropOp = \case
-    DefineTableOp _ -> True
-    DefineViewOp _ -> True
-    DefineTriggerOp _ -> True
-    DefineIndexOp _ -> True
-    DropCatalogOp _ -> True
-    AlterTableOp _ -> True
-    _ -> False
-
-baseRelName :: Name -> Text
-baseRelName (Name []) = T.empty
-baseRelName (Name parts) = T.toLower (identText (lastPart parts))
-    where
-        lastPart [x] = x
-        lastPart (_ : xs) = lastPart xs
-        lastPart [] = Ident T.empty
-
-opDefinedRelNames :: CatalogOp -> [Text]
-opDefinedRelNames = \case
-    DefineTableOp td -> [baseRelName (tableName td)]
-    DefineViewOp vd -> [baseRelName (viewName vd)]
-    DefineSequenceOp sd -> [baseRelName (sequenceName sd)]
-    RenameOp (RenameRelation _ newName _) -> [baseRelName newName]
-    _ -> []
-
-opReferencedRelNames :: CatalogOp -> [Text]
-opReferencedRelNames = \case
-    ReadOp rf
-        | readMode rf /= ReadSchema -> [baseRelName (nameRefName (readSource rf))]
-    WriteDataOp dw ->
-        baseRelName (nameRefName (dataWriteTarget dw))
-            : [baseRelName (nameRefName (readSource rf)) | rf <- dataWriteReads dw, readMode rf /= ReadSchema]
-    _ -> []
-
-txRequirement :: TxEffect -> IntSet -> Map Text IntSet -> IntSet -> Maybe IntSet
-txRequirement tx txOpens spOpens opaqueTx = case tx of
-    TxCommit _
-        | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
-    TxRollbackAll
-        | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
-    TxRollbackTo sp ->
-        IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
-    TxReleaseSavepoint sp ->
-        IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
-    _ -> Nothing
-
-recordTxOpener :: Int -> (IntSet, Map Text IntSet) -> TxEffect -> (IntSet, Map Text IntSet)
-recordTxOpener sid (txOpens, spOpens) = \case
-    TxBegin _ -> (IntSet.insert sid txOpens, spOpens)
-    TxSavepoint sp ->
-        let spKey = T.toLower (identText sp)
-         in (IntSet.insert sid txOpens, Map.insertWith IntSet.union spKey (IntSet.singleton sid) spOpens)
-    _ -> (txOpens, spOpens)
-
-isOpaqueDdlBarrier :: ScopedBarrier -> Bool
-isOpaqueDdlBarrier sb =
-    barrierScope sb == GlobalScope
-        || case barrierReason sb of
-            SyntaxErrorBarrier -> True
-            UnknownStatementBarrier -> True
-            UnknownRelationBarrier -> True
-            UnknownDDLBarrier -> True
-            UnknownDMLBarrier -> True
-            UnknownAlterBarrier -> True
-            UnknownViewBarrier -> True
-            UnknownSessionEffectBarrier -> True
-            UnsupportedTriggerBodyBarrier -> True
-            OpaqueTriggerBodyBarrier -> True
-            _ -> False
-
-isOpaqueTxBarrier :: ScopedBarrier -> Bool
-isOpaqueTxBarrier sb = case barrierReason sb of
-    SyntaxErrorBarrier -> True
-    UnknownStatementBarrier -> True
-    UnknownSessionEffectBarrier -> True
-    UnsupportedTransactionBarrier -> True
-    _ -> False
-
-dedupIntSetsSmall :: [IntSet] -> [IntSet]
-dedupIntSetsSmall [] = []
-dedupIntSetsSmall (x : xs) = x : dedupIntSetsSmall (filter (/= x) xs)
 
 isAsciiWhitespace :: ByteString -> Bool
 isAsciiWhitespace = BS.all isWsByte

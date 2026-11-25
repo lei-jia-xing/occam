@@ -88,12 +88,21 @@ library
                     , Occam.UI
                     , Occam.Version
     other-modules:    Paths_occam
+                    , Occam.Core.Schema
+                    , Occam.Core.Semantics
+                    , Occam.Certificate.MissingDef
+                    , Occam.Certificate.PrefixCache
                     , Occam.Json
                     , Occam.Parser.Binary
+                    , Occam.Parser.Binary.Primitives
+                    , Occam.Parser.Binary.Semantics
                     , Occam.Parser.Facts
                     , Occam.Parser.Native
                     , Occam.Parser.Types
                     , Occam.Parser.Validate
+                    , Occam.Oracle.Process
+                    , Occam.Pool.Types
+                    , Occam.Pool.Window
                     , Occam.Dependency.Alter
                     , Occam.Dependency.Barrier
                     , Occam.Dependency.Define
@@ -104,8 +113,28 @@ library
                     , Occam.Dependency.Resolve
                     , Occam.Dependency.Session
                     , Occam.Dependency.State
+                    , Occam.Dependency.State.Catalog
+                    , Occam.Dependency.State.Lenses
                     , Occam.Dependency.Transaction
                     , Occam.Dependency.Write
+                    , Occam.Evaluation.Execution
+                    , Occam.Evaluation.Types
+                    , Occam.Reducer.Audit
+                    , Occam.Reducer.Closure
+                    , Occam.Reducer.Config
+                    , Occam.Reducer.DDMin
+                    , Occam.Reducer.DDMin.Core
+                    , Occam.Reducer.DDMin.Ranked
+                    , Occam.Reducer.Groups
+                    , Occam.Reducer.Pipeline
+                    , Occam.Reducer.Slice
+                    , Occam.Reducer.Statement
+                    , Occam.Reducer.Support
+                    , Occam.Reducer.Syntax
+                    , Occam.Reducer.Syntax.Batches
+                    , Occam.Reducer.Syntax.Execute
+                    , Occam.Reducer.Syntax.Index
+                    , Occam.Reducer.Syntax.Snapshot
     build-depends:    unordered-containers >= 0.2.14 && < 0.3
                     , hashable >= 1.4 && < 1.6
                     , process >= 1.6 && < 1.7
@@ -133,10 +162,21 @@ executable occam
     main-is:          Main.hs
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A32m"
     other-modules:    Completion
+                    , Options
+                    , Options.Parser
+                    , Output
+                    , Runner
                     , Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
+                    , Occam.Oracle.Sqlite.FFI
+                    , Occam.Oracle.Sqlite.Match
+                    , Occam.Oracle.Sqlite.Result
                     , Occam.Oracle.DuckDB
+                    , Occam.Oracle.DuckDB.Execution
+                    , Occam.Oracle.DuckDB.FFI
+                    , Occam.Oracle.DuckDB.Replay
+                    , Occam.Oracle.DuckDB.Result
     build-depends:    occam
                     , time
                     , optparse-applicative >= 0.17 && < 0.20
@@ -169,17 +209,43 @@ test-suite occam-test
     other-modules:    Fuzz
                     , MutationalFuzz
                     , TestSupport
+                    , BenchmarkMetricsChecks
+                    , CacheChecks
+                    , CliChecks
                     , ColumnChecks
                     , DependencyChecks
+                    , DependencyChecks.CascadeAndSessionChecks
+                    , DependencyChecks.CoreChecks
+                    , DependencyChecks.NativeSliceChecks
+                    , DependencyChecks.PartitionAndDweChecks
+                    , DependencyChecks.SnapshotModelChecks
+                    , DependencyChecks.Support
+                    , DependencyChecks.ViewAndBarrierChecks
+                    , DialectAndControlChecks
+                    , DuckDBOracleChecks
                     , EvaluationChecks
                     , OracleChecks
                     , PoolChecks
                     , PoolMetricsChecks
+                    , PropertyChecks
                     , ReductionChecks
+                    , ReductionChecks.BatchAndDeferralChecks
+                    , ReductionChecks.CertificateChecks
+                    , ReductionChecks.StatementSearchChecks
+                    , ReductionChecks.Support
+                    , ReductionChecks.SyntaxAndColumnChecks
+                    , SqliteOracleChecks
                     , Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
+                    , Occam.Oracle.Sqlite.FFI
+                    , Occam.Oracle.Sqlite.Match
+                    , Occam.Oracle.Sqlite.Result
                     , Occam.Oracle.DuckDB
+                    , Occam.Oracle.DuckDB.Execution
+                    , Occam.Oracle.DuckDB.FFI
+                    , Occam.Oracle.DuckDB.Replay
+                    , Occam.Oracle.DuckDB.Result
                     , Occam.Benchmark.Metrics
     main-is:          Spec.hs
     build-depends:    occam
@@ -203,7 +269,14 @@ benchmark occam-bench
                     , Occam.Oracle.Inline
                     , ResultBaseline
                     , Occam.Oracle.Sqlite
+                    , Occam.Oracle.Sqlite.FFI
+                    , Occam.Oracle.Sqlite.Match
+                    , Occam.Oracle.Sqlite.Result
                     , Occam.Oracle.DuckDB
+                    , Occam.Oracle.DuckDB.Execution
+                    , Occam.Oracle.DuckDB.FFI
+                    , Occam.Oracle.DuckDB.Replay
+                    , Occam.Oracle.DuckDB.Result
                     , Paths_occam
     autogen-modules:  Paths_occam
     main-is:          Main.hs
