@@ -76,7 +76,9 @@ data ParserEdit = ParserEdit
     , parserEditCategory :: !ParserEditCategory
     , parserEditLabel :: !Text
     , parserEditTopProjection :: !Bool
-    , parserEditTailClause :: !Bool
+    , parserEditStringLiteral :: !Bool
+    , parserEditRecursivePredicate :: !Bool
+    , parserEditLowYield :: !Bool
     }
     deriving (Eq, Show)
 
@@ -89,7 +91,9 @@ instance FromJSON ParserEdit where
             <*> objectValue .: "category"
             <*> objectValue .: "label"
             <*> objectValue .:? "top_level_projection" .!= False
-            <*> objectValue .:? "tail_clause" .!= False
+            <*> objectValue .:? "string_literal" .!= False
+            <*> objectValue .:? "recursive_predicate" .!= False
+            <*> objectValue .:? "low_yield" .!= False
 
 data ColumnSiteKind
     = CreateDefSite

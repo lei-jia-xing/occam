@@ -49,9 +49,6 @@ import Control.Exception (
     try,
     uninterruptibleMask_,
  )
-import Control.Monad (unless, when)
-import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.Cont (callCC, evalContT)
 import Data.Aeson (
     FromJSON (..),
     FromJSONKey (..),
@@ -67,7 +64,6 @@ import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -97,7 +93,9 @@ import System.IO.Error (isResourceVanishedError)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 #ifdef mingw32_HOST_OS
+import Control.Monad (unless)
 import Data.Char (toUpper)
+import Data.Maybe (isJust)
 import System.Process (
     CmdSpec (..),
     CreateProcess (..),
@@ -110,6 +108,10 @@ import System.Process (
     withCreateProcess,
  )
 #else
+import Control.Monad (guard, unless)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
+import Data.Maybe (fromMaybe, isJust)
 import System.Posix.Signals (nullSignal, sigKILL, sigTERM, signalProcessGroup)
 import System.Posix.Types (ProcessID)
 import System.Process (
@@ -270,40 +272,10 @@ runProcessGroupWithStart onStarted timeoutMicros command input
         withNullOutput \nullOut nullErr ->
             mask \restore ->
                 withCreateProcess (process nullOut nullErr) \mbIn _ _ ph ->
-                    case mbIn of
-                        Just hIn -> do
-                            groupId <- getOwnedGroup ph
-                            reaper <- startProcessReaper ph
-                            cleanedRef <- newIORef False
-                            let wait = waitForReaper reaper
-                                cleanup = mask_ $ do
-                                    alreadyCleaned <- readIORef cleanedRef
-                                    unless alreadyCleaned $ do
-                                        reaped <- cleanupOwnedGroup groupId ph reaper
-                                        unless reaped $ throwIO OracleReapFailed
-                                        writeIORef cleanedRef True
-                            let runCandidate
-                                    | BS.length input <= inlinePipeWriteLimit = do
-                                        writePipe hIn input
-                                        exitCode <- wait
-                                        cleanup
-                                        pure exitCode
-                                    | otherwise = withWorker (writePipe hIn input) \writeInput -> do
-                                        exitCode <- wait
-                                        -- Kill remaining group members before joining the stdin writer.
-                                        cleanup
-                                        writeInput
-                                        pure exitCode
-                            result <-
-                                ( do
-                                    onStarted
-                                    hSetBinaryMode hIn True
-                                    restore $ timeout timeoutMicros runCandidate `onException` cleanup
-                                )
-                                    `onException` cleanup
-                            cleanup
-                            pure (True, result)
-                        _ -> ioError (userError "Missing oracle process pipes")
+                    maybe
+                        (ioError (userError "Missing oracle process pipes"))
+                        (\hIn -> runOwnedProcess restore onStarted timeoutMicros input hIn ph)
+                        mbIn
     where
         process nullOut nullErr =
             command
@@ -312,6 +284,45 @@ runProcessGroupWithStart onStarted timeoutMicros command input
                 , std_err = nullErr
                 , create_group = createProcessGroup
                 }
+
+runOwnedProcess ::
+    (IO (Maybe ExitCode) -> IO (Maybe ExitCode)) ->
+    IO () ->
+    Int ->
+    ByteString ->
+    Handle ->
+    ProcessHandle ->
+    IO (Bool, Maybe ExitCode)
+runOwnedProcess restore onStarted timeoutMicros input hIn ph = do
+    groupId <- getOwnedGroup ph
+    reaper <- startProcessReaper ph
+    cleanedRef <- newIORef False
+    let wait = waitForReaper reaper
+        cleanup = mask_ $ do
+            alreadyCleaned <- readIORef cleanedRef
+            unless alreadyCleaned $ do
+                reaped <- cleanupOwnedGroup groupId ph reaper
+                unless reaped $ throwIO OracleReapFailed
+                writeIORef cleanedRef True
+        runCandidate
+            | BS.length input <= inlinePipeWriteLimit = do
+                writePipe hIn input
+                exitCode <- wait
+                cleanup
+                pure exitCode
+            | otherwise = withWorker (writePipe hIn input) \writeInput -> do
+                exitCode <- wait
+                -- Kill remaining group members before joining the stdin writer.
+                cleanup
+                writeInput
+                pure exitCode
+        runGuarded = do
+            onStarted
+            hSetBinaryMode hIn True
+            restore $ timeout timeoutMicros runCandidate `onException` cleanup
+    result <- runGuarded `onException` cleanup
+    cleanup
+    pure (True, result)
 
 -- The owner of waitpid must survive cancellation until System.Process records
 -- the exit code in its handle. Cancellation interrupts the MVar reader and
@@ -414,35 +425,29 @@ isCandidateOverrideKey k = k `elem` candidateOverrideKeys
 -- | Verify a file is directly executable by execve (ELF binary or #! script).
 isDirectExecFile :: FilePath -> IO Bool
 isDirectExecFile path =
-    handle (\(_ :: IOException) -> pure False) $ do
-        exists <- doesFileExist path
-        if not exists
-            then pure False
-            else do
-                perms <- getPermissions path
-                if not (executable perms)
-                    then pure False
-                    else do
-                        header <- withBinaryFile path ReadMode (`BS.hGet` 4)
-                        pure (BS.isPrefixOf (BS.pack [0x7f, 0x45, 0x4c, 0x46]) header || BS.isPrefixOf "#!" header)
+    handle (\(_ :: IOException) -> pure False) $
+        fmap isJust . runMaybeT $ do
+            guard =<< liftIO (doesFileExist path)
+            perms <- liftIO (getPermissions path)
+            guard (executable perms)
+            header <- liftIO (withBinaryFile path ReadMode (`BS.hGet` 4))
+            guard (BS.isPrefixOf (BS.pack [0x7f, 0x45, 0x4c, 0x46]) header || BS.isPrefixOf "#!" header)
 
 -- | Upgrade a shell command without shell syntax into a direct RawCommand when
 -- the resolved target is an executable ELF binary or #! script.
 resolveShellCommand :: String -> IO CmdSpec
-resolveShellCommand cmd = case parseDirectCommand cmd of
-    Nothing -> pure (ShellCommand cmd)
-    Just (bin, args) -> do
-        resolved <-
-            if isAbsolute bin || any isPathSeparator bin
-                then do
-                    exists <- doesFileExist bin
-                    if exists then Just <$> makeAbsolute bin else pure Nothing
-                else findExecutable bin >>= traverse makeAbsolute
-        case resolved of
-            Just absPath -> do
-                direct <- isDirectExecFile absPath
-                pure (if direct then RawCommand absPath args else ShellCommand cmd)
-            Nothing -> pure (ShellCommand cmd)
+resolveShellCommand cmd =
+    fmap (fromMaybe (ShellCommand cmd)) . runMaybeT $ do
+        (bin, args) <- MaybeT (pure (parseDirectCommand cmd))
+        absPath <- MaybeT (resolveDirectBin bin)
+        guard =<< liftIO (isDirectExecFile absPath)
+        pure (RawCommand absPath args)
+    where
+        resolveDirectBin bin
+            | isAbsolute bin || any isPathSeparator bin = do
+                exists <- doesFileExist bin
+                if exists then Just <$> makeAbsolute bin else pure Nothing
+            | otherwise = findExecutable bin >>= traverse makeAbsolute
 #endif
 
 -- | Fork an asynchronous helper action ensuring guaranteed cleanup and join.
@@ -573,76 +578,102 @@ observeExternalOracleDetailedWithContext ::
     OracleContext ->
     ByteString ->
     IO OracleObservationDetails
-observeExternalOracleDetailedWithContext onOracleStarted OracleConfig {..} context sql = do
-    started <- getMonotonicTimeNSec
-    let finish observation resetElapsed oracleElapsed = do
-            ended <- getMonotonicTimeNSec
-            pure
-                OracleObservationDetails
-                    { detailedObservation = observation
-                    , totalElapsedMicros = elapsedMicros started ended
-                    , resetElapsedMicros = resetElapsed
-                    , oracleElapsedMicros = oracleElapsed
-                    }
-        remainingMicros = do
-            now <- getMonotonicTimeNSec
-            pure (oracleTimeoutMicros - elapsedMicros started now)
-    if oracleTimeoutMicros <= 0
-        then finish OracleTimedOut 0 Nothing
+observeExternalOracleDetailedWithContext onOracleStarted cfg@OracleConfig {..} context sql
+    | oracleTimeoutMicros <= 0 = do
+        started <- getMonotonicTimeNSec
+        finishOracleObservation started OracleTimedOut 0 Nothing
+    | otherwise = do
+        started <- getMonotonicTimeNSec
+        let remainingMicros = do
+                now <- getMonotonicTimeNSec
+                pure (oracleTimeoutMicros - elapsedMicros started now)
+        attempt <-
+            tryIOException $
+                withCandidateWorkdir (runOracleInWorkdir onOracleStarted cfg context sql remainingMicros)
+        case attempt of
+            Left err -> finishOracleObservation started (OracleIOFailed (T.pack (show err))) 0 Nothing
+            Right (observation, resetElapsed, oracleElapsed) ->
+                finishOracleObservation started observation resetElapsed oracleElapsed
+
+finishOracleObservation ::
+    Word64 -> OracleObservation -> Int -> Maybe Int -> IO OracleObservationDetails
+finishOracleObservation started observation resetElapsed oracleElapsed = do
+    ended <- getMonotonicTimeNSec
+    pure
+        OracleObservationDetails
+            { detailedObservation = observation
+            , totalElapsedMicros = elapsedMicros started ended
+            , resetElapsedMicros = resetElapsed
+            , oracleElapsedMicros = oracleElapsed
+            }
+
+runOracleInWorkdir ::
+    IO () ->
+    OracleConfig ->
+    OracleContext ->
+    ByteString ->
+    IO Int ->
+    FilePath ->
+    IO (OracleObservation, Int, Maybe Int)
+runOracleInWorkdir onOracleStarted OracleConfig {..} context sql remainingMicros workDir = do
+    let childEnv = candidateEnvironmentWith context workDir
+    (resetResult, resetElapsed) <-
+        runOracleResetStep oracleResetCommand context childEnv remainingMicros
+    case resetResult of
+        Left err -> pure (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
+        Right Nothing -> pure (OracleTimedOut, resetElapsed, Nothing)
+        Right (Just code)
+            | code /= ExitSuccess -> pure (OracleResetFailed, resetElapsed, Nothing)
+            | otherwise ->
+                runOracleCommandStep onOracleStarted context childEnv sql remainingMicros resetElapsed
+
+runOracleResetStep ::
+    Maybe String ->
+    OracleContext ->
+    [(String, String)] ->
+    IO Int ->
+    IO (Either IOException (Maybe ExitCode), Int)
+runOracleResetStep Nothing _ _ _ = pure (Right (Just ExitSuccess), 0)
+runOracleResetStep (Just command) context childEnv remainingMicros = do
+    resetStarted <- getMonotonicTimeNSec
+    remaining <- remainingMicros
+    result <-
+        if remaining <= 0
+            then pure (Right Nothing)
+            else do
+                let resetProc = maybe (shell command) cmdSpecToProcess (contextResetSpec context)
+                tryIOException $ runProcessGroup remaining (resetProc {env = Just childEnv}) BS.empty
+    resetEnded <- getMonotonicTimeNSec
+    pure (result, elapsedMicros resetStarted resetEnded)
+
+runOracleCommandStep ::
+    IO () ->
+    OracleContext ->
+    [(String, String)] ->
+    ByteString ->
+    IO Int ->
+    Int ->
+    IO (OracleObservation, Int, Maybe Int)
+runOracleCommandStep onOracleStarted context childEnv sql remainingMicros resetElapsed = do
+    oracleStarted <- getMonotonicTimeNSec
+    remaining <- remainingMicros
+    if remaining <= 0
+        then pure (OracleTimedOut, resetElapsed, Nothing)
         else do
-            attempt <- tryIOException $ withCandidateWorkdir \workDir -> do
-                let childEnv = candidateEnvironmentWith context workDir
-                (resetResult, resetElapsed) <- case oracleResetCommand of
-                    Nothing -> pure (Right (Just ExitSuccess), 0)
-                    Just command -> do
-                        resetStarted <- getMonotonicTimeNSec
-                        remaining <- remainingMicros
-                        result <-
-                            if remaining <= 0
-                                then pure (Right Nothing)
-                                else do
-                                    let resetProc = maybe (shell command) cmdSpecToProcess (contextResetSpec context)
-                                    tryIOException $
-                                        runProcessGroup
-                                            remaining
-                                            (resetProc {env = Just childEnv})
-                                            BS.empty
-                        resetEnded <- getMonotonicTimeNSec
-                        let duration = elapsedMicros resetStarted resetEnded
-                        pure (result, duration)
-                evalContT $ callCC \exit -> do
-                    case resetResult of
-                        Left err -> exit (OracleIOFailed (T.pack (show err)), resetElapsed, Nothing)
-                        Right Nothing -> exit (OracleTimedOut, resetElapsed, Nothing)
-                        Right (Just code)
-                            | code /= ExitSuccess -> exit (OracleResetFailed, resetElapsed, Nothing)
-                            | otherwise -> pure ()
-                    let cmdProcess = cmdSpecToProcess (contextCmdSpec context)
-                    oracleStarted <- liftIO getMonotonicTimeNSec
-                    remaining <- liftIO remainingMicros
-                    when (remaining <= 0) $ exit (OracleTimedOut, resetElapsed, Nothing)
-                    oracleResult <-
-                        liftIO $
-                            tryIOException $
-                                runProcessGroupWithStart
-                                    onOracleStarted
-                                    remaining
-                                    (cmdProcess {env = Just childEnv})
-                                    sql
-                    oracleEnded <- liftIO getMonotonicTimeNSec
-                    let oracleElapsed = elapsedMicros oracleStarted oracleEnded
-                        obs = case oracleResult of
-                            Left err -> OracleIOFailed (T.pack (show err))
-                            Right (_, Nothing) -> OracleTimedOut
-                            Right (_, Just code') -> OracleFinished code'
-                        mOracleElapsed = case oracleResult of
-                            Right (True, _) -> Just oracleElapsed
-                            _ -> Nothing
-                    pure (obs, resetElapsed, mOracleElapsed)
-            case attempt of
-                Left err -> finish (OracleIOFailed (T.pack (show err))) 0 Nothing
-                Right (observation, resetElapsed, oracleElapsed) ->
-                    finish observation resetElapsed oracleElapsed
+            let cmdProcess = cmdSpecToProcess (contextCmdSpec context)
+            oracleResult <-
+                tryIOException $
+                    runProcessGroupWithStart onOracleStarted remaining (cmdProcess {env = Just childEnv}) sql
+            oracleEnded <- getMonotonicTimeNSec
+            let oracleElapsed = elapsedMicros oracleStarted oracleEnded
+                obs = case oracleResult of
+                    Left err -> OracleIOFailed (T.pack (show err))
+                    Right (_, Nothing) -> OracleTimedOut
+                    Right (_, Just code') -> OracleFinished code'
+                mOracleElapsed = case oracleResult of
+                    Right (True, _) -> Just oracleElapsed
+                    _ -> Nothing
+            pure (obs, resetElapsed, mOracleElapsed)
 
 oracleObservationMatches :: OracleObservation -> Bool
 oracleObservationMatches (OracleFinished ExitSuccess) = True

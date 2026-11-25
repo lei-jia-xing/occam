@@ -24,9 +24,12 @@ import Occam.Core (
     DropObject (..),
     DropOp (..),
     ForeignKey (..),
+    IndexRef,
     Name (..),
+    NameRef,
     RelationKind (..),
     StatementId,
+    TriggerRef,
  )
 import Occam.Dependency.Barrier (
     indexTouchKeys,
@@ -48,6 +51,7 @@ import Occam.Dependency.Resolve (
 import Occam.Dependency.State (
     BarrierKey (..),
     Catalog (..),
+    ConstraintKey,
     ConstraintState (..),
     DefinitionState (..),
     Eval (..),
@@ -111,176 +115,172 @@ markResolutionChange sid dropped catalog =
             | otherwise = relation
 
 dropOne :: StatementId -> DropMode -> Eval -> DropObject -> Eval
-dropOne sid mode eval object =
-    case object of
-        DropRelation reference _kind ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = resolveRelationKeys session catalog reference
-                existing = filter (`Map.member` catalogRelations catalog) keys
-             in if null existing
-                    then addTouch (RelationBarrierKey (relationFallbackKey session reference)) eval
-                    else
-                        mutateResolved
-                            ( \current key ->
-                                let currentCatalog = evalCatalog current
-                                    relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
-                                    deps =
-                                        relationAllDeps session currentCatalog key
-                                            `Set.union` relationConstraintDeps currentCatalog relation
-                                 in current
-                                        & addTouches (relationTouchKeys key)
-                                        & addDeps deps
-                                        & evalCatalogL %~ (removeRelationCascade session mode key . markResolutionChange sid key)
-                            )
-                            eval
-                            existing
-        DropIndex reference ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = resolveIndexKeys session catalog reference
-                stepKey current key =
-                    case Map.lookup key (catalogIndexes (evalCatalog current)) of
-                        Nothing -> current
-                        Just state ->
-                            let tableDeps =
-                                    maybe Set.empty (relationAllDeps session (evalCatalog current)) (indexStateTable state)
-                                deps =
-                                    definitionDeps (indexDefinition state) (indexRestoredBy state)
-                                        `Set.union` tableDeps
-                                catalog1 =
-                                    deleteIndex key (evalCatalog current)
-                                catalog2 =
-                                    case indexStateTable state of
-                                        Nothing -> catalog1
-                                        Just tableKey ->
-                                            modifyRelation tableKey (relIndexesL %~ Set.delete key) catalog1
-                             in current
-                                    & addTouches (indexTouchKeys key (indexStateTable state))
-                                    & addDeps deps
-                                    & evalCatalogL .~ catalog2
-             in mutateResolved stepKey eval keys
-        DropTrigger reference ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = resolveTriggerKeys session catalog reference
-                stepKey current key =
-                    case Map.lookup key (catalogTriggers (evalCatalog current)) of
-                        Nothing -> current
-                        Just state ->
-                            let tableDeps =
-                                    maybe Set.empty (relationAllDeps session (evalCatalog current)) (triggerStateTable state)
-                                deps =
-                                    definitionDeps (triggerDefinition state) (triggerRestoredBy state)
-                                        `Set.union` tableDeps
-                                catalog1 = deleteTrigger key (evalCatalog current)
-                                catalog2 =
-                                    case triggerStateTable state of
-                                        Nothing -> catalog1
-                                        Just tableKey ->
-                                            modifyRelation tableKey (relTriggersL %~ Set.delete key) catalog1
-                             in current
-                                    & addTouches (triggerTouchKeys key (triggerStateTable state))
-                                    & addDeps deps
-                                    & evalCatalogL .~ catalog2
-             in mutateResolved stepKey eval keys
-        DropSequence reference ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = resolveSequenceKeys session catalog reference
-                stepKey current key =
-                    case Map.lookup key (catalogSequences (evalCatalog current)) of
-                        Nothing -> current
-                        Just state ->
-                            let deps =
-                                    definitionDeps (sequenceDefinition state) (sequenceRestoredBy state)
-                                        `Set.union` sequenceWrites state
-                             in current
-                                    & addTouches (sequenceTouchKeys key)
-                                    & addDeps deps
-                                    & evalCatalogL %~ deleteSequence key
-             in mutateResolved stepKey eval keys
-        DropType name ->
-            let catalog = evalCatalog eval
-                key = qualifyObjectName (evalSession eval) name
+dropOne sid mode eval (DropRelation reference _kind) =
+    dropRelation sid mode eval reference
+dropOne _ _ eval (DropIndex reference) =
+    dropIndex eval reference
+dropOne _ _ eval (DropTrigger reference) =
+    dropTrigger eval reference
+dropOne _ _ eval (DropSequence reference) =
+    dropSequence eval reference
+dropOne _ _ eval (DropType name) =
+    dropType eval name
+dropOne sid mode eval (DropSchema name) =
+    dropSchema sid mode eval name
+
+dropRelation :: StatementId -> DropMode -> Eval -> NameRef -> Eval
+dropRelation sid mode eval reference
+    | null existing = addTouch (RelationBarrierKey (relationFallbackKey session reference)) eval
+    | otherwise = mutateResolved stepKey eval existing
+    where
+        session = evalSession eval
+        catalog = evalCatalog eval
+        keys = resolveRelationKeys session catalog reference
+        existing = filter (`Map.member` catalogRelations catalog) keys
+        stepKey current key =
+            let currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
                 deps =
-                    maybe
-                        Set.empty
-                        definitionStateDeps
-                        (Map.lookup key (catalogTypes catalog))
-             in eval
-                    & addTouches (typeTouchKeys key)
+                    relationAllDeps session currentCatalog key
+                        `Set.union` relationConstraintDeps currentCatalog relation
+             in current
+                    & addTouches (relationTouchKeys key)
                     & addDeps deps
-                    & evalCatalogL . catalogTypesL %~ Map.delete key
-        DropSchema name ->
-            let catalog = evalCatalog eval
-                session = evalSession eval
-                -- Schema names are not resolved through search_path.
-                key = name
-                contents = schemaContents catalog key
-                schemaDeps =
-                    maybe
-                        Set.empty
-                        definitionStateDeps
-                        (Map.lookup key (catalogSchemas catalog))
-                deps = schemaDeps `Set.union` schemaContentsDeps session catalog contents
-                catalog1 =
-                    case mode of
-                        DropCascade ->
-                            foldl'
-                                (flip (markResolutionChange sid))
-                                (removeSchemaCascade session key catalog)
-                                (contentsRelations contents)
-                        DropRestrict
-                            -- A non-empty schema makes the server reject the
-                            -- drop, so the catalog must stay unchanged.
-                            | schemaContentsEmpty contents ->
-                                catalog & catalogSchemasL %~ Map.delete key
-                            | otherwise -> catalog
-             in eval
-                    & addTouches (schemaTouchKeys key)
-                    & addDeps deps
-                    & evalCatalogL .~ catalog1
+                    & evalCatalogL %~ (removeRelationCascade session mode key . markResolutionChange sid key)
+
+dropIndex :: Eval -> IndexRef -> Eval
+dropIndex eval reference = mutateResolved stepKey eval keys
+    where
+        session = evalSession eval
+        keys = resolveIndexKeys session (evalCatalog eval) reference
+        stepKey current key
+            | Just state <- Map.lookup key (catalogIndexes (evalCatalog current)) =
+                let currentCatalog = evalCatalog current
+                    tableDeps = maybe Set.empty (relationAllDeps session currentCatalog) (indexStateTable state)
+                    deps = definitionDeps (indexDefinition state) (indexRestoredBy state) `Set.union` tableDeps
+                    catalog1 = deleteIndex key currentCatalog
+                    catalog2 =
+                        maybe
+                            catalog1
+                            (\tableKey -> modifyRelation tableKey (relIndexesL %~ Set.delete key) catalog1)
+                            (indexStateTable state)
+                 in current
+                        & addTouches (indexTouchKeys key (indexStateTable state))
+                        & addDeps deps
+                        & evalCatalogL .~ catalog2
+            | otherwise = current
+
+dropTrigger :: Eval -> TriggerRef -> Eval
+dropTrigger eval reference = mutateResolved stepKey eval keys
+    where
+        session = evalSession eval
+        keys = resolveTriggerKeys session (evalCatalog eval) reference
+        stepKey current key
+            | Just state <- Map.lookup key (catalogTriggers (evalCatalog current)) =
+                let currentCatalog = evalCatalog current
+                    tableDeps = maybe Set.empty (relationAllDeps session currentCatalog) (triggerStateTable state)
+                    deps = definitionDeps (triggerDefinition state) (triggerRestoredBy state) `Set.union` tableDeps
+                    catalog1 = deleteTrigger key currentCatalog
+                    catalog2 =
+                        maybe
+                            catalog1
+                            (\tableKey -> modifyRelation tableKey (relTriggersL %~ Set.delete key) catalog1)
+                            (triggerStateTable state)
+                 in current
+                        & addTouches (triggerTouchKeys key (triggerStateTable state))
+                        & addDeps deps
+                        & evalCatalogL .~ catalog2
+            | otherwise = current
+
+dropSequence :: Eval -> NameRef -> Eval
+dropSequence eval reference = mutateResolved stepKey eval keys
+    where
+        keys = resolveSequenceKeys (evalSession eval) (evalCatalog eval) reference
+        stepKey current key
+            | Just state <- Map.lookup key (catalogSequences (evalCatalog current)) =
+                let deps =
+                        definitionDeps (sequenceDefinition state) (sequenceRestoredBy state)
+                            `Set.union` sequenceWrites state
+                 in current
+                        & addTouches (sequenceTouchKeys key)
+                        & addDeps deps
+                        & evalCatalogL %~ deleteSequence key
+            | otherwise = current
+
+dropType :: Eval -> Name -> Eval
+dropType eval name =
+    eval
+        & addTouches (typeTouchKeys key)
+        & addDeps deps
+        & evalCatalogL . catalogTypesL %~ Map.delete key
+    where
+        catalog = evalCatalog eval
+        key = qualifyObjectName (evalSession eval) name
+        deps = maybe Set.empty definitionStateDeps (Map.lookup key (catalogTypes catalog))
+
+dropSchema :: StatementId -> DropMode -> Eval -> Name -> Eval
+dropSchema sid mode eval key =
+    eval
+        & addTouches (schemaTouchKeys key)
+        & addDeps deps
+        & evalCatalogL .~ catalog1
+    where
+        catalog = evalCatalog eval
+        session = evalSession eval
+        -- Schema names are not resolved through search_path.
+        contents = schemaContents catalog key
+        schemaDeps = maybe Set.empty definitionStateDeps (Map.lookup key (catalogSchemas catalog))
+        deps = schemaDeps `Set.union` schemaContentsDeps session catalog contents
+        catalog1 = case mode of
+            DropCascade ->
+                foldl'
+                    (flip (markResolutionChange sid))
+                    (removeSchemaCascade session key catalog)
+                    (contentsRelations contents)
+            DropRestrict
+                -- A non-empty schema makes the server reject the drop, so the catalog must stay unchanged.
+                | schemaContentsEmpty contents -> catalog & catalogSchemasL %~ Map.delete key
+                | otherwise -> catalog
 
 removeRelationCascade :: SessionState -> DropMode -> RelationKey -> Catalog -> Catalog
 removeRelationCascade session mode = go Set.empty
     where
         go seen currentKey catalog
             | Set.member currentKey seen = catalog
+            | DropRestrict <- mode
+            , not (null dependentViews) || not (null foreignKeys) =
+                -- The server rejects the drop while dependents exist.
+                catalog
+            | DropRestrict <- mode =
+                clearRelationObjects currentKey catalog
             | otherwise =
-                let seen' = Set.insert currentKey seen
-                    dependentViews =
-                        [ viewKey
-                        | (viewKey, relation) <- Map.toList (catalogRelations catalog)
-                        , viewKey /= currentKey
-                        , relKind relation `elem` [ViewRelation, MaterializedViewRelation]
-                        , currentKey `Set.member` relSources relation
-                            || any
-                                ( \reference ->
-                                    currentKey `elem` resolveRelationKeys session catalog reference
-                                )
-                                (Set.toList (relUnresolvedSources relation))
-                        ]
-                    foreignKeys =
-                        [ constraintKey
-                        | (constraintKey, state, foreignKey) <- allForeignKeys catalog
-                        , constraintStateTable state /= currentKey
-                        , currentKey
-                            `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey)
-                        ]
-                 in case mode of
-                        DropRestrict
-                            -- The server rejects the drop while dependents exist.
-                            | not (null dependentViews) || not (null foreignKeys) -> catalog
-                            | otherwise -> clearRelationObjects currentKey catalog
-                        DropCascade ->
-                            let catalog1 =
-                                    foldl'
-                                        (flip (go seen'))
-                                        catalog
-                                        dependentViews
-                                catalog2 = foldl' (flip deleteConstraint) catalog1 foreignKeys
-                             in clearRelationObjects currentKey catalog2
+                let catalog1 = foldl' (flip (go seen')) catalog dependentViews
+                    catalog2 = foldl' (flip deleteConstraint) catalog1 foreignKeys
+                 in clearRelationObjects currentKey catalog2
+            where
+                seen' = Set.insert currentKey seen
+                dependentViews = dependentViewKeys session catalog currentKey
+                foreignKeys = dependentForeignKeys session catalog currentKey
+
+dependentViewKeys :: SessionState -> Catalog -> RelationKey -> [RelationKey]
+dependentViewKeys session catalog currentKey =
+    [ viewKey
+    | (viewKey, relation) <- Map.toList (catalogRelations catalog)
+    , viewKey /= currentKey
+    , relKind relation `elem` [ViewRelation, MaterializedViewRelation]
+    , currentKey `Set.member` relSources relation
+        || any
+            (elem currentKey . resolveRelationKeys session catalog)
+            (Set.toList (relUnresolvedSources relation))
+    ]
+
+dependentForeignKeys :: SessionState -> Catalog -> RelationKey -> [ConstraintKey]
+dependentForeignKeys session catalog currentKey =
+    [ constraintKey
+    | (constraintKey, state, foreignKey) <- allForeignKeys catalog
+    , constraintStateTable state /= currentKey
+    , currentKey `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+    ]
 
 data SchemaContents = SchemaContents
     { contentsRelations :: ![RelationKey]

@@ -163,66 +163,47 @@ applyTxEffects sid effects state = foldl' step (state, Set.empty) effects
                 _ -> Nothing
 
 applyTxEffect :: StatementId -> ScanState -> TxEffect -> ScanState
-applyTxEffect sid state effect =
-    case effect of
-        TxBegin policy ->
-            case scanTransactions state of
-                [] ->
-                    let (frame, state') = createFrame state True (Just sid)
-                     in state' {scanTransactions = [frame]}
-                frame : rest
-                    | policy == BeginCommitActive ->
-                        -- Commit pending transaction before starting a fresh one under BeginCommitActive.
-                        applyTxEffect sid (commitFrame sid state) (TxBegin BeginIgnore)
-                    | not (frameExplicit frame) ->
-                        state
-                            { scanTransactions =
-                                frame
-                                    { frameExplicit = True
-                                    , frameBegin = Just sid
-                                    , frameNesting =
-                                        if policy == BeginIgnore
-                                            then frameNesting frame + 1
-                                            else frameNesting frame
-                                    }
-                                    : rest
-                            }
-                    | policy == BeginIgnore ->
-                        state
-                            { scanTransactions =
-                                frame {frameNesting = frameNesting frame + 1} : rest
-                            }
-                    | otherwise -> state
-        TxCommit chain ->
-            case scanTransactions state of
-                frame : rest
-                    | frameNesting frame > 1 ->
-                        state
-                            { scanTransactions =
-                                frame {frameNesting = frameNesting frame - 1} : rest
-                            }
-                _ ->
-                    let state' = commitFrame sid state
-                     in if chain
-                            then
-                                let (frame, state'') = createFrame state' True (Just sid)
-                                 in state'' {scanTransactions = frame : scanTransactions state'}
-                            else state'
-        TxRollbackAll -> rollbackFrame sid state
-        TxRollbackTo name -> rollbackTo sid name state
-        TxSavepoint name -> savepoint sid name state
-        TxReleaseSavepoint name -> releaseSavepoint sid name state
-        TxSetReadOnly value ->
-            state
-                { scanSession =
-                    (scanSession state)
-                        { sessTxVariables =
-                            Map.insert
-                                "transaction_read_only"
-                                (SessionBool value)
-                                (sessTxVariables (scanSession state))
-                        }
-                }
+applyTxEffect sid state (TxBegin policy) = applyTxBegin sid policy state
+applyTxEffect sid state (TxCommit chain) = applyTxCommit sid chain state
+applyTxEffect sid state TxRollbackAll = rollbackFrame sid state
+applyTxEffect sid state (TxRollbackTo name) = rollbackTo sid name state
+applyTxEffect sid state (TxSavepoint name) = savepoint sid name state
+applyTxEffect sid state (TxReleaseSavepoint name) = releaseSavepoint sid name state
+applyTxEffect _ state (TxSetReadOnly value) =
+    state {scanSession = session {sessTxVariables = txVars'}}
+    where
+        session = scanSession state
+        txVars' = Map.insert "transaction_read_only" (SessionBool value) (sessTxVariables session)
+
+applyTxBegin :: StatementId -> BeginPolicy -> ScanState -> ScanState
+applyTxBegin sid policy state = case scanTransactions state of
+    [] ->
+        let (frame, state') = createFrame state True (Just sid)
+         in state' {scanTransactions = [frame]}
+    frame : rest
+        | policy == BeginCommitActive ->
+            -- Commit pending transaction before starting a fresh one under BeginCommitActive.
+            applyTxBegin sid BeginIgnore (commitFrame sid state)
+        | not (frameExplicit frame) ->
+            let nesting = if policy == BeginIgnore then frameNesting frame + 1 else frameNesting frame
+                frame' = frame {frameExplicit = True, frameBegin = Just sid, frameNesting = nesting}
+             in state {scanTransactions = frame' : rest}
+        | policy == BeginIgnore ->
+            state {scanTransactions = frame {frameNesting = frameNesting frame + 1} : rest}
+        | otherwise -> state
+
+applyTxCommit :: StatementId -> Bool -> ScanState -> ScanState
+applyTxCommit sid chain state = case scanTransactions state of
+    frame : rest
+        | frameNesting frame > 1 ->
+            state {scanTransactions = frame {frameNesting = frameNesting frame - 1} : rest}
+    _ ->
+        let state' = commitFrame sid state
+         in if chain
+                then
+                    let (frame, state'') = createFrame state' True (Just sid)
+                     in state'' {scanTransactions = frame : scanTransactions state'}
+                else state'
 
 savepoint :: StatementId -> Ident -> ScanState -> ScanState
 savepoint sid name state =
@@ -299,30 +280,26 @@ applyOnCommit :: Int -> SessionState -> Catalog -> Catalog
 applyOnCommit transactionId session catalog
     | not (catalogMayHaveOnCommit catalog) = catalog
     | otherwise =
-        let relations =
-                Map.map
-                    ( \relation ->
-                        case relOnCommit relation of
-                            Just OnCommitDeleteRows ->
-                                relation
-                                    { relDataWrites = Set.empty
-                                    , relCardinalityWrites = Set.empty
-                                    , relColumnWrites = Map.empty
-                                    }
-                            _ -> relation
-                    )
-                    (catalogRelations catalog)
-            dropKeys =
-                [ key
-                | (key, relation) <- Map.toList relations
-                , relOnCommit relation == Just OnCommitDrop
-                , relOnCommitFrameId relation == Just transactionId
-                ]
-            catalog1 = catalog {catalogRelations = relations}
-         in foldl'
-                (flip (removeRelationCascade session DropCascade))
-                catalog1
-                dropKeys
+        foldl'
+            (flip (removeRelationCascade session DropCascade))
+            (catalog {catalogRelations = relations})
+            dropKeys
+    where
+        relations = Map.map clearRowsOnCommit (catalogRelations catalog)
+        dropKeys =
+            [ key
+            | (key, relation) <- Map.toList relations
+            , relOnCommit relation == Just OnCommitDrop
+            , relOnCommitFrameId relation == Just transactionId
+            ]
+        clearRowsOnCommit relation
+            | relOnCommit relation == Just OnCommitDeleteRows =
+                relation
+                    { relDataWrites = Set.empty
+                    , relCardinalityWrites = Set.empty
+                    , relColumnWrites = Map.empty
+                    }
+            | otherwise = relation
 
 -- ----------------------------------------------------------------------------
 -- Transactional rollback

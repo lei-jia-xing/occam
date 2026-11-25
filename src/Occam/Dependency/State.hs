@@ -702,14 +702,12 @@ insertRelation key relation catalog =
             | otherwise = Set.delete key children
         (mbExisting, rels') =
             Map.insertLookupWithKey (\_ new _ -> new) key relation (catalogRelations catalog)
-        byLast' = case mbExisting of
-            Just _ -> catalogRelationsByLast catalog
-            Nothing
-                | relationKeyTemp key -> catalogRelationsByLast catalog
-                | otherwise -> case nameLast (relationKeyName key) of
-                    Nothing -> catalogRelationsByLast catalog
-                    Just ident ->
-                        Map.insertWith Set.union ident (Set.singleton key) (catalogRelationsByLast catalog)
+        byLast'
+            | Nothing <- mbExisting
+            , not (relationKeyTemp key)
+            , Just ident <- nameLast (relationKeyName key) =
+                Map.insertWith Set.union ident (Set.singleton key) (catalogRelationsByLast catalog)
+            | otherwise = catalogRelationsByLast catalog
      in catalog
             { catalogRelations = rels'
             , catalogMayHaveOnCommit = catalogMayHaveOnCommit catalog || isJust (relOnCommit relation)
@@ -723,17 +721,14 @@ deleteRelation key catalog =
         children' = if Set.null children then children else Set.delete key children
         byLast = catalogRelationsByLast catalog
         byLast'
-            | relationKeyTemp key || Map.null byLast = byLast
-            | otherwise = case nameLast (relationKeyName key) of
-                Nothing -> byLast
-                Just ident ->
-                    Map.update
-                        ( \keys ->
-                            let keys' = Set.delete key keys
-                             in if Set.null keys' then Nothing else Just keys'
-                        )
-                        ident
-                        byLast
+            | not (relationKeyTemp key)
+            , not (Map.null byLast)
+            , Just ident <- nameLast (relationKeyName key) =
+                Map.update removeKey ident byLast
+            | otherwise = byLast
+        removeKey keys =
+            let keys' = Set.delete key keys
+             in if Set.null keys' then Nothing else Just keys'
      in catalog
             { catalogRelations = Map.delete key (catalogRelations catalog)
             , catalogRelationsByLast = byLast'

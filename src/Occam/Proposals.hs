@@ -253,17 +253,12 @@ weaklyConnectedComponents nodes fastEdges = collect IntSet.empty (IntSet.toList 
         adj = IntMap.foldlWithKey' addNode IntMap.empty fastEdges
         addNode acc u preds
             | IntSet.notMember u nodes = acc
+            | otherwise = IntSet.foldl' (addUndirectedEdge u) acc preds
+        addUndirectedEdge u m v
+            | IntSet.notMember v nodes = m
             | otherwise =
-                IntSet.foldl'
-                    ( \m v ->
-                        if IntSet.member v nodes
-                            then
-                                IntMap.insertWith IntSet.union u (IntSet.singleton v) $
-                                    IntMap.insertWith IntSet.union v (IntSet.singleton u) m
-                            else m
-                    )
-                    acc
-                    preds
+                IntMap.insertWith IntSet.union u (IntSet.singleton v) $
+                    IntMap.insertWith IntSet.union v (IntSet.singleton u) m
         collect _ [] = []
         collect visited (start : rest)
             | IntSet.member start visited = collect visited rest
@@ -271,12 +266,12 @@ weaklyConnectedComponents nodes fastEdges = collect IntSet.empty (IntSet.toList 
                 let comp = bfs (IntSet.singleton start) [start]
                  in comp : collect (IntSet.union visited comp) rest
         bfs seen [] = seen
-        bfs seen (curr : queue) =
-            let nbrs = IntMap.findWithDefault IntSet.empty curr adj
+        bfs seen (curr : queue)
+            | IntSet.null fresh = bfs seen queue
+            | otherwise = bfs (IntSet.union seen fresh) (IntSet.foldl' (flip (:)) queue fresh)
+            where
+                nbrs = IntMap.findWithDefault IntSet.empty curr adj
                 fresh = nbrs `IntSet.difference` seen
-             in if IntSet.null fresh
-                    then bfs seen queue
-                    else bfs (IntSet.union seen fresh) (IntSet.foldl' (flip (:)) queue fresh)
 
 relationStatementMap :: [Statement] -> DependencyGraph -> Map Text IntSet
 relationStatementMap statements graph =
@@ -312,84 +307,85 @@ opRelations = \case
 canonName :: Name -> Text
 canonName = T.toLower . nameText
 
+type TxGroupState =
+    ([(Int, Int, Bool)], [(Text, Int, Int, Bool)], [(Text, IntSet)], [(Text, IntSet)])
+
 extractTransactionGroups ::
     [Statement] ->
     DependencyGraph ->
     Maybe Int ->
     ([(Text, IntSet)], [(Text, IntSet)])
 extractTransactionGroups statements graph targetId =
-    let indexed = zip [0 :: Int ..] statements
-        idsBetween startIdx endIdx =
-            IntSet.fromList
-                [ unStatementId (stmtId s)
-                | (i, s) <- indexed
-                , i >= startIdx && i <= endIdx
-                ]
-        (_, _, blocks, wrappers) = foldl' (stepTx idsBetween) ([], [], [], []) indexed
-     in (reverse blocks, reverse wrappers)
+    (reverse blocks, reverse wrappers)
     where
-        stepTx idsBetween (txStack, spStack, blocks, wrappers) (idx, stmt) =
+        indexed = zip [0 :: Int ..] statements
+        idsBetween startIdx endIdx =
+            IntSet.fromList [unStatementId (stmtId s) | (i, s) <- indexed, i >= startIdx && i <= endIdx]
+        (_, _, blocks, wrappers) = foldl' stepTx ([], [], [], []) indexed
+        stepTx acc (idx, stmt) =
             let sid = unStatementId (stmtId stmt)
-                effects =
-                    maybe [] (\f -> factPreTx f ++ factPostTx f) (Map.lookup (stmtId stmt) (graphFacts graph))
-             in foldl' (applyEffect idsBetween idx sid) (txStack, spStack, blocks, wrappers) effects
-        applyEffect idsBetween idx sid (txStack, spStack, blocks, wrappers) = \case
-            TxBegin _ ->
-                ((idx, sid, False) : txStack, spStack, blocks, wrappers)
-            TxCommit _ -> case txStack of
-                (startIdx, startSid, sawRb) : restTx ->
-                    let block = idsBetween startIdx idx
-                        blocks' = ("tx-commit-block", block) : blocks
-                        wrappers'
-                            | not sawRb && idx - startIdx > 1 =
-                                ("tx-commit-wrapper", IntSet.fromList [startSid, sid]) : wrappers
-                            | otherwise = wrappers
-                     in (restTx, [], blocks', wrappers')
-                [] -> (txStack, spStack, blocks, wrappers)
-            TxRollbackAll -> case txStack of
-                (startIdx, _, _) : restTx ->
-                    let block = idsBetween startIdx idx
-                     in (restTx, [], ("tx-rollback-block", block) : blocks, wrappers)
-                [] -> (txStack, spStack, blocks, wrappers)
-            TxSavepoint sp ->
-                (txStack, (T.toLower (identText sp), idx, sid, False) : spStack, blocks, wrappers)
-            TxRollbackTo sp ->
-                let spKey = T.toLower (identText sp)
-                    txStack' = map (\(i, s, _) -> (i, s, True)) txStack
-                    (found, spStack') = markSavepoint spKey spStack
-                    blocks' = case found of
-                        Just startIdx ->
-                            let block = idsBetween startIdx idx
-                             in if maybe True (`IntSet.notMember` block) targetId
-                                    then ("savepoint-rollback-block", block) : blocks
-                                    else blocks
-                        Nothing -> blocks
-                 in (txStack', spStack', blocks', wrappers)
-            TxReleaseSavepoint sp ->
-                let spKey = T.toLower (identText sp)
-                 in case popSavepoint spKey spStack of
-                        Nothing -> (txStack, spStack, blocks, wrappers)
-                        Just (startIdx, startSid, sawRb, restSp) ->
-                            let block = idsBetween startIdx idx
-                                blocks' = ("savepoint-release-block", block) : blocks
-                                wrappers'
-                                    | not sawRb && idx - startIdx > 1 =
-                                        ("savepoint-release-wrapper", IntSet.fromList [startSid, sid]) : wrappers
-                                    | otherwise = wrappers
-                             in (txStack, restSp, blocks', wrappers')
-            TxSetReadOnly _ -> (txStack, spStack, blocks, wrappers)
+                effects = maybe [] (\f -> factPreTx f ++ factPostTx f) (Map.lookup (stmtId stmt) (graphFacts graph))
+             in foldl' (applyTxGroupEffect targetId idsBetween idx sid) acc effects
 
-        markSavepoint _ [] = (Nothing, [])
-        markSavepoint spKey ((k, i, s, rb) : rest)
-            | k == spKey = (Just i, (k, i, s, True) : rest)
-            | otherwise =
-                let (found, rest') = markSavepoint spKey rest
-                 in (found, (k, i, s, rb) : rest')
+applyTxGroupEffect ::
+    Maybe Int -> (Int -> Int -> IntSet) -> Int -> Int -> TxGroupState -> TxEffect -> TxGroupState
+applyTxGroupEffect _ _ idx sid (txStack, spStack, blocks, wrappers) (TxBegin _) =
+    ((idx, sid, False) : txStack, spStack, blocks, wrappers)
+applyTxGroupEffect _ idsBetween idx sid state@(txStack, _, blocks, wrappers) (TxCommit _) =
+    case txStack of
+        (startIdx, startSid, sawRb) : restTx ->
+            let block = idsBetween startIdx idx
+                blocks' = ("tx-commit-block", block) : blocks
+                wrappers'
+                    | not sawRb && idx - startIdx > 1 =
+                        ("tx-commit-wrapper", IntSet.fromList [startSid, sid]) : wrappers
+                    | otherwise = wrappers
+             in (restTx, [], blocks', wrappers')
+        [] -> state
+applyTxGroupEffect _ idsBetween idx _ state@(txStack, _, blocks, wrappers) TxRollbackAll =
+    case txStack of
+        (startIdx, _, _) : restTx ->
+            (restTx, [], ("tx-rollback-block", idsBetween startIdx idx) : blocks, wrappers)
+        [] -> state
+applyTxGroupEffect _ _ idx sid (txStack, spStack, blocks, wrappers) (TxSavepoint sp) =
+    (txStack, (T.toLower (identText sp), idx, sid, False) : spStack, blocks, wrappers)
+applyTxGroupEffect targetId idsBetween idx _ (txStack, spStack, blocks, wrappers) (TxRollbackTo sp) =
+    (txStack', spStack', blocks', wrappers)
+    where
+        spKey = T.toLower (identText sp)
+        txStack' = map (\(i, s, _) -> (i, s, True)) txStack
+        (found, spStack') = markSavepoint spKey spStack
+        blocks' = maybe blocks prependRollback found
+        prependRollback startIdx
+            | maybe True (`IntSet.notMember` block) targetId = ("savepoint-rollback-block", block) : blocks
+            | otherwise = blocks
+            where
+                block = idsBetween startIdx idx
+applyTxGroupEffect _ idsBetween idx sid state@(txStack, spStack, blocks, wrappers) (TxReleaseSavepoint sp)
+    | Just (startIdx, startSid, sawRb, restSp) <- popSavepoint (T.toLower (identText sp)) spStack =
+        let block = idsBetween startIdx idx
+            blocks' = ("savepoint-release-block", block) : blocks
+            wrappers'
+                | not sawRb && idx - startIdx > 1 =
+                    ("savepoint-release-wrapper", IntSet.fromList [startSid, sid]) : wrappers
+                | otherwise = wrappers
+         in (txStack, restSp, blocks', wrappers')
+    | otherwise = state
+applyTxGroupEffect _ _ _ _ state (TxSetReadOnly _) = state
 
-        popSavepoint _ [] = Nothing
-        popSavepoint spKey ((k, i, s, rb) : rest)
-            | k == spKey = Just (i, s, rb, rest)
-            | otherwise = popSavepoint spKey rest
+markSavepoint :: Text -> [(Text, Int, Int, Bool)] -> (Maybe Int, [(Text, Int, Int, Bool)])
+markSavepoint _ [] = (Nothing, [])
+markSavepoint spKey ((k, i, s, rb) : rest)
+    | k == spKey = (Just i, (k, i, s, True) : rest)
+    | otherwise =
+        let (found, rest') = markSavepoint spKey rest
+         in (found, (k, i, s, rb) : rest')
+
+popSavepoint :: Text -> [(Text, Int, Int, Bool)] -> Maybe (Int, Int, Bool, [(Text, Int, Int, Bool)])
+popSavepoint _ [] = Nothing
+popSavepoint spKey ((k, i, s, rb) : rest)
+    | k == spKey = Just (i, s, rb, rest)
+    | otherwise = popSavepoint spKey rest
 
 {- | Project pre-slice transaction/savepoint blocks onto surviving post-slice
 statements when slicing stripped transaction wrappers (e.g., @BEGIN@/@COMMIT@)

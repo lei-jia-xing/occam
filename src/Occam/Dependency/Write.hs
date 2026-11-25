@@ -105,55 +105,37 @@ import Occam.Dependency.State (
 -- chains. @relDataWrites@ is intentionally preserved untouched so direct-edge
 -- queries on @ReadData@ retain every contributing write.
 applyWriteState :: StatementId -> WriteKind -> [Ident] -> RelationState -> RelationState
-applyWriteState sid kind columns relation =
-    case kind of
-        InsertWrite _ ->
-            relation
-                & relDataWritesL %~ Set.insert sid
-                & relCardinalityWritesL .~ Set.singleton sid
-        MergeWrite ->
-            relation
-                & relDataWritesL %~ Set.insert sid
-                & relCardinalityWritesL .~ Set.singleton sid
-        DeleteWrite scope
-            | scope == DeleteAllRows ->
-                relation
-                    & relDataWritesL .~ Set.singleton sid
-                    & relCardinalityWritesL .~ Set.singleton sid
-                    & relColumnWritesL .~ Map.empty
-            | otherwise ->
-                relation
-                    & relDataWritesL %~ Set.insert sid
-                    & relCardinalityWritesL .~ Set.singleton sid
-        UpdateWrite scope
-            | scope == UpdateAllRows ->
-                if null columns
-                    then relation & relDataWritesL %~ Set.insert sid
-                    else
-                        relation
-                            & relColumnWritesL
-                                %~ ( \current ->
-                                        foldl'
-                                            (\m column -> Map.insert column (Set.singleton sid) m)
-                                            current
-                                            columns
-                                   )
-            | null columns ->
-                relation & relDataWritesL %~ Set.insert sid
-            | otherwise ->
-                relation
-                    & relColumnWritesL
-                        %~ ( \current ->
-                                foldl'
-                                    (\m column -> Map.insert column (Set.singleton sid) m)
-                                    current
-                                    columns
-                           )
-        TruncateWrite {} ->
-            relation
-                & relDataWritesL .~ Set.singleton sid
-                & relCardinalityWritesL .~ Set.singleton sid
-                & relColumnWritesL .~ Map.empty
+applyWriteState sid (InsertWrite _) _ relation =
+    relation
+        & relDataWritesL %~ Set.insert sid
+        & relCardinalityWritesL .~ Set.singleton sid
+applyWriteState sid MergeWrite _ relation =
+    relation
+        & relDataWritesL %~ Set.insert sid
+        & relCardinalityWritesL .~ Set.singleton sid
+applyWriteState sid (DeleteWrite DeleteAllRows) _ relation =
+    relation
+        & relDataWritesL .~ Set.singleton sid
+        & relCardinalityWritesL .~ Set.singleton sid
+        & relColumnWritesL .~ Map.empty
+applyWriteState sid (DeleteWrite DeleteFilteredRows) _ relation =
+    relation
+        & relDataWritesL %~ Set.insert sid
+        & relCardinalityWritesL .~ Set.singleton sid
+applyWriteState sid (UpdateWrite _) [] relation =
+    relation & relDataWritesL %~ Set.insert sid
+applyWriteState sid (UpdateWrite _) columns relation =
+    relation & relColumnWritesL %~ insertColumnWrites sid columns
+applyWriteState sid TruncateWrite {} _ relation =
+    relation
+        & relDataWritesL .~ Set.singleton sid
+        & relCardinalityWritesL .~ Set.singleton sid
+        & relColumnWritesL .~ Map.empty
+
+insertColumnWrites ::
+    StatementId -> [Ident] -> Map.Map Ident (Set StatementId) -> Map.Map Ident (Set StatementId)
+insertColumnWrites sid columns current =
+    foldl' (\m column -> Map.insert column (Set.singleton sid) m) current columns
 
 -- Reads
 processRead :: Eval -> ReadFact -> Eval
@@ -363,61 +345,38 @@ transitiveSources catalog = go Set.empty
     where
         go seen current
             | Set.member current seen = Set.empty
-            | otherwise =
-                case lookupRelation catalog current of
-                    Nothing -> Set.singleton current
-                    Just relation ->
-                        Set.insert current $
-                            Set.unions
-                                [ go (Set.insert current seen) source
-                                | source <- Set.toList (relSources relation)
-                                ]
+            | Just relation <- lookupRelation catalog current =
+                Set.insert current $
+                    Set.unions [go (Set.insert current seen) source | source <- Set.toList (relSources relation)]
+            | otherwise = Set.singleton current
 
 -- Triggers and sequences
 expandTrigger :: StatementId -> Eval -> TriggerKey -> Eval
 expandTrigger sid eval triggerKey
     | Set.member triggerKey (evalVisitedTriggers eval) = eval
-    | otherwise =
-        case Map.lookup triggerKey (catalogTriggers (evalCatalog eval)) of
-            Nothing -> eval
-            Just trigger ->
-                let tableKey = triggerStateTable trigger
-                    eval1 =
-                        eval
-                            { evalVisitedTriggers =
-                                Set.insert triggerKey (evalVisitedTriggers eval)
-                            }
-                    definitionDeps =
-                        Set.fromList
-                            ( catMaybes
-                                [ triggerDefinition trigger
-                                , triggerRestoredBy trigger
-                                ]
-                            )
-                    eval2 =
-                        addTouches
-                            (triggerTouchKeys triggerKey tableKey)
-                            (addDeps definitionDeps eval1)
-                    eval3 =
-                        foldl'
-                            processRead
-                            eval2
-                            (triggerStateWhenReads trigger)
-                 in case triggerStateBody trigger of
-                        TriggerInline effects ->
-                            foldl' (processTriggerEffect sid) eval3 effects
-                        TriggerFunction name _ ->
-                            addBarrier
-                                ( ScopedBarrier
-                                    GlobalScope
-                                    UnsupportedTriggerBodyBarrier
-                                    (Just ("trigger function " <> nameText name))
-                                )
-                                eval3
-                        TriggerOpaque ->
-                            addBarrier
-                                (ScopedBarrier GlobalScope OpaqueTriggerBodyBarrier Nothing)
-                                eval3
+    | Just trigger <- Map.lookup triggerKey (catalogTriggers (evalCatalog eval)) =
+        let tableKey = triggerStateTable trigger
+            eval1 = eval {evalVisitedTriggers = Set.insert triggerKey (evalVisitedTriggers eval)}
+            definitionDeps =
+                Set.fromList (catMaybes [triggerDefinition trigger, triggerRestoredBy trigger])
+            eval2 = addTouches (triggerTouchKeys triggerKey tableKey) (addDeps definitionDeps eval1)
+            eval3 = foldl' processRead eval2 (triggerStateWhenReads trigger)
+         in applyTriggerBody sid eval3 (triggerStateBody trigger)
+    | otherwise = eval
+
+applyTriggerBody :: StatementId -> Eval -> TriggerBody -> Eval
+applyTriggerBody sid eval = \case
+    TriggerInline effects -> foldl' (processTriggerEffect sid) eval effects
+    TriggerFunction name _ ->
+        addBarrier
+            ( ScopedBarrier
+                GlobalScope
+                UnsupportedTriggerBodyBarrier
+                (Just ("trigger function " <> nameText name))
+            )
+            eval
+    TriggerOpaque ->
+        addBarrier (ScopedBarrier GlobalScope OpaqueTriggerBodyBarrier Nothing) eval
 
 processTriggerEffect :: StatementId -> Eval -> TriggerEffect -> Eval
 processTriggerEffect sid eval effect =
@@ -457,41 +416,34 @@ processDmlEvent sid eval event =
 -- ----------------------------------------------------------------------------
 
 processSequenceWrite :: StatementId -> Eval -> SequenceWrite -> Eval
-processSequenceWrite sid eval write =
-    let session = evalSession eval
+processSequenceWrite sid eval write
+    | not transactional && evalTransactionActive eval =
+        -- Non-transactional sequence changes during an active transaction require a barrier.
+        addBarrier
+            ( ScopedBarrier
+                GlobalScope
+                UnsupportedTransactionBarrier
+                (Just "nontransactional sequence values in a transaction")
+            )
+            evalWrites
+    | otherwise = evalWrites
+    where
+        session = evalSession eval
         catalog = evalCatalog eval
         keys = resolveSequenceKeys session catalog (sequenceWriteTarget write)
         transactional = sequenceWriteTransactional write
-        stepKey current key =
-            let existing = Map.lookup key (catalogSequences (evalCatalog current))
-                state =
-                    fromMaybe
-                        (SequenceState Nothing Set.empty Nothing transactional)
-                        existing
-                deps =
-                    Set.fromList
-                        ( catMaybes
-                            [ sequenceDefinition state
-                            , sequenceRestoredBy state
-                            ]
-                        )
-                        `Set.union` sequenceWrites state
-             in current
-                    & addTouches (sequenceTouchKeys key)
-                    & addDeps deps
-                    & evalCatalogL . catalogSequencesL %~ Map.insert key (state & sequenceWritesL %~ Set.insert sid)
         evalWrites = mutateResolved stepKey eval keys
-     in if not transactional && evalTransactionActive eval
-            then
-                -- Non-transactional sequence changes during an active transaction require a barrier.
-                addBarrier
-                    ( ScopedBarrier
-                        GlobalScope
-                        UnsupportedTransactionBarrier
-                        (Just "nontransactional sequence values in a transaction")
-                    )
-                    evalWrites
-            else evalWrites
+        stepKey current key =
+            current
+                & addTouches (sequenceTouchKeys key)
+                & addDeps deps
+                & evalCatalogL . catalogSequencesL %~ Map.insert key (state & sequenceWritesL %~ Set.insert sid)
+            where
+                existing = Map.lookup key (catalogSequences (evalCatalog current))
+                state = fromMaybe (SequenceState Nothing Set.empty Nothing transactional) existing
+                deps =
+                    Set.fromList (catMaybes [sequenceDefinition state, sequenceRestoredBy state])
+                        `Set.union` sequenceWrites state
 
 -- Foreign keys
 applyForeignKeys :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
@@ -504,157 +456,97 @@ applyForeignKeys sid eval key kind columns
          in evalActions
 
 applyChildChecks :: Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-applyChildChecks eval key kind _columns =
-    case kind of
-        InsertWrite _ -> checkParents
-        UpdateWrite _ -> checkParents
-        MergeWrite -> checkParents
-        _ -> eval
+applyChildChecks eval key kind _columns = case kind of
+    InsertWrite _ -> foldl' checkParent eval (allForeignKeys catalog)
+    UpdateWrite _ -> foldl' checkParent eval (allForeignKeys catalog)
+    MergeWrite -> foldl' checkParent eval (allForeignKeys catalog)
+    _ -> eval
     where
         catalog = evalCatalog eval
         session = evalSession eval
-        checkParents =
-            foldl'
-                ( \current (_, state, foreignKey) ->
-                    if constraintStateTable state == key
-                        then
-                            addDeps
-                                ( Set.unions
-                                    [ relationReadDeps session catalog parentKey ReadData [] False
-                                    | parentKey <-
-                                        resolveRelationKeys
-                                            session
-                                            catalog
-                                            (foreignKeyParent foreignKey)
-                                    ]
-                                )
-                                current
-                        else current
-                )
-                eval
-                (allForeignKeys catalog)
+        checkParent current (_, state, foreignKey)
+            | constraintStateTable state /= key = current
+            | otherwise = addDeps parentDeps current
+            where
+                parentDeps =
+                    Set.unions
+                        [ relationReadDeps session catalog parentKey ReadData [] False
+                        | parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+                        ]
 
 applyParentActions :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-applyParentActions sid eval key kind columns =
-    case kind of
-        DeleteWrite _ ->
-            foldl'
-                (\current item -> parentAction current key (DeleteWrite DeleteAllRows) [] item)
-                eval
-                (allForeignKeys catalog)
-        UpdateWrite scope ->
-            foldl'
-                (\current item -> parentAction current key (UpdateWrite scope) columns item)
-                eval
-                (allForeignKeys catalog)
-        TruncateWrite behavior _ ->
-            if behavior == TruncateCascade
-                then
-                    foldl'
-                        ( \current (_, state, foreignKey) ->
-                            if parentMatches state foreignKey
-                                then
-                                    writeChild
-                                        current
-                                        (constraintStateTable state)
-                                        (TruncateWrite TruncateCascade ContinueIdentity)
-                                        []
-                                else current
-                        )
-                        eval
-                        (allForeignKeys catalog)
-                else
-                    foldl' addForeignKeyDep eval (allForeignKeys catalog)
-        _ -> eval
+applyParentActions sid eval key kind columns = case kind of
+    DeleteWrite _ ->
+        foldl' (\current item -> parentAction current (DeleteWrite DeleteAllRows) [] item) eval fks
+    UpdateWrite scope ->
+        foldl' (\current item -> parentAction current (UpdateWrite scope) columns item) eval fks
+    TruncateWrite TruncateCascade _ ->
+        foldl' cascadeTruncate eval fks
+    TruncateWrite {} ->
+        foldl' addForeignKeyDep eval fks
+    _ -> eval
     where
         catalog = evalCatalog eval
         session = evalSession eval
+        fks = allForeignKeys catalog
+
+        parentMatches foreignKey =
+            key `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey)
+
+        cascadeTruncate current (_, state, foreignKey)
+            | parentMatches foreignKey =
+                writeChild current (constraintStateTable state) (TruncateWrite TruncateCascade ContinueIdentity) []
+            | otherwise = current
+
         addForeignKeyDep current (_, state, foreignKey)
-            | parentMatches state foreignKey =
+            | parentMatches foreignKey =
                 let childKey = constraintStateTable state
-                    constraintDeps =
-                        Set.fromList
-                            ( catMaybes
-                                [ constraintDefinition state
-                                , constraintRestoredBy state
-                                ]
-                            )
-                    childDeps =
-                        relationReadDeps
-                            session
-                            catalog
-                            childKey
-                            ReadSchema
-                            []
-                            False
+                    constraintDeps = Set.fromList (catMaybes [constraintDefinition state, constraintRestoredBy state])
+                    childDeps = relationReadDeps session catalog childKey ReadSchema [] False
                  in addDeps (childDeps `Set.union` constraintDeps) current
             | otherwise = current
 
-        parentMatches _state foreignKey =
-            key
-                `elem` resolveRelationKeys
-                    session
-                    catalog
-                    (foreignKeyParent foreignKey)
+        parentAction current action updatedParentColumns (_, state, foreignKey)
+            | not (parentMatches foreignKey) = current
+            | not (foreignKeyEventMatches action updatedParentColumns foreignKey) = current
+            | otherwise = applyReferentialAction current action (constraintStateTable state) foreignKey
 
-        parentAction current parentKey action updatedParentColumns (_, state, foreignKey)
-            | not (parentMatches state foreignKey) = current
-            | not (foreignKeyEventMatches action updatedParentColumns parentKey state foreignKey) = current
-            | otherwise =
-                case referentialAction action foreignKey of
-                    Cascade ->
-                        case action of
-                            DeleteWrite _ ->
-                                -- Only matching children are deleted, even when the parent
-                                -- delete is unfiltered (nullable foreign keys can survive).
-                                writeChild current (constraintStateTable state) (DeleteWrite DeleteFilteredRows) []
-                            UpdateWrite _ ->
-                                writeChild
-                                    current
-                                    (constraintStateTable state)
-                                    (UpdateWrite UpdateFilteredRows)
-                                    (foreignKeyChildColumns foreignKey)
-                            _ -> current
-                    referential
-                        | referential `elem` [SetNull, SetDefault] ->
-                            writeChild
-                                current
-                                (constraintStateTable state)
-                                (UpdateWrite UpdateFilteredRows)
-                                (foreignKeyChildColumns foreignKey)
-                        | referential `elem` [Restrict, NoAction] ->
-                            addDeps
-                                (relationReadDeps session catalog (constraintStateTable state) ReadData [] False)
-                                current
-                        | otherwise -> current
+        applyReferentialAction current action childKey foreignKey =
+            case (referentialAction action foreignKey, action) of
+                (Cascade, DeleteWrite _) ->
+                    -- Only matching children are deleted, even when the parent
+                    -- delete is unfiltered (nullable foreign keys can survive).
+                    writeChild current childKey (DeleteWrite DeleteFilteredRows) []
+                (Cascade, UpdateWrite _) ->
+                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (SetNull, _) ->
+                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (SetDefault, _) ->
+                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (Restrict, _) ->
+                    addDeps (relationReadDeps session catalog childKey ReadData [] False) current
+                (NoAction, _) ->
+                    addDeps (relationReadDeps session catalog childKey ReadData [] False) current
+                _ -> current
 
-        foreignKeyEventMatches action updatedParentColumns _parentKey _state foreignKey =
-            case action of
-                DeleteWrite _ -> True
-                UpdateWrite _ ->
-                    let relevant = referencedParentColumns session catalog foreignKey
-                     in null updatedParentColumns
-                            || null relevant
-                            || not
-                                ( Set.null
-                                    ( Set.intersection
-                                        (Set.fromList updatedParentColumns)
-                                        (Set.fromList relevant)
-                                    )
-                                )
-                _ -> False
+        foreignKeyEventMatches (DeleteWrite _) _ _ = True
+        foreignKeyEventMatches (UpdateWrite _) updatedParentColumns foreignKey =
+            null updatedParentColumns
+                || null relevant
+                || not (Set.disjoint (Set.fromList updatedParentColumns) (Set.fromList relevant))
+            where
+                relevant = referencedParentColumns session catalog foreignKey
+        foreignKeyEventMatches _ _ _ = False
 
-        referentialAction action foreignKey =
-            case action of
-                DeleteWrite _ -> foreignKeyOnDelete foreignKey
-                UpdateWrite _ -> foreignKeyOnUpdate foreignKey
-                _ -> NoAction
+        referentialAction (DeleteWrite _) = foreignKeyOnDelete
+        referentialAction (UpdateWrite _) = foreignKeyOnUpdate
+        referentialAction _ = const NoAction
 
-        writeChild current childKey childKind childColumns =
-            let signature = writeSignature childKind childColumns
-             in if Set.member (childKey, signature) (evalVisitedWrites current)
-                    then current
-                    else writeRelation sid current childKey childKind childColumns False
+        writeChild current childKey childKind childColumns
+            | Set.member (childKey, signature) (evalVisitedWrites current) = current
+            | otherwise = writeRelation sid current childKey childKind childColumns False
+            where
+                signature = writeSignature childKind childColumns
 
 -- Refresh
 processRefresh :: StatementId -> Eval -> RefreshOp -> Eval

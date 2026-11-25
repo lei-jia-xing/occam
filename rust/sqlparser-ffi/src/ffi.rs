@@ -786,4 +786,172 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn recursive_predicate_flag_scopes_to_recursive_member_predicates() {
+        let sql = concat!(
+            "WITH RECURSIVE org AS (\n",
+            "  SELECT emp_id, manager_id, 1 AS depth FROM employees WHERE manager_id IS NULL\n",
+            "  UNION ALL\n",
+            "  SELECT e.emp_id, e.manager_id, h.depth + 1 FROM employees e JOIN org h ON e.manager_id = h.emp_id\n",
+            "),\n",
+            "dept AS (SELECT emp_id FROM org JOIN employees d ON org.emp_id = d.emp_id WHERE d.emp_id > 0)\n",
+            "SELECT h.emp_id FROM org h JOIN dept d ON h.emp_id = d.emp_id WHERE h.emp_id > 10;\n",
+            "WITH RECURSIVE cnt(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) SELECT x FROM cnt;\n",
+            "WITH plain AS (SELECT e.emp_id FROM employees e JOIN employees m ON e.manager_id = m.emp_id) SELECT * FROM plain;\n",
+        );
+        let units = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: Default::default(),
+                chunk_edits: false,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
+                syntax_only: true,
+                span_only: false,
+            },
+        )
+        .expect("parse");
+
+        // Unit 0: only edits inside `e.manager_id = h.emp_id` in the recursive member are flagged.
+        let u0_edits = &units[0].facts.as_ref().unwrap().edits;
+        let u0_flagged: Vec<(&str, &str)> = u0_edits
+            .iter()
+            .filter(|e| e.recursive_predicate)
+            .map(|e| (e.label.as_ref(), &sql[e.start..e.end]))
+            .collect();
+        assert!(
+            !u0_flagged.is_empty(),
+            "expected recursive JOIN ON edits to be flagged"
+        );
+        assert!(
+            u0_flagged
+                .iter()
+                .all(|(_, slice)| *slice == "e.manager_id = h.emp_id"),
+            "unexpected flagged edits in unit 0: {u0_flagged:?}"
+        );
+        // Anchor WHERE, h.depth + 1, remove-join, non-recursive CTE dept, and outer JOIN/WHERE stay unflagged.
+        assert!(
+            u0_edits
+                .iter()
+                .any(|e| !e.recursive_predicate && e.label == "remove-join"),
+            "remove-join should remain unflagged"
+        );
+        assert!(
+            u0_edits.iter().any(|e| !e.recursive_predicate
+                && e.label == "simplify-binary_expression"
+                && &sql[e.start..e.end] == "h.depth + 1"),
+            "projection binary expr in recursive member should remain unflagged"
+        );
+        assert!(
+            u0_edits.iter().any(|e| !e.recursive_predicate
+                && e.label == "simplify-binary_expression"
+                && &sql[e.start..e.end] == "org.emp_id = d.emp_id"),
+            "non-recursive sibling CTE join predicate should remain unflagged"
+        );
+        assert!(
+            u0_edits.iter().any(|e| !e.recursive_predicate
+                && e.label == "simplify-binary_expression"
+                && &sql[e.start..e.end] == "h.emp_id = d.emp_id"),
+            "outer query join predicate should remain unflagged"
+        );
+
+        // Unit 1: recursive member WHERE (`remove-where`, `x < 10`, literal `10`) are flagged; `x + 1` is not.
+        let u1_edits = &units[1].facts.as_ref().unwrap().edits;
+        assert!(
+            u1_edits
+                .iter()
+                .any(|e| e.recursive_predicate && e.label == "remove-where"),
+            "recursive member remove-where should be flagged"
+        );
+        assert!(
+            u1_edits.iter().any(|e| e.recursive_predicate
+                && e.label == "simplify-binary_expression"
+                && &sql[e.start..e.end] == "x < 10"),
+            "recursive member WHERE predicate should be flagged"
+        );
+        assert!(
+            u1_edits.iter().any(|e| !e.recursive_predicate
+                && e.label == "simplify-binary_expression"
+                && &sql[e.start..e.end] == "x + 1"),
+            "recursive member SELECT expr x + 1 should remain unflagged"
+        );
+
+        // Unit 2: non-recursive WITH has zero flagged edits.
+        let u2_edits = &units[2].facts.as_ref().unwrap().edits;
+        assert!(
+            u2_edits.iter().all(|e| !e.recursive_predicate),
+            "non-recursive WITH should have zero recursive_predicate edits"
+        );
+    }
+
+    #[test]
+    fn literal_and_expression_flags_classify_in_rust() {
+        let sql = "SELECT 'payload_alpha', 10000, a > 0;";
+        let units = parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::SQLite,
+                server: Default::default(),
+                chunk_edits: false,
+                column_ir: false,
+                column_bundles: false,
+                syntax_edits: true,
+                syntax_only: true,
+                span_only: false,
+            },
+        )
+        .expect("parse");
+        let edits = &units[0].facts.as_ref().unwrap().edits;
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Literal
+                    && e.string_literal
+                    && e.replacement == "''"
+                    && !e.low_yield)
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Literal
+                    && e.string_literal
+                    && e.replacement == "0"
+                    && e.low_yield)
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Literal
+                    && !e.string_literal
+                    && e.replacement == "1"
+                    && !e.low_yield)
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Literal
+                    && !e.string_literal
+                    && e.replacement == "NULL"
+                    && e.low_yield)
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Expression
+                    && e.label == "simplify-binary_expression"
+                    && e.replacement == "a"
+                    && !e.low_yield)
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.category == crate::NativeEditCategory::Expression
+                    && e.label == "simplify-binary_expression"
+                    && e.replacement == "0"
+                    && e.low_yield)
+        );
+    }
 }

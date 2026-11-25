@@ -91,78 +91,65 @@ insertTrie bs TrieEmpty
     | BS.null bs = (TrieBranch True IntMap.empty, True)
     | otherwise = (TrieEdge bs (TrieBranch True IntMap.empty), True)
 insertTrie bs (TrieEdge edge child)
-    | bs == edge =
-        case child of
-            TrieBranch True _ -> (TrieEdge edge child, False)
-            TrieBranch False m -> (TrieEdge edge (TrieBranch True m), True)
-            TrieEmpty -> (TrieEdge edge (TrieBranch True IntMap.empty), True)
-            TrieEdge {} ->
-                let b = fromIntegral (BS.head (edgeOf child))
-                 in (TrieEdge edge (TrieBranch True (IntMap.singleton b child)), True)
-    | otherwise =
-        let !commonLen = commonPrefixLength bs edge
-         in if commonLen == BS.length edge
-                then
-                    let (child', ins) = insertTrie (BS.drop commonLen bs) child
-                     in (TrieEdge edge child', ins)
-                else
-                    if commonLen == 0
-                        then
-                            let !b1 = fromIntegral (BS.head bs)
-                                !b2 = fromIntegral (BS.head edge)
-                                !c1 = makeEdge (BS.tail bs) (TrieBranch True IntMap.empty)
-                                !c2 = makeEdge (BS.tail edge) child
-                                !m = IntMap.fromList [(b1, c1), (b2, c2)]
-                             in (TrieBranch False m, True)
-                        else
-                            let !common = BS.take commonLen edge
-                                !edgeRest = BS.drop commonLen edge
-                                !bsRest = BS.drop commonLen bs
-                                !b2 = fromIntegral (BS.head edgeRest)
-                                !c2 = makeEdge (BS.tail edgeRest) child
-                                !branch =
-                                    if BS.null bsRest
-                                        then TrieBranch True (IntMap.singleton b2 c2)
-                                        else
-                                            let !b1 = fromIntegral (BS.head bsRest)
-                                                !c1 = makeEdge (BS.tail bsRest) (TrieBranch True IntMap.empty)
-                                                !m = IntMap.fromList [(b1, c1), (b2, c2)]
-                                             in TrieBranch False m
-                             in (TrieEdge common branch, True)
+    | bs == edge = insertExactEdge edge child
+    | commonLen == BS.length edge =
+        let (child', ins) = insertTrie (BS.drop commonLen bs) child
+         in (TrieEdge edge child', ins)
+    | commonLen == 0 =
+        let !b1 = fromIntegral (BS.head bs)
+            !b2 = fromIntegral (BS.head edge)
+            !c1 = makeEdge (BS.tail bs) (TrieBranch True IntMap.empty)
+            !c2 = makeEdge (BS.tail edge) child
+         in (TrieBranch False (IntMap.fromList [(b1, c1), (b2, c2)]), True)
+    | otherwise = splitEdgeAt commonLen bs edge child
     where
-        edgeOf (TrieEdge e _) = e
-        edgeOf _ = BS.empty
-
-        makeEdge rest c
-            | BS.null rest = c
-            | otherwise = TrieEdge rest c
-
-        commonPrefixLength s1 s2 =
-            let !l1 = BS.length s1
-                !l2 = BS.length s2
-                !maxL = min l1 l2
-                go !i
-                    | i < maxL && BS.index s1 i == BS.index s2 i = go (i + 1)
-                    | otherwise = i
-             in go 0
+        !commonLen = commonPrefixLength bs edge
 insertTrie bs (TrieBranch isTerm children)
-    | BS.null bs =
-        if isTerm
-            then (TrieBranch isTerm children, False)
-            else (TrieBranch True children, True)
+    | BS.null bs = (TrieBranch True children, not isTerm)
     | otherwise =
         let !b = fromIntegral (BS.head bs)
             !rest = BS.tail bs
-         in case IntMap.lookup b children of
-                Nothing ->
-                    let !newChild =
-                            if BS.null rest
-                                then TrieBranch True IntMap.empty
-                                else TrieEdge rest (TrieBranch True IntMap.empty)
-                     in (TrieBranch isTerm (IntMap.insert b newChild children), True)
-                Just existing ->
-                    let (updatedChild, inserted) = insertTrie rest existing
-                     in (TrieBranch isTerm (IntMap.insert b updatedChild children), inserted)
+            (updatedChild, inserted) = case IntMap.lookup b children of
+                Nothing -> (makeEdge rest (TrieBranch True IntMap.empty), True)
+                Just existing -> insertTrie rest existing
+         in (TrieBranch isTerm (IntMap.insert b updatedChild children), inserted)
+
+insertExactEdge :: ByteString -> ByteTrie -> (ByteTrie, Bool)
+insertExactEdge edge child = case child of
+    TrieBranch True _ -> (TrieEdge edge child, False)
+    TrieBranch False m -> (TrieEdge edge (TrieBranch True m), True)
+    TrieEmpty -> (TrieEdge edge (TrieBranch True IntMap.empty), True)
+    TrieEdge e _ ->
+        let !b = fromIntegral (BS.head e)
+         in (TrieEdge edge (TrieBranch True (IntMap.singleton b child)), True)
+
+splitEdgeAt :: Int -> ByteString -> ByteString -> ByteTrie -> (ByteTrie, Bool)
+splitEdgeAt commonLen bs edge child
+    | BS.null bsRest = (TrieEdge common (TrieBranch True (IntMap.singleton b2 c2)), True)
+    | otherwise =
+        let !b1 = fromIntegral (BS.head bsRest)
+            !c1 = makeEdge (BS.tail bsRest) (TrieBranch True IntMap.empty)
+            !branch = TrieBranch False (IntMap.fromList [(b1, c1), (b2, c2)])
+         in (TrieEdge common branch, True)
+    where
+        !common = BS.take commonLen edge
+        !edgeRest = BS.drop commonLen edge
+        !bsRest = BS.drop commonLen bs
+        !b2 = fromIntegral (BS.head edgeRest)
+        !c2 = makeEdge (BS.tail edgeRest) child
+
+makeEdge :: ByteString -> ByteTrie -> ByteTrie
+makeEdge rest c
+    | BS.null rest = c
+    | otherwise = TrieEdge rest c
+
+commonPrefixLength :: ByteString -> ByteString -> Int
+commonPrefixLength s1 s2 = go 0
+    where
+        !maxL = min (BS.length s1) (BS.length s2)
+        go !i
+            | i < maxL && BS.index s1 i == BS.index s2 i = go (i + 1)
+            | otherwise = i
 
 {- | Bounded, thread-safe memo of semicolon-terminated deterministic SQL error
 prefixes observed during native result-oracle execution. Any future candidate
@@ -326,33 +313,22 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
             map (Just . spanStartByte . stmtSpan . unitStatement) (drop 1 units)
                 ++ repeat Nothing
 
-        uniqueDefiners =
-            IntMap.foldlWithKey'
-                ( \acc sid reqs ->
-                    foldl'
-                        ( \m req ->
-                            if IntSet.size req == 1
-                                then
-                                    let defSid = IntSet.findMin req
-                                     in if defSid /= sid
-                                            then IntMap.insertWith IntSet.union defSid (IntSet.singleton sid) m
-                                            else m
-                                else m
-                        )
-                        acc
-                        reqs
-                )
-                IntMap.empty
-                missingDefReqs
+        uniqueDefiners = IntMap.foldlWithKey' addUniqueDefiners IntMap.empty missingDefReqs
+        addUniqueDefiners acc sid = foldl' (addUniqueDefiner sid) acc
+        addUniqueDefiner sid m req
+            | Just (defSid, rest) <- IntSet.minView req
+            , IntSet.null rest
+            , defSid /= sid =
+                IntMap.insertWith IntSet.union defSid (IntSet.singleton sid) m
+            | otherwise = m
 
-        (prefixByteLens, prefixLengths) =
-            case traceEndByteOffsets trace of
-                Just endOffsets
-                    | traceDeterministic trace
-                    , totalStmts >= 2
-                    , length endOffsets == totalStmts ->
-                        collectPrefixes (zip3 [0 :: Int ..] endOffsets nextStarts) IntSet.empty IntSet.empty
-                _ -> (IntSet.empty, IntSet.empty)
+        (prefixByteLens, prefixLengths) = case traceEndByteOffsets trace of
+            Just endOffsets
+                | traceDeterministic trace
+                , totalStmts >= 2
+                , length endOffsets == totalStmts ->
+                    collectPrefixes (zip3 [0 :: Int ..] endOffsets nextStarts) IntSet.empty IntSet.empty
+            _ -> (IntSet.empty, IntSet.empty)
 
         collectPrefixes [] !byteLensAcc !lensAcc = (byteLensAcc, lensAcc)
         collectPrefixes ((k, endByte, mNextStart) : rest) !byteLensAcc !lensAcc
@@ -361,17 +337,18 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
             | IntSet.member k (tracePrefixMatchIndices trace) = collectPrefixes rest byteLensAcc lensAcc
             | otherwise =
                 let !byteLens1 = IntSet.insert endByte byteLensAcc
-                    (!byteLens2, !lens2) = case mNextStart of
-                        Just nextStart
-                            | countsMatch
-                            , endByte <= nextStart
-                            , nextStart <= baseLen
-                            , isAsciiWhitespace (BS.take (nextStart - endByte) (BS.drop endByte baseSQL)) ->
-                                ( IntSet.insert nextStart byteLens1
-                                , if contiguousIds then IntSet.insert (k + 1) lensAcc else lensAcc
-                                )
-                        _ -> (byteLens1, lensAcc)
+                    (!byteLens2, !lens2) = extendWithWhitespace k endByte mNextStart byteLens1 lensAcc
                  in collectPrefixes rest byteLens2 lens2
+
+        extendWithWhitespace k endByte (Just nextStart) !byteLens1 !lensAcc
+            | countsMatch
+            , endByte <= nextStart
+            , nextStart <= baseLen
+            , isAsciiWhitespace (BS.take (nextStart - endByte) (BS.drop endByte baseSQL)) =
+                ( IntSet.insert nextStart byteLens1
+                , if contiguousIds then IntSet.insert (k + 1) lensAcc else lensAcc
+                )
+        extendWithWhitespace _ _ _ !byteLens1 !lensAcc = (byteLens1, lensAcc)
 
         nonResultReady =
             countsMatch
@@ -407,144 +384,157 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
                 || not (IntMap.null missingDefReqs)
                 || isJust protectedResultIndex
 
+data MissingDefAcc = MissingDefAcc
+    { mdaRelDefs :: !(Map Text IntSet)
+    , mdaTxOpens :: !IntSet
+    , mdaSpOpens :: !(Map Text IntSet)
+    , mdaOpaqueDdl :: !IntSet
+    , mdaOpaqueTx :: !IntSet
+    , mdaReqs :: !(IntMap [IntSet])
+    }
+
 -- | Precompute per-statement required prior definers/openers in source order.
 buildMissingDefReqs :: [StatementUnit] -> IntMap [IntSet]
-buildMissingDefReqs = go Map.empty IntSet.empty Map.empty IntSet.empty IntSet.empty IntMap.empty
+buildMissingDefReqs =
+    mdaReqs . foldl' stepMissingDefUnit emptyAcc
     where
-        go _ _ _ _ _ !acc [] = acc
-        go !relDefs !txOpens !spOpens !opaqueDdl !opaqueTx !acc (unit : rest) =
-            let !sid = unStatementId (stmtId (unitStatement unit))
-             in case unitFacts unit of
-                    Nothing ->
-                        go relDefs txOpens spOpens (IntSet.insert sid opaqueDdl) (IntSet.insert sid opaqueTx) acc rest
-                    Just facts ->
-                        let sem = factSemantics facts
-                            ops = factOps sem
-                            barriers = factBarriers sem
-                            txs = factPreTx sem ++ factPostTx sem
-                            -- Never require referenced relations inside deferred view/trigger DDL or DROP.
-                            skipRelReqs = any isDeferredOrDropOp ops
-                            selfDefined = Set.fromList (concatMap opDefinedRelNames ops)
-                            refRels =
-                                if skipRelReqs
-                                    then []
-                                    else
-                                        Set.toList
-                                            ( Set.fromList (concatMap opReferencedRelNames ops)
-                                                `Set.difference` selfDefined
-                                            )
-                            relReqs =
-                                [ IntSet.union defs opaqueDdl
-                                | rel <- refRels
-                                , Just defs <- [Map.lookup rel relDefs]
-                                ]
-                            txReqs =
-                                [ req
-                                | tx <- txs
-                                , Just req <- [txRequirement tx txOpens spOpens opaqueTx]
-                                ]
-                            allReqs = dedupIntSetsSmall (relReqs ++ txReqs)
-                            acc' =
-                                if null allReqs
-                                    then acc
-                                    else IntMap.insert sid allReqs acc
-                            relDefs' =
-                                foldl'
-                                    (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m)
-                                    relDefs
-                                    (Set.toList selfDefined)
-                            (txOpens', spOpens') = foldl' (recordTxOpener sid) (txOpens, spOpens) txs
-                            opaqueDdl' =
-                                if any isOpaqueDdlBarrier barriers
-                                    then IntSet.insert sid opaqueDdl
-                                    else opaqueDdl
-                            opaqueTx' =
-                                if any isOpaqueTxBarrier barriers
-                                    then IntSet.insert sid opaqueTx
-                                    else opaqueTx
-                         in go relDefs' txOpens' spOpens' opaqueDdl' opaqueTx' acc' rest
+        emptyAcc = MissingDefAcc Map.empty IntSet.empty Map.empty IntSet.empty IntSet.empty IntMap.empty
 
-        isDeferredOrDropOp = \case
-            DefineTableOp _ -> True
-            DefineViewOp _ -> True
-            DefineTriggerOp _ -> True
-            DefineIndexOp _ -> True
-            DropCatalogOp _ -> True
-            AlterTableOp _ -> True
-            _ -> False
+stepMissingDefUnit :: MissingDefAcc -> StatementUnit -> MissingDefAcc
+stepMissingDefUnit acc unit = case unitFacts unit of
+    Nothing ->
+        acc
+            { mdaOpaqueDdl = IntSet.insert sid (mdaOpaqueDdl acc)
+            , mdaOpaqueTx = IntSet.insert sid (mdaOpaqueTx acc)
+            }
+    Just facts -> stepMissingDefFacts sid acc facts
+    where
+        !sid = unStatementId (stmtId (unitStatement unit))
 
-        baseRelName :: Name -> Text
-        baseRelName (Name []) = T.empty
-        baseRelName (Name parts) = T.toLower (identText (lastPart parts))
-            where
-                lastPart [x] = x
-                lastPart (_ : xs) = lastPart xs
-                lastPart [] = Ident T.empty
+stepMissingDefFacts :: Int -> MissingDefAcc -> StatementFacts -> MissingDefAcc
+stepMissingDefFacts sid acc facts =
+    MissingDefAcc
+        { mdaRelDefs = relDefs'
+        , mdaTxOpens = txOpens'
+        , mdaSpOpens = spOpens'
+        , mdaOpaqueDdl =
+            if any isOpaqueDdlBarrier barriers then IntSet.insert sid (mdaOpaqueDdl acc) else mdaOpaqueDdl acc
+        , mdaOpaqueTx =
+            if any isOpaqueTxBarrier barriers then IntSet.insert sid (mdaOpaqueTx acc) else mdaOpaqueTx acc
+        , mdaReqs = if null allReqs then mdaReqs acc else IntMap.insert sid allReqs (mdaReqs acc)
+        }
+    where
+        sem = factSemantics facts
+        ops = factOps sem
+        barriers = factBarriers sem
+        txs = factPreTx sem ++ factPostTx sem
+        -- Never require referenced relations inside deferred view/trigger DDL or DROP.
+        skipRelReqs = any isDeferredOrDropOp ops
+        selfDefined = Set.fromList (concatMap opDefinedRelNames ops)
+        refRels
+            | skipRelReqs = []
+            | otherwise =
+                Set.toList (Set.fromList (concatMap opReferencedRelNames ops) `Set.difference` selfDefined)
+        relReqs =
+            [ IntSet.union defs (mdaOpaqueDdl acc)
+            | rel <- refRels
+            , Just defs <- [Map.lookup rel (mdaRelDefs acc)]
+            ]
+        txReqs =
+            [ req
+            | tx <- txs
+            , Just req <- [txRequirement tx (mdaTxOpens acc) (mdaSpOpens acc) (mdaOpaqueTx acc)]
+            ]
+        allReqs = dedupIntSetsSmall (relReqs ++ txReqs)
+        relDefs' =
+            foldl'
+                (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m)
+                (mdaRelDefs acc)
+                (Set.toList selfDefined)
+        (txOpens', spOpens') = foldl' (recordTxOpener sid) (mdaTxOpens acc, mdaSpOpens acc) txs
 
-        opDefinedRelNames :: CatalogOp -> [Text]
-        opDefinedRelNames = \case
-            DefineTableOp td -> [baseRelName (tableName td)]
-            DefineViewOp vd -> [baseRelName (viewName vd)]
-            DefineSequenceOp sd -> [baseRelName (sequenceName sd)]
-            RenameOp (RenameRelation _ newName _) -> [baseRelName newName]
-            _ -> []
+isDeferredOrDropOp :: CatalogOp -> Bool
+isDeferredOrDropOp = \case
+    DefineTableOp _ -> True
+    DefineViewOp _ -> True
+    DefineTriggerOp _ -> True
+    DefineIndexOp _ -> True
+    DropCatalogOp _ -> True
+    AlterTableOp _ -> True
+    _ -> False
 
-        opReferencedRelNames :: CatalogOp -> [Text]
-        opReferencedRelNames = \case
-            ReadOp rf
-                | readMode rf /= ReadSchema -> [baseRelName (nameRefName (readSource rf))]
-            WriteDataOp dw ->
-                baseRelName (nameRefName (dataWriteTarget dw))
-                    : [baseRelName (nameRefName (readSource rf)) | rf <- dataWriteReads dw, readMode rf /= ReadSchema]
-            _ -> []
+baseRelName :: Name -> Text
+baseRelName (Name []) = T.empty
+baseRelName (Name parts) = T.toLower (identText (lastPart parts))
+    where
+        lastPart [x] = x
+        lastPart (_ : xs) = lastPart xs
+        lastPart [] = Ident T.empty
 
-        txRequirement :: TxEffect -> IntSet -> Map Text IntSet -> IntSet -> Maybe IntSet
-        txRequirement tx txOpens spOpens opaqueTx = case tx of
-            TxCommit _
-                | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
-            TxRollbackAll
-                | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
-            TxRollbackTo sp ->
-                IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
-            TxReleaseSavepoint sp ->
-                IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
-            _ -> Nothing
+opDefinedRelNames :: CatalogOp -> [Text]
+opDefinedRelNames = \case
+    DefineTableOp td -> [baseRelName (tableName td)]
+    DefineViewOp vd -> [baseRelName (viewName vd)]
+    DefineSequenceOp sd -> [baseRelName (sequenceName sd)]
+    RenameOp (RenameRelation _ newName _) -> [baseRelName newName]
+    _ -> []
 
-        recordTxOpener :: Int -> (IntSet, Map Text IntSet) -> TxEffect -> (IntSet, Map Text IntSet)
-        recordTxOpener sid (txOpens, spOpens) = \case
-            TxBegin _ -> (IntSet.insert sid txOpens, spOpens)
-            TxSavepoint sp ->
-                let spKey = T.toLower (identText sp)
-                 in (IntSet.insert sid txOpens, Map.insertWith IntSet.union spKey (IntSet.singleton sid) spOpens)
-            _ -> (txOpens, spOpens)
+opReferencedRelNames :: CatalogOp -> [Text]
+opReferencedRelNames = \case
+    ReadOp rf
+        | readMode rf /= ReadSchema -> [baseRelName (nameRefName (readSource rf))]
+    WriteDataOp dw ->
+        baseRelName (nameRefName (dataWriteTarget dw))
+            : [baseRelName (nameRefName (readSource rf)) | rf <- dataWriteReads dw, readMode rf /= ReadSchema]
+    _ -> []
 
-        isOpaqueDdlBarrier :: ScopedBarrier -> Bool
-        isOpaqueDdlBarrier sb =
-            barrierScope sb == GlobalScope
-                || case barrierReason sb of
-                    SyntaxErrorBarrier -> True
-                    UnknownStatementBarrier -> True
-                    UnknownRelationBarrier -> True
-                    UnknownDDLBarrier -> True
-                    UnknownDMLBarrier -> True
-                    UnknownAlterBarrier -> True
-                    UnknownViewBarrier -> True
-                    UnknownSessionEffectBarrier -> True
-                    UnsupportedTriggerBodyBarrier -> True
-                    OpaqueTriggerBodyBarrier -> True
-                    _ -> False
+txRequirement :: TxEffect -> IntSet -> Map Text IntSet -> IntSet -> Maybe IntSet
+txRequirement tx txOpens spOpens opaqueTx = case tx of
+    TxCommit _
+        | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
+    TxRollbackAll
+        | not (IntSet.null txOpens) -> Just (IntSet.union txOpens opaqueTx)
+    TxRollbackTo sp ->
+        IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
+    TxReleaseSavepoint sp ->
+        IntSet.union opaqueTx <$> Map.lookup (T.toLower (identText sp)) spOpens
+    _ -> Nothing
 
-        isOpaqueTxBarrier :: ScopedBarrier -> Bool
-        isOpaqueTxBarrier sb = case barrierReason sb of
+recordTxOpener :: Int -> (IntSet, Map Text IntSet) -> TxEffect -> (IntSet, Map Text IntSet)
+recordTxOpener sid (txOpens, spOpens) = \case
+    TxBegin _ -> (IntSet.insert sid txOpens, spOpens)
+    TxSavepoint sp ->
+        let spKey = T.toLower (identText sp)
+         in (IntSet.insert sid txOpens, Map.insertWith IntSet.union spKey (IntSet.singleton sid) spOpens)
+    _ -> (txOpens, spOpens)
+
+isOpaqueDdlBarrier :: ScopedBarrier -> Bool
+isOpaqueDdlBarrier sb =
+    barrierScope sb == GlobalScope
+        || case barrierReason sb of
             SyntaxErrorBarrier -> True
             UnknownStatementBarrier -> True
+            UnknownRelationBarrier -> True
+            UnknownDDLBarrier -> True
+            UnknownDMLBarrier -> True
+            UnknownAlterBarrier -> True
+            UnknownViewBarrier -> True
             UnknownSessionEffectBarrier -> True
-            UnsupportedTransactionBarrier -> True
+            UnsupportedTriggerBodyBarrier -> True
+            OpaqueTriggerBodyBarrier -> True
             _ -> False
 
-        dedupIntSetsSmall :: [IntSet] -> [IntSet]
-        dedupIntSetsSmall [] = []
-        dedupIntSetsSmall (x : xs) = x : dedupIntSetsSmall (filter (/= x) xs)
+isOpaqueTxBarrier :: ScopedBarrier -> Bool
+isOpaqueTxBarrier sb = case barrierReason sb of
+    SyntaxErrorBarrier -> True
+    UnknownStatementBarrier -> True
+    UnknownSessionEffectBarrier -> True
+    UnsupportedTransactionBarrier -> True
+    _ -> False
+
+dedupIntSetsSmall :: [IntSet] -> [IntSet]
+dedupIntSetsSmall [] = []
+dedupIntSetsSmall (x : xs) = x : dedupIntSetsSmall (filter (/= x) xs)
 
 isAsciiWhitespace :: ByteString -> Bool
 isAsciiWhitespace = BS.all isWsByte
@@ -641,14 +631,16 @@ checkEarlyRejectionBytesTracked tracker cert countChecked candidateSQL
         t0 <- getMonotonicTimeNSec
         res <- case checkEarlyRejectionBytes cert candidateSQL of
             hit@(Just _) -> pure hit
-            Nothing -> case trackerFailures tracker of
-                Nothing -> pure Nothing
-                Just fpCache -> do
-                    failed <- checkFailingPrefix fpCache candidateSQL
-                    pure (if failed then Just EarlyRejectFailingPrefix else Nothing)
+            Nothing -> checkFailingPrefixReason (trackerFailures tracker) candidateSQL
         t1 <- getMonotonicTimeNSec
         recordCheck (trackerStatsRef tracker) countChecked res (t1 - t0)
         pure res
+
+checkFailingPrefixReason :: Maybe FailingPrefixCache -> ByteString -> IO (Maybe EarlyRejectReason)
+checkFailingPrefixReason Nothing _ = pure Nothing
+checkFailingPrefixReason (Just fpCache) candidateSQL = do
+    failed <- checkFailingPrefix fpCache candidateSQL
+    pure (if failed then Just EarlyRejectFailingPrefix else Nothing)
 
 checkEarlyRejectionSyntaxEditTracked ::
     EarlyRejectTracker ->

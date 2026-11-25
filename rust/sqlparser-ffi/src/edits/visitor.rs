@@ -57,6 +57,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     chunk_edits: bool,
     syntax_edits: bool,
     top_level_select_ptr: Option<*const Select>,
+    recursive_predicate_spans: Vec<(usize, usize)>,
     pub(crate) sequences: Option<SequenceVisitor<'a>>,
 }
 impl<'a> AnalysisVisitor<'a> {
@@ -97,6 +98,7 @@ impl<'a> AnalysisVisitor<'a> {
             chunk_edits: context.chunk_edits,
             syntax_edits: context.syntax_edits,
             top_level_select_ptr: None,
+            recursive_predicate_spans: Vec::new(),
             sequences: None,
         }
     }
@@ -761,6 +763,31 @@ impl<'a> AnalysisVisitor<'a> {
         category: NativeEditCategory,
         label: impl Into<Cow<'static, str>>,
     ) {
+        self.add_edit_bytes_with_flags(start, end, replacement, category, label, false, false);
+    }
+
+    fn add_low_yield_edit_bytes(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        category: NativeEditCategory,
+        label: impl Into<Cow<'static, str>>,
+    ) {
+        self.add_edit_bytes_with_flags(start, end, replacement, category, label, false, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_edit_bytes_with_flags(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        category: NativeEditCategory,
+        label: impl Into<Cow<'static, str>>,
+        string_literal: bool,
+        low_yield: bool,
+    ) {
         // Statement-only parses skip all edit IR: no allocation, validation,
         // or downstream JSON/decode work. Semantic collection continues
         // untouched in the same traversal.
@@ -770,6 +797,11 @@ impl<'a> AnalysisVisitor<'a> {
         let Some(range) = ByteSpan::checked(self.source, start, end) else {
             return;
         };
+        let recursive_predicate = !self.recursive_predicate_spans.is_empty()
+            && self
+                .recursive_predicate_spans
+                .iter()
+                .any(|&(s, e)| s <= range.start && range.end <= e);
         self.edits.push(NativeEdit {
             start: range.start,
             end: range.end,
@@ -777,34 +809,10 @@ impl<'a> AnalysisVisitor<'a> {
             category,
             label: label.into(),
             top_level_projection: false,
-            tail_clause: false,
+            string_literal,
+            recursive_predicate,
+            low_yield,
         });
-    }
-
-    fn mark_select_tail_clause(&mut self, query: &Query, new_edit: usize) {
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return;
-        };
-        if self.statement_depth != 1
-            || query.with.is_some()
-            || select.into.is_some()
-            || !self
-                .mapped_span(select.select_token.0.span)
-                .is_some_and(|(start, _)| start == self.unit.start)
-        {
-            return;
-        }
-        if let Some(edit) = self.edits.get_mut(new_edit) {
-            // The cut must begin immediately after the surviving substantive
-            // token. In particular, an intervening comment can affect the end
-            // span of a neighbouring clause after this clause disappears.
-            let before = self
-                .tokens
-                .partition_point(|token| token.start < edit.start);
-            edit.tail_clause = before != 0
-                && self.tokens[before - 1].end == edit.start
-                && self.tokens[before - 1].kind != TokenKind::Whitespace;
-        }
     }
 
     fn source_slice(&self, span: Span) -> Option<&'a str> {
@@ -2404,7 +2412,7 @@ impl Visitor for AnalysisVisitor<'_> {
         self.alias_scope_stack.push(scope);
         self.select_scopes.push(None);
         if let Some(with) = &query.with {
-            let names = with
+            let names: Vec<String> = with
                 .cte_tables
                 .iter()
                 .map(|cte| {
@@ -2420,6 +2428,9 @@ impl Visitor for AnalysisVisitor<'_> {
                 .iter()
                 .map(|cte| self.cte_query_source_span(cte))
                 .collect();
+            if self.syntax_edits && with.recursive {
+                self.collect_recursive_predicate_spans(&with.cte_tables, &names);
+            }
             self.scopes.push(CteScope {
                 recursive: with.recursive,
                 names,
@@ -2464,7 +2475,6 @@ impl Visitor for AnalysisVisitor<'_> {
         let query_scope = self.query_source_scope(query);
         if let Some(order) = &query.order_by {
             if let (Some(body), Some(scope)) = (self.order_by_source_span(order), query_scope) {
-                let edit_index = self.edits.len();
                 self.clause_edit_complete(
                     Keyword::ORDER,
                     body,
@@ -2479,16 +2489,6 @@ impl Visitor for AnalysisVisitor<'_> {
                     ],
                     "remove-order_by",
                 );
-                if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
-                    && exprs.iter().all(|item| {
-                        matches!(
-                            &item.expr,
-                            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-                        )
-                    })
-                {
-                    self.mark_select_tail_clause(query, edit_index);
-                }
             }
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
                 && exprs.len() > 1
@@ -2499,22 +2499,12 @@ impl Visitor for AnalysisVisitor<'_> {
             }
         }
         if let Some(limit) = &query.limit_clause {
-            let edit_index = self.edits.len();
             self.limit_edits(query, limit);
-            if matches!(limit, LimitClause::LimitOffset {
-                limit: Some(Expr::Value(value)),
-                offset: None,
-                limit_by,
-            } if matches!(&value.value, sqlparser::ast::Value::Number(..)) && limit_by.is_empty())
-            {
-                self.mark_select_tail_clause(query, edit_index);
-            }
         }
         if let Some(fetch) = &query.fetch
             && let Some(scope) = query_scope
             && let Some(body) = self.fetch_source_span(fetch, scope)
         {
-            let edit_index = self.edits.len();
             self.clause_edit_complete(
                 Keyword::FETCH,
                 body,
@@ -2522,7 +2512,6 @@ impl Visitor for AnalysisVisitor<'_> {
                 &[Keyword::FOR, Keyword::SETTINGS, Keyword::FORMAT],
                 "remove-fetch",
             );
-            self.mark_select_tail_clause(query, edit_index);
         }
         if let SetExpr::Values(values) = query.body.as_ref()
             && values.rows.len() > 1
@@ -2639,7 +2628,15 @@ impl Visitor for AnalysisVisitor<'_> {
             }
         }
         if let Some(selection) = &select.selection {
+            let edit_index = self.edits.len();
             self.clause_edit_expression(Keyword::WHERE, selection, select.span(), "remove-where");
+            if !self.recursive_predicate_spans.is_empty()
+                && let Some(sel_span) = self.expression_source_span(selection)
+                && self.recursive_predicate_spans.contains(&sel_span)
+                && let Some(edit) = self.edits.get_mut(edit_index)
+            {
+                edit.recursive_predicate = true;
+            }
         }
         if let Some(having) = &select.having {
             self.clause_edit_expression(Keyword::HAVING, having, select.span(), "remove-having");
@@ -3095,7 +3092,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         );
                     }
                     for replacement in ["0", "1", "'0'"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3117,7 +3114,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         );
                     }
                     for replacement in ["0", "1", "'0'"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3190,7 +3187,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         );
                     }
                     for replacement in ["1", "0"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3219,7 +3216,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         }
                     }
                     for replacement in ["1", "0"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3241,7 +3238,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         );
                     }
                     for replacement in ["1", "0"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3263,7 +3260,7 @@ impl Visitor for AnalysisVisitor<'_> {
                         );
                     }
                     for replacement in ["0", "1"] {
-                        self.add_edit_bytes(
+                        self.add_low_yield_edit_bytes(
                             start,
                             end,
                             replacement,
@@ -3449,6 +3446,198 @@ impl Visitor for AnalysisVisitor<'_> {
 }
 
 impl AnalysisVisitor<'_> {
+    fn collect_recursive_predicate_spans(
+        &mut self,
+        ctes: &[sqlparser::ast::Cte],
+        names: &[String],
+    ) {
+        for (index, cte) in ctes.iter().enumerate() {
+            self.collect_recursive_query_predicates(&cte.query, &names[index..]);
+        }
+    }
+
+    fn collect_recursive_query_predicates(&mut self, query: &Query, targets: &[String]) {
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(with) = &query.with {
+            let shadowed: Vec<String> = with
+                .cte_tables
+                .iter()
+                .map(|cte| {
+                    canonical_ident_string(
+                        &cte.alias.name,
+                        self.rules,
+                        crate::ir::IdentifierClass::Relation,
+                    )
+                })
+                .collect();
+            let active: Vec<String> = targets
+                .iter()
+                .filter(|name| !shadowed.iter().any(|s| s == *name))
+                .cloned()
+                .collect();
+            if !active.is_empty() {
+                self.collect_recursive_set_expr_predicates(&query.body, &active);
+            }
+        } else {
+            self.collect_recursive_set_expr_predicates(&query.body, targets);
+        }
+    }
+
+    fn collect_recursive_set_expr_predicates(&mut self, body: &SetExpr, targets: &[String]) {
+        match body {
+            SetExpr::Select(select) => self.collect_recursive_select_predicates(select, targets),
+            SetExpr::Query(inner) => self.collect_recursive_query_predicates(inner, targets),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.collect_recursive_set_expr_predicates(left, targets);
+                self.collect_recursive_set_expr_predicates(right, targets);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_recursive_select_predicates(&mut self, select: &Select, targets: &[String]) {
+        if !self.select_from_references_any(&select.from, targets) {
+            return;
+        }
+        for table in &select.from {
+            self.collect_table_with_joins_predicates(table, targets);
+        }
+        if let Some(selection) = &select.selection
+            && let Some(span) = self.expression_source_span(selection)
+        {
+            self.recursive_predicate_spans.push(span);
+        }
+    }
+
+    fn collect_table_with_joins_predicates(&mut self, table: &TableWithJoins, targets: &[String]) {
+        self.collect_table_factor_predicates(&table.relation, targets);
+        for join in &table.joins {
+            self.collect_join_operator_predicates(&join.join_operator);
+            self.collect_table_factor_predicates(&join.relation, targets);
+        }
+    }
+
+    fn collect_table_factor_predicates(&mut self, factor: &TableFactor, targets: &[String]) {
+        match factor {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.collect_table_with_joins_predicates(table_with_joins, targets),
+            TableFactor::Derived { subquery, .. } => {
+                self.collect_recursive_query_predicates(subquery, targets);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_join_operator_predicates(&mut self, operator: &sqlparser::ast::JoinOperator) {
+        match operator {
+            sqlparser::ast::JoinOperator::Join(constraint)
+            | sqlparser::ast::JoinOperator::Inner(constraint)
+            | sqlparser::ast::JoinOperator::Left(constraint)
+            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+            | sqlparser::ast::JoinOperator::Right(constraint)
+            | sqlparser::ast::JoinOperator::RightOuter(constraint)
+            | sqlparser::ast::JoinOperator::FullOuter(constraint)
+            | sqlparser::ast::JoinOperator::CrossJoin(constraint)
+            | sqlparser::ast::JoinOperator::Semi(constraint)
+            | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+            | sqlparser::ast::JoinOperator::RightSemi(constraint)
+            | sqlparser::ast::JoinOperator::Anti(constraint)
+            | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+            | sqlparser::ast::JoinOperator::RightAnti(constraint)
+            | sqlparser::ast::JoinOperator::StraightJoin(constraint) => {
+                self.collect_join_constraint_predicates(constraint);
+            }
+            sqlparser::ast::JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => {
+                if let Some(span) = self.expression_source_span(match_condition) {
+                    self.recursive_predicate_spans.push(span);
+                }
+                self.collect_join_constraint_predicates(constraint);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_join_constraint_predicates(&mut self, constraint: &sqlparser::ast::JoinConstraint) {
+        if let sqlparser::ast::JoinConstraint::On(expr) = constraint
+            && let Some(span) = self.expression_source_span(expr)
+        {
+            self.recursive_predicate_spans.push(span);
+        }
+    }
+
+    fn query_references_any(&self, query: &Query, targets: &[String]) -> bool {
+        if targets.is_empty() {
+            return false;
+        }
+        if let Some(with) = &query.with {
+            let shadowed: Vec<String> = with
+                .cte_tables
+                .iter()
+                .map(|cte| {
+                    canonical_ident_string(
+                        &cte.alias.name,
+                        self.rules,
+                        crate::ir::IdentifierClass::Relation,
+                    )
+                })
+                .collect();
+            let active: Vec<String> = targets
+                .iter()
+                .filter(|name| !shadowed.iter().any(|s| s == *name))
+                .cloned()
+                .collect();
+            !active.is_empty() && self.set_expr_references_any(&query.body, &active)
+        } else {
+            self.set_expr_references_any(&query.body, targets)
+        }
+    }
+
+    fn set_expr_references_any(&self, body: &SetExpr, targets: &[String]) -> bool {
+        match body {
+            SetExpr::Select(select) => self.select_from_references_any(&select.from, targets),
+            SetExpr::Query(inner) => self.query_references_any(inner, targets),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.set_expr_references_any(left, targets)
+                    || self.set_expr_references_any(right, targets)
+            }
+            _ => false,
+        }
+    }
+
+    fn select_from_references_any(&self, from: &[TableWithJoins], targets: &[String]) -> bool {
+        from.iter()
+            .any(|table| self.table_with_joins_references_any(table, targets))
+    }
+
+    fn table_with_joins_references_any(&self, table: &TableWithJoins, targets: &[String]) -> bool {
+        self.table_factor_references_any(&table.relation, targets)
+            || table
+                .joins
+                .iter()
+                .any(|join| self.table_factor_references_any(&join.relation, targets))
+    }
+
+    fn table_factor_references_any(&self, factor: &TableFactor, targets: &[String]) -> bool {
+        match factor {
+            TableFactor::Table {
+                name, args: None, ..
+            } => name_parts(name, self.rules, ir::IdentifierClass::Relation).is_some_and(|parts| {
+                parts.len() == 1 && targets.iter().any(|target| target == &parts[0].0)
+            }),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.table_with_joins_references_any(table_with_joins, targets),
+            TableFactor::Derived { subquery, .. } => self.query_references_any(subquery, targets),
+            _ => false,
+        }
+    }
+
     fn add_scalar_edit(&mut self, value: &ValueWithSpan) {
         let Some((start, end)) = self.mapped_span(value.span) else {
             return;
@@ -3456,19 +3645,31 @@ impl AnalysisVisitor<'_> {
         let Some(raw) = self.source.get(start..end) else {
             return;
         };
-        let replacements = if raw.starts_with('\'') {
-            ["''", "'0'", "NULL", "0"].as_slice()
+        let is_string = matches!(value.value, sqlparser::ast::Value::SingleQuotedString(_))
+            || raw.starts_with('\'');
+        let replacements = if is_string {
+            [("''", false), ("'0'", true), ("NULL", true), ("0", true)].as_slice()
         } else {
-            ["0", "1", "NULL", "FALSE", "TRUE", "''"].as_slice()
+            [
+                ("0", false),
+                ("1", false),
+                ("NULL", true),
+                ("FALSE", true),
+                ("TRUE", true),
+                ("''", true),
+            ]
+            .as_slice()
         };
-        for replacement in replacements {
+        for &(replacement, low_yield) in replacements {
             if replacement.len() < end - start {
-                self.add_edit_bytes(
+                self.add_edit_bytes_with_flags(
                     start,
                     end,
                     replacement,
                     NativeEditCategory::Literal,
                     "simplify-literal",
+                    is_string,
+                    low_yield,
                 );
             }
         }

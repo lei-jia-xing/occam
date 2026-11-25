@@ -11,6 +11,9 @@ module Occam.Benchmark.Metrics (
     generateReportForDirectory,
 ) where
 
+import Control.Monad (guard)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -221,24 +224,25 @@ summarizeDirectory dir = do
         then pure []
         else do
             entries <- sort <$> listDirectory dir
-            results <- mapM processChild entries
-            pure (catMaybes results)
+            catMaybes <$> mapM processChild entries
     where
-        processChild name = do
+        processChild name = runMaybeT do
             let childPath = dir </> name
-            isDir <- doesDirectoryExist childPath
-            if not isDir
-                then pure Nothing
-                else do
-                    let statsFile = childPath </> "stats.json"
-                    hasStats <- doesFileExist statsFile
-                    if not hasStats
-                        then pure (Just (missingStatsSummary (T.pack name)))
-                        else do
-                            content <- BS.readFile statsFile
-                            case eitherDecodeStrict' content of
-                                Left _ -> pure (Just (missingStatsSummary (T.pack name)))
-                                Right stats -> pure (Just (summarizeStats (T.pack name) stats))
+            guard =<< liftIO (doesDirectoryExist childPath)
+            liftIO $ readRunSummary (T.pack name) (childPath </> "stats.json")
+
+readRunSummary :: Text -> FilePath -> IO RunSummary
+readRunSummary runNameText statsFile = do
+    hasStats <- doesFileExist statsFile
+    if not hasStats
+        then pure (missingStatsSummary runNameText)
+        else do
+            content <- BS.readFile statsFile
+            pure $
+                either
+                    (const (missingStatsSummary runNameText))
+                    (summarizeStats runNameText)
+                    (eitherDecodeStrict' content)
 
 -- | Encode runs into summary JSON payload format @{\"runs\": [...]}@.
 renderSummaryJson :: [RunSummary] -> Value

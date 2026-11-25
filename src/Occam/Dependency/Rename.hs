@@ -102,60 +102,56 @@ renameConstraintChildColumns rename constraint =
 
 -- RENAME
 processRename :: StatementId -> Eval -> RenameOp -> Eval
-processRename sid eval renameOp =
-    case renameOp of
-        RenameRelation from to placement ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog from)
-                stepKey current oldKey =
-                    let currentCatalog = evalCatalog current
-                        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog oldKey)
-                        deps =
-                            relationAllDeps session currentCatalog oldKey
-                                `Set.union` relationConstraintDeps currentCatalog relation
-                                `Set.union` schemaPrefixDeps currentCatalog (relationKeyName newKey)
-                        newKey =
-                            RelationKey
-                                (relationKeyTemp oldKey)
-                                (qualifyRenameName (relationKeyName oldKey) to)
-                        (catalog1, relation1) =
-                            moveRelationObjects placement sid oldKey newKey relation currentCatalog
-                        relation2 =
-                            relation1
-                                { relSchemaWrites = Set.insert sid (relSchemaWrites relation1)
-                                }
-                        catalog2 =
-                            insertRelation newKey relation2 (deleteRelation oldKey catalog1)
-                                & updateTriggerRelations session currentCatalog oldKey newKey
-                                & updateViewSources session currentCatalog oldKey newKey
-                                & updateForeignKeyParents session currentCatalog oldKey newKey
-                                & updatePartitionParents session currentCatalog oldKey newKey
-                     in current
-                            & addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey)
-                            & addDeps deps
-                            & evalCatalogL .~ catalog2
-             in mutateResolved stepKey eval keys
-        RenameColumnOp table from to ->
-            let session = evalSession eval
-                catalog = evalCatalog eval
-                keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog table)
-                renameColumn column
-                    | column == from = to
-                    | otherwise = column
-                stepKey current key =
-                    let currentCatalog = evalCatalog current
-                        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
-                        deps =
-                            relationAllDeps session currentCatalog key
-                                `Set.union` relationConstraintDeps currentCatalog relation
-                        relation1 = renameRelationColumns from to sid relation
-                        catalog1 = renameCatalogColumns session currentCatalog key renameColumn
-                     in current
-                            & addTouches (relationTouchKeys key)
-                            & addDeps deps
-                            & evalCatalogL .~ insertRelation key relation1 catalog1
-             in mutateResolved stepKey eval keys
+processRename sid eval (RenameRelation from to placement) =
+    mutateResolved stepKey eval keys
+    where
+        session = evalSession eval
+        catalog = evalCatalog eval
+        keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog from)
+        stepKey current oldKey =
+            current
+                & addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey)
+                & addDeps deps
+                & evalCatalogL .~ catalog2
+            where
+                currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog oldKey)
+                newKey = RelationKey (relationKeyTemp oldKey) (qualifyRenameName (relationKeyName oldKey) to)
+                deps =
+                    relationAllDeps session currentCatalog oldKey
+                        `Set.union` relationConstraintDeps currentCatalog relation
+                        `Set.union` schemaPrefixDeps currentCatalog (relationKeyName newKey)
+                (catalog1, relation1) =
+                    moveRelationObjects placement sid oldKey newKey relation currentCatalog
+                relation2 = relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
+                catalog2 =
+                    insertRelation newKey relation2 (deleteRelation oldKey catalog1)
+                        & updateTriggerRelations session currentCatalog oldKey newKey
+                        & updateViewSources session currentCatalog oldKey newKey
+                        & updateForeignKeyParents session currentCatalog oldKey newKey
+                        & updatePartitionParents session currentCatalog oldKey newKey
+processRename sid eval (RenameColumnOp table from to) =
+    mutateResolved stepKey eval keys
+    where
+        session = evalSession eval
+        catalog = evalCatalog eval
+        keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog table)
+        renameColumn column
+            | column == from = to
+            | otherwise = column
+        stepKey current key =
+            current
+                & addTouches (relationTouchKeys key)
+                & addDeps deps
+                & evalCatalogL .~ insertRelation key relation1 catalog1
+            where
+                currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+                deps =
+                    relationAllDeps session currentCatalog key
+                        `Set.union` relationConstraintDeps currentCatalog relation
+                relation1 = renameRelationColumns from to sid relation
+                catalog1 = renameCatalogColumns session currentCatalog key renameColumn
 
 renameRelationColumns :: Ident -> Ident -> StatementId -> RelationState -> RelationState
 renameRelationColumns from to sid relation =
@@ -165,44 +161,34 @@ renameRelationColumns from to sid relation =
         & relSchemaWritesL %~ Set.insert sid
         & relColumnLineageL %~ map renameLineage
     where
-        renameWrites writesMap = case Map.lookup from writesMap of
-            Nothing -> writesMap
-            Just writes ->
-                Map.insertWith Set.union to writes (Map.delete from writesMap)
+        renameWrites writesMap =
+            maybe
+                writesMap
+                (\writes -> Map.insertWith Set.union to writes (Map.delete from writesMap))
+                (Map.lookup from writesMap)
         renameLineage lineage
             | lineageColumn lineage == from = lineage {lineageColumn = to}
             | otherwise = lineage
 
 renameCatalogColumns ::
     SessionState -> Catalog -> RelationKey -> (Ident -> Ident) -> Catalog
-renameCatalogColumns session currentCatalog key renameColumn =
-    let catalog1 =
+renameCatalogColumns session currentCatalog key renameColumn
+    | Map.null (catalogForeignKeys catalog1) = catalog1
+    | otherwise = catalog1 {catalogForeignKeys = rebuildForeignKeys (catalogConstraints catalog1)}
+    where
+        catalog1 =
             currentCatalog
                 & catalogConstraintsL %~ Map.map renameConstraint
                 & catalogIndexesL %~ Map.map renameIndex
                 & catalogTriggersL %~ Map.map (renameTriggerColumns session currentCatalog key renameColumn)
                 & catalogRelationsL %~ Map.map (renameSourceReadColumns session currentCatalog key renameColumn)
-     in if Map.null (catalogForeignKeys catalog1)
-            then catalog1
-            else catalog1 {catalogForeignKeys = rebuildForeignKeys (catalogConstraints catalog1)}
-    where
         renameConstraint state =
-            let childRenamed
+            renameForeignKeyParentColumn session currentCatalog key renameColumn childRenamed
+            where
+                childRenamed
                     | constraintStateTable state == key =
-                        state
-                            { constraintValue =
-                                renameConstraintChildColumns
-                                    renameColumn
-                                    (constraintValue state)
-                            }
+                        state {constraintValue = renameConstraintChildColumns renameColumn (constraintValue state)}
                     | otherwise = state
-             in renameForeignKeyParentColumn
-                    session
-                    currentCatalog
-                    key
-                    renameColumn
-                    childRenamed
-
         renameIndex state
             | indexStateTable state == Just key =
                 state {indexStateColumns = map renameColumn (indexStateColumns state)}
@@ -216,99 +202,111 @@ moveRelationObjects ::
     RelationState ->
     Catalog ->
     (Catalog, RelationState)
-moveRelationObjects placement _sid oldKey newKey relation catalog =
-    let (catalog1, newIndexes) =
-            foldl' (moveIndex placement oldKey newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
+moveRelationObjects placement _sid _oldKey newKey relation catalog =
+    (catalog3, relation1)
+    where
+        (catalog1, newIndexes) =
+            foldl' (moveRelationIndex placement newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
         (catalog2, newTriggers) =
-            foldl' (moveTrigger oldKey newKey) (catalog1, Set.empty) (Set.toList (relTriggers relation))
+            foldl' (moveRelationTrigger newKey) (catalog1, Set.empty) (Set.toList (relTriggers relation))
         (catalog3, newConstraints) =
-            foldl' (moveConstraint oldKey newKey) (catalog2, Set.empty) (Set.toList (relConstraints relation))
+            foldl' (moveRelationConstraint newKey) (catalog2, Set.empty) (Set.toList (relConstraints relation))
         relation1 =
             relation
                 & relIndexesL .~ newIndexes
                 & relTriggersL .~ newTriggers
                 & relConstraintsL .~ newConstraints
-     in (catalog3, relation1)
+
+moveRelationIndex ::
+    IndexSchemaPlacement ->
+    RelationKey ->
+    (Catalog, Set.Set IndexKey) ->
+    IndexKey ->
+    (Catalog, Set.Set IndexKey)
+moveRelationIndex schemaPlacement new (current, keys) indexKey
+    | Just state <- Map.lookup indexKey (catalogIndexes current) =
+        ( current
+            & catalogIndexesL %~ Map.insert newIndexKey (state {indexStateTable = Just new}) . Map.delete indexKey
+        , Set.insert newIndexKey keys
+        )
+    | otherwise = (current, keys)
     where
-        moveIndex schemaPlacement _old new (current, keys) indexKey =
-            case Map.lookup indexKey (catalogIndexes current) of
-                Nothing -> (current, keys)
-                Just state ->
-                    let newIndexKey = case indexKey of
-                            TableIndexKey _ ident -> TableIndexKey new ident
-                            NamedIndexKey name -> case schemaPlacement of
-                                IndexCurrentSchema -> NamedIndexKey name
-                                IndexTableSchema -> case (nameParts name, nameParts (relationKeyName new)) of
-                                    ([_], newParts)
-                                        | length newParts > 1 ->
-                                            NamedIndexKey (Name (init newParts ++ nameParts name))
-                                    _ -> NamedIndexKey name
-                        state1 = state {indexStateTable = Just new}
-                     in ( current
-                            & catalogIndexesL %~ Map.insert newIndexKey state1 . Map.delete indexKey
-                        , Set.insert newIndexKey keys
-                        )
-        moveTrigger _old new (current, keys) triggerKey =
-            case Map.lookup triggerKey (catalogTriggers current) of
-                Nothing -> (current, keys)
-                Just state ->
-                    let newTriggerKey = case triggerKey of
-                            NamedTriggerKey name -> NamedTriggerKey name
-                            TableTriggerKey _ ident -> TableTriggerKey new ident
-                        state1 = state {triggerStateTable = Just new}
-                     in ( current
-                            & catalogTriggersL %~ Map.insert newTriggerKey state1 . Map.delete triggerKey
-                        , Set.insert newTriggerKey keys
-                        )
-        moveConstraint _old new (current, keys) constraintKey =
-            case Map.lookup constraintKey (catalogConstraints current) of
-                Nothing -> (current, keys)
-                Just state ->
-                    let newConstraintKey = ConstraintKey new (constraintKeyIdentity constraintKey)
-                        state1 = state {constraintStateTable = new}
-                        fks' = case constraintValue state1 of
-                            ForeignKeyConstraint fk ->
-                                Map.insert newConstraintKey (state1, fk) (Map.delete constraintKey (catalogForeignKeys current))
-                            _ -> catalogForeignKeys current
-                     in ( current
-                            & catalogConstraintsL %~ Map.insert newConstraintKey state1 . Map.delete constraintKey
-                            & (\c -> c {catalogForeignKeys = fks'})
-                        , Set.insert newConstraintKey keys
-                        )
+        newIndexKey = renameIndexKey schemaPlacement new indexKey
+
+renameIndexKey :: IndexSchemaPlacement -> RelationKey -> IndexKey -> IndexKey
+renameIndexKey _ new (TableIndexKey _ ident) = TableIndexKey new ident
+renameIndexKey IndexTableSchema new (NamedIndexKey name)
+    | [_] <- nameParts name
+    , newParts@(_ : _ : _) <- nameParts (relationKeyName new) =
+        NamedIndexKey (Name (init newParts ++ nameParts name))
+renameIndexKey _ _ key = key
+
+moveRelationTrigger ::
+    RelationKey ->
+    (Catalog, Set.Set TriggerKey) ->
+    TriggerKey ->
+    (Catalog, Set.Set TriggerKey)
+moveRelationTrigger new (current, keys) triggerKey
+    | Just state <- Map.lookup triggerKey (catalogTriggers current) =
+        ( current
+            & catalogTriggersL
+                %~ Map.insert newTriggerKey (state {triggerStateTable = Just new}) . Map.delete triggerKey
+        , Set.insert newTriggerKey keys
+        )
+    | otherwise = (current, keys)
+    where
+        newTriggerKey = case triggerKey of
+            NamedTriggerKey name -> NamedTriggerKey name
+            TableTriggerKey _ ident -> TableTriggerKey new ident
+
+moveRelationConstraint ::
+    RelationKey ->
+    (Catalog, Set.Set ConstraintKey) ->
+    ConstraintKey ->
+    (Catalog, Set.Set ConstraintKey)
+moveRelationConstraint new (current, keys) constraintKey
+    | Just state <- Map.lookup constraintKey (catalogConstraints current) =
+        let newConstraintKey = ConstraintKey new (constraintKeyIdentity constraintKey)
+            state1 = state {constraintStateTable = new}
+            fks' = case constraintValue state1 of
+                ForeignKeyConstraint fk ->
+                    Map.insert newConstraintKey (state1, fk) (Map.delete constraintKey (catalogForeignKeys current))
+                _ -> catalogForeignKeys current
+            catalog' =
+                current
+                    { catalogConstraints =
+                        Map.insert newConstraintKey state1 (Map.delete constraintKey (catalogConstraints current))
+                    , catalogForeignKeys = fks'
+                    }
+         in (catalog', Set.insert newConstraintKey keys)
+    | otherwise = (current, keys)
 
 updateViewSources :: SessionState -> Catalog -> RelationKey -> RelationKey -> Catalog -> Catalog
 updateViewSources session resolutionCatalog oldKey newKey catalog =
-    catalog
-        & catalogRelationsL
-            %~ Map.map
-                ( \relation ->
-                    relation
-                        & relSourcesL
-                            %~ (\srcs -> if Set.member oldKey srcs then Set.insert newKey (Set.delete oldKey srcs) else srcs)
-                        & relUnresolvedSourcesL %~ Set.map updateUnresolved
-                        & relSourceReadsL %~ map updateRead
-                        & relColumnLineageL %~ map updateLineage
-                        & relConditionColumnsL %~ map updateSourceCol
-                )
+    catalog & catalogRelationsL %~ Map.map updateRelation
     where
         newReference = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
-        resolvesToOldKey ref =
-            oldKey `elem` resolveRelationKeys session resolutionCatalog ref
+        resolvesToOldKey ref = oldKey `elem` resolveRelationKeys session resolutionCatalog ref
+        updateSources srcs
+            | Set.member oldKey srcs = Set.insert newKey (Set.delete oldKey srcs)
+            | otherwise = srcs
+        updateRelation relation =
+            relation
+                & relSourcesL %~ updateSources
+                & relUnresolvedSourcesL %~ Set.map updateUnresolved
+                & relSourceReadsL %~ map updateRead
+                & relColumnLineageL %~ map updateLineage
+                & relConditionColumnsL %~ map updateSourceCol
         updateSourceCol sc
-            | resolvesToOldKey (sourceColumnRelation sc) =
-                sc {sourceColumnRelation = newReference}
+            | resolvesToOldKey (sourceColumnRelation sc) = sc {sourceColumnRelation = newReference}
             | otherwise = sc
         updateLineage lineage =
-            lineage
-                { lineageSources = fmap (map updateSourceCol) (lineageSources lineage)
-                }
+            lineage {lineageSources = fmap (map updateSourceCol) (lineageSources lineage)}
         updateUnresolved reference
-            | resolveRelationKeys session resolutionCatalog reference == [oldKey] =
-                newReference
+            | resolveRelationKeys session resolutionCatalog reference == [oldKey] = newReference
             | otherwise = reference
         updateRead readFact
-            | resolvesToOldKey (readSource readFact) =
-                readFact {readSource = newReference}
+            | resolvesToOldKey (readSource readFact) = readFact {readSource = newReference}
             | otherwise = readFact
 
 updateForeignKeyParents ::
@@ -327,19 +325,12 @@ updateForeignKeyParents session resolutionCatalog oldKey newKey catalog
                 , catalogForeignKeys = rebuildForeignKeys constraints'
                 }
     where
-        adjust state =
-            case constraintValue state of
-                ForeignKeyConstraint foreignKey
-                    | resolveRelationKeys session resolutionCatalog (foreignKeyParent foreignKey) == [oldKey] ->
-                        state
-                            { constraintValue =
-                                ForeignKeyConstraint
-                                    foreignKey
-                                        { foreignKeyParent =
-                                            NameRef (relationKeyName newKey) (relationKeyTemp newKey)
-                                        }
-                            }
-                _ -> state
+        newRef = NameRef (relationKeyName newKey) (relationKeyTemp newKey)
+        adjust state
+            | ForeignKeyConstraint foreignKey <- constraintValue state
+            , resolveRelationKeys session resolutionCatalog (foreignKeyParent foreignKey) == [oldKey] =
+                state {constraintValue = ForeignKeyConstraint (foreignKey {foreignKeyParent = newRef})}
+            | otherwise = state
 
 updatePartitionParents ::
     SessionState ->
@@ -491,16 +482,9 @@ renameForeignKeyParentColumn ::
     (Ident -> Ident) ->
     ConstraintState ->
     ConstraintState
-renameForeignKeyParentColumn session catalog key rename state =
-    case constraintValue state of
-        ForeignKeyConstraint foreignKey
-            | key `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey) ->
-                state
-                    { constraintValue =
-                        ForeignKeyConstraint
-                            foreignKey
-                                { foreignKeyParentColumns =
-                                    map rename (foreignKeyParentColumns foreignKey)
-                                }
-                    }
-        _ -> state
+renameForeignKeyParentColumn session catalog key rename state
+    | ForeignKeyConstraint foreignKey <- constraintValue state
+    , key `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey) =
+        let fk' = foreignKey {foreignKeyParentColumns = map rename (foreignKeyParentColumns foreignKey)}
+         in state {constraintValue = ForeignKeyConstraint fk'}
+    | otherwise = state

@@ -26,7 +26,7 @@ module Occam.Oracle.Sqlite (
 ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
-import Control.Exception (bracket, mask, onException)
+import Control.Exception (bracket, mask, onException, uninterruptibleMask_)
 import Control.Exception.Safe (
     SomeException,
     displayException,
@@ -61,6 +61,7 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Char (isSpace)
+import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.IntSet qualified as IntSet
@@ -380,7 +381,7 @@ releaseSqliteConn True conn = do
     if not ok
         then destroySqliteConn conn
         else do
-            returned <- modifyMVar sharedSqlitePool $ \conns ->
+            returned <- uninterruptibleMask_ $ modifyMVar sharedSqlitePool $ \conns ->
                 if length conns < maxPooledConns
                     then pure (conn : conns, True)
                     else pure (conns, False)
@@ -390,7 +391,7 @@ withPooledSqliteConn :: (SqliteConn -> IO (Bool, a)) -> IO a
 withPooledSqliteConn action = mask $ \restore -> do
     conn <- acquireSqliteConn
     (keep, val) <- restore (action conn) `onException` destroySqliteConn conn
-    releaseSqliteConn keep conn
+    releaseSqliteConn keep conn `onException` destroySqliteConn conn
     pure val
 
 {- | All phases of one observation share a monotonic deadline. The remaining
@@ -488,43 +489,39 @@ runCandidateOnConn micros sql conn = do
     tainted <- readIORef (scDmlTainted conn)
     let db = scDb conn
         maxOffsets = max 64 (BS.count 59 sql + 16)
-    res <- try $
-        timeout micros $
-            interruptibly db $
-                evalContT do
-                    start <- ContT $ BS.useAsCString sql
-                    offsetsPtr <- ContT $ allocaArray maxOffsets
-                    liftIO $ runStatements db offsetsPtr maxOffsets start (start `plusPtr` BS.length sql) start 0 []
+    res <-
+        try $
+            timeout micros $
+                interruptibly db $
+                    evalContT do
+                        start <- ContT $ BS.useAsCString sql
+                        offsetsPtr <- ContT $ allocaArray maxOffsets
+                        liftIO $ runStatements db offsetsPtr maxOffsets start (start `plusPtr` BS.length sql) start 0 []
     dirty <- peek (scDirtyPtr conn)
     when ((dirty .&. dirtyDml) /= 0) $
         writeIORef (scDmlTainted conn) True
     let poolable = (dirty .&. dirtyTemp) == 0
         counterPolluted = tainted && (dirty .&. dirtyConnCounter) /= 0
         authorizerDet = (dirty .&. dirtyNondet) == 0
-    case res of
-        Left err ->
-            case classifySqliteException err of
-                e@(SqliteExecutionError _) -> pure (poolable, counterPolluted, Left e)
-                e -> pure (False, False, Left e)
-        Right Nothing -> pure (False, False, Left SqliteTimeout)
-        Right (Just (totalStmts, revResults, offsets)) ->
-            case revResults of
-                [] -> pure (poolable, counterPolluted, Right Nothing)
-                (lastIdx, lastRs) : _ ->
-                    pure
-                        ( poolable
-                        , counterPolluted
-                        , Right $
-                            Just
-                                SqliteRun
-                                    { srLastResult = lastRs
-                                    , srLastIndex = lastIdx
-                                    , srResults = reverse revResults
-                                    , srStatementCount = totalStmts
-                                    , srAuthorizerDeterministic = authorizerDet
-                                    , srEndOffsets = offsets
-                                    }
-                        )
+    pure $ case res of
+        Left err -> case classifySqliteException err of
+            e@(SqliteExecutionError _) -> (poolable, counterPolluted, Left e)
+            e -> (False, False, Left e)
+        Right Nothing -> (False, False, Left SqliteTimeout)
+        Right (Just (_, [], _)) -> (poolable, counterPolluted, Right Nothing)
+        Right (Just (totalStmts, revResults@((lastIdx, lastRs) : _), offsets)) ->
+            ( poolable
+            , counterPolluted
+            , Right . Just $
+                SqliteRun
+                    { srLastResult = lastRs
+                    , srLastIndex = lastIdx
+                    , srResults = reverse revResults
+                    , srStatementCount = totalStmts
+                    , srAuthorizerDeterministic = authorizerDet
+                    , srEndOffsets = offsets
+                    }
+            )
 
 foreign import ccall unsafe "occam_sqlite_check_sql"
     c_checkSql :: Ptr Word8 -> CSize -> IO CInt
@@ -577,67 +574,95 @@ runStatements ::
     Int ->
     [(Int, ResultSet)] ->
     IO (Int, [(Int, ResultSet)], Maybe [Int])
-runStatements db@(Direct.Database handle) offsetsPtr maxOffsets base end start0 ordinal0 revResults0 =
+runStatements db offsetsPtr maxOffsets base end start0 ordinal0 revResults0 =
     evalContT do
         outTail <- ContT alloca
         outStmt <- ContT alloca
         outOrdinal <- ContT alloca
         liftIO $
-            let finish !total revResults = do
-                    offsets <-
-                        if total <= maxOffsets
-                            then Just . map fromIntegral <$> peekArray total offsetsPtr
-                            else pure Nothing
-                    pure (total, revResults, offsets)
-                go !start !ordinal revResults
-                    | start >= end = finish ordinal revResults
-                    -- C may return a live statement even when stepping failed.
-                    -- Keep ownership transfer and finalization masked.
-                    | otherwise = mask $ \restore -> do
-                        rc <-
-                            c_occamSqliteNextResult
-                                handle
-                                base
-                                start
-                                end
-                                (fromIntegral ordinal)
-                                offsetsPtr
-                                (fromIntegral maxOffsets)
-                                outTail
-                                outStmt
-                                outOrdinal
-                        tailPtr <- peek outTail
-                        stmtPtr <- peek outStmt
-                        nextOrd <- fromIntegral <$> peek outOrdinal
-                        case rc of
-                            0 -> restore (finish nextOrd revResults)
-                            1 -> do
-                                let stmt = Direct.Statement stmtPtr
-                                rs <-
-                                    restore
-                                        ( do
-                                            count <- columnCount stmt
-                                            names <- forM [0 .. count - 1] $ \i -> do
-                                                name <- columnName stmt i
-                                                maybe (fail "SQLite omitted a result column name") pure name
-                                            rows <- stepAll stmt
-                                            pure (ResultSet names [] rows)
-                                        )
-                                        `onException` c_sqlite3_finalize stmtPtr
-                                finalize stmt
-                                restore (go tailPtr (nextOrd + 1) ((nextOrd, rs) : revResults))
-                            -1 -> do
-                                code <- Direct.errcode db
-                                Direct.Utf8 message <- Direct.errmsg db
-                                throwIO (SQLError code (TE.decodeUtf8 message) "prepare")
-                            _ -> do
-                                code <- Direct.errcode db
-                                Direct.Utf8 message <- Direct.errmsg db
-                                when (stmtPtr /= nullPtr) $ do
-                                    _ <- c_sqlite3_finalize stmtPtr
-                                    pure ()
-                                throwIO (SQLError code (TE.decodeUtf8 message) "step")
-             in go start0 ordinal0 revResults0
+            stepSqliteStatements
+                db
+                offsetsPtr
+                maxOffsets
+                base
+                end
+                outTail
+                outStmt
+                outOrdinal
+                start0
+                ordinal0
+                revResults0
+
+stepSqliteStatements ::
+    Direct.Database ->
+    Ptr CInt ->
+    Int ->
+    CString ->
+    CString ->
+    Ptr CString ->
+    Ptr (Ptr CStatement) ->
+    Ptr CInt ->
+    CString ->
+    Int ->
+    [(Int, ResultSet)] ->
+    IO (Int, [(Int, ResultSet)], Maybe [Int])
+stepSqliteStatements db@(Direct.Database handle) offsetsPtr maxOffsets base end outTail outStmt outOrdinal = go
+    where
+        finish !total revResults = do
+            offsets <-
+                if total <= maxOffsets
+                    then Just . map fromIntegral <$> peekArray total offsetsPtr
+                    else pure Nothing
+            pure (total, revResults, offsets)
+
+        -- C may return a live statement even when stepping failed.
+        -- Keep ownership transfer and finalization masked.
+        go !start !ordinal revResults
+            | start >= end = finish ordinal revResults
+            | otherwise = mask $ \restore -> do
+                rc <-
+                    c_occamSqliteNextResult
+                        handle
+                        base
+                        start
+                        end
+                        (fromIntegral ordinal)
+                        offsetsPtr
+                        (fromIntegral maxOffsets)
+                        outTail
+                        outStmt
+                        outOrdinal
+                tailPtr <- peek outTail
+                stmtPtr <- peek outStmt
+                nextOrd <- fromIntegral <$> peek outOrdinal
+                case rc of
+                    0 -> restore (finish nextOrd revResults)
+                    1 -> do
+                        let stmt = Direct.Statement stmtPtr
+                        rs <- restore (readSqliteResultSet stmt) `onException` c_sqlite3_finalize stmtPtr
+                        finalize stmt
+                        restore (go tailPtr (nextOrd + 1) ((nextOrd, rs) : revResults))
+                    -1 -> throwSqliteError db "prepare"
+                    _ -> do
+                        when (stmtPtr /= nullPtr) $ do
+                            _ <- c_sqlite3_finalize stmtPtr
+                            pure ()
+                        throwSqliteError db "step"
+
+readSqliteResultSet :: Statement -> IO ResultSet
+readSqliteResultSet stmt = do
+    count <- columnCount stmt
+    names <- forM [0 .. count - 1] $ \i -> do
+        name <- columnName stmt i
+        maybe (fail "SQLite omitted a result column name") pure name
+    rows <- stepAll stmt
+    pure (ResultSet names [] rows)
+
+throwSqliteError :: Direct.Database -> Text -> IO a
+throwSqliteError db phase = do
+    code <- Direct.errcode db
+    Direct.Utf8 message <- Direct.errmsg db
+    throwIO (SQLError code (TE.decodeUtf8 message) phase)
 
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidateTimeout micros sql = do
@@ -678,12 +703,10 @@ generateSqliteContractWithTrace micros sql =
                 let result = srLastResult run
                 trace <- buildSqliteTrace sql result run
                 when (traceDeterministic trace && traceStatementCount trace >= 8) $
-                    case encodeSqliteExpected result of
-                        Nothing -> pure ()
-                        Just expBytes ->
-                            withPooledSqliteConn $ \conn -> do
-                                ok <- buildSqliteCheckpoints remaining expBytes sql (traceStatementCount trace) conn
-                                pure (ok, ())
+                    for_ (encodeSqliteExpected result) \expBytes ->
+                        withPooledSqliteConn $ \conn -> do
+                            ok <- buildSqliteCheckpoints remaining expBytes sql (traceStatementCount trace) conn
+                            pure (ok, ())
                 pure $
                     Right
                         ( SqliteContract
@@ -733,6 +756,17 @@ encodeSqliteExpected (ResultSet cols _ rows) = do
             | otherwise = Nothing
         encodeVal _ = Nothing
 
+data SqliteMatchCall = SqliteMatchCall
+    { smcStatus :: !CInt
+    , smcStmtCount :: !Int
+    , smcFirstRes :: !Int
+    , smcLastRes :: !Int
+    , smcOffsets :: !(Maybe [Int])
+    , smcFlags :: ![Word8]
+    , smcUsedCkptDml :: !Bool
+    , smcFailEnd :: !Int
+    }
+
 matchCandidateOnConn ::
     IO Int ->
     ByteString ->
@@ -746,62 +780,8 @@ matchCandidateOnConn remaining expectedBytes sql allowCkpt needTrace onFailingPr
     poke (scDirtyPtr conn) 0
     tainted <- readIORef (scDmlTainted conn)
     checkpointContract <- readIORef (scCheckpointContract conn)
-    let db = scDb conn
-        Direct.Database dbPtr = db
-        useCheckpoint = allowCkpt && checkpointContract == Just expectedBytes
-        maxOffsets = if needTrace then max 64 (BS.count 59 sql + 16) else 0
-        allocOffsets = if needTrace then allocaArray maxOffsets else ($ nullPtr)
-        allocFlags = if needTrace then allocaArray maxOffsets else ($ nullPtr)
-    res <-
-        try $
-            interruptibly db $
-                evalContT do
-                    (sqlPtr, sqlLen) <- ContT $ BSU.unsafeUseAsCStringLen sql
-                    (expPtr, expLen) <- ContT $ BSU.unsafeUseAsCStringLen expectedBytes
-                    stmtCountPtr <- ContT alloca
-                    firstResPtr <- ContT alloca
-                    lastResPtr <- ContT alloca
-                    offsetsPtr <- ContT allocOffsets
-                    flagsPtr <- ContT allocFlags
-                    usedCkptDmlPtr <- ContT alloca
-                    failEndPtr <- ContT alloca
-                    liftIO do
-                        micros <- remaining
-                        status <-
-                            c_occamSqliteRunAndMatch
-                                dbPtr
-                                (scDirtyPtr conn)
-                                (scCachePtr conn)
-                                (castPtr sqlPtr)
-                                (fromIntegral sqlLen)
-                                (castPtr expPtr)
-                                (fromIntegral expLen)
-                                (fromIntegral micros)
-                                (if useCheckpoint then 1 else 0)
-                                stmtCountPtr
-                                firstResPtr
-                                lastResPtr
-                                offsetsPtr
-                                flagsPtr
-                                (fromIntegral maxOffsets)
-                                usedCkptDmlPtr
-                                failEndPtr
-                        stmtCount <- fromIntegral <$> peek stmtCountPtr
-                        firstRes <- fromIntegral <$> peek firstResPtr
-                        lastRes <- fromIntegral <$> peek lastResPtr
-                        usedCkptDml <- (/= 0) <$> peek usedCkptDmlPtr
-                        failEnd <- fromIntegral <$> peek failEndPtr
-                        if status == 0 && needTrace
-                            then do
-                                (offsets, flags) <-
-                                    if stmtCount <= maxOffsets
-                                        then do
-                                            rawOffsets <- peekArray stmtCount offsetsPtr
-                                            rawFlags <- peekArray stmtCount flagsPtr
-                                            pure (Just (map fromIntegral rawOffsets), rawFlags)
-                                        else pure (Nothing, [])
-                                pure (status, stmtCount, firstRes, lastRes, offsets, flags, usedCkptDml, failEnd)
-                            else pure (status, stmtCount, firstRes, lastRes, Nothing, [], usedCkptDml, failEnd)
+    let useCheckpoint = allowCkpt && checkpointContract == Just expectedBytes
+    res <- try $ invokeSqliteRunAndMatch remaining expectedBytes sql useCheckpoint needTrace conn
     dirty <- peek (scDirtyPtr conn)
     when ((dirty .&. dirtyDml) /= 0) $
         writeIORef (scDmlTainted conn) True
@@ -810,70 +790,162 @@ matchCandidateOnConn remaining expectedBytes sql allowCkpt needTrace onFailingPr
     case res of
         Left (err :: SomeException) ->
             pure (False, False, (OracleIOFailed (T.pack (displayException err)), Nothing))
-        Right (status, stmtCount, firstRes, lastRes, offsets, flags, usedCkptDml, failEnd) ->
-            let counterPolluted = (tainted || usedCkptDml) && (dirty .&. dirtyConnCounter) /= 0
-             in case status of
-                    0 -> do
-                        deterministic <-
-                            if authorizerDet
-                                then BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
-                                    (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
-                                else pure False
-                        let trace =
-                                if needTrace
-                                    then
-                                        let (resIdxList, prefMatchList) = decodeResultFlags flags
-                                         in Just
-                                                ResultTrace
-                                                    { traceStatementCount = stmtCount
-                                                    , traceFirstResultIndex = if firstRes >= 0 then firstRes else lastRes
-                                                    , traceLastResultIndex = lastRes
-                                                    , traceResultIndices = IntSet.fromDistinctAscList resIdxList
-                                                    , tracePrefixMatchIndices = IntSet.fromDistinctAscList prefMatchList
-                                                    , traceDeterministic = deterministic
-                                                    , traceEndByteOffsets = offsets
-                                                    }
-                                    else Nothing
-                        keepConn <-
-                            if allowCkpt
-                                && not counterPolluted
-                                && poolable
-                                && deterministic
-                                && stmtCount >= 8
-                                && (dirty .&. (dirtyTemp .|. dirtyPragma .|. dirtyConnCounter .|. dirtyNondet)) == 0
-                                then do
-                                    resetOk <- resetSqliteConn conn
-                                    if resetOk
-                                        then buildSqliteCheckpoints remaining expectedBytes sql stmtCount conn
-                                        else pure False
-                                else pure poolable
-                        pure (keepConn, counterPolluted, (OracleFinished ExitSuccess, trace))
-                    1 -> pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
-                    2 -> do
-                        when
-                            ( not counterPolluted
-                                && failEnd > 0
-                                && failEnd <= BS.length sql
-                                && (dirty .&. (dirtyTemp .|. dirtyNondet)) == 0
-                            )
-                            $ do
-                                let prefix = BS.take failEnd sql
-                                isDetPrefix <- BSU.unsafeUseAsCStringLen prefix $ \(ptr, len) ->
-                                    (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
-                                when isDetPrefix (onFailingPrefix prefix)
-                        pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
-                    3 -> pure (False, False, (OracleTimedOut, Nothing))
-                    _ -> pure (False, False, (OracleIOFailed "SQLite execution infrastructure error", Nothing))
+        Right call ->
+            let counterPolluted = (tainted || smcUsedCkptDml call) && (dirty .&. dirtyConnCounter) /= 0
+             in handleSqliteMatchCall
+                    remaining
+                    expectedBytes
+                    sql
+                    allowCkpt
+                    needTrace
+                    onFailingPrefix
+                    conn
+                    dirty
+                    poolable
+                    authorizerDet
+                    counterPolluted
+                    call
+
+invokeSqliteRunAndMatch ::
+    IO Int -> ByteString -> ByteString -> Bool -> Bool -> SqliteConn -> IO SqliteMatchCall
+invokeSqliteRunAndMatch remaining expectedBytes sql useCheckpoint needTrace conn =
+    interruptibly db $ evalContT do
+        (sqlPtr, sqlLen) <- ContT $ BSU.unsafeUseAsCStringLen sql
+        (expPtr, expLen) <- ContT $ BSU.unsafeUseAsCStringLen expectedBytes
+        stmtCountPtr <- ContT alloca
+        firstResPtr <- ContT alloca
+        lastResPtr <- ContT alloca
+        offsetsPtr <- ContT allocOffsets
+        flagsPtr <- ContT allocFlags
+        usedCkptDmlPtr <- ContT alloca
+        failEndPtr <- ContT alloca
+        liftIO do
+            micros <- remaining
+            status <-
+                c_occamSqliteRunAndMatch
+                    dbPtr
+                    (scDirtyPtr conn)
+                    (scCachePtr conn)
+                    (castPtr sqlPtr)
+                    (fromIntegral sqlLen)
+                    (castPtr expPtr)
+                    (fromIntegral expLen)
+                    (fromIntegral micros)
+                    (if useCheckpoint then 1 else 0)
+                    stmtCountPtr
+                    firstResPtr
+                    lastResPtr
+                    offsetsPtr
+                    flagsPtr
+                    (fromIntegral maxOffsets)
+                    usedCkptDmlPtr
+                    failEndPtr
+            stmtCount <- fromIntegral <$> peek stmtCountPtr
+            firstRes <- fromIntegral <$> peek firstResPtr
+            lastRes <- fromIntegral <$> peek lastResPtr
+            usedCkptDml <- (/= 0) <$> peek usedCkptDmlPtr
+            failEnd <- fromIntegral <$> peek failEndPtr
+            (offsets, flags) <-
+                if status == 0 && needTrace && stmtCount <= maxOffsets
+                    then do
+                        rawOffsets <- peekArray stmtCount offsetsPtr
+                        rawFlags <- peekArray stmtCount flagsPtr
+                        pure (Just (map fromIntegral rawOffsets), rawFlags)
+                    else pure (Nothing, [])
+            pure (SqliteMatchCall status stmtCount firstRes lastRes offsets flags usedCkptDml failEnd)
     where
-        decodeResultFlags = go 0 False [] []
-            where
-                go _ _ resAcc prefAcc [] = (reverse resAcc, reverse prefAcc)
-                go !k !matches resAcc prefAcc (f : fs)
-                    | (f .&. 1) /= 0 =
-                        let !m = (f .&. 2) /= 0
-                         in go (k + 1) m (k : resAcc) (if m then k : prefAcc else prefAcc) fs
-                    | matches = go (k + 1) True resAcc (k : prefAcc) fs
-                    | otherwise = go (k + 1) False resAcc prefAcc fs
+        db@(Direct.Database dbPtr) = scDb conn
+        maxOffsets = if needTrace then max 64 (BS.count 59 sql + 16) else 0
+        allocOffsets = if needTrace then allocaArray maxOffsets else ($ nullPtr)
+        allocFlags = if needTrace then allocaArray maxOffsets else ($ nullPtr)
+
+handleSqliteMatchCall ::
+    IO Int ->
+    ByteString ->
+    ByteString ->
+    Bool ->
+    Bool ->
+    (ByteString -> IO ()) ->
+    SqliteConn ->
+    CInt ->
+    Bool ->
+    Bool ->
+    Bool ->
+    SqliteMatchCall ->
+    IO (Bool, Bool, (OracleObservation, Maybe ResultTrace))
+handleSqliteMatchCall remaining expectedBytes sql allowCkpt needTrace onFailingPrefix conn dirty poolable authorizerDet counterPolluted call =
+    case smcStatus call of
+        0 -> do
+            deterministic <-
+                if authorizerDet
+                    then BSU.unsafeUseAsCStringLen sql $ \(ptr, len) ->
+                        (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
+                    else pure False
+            let trace = if needTrace then Just (buildSqliteMatchTrace call deterministic) else Nothing
+                canCheckpoint =
+                    allowCkpt
+                        && not counterPolluted
+                        && poolable
+                        && deterministic
+                        && smcStmtCount call >= 8
+                        && (dirty .&. (dirtyTemp .|. dirtyPragma .|. dirtyConnCounter .|. dirtyNondet)) == 0
+            keepConn <-
+                if canCheckpoint
+                    then rebuildSqliteCheckpoints remaining expectedBytes sql (smcStmtCount call) conn
+                    else pure poolable
+            pure (keepConn, counterPolluted, (OracleFinished ExitSuccess, trace))
+        1 -> pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
+        2 -> do
+            recordSqliteFailingPrefix sql dirty counterPolluted (smcFailEnd call) onFailingPrefix
+            pure (poolable, counterPolluted, (OracleFinished (ExitFailure 1), Nothing))
+        3 -> pure (False, False, (OracleTimedOut, Nothing))
+        _ -> pure (False, False, (OracleIOFailed "SQLite execution infrastructure error", Nothing))
+
+rebuildSqliteCheckpoints :: IO Int -> ByteString -> ByteString -> Int -> SqliteConn -> IO Bool
+rebuildSqliteCheckpoints remaining expectedBytes sql stmtCount conn = do
+    resetOk <- resetSqliteConn conn
+    if resetOk
+        then buildSqliteCheckpoints remaining expectedBytes sql stmtCount conn
+        else pure False
+
+recordSqliteFailingPrefix :: ByteString -> CInt -> Bool -> Int -> (ByteString -> IO ()) -> IO ()
+recordSqliteFailingPrefix sql dirty counterPolluted failEnd onFailingPrefix =
+    when
+        ( not counterPolluted
+            && failEnd > 0
+            && failEnd <= BS.length sql
+            && (dirty .&. (dirtyTemp .|. dirtyNondet)) == 0
+        )
+        do
+            let prefix = BS.take failEnd sql
+            isDetPrefix <- BSU.unsafeUseAsCStringLen prefix $ \(ptr, len) ->
+                (== 0) <$> c_hasNondetKeyword (castPtr ptr) (fromIntegral len)
+            when isDetPrefix (onFailingPrefix prefix)
+
+buildSqliteMatchTrace :: SqliteMatchCall -> Bool -> ResultTrace
+buildSqliteMatchTrace call deterministic =
+    ResultTrace
+        { traceStatementCount = smcStmtCount call
+        , traceFirstResultIndex = if smcFirstRes call >= 0 then smcFirstRes call else smcLastRes call
+        , traceLastResultIndex = smcLastRes call
+        , traceResultIndices = IntSet.fromDistinctAscList resIdxList
+        , tracePrefixMatchIndices = IntSet.fromDistinctAscList prefMatchList
+        , traceDeterministic = deterministic
+        , traceEndByteOffsets = smcOffsets call
+        }
+    where
+        (resIdxList, prefMatchList) = decodeResultFlags (smcFlags call)
+
+decodeResultFlags :: [Word8] -> ([Int], [Int])
+decodeResultFlags = go 0 False [] []
+    where
+        go _ _ resAcc prefAcc [] = (reverse resAcc, reverse prefAcc)
+        go !k !matches resAcc prefAcc (f : fs)
+            | (f .&. 1) /= 0 =
+                let !m = (f .&. 2) /= 0
+                 in go (k + 1) m (k : resAcc) (if m then k : prefAcc else prefAcc) fs
+            | matches = go (k + 1) True resAcc (k : prefAcc) fs
+            | otherwise = go (k + 1) False resAcc prefAcc fs
 
 {- | Prepare a reusable fast SQLite contract observer that pre-encodes expected
 results once into binary form for zero-allocation C-side matching and

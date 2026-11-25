@@ -200,109 +200,97 @@ getInt32 = fromIntegral <$> getWord32le
 getBool :: Decoder Bool
 getBool = (/= 0) <$> getWord8
 
+{-# INLINE decodeWord64LE #-}
+decodeWord64LE :: ByteString -> Int -> Word64
+decodeWord64LE bs i =
+    let !w0 = fromIntegral (BSU.unsafeIndex bs i) :: Word64
+        !w1 = fromIntegral (BSU.unsafeIndex bs (i + 1)) :: Word64
+        !w2 = fromIntegral (BSU.unsafeIndex bs (i + 2)) :: Word64
+        !w3 = fromIntegral (BSU.unsafeIndex bs (i + 3)) :: Word64
+        !w4 = fromIntegral (BSU.unsafeIndex bs (i + 4)) :: Word64
+        !w5 = fromIntegral (BSU.unsafeIndex bs (i + 5)) :: Word64
+        !w6 = fromIntegral (BSU.unsafeIndex bs (i + 6)) :: Word64
+        !w7 = fromIntegral (BSU.unsafeIndex bs (i + 7)) :: Word64
+     in w0
+            .|. (w1 `shiftL` 8)
+            .|. (w2 `shiftL` 16)
+            .|. (w3 `shiftL` 24)
+            .|. (w4 `shiftL` 32)
+            .|. (w5 `shiftL` 40)
+            .|. (w6 `shiftL` 48)
+            .|. (w7 `shiftL` 56)
+
 {-# INLINE getInt64 #-}
 getInt64 :: Decoder Integer
 getInt64 = Decoder $ \_ bs len pos ->
     if isTrue# (pos +# 8# <=# len)
         then
-            let !i = I# pos
-                !w0 = fromIntegral (BSU.unsafeIndex bs i) :: Word64
-                !w1 = fromIntegral (BSU.unsafeIndex bs (i + 1)) :: Word64
-                !w2 = fromIntegral (BSU.unsafeIndex bs (i + 2)) :: Word64
-                !w3 = fromIntegral (BSU.unsafeIndex bs (i + 3)) :: Word64
-                !w4 = fromIntegral (BSU.unsafeIndex bs (i + 4)) :: Word64
-                !w5 = fromIntegral (BSU.unsafeIndex bs (i + 5)) :: Word64
-                !w6 = fromIntegral (BSU.unsafeIndex bs (i + 6)) :: Word64
-                !w7 = fromIntegral (BSU.unsafeIndex bs (i + 7)) :: Word64
-                !w =
-                    w0
-                        .|. (w1 `shiftL` 8)
-                        .|. (w2 `shiftL` 16)
-                        .|. (w3 `shiftL` 24)
-                        .|. (w4 `shiftL` 32)
-                        .|. (w5 `shiftL` 40)
-                        .|. (w6 `shiftL` 48)
-                        .|. (w7 `shiftL` 56)
-                !i64 = fromIntegral w :: Int64
+            let !i64 = fromIntegral (decodeWord64LE bs (I# pos)) :: Int64
                 !val = fromIntegral i64
              in (# | (# val, pos +# 8# #) #)
         else (# "unexpected end of binary stream" | #)
 
 {-# INLINE getText #-}
 getText :: Decoder Text
-getText = Decoder $ \idents bs len pos -> case unDec getInt32 idents bs len pos of
-    (# err | #) -> (# err | #)
-    (# | (# n@(I# n#), pos1 #) #) ->
-        if n < 0 || n > I# (len -# pos1)
-            then (# "unexpected end of binary stream" | #)
-            else
-                if n == 0
-                    then (# | (# T.empty, pos1 #) #)
-                    else
-                        let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos1) bs)
-                         in case TE.decodeUtf8' slice of
-                                Left exc -> (# T.pack ("invalid UTF-8 in binary stream: " ++ show exc) | #)
-                                Right !txt -> (# | (# txt, pos1 +# n# #) #)
+getText = getInt32 >>= getUtf8Text
+
+{-# INLINE getUtf8Text #-}
+getUtf8Text :: Int -> Decoder Text
+getUtf8Text n@(I# n#) = Decoder $ \_ bs len pos ->
+    decodeUtf8Slice bs len pos n n#
+
+{-# INLINE decodeUtf8Slice #-}
+decodeUtf8Slice :: ByteString -> Int# -> Int# -> Int -> Int# -> (# Text | (# Text, Int# #) #)
+decodeUtf8Slice bs len pos n n#
+    | n < 0 || n > I# (len -# pos) = (# "unexpected end of binary stream" | #)
+    | n == 0 = (# | (# T.empty, pos #) #)
+    | otherwise =
+        let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos) bs)
+         in case TE.decodeUtf8' slice of
+                Left exc -> (# T.pack ("invalid UTF-8 in binary stream: " ++ show exc) | #)
+                Right !txt -> (# | (# txt, pos +# n# #) #)
 
 -- | Intern common static edit labels without UTF-8 decoding or Text allocation.
-{-# INLINE decodeEditLabel #-}
-decodeEditLabel :: ByteString -> Int# -> Int# -> (# Text | (# Text, Int# #) #)
-decodeEditLabel bs len pos =
-    if isTrue# (pos <# len)
-        then
-            let !code = BSU.unsafeIndex bs (I# pos)
-                !pos1 = pos +# 1#
-             in case commonLabel code of
-                    Just !lbl -> (# | (# lbl, pos1 #) #)
-                    Nothing ->
-                        if isTrue# (pos1 +# 4# <=# len)
-                            then
-                                let !n@(I# n#) = fromIntegral (decodeWord32LE bs (I# pos1))
-                                    !pos2 = pos1 +# 4#
-                                 in if n < 0 || n > I# (len -# pos2)
-                                        then (# "unexpected end of binary stream" | #)
-                                        else
-                                            if n == 0
-                                                then (# | (# T.empty, pos2 #) #)
-                                                else
-                                                    let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos2) bs)
-                                                     in case TE.decodeUtf8' slice of
-                                                            Left exc -> (# T.pack ("invalid UTF-8 in binary stream: " ++ show exc) | #)
-                                                            Right !txt -> (# | (# txt, pos2 +# n# #) #)
-                            else (# "unexpected end of binary stream" | #)
-        else (# "unexpected end of binary stream" | #)
+{-# INLINE getEditLabel #-}
+getEditLabel :: Decoder Text
+getEditLabel = do
+    !code <- getWord8
+    maybe getText pure (commonLabel code)
 
 -- | Intern common edit replacements without retaining slices of the FFI buffer.
-{-# INLINE decodeEditReplacement #-}
-decodeEditReplacement :: ByteString -> Int# -> Int# -> (# Text | (# ByteString, Int# #) #)
-decodeEditReplacement bs len pos =
-    if isTrue# (pos +# 4# <=# len)
-        then
-            let !n@(I# n#) = fromIntegral (decodeWord32LE bs (I# pos))
-                !pos1 = pos +# 4#
-             in if n < 0 || n > I# (len -# pos1)
-                    then (# "unexpected end of binary stream" | #)
-                    else case n of
-                        0 -> (# | (# BS.empty, pos1 #) #)
-                        1 -> case BSU.unsafeIndex bs (I# pos1) of
-                            0x30 -> (# | (# repZero, pos1 +# 1# #) #)
-                            0x31 -> (# | (# repOne, pos1 +# 1# #) #)
-                            _ ->
-                                let !rep = BS.copy (BSU.unsafeTake 1 (BSU.unsafeDrop (I# pos1) bs))
-                                 in (# | (# rep, pos1 +# 1# #) #)
-                        3 ->
-                            let !slice = BSU.unsafeTake 3 (BSU.unsafeDrop (I# pos1) bs)
-                                !rep = if slice == repQuotedZero then repQuotedZero else BS.copy slice
-                             in (# | (# rep, pos1 +# 3# #) #)
-                        4 ->
-                            let !slice = BSU.unsafeTake 4 (BSU.unsafeDrop (I# pos1) bs)
-                                !rep = if slice == repNull then repNull else BS.copy slice
-                             in (# | (# rep, pos1 +# 4# #) #)
-                        _ ->
-                            let !slice = BSU.unsafeTake n (BSU.unsafeDrop (I# pos1) bs)
-                                !rep = BS.copy slice
-                             in (# | (# rep, pos1 +# n# #) #)
-        else (# "unexpected end of binary stream" | #)
+{-# INLINE getEditReplacement #-}
+getEditReplacement :: Decoder ByteString
+getEditReplacement = getInt32 >>= getInternedBytes
+
+{-# INLINE getInternedBytes #-}
+getInternedBytes :: Int -> Decoder ByteString
+getInternedBytes n@(I# n#) = Decoder $ \_ bs len pos ->
+    decodeInternedSlice bs len pos n n#
+
+{-# INLINE decodeInternedSlice #-}
+decodeInternedSlice ::
+    ByteString -> Int# -> Int# -> Int -> Int# -> (# Text | (# ByteString, Int# #) #)
+decodeInternedSlice bs len pos n n#
+    | n < 0 || n > I# (len -# pos) = (# "unexpected end of binary stream" | #)
+    | n == 0 = (# | (# BS.empty, pos #) #)
+    | otherwise =
+        let !rep = internReplacement bs (I# pos) n
+         in (# | (# rep, pos +# n# #) #)
+
+{-# INLINE internReplacement #-}
+internReplacement :: ByteString -> Int -> Int -> ByteString
+internReplacement bs off 1 = case BSU.unsafeIndex bs off of
+    0x30 -> repZero
+    0x31 -> repOne
+    _ -> BS.copy (BSU.unsafeTake 1 (BSU.unsafeDrop off bs))
+internReplacement bs off 3 =
+    let !slice = BSU.unsafeTake 3 (BSU.unsafeDrop off bs)
+     in if slice == repQuotedZero then repQuotedZero else BS.copy slice
+internReplacement bs off 4 =
+    let !slice = BSU.unsafeTake 4 (BSU.unsafeDrop off bs)
+     in if slice == repNull then repNull else BS.copy slice
+internReplacement bs off n =
+    BS.copy (BSU.unsafeTake n (BSU.unsafeDrop off bs))
 
 repZero, repOne, repQuotedZero, repNull :: ByteString
 repZero = "0"
@@ -920,57 +908,42 @@ getCatalogOp = do
         17 -> RefreshCatalogOp <$> getRefreshOp
         _ -> fail ("invalid CatalogOp tag: " ++ show tag)
 
-{-# INLINE decodeEditCategory #-}
-decodeEditCategory :: Word8 -> (# Text | ParserEditCategory #)
-decodeEditCategory 0 = (# | EditExpression #)
-decodeEditCategory 1 = (# | EditClause #)
-decodeEditCategory 2 = (# | EditConstraint #)
-decodeEditCategory 3 = (# | EditList #)
-decodeEditCategory 4 = (# | EditColumn #)
-decodeEditCategory 5 = (# | EditType #)
-decodeEditCategory 6 = (# | EditLiteral #)
-decodeEditCategory code = (# T.pack ("unknown parser edit category code: " ++ show code) | #)
+{-# INLINE getEditCategory #-}
+getEditCategory :: Word8 -> Decoder ParserEditCategory
+getEditCategory = \case
+    0 -> pure EditExpression
+    1 -> pure EditClause
+    2 -> pure EditConstraint
+    3 -> pure EditList
+    4 -> pure EditColumn
+    5 -> pure EditType
+    6 -> pure EditLiteral
+    code -> fail ("unknown parser edit category code: " ++ show code)
 
-{-# INLINE decodeParserEdit #-}
-decodeParserEdit :: IntMap Text -> ByteString -> Int# -> Int# -> (# Text | (# ParserEdit, Int# #) #)
-decodeParserEdit _idents bs len pos =
-    if isTrue# (pos +# 8# <=# len)
-        then
-            let !i = I# pos
-                !start = fromIntegral (decodeWord32LE bs i)
-                !end = fromIntegral (decodeWord32LE bs (i + 4))
-             in case decodeEditReplacement bs len (pos +# 8#) of
-                    (# err | #) -> (# err | #)
-                    (# | (# rep, posRep #) #) ->
-                        if isTrue# (posRep <# len)
-                            then
-                                let !rawCat = BSU.unsafeIndex bs (I# posRep)
-                                    !topProj = (rawCat .&. 0x80) /= 0
-                                    !tailClause = (rawCat .&. 0x40) /= 0
-                                 in case decodeEditCategory (rawCat .&. 0x3f) of
-                                        (# err | #) -> (# err | #)
-                                        (# | cat #) -> case decodeEditLabel bs len (posRep +# 1#) of
-                                            (# err | #) -> (# err | #)
-                                            (# | (# label, posNext #) #) ->
-                                                (#
-                                                    | (#
-                                                        ParserEdit
-                                                            { parserEditStart = start
-                                                            , parserEditEnd = end
-                                                            , parserEditReplacement = rep
-                                                            , parserEditCategory = cat
-                                                            , parserEditLabel = label
-                                                            , parserEditTopProjection = topProj
-                                                            , parserEditTailClause = tailClause
-                                                            }
-                                                        , posNext
-                                                      #)
-                                                #)
-                            else (# "unexpected end of binary stream" | #)
-        else (# "unexpected end of binary stream" | #)
+{-# INLINE getParserEdit #-}
+getParserEdit :: Decoder ParserEdit
+getParserEdit = do
+    !start <- getInt32
+    !end <- getInt32
+    !rep <- getEditReplacement
+    !rawCat <- getWord8
+    !cat <- getEditCategory (rawCat .&. 0x0f)
+    !label <- getEditLabel
+    pure
+        ParserEdit
+            { parserEditStart = start
+            , parserEditEnd = end
+            , parserEditReplacement = rep
+            , parserEditCategory = cat
+            , parserEditLabel = label
+            , parserEditTopProjection = (rawCat .&. 0x80) /= 0
+            , parserEditStringLiteral = (rawCat .&. 0x40) /= 0
+            , parserEditRecursivePredicate = (rawCat .&. 0x20) /= 0
+            , parserEditLowYield = (rawCat .&. 0x10) /= 0
+            }
 
 getParserEditVec :: Decoder [ParserEdit]
-getParserEditVec = getVec (Decoder decodeParserEdit)
+getParserEditVec = getVec getParserEdit
 
 {-# INLINE getSemanticFacts #-}
 getSemanticFacts :: Decoder SemanticFacts

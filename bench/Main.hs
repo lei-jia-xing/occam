@@ -77,6 +77,16 @@ import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
 import ResultBaseline (
     runCombinedSyntaxBaseline,
+    runDeferLiteralVariants01Baseline,
+    runDeferLiteralVariantsBaseline,
+    runDeferRecursiveBaseline,
+    runDistributedCap16Vs32Baseline,
+    runDistributedCap8Vs16Baseline,
+    runDistributedLiteralBatchBaseline,
+    runDistributedMin16Vs32Baseline,
+    runDistributedMisses1Vs2Baseline,
+    runDistributedMisses2Vs3Baseline,
+    runDistributedRefreshBaseline,
     runEarlyRejectBaseline,
     runGroupProposalsBaseline,
     runGroupProposalsNoLocBaseline,
@@ -423,7 +433,41 @@ searchModes =
     , ("--early-reject-baseline", runEarlyRejectBaseline)
     , ("--reparse-baseline", runReparseBaseline)
     , ("--worker-baseline", runWorkerBaseline)
+    , ("--distributed-literal-batch-baseline", runDistributedLiteralBatchBaseline)
+    , ("--distributed-refresh-baseline", runDistributedRefreshBaseline)
+    , ("--distributed-misses-1-vs-2-baseline", runDistributedMisses1Vs2Baseline)
+    , ("--distributed-misses-2-vs-3-baseline", runDistributedMisses2Vs3Baseline)
+    , ("--distributed-min16-vs-32-baseline", runDistributedMin16Vs32Baseline)
+    , ("--distributed-cap8-vs-16-baseline", runDistributedCap8Vs16Baseline)
+    , ("--distributed-cap16-vs-32-baseline", runDistributedCap16Vs32Baseline)
+    , ("--defer-literal-variants-baseline", runDeferLiteralsWithCorpus runDeferLiteralVariantsBaseline)
+    ,
+        ( "--defer-literal-variants-01-baseline"
+        , runDeferLiteralsWithCorpus runDeferLiteralVariants01Baseline
+        )
+    , ("--defer-recursive-baseline", runDeferRecursiveBaseline)
     ]
+
+runDeferLiteralsWithCorpus ::
+    ( (ByteString, ByteString, ByteString, ByteString, ByteString, ByteString) ->
+      Int ->
+      Maybe Int ->
+      Maybe Int ->
+      FilePath ->
+      IO ()
+    ) ->
+    Int ->
+    Maybe Int ->
+    Maybe Int ->
+    FilePath ->
+    IO ()
+runDeferLiteralsWithCorpus runner pairs wallLimit callLimit out = do
+    txChurn <- locateCorpusFile "02_transaction_savepoint_churn.sql" >>= BS.readFile
+    deep <- locateCorpusFile "03_deep_expressions_polymorphic.sql" >>= BS.readFile
+    diamond <- locateCorpusFile "04_multitable_diamond_dag.sql" >>= BS.readFile
+    upsert <- locateCorpusFile "05_upsert_conflict.sql" >>= BS.readFile
+    views <- locateCorpusFile "06_views_and_aggregates.sql" >>= BS.readFile
+    runner (txChurn, deep, diamond, upsert, views, genScale 64) pairs wallLimit callLimit out
 
 runCombinedWithCorpus :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
 runCombinedWithCorpus pairs wallLimit callLimit out = do

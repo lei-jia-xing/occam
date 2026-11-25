@@ -118,10 +118,18 @@ struct NativeEdit {
     /// to strictly reduce result column arity).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     top_level_projection: bool,
-    /// When this clause ends the outer SELECT, deleting it preserves the
-    /// grammar and bindings of all surviving children.
+    /// True when this edit rewrites a SQL single-quoted string literal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    tail_clause: bool,
+    string_literal: bool,
+    /// True when this edit rewrites a join or filter predicate inside a
+    /// recursive CTE member, where weakening the predicate risks non-termination.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    recursive_predicate: bool,
+    /// True when this edit is a lower-yield variant (e.g., secondary scalar
+    /// literal fallback or destructive expression constant) that should trail
+    /// primary structure-preserving candidates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    low_yield: bool,
 }
 
 #[cfg(test)]

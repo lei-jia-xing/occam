@@ -32,7 +32,9 @@ import Control.Exception.Safe (
     toException,
     try,
  )
-import Control.Monad (unless, when)
+import Control.Monad (guard, unless, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Aeson (
     FromJSON (..),
     ToJSON (..),
@@ -787,137 +789,141 @@ runAuditPhase env state pool reporter evidence = do
     auditInput <- evalAccepted <$> readIORef state
     case evidence of
         Just ReductionEvidence {..}
-            | evidenceAuditMinimal && evidenceBytes == auditInput -> do
-                modifyEvalState state \s ->
-                    s
-                        { evalAuditSeconds = 0
-                        , evalAuditCompleted = True
-                        , evalAuditSkipped = True
-                        , evalAuditUnchanged = True
-                        , evalAuditInitialAccepted = True
-                        , evalAuditResult = Just auditInput
-                        }
-                logDebug'
-                    (envLogger env)
-                    "audit"
-                    "Shared statement audit skipped (already confirmed 1-minimal)"
-                    [ ("audit_skipped", toJSON True)
-                    , ("audit_minimality_confirmed", toJSON True)
-                    ]
-        _ -> do
-            auditStart <- ticks
-            let auditPool =
-                    mapPoolRetire
-                        ( \retire index candidate outcome hit -> do
-                            priorChecks <- evalAuditChecks <$> readIORef state
-                            modifyEvalState state (\s -> s {evalAuditChecks = evalAuditChecks s + 1})
-                            when (priorChecks == 0) $
-                                modifyEvalState state (\s -> s {evalAuditInitialAccepted = outcome == OracleAccepted})
-                            retire index candidate outcome hit
-                        )
-                        pool
-                finishAudit = do
-                    auditEnd <- ticks
-                    let elapsed = seconds auditStart auditEnd
-                    st <- readIORef state
-                    let complete = evalAuditCompleted st
-                        checks = evalAuditChecks st
-                        unchanged = evalAuditUnchanged st
-                    modifyEvalState state (\s -> s {evalAuditSeconds = elapsed})
-                    logInfo'
-                        (envLogger env)
-                        "audit"
-                        "Shared statement audit finished"
-                        [ ("elapsed_seconds", toJSON elapsed)
-                        , ("candidate_checks", toJSON checks)
-                        , ("completed", toJSON complete)
-                        , ("candidate_unchanged", toJSON unchanged)
-                        , ("audit_minimality_confirmed", toJSON complete)
-                        , ("skipped", toJSON False)
-                        ]
-            reporter (StageStarted StageStatementAudit)
-            result <-
-                ( do
-                    (audited, stats) <-
-                        statementAuditWithLogger (envLogger env) (envDialect env) auditPool auditInput
-                    initialAccepted <- evalAuditInitialAccepted <$> readIORef state
-                    modifyEvalState state \s ->
-                        s
-                            { evalAuditCompleted = auditMinimalityConfirmed stats
-                            , evalAuditUnchanged = initialAccepted && audited == auditInput
-                            , evalAuditResult = Just audited
-                            }
-                    pure audited
-                )
-                    `finally` finishAudit
+            | evidenceAuditMinimal && evidenceBytes == auditInput ->
+                skipAuditPhase env state auditInput
+        _ -> executeAuditPhase env state pool reporter auditInput
+
+skipAuditPhase :: EvalEnv -> IORef EvalState -> ByteString -> IO ()
+skipAuditPhase env state auditInput = do
+    modifyEvalState state \s ->
+        s
+            { evalAuditSeconds = 0
+            , evalAuditCompleted = True
+            , evalAuditSkipped = True
+            , evalAuditUnchanged = True
+            , evalAuditInitialAccepted = True
+            , evalAuditResult = Just auditInput
+            }
+    logDebug'
+        (envLogger env)
+        "audit"
+        "Shared statement audit skipped (already confirmed 1-minimal)"
+        [ ("audit_skipped", toJSON True)
+        , ("audit_minimality_confirmed", toJSON True)
+        ]
+
+executeAuditPhase ::
+    EvalEnv -> IORef EvalState -> OraclePool -> StageReporter -> ByteString -> IO ()
+executeAuditPhase env state pool reporter auditInput = do
+    auditStart <- ticks
+    let auditPool = mapPoolRetire recordAuditRetire pool
+    reporter (StageStarted StageStatementAudit)
+    result <- runAuditBody auditPool `finally` finishAudit auditStart
+    auditEnd <- ticks
+    reporter
+        ( StageFinished
+            StageStatementAudit
+            (seconds auditStart auditEnd)
+            (BS.length auditInput)
+            (BS.length result)
+        )
+    where
+        recordAuditRetire retire index candidate outcome hit = do
+            priorChecks <- evalAuditChecks <$> readIORef state
+            modifyEvalState state (\s -> s {evalAuditChecks = evalAuditChecks s + 1})
+            when (priorChecks == 0) $
+                modifyEvalState state (\s -> s {evalAuditInitialAccepted = outcome == OracleAccepted})
+            retire index candidate outcome hit
+
+        runAuditBody auditPool = do
+            (audited, stats) <-
+                statementAuditWithLogger (envLogger env) (envDialect env) auditPool auditInput
+            initialAccepted <- evalAuditInitialAccepted <$> readIORef state
+            modifyEvalState state \s ->
+                s
+                    { evalAuditCompleted = auditMinimalityConfirmed stats
+                    , evalAuditUnchanged = initialAccepted && audited == auditInput
+                    , evalAuditResult = Just audited
+                    }
+            pure audited
+
+        finishAudit auditStart = do
             auditEnd <- ticks
-            reporter
-                ( StageFinished
-                    StageStatementAudit
-                    (seconds auditStart auditEnd)
-                    (BS.length auditInput)
-                    (BS.length result)
-                )
+            let elapsed = seconds auditStart auditEnd
+            st <- readIORef state
+            modifyEvalState state (\s -> s {evalAuditSeconds = elapsed})
+            logInfo'
+                (envLogger env)
+                "audit"
+                "Shared statement audit finished"
+                [ ("elapsed_seconds", toJSON elapsed)
+                , ("candidate_checks", toJSON (evalAuditChecks st))
+                , ("completed", toJSON (evalAuditCompleted st))
+                , ("candidate_unchanged", toJSON (evalAuditUnchanged st))
+                , ("audit_minimality_confirmed", toJSON (evalAuditCompleted st))
+                , ("skipped", toJSON False)
+                ]
 
 -- | Validation phase: repeat the final check twice within the shared limits.
 runValidationPhase :: EvalEnv -> IORef EvalState -> ByteString -> Bool -> Int -> IO Bool
 runValidationPhase env state finalSQL skipValidation callLimit
     | skipValidation = pure False
     | otherwise = do
-        first <- validateOnce finalSQL
-        second <- validateOnce finalSQL
+        first <- validateOnce env state callLimit finalSQL
+        second <- validateOnce env state callLimit finalSQL
         pure (first == Just OracleAccepted && second == Just OracleAccepted)
-    where
-        validateOnce candidate = do
-            prior <- evalValidationObs <$> readIORef state
-            if prior >= callLimit
-                then pure Nothing
-                else do
-                    start <- ticks
-                    let remainingMicros = (`div` 1000) . subtract start <$> envTotalDeadline env
-                    case remainingMicros of
-                        Just remaining | remaining <= 0 -> pure Nothing
-                        _ -> do
-                            modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
-                            let observe =
-                                    envValidate
-                                        env
-                                        (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
-                                        candidate
-                            result <-
-                                case remainingMicros of
-                                    Nothing -> Just <$> observe
-                                    Just remaining ->
-                                        timeout (boundedTimeout (max 0 remaining)) observe
-                            end <- ticks
-                            modifyEvalState
-                                state
-                                (\s -> s {evalValidationSeconds = evalValidationSeconds s + seconds start end})
-                            case result of
-                                Nothing -> do
-                                    let observation = OracleTimedOut
-                                    modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
-                                    recordValidationOutcome state observation
-                                    pure (Just OracleInconclusive)
-                                Just profile -> do
-                                    let observation = detailedObservation profile
-                                        micros = fromIntegral
-                                    modifyEvalState state \s ->
-                                        s
-                                            { evalValidationResetSeconds =
-                                                evalValidationResetSeconds s + micros (resetElapsedMicros profile) / 1000000
-                                            , evalValidationOracleSeconds =
-                                                evalValidationOracleSeconds s + maybe 0 micros (oracleElapsedMicros profile) / 1000000
-                                            }
-                                    recordValidationOutcome state observation
-                                    case observationOutcome observation of
-                                        OracleAccepted -> pure (Just OracleAccepted)
-                                        OracleRejected -> do
-                                            modifyEvalState state (\s -> s {evalValidationRejected = True})
-                                            pure (Just OracleRejected)
-                                        OracleInconclusive -> do
-                                            modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
-                                            pure (Just OracleInconclusive)
+
+validateOnce :: EvalEnv -> IORef EvalState -> Int -> ByteString -> IO (Maybe OracleOutcome)
+validateOnce env state callLimit candidate = runMaybeT do
+    prior <- liftIO $ evalValidationObs <$> readIORef state
+    guard (prior < callLimit)
+    start <- liftIO ticks
+    let remainingMicros = (`div` 1000) . subtract start <$> envTotalDeadline env
+    guard (maybe True (> 0) remainingMicros)
+    liftIO $ executeValidationAttempt env state candidate start remainingMicros
+
+executeValidationAttempt ::
+    EvalEnv -> IORef EvalState -> ByteString -> Ticks -> Maybe Ticks -> IO OracleOutcome
+executeValidationAttempt env state candidate start remainingMicros = do
+    modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
+    let observe =
+            envValidate
+                env
+                (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
+                candidate
+    result <- case remainingMicros of
+        Nothing -> Just <$> observe
+        Just remaining -> timeout (boundedTimeout (max 0 remaining)) observe
+    end <- ticks
+    modifyEvalState
+        state
+        (\s -> s {evalValidationSeconds = evalValidationSeconds s + seconds start end})
+    recordValidationAttempt state result
+
+recordValidationAttempt :: IORef EvalState -> Maybe OracleObservationDetails -> IO OracleOutcome
+recordValidationAttempt state Nothing = do
+    modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
+    recordValidationOutcome state OracleTimedOut
+    pure OracleInconclusive
+recordValidationAttempt state (Just profile) = do
+    let observation = detailedObservation profile
+        micros = fromIntegral
+    modifyEvalState state \s ->
+        s
+            { evalValidationResetSeconds =
+                evalValidationResetSeconds s + micros (resetElapsedMicros profile) / 1000000
+            , evalValidationOracleSeconds =
+                evalValidationOracleSeconds s + maybe 0 micros (oracleElapsedMicros profile) / 1000000
+            }
+    recordValidationOutcome state observation
+    case observationOutcome observation of
+        OracleAccepted -> pure OracleAccepted
+        OracleRejected -> do
+            modifyEvalState state (\s -> s {evalValidationRejected = True})
+            pure OracleRejected
+        OracleInconclusive -> do
+            modifyEvalState state (\s -> s {evalValidationErrors = evalValidationErrors s + 1})
+            pure OracleInconclusive
 
 -- | Atomically record worker observation metrics.
 recordReductionObservation :: IORef EvalState -> OracleObservationDetails -> IO ()
@@ -927,6 +933,8 @@ recordReductionObservation state profile = do
         resetDelta = micros (resetElapsedMicros profile) / 1000000
         oracleDelta = maybe 0 (\oracleMicros -> fromIntegral oracleMicros / 1000000) (oracleElapsedMicros profile)
         outcome = classifyOracleObservation observation
+        acceptedDelta = if oracleObservationMatches observation then 1 else 0
+        rejectedDelta = 1 - acceptedDelta
     modifyEvalState state \s ->
         let billed =
                 s
@@ -938,12 +946,8 @@ recordReductionObservation state profile = do
                 OracleFinished _ ->
                     billed
                         { evalCompleted = evalCompleted s + 1
-                        , evalAcceptedCount =
-                            evalAcceptedCount s
-                                + if oracleObservationMatches observation then 1 else 0
-                        , evalRejectedCount =
-                            evalRejectedCount s
-                                + if oracleObservationMatches observation then 0 else 1
+                        , evalAcceptedCount = evalAcceptedCount s + acceptedDelta
+                        , evalRejectedCount = evalRejectedCount s + rejectedDelta
                         }
                 OracleTimedOut ->
                     billed {evalTimedOut = evalTimedOut s + 1, evalErrors = evalErrors s + 1}

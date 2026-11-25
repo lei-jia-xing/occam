@@ -163,44 +163,35 @@ ensureTable initial ref catalog =
 
 applyChange ::
     SessionInit -> NameRef -> Map TableKey TableInfo -> AlterChange -> Map TableKey TableInfo
-applyChange initial target catalog change = case change of
+applyChange initial target catalog = \case
     AddConstraint (ForeignKeyConstraint foreignKey) ->
-        Map.adjust appendFK key (ensureTable initial target catalog)
-        where
-            appendFK info = info {infoFKs = infoFKs info ++ [foreignKey]}
+        Map.adjust (\info -> info {infoFKs = infoFKs info ++ [foreignKey]}) key ensured
     AddConstraint (PrimaryKeyConstraint _ columns) ->
-        Map.adjust appendPK key (ensureTable initial target catalog)
-        where
-            appendPK info = info {infoPK = infoPK info ++ map lowerIdent columns}
+        Map.adjust (\info -> info {infoPK = infoPK info ++ map lowerIdent columns}) key ensured
     AddColumn column extras ->
-        Map.adjust appendBoth key (ensureTable initial target catalog)
-        where
-            appendBoth info =
-                info
-                    { infoFKs =
-                        infoFKs info
-                            ++ [foreignKey | ForeignKeyConstraint foreignKey <- extras]
-                            ++ columnReferences column
-                    , infoPK =
-                        infoPK info
-                            ++ [ lowerIdent columnName
-                               | PrimaryKeyConstraint _ columns <- extras
-                               , columnName <- columns
-                               ]
-                    }
-    DropConstraint name _ -> Map.adjust removeFK key catalog
-        where
-            removeFK info =
-                info {infoFKs = [foreignKey | foreignKey <- infoFKs info, foreignKeyName foreignKey /= Just name]}
+        Map.adjust (appendColumn column extras) key ensured
+    DropConstraint name _ ->
+        Map.adjust (removeNamedFK name) key catalog
     _ -> catalog
     where
         key = fromMaybe (tableKeyOf target) (resolveTableKey initial catalog target)
+        ensured = ensureTable initial target catalog
+        appendColumn column extras info =
+            info
+                { infoFKs =
+                    infoFKs info
+                        ++ [foreignKey | ForeignKeyConstraint foreignKey <- extras]
+                        ++ columnReferences column
+                , infoPK =
+                    infoPK info
+                        ++ [lowerIdent columnName | PrimaryKeyConstraint _ columns <- extras, columnName <- columns]
+                }
+        removeNamedFK name info =
+            info {infoFKs = [fk | fk <- infoFKs info, foreignKeyName fk /= Just name]}
 
 applyDrop :: SessionInit -> Map TableKey TableInfo -> DropObject -> Map TableKey TableInfo
 applyDrop initial catalog (DropRelation ref _) =
-    case resolveTableKey initial catalog ref of
-        Just key -> Map.delete key catalog
-        Nothing -> catalog
+    maybe catalog (`Map.delete` catalog) (resolveTableKey initial catalog ref)
 applyDrop _ catalog (DropSchema schema) =
     Map.filterWithKey (\key _ -> notInSchema key) catalog
     where
@@ -215,15 +206,11 @@ applyDrop _ catalog _ = catalog
 
 applyRename :: SessionInit -> RenameOp -> Map TableKey TableInfo -> Map TableKey TableInfo
 applyRename initial (RenameRelation old new _) catalog =
-    case resolveTableKey initial catalog old of
-        Nothing -> catalog
-        Just oldKey ->
-            case Map.lookup oldKey catalog of
-                Nothing -> catalog
-                Just info ->
-                    Map.insert newKey (info {infoRef = NameRef new (nameRefTemp old)}) (Map.delete oldKey catalog)
-    where
-        newKey = tableKeyOf (NameRef new (nameRefTemp old))
+    fromMaybe catalog do
+        oldKey <- resolveTableKey initial catalog old
+        info <- Map.lookup oldKey catalog
+        let newRef = NameRef new (nameRefTemp old)
+        pure (Map.insert (tableKeyOf newRef) (info {infoRef = newRef}) (Map.delete oldKey catalog))
 applyRename initial (RenameColumnOp target old new) catalog =
     renameColumn initial target old new catalog
 
@@ -237,20 +224,15 @@ renameColumn initial targetRef old new catalog = Map.mapWithKey fix catalog
             | key == target =
                 info
                     { infoPK = renameLowered (infoPK info)
-                    , infoFKs =
-                        [ foreignKey {foreignKeyChildColumns = renameIdents (foreignKeyChildColumns foreignKey)}
-                        | foreignKey <- infoFKs info
-                        ]
+                    , infoFKs = map renameChildCols (infoFKs info)
                     }
             | otherwise =
-                info
-                    { infoFKs =
-                        [ if resolveTableKey initial catalog (foreignKeyParent foreignKey) == Just target
-                            then foreignKey {foreignKeyParentColumns = renameIdents (foreignKeyParentColumns foreignKey)}
-                            else foreignKey
-                        | foreignKey <- infoFKs info
-                        ]
-                    }
+                info {infoFKs = map renameParentCols (infoFKs info)}
+        renameChildCols fk = fk {foreignKeyChildColumns = renameIdents (foreignKeyChildColumns fk)}
+        renameParentCols fk
+            | resolveTableKey initial catalog (foreignKeyParent fk) == Just target =
+                fk {foreignKeyParentColumns = renameIdents (foreignKeyParentColumns fk)}
+            | otherwise = fk
         renameLowered = map (\column -> if column == oldLower then lowerIdent new else column)
         renameIdents = map (\column -> if lowerIdent column == oldLower then new else column)
 
@@ -274,53 +256,54 @@ expandWrite initial catalog write = case dataWriteKind write of
         bfs :: Set (TableKey, Bool, Set Text) -> [(TableKey, Bool, [Text])] -> [DataWrite]
         bfs _ [] = []
         bfs visited ((key, isDelete, columns) : rest)
-            | Set.member guard visited = bfs visited rest
-            | otherwise =
-                let children = cascadeChildren key isDelete columns
-                    writes =
-                        [ childWrite ref childIsDelete childColumns
-                        | (_, ref, childIsDelete, childColumns) <- children
-                        ]
-                    queued =
-                        [ (childKey, childIsDelete, map lowerIdent childColumns)
-                        | (childKey, _, childIsDelete, childColumns) <- children
-                        ]
-                 in writes ++ bfs (Set.insert guard visited) (rest ++ queued)
+            | Set.member guardKey visited = bfs visited rest
+            | otherwise = writes ++ bfs (Set.insert guardKey visited) (rest ++ queued)
             where
-                guard = (key, isDelete, Set.fromList columns)
+                guardKey = (key, isDelete, Set.fromList columns)
+                children = cascadeChildren initial catalog key isDelete columns
+                writes = [childWrite ref childIsDelete childColumns | (_, ref, childIsDelete, childColumns) <- children]
+                queued =
+                    [ (childKey, childIsDelete, map lowerIdent childColumns)
+                    | (childKey, _, childIsDelete, childColumns) <- children
+                    ]
 
         childWrite :: NameRef -> Bool -> [Ident] -> DataWrite
         childWrite ref True _ = DataWrite ref (DeleteWrite DeleteFilteredRows) [] [] [] False
         childWrite ref False childColumns = DataWrite ref (UpdateWrite UpdateFilteredRows) childColumns [] [] False
 
-        cascadeChildren :: TableKey -> Bool -> [Text] -> [(TableKey, NameRef, Bool, [Ident])]
-        cascadeChildren parentKey isDelete columns =
-            [ (childKey, infoRef info, childIsDelete, foreignKeyChildColumns foreignKey)
-            | (childKey, info) <- Map.toList catalog
-            , foreignKey <- infoFKs info
-            , resolveTableKey initial catalog (foreignKeyParent foreignKey) == Just parentKey
-            , Just childIsDelete <- [matchAction foreignKey]
-            ]
-            where
-                matchAction :: ForeignKey -> Maybe Bool
-                matchAction foreignKey
-                    | isDelete = case foreignKeyOnDelete foreignKey of
-                        Cascade -> Just True
-                        SetNull -> Just False
-                        SetDefault -> Just False
-                        _ -> Nothing
-                    | otherwise = case foreignKeyOnUpdate foreignKey of
-                        Cascade -> overlap
-                        SetNull -> overlap
-                        SetDefault -> overlap
-                        _ -> Nothing
-                    where
-                        overlap
-                            | null columns = Just False
-                            | null parentColumns = Just False
-                            | any (`elem` parentColumns) columns = Just False
-                            | otherwise = Nothing
-                        parentColumns
-                            | not (null (foreignKeyParentColumns foreignKey)) =
-                                map lowerIdent (foreignKeyParentColumns foreignKey)
-                            | otherwise = maybe [] infoPK (Map.lookup parentKey catalog)
+cascadeChildren ::
+    SessionInit ->
+    Map TableKey TableInfo ->
+    TableKey ->
+    Bool ->
+    [Text] ->
+    [(TableKey, NameRef, Bool, [Ident])]
+cascadeChildren initial catalog parentKey isDelete columns =
+    [ (childKey, infoRef info, childIsDelete, foreignKeyChildColumns foreignKey)
+    | (childKey, info) <- Map.toList catalog
+    , foreignKey <- infoFKs info
+    , resolveTableKey initial catalog (foreignKeyParent foreignKey) == Just parentKey
+    , Just childIsDelete <- [matchCascadeAction catalog parentKey isDelete columns foreignKey]
+    ]
+
+matchCascadeAction ::
+    Map TableKey TableInfo -> TableKey -> Bool -> [Text] -> ForeignKey -> Maybe Bool
+matchCascadeAction catalog parentKey isDelete columns foreignKey
+    | isDelete = case foreignKeyOnDelete foreignKey of
+        Cascade -> Just True
+        SetNull -> Just False
+        SetDefault -> Just False
+        _ -> Nothing
+    | otherwise = case foreignKeyOnUpdate foreignKey of
+        Cascade -> overlap
+        SetNull -> overlap
+        SetDefault -> overlap
+        _ -> Nothing
+    where
+        parentColumns
+            | not (null (foreignKeyParentColumns foreignKey)) =
+                map lowerIdent (foreignKeyParentColumns foreignKey)
+            | otherwise = maybe [] infoPK (Map.lookup parentKey catalog)
+        overlap
+            | null columns || null parentColumns || any (`elem` parentColumns) columns = Just False
+            | otherwise = Nothing

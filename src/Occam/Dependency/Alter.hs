@@ -144,73 +144,60 @@ viewTransitiveDependsOn session catalog visited tableKey column currentKey reque
 
 processAlterTable :: StatementId -> Eval -> AlterTable -> Eval
 processAlterTable sid eval alter =
-    let session = evalSession eval
+    mutateResolved (alterRelationKey session sid changes foreignKeyDeps) eval keys
+    where
+        session = evalSession eval
         catalog = evalCatalog eval
         keys = resolveRelationKeys session catalog (alterTableTarget alter)
         changes = alterTableChanges alter
-        introducedForeignKeys =
-            concatMap introducedForeignKeysOf changes
+        introducedForeignKeys = concatMap introducedForeignKeysOf changes
         foreignKeyDeps =
             Set.unions
                 [ relationReadDeps
                     session
                     catalog
                     parentKey
-                    ( if foreignKeyNotValid foreignKey
-                        then ReadSchema
-                        else ReadData
-                    )
+                    (if foreignKeyNotValid foreignKey then ReadSchema else ReadData)
                     []
                     False
                 | foreignKey <- introducedForeignKeys
                 , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
                 ]
-        stepKey current key =
-            let currentCatalog = evalCatalog current
-                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
-                validationDeps =
-                    Set.unions
-                        [ relationReadDeps session currentCatalog parentKey ReadData [] False
-                        | ValidateConstraint name <- changes
-                        , constraintKey <- Set.toList (relConstraints relation)
-                        , constraintKeyIdentity constraintKey == NamedConstraint name
-                        , Just state <- [Map.lookup constraintKey (catalogConstraints currentCatalog)]
-                        , ForeignKeyConstraint foreignKey <- [constraintValue state]
-                        , parentKey <-
-                            resolveRelationKeys
-                                session
-                                currentCatalog
-                                (foreignKeyParent foreignKey)
-                        ]
-                dropColumnViewDeps =
-                    Set.unions
-                        [ Set.unions
-                            [ relationAllDeps session currentCatalog viewKey
-                                `Set.union` relationConstraintDeps currentCatalog viewRelation
-                            | viewKey <- dropColumnDependentViews session currentCatalog key column
-                            , Just viewRelation <- [lookupRelation currentCatalog viewKey]
-                            ]
-                        | DropColumn column _ <- changes
-                        ]
-                deps =
-                    relationAllDeps session currentCatalog key
-                        `Set.union` relationConstraintDeps currentCatalog relation
-                        `Set.union` foreignKeyDeps
-                        `Set.union` validationDeps
-                        `Set.union` dropColumnViewDeps
-                current1 =
-                    addTouches
-                        (relationTouchKeys key)
-                        (addDeps deps current)
-                (catalog1, relation1) =
-                    foldl'
-                        (applyAlterChange session sid key)
-                        (currentCatalog, relation)
-                        changes
-                relation2 =
-                    relation1 & relSchemaWritesL %~ Set.insert sid
-             in current1 & evalCatalogL .~ insertRelation key relation2 catalog1
-     in mutateResolved stepKey eval keys
+
+alterRelationKey ::
+    SessionState -> StatementId -> [AlterChange] -> Set StatementId -> Eval -> RelationKey -> Eval
+alterRelationKey session sid changes foreignKeyDeps current key =
+    current1 & evalCatalogL .~ insertRelation key relation2 catalog1
+    where
+        currentCatalog = evalCatalog current
+        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+        validationDeps =
+            Set.unions
+                [ relationReadDeps session currentCatalog parentKey ReadData [] False
+                | ValidateConstraint name <- changes
+                , constraintKey <- Set.toList (relConstraints relation)
+                , constraintKeyIdentity constraintKey == NamedConstraint name
+                , Just state <- [Map.lookup constraintKey (catalogConstraints currentCatalog)]
+                , ForeignKeyConstraint foreignKey <- [constraintValue state]
+                , parentKey <- resolveRelationKeys session currentCatalog (foreignKeyParent foreignKey)
+                ]
+        dropColumnViewDeps =
+            Set.unions
+                [ relationAllDeps session currentCatalog viewKey
+                    `Set.union` relationConstraintDeps currentCatalog viewRelation
+                | DropColumn column _ <- changes
+                , viewKey <- dropColumnDependentViews session currentCatalog key column
+                , Just viewRelation <- [lookupRelation currentCatalog viewKey]
+                ]
+        deps =
+            relationAllDeps session currentCatalog key
+                `Set.union` relationConstraintDeps currentCatalog relation
+                `Set.union` foreignKeyDeps
+                `Set.union` validationDeps
+                `Set.union` dropColumnViewDeps
+        current1 = addTouches (relationTouchKeys key) (addDeps deps current)
+        (catalog1, relation1) = foldl' (applyAlterChange session sid key) (currentCatalog, relation) changes
+        relation2 = relation1 & relSchemaWritesL %~ Set.insert sid
 
 -- | Process @ALTER TABLE ... ATTACH PARTITION@.
 processAttachPartition :: StatementId -> Eval -> PartitionLink -> Eval
@@ -245,46 +232,40 @@ attachDetachLink ::
     Bool ->
     Eval
 attachDetachLink getLinks setLinks sid eval link isAttach =
-    let session = evalSession eval
+    mutateResolved step eval pairs
+    where
+        session = evalSession eval
         catalog = evalCatalog eval
         existing reference =
-            filter
-                (`Map.member` catalogRelations catalog)
-                (resolveRelationKeys session catalog reference)
+            filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog reference)
         pairs =
             [ (parentKey, childKey)
             | parentKey <- existing (linkParent link)
             , childKey <- existing (linkChild link)
             ]
         step current (parentKey, childKey) =
-            let currentCatalog = evalCatalog current
+            current1 & evalCatalogL .~ catalog1
+            where
+                currentCatalog = evalCatalog current
                 child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
                 parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
                 deps =
                     relationDefinitionDeps currentCatalog parentKey
                         `Set.union` relationDefinitionDeps currentCatalog childKey
                 current1 =
-                    addTouches
-                        (relationTouchKeys parentKey ++ relationTouchKeys childKey)
-                        (addDeps deps current)
-                updatedLinks =
-                    if isAttach
-                        then Set.insert (linkParent link) (getLinks child)
-                        else
-                            Set.filter
-                                ( \reference ->
-                                    parentKey
-                                        `notElem` resolveRelationKeys session currentCatalog reference
-                                )
-                                (getLinks child)
+                    addTouches (relationTouchKeys parentKey ++ relationTouchKeys childKey) (addDeps deps current)
+                updatedLinks
+                    | isAttach = Set.insert (linkParent link) (getLinks child)
+                    | otherwise =
+                        Set.filter
+                            (\reference -> parentKey `notElem` resolveRelationKeys session currentCatalog reference)
+                            (getLinks child)
                 parent1 = parent & relSchemaWritesL %~ Set.insert sid
                 catalog1 =
                     insertRelation
                         childKey
                         (setLinks child updatedLinks)
                         (insertRelation parentKey parent1 currentCatalog)
-             in current1 & evalCatalogL .~ catalog1
-     in mutateResolved step eval pairs
 
 applyAlterChange ::
     SessionState ->
@@ -486,86 +467,58 @@ applyRenameConstraint ::
     Ident ->
     (Catalog, RelationState)
 applyRenameConstraint key (catalog, relation) from to =
-    let matching =
+    ( foldl' renameOne catalog matching
+    , relation
+        { relConstraints =
+            Set.union newKeys (Set.difference (relConstraints relation) (Set.fromList matching))
+        }
+    )
+    where
+        matching =
             [ constraintKey
             | constraintKey <- Set.toList (relConstraints relation)
             , constraintKeyIdentity constraintKey == NamedConstraint from
             ]
-        renameOne catalog' constraintKey =
-            case Map.lookup constraintKey (catalogConstraints catalog') of
-                Nothing -> catalog'
-                Just state ->
-                    let newKey = ConstraintKey key (NamedConstraint to)
-                        newState =
-                            state
-                                { constraintStateTable = key
-                                , constraintValue = renameConstraintName to (constraintValue state)
-                                }
-                        fks' = case constraintValue newState of
-                            ForeignKeyConstraint fk ->
-                                Map.insert newKey (newState, fk) (Map.delete constraintKey (catalogForeignKeys catalog'))
-                            _ -> catalogForeignKeys catalog'
-                     in catalog'
-                            { catalogConstraints =
-                                Map.insert
-                                    newKey
-                                    newState
-                                    (Map.delete constraintKey (catalogConstraints catalog'))
-                            , catalogForeignKeys = fks'
-                            }
-        catalog1 = foldl' renameOne catalog matching
         newKeys = Set.fromList [ConstraintKey key (NamedConstraint to) | _ <- matching]
-     in ( catalog1
-        , relation
-            { relConstraints =
-                Set.union
-                    newKeys
-                    (Set.difference (relConstraints relation) (Set.fromList matching))
-            }
-        )
+        renameOne catalog' constraintKey
+            | Just state <- Map.lookup constraintKey (catalogConstraints catalog') =
+                let newKey = ConstraintKey key (NamedConstraint to)
+                    newState =
+                        state
+                            { constraintStateTable = key
+                            , constraintValue = renameConstraintName to (constraintValue state)
+                            }
+                    fks' = case constraintValue newState of
+                        ForeignKeyConstraint fk ->
+                            Map.insert newKey (newState, fk) (Map.delete constraintKey (catalogForeignKeys catalog'))
+                        _ -> catalogForeignKeys catalog'
+                 in catalog'
+                        { catalogConstraints =
+                            Map.insert newKey newState (Map.delete constraintKey (catalogConstraints catalog'))
+                        , catalogForeignKeys = fks'
+                        }
+            | otherwise = catalog'
 
 applyValidateConstraint ::
     (Catalog, RelationState) ->
     Ident ->
     (Catalog, RelationState)
 applyValidateConstraint (catalog, relation) name =
-    let matching =
+    (foldl' validateOne catalog matching, relation)
+    where
+        matching =
             [ constraintKey
             | constraintKey <- Set.toList (relConstraints relation)
             , constraintKeyIdentity constraintKey == NamedConstraint name
             ]
-        catalog1 =
-            foldl'
-                ( \current constraintKey ->
-                    let fks' =
-                            if Map.member constraintKey (catalogForeignKeys current)
-                                then
-                                    Map.adjust
-                                        ( \(st, fk) ->
-                                            let st' = st {constraintValue = validateConstraintValue (constraintValue st)}
-                                                fk' = fk {foreignKeyNotValid = False}
-                                             in (st', fk')
-                                        )
-                                        constraintKey
-                                        (catalogForeignKeys current)
-                                else catalogForeignKeys current
-                     in current
-                            { catalogConstraints =
-                                Map.adjust
-                                    ( \state ->
-                                        state
-                                            { constraintValue =
-                                                validateConstraintValue (constraintValue state)
-                                            }
-                                    )
-                                    constraintKey
-                                    (catalogConstraints current)
-                            , catalogForeignKeys = fks'
-                            }
-                )
-                catalog
-                matching
-     in (catalog1, relation)
+        validateState state =
+            state {constraintValue = validateConstraintValue (constraintValue state)}
+        validateFk (st, fk) = (validateState st, fk {foreignKeyNotValid = False})
+        validateOne current constraintKey =
+            current
+                { catalogConstraints = Map.adjust validateState constraintKey (catalogConstraints current)
+                , catalogForeignKeys = Map.adjust validateFk constraintKey (catalogForeignKeys current)
+                }
 
 applyDropIndexChange ::
     (Catalog, RelationState) ->

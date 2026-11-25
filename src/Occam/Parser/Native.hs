@@ -173,19 +173,25 @@ nativeError status = evalContT do
         poke messagePointer nullPtr
         poke messageLength 0
         errorStatus <- c_parseError status messagePointer messageLength
-        if errorStatus /= 0
-            then pure (ParserError (parserErrorKindFromStatus status) "sqlparser native parser failed")
-            else do
-                pointer <- peek messagePointer
-                length' <- peek messageLength
-                if pointer == nullPtr
-                    then pure (ParserError (parserErrorKindFromStatus status) "sqlparser native parser failed")
-                    else do
-                        let free = c_freeSQL pointer length'
-                            decode = do
-                                bytes <- BS.packCStringLen (castPtr pointer, fromIntegral length')
-                                pure (ParserError (parserErrorKindFromStatus status) (TE.decodeUtf8Lenient bytes))
-                        finally decode free
+        decodeNativeError status errorStatus messagePointer messageLength
+
+decodeNativeError :: CInt -> CInt -> Ptr (Ptr Word8) -> Ptr CSize -> IO ParserError
+decodeNativeError status errorStatus messagePointer messageLength
+    | errorStatus /= 0 = pure fallback
+    | otherwise = do
+        pointer <- peek messagePointer
+        length' <- peek messageLength
+        if pointer == nullPtr
+            then pure fallback
+            else
+                finally
+                    ( ParserError kind . TE.decodeUtf8Lenient
+                        <$> BS.packCStringLen (castPtr pointer, fromIntegral length')
+                    )
+                    (c_freeSQL pointer length')
+    where
+        kind = parserErrorKindFromStatus status
+        fallback = ParserError kind "sqlparser native parser failed"
 
 -- | Untimed statement count plus raw pointer decoding.
 countStatementsRaw :: ByteString -> CUInt -> IO (Either ParserError Int)

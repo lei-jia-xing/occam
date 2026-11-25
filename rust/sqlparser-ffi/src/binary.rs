@@ -1044,7 +1044,9 @@ fn write_edit(w: &mut BinaryWriter, edit: &NativeEdit) {
     w.write_str(&edit.replacement);
     let cat_byte = category_code(edit.category)
         | if edit.top_level_projection { 0x80 } else { 0 }
-        | if edit.tail_clause { 0x40 } else { 0 };
+        | if edit.string_literal { 0x40 } else { 0 }
+        | if edit.recursive_predicate { 0x20 } else { 0 }
+        | if edit.low_yield { 0x10 } else { 0 };
     w.write_u8(cat_byte);
     if let Some(pos) = COMMON_LABELS.iter().position(|&l| l == edit.label.as_ref()) {
         w.write_u8(pos as u8);

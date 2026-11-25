@@ -261,47 +261,37 @@ ttyProgressStyle useColor =
 newTTYUI :: UIConfig -> IO UI
 newTTYUI config@UIConfig {..} = do
     printReductionHeader useColor config
-
     let pbTodo = max 1 (uiInitialStmts + 1)
         pbStyle = ttyProgressStyle useColor
     pb <- hNewProgressBar stderr pbStyle 10.0 (Progress 0 pbTodo (initialProgressInfo config))
-
-    let handleProgress = \case
-            ProgressStage newStage ->
-                updateProgress pb (\p -> p {progressCustom = (progressCustom p) {piPhase = newStage}})
-            ProgressCandidateTested callIndex cacheHit _accepted ->
-                updateProgress
-                    pb
-                    ( \p ->
-                        let inf = progressCustom p
-                            hits' = if cacheHit then piCacheHits inf + 1 else piCacheHits inf
-                         in p {progressCustom = inf {piTotalRuns = callIndex, piCacheHits = hits'}}
-                    )
-            ProgressCandidateAccepted newBytes mNewStmts ->
-                updateProgress
-                    pb
-                    ( \p ->
-                        let inf = progressCustom p
-                            oldStmts = piCurrentStmts inf
-                            newStmts = fromMaybe oldStmts mNewStmts
-                            doneCount = max (progressDone p) (uiInitialStmts - newStmts)
-                         in p
-                                { progressDone = doneCount
-                                , progressCustom =
-                                    inf
-                                        { piCurrentStmts = min oldStmts newStmts
-                                        , piCurrentBytes = min (piCurrentBytes inf) newBytes
-                                        }
-                                }
-                    )
-
-        finish summary = do
+    let finish summary = do
             updateProgress pb (\p -> p {progressDone = progressTodo p})
             printSummary useColor summary
-
-    pure UI {uiOnProgress = handleProgress, uiFinish = finish}
+    pure UI {uiOnProgress = updateProgress pb . applyTTYProgress uiInitialStmts, uiFinish = finish}
     where
         useColor = uiUseColor
+
+applyTTYProgress :: Int -> EvaluationProgress -> Progress ProgressInfo -> Progress ProgressInfo
+applyTTYProgress _ (ProgressStage newStage) p =
+    p {progressCustom = (progressCustom p) {piPhase = newStage}}
+applyTTYProgress _ (ProgressCandidateTested callIndex cacheHit _accepted) p =
+    p {progressCustom = inf {piTotalRuns = callIndex, piCacheHits = hits'}}
+    where
+        inf = progressCustom p
+        hits' = if cacheHit then piCacheHits inf + 1 else piCacheHits inf
+applyTTYProgress initialStmts (ProgressCandidateAccepted newBytes mNewStmts) p =
+    p
+        { progressDone = max (progressDone p) (initialStmts - newStmts)
+        , progressCustom =
+            inf
+                { piCurrentStmts = min oldStmts newStmts
+                , piCurrentBytes = min (piCurrentBytes inf) newBytes
+                }
+        }
+    where
+        inf = progressCustom p
+        oldStmts = piCurrentStmts inf
+        newStmts = fromMaybe oldStmts mNewStmts
 
 -- | Non-TTY renderer that prints one line per accepted shrink.
 newNonTTYUI :: UIConfig -> IO UI

@@ -41,9 +41,10 @@ import Data.Either (fromRight)
 import Data.Int (Int64)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Word (Word32, Word64)
-import Foreign (alloca, castPtr, nullPtr, peek, poke)
-import Foreign.C.Types (CUInt)
+import Data.Word (Word32, Word64, Word8)
+import Foreign (Ptr, alloca, castPtr, nullPtr, peek, poke)
+import Foreign.C.String (CString)
+import Foreign.C.Types (CInt, CSize, CUInt)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Facts (
     ColumnSite (..),
@@ -102,68 +103,71 @@ nativeDuckDBReplayUnits sql = do
 
 decodeReplayUnits :: ByteString -> [DuckDBReplayUnit]
 decodeReplayUnits bs
-    | BS.isPrefixOf "OCCM\x03" bs = decodeBinary (BS.drop 5 bs)
+    | BS.isPrefixOf "OCCM\x03" bs = decodeBinaryReplayUnits (BS.drop 5 bs)
     | otherwise = fromRight [] (eitherDecodeStrict' bs)
-    where
-        decodeBinary buf
-            | BS.length buf < 4 = []
-            | otherwise =
-                let !count = fromIntegral (readU32LE buf 0) :: Int
-                 in parseUnits (BS.drop 4 buf) count
-        parseUnits _ 0 = []
-        parseUnits cur !remaining
-            | BS.length cur < 10 = []
-            | otherwise =
-                let !endVal = readI64LE cur 0
-                    !mEnd = if endVal < 0 then Nothing else Just (fromIntegral endVal)
-                    !kindByte = BS.index cur 8
-                    !kindText = case kindByte of
-                        1 -> "create"
-                        2 -> "insert"
-                        3 -> "query"
-                        _ -> "other"
-                    !hasTable = BS.index cur 9
-                    (!mTable, !rest) =
-                        if hasTable == 1
-                            then
-                                let curAfterHdr = BS.drop 10 cur
-                                 in if BS.length curAfterHdr < 4
-                                        then (Nothing, BS.empty)
-                                        else
-                                            let !tLen = fromIntegral (readU32LE curAfterHdr 0)
-                                                !tblBytes = BS.take tLen (BS.drop 4 curAfterHdr)
-                                                !afterTbl = BS.drop (4 + tLen) curAfterHdr
-                                             in (Just (TE.decodeUtf8 tblBytes), afterTbl)
-                            else (Nothing, BS.drop 10 cur)
-                    !unit = DuckDBReplayUnit mEnd kindText mTable
-                 in unit : parseUnits rest (remaining - 1)
 
-        readU32LE s off =
-            let b0 = fromIntegral (BS.index s off) :: Word32
-                b1 = fromIntegral (BS.index s (off + 1)) :: Word32
-                b2 = fromIntegral (BS.index s (off + 2)) :: Word32
-                b3 = fromIntegral (BS.index s (off + 3)) :: Word32
-             in b0 .|. (b1 `unsafeShiftL` 8) .|. (b2 `unsafeShiftL` 16) .|. (b3 `unsafeShiftL` 24)
+decodeBinaryReplayUnits :: ByteString -> [DuckDBReplayUnit]
+decodeBinaryReplayUnits buf
+    | BS.length buf < 4 = []
+    | otherwise = parseReplayUnits (BS.drop 4 buf) (fromIntegral (readU32LE buf 0))
 
-        readI64LE s off =
-            let b0 = fromIntegral (BS.index s off) :: Word64
-                b1 = fromIntegral (BS.index s (off + 1)) :: Word64
-                b2 = fromIntegral (BS.index s (off + 2)) :: Word64
-                b3 = fromIntegral (BS.index s (off + 3)) :: Word64
-                b4 = fromIntegral (BS.index s (off + 4)) :: Word64
-                b5 = fromIntegral (BS.index s (off + 5)) :: Word64
-                b6 = fromIntegral (BS.index s (off + 6)) :: Word64
-                b7 = fromIntegral (BS.index s (off + 7)) :: Word64
-                w =
-                    b0
-                        .|. (b1 `unsafeShiftL` 8)
-                        .|. (b2 `unsafeShiftL` 16)
-                        .|. (b3 `unsafeShiftL` 24)
-                        .|. (b4 `unsafeShiftL` 32)
-                        .|. (b5 `unsafeShiftL` 40)
-                        .|. (b6 `unsafeShiftL` 48)
-                        .|. (b7 `unsafeShiftL` 56)
-             in fromIntegral w :: Int64
+parseReplayUnits :: ByteString -> Int -> [DuckDBReplayUnit]
+parseReplayUnits _ 0 = []
+parseReplayUnits cur !remaining
+    | BS.length cur < 10 = []
+    | otherwise =
+        let !endVal = readI64LE cur 0
+            !mEnd = if endVal < 0 then Nothing else Just (fromIntegral endVal)
+            !kindText = decodeReplayKind (BS.index cur 8)
+            (!mTable, !rest) = parseReplayTable (BS.index cur 9) (BS.drop 10 cur)
+            !unit = DuckDBReplayUnit mEnd kindText mTable
+         in unit : parseReplayUnits rest (remaining - 1)
+
+decodeReplayKind :: Word8 -> T.Text
+decodeReplayKind = \case
+    1 -> "create"
+    2 -> "insert"
+    3 -> "query"
+    _ -> "other"
+
+parseReplayTable :: Word8 -> ByteString -> (Maybe T.Text, ByteString)
+parseReplayTable hasTable afterHdr
+    | hasTable /= 1 = (Nothing, afterHdr)
+    | BS.length afterHdr < 4 = (Nothing, BS.empty)
+    | otherwise =
+        let !tLen = fromIntegral (readU32LE afterHdr 0)
+            !tblBytes = BS.take tLen (BS.drop 4 afterHdr)
+            !afterTbl = BS.drop (4 + tLen) afterHdr
+         in (Just (TE.decodeUtf8 tblBytes), afterTbl)
+
+readU32LE :: ByteString -> Int -> Word32
+readU32LE s off =
+    let b0 = fromIntegral (BS.index s off) :: Word32
+        b1 = fromIntegral (BS.index s (off + 1)) :: Word32
+        b2 = fromIntegral (BS.index s (off + 2)) :: Word32
+        b3 = fromIntegral (BS.index s (off + 3)) :: Word32
+     in b0 .|. (b1 `unsafeShiftL` 8) .|. (b2 `unsafeShiftL` 16) .|. (b3 `unsafeShiftL` 24)
+
+readI64LE :: ByteString -> Int -> Int64
+readI64LE s off =
+    let b0 = fromIntegral (BS.index s off) :: Word64
+        b1 = fromIntegral (BS.index s (off + 1)) :: Word64
+        b2 = fromIntegral (BS.index s (off + 2)) :: Word64
+        b3 = fromIntegral (BS.index s (off + 3)) :: Word64
+        b4 = fromIntegral (BS.index s (off + 4)) :: Word64
+        b5 = fromIntegral (BS.index s (off + 5)) :: Word64
+        b6 = fromIntegral (BS.index s (off + 6)) :: Word64
+        b7 = fromIntegral (BS.index s (off + 7)) :: Word64
+        w =
+            b0
+                .|. (b1 `unsafeShiftL` 8)
+                .|. (b2 `unsafeShiftL` 16)
+                .|. (b3 `unsafeShiftL` 24)
+                .|. (b4 `unsafeShiftL` 32)
+                .|. (b5 `unsafeShiftL` 40)
+                .|. (b6 `unsafeShiftL` 48)
+                .|. (b7 `unsafeShiftL` 56)
+     in fromIntegral w :: Int64
 
 -- | Untimed parse; delegates to the single timed implementation.
 parseSQL :: ParseOptions -> ByteString -> IO (Either ParserError ParsedSQL)
@@ -181,76 +185,102 @@ parseSQLTimed store kind options sql = evalContT do
         poke outputLength 0
         -- Mask async exceptions across FFI allocation and cleanup registration.
         mask $ \restore -> do
-            ffiStart <- clockIf
-            status <-
-                if parseServerConfig options == defaultServerConfig
-                    then
-                        c_parseSQLFlags
-                            (dialectCode (parseDialect options))
-                            (parseOptionFlags options)
-                            (castPtr input)
-                            (fromIntegral inputLength)
-                            outputPointer
-                            outputLength
-                    else do
-                        let configBytes = BL.toStrict (encode options)
-                        evalContT do
-                            (configPointer, configLength) <- ContT $ BSU.unsafeUseAsCStringLen configBytes
-                            liftIO $
-                                c_parseSQL
-                                    (castPtr configPointer)
-                                    (fromIntegral configLength)
-                                    (castPtr input)
-                                    (fromIntegral inputLength)
-                                    outputPointer
-                                    outputLength
-            ffiEnd <- clockIf
+            ffiStart <- clockIf store
+            status <- invokeNativeParser options input inputLength outputPointer outputLength
+            ffiEnd <- clockIf store
             let ffiMicros = microsBetween ffiStart ffiEnd
-            if status /= 0
-                then do
-                    recordParseTiming store kind ffiMicros 0
-                    Left <$> nativeError status
-                else do
-                    pointer <- peek outputPointer
-                    length' <- peek outputLength
-                    if pointer == nullPtr
-                        then do
-                            recordParseTiming store kind ffiMicros 0
-                            pure (Left (ParserError ParserNullResult "sqlparser returned a null result buffer"))
-                        else do
-                            let free = c_freeSQL pointer length'
-                                run = restore $ do
-                                    -- Zero-copy view over the Rust buffer: every primitive in
-                                    -- decodeBinaryResponse is strictly evaluated/copied before
-                                    -- `evaluate (forceParsed parsed)` returns and `free` runs.
-                                    bytes <- BSU.unsafePackCStringLen (castPtr pointer, fromIntegral length')
-                                    let buildResponse response = do
-                                            units <- makeUnits sql (responseUnits response)
-                                            columns <- validateColumns sql units (responseColumns response)
-                                            pure (ParsedSQL (responseInitialSession response) units columns)
-                                        parsed
-                                            | BS.isPrefixOf binaryMagic bytes =
-                                                case decodeBinaryResponse (BS.drop (BS.length binaryMagic) bytes) of
-                                                    Left message -> Left (ParserError ParserDecodeFailure message)
-                                                    Right response -> buildResponse response
-                                            | otherwise =
-                                                case eitherDecodeStrict' (BS.copy bytes) of
-                                                    Left message -> Left (ParserError ParserDecodeFailure (T.pack message))
-                                                    Right response -> buildResponse response
-                                    evaluate (forceParsed parsed)
-                                -- Decode elapsed finalizes even on async abort,
-                                -- before the buffer is freed.
-                                timed =
-                                    run
-                                        `finally` ( do
-                                                        decodeEnd <- clockIf
-                                                        recordParseTiming store kind ffiMicros (microsBetween ffiEnd decodeEnd)
-                                                  )
-                            finally timed free
+            finishNativeParse restore store kind sql ffiMicros ffiEnd status outputPointer outputLength
+
+invokeNativeParser ::
+    ParseOptions -> CString -> Int -> Ptr (Ptr Word8) -> Ptr CSize -> IO CInt
+invokeNativeParser options input inputLength outputPointer outputLength
+    | parseServerConfig options == defaultServerConfig =
+        c_parseSQLFlags
+            (dialectCode (parseDialect options))
+            (parseOptionFlags options)
+            (castPtr input)
+            (fromIntegral inputLength)
+            outputPointer
+            outputLength
+    | otherwise = evalContT do
+        let configBytes = BL.toStrict (encode options)
+        (configPointer, configLength) <- ContT $ BSU.unsafeUseAsCStringLen configBytes
+        liftIO $
+            c_parseSQL
+                (castPtr configPointer)
+                (fromIntegral configLength)
+                (castPtr input)
+                (fromIntegral inputLength)
+                outputPointer
+                outputLength
+
+finishNativeParse ::
+    (IO (Either ParserError ParsedSQL) -> IO (Either ParserError ParsedSQL)) ->
+    Maybe MetricsStore ->
+    ParseKind ->
+    ByteString ->
+    Int ->
+    Word64 ->
+    CInt ->
+    Ptr (Ptr Word8) ->
+    Ptr CSize ->
+    IO (Either ParserError ParsedSQL)
+finishNativeParse restore store kind sql ffiMicros ffiEnd status outputPointer outputLength
+    | status /= 0 = do
+        recordParseTiming store kind ffiMicros 0
+        Left <$> nativeError status
+    | otherwise = do
+        pointer <- peek outputPointer
+        length' <- peek outputLength
+        if pointer == nullPtr
+            then do
+                recordParseTiming store kind ffiMicros 0
+                pure (Left (ParserError ParserNullResult "sqlparser returned a null result buffer"))
+            else decodeAllocatedNativeBuffer restore store kind sql ffiMicros ffiEnd pointer length'
+
+decodeAllocatedNativeBuffer ::
+    (IO (Either ParserError ParsedSQL) -> IO (Either ParserError ParsedSQL)) ->
+    Maybe MetricsStore ->
+    ParseKind ->
+    ByteString ->
+    Int ->
+    Word64 ->
+    Ptr Word8 ->
+    CSize ->
+    IO (Either ParserError ParsedSQL)
+decodeAllocatedNativeBuffer restore store kind sql ffiMicros ffiEnd pointer length' =
+    finally timed (c_freeSQL pointer length')
     where
-        clockIf = case store of
-            Nothing -> pure 0
-            Just _ -> getMonotonicTimeNSec
+        -- Zero-copy view over the Rust buffer: every primitive in decodeBinaryResponse
+        -- is strictly evaluated/copied before `evaluate (forceParsed parsed)` returns
+        -- and `c_freeSQL` runs.
+        run = restore $ do
+            bytes <- BSU.unsafePackCStringLen (castPtr pointer, fromIntegral length')
+            evaluate (forceParsed (decodeNativeResponse sql bytes))
+        -- Decode elapsed finalizes even on async abort, before the buffer is freed.
+        timed = run `finally` recordDecode
+        recordDecode = do
+            decodeEnd <- clockIf store
+            recordParseTiming store kind ffiMicros (microsBetween ffiEnd decodeEnd)
+
+decodeNativeResponse :: ByteString -> ByteString -> Either ParserError ParsedSQL
+decodeNativeResponse sql bytes = decodeRaw >>= buildResponse
+    where
+        decodeRaw
+            | BS.isPrefixOf binaryMagic bytes =
+                either (Left . ParserError ParserDecodeFailure) Right $
+                    decodeBinaryResponse (BS.drop (BS.length binaryMagic) bytes)
+            | otherwise =
+                either (Left . ParserError ParserDecodeFailure . T.pack) Right $
+                    eitherDecodeStrict' (BS.copy bytes)
+        buildResponse response = do
+            units <- makeUnits sql (responseUnits response)
+            columns <- validateColumns sql units (responseColumns response)
+            pure (ParsedSQL (responseInitialSession response) units columns)
+
+clockIf :: Maybe MetricsStore -> IO Word64
+clockIf Nothing = pure 0
+clockIf (Just _) = getMonotonicTimeNSec
 
 parseOptionFlags :: ParseOptions -> CUInt
 parseOptionFlags options =
