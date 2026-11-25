@@ -4,10 +4,12 @@ module Occam.Oracle.Inline (
     prepareResultOracle,
     prepareResultOracleWithTrace,
     prepareResultOracleWithTraceAndFailures,
+    prepareResultOracleWithValidation,
 ) where
 
-import Data.Bifunctor (first)
+import Control.Monad (when)
 import Data.ByteString qualified as BS
+import Data.Functor ((<&>))
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -18,10 +20,12 @@ import Occam.Evaluation (EvaluationObserver)
 import Occam.Oracle (OracleObservation (OracleFinished), OracleObservationDetails (..))
 import Occam.Oracle.DuckDB (
     generateDuckDBContractWithTrace,
+    prepareDuckDBContractObserver,
     prepareDuckDBContractObserverWithReplay,
  )
 import Occam.Oracle.Sqlite (
     generateSqliteContractWithTrace,
+    prepareFreshSqliteContractObserver,
     prepareSqliteContractObserverWithTrace,
  )
 import Occam.Parser (SQLDialect (..))
@@ -87,26 +91,43 @@ prepareResultOracleWithTraceAndFailures ::
     Int ->
     BS.ByteString ->
     IO (Either Text (OracleObservationDetails, EvaluationObserver))
-prepareResultOracleWithTraceAndFailures needTrace mFailCache rememberTrace dialect micros sql = do
+prepareResultOracleWithTraceAndFailures needTrace mFailCache rememberTrace dialect micros sql =
+    fmap (\(details, observe, _) -> (details, observe))
+        <$> prepareResultOracleWithValidation needTrace mFailCache rememberTrace dialect micros sql
+
+prepareResultOracleWithValidation ::
+    Bool ->
+    Maybe FailingPrefixCache ->
+    (BS.ByteString -> ResultTrace -> IO ()) ->
+    SQLDialect ->
+    Int ->
+    BS.ByteString ->
+    IO (Either Text (OracleObservationDetails, EvaluationObserver, EvaluationObserver))
+prepareResultOracleWithValidation needTrace mFailCache rememberTrace dialect micros sql = do
     start <- getMonotonicTimeNSec
     let onFail = maybe (const (pure ())) recordFailingPrefix mFailCache
     prepared <- case dialect of
-        SQLite ->
-            fmap (first (\c -> prepareSqliteContractObserverWithTrace needTrace micros c onFail))
-                <$> generateSqliteContractWithTrace micros sql
+        SQLite -> do
+            result <- generateSqliteContractWithTrace micros sql
+            pure $
+                result <&> \(contract, trace) ->
+                    ( prepareSqliteContractObserverWithTrace needTrace micros contract onFail
+                    , fmap (,Nothing) . prepareFreshSqliteContractObserver micros contract
+                    , trace
+                    )
         DuckDB -> do
             result <- generateDuckDBContractWithTrace micros sql
             traverse
                 ( \(contract, trace) -> do
                     observe <- prepareDuckDBContractObserverWithReplay micros contract sql onFail
-                    pure (observe, trace)
+                    pure (observe, prepareDuckDBContractObserver micros contract, trace)
                 )
                 result
         _ -> pure (Left "Result oracle requires SQLite or DuckDB")
     end <- getMonotonicTimeNSec
     case prepared of
         Left err -> pure (Left err)
-        Right (observe, trace) -> do
+        Right (observe, validate, trace) -> do
             rememberTrace sql trace
             let details =
                     OracleObservationDetails
@@ -114,13 +135,13 @@ prepareResultOracleWithTraceAndFailures needTrace mFailCache rememberTrace diale
                         (elapsed start end)
                         0
                         (Just (elapsed start end))
-            pure (Right (details, timeObservation observe))
+            pure (Right (details, timeObservation needTrace observe, timeObservation False validate))
     where
         elapsed start end = fromIntegral ((end - start) `div` 1000)
-        timeObservation observe started candidate = do
+        timeObservation track observe started candidate = do
             start <- getMonotonicTimeNSec
             _ <- started
             (observation, trace) <- observe candidate
-            mapM_ (rememberTrace candidate) trace
+            when track (mapM_ (rememberTrace candidate) trace)
             end <- getMonotonicTimeNSec
             pure (OracleObservationDetails observation (elapsed start end) 0 (Just (elapsed start end)))

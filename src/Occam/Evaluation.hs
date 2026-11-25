@@ -19,6 +19,7 @@ module Occam.Evaluation (
     runEvaluationRequest,
     runEvaluationRequestWithObserver,
     runEvaluationRequestWithNativeObserver,
+    runEvaluationRequestWithNativeValidation,
     sqlDialectName,
 ) where
 
@@ -90,6 +91,7 @@ import Occam.Pool (
     poolAttempts,
     poolCacheStats,
     poolCancelled,
+    withAdaptiveLookahead,
     withCandidateCountCleanup,
  )
 import Occam.Reducer (
@@ -417,24 +419,34 @@ runEvaluationRequest request = do
 
 runEvaluationRequestWithObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
-runEvaluationRequestWithObserver = runEvaluationRequestWithKey pure
+runEvaluationRequestWithObserver micros observe =
+    runEvaluationRequestWithKey False pure micros observe observe
 
 runEvaluationRequestWithNativeObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
-runEvaluationRequestWithNativeObserver micros observe request =
+runEvaluationRequestWithNativeObserver micros observe =
+    runEvaluationRequestWithNativeValidation micros observe observe
+
+runEvaluationRequestWithNativeValidation ::
+    Int -> EvaluationObserver -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
+runEvaluationRequestWithNativeValidation micros observe validate request =
     runEvaluationRequestWithKey
+        True
         (nativeCandidateKey (nativeOracleCacheKey (requestDialect request)))
         micros
         observe
+        validate
         request
 
 runEvaluationRequestWithKey ::
+    Bool ->
     (ByteString -> IO ByteString) ->
     Int ->
     EvaluationObserver ->
+    EvaluationObserver ->
     EvaluationRequest oracle ->
     IO EvaluationResult
-runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest {..} = do
+runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate EvaluationRequest {..} = do
     let onProgress = requestOnProgress
         metricsPolicy = requestMetricsPolicy
         config = requestConfig
@@ -500,11 +512,13 @@ runEvaluationRequestWithKey candidateKey timeoutMicros observe EvaluationRequest
                     Just
                         (\bytes count -> modifyEvalState state (\s -> s {evalCounts = Map.insert bytes count (evalCounts s)}))
                 }
-    let pool = withCandidateCountCleanup (modifyEvalState state (\s -> s {evalCounts = seedCounts})) rawPool
+    configuredPool <- if adaptive then withAdaptiveLookahead rawPool else pure rawPool
+    let pool =
+            withCandidateCountCleanup (modifyEvalState state (\s -> s {evalCounts = seedCounts})) configuredPool
         env =
             EvalEnv
                 { envDialect = dialect
-                , envObserve = observe
+                , envValidate = validate
                 , envLogger = parentLogger
                 , envReductionStart = reductionStart
                 , envTotalDeadline = totalDeadline
@@ -722,7 +736,7 @@ modifyEvalState ref f = atomicModifyIORef' ref (\s -> (f s, ()))
 -- | Static phase environment: handles, clocks, and budgets fixed at setup.
 data EvalEnv = EvalEnv
     { envDialect :: !SQLDialect
-    , envObserve :: !EvaluationObserver
+    , envValidate :: !EvaluationObserver
     , envLogger :: !Logger
     , envReductionStart :: !Ticks
     , envTotalDeadline :: !(Maybe Ticks)
@@ -866,7 +880,7 @@ runValidationPhase env state finalSQL skipValidation callLimit
                         _ -> do
                             modifyEvalState state (\s -> s {evalValidationObs = evalValidationObs s + 1})
                             let observe =
-                                    envObserve
+                                    envValidate
                                         env
                                         (modifyEvalState state (\s -> s {evalValidationDatabase = evalValidationDatabase s + 1}))
                                         candidate

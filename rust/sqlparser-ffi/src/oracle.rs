@@ -112,6 +112,13 @@ pub(super) fn cache_key(sql: &str, kind: DialectKind) -> Option<Vec<u8>> {
     {
         return None;
     }
+    // A semicolon before the first string literal must be the final token.
+    // Skip lexing whole scripts when we can prove this from the raw bytes.
+    let trimmed = sql.as_bytes().trim_ascii_end();
+    let body = trimmed.strip_suffix(b";").unwrap_or(trimmed);
+    if body.iter().find(|&&byte| matches!(byte, b'\'' | b';')) == Some(&b';') {
+        return None;
+    }
     let tokens = tokens(sql, kind)?;
     let bare = tokens
         .split_last()

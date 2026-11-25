@@ -367,16 +367,18 @@ static int64_t occam_monotonic_ns(void) {
 
 typedef struct {
     int64_t deadline_ns;
-    int timed_out;
 } occam_sqlite_deadline;
 
+static occam_sqlite_deadline make_deadline(int64_t micros) {
+    int64_t now = occam_monotonic_ns();
+    int64_t room = INT64_MAX - now;
+    int64_t delta = micros <= 0 ? 0 : (micros > room / 1000 ? room : micros * 1000);
+    return (occam_sqlite_deadline){ now + delta };
+}
+
 static int occam_sqlite_progress_cb(void *ctx) {
-    occam_sqlite_deadline *dl = (occam_sqlite_deadline *)ctx;
-    if (occam_monotonic_ns() >= dl->deadline_ns) {
-        dl->timed_out = 1;
-        return 1;
-    }
-    return 0;
+    const occam_sqlite_deadline *dl = (const occam_sqlite_deadline *)ctx;
+    return occam_monotonic_ns() >= dl->deadline_ns;
 }
 
 #define OCCAM_MAX_CKPTS 16
@@ -399,6 +401,8 @@ typedef struct {
     size_t sql_cap;
     uint8_t *base_sql;
     size_t base_len;
+    uint8_t *pending_prefix;
+    size_t pending_prefix_len;
     occam_sqlite_ckpt ckpts[OCCAM_MAX_CKPTS];
     int num_ckpts;
 } occam_sqlite_cache;
@@ -407,21 +411,28 @@ occam_sqlite_cache *occam_sqlite_cache_create(void) {
     return (occam_sqlite_cache *)calloc(1, sizeof(occam_sqlite_cache));
 }
 
+static void free_checkpoints_after(occam_sqlite_cache *cache, int retained) {
+    for (int i = retained; i < cache->num_ckpts; i++) {
+        occam_sqlite_ckpt *slot = &cache->ckpts[i];
+        sqlite3_close(slot->db);
+        free(slot->end_offsets);
+        free(slot->result_flags);
+    }
+    cache->num_ckpts = retained;
+}
+
+static void clear_pending_prefix(occam_sqlite_cache *cache) {
+    free(cache->pending_prefix);
+    cache->pending_prefix = NULL;
+    cache->pending_prefix_len = 0;
+}
+
 void occam_sqlite_cache_clear_ckpts(occam_sqlite_cache *cache) {
     if (!cache) {
         return;
     }
-    for (int i = 0; i < cache->num_ckpts; i++) {
-        if (cache->ckpts[i].db) {
-            sqlite3_close(cache->ckpts[i].db);
-            cache->ckpts[i].db = NULL;
-        }
-        free(cache->ckpts[i].end_offsets);
-        cache->ckpts[i].end_offsets = NULL;
-        free(cache->ckpts[i].result_flags);
-        cache->ckpts[i].result_flags = NULL;
-    }
-    cache->num_ckpts = 0;
+    free_checkpoints_after(cache, 0);
+    clear_pending_prefix(cache);
     free(cache->base_sql);
     cache->base_sql = NULL;
     cache->base_len = 0;
@@ -605,12 +616,15 @@ static int match_stmt_against_expected(
     return 0;
 }
 
-static int backup_db_main(sqlite3 *dest, sqlite3 *src) {
+static int backup_db_main(sqlite3 *dest, sqlite3 *src, occam_sqlite_deadline *deadline) {
     sqlite3_backup *bk = sqlite3_backup_init(dest, "main", src, "main");
     if (!bk) {
         return 0;
     }
-    int step_rc = sqlite3_backup_step(bk, -1);
+    int step_rc;
+    do {
+        step_rc = sqlite3_backup_step(bk, 128);
+    } while (step_rc == 0 /* SQLITE_OK */ && !occam_sqlite_progress_cb(deadline));
     int finish_rc = sqlite3_backup_finish(bk);
     return (step_rc == 101 && finish_rc == 0) ? 1 : 0;
 }
@@ -652,6 +666,10 @@ int occam_sqlite_run_and_match(
     *out_used_ckpt_dml = 0;
     *out_fail_end_offset = 0;
 
+    if (timeout_micros <= 0) {
+        return 3;
+    }
+    occam_sqlite_deadline dl = make_deadline(timeout_micros);
     if (!cache || !cache_ensure_sql_buf(cache, sql, sql_len)) {
         return 4;
     }
@@ -666,39 +684,41 @@ int occam_sqlite_run_and_match(
     int last_matched = 0;
     const occam_sqlite_ckpt *matched_ckpt = NULL;
 
-    occam_sqlite_deadline dl;
-    dl.deadline_ns = occam_monotonic_ns() + (timeout_micros > 0 ? timeout_micros * 1000LL : 0);
-    dl.timed_out = 0;
-    if (timeout_micros <= 0) {
-        return 3;
-    }
+    int status = 1;
     sqlite3_progress_handler(db, 1000, occam_sqlite_progress_cb, &dl);
 
     /* Find longest matching deterministic semicolon-terminated prefix checkpoint. */
     if (allow_ckpt_use && cache->num_ckpts > 0 && cache->base_sql != NULL) {
         for (int i = cache->num_ckpts - 1; i >= 0; i--) {
+            if (occam_sqlite_progress_cb(&dl)) {
+                goto done;
+            }
             size_t plen = cache->ckpts[i].prefix_len;
             if (plen > 0 && plen <= sql_len && memcmp(sql, cache->base_sql, plen) == 0) {
-                if (backup_db_main(db, cache->ckpts[i].db)) {
-                    matched_ckpt = &cache->ckpts[i];
-                    *dirty_ptr |= OCCAM_DIRTY_MAIN;
-                    start = base + plen;
-                    ordinal = matched_ckpt->stmt_count;
-                    first_result = matched_ckpt->first_result_idx;
-                    last_result = matched_ckpt->last_result_idx;
-                    has_result = matched_ckpt->has_result;
-                    last_matched = matched_ckpt->last_matched;
-                    *out_used_ckpt_dml = matched_ckpt->had_dml;
+                if (!backup_db_main(db, cache->ckpts[i].db, &dl)) {
+                    status = 4;
+                    goto done;
                 }
+                matched_ckpt = &cache->ckpts[i];
+                *dirty_ptr |= OCCAM_DIRTY_MAIN;
+                start = base + plen;
+                ordinal = matched_ckpt->stmt_count;
+                first_result = matched_ckpt->first_result_idx;
+                last_result = matched_ckpt->last_result_idx;
+                has_result = matched_ckpt->has_result;
+                last_matched = matched_ckpt->last_matched;
+                *out_used_ckpt_dml = matched_ckpt->had_dml;
                 break;
             }
         }
     }
 
     int sql_limit = sqlite3_limit(db, 1 /* SQLITE_LIMIT_SQL_LENGTH */, -1);
-    int status = 1;
 
     while (start < end) {
+        if (occam_sqlite_progress_cb(&dl)) {
+            goto done;
+        }
         sqlite3_stmt *stmt = NULL;
         const char *tail = start;
         ptrdiff_t rem = end - start;
@@ -802,6 +822,9 @@ int occam_sqlite_run_and_match(
 
 done:
     sqlite3_progress_handler(db, 0, NULL, NULL);
+    if (occam_sqlite_progress_cb(&dl)) {
+        status = 3;
+    }
     *out_stmt_count = ordinal;
     *out_first_result_idx = first_result;
     *out_last_result_idx = last_result;
@@ -823,11 +846,13 @@ int occam_sqlite_build_ckpts(
     size_t sql_len,
     const uint8_t *expected_buf,
     size_t expected_len,
-    int total_stmts
+    int total_stmts,
+    int64_t timeout_micros
 ) {
-    if (!cache || total_stmts < 8 || sql_len == 0) {
+    if (!cache || total_stmts < 8 || sql_len == 0 || timeout_micros <= 0) {
         return 1;
     }
+    occam_sqlite_deadline dl = make_deadline(timeout_micros);
     /* Skip rebuild if checkpoints already match this exact base script. */
     if (cache->base_sql != NULL && cache->base_len == sql_len &&
         memcmp(cache->base_sql, sql, sql_len) == 0 && cache->num_ckpts > 0) {
@@ -846,28 +871,27 @@ int occam_sqlite_build_ckpts(
                 break;
             }
         }
-        for (int i = retained; i < cache->num_ckpts; i++) {
-            if (cache->ckpts[i].db) {
-                sqlite3_close(cache->ckpts[i].db);
-                cache->ckpts[i].db = NULL;
-            }
-            free(cache->ckpts[i].end_offsets);
-            cache->ckpts[i].end_offsets = NULL;
-            free(cache->ckpts[i].result_flags);
-            cache->ckpts[i].result_flags = NULL;
+        if (retained > 0) {
+            free_checkpoints_after(cache, retained);
+            clear_pending_prefix(cache);
+            return 1;
         }
-        cache->num_ckpts = retained;
-    }
 
-    if (retained > 0) {
-        if (!cache_ensure_sql_buf(cache, sql, sql_len)) {
-            return 0;
+        /* A new head often means that the next accepted deletion will
+         * invalidate another replay. Keep the old slots until a second
+         * accepted script demonstrates a stable new prefix. */
+        size_t prefix_len = cache->ckpts[0].prefix_len;
+        if (prefix_len > sql_len / 2) {
+            prefix_len = sql_len / 2 + 1;
         }
-        uint8_t *new_base = (uint8_t *)realloc(cache->base_sql, sql_len);
-        if (new_base) {
-            cache->base_sql = new_base;
-            memcpy(cache->base_sql, sql, sql_len);
-            cache->base_len = sql_len;
+        if (cache->pending_prefix_len != prefix_len ||
+            memcmp(cache->pending_prefix, sql, prefix_len) != 0) {
+            uint8_t *pending = (uint8_t *)realloc(cache->pending_prefix, prefix_len);
+            if (pending) {
+                cache->pending_prefix = pending;
+                cache->pending_prefix_len = prefix_len;
+                memcpy(pending, sql, prefix_len);
+            }
             return 1;
         }
     }
@@ -909,8 +933,9 @@ int occam_sqlite_build_ckpts(
     int has_result = 0;
     int last_matched = 0;
     int sql_limit = sqlite3_limit(db, 1, -1);
+    sqlite3_progress_handler(db, 1000, occam_sqlite_progress_cb, &dl);
 
-    while (start < end && ordinal < total_stmts) {
+    while (start < end && ordinal < total_stmts && !occam_sqlite_progress_cb(&dl)) {
         sqlite3_stmt *stmt = NULL;
         const char *tail = start;
         ptrdiff_t rem = end - start;
@@ -968,7 +993,7 @@ int occam_sqlite_build_ckpts(
             sqlite3_get_autocommit(db) == 1) {
             sqlite3 *snap = NULL;
             if (sqlite3_open(":memory:", &snap) == 0 && snap != NULL) {
-                if (backup_db_main(snap, db)) {
+                if (backup_db_main(snap, db, &dl)) {
                     int *off_copy = (int *)malloc((size_t)completed_stmts * sizeof(int));
                     uint8_t *flg_copy = (uint8_t *)malloc((size_t)completed_stmts);
                     if (off_copy && flg_copy) {
@@ -1004,6 +1029,7 @@ int occam_sqlite_build_ckpts(
         start = tail;
     }
 
+    sqlite3_progress_handler(db, 0, NULL, NULL);
     free(offsets);
     free(flags);
     return occam_sqlite_reset(db, tmpl, dirty_ptr);

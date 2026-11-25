@@ -14,6 +14,10 @@ module Occam.Cache (
     cacheCompleteInflight,
     cacheInsertDone,
     cacheRemoveInflight,
+    cacheLookupKey,
+    cacheInstallInflightKey,
+    cacheCompleteInflightKey,
+    cacheInsertDoneKey,
     cacheStats,
     LookupResult (..),
     observationAdmission,
@@ -66,7 +70,7 @@ instance Hashable CacheKey where
 
 {-# INLINE makeKey #-}
 makeKey :: ByteString -> CacheKey
-makeKey bs = CacheKey (hash bs) bs
+makeKey bs = makeKeyWithFingerprint (hash bs) bs
 
 {-# INLINE makeKeyWithFingerprint #-}
 makeKeyWithFingerprint :: Int -> ByteString -> CacheKey
@@ -116,8 +120,10 @@ nativeCandidateKey prove sql = do
 
 -- | Look up candidate bytes in the cache according to the cache mode.
 cacheLookup :: Cache -> CacheMode -> ByteString -> IO LookupResult
-cacheLookup cache mode sql = do
-    let !k = makeKey sql
+cacheLookup cache mode = cacheLookupKey cache mode . makeKey
+
+cacheLookupKey :: Cache -> CacheMode -> CacheKey -> IO LookupResult
+cacheLookupKey cache mode !k = do
     entries <- readMVar (cacheEntries cache)
     case mode of
         CacheDisabled -> case HashMap.lookup k entries of
@@ -140,26 +146,34 @@ cacheLookup cache mode sql = do
             pure (LookupHit res)
 
 cacheInstallInflight :: Cache -> ByteString -> Int -> IO ()
-cacheInstallInflight cache sql ordinal =
+cacheInstallInflight cache = cacheInstallInflightKey cache . makeKey
+
+cacheInstallInflightKey :: Cache -> CacheKey -> Int -> IO ()
+cacheInstallInflightKey cache !key ordinal =
     modifyMVar_ (cacheEntries cache) \entries ->
-        pure $! HashMap.insert (makeKey sql) (CacheInflight ordinal) entries
+        pure $! HashMap.insert key (CacheInflight ordinal) entries
 
 -- | Directly insert a completed observation into the cache (serial path).
 cacheInsertDone :: Cache -> ByteString -> OracleObservation -> IO ()
-cacheInsertDone cache sql res =
+cacheInsertDone cache = cacheInsertDoneKey cache . makeKey
+
+cacheInsertDoneKey :: Cache -> CacheKey -> OracleObservation -> IO ()
+cacheInsertDoneKey cache !key res =
     modifyMVar_ (cacheEntries cache) \entries ->
-        pure $! HashMap.insert (makeKey sql) (CacheDone res) entries
+        pure $! HashMap.insert key (CacheDone res) entries
 
 -- | Complete an in-flight entry with an admitted observation or remove it.
 cacheCompleteInflight :: Cache -> ByteString -> Int -> Maybe OracleObservation -> IO ()
-cacheCompleteInflight cache sql ordinal admitted =
-    let !k = makeKey sql
-     in modifyMVar_ (cacheEntries cache) \entries -> case HashMap.lookup k entries of
-            Just (CacheInflight owner)
-                | owner == ordinal -> case admitted of
-                    Just res -> pure $! HashMap.insert k (CacheDone res) entries
-                    Nothing -> pure $! HashMap.delete k entries
-            _ -> pure entries
+cacheCompleteInflight cache = cacheCompleteInflightKey cache . makeKey
+
+cacheCompleteInflightKey :: Cache -> CacheKey -> Int -> Maybe OracleObservation -> IO ()
+cacheCompleteInflightKey cache !key ordinal admitted =
+    modifyMVar_ (cacheEntries cache) \entries -> case HashMap.lookup key entries of
+        Just (CacheInflight owner)
+            | owner == ordinal -> case admitted of
+                Just res -> pure $! HashMap.insert key (CacheDone res) entries
+                Nothing -> pure $! HashMap.delete key entries
+        _ -> pure entries
 
 -- | Drop an in-flight entry owned by the given ordinal (worker cancellation).
 cacheRemoveInflight :: Cache -> ByteString -> Int -> IO ()

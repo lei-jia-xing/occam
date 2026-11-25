@@ -24,6 +24,13 @@ cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
 cabal bench --benchmark-options="+RTS -T -RTS"
 ```
 
+`make bench-product` also exercises the shared native evaluator on two audit
+workloads with 512 candidate deletions. One accepts deletions frequently. The
+other preserves a row count and rejects all deletions from a wide SQL script.
+Both check the exact endpoint, the minimality claim, and two fresh validations.
+`make microbench` includes native cache key eligibility and raw versus prepared
+cache lookups for 4 KiB, 32 KiB, and 128 KiB keys.
+
 ### GHC cost-centre flame graph
 
 Run `make flamegraph` from the pinned development environment. It builds

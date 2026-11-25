@@ -1042,6 +1042,13 @@ tests =
                 firstStatement = BSC.pack "SELECT 11;\r\n"
             byteResult <- statementDdmin GenericSQL keepPool bytes
             assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
+        , testCase "statement audit distinguishes identical statements with different trailing comments" $ do
+            let kept = "SELECT 1; -- A\n"
+                input = kept <> "SELECT 1; -- B\n"
+            forM_ [1, 4] $ \jobs -> do
+                pool <- jobsPool jobs (BS.isInfixOf "-- A")
+                reduced <- statementAudit SQLite pool input
+                assertEqual "audit finds the interesting deletion" kept reduced
         , testCase "statement deletion removes exactly its own terminator and separator" $ do
             pool <-
                 predicatePool

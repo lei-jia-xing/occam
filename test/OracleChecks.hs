@@ -1,6 +1,6 @@
 {-# LANGUAGE CPP #-}
 
-module OracleChecks (tests) where
+module OracleChecks (tests, checkInPlacePermissions) where
 
 import Data.ByteString qualified as BS
 import Occam.Oracle
@@ -10,8 +10,10 @@ import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 import TestSupport (withSentinelPath)
 #ifndef mingw32_HOST_OS
 import Control.Concurrent (threadDelay)
+import Data.Bits ((.&.))
 import Data.Maybe (isJust)
 import System.Directory (doesFileExist, findExecutable)
+import System.Posix.Files (accessModes, fileMode, getFileStatus, setFileMode)
 import System.Process (CmdSpec (..))
 import System.Timeout (timeout)
 #endif
@@ -159,4 +161,20 @@ shellQuote value = "'" ++ concatMap quote value ++ "'"
   where
     quote '\'' = "'\\''"
     quote character = [character]
+#endif
+
+checkInPlacePermissions :: FilePath -> FilePath -> IO a -> IO a
+#ifdef mingw32_HOST_OS
+checkInPlacePermissions _ _ action = action
+#else
+checkInPlacePermissions input backup action = do
+    setFileMode input 0o600
+    setFileMode backup 0o644
+    result <- action
+    mapM_ checkMode [input, backup]
+    pure result
+    where
+        checkMode path = do
+            status <- getFileStatus path
+            assertEqual ("permissions for " ++ path) 0o600 (fileMode status .&. accessModes)
 #endif

@@ -40,7 +40,7 @@ import Control.Concurrent (
  )
 import Control.Exception qualified as Exception
 import Control.Exception.Safe (SomeException, bracket, displayException, try)
-import Control.Monad (filterM, forM, when, zipWithM)
+import Control.Monad (filterM, forM, guard, when, zipWithM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Aeson (
@@ -70,7 +70,8 @@ import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64, Int8)
 import Data.IntSet qualified as IntSet
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Ratio ((%))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -120,6 +121,7 @@ import System.Posix.DynamicLinker (
 type DuckdbDatabase = Ptr ()
 type DuckdbConnection = Ptr ()
 type DuckdbConfig = Ptr ()
+type DuckdbLogicalType = Ptr ()
 type DuckdbPreparedStatement = Ptr ()
 type DuckdbExtractedStatements = Ptr ()
 type IdxT = Word64
@@ -185,6 +187,10 @@ type FnResultError = Ptr DuckDBResult -> IO CString
 type FnColumnCount = Ptr DuckDBResult -> IO IdxT
 type FnColumnName = Ptr DuckDBResult -> IdxT -> IO CString
 type FnColumnType = Ptr DuckDBResult -> IdxT -> IO CInt
+type FnColumnLogicalType = Ptr DuckDBResult -> IdxT -> IO DuckdbLogicalType
+type FnDecimalDimension = DuckdbLogicalType -> IO Word8
+type FnDecimalStorage = DuckdbLogicalType -> IO CInt
+type FnDestroyLogicalType = Ptr DuckdbLogicalType -> IO ()
 type FnChunkSize = Chunk -> IO IdxT
 type FnDestroyChunk = Ptr Chunk -> IO ()
 type FnChunkVector = Chunk -> IdxT -> IO Vector
@@ -213,6 +219,12 @@ foreign import ccall "dynamic" mkResultError :: FunPtr FnResultError -> FnResult
 foreign import ccall "dynamic" mkColumnCount :: FunPtr FnColumnCount -> FnColumnCount
 foreign import ccall "dynamic" mkColumnName :: FunPtr FnColumnName -> FnColumnName
 foreign import ccall "dynamic" mkColumnType :: FunPtr FnColumnType -> FnColumnType
+foreign import ccall "dynamic"
+    mkColumnLogicalType :: FunPtr FnColumnLogicalType -> FnColumnLogicalType
+foreign import ccall "dynamic" mkDecimalDimension :: FunPtr FnDecimalDimension -> FnDecimalDimension
+foreign import ccall "dynamic" mkDecimalStorage :: FunPtr FnDecimalStorage -> FnDecimalStorage
+foreign import ccall "dynamic"
+    mkDestroyLogicalType :: FunPtr FnDestroyLogicalType -> FnDestroyLogicalType
 foreign import ccall "dynamic" mkChunkSize :: FunPtr FnChunkSize -> FnChunkSize
 foreign import ccall "dynamic" mkDestroyChunk :: FunPtr FnDestroyChunk -> FnDestroyChunk
 foreign import ccall "dynamic" mkChunkVector :: FunPtr FnChunkVector -> FnChunkVector
@@ -225,6 +237,14 @@ data DuckDBConfigOpen = DuckDBConfigOpen
     , apiSetConfig :: !FnSetConfig
     , apiOpenExt :: !FnOpenExt
     , apiDestroyConfig :: !FnDestroyConfig
+    }
+
+data DuckDBDecimalAPI = DuckDBDecimalAPI
+    { apiColumnLogicalType :: !FnColumnLogicalType
+    , apiDecimalWidth :: !FnDecimalDimension
+    , apiDecimalScale :: !FnDecimalDimension
+    , apiDecimalStorage :: !FnDecimalStorage
+    , apiDestroyLogicalType :: !FnDestroyLogicalType
     }
 
 data DuckDBAPI = DuckDBAPI
@@ -248,6 +268,7 @@ data DuckDBAPI = DuckDBAPI
     , apiColumnCount :: !FnColumnCount
     , apiColumnName :: !FnColumnName
     , apiColumnType :: !FnColumnType
+    , apiDecimalAPI :: !(Maybe DuckDBDecimalAPI)
     , apiFetchChunk :: !(FunPtr FnFetchChunk)
     , apiDestroyChunk :: !(FunPtr FnDestroyChunk)
     , apiChunkSize :: !(FunPtr FnChunkSize)
@@ -422,6 +443,13 @@ loadSymbols libPath = withCString libPath $ \cLib -> do
             apiColumnCount <- getProc "duckdb_column_count" mkColumnCount
             apiColumnName <- getProc "duckdb_column_name" mkColumnName
             apiColumnType <- getProc "duckdb_column_type" mkColumnType
+            apiDecimalAPI <- do
+                logical <- tryProc "duckdb_column_logical_type" mkColumnLogicalType
+                width <- tryProc "duckdb_decimal_width" mkDecimalDimension
+                scale <- tryProc "duckdb_decimal_scale" mkDecimalDimension
+                storage <- tryProc "duckdb_decimal_internal_type" mkDecimalStorage
+                destroy <- tryProc "duckdb_destroy_logical_type" mkDestroyLogicalType
+                pure (DuckDBDecimalAPI <$> logical <*> width <*> scale <*> storage <*> destroy)
             apiFetchChunk <- getProc "duckdb_fetch_chunk" id
             apiDestroyChunk <- getProc "duckdb_destroy_data_chunk" id
             apiChunkSize <- getProc "duckdb_data_chunk_get_size" id
@@ -470,6 +498,13 @@ loadSymbols libPath = do
     apiColumnCount <- getSym "duckdb_column_count" mkColumnCount
     apiColumnName <- getSym "duckdb_column_name" mkColumnName
     apiColumnType <- getSym "duckdb_column_type" mkColumnType
+    apiDecimalAPI <- do
+        logical <- trySym "duckdb_column_logical_type" mkColumnLogicalType
+        width <- trySym "duckdb_decimal_width" mkDecimalDimension
+        scale <- trySym "duckdb_decimal_scale" mkDecimalDimension
+        storage <- trySym "duckdb_decimal_internal_type" mkDecimalStorage
+        destroy <- trySym "duckdb_destroy_logical_type" mkDestroyLogicalType
+        pure (DuckDBDecimalAPI <$> logical <*> width <*> scale <*> storage <*> destroy)
     apiFetchChunk <- getSym "duckdb_fetch_chunk" id
     apiDestroyChunk <- getSym "duckdb_destroy_data_chunk" id
     apiChunkSize <- getSym "duckdb_data_chunk_get_size" id
@@ -499,14 +534,57 @@ isDuckDBAvailable = do
         Right _ -> True
         Left _ -> False
 
+data DuckDBColumnType
+    = ScalarColumn !CInt
+    | DecimalColumn !Word8 !Word8 !CInt
+
+-- Decimal contracts store the native tag in the low byte, width in the
+-- next byte, and scale in the third byte. Scalar tags retain their format.
+contractTypeTag :: DuckDBColumnType -> Int
+contractTypeTag (ScalarColumn ty) = fromIntegral ty
+contractTypeTag (DecimalColumn width scale _) =
+    19 + (fromIntegral width `shiftL` 8) + (fromIntegral scale `shiftL` 16)
+
+readColumnType :: DuckDBAPI -> Ptr DuckDBResult -> (CInt, IdxT) -> IO (Maybe DuckDBColumnType)
+readColumnType api result (ty, column)
+    | supportedType ty = pure (Just (ScalarColumn ty))
+    | ty == 19
+    , Just DuckDBDecimalAPI {..} <- apiDecimalAPI api = alloca $ \logicalPtr ->
+        bracket
+            (do logical <- apiColumnLogicalType result column; poke logicalPtr logical; pure logical)
+            (const (apiDestroyLogicalType logicalPtr))
+            $ \logical ->
+                if logical == nullPtr
+                    then pure Nothing
+                    else do
+                        width <- apiDecimalWidth logical
+                        scale <- apiDecimalScale logical
+                        storage <- apiDecimalStorage logical
+                        pure $ do
+                            guard (width > 0 && scale <= width && storage `elem` [3, 4, 5, 16])
+                            pure (DecimalColumn width scale storage)
+    | otherwise = pure Nothing
+
 -- NOTE: DuckDB's legacy string accessors truncate at embedded NULs. Read
 -- chunk vectors here, including for scalars, to preserve complete values.
-convertCell :: DuckDBAPI -> (CInt, Ptr (), Ptr Word64) -> IdxT -> IO Value
+convertCell :: DuckDBAPI -> (DuckDBColumnType, Ptr (), Ptr Word64) -> IdxT -> IO Value
 convertCell api (colType, values, validity) row = do
     valid <- if validity == nullPtr then pure 1 else apiRowValid api validity row
     if valid == 0
         then pure Null
         else case colType of
+            DecimalColumn _ scale storage -> do
+                unscaled <- readDecimalStorage storage
+                pure (Number (fromRational (unscaled % (10 ^ scale))))
+            ScalarColumn ty -> readScalar ty
+    where
+        readDecimalStorage storage = case storage of
+            3 -> toInteger <$> item @Int16
+            4 -> toInteger <$> item @Int32
+            5 -> toInteger <$> item @Int64
+            _ -> wide signedHigh
+
+        readScalar ty = case ty of
             1 -> Bool . (/= (0 :: Word8)) <$> item
             2 -> integral @Int8
             3 -> integral @Int16
@@ -518,27 +596,27 @@ convertCell api (colType, values, validity) row = do
             9 -> integral @Word64
             10 -> floatBits . realToFrac <$> item @Float
             11 -> floatBits <$> item @Double
-            16 -> wide (toInteger . (fromIntegral :: Word64 -> Int64))
+            16 -> Number . fromInteger <$> wide signedHigh
             17 -> do
                 value <- readBytes
                 either (fail . show) (pure . String) (TE.decodeUtf8' value)
             18 -> do
                 value <- readBytes
                 pure (object ["blob" .= BS.unpack value])
-            32 -> wide toInteger
+            32 -> Number . fromInteger <$> wide toInteger
             36 -> pure Null
-            _ -> fail ("Unsupported DuckDB result type " ++ show colType)
-    where
+            _ -> fail ("Unsupported DuckDB result type " ++ show ty)
         item :: (Storable a) => IO a
         item = peekElemOff (castPtr values) (fromIntegral row)
         integral :: forall a. (Integral a, Storable a) => IO Value
         integral = Number . fromIntegral <$> item @a
         floatBits value = object ["float64_bits" .= castDoubleToWord64 value]
+        signedHigh = toInteger . (fromIntegral :: Word64 -> Int64)
         wide highInteger = do
             let offset = fromIntegral row * 16
             low <- peekByteOff values offset :: IO Word64
             high <- peekByteOff values (offset + 8) :: IO Word64
-            pure (Number (fromInteger ((highInteger high `shiftL` 64) + toInteger low)))
+            pure ((highInteger high `shiftL` 64) + toInteger low)
         readBytes = evalContT do
             sizePtr <- ContT alloca
             liftIO do
@@ -640,7 +718,7 @@ executeWithAPI api observe existing onFailure micros sql = do
                         (\_ -> apiDisconnect api conPtr)
             liftIO do
                 mRes <- executeInterruptibly micros (apiInterrupt api con) do
-                    let needsConfigure = configureDb && not (isJust (apiConfigOpen api))
+                    let needsConfigure = configureDb && isNothing (apiConfigOpen api)
                     when needsConfigure (configure con)
                     runStatements con
                 pure (fromMaybe (Left DuckDBTimeout) mRes)
@@ -828,13 +906,12 @@ supportedType ty = (ty >= 1 && ty <= 11) || ty `elem` [16, 17, 18, 32, 36]
 observeRows :: DuckDBAPI -> Ptr DuckDBResult -> IO (Either DuckDBError ResultSet)
 observeRows api ptr = do
     (names, types) <- readResultColumns api ptr
-    let columnTypes = map fromIntegral types
-    -- TODO: Add lossless decoding for exact decimals and composite types.
-    if all supportedType types
-        then do
-            rows <- readChunks (zip types [0 ..]) []
-            pure (Right (ResultSet names columnTypes rows))
-        else pure (Left (DuckDBUnsupportedResultTypes columnTypes))
+    descriptors <- traverse (readColumnType api ptr) (zip types [0 ..])
+    case sequence descriptors of
+        Nothing -> pure (Left (DuckDBUnsupportedResultTypes (map fromIntegral types)))
+        Just columnTypes -> do
+            rows <- readChunks (zip columnTypes [0 ..]) []
+            pure (Right (ResultSet names (map contractTypeTag columnTypes) rows))
     where
         readChunks columnTypes accumulated = do
             chunkRows <- evalContT do

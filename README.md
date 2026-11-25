@@ -20,7 +20,7 @@ occam input.sql \
 ```
 
 - **Input**: pass a file path, or `-` to read SQL from `stdin` (never implicit).
-- **Output**: writes reduced SQL to `stdout` by default; use `--out PATH` to write a file or `--in-place` (`-i`) to replace the input with a `.bak` backup after final validation.
+- Reduced SQL goes to `stdout` by default. Use `--out PATH` to write a file or `--in-place` (`-i`) to replace the input with a `.bak` backup after final validation. The replacement and backup inherit the input's permission bits.
 - **`--reset`** is optional and runs before each oracle invocation.
 
 ```bash

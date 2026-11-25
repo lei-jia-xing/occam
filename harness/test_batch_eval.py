@@ -1518,7 +1518,8 @@ class TestBatchEvalRegressions(unittest.TestCase):
                 h.write(
                     "#!/bin/sh\n"
                     "inp=$(cat)\n"
-                    "sleep 0.08\n"
+                    # Keep preflight fast and exhaust the budget on a deletion.
+                    'if [ "$(printf "%s\\n" "$inp" | grep -c "^SELECT ")" -lt 10 ]; then sleep 3; fi\n'
                     'if printf "%s" "$inp" | grep -q "999"; then\n'
                     '  echo "sqlite3: sqlite3.c:666: vdbeExec: Assertion \\`t0_budget != 0\' failed." >&2\n'
                     "  exit 134\n"
@@ -1543,7 +1544,7 @@ class TestBatchEvalRegressions(unittest.TestCase):
                     "--replays",
                     "0",
                     "--budget",
-                    "0.25",
+                    "1.5",
                     "--timeout",
                     "5.0",
                     "--local-embedded",

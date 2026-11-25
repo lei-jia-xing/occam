@@ -70,14 +70,14 @@ import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.Foldable (for_, toList)
+import Data.Foldable (for_)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.List (find, partition, sortOn)
+import Data.List (partition, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Ord (Down (..))
@@ -156,6 +156,7 @@ import Occam.Pool (
     poolMetricsStore,
     poolOracle,
     reportCandidateCount,
+    testOrderedGenerated,
     testOrderedTagged,
  )
 import Occam.Proposals (
@@ -646,8 +647,9 @@ data StatementSnapshot = StatementSnapshot
     , snapOffsets :: !(IntMap.IntMap (Int, Int))
     }
 
-buildStatementSnapshot :: ByteString -> [Statement] -> IntSet.IntSet -> StatementSnapshot
-buildStatementSnapshot baseSQL allStatements keptInts =
+buildStatementSnapshot ::
+    ByteString -> [Statement] -> IntSet.IntSet -> ByteString -> StatementSnapshot
+buildStatementSnapshot baseSQL allStatements keptInts currentSQL =
     let !sourceLength = BS.length baseSQL
         !firstStart = case allStatements of
             s : _ -> spanStartByte (stmtSpan s)
@@ -670,7 +672,6 @@ buildStatementSnapshot baseSQL allStatements keptInts =
             | otherwise = buildOffsets rest m off
 
         !offsets = buildOffsets spans IntMap.empty firstStart
-        !currentSQL = cutRemovedStatementInts baseSQL allStatements keptInts
      in StatementSnapshot currentSQL offsets
 
 renderSingletonDeletion :: StatementSnapshot -> Statement -> Maybe ByteString
@@ -1297,35 +1298,38 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                 [currentInts `IntSet.difference` statementIdsInt chunk | chunk <- chunks]
 
         trySeeds lane tag current currentInts currentLen seeds = do
-            seenProjectionsRef <- newIORef HashSet.empty
-            pull seenProjectionsRef seeds
-            where
-                batchLimit = max 64 (jobs * 16)
-                -- Pull and test eligible candidate windows incrementally.
-                pull _ [] = pure Nothing
-                pull seenProj s = collect seenProj batchLimit [] HashSet.empty s
-                collect _ _ acc _ [] = testAndContinue (reverse acc) [] Nothing
-                collect _ 0 acc _ rest = testAndContinue (reverse acc) rest Nothing
-                collect seenProj n acc seen (seedInts : rest) = do
-                    token <- classifySeed (Just seenProj) tag current currentInts currentLen seedInts
+            seenProjections <- newIORef HashSet.empty
+            pendingBytes <- newIORef HashSet.empty
+            cachedAcceptance <- newIORef Nothing
+            let next [] = pure Nothing
+                next (seed : rest) = do
+                    token <- classifySeed (Just seenProjections) tag current currentInts currentLen seed
                     case token of
-                        Nothing -> collect seenProj (n - 1) acc seen rest
-                        Just (SeedAccepted kept saved) -> testAndContinue (reverse acc) rest (Just (kept, saved))
-                        Just (SeedFresh kept count sql)
-                            | HashSet.member sql seen -> collect seenProj (n - 1) acc seen rest
-                            | otherwise ->
-                                collect seenProj (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
-                testAndContinue batch rest barrier = do
-                    accepted <- testMixedBatch currentLen batch
-                    case accepted of
-                        Just result -> pure (Just result)
-                        Nothing -> case barrier of
-                            Just (kept, saved) -> do
-                                recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
-                                pure (Just (lane, kept, saved))
-                            Nothing -> do
-                                seenProj <- newIORef HashSet.empty
-                                pull seenProj rest
+                        Nothing -> next rest
+                        Just (SeedAccepted kept saved) ->
+                            writeIORef cachedAcceptance (Just (kept, saved)) >> pure Nothing
+                        Just (SeedFresh kept count bytes) -> do
+                            pending <- readIORef pendingBytes
+                            if HashSet.member bytes pending
+                                then next rest
+                                else do
+                                    writeIORef pendingBytes (HashSet.insert bytes pending)
+                                    reportCandidateCount pool bytes count
+                                    pure (Just ((tag, bytes, kept), rest))
+                retire _ kept bytes (outcome, _) = do
+                    modifyIORef' pendingBytes (HashSet.delete bytes)
+                    recordVerdict bytes outcome
+                    pure (if outcome == OracleAccepted then Just (kept, currentLen - BS.length bytes) else Nothing)
+            tested <- testOrderedGenerated pool next retire Nothing seeds
+            accepted <- case tested of
+                Just _ -> pure tested
+                Nothing -> readIORef cachedAcceptance
+            traverse
+                ( \(kept, saved) -> do
+                    recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
+                    pure (lane, kept, saved)
+                )
+                accepted
 
         testMixedBatch _ [] = pure Nothing
         testMixedBatch currentLen batch = do
@@ -1340,7 +1344,9 @@ searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate poo
                     pure (Just (lane, kept, saved))
                 Nothing -> pure Nothing
 
-        recordRetired ((_, _, _, _, sql), (outcome, _)) =
+        recordRetired ((_, _, _, _, sql), (outcome, _)) = recordVerdict sql outcome
+
+        recordVerdict sql outcome =
             let verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
              in modifyIORef' (fbEvaluated feedback) (HashMap.insert sql verdict)
 
@@ -1495,8 +1501,6 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
     logAuditStats logger (snd outcome)
     pure outcome
     where
-        jobs = poolJobCount pool
-        batchLimit = max 64 (jobs * 16)
         -- The audit only removes whole statements, and those statements keep
         -- their original byte spans. Parse once, then track the retained set.
         loop cert baseSQL allStatements kept !keptCount passCount attemptCount removalCount
@@ -1527,76 +1531,39 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
                             )
 
         auditPass cert baseSQL allStatements kept keptCount =
-            let !initSnap = buildStatementSnapshot baseSQL allStatements kept
-             in go initSnap (snapSQL initSnap) kept keptCount allStatements 0 0
+            let !initSnap = buildStatementSnapshot baseSQL allStatements kept (renderKept baseSQL allStatements kept)
+             in go initSnap kept keptCount allStatements 0 0
             where
-                go _ _ currentKept !currentCount [] attempts removals =
-                    pure (currentKept, currentCount, attempts, removals)
-                go snap currentSQL currentKept !currentCount statements attempts removals = do
-                    let currentLen = BS.length currentSQL
-                    (testables, restStatements) <-
-                        collectBatch snap currentLen currentKept currentCount batchLimit Nothing [] statements
-                    case testables of
-                        [] -> pure (currentKept, currentCount, attempts, removals)
-                        _ -> do
-                            let candCount = currentCount - 1
-                            mapM_ (\(_, sql) -> reportCandidateCount pool sql candCount) testables
-                            outcomes <- testOrderedTagged pool [(TagStatement, sql) | (_, sql) <- testables]
-                            let retired = zip testables outcomes
-                                tested = length outcomes
-                            case listToMaybe [(s, sql) | ((s, sql), (outcome, _)) <- retired, outcome == OracleAccepted] of
-                                Just (acceptedStatement, acceptedSQL) -> do
-                                    let nextKept = IntSet.delete (unStatementId (stmtId acceptedStatement)) currentKept
-                                        nextCount = currentCount - 1
-                                        nextSnap = buildStatementSnapshot baseSQL allStatements nextKept
-                                    go
-                                        nextSnap
-                                        acceptedSQL
-                                        nextKept
-                                        nextCount
-                                        (afterStatement acceptedStatement statements)
-                                        (attempts + tested)
-                                        (removals + 1)
-                                Nothing ->
-                                    go
-                                        snap
-                                        currentSQL
-                                        currentKept
-                                        currentCount
-                                        restStatements
-                                        (attempts + tested)
-                                        removals
+                go snap currentKept !currentCount statements !attempts !removals = do
+                    (tested, accepted) <-
+                        testOrderedGenerated
+                            pool
+                            (nextCandidate snap currentKept (currentCount - 1))
+                            retire
+                            (0, Nothing)
+                            (Nothing, statements)
+                    case accepted of
+                        Nothing -> pure (currentKept, currentCount, attempts + tested, removals)
+                        Just (sid, rest, bytes) -> do
+                            let nextKept = IntSet.delete sid currentKept
+                                nextSnap = buildStatementSnapshot baseSQL allStatements nextKept bytes
+                            go nextSnap nextKept (currentCount - 1) rest (attempts + tested) (removals + 1)
 
-                collectBatch _ _ _ _ _ _ acc [] = pure (reverse acc, [])
-                collectBatch _ _ _ _ 0 _ acc rest = pure (reverse acc, rest)
-                collectBatch snap currentLen currentKept currentCount slots mLastCandidate acc (statement : rest)
-                    | IntSet.notMember (unStatementId (stmtId statement)) currentKept =
-                        collectBatch snap currentLen currentKept currentCount slots mLastCandidate acc rest
+                retire (!tested, _) (sid, rest) bytes (outcome, _) =
+                    pure (tested + 1, if outcome == OracleAccepted then Just (sid, rest, bytes) else Nothing)
+
+                nextCandidate _ _ _ (_, []) = pure Nothing
+                nextCandidate snap currentKept count (previous, statement : rest)
+                    | IntSet.notMember sid currentKept = nextCandidate snap currentKept count (previous, rest)
                     | otherwise = do
-                        (nextLast, mBytes) <- stepCandidate statement mLastCandidate
-                        case mBytes of
-                            Nothing ->
-                                collectBatch snap currentLen currentKept currentCount slots nextLast acc rest
-                            Just bytes ->
-                                collectBatch
-                                    snap
-                                    currentLen
-                                    currentKept
-                                    currentCount
-                                    (slots - 1)
-                                    nextLast
-                                    ((statement, bytes) : acc)
-                                    rest
-                    where
-                        stepCandidate stmt mLast = evalContT do
-                            let keptAfter = IntSet.delete (unStatementId (stmtId stmt)) currentKept
+                        (nextLast, candidate) <- evalContT do
+                            let keptAfter = IntSet.delete sid currentKept
                             earlyId <- liftIO $ checkEarlyRejectionIdsTracked tracker cert keptAfter
                             for_ earlyId \reason -> do
                                 liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
-                                earlyExit (mLast, Nothing)
-                            let sid = unStatementId (stmtId stmt)
-                            (bytes, nextLast) <- liftIO $ renderCandidate stmt sid keptAfter mLast
-                            when (BS.length bytes >= currentLen) do
+                                earlyExit (previous, Nothing)
+                            (bytes, nextLast) <- liftIO $ renderCandidate snap statement sid keptAfter previous
+                            when (BS.length bytes >= BS.length (snapSQL snap)) do
                                 liftIO $ recordGeneratedSkipped (poolMetricsStore pool) "nonshrinking"
                                 earlyExit (nextLast, Nothing)
                             earlyBytes <- liftIO $ checkEarlyRejectionBytesTracked tracker cert False bytes
@@ -1604,32 +1571,29 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
                                 liftIO $ recordEarlyRejectSkip (poolMetricsStore pool) reason
                                 earlyExit (nextLast, Nothing)
                             pure (nextLast, Just bytes)
-
-                        renderCandidate stmt sid keptAfter mLast = case mLast of
-                            Just (prevStmt, prevOff, prevLen, prevBytes)
-                                | Just (off, len) <- IntMap.lookup sid (snapOffsets snap)
-                                , off == prevOff + prevLen
-                                , len == prevLen
-                                , stmtRaw stmt == stmtRaw prevStmt ->
-                                    pure (prevBytes, Just (stmt, off, len, prevBytes))
-                            _ -> do
-                                rendered <- case renderSingletonDeletion snap stmt of
-                                    Just b -> pure b
-                                    Nothing ->
-                                        timeStatementBuild
-                                            (poolMetricsStore pool)
-                                            (renderKept baseSQL allStatements keptAfter)
-                                let nextLast = case IntMap.lookup sid (snapOffsets snap) of
-                                        Just (off, len) -> Just (stmt, off, len, rendered)
-                                        Nothing -> Nothing
-                                pure (rendered, nextLast)
-
-                afterStatement target = goAfter
+                        case candidate of
+                            Nothing -> nextCandidate snap currentKept count (nextLast, rest)
+                            Just bytes -> do
+                                reportCandidateCount pool bytes count
+                                pure (Just ((TagStatement, bytes, (sid, rest)), (nextLast, rest)))
                     where
-                        goAfter [] = []
-                        goAfter (s : ss)
-                            | stmtId s == stmtId target = ss
-                            | otherwise = goAfter ss
+                        sid = unStatementId (stmtId statement)
+
+                renderCandidate snap statement sid keptAfter previous =
+                    case (previous, IntMap.lookup sid (snapOffsets snap)) of
+                        (Just (prevOff, prevLen, bytes), Just (off, len))
+                            | off == prevOff + prevLen
+                            , len == prevLen
+                            , deletedBytes off len == deletedBytes prevOff prevLen ->
+                                pure (bytes, Just (off, len, bytes))
+                        (_, extent) -> do
+                            bytes <-
+                                timeStatementBuild
+                                    (poolMetricsStore pool)
+                                    (fromMaybe (renderKept baseSQL allStatements keptAfter) (renderSingletonDeletion snap statement))
+                            pure (bytes, fmap (\(off, len) -> (off, len, bytes)) extent)
+                    where
+                        deletedBytes off len = BS.take len (BS.drop off (snapSQL snap))
 
         renderKept = cutRemovedStatementInts
 
@@ -2772,7 +2736,7 @@ sweepSyntaxCategories ::
     IORef SyntaxStats ->
     ByteString ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     [ParserEditCategory] ->
     Bool ->
@@ -2785,8 +2749,8 @@ sweepSyntaxCategories context stats currentSQL units phases bundles [] shrunk
         if accepted then restart nextSQL else pure nextSQL
     | otherwise = pure currentSQL
     where
-        deferredStream buckets _ =
-            map SingleCandidate (valuesChunkEdits True (phaseCandidates EditList buckets))
+        deferredStream buckets _ ordinal =
+            map SingleCandidate (drop ordinal (valuesChunkEdits True (phaseCandidates EditList buckets)))
         restart = runSyntaxFixedPoint context stats
 sweepSyntaxCategories context stats currentSQL currentUnits phases bundles (category : rest) shrunk = do
     (batchSQL, batchUnits, batchPhases, batchBundles) <-
@@ -2904,66 +2868,52 @@ updateSyntaxSnapshot ::
     SyntaxContext ->
     ParserEditCategory ->
     [StatementUnit] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEdit ->
     ByteString ->
-    IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
-updateSyntaxSnapshot context _ _ _ _ acceptedBytes
+    IO ([StatementUnit], SyntaxIndex, [ColumnTarget])
+updateSyntaxSnapshot context _ _ _ _ _ acceptedBytes
     | syntaxFullReparse context = parseSyntaxSnapshot context acceptedBytes
-updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedBytes = do
-    let editStart = parserEditStart edit
-        editEnd = parserEditEnd edit
-        targetUnit =
-            find
-                ( \u ->
-                    let Span s e = stmtSpan (unitStatement u)
-                     in editStart >= s && editEnd <= e
-                )
-                currentUnits
-    case targetUnit of
-        Nothing -> parseSyntaxSnapshot context acceptedBytes
-        Just oldUnit
-            | hasAffectedBundleSite oldUnit ->
-                parseSyntaxSnapshot context acceptedBytes
-            | otherwise -> do
+updateSyntaxSnapshot context category currentUnits index currentBundles edit acceptedBytes =
+    case break (containsEdit edit) currentUnits of
+        (before, oldUnit : after)
+            | not (hasAffectedBundleSite oldUnit) -> do
                 singleResult <- parseSingleUnit context category oldUnit edit
                 case singleResult of
                     Nothing -> parseSyntaxSnapshot context acceptedBytes
                     Just (updatedUnit, delta) -> do
-                        let targetId = stmtId (unitStatement oldUnit)
-                            (before, targetAndAfter) =
-                                break (\u -> stmtId (unitStatement u) == targetId) currentUnits
-                            after = case targetAndAfter of
-                                _ : rest -> rest
-                                [] -> []
-                            shiftedAfter =
-                                if delta == 0
-                                    then after
-                                    else map (shiftStatementUnit delta) after
-                            freshUnits = before ++ updatedUnit : shiftedAfter
-                            shouldRun = syntaxShouldRun context
-                            beforeBuckets = map (categorizeUnitEdits shouldRun) before
-                            updatedBuckets = categorizeUnitEdits shouldRun updatedUnit
-                            afterBuckets =
-                                if delta == 0
-                                    then map (categorizeUnitEdits shouldRun) after
-                                    else map (shiftUnitBuckets delta . categorizeUnitEdits shouldRun) after
-                            freshPhases = assembleCategoryPhases (beforeBuckets ++ [updatedBuckets] ++ afterBuckets)
+                        let (freshUnits, freshIndex) = updateSyntaxUnit context index before updatedUnit after delta
                             oldEnd = spanEndByte (stmtSpan (unitStatement oldUnit))
                             freshBundles
-                                | delta == 0 || null currentBundles = currentBundles
+                                | delta == 0 = currentBundles
                                 | otherwise = map (shiftColumnTarget oldEnd delta) currentBundles
-                        pure
-                            ( freshUnits
-                            , freshPhases
-                            , freshBundles
-                            )
+                        pure (freshUnits, freshIndex, freshBundles)
+        _ -> parseSyntaxSnapshot context acceptedBytes
     where
         hasAffectedBundleSite u =
             let Span oldStart oldEnd = stmtSpan (unitStatement u)
              in any
                     (any (\site -> siteStart site >= oldStart && siteStart site < oldEnd) . targetSites)
                     currentBundles
+
+containsEdit :: ParserEdit -> StatementUnit -> Bool
+containsEdit edit unit =
+    let Span start end = stmtSpan (unitStatement unit)
+     in parserEditStart edit >= start && parserEditEnd edit <= end
+
+updateSyntaxUnit ::
+    SyntaxContext ->
+    SyntaxIndex ->
+    [StatementUnit] ->
+    StatementUnit ->
+    [StatementUnit] ->
+    Int ->
+    ([StatementUnit], SyntaxIndex)
+updateSyntaxUnit context index before unit after delta =
+    ( before ++ unit : (if delta == 0 then after else map (shiftStatementUnit delta) after)
+    , replaceIndexedUnit (length before) delta (indexUnitEdits context unit) index
+    )
 
 {- | Drop a parser-certified trailing SELECT clause. The parser certifies that
 it ends at a token boundary and cannot change the surviving query children.
@@ -2972,9 +2922,10 @@ Any enclosing edit requires recomputation even though its children survive.
 shiftTailClauseSnapshot ::
     SyntaxContext ->
     [StatementUnit] ->
+    SyntaxIndex ->
     ParserEdit ->
-    Maybe ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
-shiftTailClauseSnapshot context units edit
+    Maybe ([StatementUnit], SyntaxIndex, [ColumnTarget])
+shiftTailClauseSnapshot context units index edit
     | syntaxMode context /= ColumnOff || not (parserEditTailClause edit) = Nothing
     | otherwise = do
         (before, unit : after) <- pure (break endsAtCut units)
@@ -2992,20 +2943,8 @@ shiftTailClauseSnapshot context units edit
                     shortened =
                         statement {stmtSpan = Span start (end + delta), stmtRaw = shortenedRaw}
                     updated = unit {unitStatement = shortened, unitFacts = Just facts {factEdits = survivors}}
-                    shiftedAfter =
-                        if delta == 0
-                            then after
-                            else map (shiftStatementUnit delta) after
-                    fresh = before ++ updated : shiftedAfter
-                    shouldRun = syntaxShouldRun context
-                    beforeBuckets = map (categorizeUnitEdits shouldRun) before
-                    updatedBuckets = categorizeUnitEdits shouldRun updated
-                    afterBuckets =
-                        if delta == 0
-                            then map (categorizeUnitEdits shouldRun) after
-                            else map (shiftUnitBuckets delta . categorizeUnitEdits shouldRun) after
-                    freshPhases = assembleCategoryPhases (beforeBuckets ++ [updatedBuckets] ++ afterBuckets)
-                 in Just (fresh, freshPhases, [])
+                    (freshUnits, freshIndex) = updateSyntaxUnit context index before updated after delta
+                 in Just (freshUnits, freshIndex, [])
     where
         cutStart = parserEditStart edit
         cutEnd = parserEditEnd edit
@@ -3022,25 +2961,43 @@ follow-up replacements on the edited literal and shifts all later spans by
 @delta@. Returns 'Nothing' if any edit partially overlaps the edited span.
 -}
 shiftLiteralSnapshot ::
+    SyntaxContext ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEdit ->
-    Maybe ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
-shiftLiteralSnapshot currentUnits currentPhases currentBundles edit
+    Maybe ([StatementUnit], SyntaxIndex, [ColumnTarget])
+shiftLiteralSnapshot context currentUnits index currentBundles edit
     | parserEditCategory edit /= EditLiteral || parserEditLabel edit /= "simplify-literal" = Nothing
-    | any partialOverlap literals = Nothing
-    | otherwise = Just (freshUnits, freshPhases, freshBundles)
+    | otherwise = do
+        (before, unit : after) <- pure (break (containsEdit edit) currentUnits)
+        facts <- unitFacts unit
+        if any partialOverlap (factEdits facts)
+            then Nothing
+            else
+                let stmt = unitStatement unit
+                    Span start end = stmtSpan stmt
+                    bytes = replaceSpan (editStart - start) (editEnd - start) repl (stmtRaw stmt)
+                    updated =
+                        unit
+                            { unitStatement = stmt {stmtSpan = Span start (end + delta), stmtRaw = bytes}
+                            , unitFacts = Just facts {factEdits = updateLiterals False (factEdits facts)}
+                            }
+                    (freshUnits, freshIndex) = updateSyntaxUnit context index before updated after delta
+                    freshBundles = map (shiftColumnTarget editEnd delta) currentBundles
+                 in Just (freshUnits, freshIndex, freshBundles)
     where
         editStart = parserEditStart edit
         editEnd = parserEditEnd edit
         repl = parserEditReplacement edit
         newEnd = editStart + BS.length repl
         delta = newEnd - editEnd
-        literals = phaseCandidates EditLiteral currentPhases
         sameSpan x = parserEditStart x == editStart && parserEditEnd x == editEnd
         partialOverlap x =
-            not (sameSpan x) && parserEditStart x < editEnd && editStart < parserEditEnd x
+            parserEditCategory x == EditLiteral
+                && not (sameSpan x)
+                && parserEditStart x < editEnd
+                && editStart < parserEditEnd x
         followUps =
             let table =
                     if BS.isPrefixOf "'" repl
@@ -3056,6 +3013,7 @@ shiftLiteralSnapshot currentUnits currentPhases currentBundles edit
                 ]
         updateLiterals _ [] = []
         updateLiterals inserted (x : xs)
+            | parserEditCategory x /= EditLiteral = x : updateLiterals inserted xs
             | sameSpan x =
                 if inserted
                     then updateLiterals True xs
@@ -3063,39 +3021,15 @@ shiftLiteralSnapshot currentUnits currentPhases currentBundles edit
             | parserEditStart x >= editEnd =
                 shiftParserEdit delta x : updateLiterals inserted xs
             | otherwise = x : updateLiterals inserted xs
-        freshLiterals = updateLiterals False literals
-        freshPhases =
-            [ if cat == EditLiteral then (EditLiteral, freshLiterals) else (cat, es)
-            | (cat, es) <- currentPhases
-            ]
-        updateUnit u =
-            let stmt = unitStatement u
-                Span s e = stmtSpan stmt
-             in if editStart >= s && editEnd <= e
-                    then
-                        let newRaw = replaceSpan (editStart - s) (editEnd - s) repl (stmtRaw stmt)
-                         in u {unitStatement = stmt {stmtSpan = Span s (e + delta), stmtRaw = newRaw}}
-                    else
-                        if delta /= 0 && s > editStart
-                            then shiftStatementUnit delta u
-                            else u
-        freshUnits = map updateUnit currentUnits
-        freshBundles
-            | delta == 0 || null currentBundles = currentBundles
-            | otherwise = map (shiftColumnTarget editEnd delta) currentBundles
 
 -- | Parse a full snapshot into units, ordered edit buckets, and unblocked column bundles.
 parseSyntaxSnapshot ::
     SyntaxContext ->
     ByteString ->
-    IO ([StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+    IO ([StatementUnit], SyntaxIndex, [ColumnTarget])
 parseSyntaxSnapshot context currentSQL = do
     (_, units, columns) <-
         parseUnitsOrThrow (syntaxStore context) (syntaxOptions context) currentSQL
-    let edits =
-            concatMap
-                (filter (syntaxShouldRun context) . maybe [] factEdits . unitFacts)
-                units
     -- Record skipped metrics for blocked bundles.
     mapM_
         (maybe (pure ()) (recordGeneratedSkipped (syntaxStore context)) . targetBlocked)
@@ -3103,135 +3037,148 @@ parseSyntaxSnapshot context currentSQL = do
     -- Fold into ordered buckets once; category transitions reuse this snapshot.
     pure
         ( units
-        , groupSyntaxEdits edits
+        , buildSyntaxIndex context units
         , [target | target <- columns, isNothing (targetBlocked target)]
         )
 
-groupSyntaxEdits :: [ParserEdit] -> [(ParserEditCategory, [ParserEdit])]
-groupSyntaxEdits edits =
-    let !(cl, li, co, cn, ty, ex, lt) = go edits
-     in [ (EditClause, sortClauses cl)
-        , (EditList, li)
-        , (EditColumn, co)
-        , (EditConstraint, cn)
-        , (EditType, ty)
-        , (EditExpression, sortExpressions ex)
-        , (EditLiteral, lt)
-        ]
+-- Priority buckets preserve category ordering across statement boundaries.
+data EditBucket
+    = SafeClauses
+    | StructuralClauses
+    | FragileClauses
+    | Lists
+    | Columns
+    | Constraints
+    | Types
+    | UnwrapExpressions
+    | AggressiveExpressions
+    | Literals
+    deriving (Enum)
+
+type IndexedUnitEdits = IntMap.IntMap (Seq ParserEdit)
+
+{- | A fixed-shape tree of statement units. Branches cache edit counts for
+ordinal seeking and the sum of byte changes made below them. Unchanged
+right subtrees stay in their original coordinates after an earlier edit.
+-}
+data SyntaxIndex
+    = EmptySyntaxIndex
+    | IndexedUnit !Int !IndexedUnitEdits
+    | IndexedUnits !Int !Int !(IntMap.IntMap Int) !SyntaxIndex !SyntaxIndex
+
+indexUnitEdits :: SyntaxContext -> StatementUnit -> IndexedUnitEdits
+indexUnitEdits context unit =
+    IntMap.map (Seq.fromList . reverse) $
+        foldl' insertEdit IntMap.empty (filter (syntaxShouldRun context) edits)
     where
-        go [] = ([], [], [], [], [], [], [])
-        go (e : es) =
-            let !(cl, li, co, cn, ty, ex, lt) = go es
-             in case parserEditCategory e of
-                    EditClause -> (e : cl, li, co, cn, ty, ex, lt)
-                    EditList -> (cl, e : li, co, cn, ty, ex, lt)
-                    EditColumn -> (cl, li, e : co, cn, ty, ex, lt)
-                    EditConstraint -> (cl, li, co, e : cn, ty, ex, lt)
-                    EditType -> (cl, li, co, cn, e : ty, ex, lt)
-                    EditExpression -> (cl, li, co, cn, ty, e : ex, lt)
-                    EditLiteral -> (cl, li, co, cn, ty, ex, e : lt)
+        edits = maybe [] factEdits (unitFacts unit)
+        insertEdit buckets edit = IntMap.insertWith (++) (fromEnum (editBucket edit)) [edit] buckets
+        editBucket edit = case parserEditCategory edit of
+            EditClause -> case classifyClauseEdit edit of
+                SafeClauseEdit -> SafeClauses
+                StructuralClauseEdit -> StructuralClauses
+                FragileClauseEdit -> FragileClauses
+            EditList -> Lists
+            EditColumn -> Columns
+            EditConstraint -> Constraints
+            EditType -> Types
+            EditExpression -> case classifyExpressionEdit edit of
+                UnwrapExpressionEdit -> UnwrapExpressions
+                AggressiveExpressionEdit -> AggressiveExpressions
+            EditLiteral -> Literals
 
-        sortClauses [] = []
-        sortClauses xs =
-            let !(safe, struct, frag) = partitionClauses xs
-             in safe ++ struct ++ frag
-        partitionClauses [] = ([], [], [])
-        partitionClauses (e : es) =
-            let !(safe, struct, frag) = partitionClauses es
-             in case classifyClauseEdit e of
-                    SafeClauseEdit -> (e : safe, struct, frag)
-                    StructuralClauseEdit -> (safe, e : struct, frag)
-                    FragileClauseEdit -> (safe, struct, e : frag)
+buildSyntaxIndex :: SyntaxContext -> [StatementUnit] -> SyntaxIndex
+buildSyntaxIndex context = build . Seq.fromList
+    where
+        build units = case Seq.viewl units of
+            Seq.EmptyL -> EmptySyntaxIndex
+            unit Seq.:< rest
+                | Seq.null rest -> IndexedUnit 0 (indexUnitEdits context unit)
+                | otherwise ->
+                    let (left, right) = Seq.splitAt (Seq.length units `div` 2) units
+                     in joinSyntaxIndex (build left) (build right)
 
-        sortExpressions [] = []
-        sortExpressions xs =
-            let !(unwrap, aggr) = partitionExpressions xs
-             in unwrap ++ aggr
-        partitionExpressions [] = ([], [])
-        partitionExpressions (e : es) =
-            let !(unwrap, aggr) = partitionExpressions es
-             in case classifyExpressionEdit e of
-                    UnwrapExpressionEdit -> (e : unwrap, aggr)
-                    AggressiveExpressionEdit -> (unwrap, e : aggr)
+joinSyntaxIndex :: SyntaxIndex -> SyntaxIndex -> SyntaxIndex
+joinSyntaxIndex left right =
+    IndexedUnits
+        (indexUnitCount left + indexUnitCount right)
+        (indexDelta left + indexDelta right)
+        (IntMap.unionWith (+) (counts left) (counts right))
+        left
+        right
+    where
+        counts EmptySyntaxIndex = IntMap.empty
+        counts (IndexedUnit _ edits) = IntMap.map Seq.length edits
+        counts (IndexedUnits _ _ totals _ _) = totals
 
-data UnitBuckets = UnitBuckets
-    { ubSafeClauses :: ![ParserEdit]
-    , ubStructClauses :: ![ParserEdit]
-    , ubFragClauses :: ![ParserEdit]
-    , ubLists :: ![ParserEdit]
-    , ubColumns :: ![ParserEdit]
-    , ubConstraints :: ![ParserEdit]
-    , ubTypes :: ![ParserEdit]
-    , ubUnwrapExprs :: ![ParserEdit]
-    , ubAggrExprs :: ![ParserEdit]
-    , ubLiterals :: ![ParserEdit]
-    }
+indexUnitCount :: SyntaxIndex -> Int
+indexUnitCount EmptySyntaxIndex = 0
+indexUnitCount IndexedUnit {} = 1
+indexUnitCount (IndexedUnits count _ _ _ _) = count
 
-emptyUnitBuckets :: UnitBuckets
-emptyUnitBuckets =
-    UnitBuckets [] [] [] [] [] [] [] [] [] []
+indexDelta :: SyntaxIndex -> Int
+indexDelta EmptySyntaxIndex = 0
+indexDelta (IndexedUnit shift _) = shift
+indexDelta (IndexedUnits _ shift _ _ _) = shift
 
-addUnitEdit :: ParserEdit -> UnitBuckets -> UnitBuckets
-addUnitEdit e !ub = case parserEditCategory e of
-    EditClause -> case classifyClauseEdit e of
-        SafeClauseEdit -> ub {ubSafeClauses = e : ubSafeClauses ub}
-        StructuralClauseEdit -> ub {ubStructClauses = e : ubStructClauses ub}
-        FragileClauseEdit -> ub {ubFragClauses = e : ubFragClauses ub}
-    EditList -> ub {ubLists = e : ubLists ub}
-    EditColumn -> ub {ubColumns = e : ubColumns ub}
-    EditConstraint -> ub {ubConstraints = e : ubConstraints ub}
-    EditType -> ub {ubTypes = e : ubTypes ub}
-    EditExpression -> case classifyExpressionEdit e of
-        UnwrapExpressionEdit -> ub {ubUnwrapExprs = e : ubUnwrapExprs ub}
-        AggressiveExpressionEdit -> ub {ubAggrExprs = e : ubAggrExprs ub}
-    EditLiteral -> ub {ubLiterals = e : ubLiterals ub}
+replaceIndexedUnit :: Int -> Int -> IndexedUnitEdits -> SyntaxIndex -> SyntaxIndex
+replaceIndexedUnit unitOrdinal delta edits = update unitOrdinal 0
+    where
+        update _ _ EmptySyntaxIndex = EmptySyntaxIndex
+        update _ prefix (IndexedUnit previous _) =
+            let local
+                    | prefix == 0 = edits
+                    | otherwise = IntMap.map (fmap (shiftParserEdit (negate prefix))) edits
+             in IndexedUnit (previous + delta) local
+        update position prefix (IndexedUnits _ _ _ left right)
+            | position < leftCount =
+                joinSyntaxIndex (update position prefix left) right
+            | otherwise =
+                joinSyntaxIndex left (update (position - leftCount) (prefix + indexDelta left) right)
+            where
+                leftCount = indexUnitCount left
 
-categorizeUnitEdits :: (ParserEdit -> Bool) -> StatementUnit -> UnitBuckets
-categorizeUnitEdits shouldRun unit =
-    let edits = filter shouldRun (maybe [] factEdits (unitFacts unit))
-     in foldr addUnitEdit emptyUnitBuckets edits
+phaseCandidatesFrom :: ParserEditCategory -> SyntaxIndex -> Int -> [ParserEdit]
+phaseCandidatesFrom category index = visitBuckets (phaseBuckets category)
+    where
+        phaseBuckets EditClause = [SafeClauses, StructuralClauses, FragileClauses]
+        phaseBuckets EditList = [Lists]
+        phaseBuckets EditColumn = [Columns]
+        phaseBuckets EditConstraint = [Constraints]
+        phaseBuckets EditType = [Types]
+        phaseBuckets EditExpression = [UnwrapExpressions, AggressiveExpressions]
+        phaseBuckets EditLiteral = [Literals]
 
-shiftUnitBuckets :: Int -> UnitBuckets -> UnitBuckets
-shiftUnitBuckets 0 ub = ub
-shiftUnitBuckets delta ub =
-    UnitBuckets
-        { ubSafeClauses = map (shiftParserEdit delta) (ubSafeClauses ub)
-        , ubStructClauses = map (shiftParserEdit delta) (ubStructClauses ub)
-        , ubFragClauses = map (shiftParserEdit delta) (ubFragClauses ub)
-        , ubLists = map (shiftParserEdit delta) (ubLists ub)
-        , ubColumns = map (shiftParserEdit delta) (ubColumns ub)
-        , ubConstraints = map (shiftParserEdit delta) (ubConstraints ub)
-        , ubTypes = map (shiftParserEdit delta) (ubTypes ub)
-        , ubUnwrapExprs = map (shiftParserEdit delta) (ubUnwrapExprs ub)
-        , ubAggrExprs = map (shiftParserEdit delta) (ubAggrExprs ub)
-        , ubLiterals = map (shiftParserEdit delta) (ubLiterals ub)
-        }
+        visitBuckets [] _ = []
+        visitBuckets (bucket : rest) ordinal
+            | ordinal >= count = visitBuckets rest (ordinal - count)
+            | otherwise = visit key ordinal 0 index (visitBuckets rest 0)
+            where
+                key = fromEnum bucket
+                count = bucketCount key index
 
-assembleCategoryPhases :: [UnitBuckets] -> [(ParserEditCategory, [ParserEdit])]
-assembleCategoryPhases buckets =
-    [
-        ( EditClause
-        , concatMap ubSafeClauses buckets
-            ++ concatMap ubStructClauses buckets
-            ++ concatMap ubFragClauses buckets
-        )
-    , (EditList, concatMap ubLists buckets)
-    , (EditColumn, concatMap ubColumns buckets)
-    , (EditConstraint, concatMap ubConstraints buckets)
-    , (EditType, concatMap ubTypes buckets)
-    , (EditExpression, concatMap ubUnwrapExprs buckets ++ concatMap ubAggrExprs buckets)
-    , (EditLiteral, concatMap ubLiterals buckets)
-    ]
+        bucketCount _ EmptySyntaxIndex = 0
+        bucketCount key (IndexedUnit _ edits) = maybe 0 Seq.length (IntMap.lookup key edits)
+        bucketCount key (IndexedUnits _ _ totals _ _) = IntMap.findWithDefault 0 key totals
 
-newtype IndexedCandidates = IndexedCandidates (Seq SyntaxCandidate)
+        visit _ _ _ EmptySyntaxIndex rest = rest
+        visit key ordinal shift (IndexedUnit _ edits) rest =
+            case IntMap.lookup key edits of
+                Nothing -> rest
+                Just bucket ->
+                    foldr
+                        (\edit -> (:) (if shift == 0 then edit else shiftParserEdit shift edit))
+                        rest
+                        (Seq.drop ordinal bucket)
+        visit key ordinal shift (IndexedUnits _ _ _ left right) rest
+            | ordinal >= leftCount = visit key (ordinal - leftCount) rightShift right rest
+            | otherwise = visit key ordinal shift left (visit key 0 rightShift right rest)
+            where
+                leftCount = bucketCount key left
+                rightShift = shift + indexDelta left
 
-indexCandidates :: [SyntaxCandidate] -> IndexedCandidates
-indexCandidates = IndexedCandidates . Seq.fromList
-
-sliceCandidatesFrom :: Int -> IndexedCandidates -> [SyntaxCandidate]
-sliceCandidatesFrom !n (IndexedCandidates s)
-    | n <= 0 = toList s
-    | otherwise = toList (Seq.drop n s)
+phaseCandidates :: ParserEditCategory -> SyntaxIndex -> [ParserEdit]
+phaseCandidates category index = phaseCandidatesFrom category index 0
 
 {- | Try literal batches before the regular single-edit sweep. A rejection of
 a batch leaves its smaller partitions and the single-edit sweep eligible.
@@ -3241,9 +3188,9 @@ exhaustLiteralBatches ::
     IORef SyntaxStats ->
     ByteString ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
-    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+    IO (ByteString, [StatementUnit], SyntaxIndex, [ColumnTarget])
 exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: Int) candidates
     where
         literals = phaseCandidates EditLiteral phases
@@ -3258,8 +3205,7 @@ exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: In
         search _ _ [] = pure (sql, units, phases, bundles)
         search ordinal misses remaining = do
             let (eligible, deferred) = splitAt misses remaining
-            (window, nextOrdinal, rest) <- fillSyntaxWindow context units sql ordinal eligible
-            (tested, elapsed, accepted) <- testSyntaxWindow context (length units) window
+            (tested, elapsed, accepted) <- testSyntaxCandidates context units sql ordinal eligible
             modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
             case accepted of
                 Just (_, SingleCandidate edit, bytes) -> do
@@ -3271,9 +3217,9 @@ exhaustLiteralBatches context stats sql units phases bundles = search 0 (8 :: In
                         , ("bytes_after", toJSON (BS.length bytes))
                         ]
                     (nextUnits, nextPhases, nextBundles) <-
-                        updateSyntaxSnapshot context EditLiteral units bundles edit bytes
+                        updateSyntaxSnapshot context EditLiteral units phases bundles edit bytes
                     exhaustLiteralBatches context stats bytes nextUnits nextPhases nextBundles
-                _ -> search nextOrdinal (misses - tested) (rest ++ deferred)
+                _ -> search (ordinal + length eligible) (misses - tested) deferred
 
 {- | Group equal replacements while retaining order within each group. This
 keeps edits to result-bearing literals from blocking batches of noise values.
@@ -3401,10 +3347,10 @@ exhaustIndependentAstBatches ::
     IORef SyntaxStats ->
     ByteString ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEditCategory ->
-    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget])
+    IO (ByteString, [StatementUnit], SyntaxIndex, [ColumnTarget])
 exhaustIndependentAstBatches context stats initSQL initUnits initPhases initBundles category =
     go initSQL initUnits initPhases initBundles HashSet.empty
     where
@@ -3437,7 +3383,7 @@ exhaustIndependentAstBatches context stats initSQL initUnits initPhases initBund
                         Just (_, _, bytes) -> do
                             logAcceptedSyntaxEdit context candidate sql bytes
                             (nextUnits, nextPhases, nextBundles) <- case singleUnitPatch sql units batch of
-                                Just patch -> updateSyntaxSnapshot context category units bundles patch bytes
+                                Just patch -> updateSyntaxSnapshot context category units phases bundles patch bytes
                                 Nothing -> parseSyntaxSnapshot context bytes
                             go bytes nextUnits nextPhases nextBundles seenRejected
                         Nothing ->
@@ -3468,10 +3414,10 @@ exhaustSyntaxCategory ::
     IORef SyntaxStats ->
     ByteString ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEditCategory ->
-    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
+    IO (ByteString, [StatementUnit], SyntaxIndex, [ColumnTarget], Bool)
 exhaustSyntaxCategory context stats sql units phases bundles category =
     exhaustSyntaxStream
         context
@@ -3488,11 +3434,11 @@ exhaustSyntaxStream ::
     IORef SyntaxStats ->
     ByteString ->
     [StatementUnit] ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEditCategory ->
-    ([(ParserEditCategory, [ParserEdit])] -> [ColumnTarget] -> [SyntaxCandidate]) ->
-    IO (ByteString, [StatementUnit], [(ParserEditCategory, [ParserEdit])], [ColumnTarget], Bool)
+    (SyntaxIndex -> [ColumnTarget] -> Int -> [SyntaxCandidate]) ->
+    IO (ByteString, [StatementUnit], SyntaxIndex, [ColumnTarget], Bool)
 exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category stream =
     sweep
         False
@@ -3501,46 +3447,41 @@ exhaustSyntaxStream context stats sourceSQL sourceUnits phases bundles category 
         sourceUnits
         phases
         bundles
-        (stream phases bundles)
+        (stream phases bundles 0)
     where
         sweep changed _ currentSQL currentUnits currentPhases currentBundles [] =
             pure (currentSQL, currentUnits, currentPhases, currentBundles, changed)
         sweep changed ordinal currentSQL currentUnits currentPhases currentBundles candidates = do
-            (windowTasks, nextOrdinal, rest) <-
-                fillSyntaxWindow context currentUnits currentSQL ordinal candidates
-            if null windowTasks
-                then sweep changed nextOrdinal currentSQL currentUnits currentPhases currentBundles rest
-                else do
-                    (tested, elapsed, accepted) <- testSyntaxWindow context (length currentUnits) windowTasks
-                    modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
-                    case accepted of
-                        Just (acceptedOrdinal, candidate, acceptedBytes) -> do
-                            logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
-                            (freshUnits, freshPhases, freshBundles) <- case candidate of
-                                SingleCandidate edit
-                                    | not (syntaxFullReparse context)
-                                    , category == EditClause
-                                    , Just shifted <- shiftTailClauseSnapshot context currentUnits edit ->
-                                        pure shifted
-                                    | not (syntaxFullReparse context)
-                                    , category == EditLiteral
-                                    , Just shifted <- shiftLiteralSnapshot currentUnits currentPhases currentBundles edit ->
-                                        pure shifted
-                                    | category /= EditColumn ->
-                                        updateSyntaxSnapshot context category currentUnits currentBundles edit acceptedBytes
-                                _ -> parseSyntaxSnapshot context acceptedBytes
-                            let freshCandidates =
-                                    sliceCandidatesFrom acceptedOrdinal (indexCandidates (stream freshPhases freshBundles))
-                            sweep
-                                True
-                                acceptedOrdinal
-                                acceptedBytes
-                                freshUnits
-                                freshPhases
-                                freshBundles
-                                freshCandidates
-                        Nothing ->
-                            sweep changed nextOrdinal currentSQL currentUnits currentPhases currentBundles rest
+            (tested, elapsed, accepted) <-
+                testSyntaxCandidates context currentUnits currentSQL ordinal candidates
+            modifyIORef' stats (recordSyntaxTest tested elapsed accepted)
+            case accepted of
+                Just (acceptedOrdinal, candidate, acceptedBytes) -> do
+                    logAcceptedSyntaxEdit context candidate currentSQL acceptedBytes
+                    (freshUnits, freshPhases, freshBundles) <- case candidate of
+                        SingleCandidate edit
+                            | not (syntaxFullReparse context)
+                            , category == EditClause
+                            , Just shifted <- shiftTailClauseSnapshot context currentUnits currentPhases edit ->
+                                pure shifted
+                            | not (syntaxFullReparse context)
+                            , category == EditLiteral
+                            , Just shifted <- shiftLiteralSnapshot context currentUnits currentPhases currentBundles edit ->
+                                pure shifted
+                            | category /= EditColumn ->
+                                updateSyntaxSnapshot context category currentUnits currentPhases currentBundles edit acceptedBytes
+                        _ -> parseSyntaxSnapshot context acceptedBytes
+                    let freshCandidates =
+                            stream freshPhases freshBundles acceptedOrdinal
+                    sweep
+                        True
+                        acceptedOrdinal
+                        acceptedBytes
+                        freshUnits
+                        freshPhases
+                        freshBundles
+                        freshCandidates
+                Nothing -> pure (currentSQL, currentUnits, currentPhases, currentBundles, changed)
 
 -- | Run one window of candidates and return the first accepted candidate.
 testSyntaxWindow ::
@@ -3578,16 +3519,18 @@ recordSyntaxTest tested elapsed accepted stats =
 -- | Initial candidate stream for the given syntax category.
 initialSyntaxStream ::
     SyntaxContext ->
-    [(ParserEditCategory, [ParserEdit])] ->
+    SyntaxIndex ->
     [ColumnTarget] ->
     ParserEditCategory ->
+    Int ->
     [SyntaxCandidate]
-initialSyntaxStream context phases bundles category
+initialSyntaxStream context phases bundles category ordinal
     | category == EditColumn && syntaxMode context == ColumnAtomic =
-        map BundleCandidate bundles ++ map SingleCandidate (phaseCandidates category phases)
+        map BundleCandidate (drop ordinal bundles)
+            ++ map SingleCandidate (phaseCandidatesFrom category phases (max 0 (ordinal - length bundles)))
     | category == EditList && syntaxAdaptiveValues context =
-        map SingleCandidate (valuesChunkEdits False (phaseCandidates category phases))
-    | otherwise = map SingleCandidate (phaseCandidates category phases)
+        map SingleCandidate (drop ordinal (valuesChunkEdits False (phaseCandidates category phases)))
+    | otherwise = map SingleCandidate (phaseCandidatesFrom category phases ordinal)
 
 -- The frontend emits each VALUES list's chunks coarse-to-fine, then singles.
 -- Leave its coarse pair in the regular sweep and revisit the finer candidates
@@ -3604,27 +3547,34 @@ valuesChunkEdits deferred edits@(edit : rest)
     where
         isChunk candidate = parserEditLabel candidate == "remove-values_row-chunk"
 
-phaseCandidates :: ParserEditCategory -> [(ParserEditCategory, [ParserEdit])] -> [ParserEdit]
-phaseCandidates category = fromMaybe [] . lookup category
-
--- | Fill one oracle window, skipping non-shrinking and early-certified-rejected candidates.
-fillSyntaxWindow ::
+-- | Build and execute eligible syntax candidates as the ordered pool asks for them.
+testSyntaxCandidates ::
     SyntaxContext ->
     [StatementUnit] ->
     ByteString ->
     Int ->
     [SyntaxCandidate] ->
-    IO ([(Int, SyntaxCandidate, ByteString)], Int, [SyntaxCandidate])
-fillSyntaxWindow context currentUnits currentSQL startOrdinal =
-    let batchLimit = max 64 (poolJobCount (syntaxPool context) * 16)
-     in fill batchLimit startOrdinal []
+    IO (Int, Word64, Maybe (Int, SyntaxCandidate, ByteString))
+testSyntaxCandidates context currentUnits currentSQL startOrdinal candidates = do
+    started <- getMonotonicTimeNSec
+    (tested, accepted) <-
+        testOrderedGenerated pool nextCandidate retire (0, Nothing) (startOrdinal, candidates)
+    finished <- getMonotonicTimeNSec
+    pure (tested, finished - started, accepted)
     where
-        fill _ ordinal acc [] = pure (reverse acc, ordinal, [])
-        fill 0 ordinal acc rest = pure (reverse acc, ordinal, rest)
-        fill remaining ordinal acc (candidate : rest) = do
+        pool = syntaxPool context
+        currentCount = length currentUnits
+        nextCandidate (_, []) = pure Nothing
+        nextCandidate (ordinal, candidate : rest) = do
+            let next = (ordinal + 1, rest)
             stepCandidate candidate >>= \case
-                Nothing -> fill remaining (ordinal + 1) acc rest
-                Just bytes -> fill (remaining - 1) (ordinal + 1) ((ordinal, candidate, bytes) : acc) rest
+                Nothing -> nextCandidate next
+                Just bytes -> do
+                    reportCandidateCount pool bytes currentCount
+                    pure (Just ((candidateTag candidate, bytes, (ordinal, candidate)), next))
+
+        retire (!tested, _) (ordinal, candidate) bytes (outcome, _) =
+            pure (tested + 1, if outcome == OracleAccepted then Just (ordinal, candidate, bytes) else Nothing)
 
         stepCandidate candidate = evalContT do
             earlyEdit <- liftIO $ case candidate of
@@ -3722,7 +3672,7 @@ logSyntaxStats logger finalStats =
                     "Syntax rewrites accepted"
                     [ ("accepted_edits", toJSON accepted)
                     , ("attempts", toJSON (syntaxAttempts finalStats))
-                    , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                    , ("window_seconds", toJSON (seconds (syntaxElapsed finalStats)))
                     ]
             else
                 logDebug'
@@ -3730,7 +3680,7 @@ logSyntaxStats logger finalStats =
                     "reducer"
                     "Syntax replacement completed with no accepted edits"
                     [ ("attempts", toJSON (syntaxAttempts finalStats))
-                    , ("oracle_seconds", toJSON (seconds (syntaxElapsed finalStats)))
+                    , ("window_seconds", toJSON (seconds (syntaxElapsed finalStats)))
                     ]
 
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString

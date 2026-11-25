@@ -58,8 +58,8 @@ All stages provide **local minimality guarantees**, not a global minimum.
 
 ## 2. Ordered Scheduler & Caching (`src/Occam/Pool.hs`, `src/Occam/Cache.hs`)
 
-- A single ordered scheduler serves every search phase under a hard `--jobs N` concurrency cap (default `1`; the same scheduler runs at `N = 1`).
-- Candidates are tested in decision order in bounded windows: cache entries and execution permits are reserved in order before forking, so lookahead never steals a permit from an earlier candidate.
+- Every search phase uses ordered retirement under the `--jobs N` concurrency cap, which defaults to one. The audit and syntax sweeps build candidate SQL as slots become available.
+- The scheduler reserves cache entries and execution permits in candidate order before forking. Native probes start the next window with one slot after two consecutive acceptances and restore full lookahead on the first rejection.
 - Retirement commits the earliest acceptance, surfaces the earliest inconclusive result or budget denial, then cancels and reaps losers. Completed-but-unselected physical work remains billed; killed tasks are counted as cancelled.
 - When a launched candidate has already published a decisive result, the scheduler leaves later slots empty while it retires the earlier candidates in order.
 - Progress, curve, and checkpoint updates occur only at ordered retirement, and every window drains fully before reparse, phase transition, or serial final validation.
@@ -95,10 +95,10 @@ All stages provide **local minimality guarantees**, not a global minimum.
 ### In-Process Result Oracle (`--result-oracle`)
 
 - Available with `--dialect sqlite` or `--dialect duckdb`; replaces both `--oracle` and `--reset`.
-- Runs each complete candidate in a fresh in-memory database inside Occam's process (with external data access restricted) and preserves the **last result set** produced by the original script: ordered rows, column names, and value types.
+- Evaluates the complete candidate in isolated in-memory state with external data access restricted. It preserves the **last result set** produced by the original script, including ordered rows, column names, and value types. Reduction may reuse an exact deterministic prefix under the same result contract. Each final validation starts with a fresh database and executes the entire SQL without replay.
 - Trailing statements after the last result set must still execute without error. Zero-row results still compare column names; scripts without any result set cannot seed a contract. Use deterministic queries and `ORDER BY` to fix row order.
-- SQLite starts with foreign keys disabled (matching the reducer's session model); scripts can enable them via `PRAGMA foreign_keys = ON`.
-- DuckDB loads its native shared library dynamically (`OCCAM_DUCKDB_LIB` if not on the standard library path) and reports unsupported types in the compared result set (earlier ignored result sets may contain other types).
+- SQLite starts with foreign keys disabled (matching the reducer's session model). Scripts can enable them via `PRAGMA foreign_keys = ON`. A probe shares one deadline across execution and checkpoint work.
+- DuckDB loads its native shared library dynamically (`OCCAM_DUCKDB_LIB` if not on the standard library path). Decimal results compare exact values, precision, and scale. DuckDB reports unsupported types in the compared result set. Earlier ignored result sets may contain other types.
 
 ---
 

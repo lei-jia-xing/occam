@@ -18,7 +18,7 @@ import Data.Text qualified as T
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam qualified
-import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
+import Occam.AtomicFile (writeAtomicBytes, writeAtomicBytesWithPermissionsOf, writeAtomicLazyBytes)
 import Occam.Certificate (newFailingPrefixCache)
 import Occam.Core (SessionInit)
 import Occam.Evaluation (
@@ -32,7 +32,7 @@ import Occam.Evaluation (
     Stats (..),
     metricPolicyForReduction,
     parseSQLDialect,
-    runEvaluationRequestWithNativeObserver,
+    runEvaluationRequestWithNativeValidation,
     runEvaluationRequestWithObserver,
     sqlDialectName,
  )
@@ -46,6 +46,7 @@ import Occam.Logger (
     logWarn,
     withLogger,
  )
+import Occam.Metrics (MetricPolicy (..))
 import Occam.Oracle (
     OracleObservationDetails (..),
     observeExternalOracleDetailedWithContext,
@@ -54,7 +55,7 @@ import Occam.Oracle (
     shellOracleConfig,
     withCandidateWorkdir,
  )
-import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTraceAndFailures)
+import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithValidation)
 import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
@@ -990,10 +991,10 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             then Just <$> newFailingPrefixCache
             else pure Nothing
     let totalBudgetMicros = round . (* 1000000) <$> valBudgetSecs :: Maybe Integer
-    (initialStart, initialEnd, preflightDetails, observer, preflightMicros) <-
+    (initialStart, initialEnd, preflightDetails, observer, validate, preflightMicros) <-
         runPreflight totalBudgetMicros $ case oracleCmd of
             Nothing ->
-                prepareResultOracleWithTraceAndFailures
+                prepareResultOracleWithValidation
                     needTraces
                     failPrefixCache
                     rememberTrace
@@ -1007,7 +1008,8 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
                 case prepared of
                     Left err -> pure (Left err)
                     Right details ->
-                        pure (Right (details, \started -> observeExternalOracleDetailedWithContext started config context))
+                        let observe started = observeExternalOracleDetailedWithContext started config context
+                         in pure (Right (details, observe, observe))
     let budgetConfig =
             configuredBudget
                 { evaluationPreflightMicros = preflightMicros
@@ -1029,14 +1031,15 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
             "cli"
             "running with --jobs > 1 without --reset may lead to shared database state contamination"
 
-    metricsPolicy <- case valStrategy of
-        StrategyFull -> case metricPolicyForReduction reductionConfig valJobs of
+    metricsPolicy <- case (valStatsFile, valStrategy) of
+        (Nothing, _) -> pure Nothing
+        (Just _, StrategyFull) -> case metricPolicyForReduction reductionConfig valJobs of
             Left err -> do
                 logError logger "cli" err
                 exitCliError
             Right pol -> pure (Just pol)
-        StrategyDdminOnly -> pure Nothing
-        StrategyAuditOnly -> pure Nothing
+        (Just _, strategy) ->
+            pure (Just (MetricPolicy (strategyName strategy) (columnModeName ColumnOff) valJobs))
 
     let reductionAction reporter reducerLogger pool = case valStrategy of
             StrategyFull -> do
@@ -1081,11 +1084,9 @@ runOccamWithLogger logger useColor ValidatedOptions {..} = do
         withCandidateWorkdir $ \_ -> do
             let checkpointPath = ""
                 runEvaluation
-                    | isNothing oracleCmd = runEvaluationRequestWithNativeObserver
-                    | otherwise = runEvaluationRequestWithObserver
+                    | isNothing oracleCmd = runEvaluationRequestWithNativeValidation timeoutMicros observer validate
+                    | otherwise = runEvaluationRequestWithObserver timeoutMicros observer
             runEvaluation
-                timeoutMicros
-                observer
                 EvaluationRequest
                     { requestOnProgress = uiOnProgress ui
                     , requestMetricsPolicy = metricsPolicy
@@ -1289,13 +1290,13 @@ buildBudgetConfig cacheEnabled jobs budgetSecs maxExecutions initialStmts =
 
 runPreflight ::
     Maybe Integer ->
-    IO (Either Text (OracleObservationDetails, EvaluationObserver)) ->
-    IO (UTCTime, UTCTime, OracleObservationDetails, EvaluationObserver, Int)
+    IO (Either Text (OracleObservationDetails, EvaluationObserver, EvaluationObserver)) ->
+    IO (UTCTime, UTCTime, OracleObservationDetails, EvaluationObserver, EvaluationObserver, Int)
 runPreflight totalBudgetMicros prepare = do
     initialStart <- getCurrentTime
     preflightStart <- toInteger <$> getMonotonicTimeNSec
     prepared <- runWithinBudget preflightStart totalBudgetMicros prepare
-    (details, observer) <- case prepared of
+    (details, observer, validate) <- case prepared of
         Nothing -> do
             hPutStrLn stderr "error: initial predicate check exceeded the total budget"
             exitTimeout
@@ -1308,7 +1309,7 @@ runPreflight totalBudgetMicros prepare = do
     let micros =
             fromInteger
                 (min (toInteger (maxBound :: Int)) (max 0 ((preflightEnd - preflightStart) `div` 1000)))
-    pure (initialStart, initialEnd, details, observer, micros)
+    pure (initialStart, initialEnd, details, observer, validate, micros)
 
 resolveOutputTargets ::
     FilePath ->
@@ -1344,9 +1345,11 @@ writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath s
         hPutStrLn stderr ("error: " ++ msg)
 
     unless (writeToStdout || not canWriteOutput) do
-        when (inPlace && inputFile /= "-") do
-            writeAtomicFile (inputFile ++ ".bak") initialSQL
-        writeAtomicFile targetMinimalPath reducedSQL
+        if inPlace
+            then do
+                writeAtomicBytesWithPermissionsOf inputFile (inputFile ++ ".bak") initialSQL
+                writeAtomicBytesWithPermissionsOf inputFile targetMinimalPath reducedSQL
+            else writeAtomicFile targetMinimalPath reducedSQL
 
     unless (null statsPath) do
         writeAtomicLazy statsPath (encode stats)

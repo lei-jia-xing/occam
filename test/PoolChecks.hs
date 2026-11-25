@@ -31,6 +31,7 @@ import Data.Map.Strict qualified as Map
 import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleInconclusiveError, OracleOutcome (..))
+import Occam.Metrics (FamilyTag (TagUnknown))
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails, OracleReapFailed (..))
 import Occam.Pool (
     ExecutionBudgetReached (..),
@@ -44,6 +45,8 @@ import Occam.Pool (
     poolCancelled,
     poolLiveWorkers,
     testOrdered,
+    testOrderedGenerated,
+    withAdaptiveLookahead,
  )
 import System.Exit (ExitCode (..))
 import System.Timeout (timeout)
@@ -232,6 +235,25 @@ tests =
             case result of
                 Nothing -> assertFailure "ordered window forced the unbounded tail"
                 Just outcomes -> assertEqual "decision stops at the head" [OracleAccepted] (map fst outcomes)
+        , testCase "adaptive lookahead pulls one SQL candidate after consecutive acceptances" $ do
+            let execute candidate = pure (if candidate == "reject" then rejectDetails else acceptDetails)
+                collect results payload _ (outcome, _) = pure ((payload, outcome) : results)
+                next False = pure (Just ((TagUnknown, "generated", "head" :: String), True))
+                next True = assertFailure "a serial accept must leave the generator's tail untouched"
+            pool <-
+                testPool 4 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
+                    >>= withAdaptiveLookahead
+            _ <- testOrdered pool ["warm-1"]
+            _ <- testOrdered pool ["warm-2"]
+            retired <- testOrderedGenerated pool next collect [] False
+            assertEqual "retirement carries the producer's payload" [("head", OracleAccepted)] retired
+            attempts <- poolAttempts pool
+            assertEqual "two warmups and one generated probe" 3 attempts
+            widened <- testOrdered pool ["reject", "next"]
+            assertEqual
+                "head rejection resumes the scan in order"
+                [OracleRejected, OracleAccepted]
+                (map fst widened)
         , testCase "concurrent windows serialize on the shared gate" $ do
             let execute _ = pure rejectDetails
             pool <- testPool 2 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())

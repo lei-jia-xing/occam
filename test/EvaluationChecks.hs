@@ -23,6 +23,7 @@ import Occam.Evaluation (
     parseSQLDialect,
     runEvaluatedReduction,
     runEvaluationRequest,
+    runEvaluationRequestWithNativeValidation,
     sqlDialectName,
  )
 import Occam.Facts (ParserEditCategory (..))
@@ -34,12 +35,13 @@ import Occam.Metrics (
  )
 import Occam.Oracle (
     OracleConfig (..),
+    OracleObservation (..),
     OracleObservationDetails (..),
     prepareOracle,
     shellOracleConfig,
  )
 import Occam.Parser (SQLDialect (..), countStatements, dialectCode, dialectName)
-import Occam.Pool (poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
+import Occam.Pool (observationDetails, poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
     ReductionEvidence (..),
@@ -48,6 +50,7 @@ import Occam.Reducer (
     reduceSQLWithConfig,
  )
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
+import System.Exit (ExitCode (..))
 import System.IO (hClose, openTempFile)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
@@ -94,6 +97,42 @@ tests =
                 (sum (Map.elems (evaluationValidationOutcomes metrics)))
             assertBool "reset process time is reported separately" (evaluationResetSeconds metrics > 0)
             assertBool "validation reset time is separate" (evaluationValidationResetSeconds metrics > 0)
+        , testCase "native validation uses the independent observer for both final probes" $ do
+            let initial = "SELECT 1; SELECT 2;"
+                candidate = "SELECT 2;"
+                observe started _ = started >> pure (observationDetails (OracleFinished ExitSuccess))
+                validate started _ = started >> pure (observationDetails (OracleFinished (ExitFailure 1)))
+            result <-
+                runEvaluationRequestWithNativeValidation 500000 observe validate $
+                    EvaluationRequest
+                        { requestOnProgress = const (pure ())
+                        , requestMetricsPolicy = Nothing
+                        , requestConfig = evaluationConfig True Nothing (Just 3)
+                        , requestDialect = SQLite
+                        , requestOracleConfig = ()
+                        , requestPreflightObservation = Just (OracleFinished ExitSuccess)
+                        , requestLogger = nullLogger
+                        , requestInitialSQL = initial
+                        , requestCheckpoint = ""
+                        , requestCollectCurve = False
+                        , requestAction = \_ _ pool -> do
+                            outcome <- poolOracle pool candidate
+                            assertEqual "reduction accepts its candidate" OracleAccepted outcome
+                            pure (ReductionActionResult candidate (Just (ReductionEvidence candidate True)))
+                        }
+            let metrics = evaluationMetrics result
+            assertEqual
+                "validation bypasses the cached acceptance"
+                EvaluationValidationFailed
+                (evaluationStatus metrics)
+            assertEqual
+                "both validations executed independently"
+                2
+                (evaluationValidationDatabaseObservations metrics)
+            assertEqual
+                "rejected validation suppresses minimality"
+                MinimalityNotEstablished
+                (evaluationMinimalityClaim metrics)
         , testCase "coarse-to-fine search checkpoints a structural edit within finite budget" $ do
             let initial = "INSERT INTO t VALUES (123456);\nSELECT x FROM t WHERE x = 42;\n"
                 candidate = "INSERT INTO t VALUES (123456);\nSELECT x FROM t;\n"

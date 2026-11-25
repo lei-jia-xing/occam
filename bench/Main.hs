@@ -1,12 +1,13 @@
 module Main (main) where
 
 import Control.Exception (IOException, catch)
-import Control.Monad (forM_, unless)
+import Control.Monad (forM, forM_, unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.List (intercalate, stripPrefix)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Occam.Cache (
@@ -14,6 +15,8 @@ import Occam.Cache (
     cacheCompleteInflight,
     cacheInstallInflight,
     cacheLookup,
+    cacheLookupKey,
+    makeKey,
     newCache,
  )
 import Occam.Core (
@@ -24,35 +27,51 @@ import Occam.Core (
     StatementId (..),
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
+import Occam.Evaluation (
+    EvaluationConfig (..),
+    EvaluationMetrics (..),
+    EvaluationRequest (..),
+    EvaluationResult (..),
+    EvaluationStatus (..),
+    MinimalityClaim (..),
+    ReductionActionResult (..),
+    runEvaluationRequestWithNativeValidation,
+ )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Logger (nullLogger)
-import Occam.Metrics (ParseKind (..))
-import Occam.Oracle (OracleObservation (..))
+import Occam.Metrics (MetricPolicy (..), ParseKind (..))
+import Occam.Oracle (OracleObservation (..), OracleObservationDetails (..))
 import Occam.Oracle.DuckDB (
     DuckDBContract,
     duckdbContractOracle,
     generateDuckDBContract,
     isDuckDBAvailable,
  )
+import Occam.Oracle.Inline (prepareResultOracleWithValidation)
 import Occam.Oracle.Sqlite (SqliteContract, generateSqliteContract, sqliteContractOracle)
 import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
     SQLDialect (..),
     defaultParseOptions,
+    nativeOracleCacheKey,
     parseSQLTimed,
  )
-import Occam.Pool (withPredicatePool)
+import Occam.Pool (poolMetricsStore, withPredicatePool)
 import Occam.Reducer (
+    AuditStats (..),
     ReductionConfig (..),
+    ReductionEvidence (..),
     ReductionResult (..),
     closeSet,
     cutRemovedStatementIds,
     defaultReductionConfig,
+    parseStatementsFast,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
     replaceSpan,
     statementAuditWithLogger,
+    statementAuditWithParser,
  )
 import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
@@ -129,6 +148,69 @@ genScale n =
                 [ "(" ++ show i ++ ", " ++ show ((i * 7) `mod` n + 1) ++ ", 't" ++ show (i `mod` 5) ++ "')"
                 | i <- [1 .. n]
                 ]
+
+{- | Audit workloads that respectively accept every early deletion and
+reject every deletion. The latter includes wide trivia in the source spans.
+-}
+auditRemovable :: Int -> ByteString
+auditRemovable count =
+    BSC.unlines ["SELECT " <> BSC.pack (show value) <> ";" | value <- [1 .. count]]
+
+auditRequiredWide :: Int -> ByteString
+auditRequiredWide count =
+    BSC.unlines $
+        "CREATE TABLE t(x);"
+            : ["INSERT INTO t VALUES(" <> BSC.pack (show value) <> "); -- " <> padding | value <- [1 .. count]]
+            ++ ["SELECT count(*) AS n FROM t;"]
+    where
+        padding = BS.replicate 440 120
+
+runNativeAudit :: ByteString -> ByteString -> IO Int
+runNativeAudit sql expected = do
+    (preflight, observe, validate) <-
+        prepareResultOracleWithValidation False Nothing (\_ _ -> pure ()) SQLite timeoutMicros sql
+            >>= either (die . T.unpack) pure
+    result <-
+        runEvaluationRequestWithNativeValidation timeoutMicros observe validate $
+            EvaluationRequest
+                { requestOnProgress = \_ -> pure ()
+                , requestMetricsPolicy = Just (MetricPolicy "audit-only" "off" 1)
+                , requestConfig =
+                    EvaluationConfig
+                        { evaluationCacheEnabled = True
+                        , evaluationJobs = 1
+                        , evaluationTotalTimeoutMicros = Nothing
+                        , evaluationMaxOracleExecutions = Nothing
+                        , evaluationPreflightMicros = fromMaybe 0 (oracleElapsedMicros preflight)
+                        , evaluationPreflightAttempts = 1
+                        , evaluationPreflightResetMicros = Just 0
+                        , evaluationPreflightOracleMicros = oracleElapsedMicros preflight
+                        , evaluationInitialStatements = Nothing
+                        }
+                , requestDialect = SQLite
+                , requestOracleConfig = ()
+                , requestPreflightObservation = Just (detailedObservation preflight)
+                , requestLogger = nullLogger
+                , requestInitialSQL = sql
+                , requestCheckpoint = ""
+                , requestAction = \_ logger pool -> do
+                    (reduced, stats) <-
+                        statementAuditWithParser logger (parseStatementsFast (poolMetricsStore pool) SQLite) pool sql
+                    pure
+                        (ReductionActionResult reduced (Just (ReductionEvidence reduced (auditMinimalityConfirmed stats))))
+                , requestCollectCurve = True
+                }
+    let metrics = evaluationMetrics result
+    unless
+        ( evaluatedSQL result == expected
+            && evaluationStatus metrics == EvaluationCompleted
+            && evaluationValidationPassed metrics
+            && evaluationMinimalityClaim metrics == StatementDeletionOneMinimal
+        )
+        (die "occam-bench: product audit failed its endpoint or validation check")
+    pure (BS.length (evaluatedSQL result))
+    where
+        timeoutMicros = 5000000
 
 corpusCases :: [FilePath]
 corpusCases =
@@ -393,6 +475,12 @@ runTimingBenchmarks = do
         cacheCompleteInflight cache key i (Just obs)
     cacheInstallInflight cache candidateKey 512
     cacheCompleteInflight cache candidateKey 512 (Just obs)
+    largeCacheCases <- forM [4096, 32768, 131072] $ \size -> do
+        let stored = BS.replicate size 120
+            hit = BS.copy stored
+            miss = BS.snoc (BS.init stored) 121
+        largeCache <- newCache (Map.singleton stored obs)
+        pure (size, largeCache, hit, miss, makeKey hit)
     let sqlScale64 = genScale 64
     contractRes <- generateSqliteContract sqlScale64
     contractScale64 <- case contractRes of
@@ -481,10 +569,26 @@ runTimingBenchmarks = do
                 ]
           , bgroup
                 "cache"
-                [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled candidateKey)
-                , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
-                    bench "miss" $
-                        whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
+                ( [ bench "hit" $ whnfIO (cacheLookup cache CacheEnabled candidateKey)
+                  , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
+                        bench "miss" $
+                            whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
+                  , bench "native-key-multi-statement" $ whnfIO (nativeOracleCacheKey SQLite (auditRemovable 512))
+                  ]
+                    ++ [ bgroup
+                            (show size ++ "-bytes")
+                            [ bench "hit" $ whnfIO (cacheLookup largeCache CacheEnabled hit)
+                            , bench "prepared-hit" $ whnfIO (cacheLookupKey largeCache CacheEnabled prepared)
+                            , bench "miss" $ whnfIO (cacheLookup largeCache CacheEnabled miss)
+                            ]
+                       | (size, largeCache, hit, miss, prepared) <- largeCacheCases
+                       ]
+                )
+          , bgroup
+                "audit-product"
+                [ bench "accept-frequently" $ whnfIO (runNativeAudit (auditRemovable 512) "SELECT 512;\n")
+                , let sql = auditRequiredWide 512
+                   in bench "reject-all-wide" $ whnfIO (runNativeAudit sql sql)
                 ]
           , bgroup
                 "reduction"

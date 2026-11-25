@@ -25,7 +25,7 @@ microbench:
 	cabal bench --benchmark-option=-p --benchmark-option='$$2 == "parse" || $$2 == "dag" || $$2 == "surgery" || $$2 == "cache"' --benchmark-options="--stdev 20 --timeout 5s"
 
 bench-product:
-	cabal bench --benchmark-options="-p reduction-audit-validation --stdev 20 --timeout 5s"
+	cabal bench --benchmark-option=-p --benchmark-option='$$2 == "reduction-audit-validation" || $$2 == "audit-product"' --benchmark-options="--stdev 20 --timeout 5s"
 
 FLAMEGRAPH_DIR ?= dist-newstyle/flamegraph
 FLAMEGRAPH_SQL ?= benchmarks/corpus/06_views_and_aggregates.sql
@@ -40,9 +40,9 @@ flamegraph:
 
 fmt:
 	@if command -v fourmolu >/dev/null 2>&1; then \
-		fourmolu -m inplace $$(find src app test bench -name "*.hs") Setup.hs; \
+		fourmolu -m inplace $$(find src app test bench eval-lib -name "*.hs") Setup.hs; \
 	else \
-		nix develop --command fourmolu -m inplace $$(find src app test bench -name "*.hs") Setup.hs; \
+		nix develop --command fourmolu -m inplace $$(find src app test bench eval-lib -name "*.hs") Setup.hs; \
 	fi
 	@if command -v cargo >/dev/null 2>&1; then \
 		cargo fmt --manifest-path rust/sqlparser-ffi/Cargo.toml --all; \
@@ -52,16 +52,16 @@ fmt:
 
 fmt-check:
 	@if command -v fourmolu >/dev/null 2>&1; then \
-		fourmolu --mode check $$(find src app test bench -name "*.hs") Setup.hs; \
+		fourmolu --mode check $$(find src app test bench eval-lib -name "*.hs") Setup.hs; \
 	else \
-		nix develop --command fourmolu --mode check $$(find src app test bench -name "*.hs") Setup.hs; \
+		nix develop --command fourmolu --mode check $$(find src app test bench eval-lib -name "*.hs") Setup.hs; \
 	fi
 
 lint:
 	@if command -v hlint >/dev/null 2>&1; then \
-		hlint src app test bench Setup.hs; \
+		hlint src app test bench eval-lib Setup.hs; \
 	else \
-		nix develop --command hlint src app test bench Setup.hs; \
+		nix develop --command hlint src app test bench eval-lib Setup.hs; \
 	fi
 
 rust-check:

@@ -63,6 +63,7 @@ jobs:
             app/**/*.hs
             test/**/*.hs
             bench/**/*.hs
+            eval-lib/**/*.hs
             Setup.hs
 
       # Manual install: haskell-actions/hlint-setup@v2 is node20-based (removed from
@@ -74,7 +75,7 @@ jobs:
           echo "$(dirname "$(find /tmp/hlint-bin -name hlint -type f | head -n 1)")" >> "$GITHUB_PATH"
 
       - name: Run HLint
-        run: hlint src app test bench Setup.hs
+        run: hlint src app test bench eval-lib Setup.hs
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path rust/sqlparser-ffi/Cargo.toml --all -- --check
@@ -101,6 +102,6 @@ jobs:
         run: make harness-check
 
       - name: Run benchmarks
-        run: cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"
+        run: make bench bench-product
 
 # proof-check (cd proofs && lake build) stays nightly/manual: elan + Lean dependency setup is too heavy to cache cheaply here.

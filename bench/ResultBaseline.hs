@@ -57,7 +57,7 @@ import Occam.Evaluation (
     EvaluationStatus (..),
     ReductionActionResult (..),
     metricPolicyForReduction,
-    runEvaluationRequestWithObserver,
+    runEvaluationRequestWithNativeValidation,
     sqlDialectName,
  )
 import Occam.Logger (Logger (..), defaultLogConfig)
@@ -67,7 +67,7 @@ import Occam.Oracle (
     oracleObservationMatches,
     withCandidateWorkdir,
  )
-import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
+import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithValidation)
 import Occam.Parser (
     ParsedSQL (..),
     SQLDialect (..),
@@ -1161,21 +1161,23 @@ runFixture ::
     Int -> Maybe Int -> Maybe Int -> [EvaluationStatus] -> (Arm, Arm) -> Fixture -> IO (Value, [String])
 runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixture {..} = do
     let config = defaultReductionConfig {reductionDialect = fixtureDialect}
-        prepare remember sql = prepareResultOracleWithTrace remember fixtureDialect probeTimeout sql >>= require fixtureName
+        prepare remember sql =
+            prepareResultOracleWithValidation True Nothing remember fixtureDialect probeTimeout sql
+                >>= require fixtureName
         assert = check . ((fixtureName ++ ": ") ++)
     parsed <- parseSQL (defaultParseOptions fixtureDialect) fixtureInput >>= require fixtureName
     let initialCount = length (parsedUnits parsed)
         graph = analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed)
     assert "unexpected global fence classification" (graphHasGlobalBarrier graph == fixtureFence)
     locationRef <- newIORef Nothing
-    (_, inputObserver) <-
+    (_, inputObserver, _) <-
         prepare (\_ trace -> writeIORef locationRef (Just (traceResultStatement trace))) fixtureInput
     location <- readIORef locationRef
     assert "unexpected engine result location" (location == Just fixtureLocation)
     assert
         "engine/frontend statement count mismatch"
         (resultStatementCount fixtureLocation == initialCount)
-    (_, expectedObserver) <- prepare (\_ _ -> pure ()) fixtureExpected
+    (_, _, expectedObserver) <- prepare (\_ _ -> pure ()) fixtureExpected
     let observation observe sql = detailedObservation <$> observe (pure ()) sql
         matches observe sql = oracleObservationMatches <$> observation observe sql
     matches expectedObserver fixtureInput >>= assert "input disagrees with the reference result"
@@ -1192,7 +1194,7 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             -- Both arms collect trace metadata, including when the policy ignores it.
             (remember, lookupTrace) <- newResultTraceTracker True
             start <- getMonotonicTimeNSec
-            (preflight, observer) <- prepare remember fixtureInput
+            (preflight, observer, validate) <- prepare remember fixtureInput
             end <- getMonotonicTimeNSec
             physicalCalls <- newIORef (1 :: Int)
             accepted <- newIORef []
@@ -1204,7 +1206,7 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
             earlyRejectExactRef <- newIORef (0 :: Int)
             earlyRejectNoResRef <- newIORef (0 :: Int)
             earlyRejectNanosRef <- newIORef (0 :: Integer)
-            let observed started = observer $ do
+            let counted observe started = observe $ do
                     atomicModifyIORef' physicalCalls (\calls -> (calls + 1, ()))
                     started
                 getNumField :: (Eq k, Integral a) => k -> [(k, Value)] -> a
@@ -1245,9 +1247,10 @@ runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixtu
                     candidateTrace <- lookupTrace sql
                     pure (if armObservedResult arm then candidateTrace else Nothing)
             result <-
-                runEvaluationRequestWithObserver
+                runEvaluationRequestWithNativeValidation
                     probeTimeout
-                    observed
+                    (counted observer)
+                    (counted validate)
                     EvaluationRequest
                         { requestOnProgress = progress
                         , requestMetricsPolicy = Just policy

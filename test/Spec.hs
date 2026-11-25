@@ -2,7 +2,7 @@ module Main (main) where
 
 import ColumnChecks qualified
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, bracket, try)
+import Control.Exception (SomeException, bracket, finally, try)
 import Control.Monad (forM, forM_, when)
 import Data.Aeson (FromJSON (..), Value (..), eitherDecodeStrict', encode, withObject, (.:))
 import Data.ByteString qualified as BS
@@ -732,6 +732,17 @@ phase5Tests =
                 assertEqual ("--out input must exit 2: " ++ err) (ExitFailure 2) code
                 inputAfter <- BS.readFile input
                 assertEqual "input file changed" "SELECT 1; SELECT 2;" inputAfter
+        , testCase "CLI preserves input and backup permissions for in-place output" $
+            withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
+                let backup = input ++ ".bak"
+                BS.writeFile backup "old backup"
+                flip finally (removeFile backup) $
+                    OracleChecks.checkInPlacePermissions input backup $ do
+                        (code, _, err) <-
+                            runOccamCLI [input, "--in-place", "--dialect", "sqlite", "--result-oracle", "--quiet"]
+                        assertEqual err ExitSuccess code
+                        original <- BS.readFile backup
+                        assertEqual "backup contains the original input" "SELECT 1; SELECT 2;" original
         , testCase "CLI rejects --stats paths that collide with input or output" $
             withCLIInput "SELECT 1;" $ \input outFile -> do
                 (inputCode, _, inputErr) <-
@@ -1029,6 +1040,12 @@ phase6Tests =
                 assertEqual "derived column names require exact bytes" Nothing =<< key "SELECT 1 + 2;"
                 assertEqual "source-reading functions require exact bytes" Nothing
                     =<< key "SELECT current_query() AS note;"
+                withSemicolon <- key "SELECT 'a;''b' AS note ;"
+                assertBool "quoted semicolon remains eligible" (isJust withSemicolon)
+                assertEqual "quoted semicolon keeps exact token bytes" withSemicolon
+                    =<< key "SELECT\t'a;''b' AS note;"
+                assertEqual "multiple statements require exact bytes" Nothing
+                    =<< key "SELECT 1 AS n; SELECT 2 AS n;"
         , testCase "direct cacheLookup and newCache behavior" $ do
             let precompKey = BSC.pack "SELECT 42;"
                 precompObs = OracleFinished ExitSuccess
@@ -1276,6 +1293,25 @@ sqliteOracleTests =
                     assertEqual "mismatched query rejects" OracleRejected o3
                     o4 <- oracle ""
                     assertEqual "empty candidate rejects" OracleRejected o4
+        , testCase "SQLite checkpoints bind result evidence to the expected contract" $ do
+            let prefix = "SELECT 1 AS n; CREATE TABLE a(i); CREATE TABLE b(i); CREATE TABLE c(i);"
+                baseline = prefix <> " CREATE TABLE d(i); CREATE TABLE e(i); CREATE TABLE f(i); CREATE TABLE g(i);"
+            one <- generateSqliteContract "SELECT 1 AS n;" >>= either (assertFailure . T.unpack) pure
+            two <- generateSqliteContract "SELECT 2 AS n;" >>= either (assertFailure . T.unpack) pure
+            warm <- sqliteContractOracle one baseline
+            assertEqual "warm the checkpoint under the first contract" OracleAccepted warm
+            mismatch <- sqliteContractOracle two prefix
+            assertEqual "the checkpoint cannot satisfy the second contract" OracleRejected mismatch
+            match <- sqliteContractOracle one prefix
+            assertEqual "the original contract still accepts" OracleAccepted match
+        , testCase "SQLite enforces a shared deadline across short statements" $ do
+            contract <- generateSqliteContract "SELECT 1 AS n;" >>= either (assertFailure . T.unpack) pure
+            let candidate = BSC.concat (replicate 12000 "SELECT 1 AS n;\n")
+            BS.length candidate `seq` pure ()
+            delayed <- sqliteContractObservationTimeout 1000 contract candidate
+            assertEqual "the sequence exceeds its deadline" OracleTimedOut delayed
+            clean <- sqliteContractOracle contract "SELECT 1 AS n;"
+            assertEqual "the next observation starts clean" OracleAccepted clean
         , testCase "SQLite preserves an empty final result and its column names" $ do
             let sql = "SELECT 1 AS earlier; SELECT 2 AS answer WHERE FALSE;"
             contractRes <- generateSqliteContract sql
@@ -1568,6 +1604,31 @@ duckdbOracleTests =
                     assertEqual "dropping final result changes the observation" OracleRejected dropped
                     assertEqual "renaming an empty result column changes the observation" OracleRejected renamed
                     assertEqual "a script without a result set is distinct" OracleRejected noResult
+        , testCase "DuckDB compares decimals exactly and preserves precision and scale" $ do
+            let source =
+                    "SELECT 1.23::DECIMAL(4,2) AS small, -98765.4321::DECIMAL(9,4) AS medium, "
+                        <> "123456789.123456789::DECIMAL(18,9) AS large, "
+                        <> "-123456789012345678901234567890.12345678::DECIMAL(38,8) AS wide;"
+                changed =
+                    "SELECT 1.23::DECIMAL(4,2) AS small, -98765.4321::DECIMAL(9,4) AS medium, "
+                        <> "123456789.123456789::DECIMAL(18,9) AS large, "
+                        <> "-123456789012345678901234567890.12345679::DECIMAL(38,8) AS wide;"
+            contract <- generateDuckDBContract source >>= either (assertFailure . T.unpack) pure
+            assertEqual
+                "contract survives JSON round trip"
+                (Right contract)
+                (eitherDecodeStrict' (BSL.toStrict (encode contract)))
+            exact <- duckdbContractOracle contract source
+            different <- duckdbContractOracle contract changed
+            assertEqual "all four integer storage widths match" OracleAccepted exact
+            assertEqual "one unit of the last place differs" OracleRejected different
+            empty <-
+                generateDuckDBContract "SELECT NULL::DECIMAL(4,2) AS n WHERE FALSE;"
+                    >>= either (assertFailure . T.unpack) pure
+            wrongWidth <- duckdbContractOracle empty "SELECT NULL::DECIMAL(5,2) AS n WHERE FALSE;"
+            wrongScale <- duckdbContractOracle empty "SELECT NULL::DECIMAL(4,1) AS n WHERE FALSE;"
+            assertEqual "empty columns retain precision" OracleRejected wrongWidth
+            assertEqual "empty columns retain scale" OracleRejected wrongScale
         , testCase "DuckDB decodes only the last result set and still executes trailing statements" $ do
             let sql = "SELECT [1, 2] AS ignored; SELECT 42 AS answer; CREATE TABLE tail (x INT);"
             result <- generateDuckDBContractWithResultStatement 1000000 sql
