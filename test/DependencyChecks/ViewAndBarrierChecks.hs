@@ -438,4 +438,62 @@ checks =
         assertBool
             "the index definition survives the lifted fence"
             (any (isNamedIndex "sk") constraints)
+    , testCase "mysql user variable expressions chain without polluting table reads or unrelated tables" $ do
+        let sql =
+                BSC.unlines
+                    [ "SET @f = _utf32 'a';"
+                    , "CREATE TABLE unrelated (x INT);"
+                    , "CREATE TABLE t1 (a INT);"
+                    , "SELECT 1 FROM t1 WHERE @f<>'3761-03-28' XOR (@f:='5570-12-30') > a;"
+                    ]
+        graph <- analyze MySQL sql
+        let queryDeps = dependenciesFor (StatementId 4) graph
+        assertBool
+            "user variable reader depends on SET @f and table definition"
+            (has (StatementId 1) queryDeps && has (StatementId 3) queryDeps)
+        assertBool
+            "user variable fence does not chain unrelated tables"
+            (not (has (StatementId 2) queryDeps))
+        assertEqual
+            "user variable is excluded from table column reads"
+            ["a"]
+            [identText column | readFact <- readsFor (StatementId 4) graph, column <- readColumns readFact]
+    , testCase "postgresql bare ANALYZE carries a global fence" $ do
+        let sql =
+                BSC.unlines
+                    [ "CREATE TABLE t (a INT);"
+                    , "ANALYZE;"
+                    , "SELECT a FROM t;"
+                    ]
+        graph <- analyze PostgreSQL sql
+        let analyzeDeps = dependenciesFor (StatementId 2) graph
+            readDeps = dependenciesFor (StatementId 3) graph
+            barriers = factBarriers (factsFor (StatementId 2) graph)
+        assertBool
+            "bare ANALYZE emits GlobalScope barrier"
+            (any (\b -> barrierScope b == GlobalScope) barriers)
+        assertBool
+            "global barrier fences preceding and following statements"
+            (has (StatementId 1) analyzeDeps && has (StatementId 2) readDeps)
+    , testCase "mysql SET user variable subquery retains referenced table without unrelated fence" $ do
+        let sql =
+                BSC.unlines
+                    [ "CREATE TABLE unrelated (x INT);"
+                    , "CREATE TABLE t (a INT);"
+                    , "INSERT INTO t VALUES (1);"
+                    , "SET @x = (SELECT a FROM t);"
+                    , "SELECT @x;"
+                    ]
+        graph <- analyze MySQL sql
+        let setDeps = dependenciesFor (StatementId 4) graph
+            readDeps = dependenciesFor (StatementId 5) graph
+        assertBool
+            "SET @x = (SELECT a FROM t) depends on t DDL and DML"
+            (has (StatementId 2) setDeps && has (StatementId 3) setDeps)
+        assertBool
+            "SET @x = (SELECT a FROM t) does not depend on unrelated table"
+            (not (has (StatementId 1) setDeps))
+        assertBool
+            "SELECT @x depends on SET @x"
+            (has (StatementId 4) readDeps)
     ]

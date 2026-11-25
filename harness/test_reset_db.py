@@ -312,6 +312,73 @@ exit 0
             self.assertIn("must match", result.stderr)
             self.assertFalse(os.path.exists(called))
 
+    def test_clickhouse_container_fallback_uses_docker_exec_without_host_port(self):
+        if os.path.exists("/usr/bin/clickhouse-client") or os.path.exists("/usr/local/bin/clickhouse-client"):
+            self.skipTest("host clickhouse-client present in /usr/bin or /usr/local/bin")
+        with tempfile.TemporaryDirectory() as td:
+            args_file = os.path.join(td, "docker_args.txt")
+            sql_file = os.path.join(td, "sql.txt")
+            pwd_file = os.path.join(td, "pwd.txt")
+            self.write_mock(
+                td,
+                "docker",
+                f"""if [ "$1" = "ps" ]; then
+    echo "occam-target-ch"
+    exit 0
+fi
+if [ "$1" = "exec" ] && [ "$2" = "-i" ]; then
+    if echo "$*" | grep -q -- '--query'; then
+        exit 0
+    fi
+    printf '%s\\n' "$@" > {args_file}
+    cat > {sql_file}
+    printf '%s' "$CLICKHOUSE_PASSWORD" > {pwd_file}
+    exit 0
+fi
+exit 1
+""",
+            )
+            result = self.run_reset(
+                [
+                    "--dbms",
+                    "clickhouse",
+                    "--container-name",
+                    "occam-target-ch",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "49152",
+                    "--password",
+                    "chsecret",
+                    "--dbname",
+                    "ch_fallback",
+                ],
+                td,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(args_file, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertEqual(
+                argv,
+                [
+                    "exec",
+                    "-i",
+                    "-e",
+                    "CLICKHOUSE_PASSWORD",
+                    "occam-target-ch",
+                    "clickhouse-client",
+                    "--user",
+                    "default",
+                    "--multiquery",
+                ],
+            )
+            with open(pwd_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "chsecret")
+            with open(sql_file, encoding="utf-8") as handle:
+                sql = handle.read()
+            self.assertIn("DROP DATABASE IF EXISTS `ch_fallback` SYNC;", sql)
+            self.assertIn("CREATE DATABASE `ch_fallback`;", sql)
+
     def test_sqlite_and_duckdb_stateless_local_reset_exit_zero(self):
         with tempfile.TemporaryDirectory() as td:
             for dbms in ("sqlite", "duckdb"):

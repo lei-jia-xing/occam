@@ -400,6 +400,7 @@ getBarrierScope = do
         3 -> ObjectScope <$> getObjectRef
         4 -> pure SessionStateScope
         5 -> pure TransactionStateScope
+        6 -> UserVariableScope <$> getIdent
         _ -> fail ("invalid BarrierScope tag: " ++ show tag)
 
 getBarrierReason :: Decoder BarrierReason

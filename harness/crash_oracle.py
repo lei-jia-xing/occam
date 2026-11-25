@@ -2445,22 +2445,44 @@ def main():
             "/usr/bin/clickhouse-client",
             "/usr/local/bin/clickhouse-client",
         ]
-        binary = resolve_binary("clickhouse-client", ch_candidates)
-        cmd = [
-            binary,
-            "--host",
-            args.host,
-            "--port",
-            str(args.port),
-            "--user",
-            args.user,
-            "--database",
-            args.dbname,
-            "--multiquery",
-            "--ignore-error",
-        ]
-        if args.password:
-            env["CLICKHOUSE_PASSWORD"] = args.password
+        found_binary = shutil.which("clickhouse-client")
+        if not found_binary:
+            for candidate in ch_candidates:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    found_binary = candidate
+                    break
+        if found_binary or not args.container_name:
+            binary = found_binary or "clickhouse-client"
+            cmd = [
+                binary,
+                "--host",
+                args.host,
+                "--port",
+                str(args.port),
+                "--user",
+                args.user,
+                "--database",
+                args.dbname,
+                "--multiquery",
+                "--ignore-error",
+            ]
+            if args.password:
+                env["CLICKHOUSE_PASSWORD"] = args.password
+        else:
+            cmd = ["docker", "exec", "-i"]
+            if args.password:
+                env["CLICKHOUSE_PASSWORD"] = args.password
+                cmd.extend(["-e", "CLICKHOUSE_PASSWORD"])
+            cmd.extend([
+                args.container_name,
+                "clickhouse-client",
+                "--user",
+                args.user,
+                "--database",
+                args.dbname,
+                "--multiquery",
+                "--ignore-error",
+            ])
     elif args.dbms == "sqlite":
         if args.container_name:
             exec_bin = args.engine_bin or "occam-exec"

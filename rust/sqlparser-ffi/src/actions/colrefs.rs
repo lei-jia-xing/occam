@@ -14,14 +14,16 @@ impl Visitor for ColumnCollector<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
         let column = match expr {
-            Expr::Identifier(ident) => Some(canonical_ident(
+            Expr::Identifier(ident) if !is_variable_ident(ident) => Some(canonical_ident(
                 ident,
                 self.rules,
                 ir::IdentifierClass::Column,
             )),
-            Expr::CompoundIdentifier(idents) => idents
-                .last()
-                .map(|ident| canonical_ident(ident, self.rules, ir::IdentifierClass::Column)),
+            Expr::CompoundIdentifier(idents) if !idents.first().is_some_and(is_variable_ident) => {
+                idents
+                    .last()
+                    .map(|ident| canonical_ident(ident, self.rules, ir::IdentifierClass::Column))
+            }
             _ => None,
         };
         match column {

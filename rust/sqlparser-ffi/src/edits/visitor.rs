@@ -36,6 +36,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     /// Subtrees whose function calls never fence (e.g. partition schemes, index length prefixes).
     pub(crate) ignored_function_roots: Vec<Span>,
     pub(crate) ignored_relation_spans: Vec<Span>,
+    pub(crate) ignored_user_var_spans: Vec<Span>,
     pub(crate) select_into_count: usize,
     /// Column reference and the alias scope in which it appeared.
     pub(crate) columns: Vec<(Vec<String>, usize)>,
@@ -59,6 +60,7 @@ pub(crate) struct AnalysisVisitor<'a> {
     top_level_select_ptr: Option<*const Select>,
     recursive_predicate_spans: Vec<(usize, usize)>,
     pub(crate) sequences: Option<SequenceVisitor<'a>>,
+    pub(crate) user_vars: Vec<crate::ir::Ident>,
 }
 impl<'a> AnalysisVisitor<'a> {
     pub(crate) fn new(context: AnalysisContext<'a>) -> Self {
@@ -78,6 +80,7 @@ impl<'a> AnalysisVisitor<'a> {
             has_function: false,
             ignored_function_roots: Vec::new(),
             ignored_relation_spans: Vec::new(),
+            ignored_user_var_spans: Vec::new(),
             select_into_count: 0,
             columns: Vec::new(),
             whole_rows: Vec::new(),
@@ -100,6 +103,7 @@ impl<'a> AnalysisVisitor<'a> {
             top_level_select_ptr: None,
             recursive_predicate_spans: Vec::new(),
             sequences: None,
+            user_vars: Vec::new(),
         }
     }
 
@@ -3034,17 +3038,52 @@ impl Visitor for AnalysisVisitor<'_> {
                 }
                 _ => false,
             };
+        if !self.ignored_user_var_spans.contains(&expr.span()) {
+            match expr {
+                Expr::Identifier(ident) if crate::actions::is_user_variable_ident(ident) => {
+                    let var = crate::actions::canonical_ident(
+                        ident,
+                        self.rules,
+                        crate::ir::IdentifierClass::Other,
+                    );
+                    if !self.user_vars.contains(&var) {
+                        self.user_vars.push(var);
+                    }
+                }
+                Expr::CompoundIdentifier(idents)
+                    if idents
+                        .first()
+                        .is_some_and(crate::actions::is_user_variable_ident) =>
+                {
+                    if let Some(first) = idents.first() {
+                        let var = crate::actions::canonical_ident(
+                            first,
+                            self.rules,
+                            crate::ir::IdentifierClass::Other,
+                        );
+                        if !self.user_vars.contains(&var) {
+                            self.user_vars.push(var);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let record_columns = self.nested_dml_depth == 0;
         let scope = self.current_alias_scope();
         match expr {
-            Expr::Identifier(ident) if record_columns => self.columns.push((
-                vec![canonical_ident_string(
-                    ident,
-                    self.rules,
-                    crate::ir::IdentifierClass::Column,
-                )],
-                scope,
-            )),
+            Expr::Identifier(ident) if record_columns => {
+                if !crate::actions::is_variable_ident(ident) {
+                    self.columns.push((
+                        vec![canonical_ident_string(
+                            ident,
+                            self.rules,
+                            crate::ir::IdentifierClass::Column,
+                        )],
+                        scope,
+                    ));
+                }
+            }
             _ if record_columns && matches!(self.dialect, DialectKind::MySql) => {
                 if let Some(ident) = crate::actions::index_length_prefix_ident(expr) {
                     self.columns.push((
@@ -3058,20 +3097,25 @@ impl Visitor for AnalysisVisitor<'_> {
                 }
             }
             Expr::CompoundIdentifier(idents) if record_columns => {
-                let last = idents.len().saturating_sub(1);
-                let parts = idents
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ident)| {
-                        let class = if index == last {
-                            crate::ir::IdentifierClass::Column
-                        } else {
-                            crate::ir::IdentifierClass::Relation
-                        };
-                        canonical_ident_string(ident, self.rules, class)
-                    })
-                    .collect();
-                self.columns.push((parts, scope));
+                if !idents
+                    .first()
+                    .is_some_and(crate::actions::is_variable_ident)
+                {
+                    let last = idents.len().saturating_sub(1);
+                    let parts = idents
+                        .iter()
+                        .enumerate()
+                        .map(|(index, ident)| {
+                            let class = if index == last {
+                                crate::ir::IdentifierClass::Column
+                            } else {
+                                crate::ir::IdentifierClass::Relation
+                            };
+                            canonical_ident_string(ident, self.rules, class)
+                        })
+                        .collect();
+                    self.columns.push((parts, scope));
+                }
             }
             _ if !self.syntax_edits => {}
             Expr::BinaryOp { left, right, .. } => {

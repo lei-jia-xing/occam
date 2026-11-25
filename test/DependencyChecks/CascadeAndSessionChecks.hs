@@ -11,10 +11,12 @@ import DependencyChecks.Support (
     has,
  )
 import Occam.Core (
+    BarrierScope (..),
     DataWrite (..),
     DeleteScope (..),
     Ident (..),
     NameRef (..),
+    ScopedBarrier (..),
     SemanticFacts (..),
     StatementId (..),
     UpdateScope (..),
@@ -623,12 +625,16 @@ checks =
         graph <- analyze MySQL sql
         let setDeps = dependenciesFor (StatementId 3) graph
             readDeps = dependenciesFor (StatementId 5) graph
+            barriers = factBarriers (factsFor (StatementId 3) graph)
         assertBool
             "the user variable does not disable the session cascade"
             (has (StatementId 4) readDeps)
         assertBool
-            "the user variable keeps its fence"
-            (has (StatementId 1) setDeps && has (StatementId 2) setDeps)
+            "the user variable carries UserVariableScope"
+            (any (\b -> barrierScope b == UserVariableScope (Ident "@foreign_key_checks")) barriers)
+        assertBool
+            "the user variable does not chain unrelated tables"
+            (not (has (StatementId 1) setDeps) && not (has (StatementId 2) setDeps))
     , testCase "MySQL SET @autocommit stays fenced as a user variable" $ do
         let sql =
                 BSC.unlines
@@ -636,19 +642,28 @@ checks =
                     , "SET @autocommit = 0;"
                     , "INSERT INTO t VALUES (1);"
                     , "SELECT * FROM t;"
+                    , "SELECT @autocommit;"
                     ]
         graph <- analyze MySQL sql
         let setDeps = dependenciesFor (StatementId 2) graph
             readDeps = dependenciesFor (StatementId 4) graph
+            varReadDeps = dependenciesFor (StatementId 5) graph
+            barriers = factBarriers (factsFor (StatementId 2) graph)
         assertBool
             "the user variable records no session effect"
             (null (factSession (factsFor (StatementId 2) graph)))
         assertBool
-            "the user variable keeps its fence"
-            (has (StatementId 1) setDeps)
+            "the user variable carries UserVariableScope"
+            (any (\b -> barrierScope b == UserVariableScope (Ident "@autocommit")) barriers)
+        assertBool
+            "the user variable does not chain unrelated table definitions"
+            (not (has (StatementId 1) setDeps) && not (has (StatementId 2) readDeps))
         assertBool
             "ordinary dependencies still resolve"
             (has (StatementId 3) readDeps)
+        assertBool
+            "later reader of @autocommit depends on SET @autocommit"
+            (has (StatementId 2) varReadDeps)
     , testCase "MySQL SET @@autocommit maps without a fence" $ do
         let sql =
                 BSC.unlines
@@ -672,15 +687,25 @@ checks =
                     [ "CREATE TABLE t (id INT);"
                     , "SET @search_path = 'public';"
                     , "SELECT * FROM t;"
+                    , "SELECT @search_path;"
                     ]
         graph <- analyze MySQL sql
         let setDeps = dependenciesFor (StatementId 2) graph
+            readDeps = dependenciesFor (StatementId 3) graph
+            varReadDeps = dependenciesFor (StatementId 4) graph
+            barriers = factBarriers (factsFor (StatementId 2) graph)
         assertBool
             "the user variable records no session effect"
             (null (factSession (factsFor (StatementId 2) graph)))
         assertBool
-            "the user variable keeps its fence"
-            (has (StatementId 1) setDeps)
+            "the user variable carries UserVariableScope"
+            (any (\b -> barrierScope b == UserVariableScope (Ident "@search_path")) barriers)
+        assertBool
+            "the user variable does not chain unrelated statements"
+            (not (has (StatementId 1) setDeps) && not (has (StatementId 2) readDeps))
+        assertBool
+            "later reader of @search_path depends on SET @search_path"
+            (has (StatementId 2) varReadDeps)
     , testCase "RESET @@global stays fenced" $ do
         let sql =
                 BSC.unlines

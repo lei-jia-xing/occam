@@ -743,6 +743,7 @@ pub enum BarrierScope {
     Object { object: ObjectRef },
     SessionState,
     TransactionState,
+    UserVariable { name: Ident },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -2749,11 +2749,26 @@ fn postgres_analyze_table_extracts_relation_and_columns() {
         panic!("expected CatalogOp::Read");
     }
 
-    // Bare ANALYZE; has no parse error
+    // Bare ANALYZE; has no parse error and stays globally fenced
     let sql_bare = "ANALYZE;";
     let units_bare = parse(sql_bare, DialectKind::PostgreSql).unwrap();
     assert_eq!(units_bare.len(), 1);
     assert!(units_bare[0].parse_error.is_none());
+    let bare_facts = units_bare[0]
+        .facts
+        .as_ref()
+        .expect("expected facts for bare ANALYZE");
+    assert!(bare_facts.ops.is_empty());
+    assert!(bare_facts.barriers.iter().any(|barrier| {
+        matches!(
+            barrier,
+            ScopedBarrier {
+                scope: BarrierScope::Global,
+                reason: BarrierReason::UnknownDdl,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]
@@ -3773,7 +3788,6 @@ fn mysql_foreign_key_checks_unmodeled_spellings_stay_fenced() {
     for sql in [
         "SET foreign_key_checks = @x;",
         "SET @@global.foreign_key_checks = @x;",
-        "SET @foreign_key_checks = 0;",
         "SET GLOBAL @@session.foreign_key_checks = 0;",
         "SET SESSION @@global.foreign_key_checks = 0;",
         "SET app.foreign_key_checks = 0;",
@@ -3795,6 +3809,29 @@ fn mysql_foreign_key_checks_unmodeled_spellings_stay_fenced() {
             "{sql}"
         );
     }
+    let units = parse("SET @foreign_key_checks = 0;", DialectKind::MySql).unwrap();
+    assert!(units[0].parse_error.is_none());
+    assert!(facts(&units[0]).session.is_empty());
+    assert!(
+        facts(&units[0]).barriers.iter().any(|barrier| {
+            matches!(
+                barrier,
+                ScopedBarrier {
+                    scope: BarrierScope::UserVariable { name },
+                    reason: BarrierReason::UnknownSessionEffect,
+                    ..
+                } if name.0 == "@foreign_key_checks"
+            )
+        }),
+        "{:?}",
+        facts(&units[0]).barriers
+    );
+    assert!(
+        !facts(&units[0])
+            .barriers
+            .iter()
+            .any(|barrier| matches!(barrier.scope, BarrierScope::Global))
+    );
     // Out-of-scope variables keep the blanket fence.
     let units = parse("SET @@global.super_read_only = TRUE;", DialectKind::MySql).unwrap();
     assert!(
@@ -3838,9 +3875,36 @@ fn mysql_autocommit_scope_forms() {
 
 #[test]
 fn system_var_user_spellings_stay_fenced() {
+    for (sql, expected_var) in [
+        ("SET @autocommit = 0;", "@autocommit"),
+        ("SET @search_path = 'public';", "@search_path"),
+    ] {
+        let units = parse(sql, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{sql}");
+        assert!(facts(&units[0]).session.is_empty(), "{sql}");
+        assert!(
+            facts(&units[0]).barriers.iter().any(|barrier| {
+                matches!(
+                    barrier,
+                    ScopedBarrier {
+                        scope: BarrierScope::UserVariable { name },
+                        reason: BarrierReason::UnknownSessionEffect,
+                        ..
+                    } if name.0 == expected_var
+                )
+            }),
+            "{sql}: {:?}",
+            facts(&units[0]).barriers
+        );
+        assert!(
+            !facts(&units[0])
+                .barriers
+                .iter()
+                .any(|barrier| matches!(barrier.scope, BarrierScope::Global)),
+            "{sql}"
+        );
+    }
     for sql in [
-        "SET @autocommit = 0;",
-        "SET @search_path = 'public';",
         "SET GLOBAL @@session.autocommit = 0;",
         "SET SESSION @@global.autocommit = 0;",
         "SET app.autocommit = 0;",
@@ -4907,4 +4971,187 @@ fn window_partition_deletion_skips_nested_order_by() {
     let mut candidate = sql.to_owned();
     candidate.replace_range(edit.start..edit.end, &edit.replacement);
     assert_eq!(candidate, "SELECT sum(a) OVER (ORDER BY c) FROM t");
+}
+
+#[test]
+fn user_variables_are_excluded_from_table_reads_and_scoped() {
+    let sql = "SET @f = _utf32 'a'; CREATE TABLE t1 (a INT); SELECT 1 FROM t1 WHERE @f<>'3761-03-28' XOR (@f:='5570-12-30') > a;";
+    let units = parse(sql, DialectKind::MySql).unwrap();
+    assert_eq!(units.len(), 3);
+    assert!(units.iter().all(|unit| unit.parse_error.is_none()));
+    assert!(
+        facts(&units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@f"))
+    );
+    assert!(
+        !facts(&units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+    assert_eq!(relation_reads(facts(&units[2])), ["t1"]);
+    assert_eq!(read_column_names(facts(&units[2])), ["a"]);
+    assert!(
+        facts(&units[2])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@f"))
+    );
+    assert!(
+        !facts(&units[2])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    let mdev_units = parse(
+        "SELECT a FROM t WHERE (a,b) in (SELECT @c,@d);",
+        DialectKind::MySql,
+    )
+    .unwrap();
+    assert!(mdev_units[0].parse_error.is_none());
+    assert_eq!(relation_reads(facts(&mdev_units[0])), ["t"]);
+    assert_eq!(read_column_names(facts(&mdev_units[0])), ["a", "b"]);
+    assert!(
+        facts(&mdev_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@c"))
+    );
+    assert!(
+        facts(&mdev_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@d"))
+    );
+    assert!(
+        !facts(&mdev_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    let set_expr_units = parse("SET @X = @Y + 1;", DialectKind::MySql).unwrap();
+    assert!(set_expr_units[0].parse_error.is_none());
+    let set_vars: Vec<&str> = facts(&set_expr_units[0])
+        .barriers
+        .iter()
+        .filter_map(|b| match &b.scope {
+            BarrierScope::UserVariable { name } => Some(name.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(set_vars.contains(&"@x"), "{set_vars:?}");
+    assert!(set_vars.contains(&"@y"), "{set_vars:?}");
+    assert!(
+        !facts(&set_expr_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    let sysvar_units = parse("SELECT @@sql_mode FROM t;", DialectKind::MySql).unwrap();
+    assert!(sysvar_units[0].parse_error.is_none());
+    assert_eq!(relation_reads(facts(&sysvar_units[0])), ["t"]);
+    assert!(read_column_names(facts(&sysvar_units[0])).is_empty());
+
+    let into_units = parse("SELECT a INTO @x FROM t;", DialectKind::MySql).unwrap();
+    assert!(into_units[0].parse_error.is_none());
+    assert_eq!(relation_reads(facts(&into_units[0])), ["t"]);
+    assert_eq!(read_column_names(facts(&into_units[0])), ["a"]);
+    assert!(
+        facts(&into_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@x"))
+    );
+    assert!(
+        !facts(&into_units[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    let multi_into = parse("SELECT a, b INTO @x, @y FROM t1;", DialectKind::MySql).unwrap();
+    assert!(multi_into[0].parse_error.is_none());
+    assert_eq!(relation_reads(facts(&multi_into[0])), ["t1"]);
+    assert_eq!(read_column_names(facts(&multi_into[0])), ["a", "b"]);
+    assert!(
+        !facts(&multi_into[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    for fenced_into in [
+        "SELECT a INTO @x FROM (SELECT b INTO t2 FROM t1) s;",
+        "SELECT a INTO @x FROM t1 WHERE EXISTS (SELECT b INTO t2 FROM t3);",
+        "SELECT a INTO TEMPORARY @x FROM t1;",
+    ] {
+        let units = parse(fenced_into, DialectKind::MySql).unwrap();
+        assert!(units[0].parse_error.is_none(), "{fenced_into}");
+        assert!(
+            facts(&units[0]).barriers.iter().any(|b| matches!(
+                b,
+                ScopedBarrier {
+                    scope: BarrierScope::Global,
+                    reason: BarrierReason::UnknownDml,
+                    ..
+                }
+            )),
+            "{fenced_into}: {:?}",
+            facts(&units[0]).barriers
+        );
+    }
+
+    let set_subquery = parse("SET @x = (SELECT a FROM t);", DialectKind::MySql).unwrap();
+    assert!(set_subquery[0].parse_error.is_none());
+    assert_eq!(relation_reads(facts(&set_subquery[0])), ["t"]);
+    assert_eq!(read_column_names(facts(&set_subquery[0])), ["a"]);
+    assert!(
+        facts(&set_subquery[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(&b.scope, BarrierScope::UserVariable { name } if name.0 == "@x"))
+    );
+    assert!(
+        !facts(&set_subquery[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+
+    let set_unmodeled = parse(
+        "SET @x = (SELECT a FROM unknown_tvf());",
+        DialectKind::MySql,
+    )
+    .unwrap();
+    assert!(set_unmodeled[0].parse_error.is_none());
+    assert!(
+        facts(&set_unmodeled[0])
+            .barriers
+            .iter()
+            .any(|b| matches!(b.scope, BarrierScope::Global))
+    );
+}
+
+#[test]
+fn clickhouse_empty_tuple_order_by_lifts_routine_fence() {
+    let units = parse(
+        "CREATE TABLE t0 (c0 UInt64) ENGINE = MergeTree ORDER BY tuple();",
+        DialectKind::ClickHouse,
+    )
+    .unwrap();
+    assert!(units[0].parse_error.is_none());
+    assert!(
+        facts(&units[0]).barriers.is_empty(),
+        "{:?}",
+        facts(&units[0]).barriers
+    );
+
+    let select_units = parse("SELECT tuple();", DialectKind::ClickHouse).unwrap();
+    assert!(select_units[0].parse_error.is_none());
+    assert!(has_routine_barrier(facts(&select_units[0])));
 }

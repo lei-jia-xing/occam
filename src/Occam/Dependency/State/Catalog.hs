@@ -113,6 +113,7 @@ data BarrierKey
     | RelationBarrierKey !RelationKey
     | SchemaBarrierKey !Name
     | ObjectBarrierKey !ObjectKey
+    | UserVariableBarrierKey !Ident
     deriving (Eq, Ord, Show)
 
 -- Catalog state

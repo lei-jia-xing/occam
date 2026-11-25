@@ -33,15 +33,15 @@ ARG CLICKHOUSE_CLIENT_SHA256=""
 
 WORKDIR /tmp/ch-debs
 RUN set -eu; \
-    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-common-static_${CLICKHOUSE_VERSION}_amd64.deb" -o common.deb; \
+    curl -fSL --retry 5 --retry-delay 3 --retry-connrefused "${CLICKHOUSE_POOL_URL}/clickhouse-common-static_${CLICKHOUSE_VERSION}_amd64.deb" -o common.deb; \
     if [ -n "${CLICKHOUSE_COMMON_SHA256}" ]; then echo "${CLICKHOUSE_COMMON_SHA256}  common.deb" | sha256sum -c -; fi; \
-    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-server_${CLICKHOUSE_VERSION}_amd64.deb" -o server.deb; \
+    curl -fSL --retry 5 --retry-delay 3 --retry-connrefused "${CLICKHOUSE_POOL_URL}/clickhouse-server_${CLICKHOUSE_VERSION}_amd64.deb" -o server.deb; \
     if [ -n "${CLICKHOUSE_SERVER_SHA256}" ]; then echo "${CLICKHOUSE_SERVER_SHA256}  server.deb" | sha256sum -c -; fi; \
-    curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-client_${CLICKHOUSE_VERSION}_amd64.deb" -o client.deb; \
+    curl -fSL --retry 5 --retry-delay 3 --retry-connrefused "${CLICKHOUSE_POOL_URL}/clickhouse-client_${CLICKHOUSE_VERSION}_amd64.deb" -o client.deb; \
     if [ -n "${CLICKHOUSE_CLIENT_SHA256}" ]; then echo "${CLICKHOUSE_CLIENT_SHA256}  client.deb" | sha256sum -c -; fi; \
     dpkg -i common.deb server.deb client.deb; \
     if [ "${INSTALL_DBG}" = "1" ]; then \
-        curl -fSL "${CLICKHOUSE_POOL_URL}/clickhouse-common-static-dbg_${CLICKHOUSE_VERSION}_amd64.deb" -o common-dbg.deb; \
+        curl -fSL --retry 5 --retry-delay 3 --retry-connrefused "${CLICKHOUSE_POOL_URL}/clickhouse-common-static-dbg_${CLICKHOUSE_VERSION}_amd64.deb" -o common-dbg.deb; \
         dpkg -i common-dbg.deb; \
     fi; \
     rm -rf /tmp/ch-debs

@@ -275,6 +275,7 @@ barrierScopeName (SchemaScope n) = "schema:" <> nameText n
 barrierScopeName (ObjectScope o) = "object:" <> objectRefName o
 barrierScopeName SessionStateScope = "session"
 barrierScopeName TransactionStateScope = "transaction"
+barrierScopeName (UserVariableScope ident) = "user_var:" <> identText ident
 
 objectRefName :: ObjectRef -> T.Text
 objectRefName (ObjectRelation r) = "relation:" <> nameText (nameRefName r)

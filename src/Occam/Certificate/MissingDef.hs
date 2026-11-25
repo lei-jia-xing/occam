@@ -160,8 +160,10 @@ recordTxOpener sid (txOpens, spOpens) = \case
 
 isOpaqueDdlBarrier :: ScopedBarrier -> Bool
 isOpaqueDdlBarrier sb =
-    barrierScope sb == GlobalScope
-        || case barrierReason sb of
+    case barrierScope sb of
+        UserVariableScope _ -> False
+        GlobalScope -> True
+        _ -> case barrierReason sb of
             SyntaxErrorBarrier -> True
             UnknownStatementBarrier -> True
             UnknownRelationBarrier -> True
@@ -175,12 +177,15 @@ isOpaqueDdlBarrier sb =
             _ -> False
 
 isOpaqueTxBarrier :: ScopedBarrier -> Bool
-isOpaqueTxBarrier sb = case barrierReason sb of
-    SyntaxErrorBarrier -> True
-    UnknownStatementBarrier -> True
-    UnknownSessionEffectBarrier -> True
-    UnsupportedTransactionBarrier -> True
-    _ -> False
+isOpaqueTxBarrier sb =
+    case barrierScope sb of
+        UserVariableScope _ -> False
+        _ -> case barrierReason sb of
+            SyntaxErrorBarrier -> True
+            UnknownStatementBarrier -> True
+            UnknownSessionEffectBarrier -> True
+            UnsupportedTransactionBarrier -> True
+            _ -> False
 
 dedupIntSetsSmall :: [IntSet] -> [IntSet]
 dedupIntSetsSmall [] = []

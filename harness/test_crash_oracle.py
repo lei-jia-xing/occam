@@ -1943,6 +1943,65 @@ exit 0
             with open(pwd_file, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "chsecret")
 
+    def test_clickhouse_docker_exec_fallback_when_host_client_missing(self):
+        if os.path.exists("/usr/bin/clickhouse-client") or os.path.exists("/usr/local/bin/clickhouse-client"):
+            self.skipTest("host clickhouse-client present in /usr/bin or /usr/local/bin")
+        with tempfile.TemporaryDirectory() as td:
+            log_path = self.make_log(td)
+            args_file = os.path.join(td, "docker_args.txt")
+            pwd_file = os.path.join(td, "ch_pwd.txt")
+            self.write_mock(
+                td,
+                "docker",
+                f"""cat >/dev/null || true
+printf '%s\\n' "$@" > {shlex.quote(args_file)}
+printf '%s' "$CLICKHOUSE_PASSWORD" > {shlex.quote(pwd_file)}
+exit 0
+""",
+            )
+            code, _, _ = self.run_oracle(
+                "SELECT 1;",
+                args=[
+                    "--dbms",
+                    "clickhouse",
+                    "--container-name",
+                    "occam-target-ch",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "49152",
+                    "--dbname",
+                    "ch_db",
+                    "--log-file",
+                    log_path,
+                    "--password",
+                    "chsecret",
+                ],
+                env=self.path_env(td),
+            )
+            self.assertEqual(code, 1)
+            with open(args_file, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertEqual(
+                argv,
+                [
+                    "exec",
+                    "-i",
+                    "-e",
+                    "CLICKHOUSE_PASSWORD",
+                    "occam-target-ch",
+                    "clickhouse-client",
+                    "--user",
+                    "default",
+                    "--database",
+                    "ch_db",
+                    "--multiquery",
+                    "--ignore-error",
+                ],
+            )
+            with open(pwd_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "chsecret")
+
     def test_sqlite_strip_error_blocks_caret_and_quoted_spoofs(self):
         with tempfile.TemporaryDirectory() as td:
             decisions = os.path.join(td, "decisions.jsonl")

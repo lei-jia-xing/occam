@@ -93,6 +93,7 @@ barrierKeysForScope session catalog scope =
         SchemaScope name -> [SchemaBarrierKey name]
         ObjectScope objectRef ->
             map ObjectBarrierKey (resolveObjectKeys session catalog objectRef)
+        UserVariableScope ident -> [UserVariableBarrierKey ident]
 
 lastBarrierDeps :: ScanState -> [BarrierKey] -> Set StatementId
 lastBarrierDeps state = foldl' addLast Set.empty

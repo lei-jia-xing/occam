@@ -681,6 +681,10 @@ fn write_barrier_scope(w: &mut BinaryWriter, scope: &BarrierScope) {
         }
         BarrierScope::SessionState => w.write_u8(4),
         BarrierScope::TransactionState => w.write_u8(5),
+        BarrierScope::UserVariable { name } => {
+            w.write_u8(6);
+            write_ident(w, name);
+        }
     }
 }
 

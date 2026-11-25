@@ -220,6 +220,7 @@ data BarrierScope
     | ObjectScope !ObjectRef
     | SessionStateScope
     | TransactionStateScope
+    | UserVariableScope !Ident
     deriving (Eq, Ord, Show)
 
 data ScopedBarrier = ScopedBarrier
@@ -489,6 +490,7 @@ instance FromJSON BarrierScope where
             "object" -> ObjectScope <$> objectValue .: "object"
             "session_state" -> pure SessionStateScope
             "transaction_state" -> pure TransactionStateScope
+            "user_variable" -> UserVariableScope <$> objectValue .: "name"
             _ -> fail ("unknown barrier scope: " <> T.unpack tag)
 
 instance FromJSON ScopedBarrier where

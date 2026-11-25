@@ -357,10 +357,23 @@ EOF
 reset_clickhouse() {
     local is_ready=0
     local attempt
-    local conn_args=(--host "$HOST" --port "$PORT" --user "$DB_USER")
+    local -a ch_cmd=()
+
+    if command -v "$CLICKHOUSE_CLIENT_BIN" >/dev/null 2>&1 || [[ -x "$CLICKHOUSE_CLIENT_BIN" ]]; then
+        ch_cmd=("$CLICKHOUSE_CLIENT_BIN" --host "$HOST" --port "$PORT" --user "$DB_USER")
+    elif [[ -n "$CONTAINER_NAME" ]] && command -v docker >/dev/null 2>&1; then
+        ch_cmd=(docker exec -i)
+        if [[ -n "$PASSWORD" ]]; then
+            ch_cmd+=(-e CLICKHOUSE_PASSWORD)
+        fi
+        ch_cmd+=("$CONTAINER_NAME" clickhouse-client --user "$DB_USER")
+    else
+        echo "[reset_db] Error: clickhouse-client not found on host and no --container-name fallback available" >&2
+        return 1
+    fi
 
     for ((attempt = 1; attempt <= MAX_WAIT_SECS * 5; attempt++)); do
-        if "$CLICKHOUSE_CLIENT_BIN" "${conn_args[@]}" --query "SELECT 1" >/dev/null 2>&1; then
+        if "${ch_cmd[@]}" --query "SELECT 1" >/dev/null 2>&1; then
             is_ready=1
             break
         fi
@@ -381,7 +394,7 @@ reset_clickhouse() {
     fi
 
     # Atomic databases drop asynchronously unless SYNC is specified.
-    "$CLICKHOUSE_CLIENT_BIN" "${conn_args[@]}" --multiquery <<EOF
+    "${ch_cmd[@]}" --multiquery <<EOF
 DROP DATABASE IF EXISTS \`${DBNAME}\` SYNC;
 CREATE DATABASE \`${DBNAME}\`;
 EOF

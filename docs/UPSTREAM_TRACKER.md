@@ -10,12 +10,17 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **UP-01** | **MySQL** | Prefix Index (`INDEX (col(N))`) | Parsed generically as `Expr::Function` instead of key-part length prefix | Erroneously tripped `visitor.has_function` in DDL, raising `UnknownStatementBarrier` (global fence) | Structural recognition in [`facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs) via `index_length_prefix_ident` | Add `length: Option<u64>` to `sqlparser::ast::IndexColumn` in `sqlparser-rs` |
 | **UP-02** | **SQLite** | Virtual Tables (`CREATE VIRTUAL TABLE ... USING module(...)`) | Module arguments are unparsed strings/idents; schema not extracted | Marked as unmodeled syntax, raising global `UnknownStatementBarrier` and locking subsequent slicing | Lower barrier scope to `RelationScope(name)` in [`facts.rs`](../rust/sqlparser-ffi/src/actions/facts.rs) | Provide structured column parsing for standard SQLite modules (`fts5`, `rtree`) |
-| **UP-03** | **MySQL** | User & System Variables (`SET @var`, `SET @@var`) | Variable scopes (user vs session vs global) are parsed but lack unified semantics | Generates `UnknownSessionEffectBarrier(scope: Global)` | Scope narrowing: route user variables (`@var`) to `UserVariableScope` | Refine `sqlparser::ast::Statement::SetVariable` variable scoping |
+| **UP-03** | **MySQL / MSSQL** | User & System Variables (`@var`, `@@var`, `SELECT ... INTO @var`) | Variable scopes (user vs session vs global) are parsed as session vars or expression identifiers lacking user-variable scope distinction | Previously generated `GlobalScope` barriers or polluted table `reads` with `@var` column names | Wired `UserVariableScope` across `SET @var`, `SELECT ... INTO @var`, MSSQL `OUTPUT INTO @var`, and in-expression `@var` refs; excluded `@`/`@@` from table column reads | Refine `sqlparser::ast::Statement::SetVariable` and expression variable nodes |
 | **UP-04** | **PostgreSQL** | Dynamic / Dollar-Quoted Routine Bodies | Functions defined in dollar quotes (`$$ ... $$`) contain nested SQL not visited by AST visitor | Functions cannot be statically inspected for read/write effects | Treated as unmodeled routine fence | Pluggable inner statement parser for routine bodies |
 | **UP-05** | **PostgreSQL** | Extended Statistics (`CREATE STATISTICS s0 ON ... FROM t0`) | Grammar lacks `STATISTICS` branch in `parse_create`; throws `Expected: an object type after CREATE, found: STATISTICS` | Raises `GlobalScope SyntaxErrorBarrier`, freezing entire script (affects 10 real fuzz units) | Blocked on AST representation; tracked for upstream submission | Add `Statement::CreateStatistics` in `sqlparser-rs` under `PostgreSqlDialect` |
 | **UP-06** | **SQLite** | PRAGMA Boolean / Word Literals (`PRAGMA key = true / ON`) | `parse_pragma` value expects `Number` or `SingleQuotedString`; rejects boolean words `true/on/off/false` | Raises `GlobalScope SyntaxErrorBarrier` (tripped in `sqlite_fuzz_recursive_trigger.sql:1`) | Numeric literals (`= 1/0`) work. Occam handles bare boolean words for SQLite `foreign_keys`; other PRAGMAs still depend on upstream parsing | Allow `Word` in `parse_pragma` value in `sqlparser-rs` |
 | **UP-07** | **MySQL** | Column Definition `BINARY` Attribute (`col CHAR(1) BINARY`) | `parse_column_def` parses `CHARACTER SET`/`COLLATE` but rejects bare `BINARY` attribute | Raises `GlobalScope SyntaxErrorBarrier` (tripped in `mysql_bug88355.sql:1,3`) | Blocked on AST representation; tracked for upstream submission | Support optional `BINARY` attribute in MySQL column options in `sqlparser-rs` |
 | **UP-08** | **ClickHouse** | Materialized View Storage Engine (`CREATE MATERIALIZED VIEW mv ENGINE = ... AS SELECT`) | `parse_create_view` expects `AS` immediately after view name; rejects ClickHouse `ENGINE = ...` | Raises `GlobalScope SyntaxErrorBarrier` on ClickHouse materialized views | Standard views without engine work; engine-bound views blocked upstream | Allow `ENGINE = ...` clause in `parse_create_view` under `ClickHouseDialect` |
+| **UP-09** | **ClickHouse** | DDL/Query Clauses & Types (`ALTER ... MATERIALIZE TTL`, `DETACH`/`ATTACH`, `SETTINGS`, `Array(JSON(...))`, `data.:Int64`, `ARRAY JOIN []`) | `ClickHouseDialect` parser rejects ClickHouse `TTL`/query `SETTINGS`, `DETACH`/`ATTACH TABLE`, parameterized `JSON(...)` type args, typed JSON path `.:Type`, and `ARRAY JOIN [...]` | Raises `GlobalScope SyntaxErrorBarrier` across 6 ClickHouse corpus scripts | Tracked upstream only (no local `sqlparser-rs` fork/patch); `ORDER BY tuple()` lifted locally | Extend `ClickHouseDialect` grammar & AST in `sqlparser-rs` |
+| **UP-10** | **DuckDB** | `PIVOT`, `ASOF RIGHT JOIN`, `E'...'` Escapes, Parenthesized `FROM` Filters | `DuckDbDialect` lacks top-level `PIVOT`, `ASOF RIGHT JOIN`, `E'\n'` escape mode, and certain subquery `WHERE` forms | Raises `GlobalScope SyntaxErrorBarrier` in 4 DuckDB corpus scripts | Tracked upstream only (no local `sqlparser-rs` fork/patch) | Support `PIVOT`, `ASOF RIGHT JOIN`, and DuckDB escape/subquery forms in `sqlparser-rs` |
+| **UP-11** | **MariaDB / MySQL** | `CREATE FULLTEXT INDEX`, `PREPARE ... FROM '...'`, Parenthesized `ADD COLUMN (...)` | `MySqlDialect` rejects `CREATE FULLTEXT INDEX`, string-form `PREPARE s FROM '...'`, and `ALTER TABLE ... ADD COLUMN (...)` | Raises `GlobalScope SyntaxErrorBarrier` in 3 MariaDB corpus scripts | Tracked upstream only (no local `sqlparser-rs` fork/patch) | Extend `MySqlDialect` DDL & `PREPARE` parsing in `sqlparser-rs` |
+| **UP-12** | **MySQL** | Multi-Table `ANALYZE TABLE t1, t2` | `parse_analyze` expects a single table / semicolon after first table (`expected a semicolon between statements`) | Raises `GlobalScope SyntaxErrorBarrier` (`mysql_bug26542829`) | Single-table `ANALYZE TABLE t` parses and extracts columns; bare `ANALYZE;` handled locally | Support comma-separated `ANALYZE TABLE` targets in `sqlparser-rs` |
+| **UP-13** | **PostgreSQL** | `DROP CONVERSION` | `CONVERSION` is missing from `DROP` object type dispatch | Raises `GlobalScope SyntaxErrorBarrier` (`pg_result_rte_lateral_assert.sql:6`) | Tracked upstream only (no local `sqlparser-rs` fork/patch) | Add `CONVERSION` to `ObjectType` and `parse_drop` in `sqlparser-rs` |
 
 ---
 
@@ -157,6 +162,55 @@ This document tracks syntax gaps, AST representation mismatches, and parsing lim
   Raises `GlobalScope SyntaxErrorBarrier` on ClickHouse materialized views.
 - **Proposed Upstream PR**:
   Under `ClickHouseDialect`, allow `parse_create_view` to parse optional `ENGINE = ...` table engine specification before `AS`.
+
+---
+
+### UP-09: ClickHouse DDL/Query Clauses & Types
+- **Affects**: ClickHouse
+- **Upstream Errors Observed** (`sqlparser-rs 0.64.0`):
+  - `Expected: ADD, RENAME, PARTITION, SWAP, DROP, REPLICA IDENTITY, SET, or SET TBLPROPERTIES after ALTER TABLE, found: MATERIALIZE` (`benchmarks/real_fuzz_corpus/clickhouse_alias_materialize_ttl_segv.sql`)
+  - `Expected: an SQL statement, found: DETACH` (`benchmarks/real_fuzz_corpus/clickhouse_alter_sorting_key_cast_segv.sql`)
+  - `Expected: ), found: (` on `Array(JSON(...))` and `Expected: an identifier or a '*' after '.', found: :` on `data.:Int64` (`benchmarks/real_fuzz_corpus/clickhouse_json_shared_variant_size_segv.sql`)
+  - `Expected: identifier, found: [` on `ARRAY JOIN []` (`benchmarks/real_fuzz_corpus/clickhouse_logical_expr_single_or_abort.sql`, `benchmarks/real_fuzz_corpus/clickhouse_logical_expr_nullable_chassert.sql`)
+  - Trailing query/DDL `SETTINGS ...` or `DETACH`/`ATTACH` statements splitting as `expected a semicolon between statements` (`benchmarks/real_fuzz_corpus/clickhouse_coalescing_projection_part_offset_segv.sql`)
+- **Occam Status**: Unpatched upstream gap; emits `SyntaxErrorBarrier` per failing unit while keeping `CREATE TABLE ... ORDER BY tuple()` unfenced locally.
+
+---
+
+### UP-10: DuckDB `PIVOT`, `ASOF RIGHT JOIN`, Escape Strings, and Parenthesized `FROM` Filters
+- **Affects**: DuckDB
+- **Upstream Errors Observed** (`sqlparser-rs 0.64.0`):
+  - `Expected: an SQL statement, found: PIVOT` (`benchmarks/real_fuzz_corpus/duckdb_pivot_full_join_columnref.sql`)
+  - `Expected: JOIN, found: RIGHT` on `ASOF RIGHT JOIN` (`benchmarks/real_fuzz_corpus/duckdb_asof_right_join_vector_ref.sql`)
+  - `Expected: ), found: '\n'` on `E'\n'` escape string literals (`benchmarks/real_fuzz_corpus/duckdb_recursive_cte_bind_column.sql`)
+  - `Expected: ), found: WHERE` on `SELECT ... FROM (VALUES ...) WHERE ...` (`benchmarks/real_fuzz_corpus/duckdb_window_subquery_tostring_internal.sql`)
+- **Occam Status**: Unpatched upstream gap; emits `SyntaxErrorBarrier` per failing unit.
+
+---
+
+### UP-11: MariaDB / MySQL `FULLTEXT INDEX`, `PREPARE ... FROM '...'`, and Parenthesized `ADD COLUMN (...)`
+- **Affects**: MariaDB, MySQL
+- **Upstream Errors Observed** (`sqlparser-rs 0.64.0`):
+  - `Expected: identifier, found: (` on `ALTER TABLE ... ADD COLUMN (...)` (`benchmarks/real_fuzz_corpus/mariadb_mdev24072_instant_alter_vcols_assert.sql`)
+  - `Expected: an object type after CREATE, found: FULLTEXT` (`benchmarks/real_fuzz_corpus/mariadb_mdev25295_duplicate_fulltext_index_assert.sql`)
+  - `Expected: AS, found: FROM` on `PREPARE s FROM '...'` (`benchmarks/real_fuzz_corpus/mariadb_mdev25460_prepare_set_statement_assert.sql`)
+- **Occam Status**: Unpatched upstream gap; emits `SyntaxErrorBarrier` per failing unit.
+
+---
+
+### UP-12: MySQL Multi-Table `ANALYZE TABLE`
+- **Affects**: MySQL
+- **Upstream Error Observed** (`sqlparser-rs 0.64.0`):
+  - `expected a semicolon between statements` on `ANALYZE TABLE t1, t2` (`benchmarks/real_fuzz_corpus/mysql_bug26542829_derived_datetime_range_assert.sql`)
+- **Occam Status**: Single-table `ANALYZE TABLE` parses natively and bare `ANALYZE;` emits `GlobalScope UnknownDDLBarrier`; multi-table lists require upstream `sqlparser-rs` support.
+
+---
+
+### UP-13: PostgreSQL `DROP CONVERSION`
+- **Affects**: PostgreSQL
+- **Upstream Error Observed** (`sqlparser-rs 0.64.0`):
+  - `Expected: ..., found: CONVERSION` (`benchmarks/real_fuzz_corpus/pg_result_rte_lateral_assert.sql`)
+- **Occam Status**: Unpatched upstream gap; emits `SyntaxErrorBarrier` for statement 5.
 
 ---
 

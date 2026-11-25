@@ -1,13 +1,15 @@
 # Reproducible target MySQL 8.0 image built with assertion checking (-DWITH_DEBUG=1)
-# and debug symbols on Ubuntu 18.04 for validating Occam reduction on authentic DBMS fuzz crashes.
-FROM ubuntu:18.04
+# and debug symbols on Ubuntu 20.04 for validating Occam reduction on authentic DBMS fuzz crashes.
+FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MYSQL_DATADIR="/var/lib/mysql"
 ENV MYSQL_LOGDIR="/var/log/mysql"
 
 # Install native system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN mkdir -p /var/lib/apt/lists/partial && \
+    apt-get -o Acquire::ForceIPv4=true update && \
+    apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libaio1 \
@@ -27,26 +29,26 @@ RUN echo "mysql-community-server mysql-community-server/root-pass password root"
     echo "mysql-community-server mysql-community-server/re-root-pass seen true" | debconf-set-selections
 
 # Download and install official MySQL Community Server 8.0.20 deb bundle with debug binaries
-ARG MYSQL_BUNDLE_URL=https://cdn.mysql.com/archives/mysql-8.0/mysql-server_8.0.20-1ubuntu18.04_amd64.deb-bundle.tar
+ARG MYSQL_BUNDLE_URL=https://cdn.mysql.com/archives/mysql-8.0/mysql-server_8.0.20-1ubuntu20.04_amd64.deb-bundle.tar
 # Optional integrity check; pass --build-arg MYSQL_BUNDLE_SHA256=<sha256>.
 ARG MYSQL_BUNDLE_SHA256=""
 
 RUN mkdir -p /tmp/mysql-debs && \
     cd /tmp/mysql-debs && \
-    curl -fSL "${MYSQL_BUNDLE_URL}" -o mysql-bundle.tar && \
+    curl -fSL --retry 5 --retry-delay 3 --retry-connrefused "${MYSQL_BUNDLE_URL}" -o mysql-bundle.tar && \
     if [ -n "${MYSQL_BUNDLE_SHA256}" ]; then \
         echo "${MYSQL_BUNDLE_SHA256}  mysql-bundle.tar" | sha256sum -c -; \
     fi && \
     tar -xf mysql-bundle.tar && \
-    dpkg -i mysql-common_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i libmysqlclient21_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-community-client-core_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-community-client_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-client_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-community-server-core_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-community-server_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-server_8.0.20-1ubuntu18.04_amd64.deb && \
-    dpkg -i mysql-community-server-debug_8.0.20-1ubuntu18.04_amd64.deb && \
+    dpkg -i mysql-common_*_amd64.deb && \
+    dpkg -i libmysqlclient21_*_amd64.deb && \
+    dpkg -i mysql-community-client-core_*_amd64.deb && \
+    dpkg -i mysql-community-client_*_amd64.deb && \
+    dpkg -i mysql-client_*_amd64.deb && \
+    dpkg -i mysql-community-server-core_*_amd64.deb && \
+    dpkg -i mysql-community-server_*_amd64.deb && \
+    dpkg -i mysql-server_*_amd64.deb && \
+    dpkg -i mysql-community-server-debug_*_amd64.deb && \
     cd / && \
     rm -rf /tmp/mysql-debs
 

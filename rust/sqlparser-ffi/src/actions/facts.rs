@@ -672,10 +672,16 @@ pub(crate) fn visitor_relations<'a>(
 fn collect_expr_col_parts(expr: &Expr, out: &mut Vec<Vec<String>>) -> bool {
     match expr {
         Expr::Identifier(ident) => {
+            if is_variable_ident(ident) {
+                return false;
+            }
             out.push(vec![ident.value.clone()]);
             true
         }
         Expr::CompoundIdentifier(idents) => {
+            if idents.first().is_some_and(is_variable_ident) {
+                return false;
+            }
             out.push(idents.iter().map(|i| i.value.clone()).collect());
             true
         }
@@ -1702,16 +1708,19 @@ impl Visitor for ConflictReadCollector<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
         let (ident, excluded) = match expr {
-            Expr::Identifier(ident) => (ident, false),
-            Expr::CompoundIdentifier(idents) => match idents.last() {
-                Some(last) => {
-                    let excluded = idents.first().is_some_and(|first| {
-                        first.quote_style.is_none() && first.value.eq_ignore_ascii_case("excluded")
-                    });
-                    (last, excluded)
+            Expr::Identifier(ident) if !is_variable_ident(ident) => (ident, false),
+            Expr::CompoundIdentifier(idents) if !idents.first().is_some_and(is_variable_ident) => {
+                match idents.last() {
+                    Some(last) => {
+                        let excluded = idents.first().is_some_and(|first| {
+                            first.quote_style.is_none()
+                                && first.value.eq_ignore_ascii_case("excluded")
+                        });
+                        (last, excluded)
+                    }
+                    None => return std::ops::ControlFlow::Continue(()),
                 }
-                None => return std::ops::ControlFlow::Continue(()),
-            },
+            }
             _ => return std::ops::ControlFlow::Continue(()),
         };
         let column = canonical_ident(ident, self.rules, ir::IdentifierClass::Column);
@@ -1858,18 +1867,20 @@ impl Visitor for DuplicateReadCollector<'_> {
             return std::ops::ControlFlow::Continue(());
         }
         let (ident, proposed) = match expr {
-            Expr::Identifier(ident) => (ident, self.values_depth > 0),
-            Expr::CompoundIdentifier(idents) => match idents.last() {
-                Some(last) => {
-                    let proposed = self.values_depth > 0
-                        || idents.first().is_some_and(|first| {
-                            self.row_alias
-                                .is_some_and(|alias| first.value.eq_ignore_ascii_case(alias))
-                        });
-                    (last, proposed)
+            Expr::Identifier(ident) if !is_variable_ident(ident) => (ident, self.values_depth > 0),
+            Expr::CompoundIdentifier(idents) if !idents.first().is_some_and(is_variable_ident) => {
+                match idents.last() {
+                    Some(last) => {
+                        let proposed = self.values_depth > 0
+                            || idents.first().is_some_and(|first| {
+                                self.row_alias
+                                    .is_some_and(|alias| first.value.eq_ignore_ascii_case(alias))
+                            });
+                        (last, proposed)
+                    }
+                    None => return std::ops::ControlFlow::Continue(()),
                 }
-                None => return std::ops::ControlFlow::Continue(()),
-            },
+            }
             _ => return std::ops::ControlFlow::Continue(()),
         };
         let column = canonical_ident(ident, self.rules, ir::IdentifierClass::Column);
@@ -2524,7 +2535,20 @@ fn merge_nested(facts: &mut ir::NativeFacts, nested_facts: Vec<ir::NativeFacts>)
         facts.session.extend(nested.session);
         facts.pre_tx.extend(nested.pre_tx);
         facts.post_tx.extend(nested.post_tx);
-        facts.barriers.extend(nested.barriers);
+        for b in nested.barriers {
+            let dup_user_var = matches!(
+                &b.scope,
+                ir::BarrierScope::UserVariable { name }
+                    if facts.barriers.iter().any(|existing| matches!(
+                        &existing.scope,
+                        ir::BarrierScope::UserVariable { name: existing_name }
+                            if existing_name == name
+                    ))
+            );
+            if !dup_user_var {
+                facts.barriers.push(b);
+            }
+        }
     }
 }
 
@@ -2998,6 +3022,29 @@ pub(crate) fn set_effects(
     keyword: Option<ContextModifier>,
     rules: &ir::IdentifierRules,
 ) -> (Vec<ir::SessionEffect>, Vec<ir::ScopedBarrier>) {
+    if let [ObjectNamePart::Identifier(ident)] = variable.0.as_slice()
+        && is_user_variable_ident(ident)
+    {
+        if keyword.is_some() {
+            return (
+                Vec::new(),
+                vec![global_barrier(
+                    ir::BarrierReason::UnknownSessionEffect,
+                    Some("SET user variable with an unmodeled scope modifier".to_string()),
+                )],
+            );
+        }
+        let name = canonical_ident(ident, rules, ir::IdentifierClass::Other);
+        let detail = format!("user variable {}", name.0);
+        return (
+            Vec::new(),
+            vec![barrier(
+                ir::BarrierScope::UserVariable { name },
+                ir::BarrierReason::UnknownSessionEffect,
+                Some(detail),
+            )],
+        );
+    }
     let scope = context_scope(keyword);
     let Some(name) = name_from_object(variable, rules, ir::IdentifierClass::Other) else {
         return (
@@ -4035,6 +4082,49 @@ pub(crate) fn sequence_effects_for_statement<'a>(
     visitor
 }
 
+fn is_empty_clickhouse_tuple(expr: &Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    if function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return false;
+    }
+    let [ObjectNamePart::Identifier(ident)] = function.name.0.as_slice() else {
+        return false;
+    };
+    ident.quote_style.is_none()
+        && ident.value.eq_ignore_ascii_case("tuple")
+        && matches!(
+            &function.args,
+            FunctionArguments::List(list)
+                if list.args.is_empty()
+                    && list.duplicate_treatment.is_none()
+                    && list.clauses.is_empty()
+        )
+}
+
+fn is_mysql_user_var_select_into(query: &Query, dialect: DialectKind) -> bool {
+    dialect == DialectKind::MySql
+        && matches!(
+            query.body.as_ref(),
+            SetExpr::Select(select)
+                if select.into.as_ref().is_some_and(|into| {
+                    !into.temporary
+                        && !into.unlogged
+                        && !into.table
+                        && !into.targets.is_empty()
+                        && into.targets.iter().all(|target| {
+                            matches!(target, Expr::Identifier(ident) if is_user_variable_ident(ident))
+                        })
+                })
+        )
+}
+
 /// Analyzes a single SQL statement AST to extract relational dependencies, session/tx effects,
 /// barriers, and syntactic reduction edits into [`ir::NativeFacts`].
 pub(crate) fn analyze_statement(
@@ -4068,14 +4158,26 @@ pub(crate) fn analyze_statement(
         // relations inside nested data-modifying CTEs.
         visitor.gate_nested_dml = false;
     }
-    if let Statement::CreateTable(create) = statement
-        && let Some(partition_by) = &create.partition_by
-    {
-        // The partitioning scheme lowers its keyword (`RANGE`/`LIST`/`HASH`)
-        // as `Function`, but it names no routine and creates no dependency
-        // edge, so the whole scheme subtree is excluded from the
-        // deferred-function check.
-        visitor.ignored_function_roots.push(partition_by.span());
+    if let Statement::CreateTable(create) = statement {
+        if let Some(partition_by) = &create.partition_by {
+            // The partitioning scheme lowers its keyword (`RANGE`/`LIST`/`HASH`)
+            // as `Function`, but it names no routine and creates no dependency
+            // edge, so the whole scheme subtree is excluded from the
+            // deferred-function check.
+            visitor.ignored_function_roots.push(partition_by.span());
+        }
+        if dialect == DialectKind::ClickHouse {
+            let order_exprs: &[Expr] = match &create.order_by {
+                Some(OneOrManyWithParens::One(expr)) => std::slice::from_ref(expr),
+                Some(OneOrManyWithParens::Many(exprs)) => exprs.as_slice(),
+                None => &[],
+            };
+            for expr in order_exprs.iter().chain(create.primary_key.as_deref()) {
+                if is_empty_clickhouse_tuple(expr) {
+                    visitor.ignored_function_roots.push(expr.span());
+                }
+            }
+        }
     }
     if matches!(dialect, DialectKind::MySql) {
         // MySQL index length prefixes (`col(N)`) lower as `Expr::Function`
@@ -4129,6 +4231,27 @@ pub(crate) fn analyze_statement(
                 .extend(values_marker_spans(assignments));
         }
         visitor.sequences = Some(seq_visitor);
+    }
+    // MSSQL `OUTPUT ... INTO`: the output rows are additionally inserted
+    // into the target. A real table becomes a second write edge (emitted
+    // after the match so it lands after the host write); a table variable
+    // has no catalog entry and is fenced at relation scope; `OUTPUT`
+    // without `INTO` is a read-only projection with no extra edge.
+    let output = match statement {
+        Statement::Insert(insert) => insert.output.as_ref(),
+        Statement::Update(update) => update.output.as_ref(),
+        Statement::Delete(delete) => delete.output.as_ref(),
+        Statement::Merge(merge) => merge.output.as_ref(),
+        _ => None,
+    };
+    if let Some(OutputClause::Output {
+        into_table: Some(into),
+        ..
+    }) = output
+    {
+        for target in &into.targets {
+            visitor.ignored_user_var_spans.push(target.span());
+        }
     }
     let _ = statement.visit(&mut visitor);
     let mut facts = ir::NativeFacts::default();
@@ -4190,18 +4313,6 @@ pub(crate) fn analyze_statement(
             Some("SELECT INTO outside a standalone query".to_string()),
         ));
     }
-    // MSSQL `OUTPUT ... INTO`: the output rows are additionally inserted
-    // into the target. A real table becomes a second write edge (emitted
-    // after the match so it lands after the host write); a table variable
-    // has no catalog entry and is fenced at relation scope; `OUTPUT`
-    // without `INTO` is a read-only projection with no extra edge.
-    let output = match statement {
-        Statement::Insert(insert) => insert.output.as_ref(),
-        Statement::Update(update) => update.output.as_ref(),
-        Statement::Delete(delete) => delete.output.as_ref(),
-        Statement::Merge(merge) => merge.output.as_ref(),
-        _ => None,
-    };
     if implicit_commit(dialect, statement) {
         // The statement runs in its own implicit transaction: close any active
         // transaction before it and the implicit one after it.
@@ -4234,7 +4345,10 @@ pub(crate) fn analyze_statement(
                     facts.ops.push(ir::CatalogOp::DefineTable(table));
                 }
                 None => {
-                    if visitor.select_into_count > 0 {
+                    if visitor.select_into_count > 0
+                        && !(visitor.select_into_count == 1
+                            && is_mysql_user_var_select_into(query, dialect))
+                    {
                         facts.barriers.push(global_barrier(
                             ir::BarrierReason::UnknownDml,
                             Some(
@@ -5071,6 +5185,10 @@ pub(crate) fn analyze_statement(
             facts.session.extend(effects);
             facts.barriers.extend(barriers);
             facts.post_tx.extend(transactions);
+            let nested = analyze_nested(set, context, false);
+            add_reads(&mut facts, visitor_reads(&visitor, &[], ir::ReadMode::Data));
+            add_unmodeled_barriers(&mut facts, &visitor, &[]);
+            merge_nested(&mut facts, nested);
         }
         Statement::Reset(reset) => {
             let (effects, barriers) = reset_effects(&reset.reset, rules);
@@ -5310,36 +5428,40 @@ pub(crate) fn analyze_statement(
                 }
             }
         }
-        Statement::Analyze(analyze) => {
-            if let Some(name) = &analyze.table_name {
-                match relation_ref(name, dialect, rules) {
-                    Some(target) => {
-                        let cols = analyze
-                            .columns
-                            .iter()
-                            .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
-                            .collect();
-                        facts.ops.push(ir::CatalogOp::Read(read_fact(
-                            target.clone(),
-                            ir::ReadMode::Data,
-                            cols,
-                            false,
-                        )));
-                        facts.barriers.push(barrier(
-                            ir::BarrierScope::Relation { relation: target },
-                            ir::BarrierReason::UnknownDdl,
-                            Some(format!("ANALYZE on relation {}", name)),
-                        ));
-                    }
-                    None => {
-                        facts.barriers.push(global_barrier(
-                            ir::BarrierReason::UnknownRelation,
-                            Some(name.to_string()),
-                        ));
-                    }
+        Statement::Analyze(analyze) => match &analyze.table_name {
+            Some(name) => match relation_ref(name, dialect, rules) {
+                Some(target) => {
+                    let cols = analyze
+                        .columns
+                        .iter()
+                        .map(|col| canonical_ident(col, rules, ir::IdentifierClass::Column))
+                        .collect();
+                    facts.ops.push(ir::CatalogOp::Read(read_fact(
+                        target.clone(),
+                        ir::ReadMode::Data,
+                        cols,
+                        false,
+                    )));
+                    facts.barriers.push(barrier(
+                        ir::BarrierScope::Relation { relation: target },
+                        ir::BarrierReason::UnknownDdl,
+                        Some(format!("ANALYZE on relation {}", name)),
+                    ));
                 }
+                None => {
+                    facts.barriers.push(global_barrier(
+                        ir::BarrierReason::UnknownRelation,
+                        Some(name.to_string()),
+                    ));
+                }
+            },
+            None => {
+                facts.barriers.push(global_barrier(
+                    ir::BarrierReason::UnknownDdl,
+                    Some(statement.to_string()),
+                ));
             }
-        }
+        },
         Statement::CreateDatabase {
             db_name,
             location: None,
@@ -5495,6 +5617,20 @@ pub(crate) fn analyze_statement(
             ir::BarrierReason::UnknownSessionEffect,
             Some("unmodeled session variable effects".to_string()),
         ));
+    }
+    for var_name in &visitor.user_vars {
+        let already_fenced = facts.barriers.iter().any(|existing| {
+            matches!(&existing.scope, ir::BarrierScope::UserVariable { name } if name == var_name)
+        });
+        if !already_fenced {
+            facts.barriers.push(barrier(
+                ir::BarrierScope::UserVariable {
+                    name: var_name.clone(),
+                },
+                ir::BarrierReason::UnsupportedExpression,
+                Some(format!("user variable {}", var_name.0)),
+            ));
+        }
     }
     // A sequence can be referenced from both the outer statement and a nested
     // DML statement that is analyzed separately (for example a data-modifying
