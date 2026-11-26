@@ -12,16 +12,25 @@ import Occam.Core (Statement (stmtRaw), StatementId (..), oracleAccepts)
 import Occam.Dependency (DependencyGraph, analyzeStatements)
 import Occam.Logger (nullLogger)
 import Occam.Parser (
+    CaseFolding (..),
+    DialectFeature (..),
+    DialectProfile (..),
+    IdentifierProfile (..),
+    LexicalProfile (..),
     ParsedSQL (..),
     SQLDialect (..),
     StatementUnit (..),
+    allDialectProfiles,
+    applyCaseFolding,
     defaultParseOptions,
+    dialectHasFeature,
+    dialectProfile,
     parseSQL,
  )
 import Occam.Pool (poolOracle)
 import Occam.Reducer (
     ReductionConfig (..),
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     isValidClosure,
     reduceSQLWithConfig,
     statementAudit,
@@ -51,7 +60,7 @@ phase3Tests =
                         , "CREATE INDEX i1 ON t1 (a);"
                         , "SELECT * FROM t1 WHERE a > 0 ORDER BY a LIMIT 1;"
                         ]
-            withGraph GenericSQL script $ \graph -> do
+            withGraph SQLite script $ \graph -> do
                 assertBool
                     "table, data, index, and query form a valid conservative closure"
                     (isValidClosure graph (Set.fromList [StatementId 1, StatementId 3, StatementId 4, StatementId 5]))
@@ -75,7 +84,7 @@ phase3Tests =
                         hasIns = BSC.isInfixOf "INSERT INTO t1" sql
                         hasSel = BSC.isInfixOf "SELECT" sql && BSC.isInfixOf "WHERE a > 0" sql
                     pure (hasT1 && hasIns && hasSel)
-                config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+                config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
             pool <- testPredicatePool predicate
             reduced <- reduceSQLWithConfig config nullLogger pool script
             ok <- oracleAccepts (poolOracle pool) reduced
@@ -102,10 +111,34 @@ phase7Tests =
                     "CREATE TRIGGER trg AFTER INSERT ON t BEGIN UPDATE t SET a = 1; UPDATE t SET a = 2; END"
                     "SELECT 2"
                , check MySQL "CREATE TABLE `t` (`c` CHAR(8), INDEX (`c`(4)))" "SELECT 2"
+               , check MariaDB "CREATE TABLE `t` (`c` CHAR(8), INDEX (`c`(4)))" "SELECT 2"
                , check DuckDB "SELECT * FROM range(3) QUALIFY row_number() OVER () = 1" "SELECT 2"
-               , check MsSql "SELECT TOP (1) [a] FROM [t]" "SELECT 2"
-               , check Oracle "SELECT seq.NEXTVAL FROM dual" "SELECT 2 FROM dual"
-               , check BigQuery "SELECT * EXCEPT (a) FROM `project.dataset.t`" "SELECT 2"
+               , check
+                    ClickHouse
+                    "CREATE TABLE t (a UInt32) ENGINE = MergeTree ORDER BY tuple()"
+                    "SELECT 2"
+               , testCase "DialectProfile covers all 6 active dialects and distinct capabilities" $ do
+                    assertEqual "profile count" 6 (length allDialectProfiles)
+                    assertEqual
+                        "every Enum dialect maps to itself"
+                        [minBound .. maxBound]
+                        (map (dialectId . dialectProfile) [minBound .. maxBound])
+                    assertBool
+                        "PostgreSQL enables dollar quoting"
+                        (lexDollarQuoting (dialectLexical (dialectProfile PostgreSQL)))
+                    assertBool
+                        "MariaDB has sequence DDL while MySQL does not"
+                        ( dialectHasFeature MariaDB FeatureSequenceDDL
+                            && not (dialectHasFeature MySQL FeatureSequenceDDL)
+                        )
+                    assertEqual
+                        "SQLite folds ASCII only"
+                        "t_É"
+                        (applyCaseFolding (identUnquotedFolding (dialectIdentifiers (dialectProfile SQLite))) "T_É")
+                    assertEqual
+                        "ClickHouse preserves identifier case"
+                        FoldPreserve
+                        (identUnquotedFolding (dialectIdentifiers (dialectProfile ClickHouse)))
                ]
         )
     where
@@ -141,7 +174,7 @@ phase8Tests =
                                 hasSel = BSC.isInfixOf "SELECT * FROM t1 WHERE a > 0" sql
                             pure (hasT1 && hasIns && hasSel)
                     pool <- testPredicatePool predicate
-                    reduced <- reduce GenericSQL pool script
+                    reduced <- reduce SQLite pool script
                     accepted <- oracleAccepts (poolOracle pool) reduced
                     assertBool (name ++ " must satisfy oracle") accepted
                     assertBool (name ++ " should remove dead table t2") (not (BSC.isInfixOf "t2" reduced))

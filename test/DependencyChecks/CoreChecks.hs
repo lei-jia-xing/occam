@@ -106,7 +106,7 @@ checks =
                     [ "CREATE TABLE actual (id INT);"
                     , "SELECT missing.id FROM actual;"
                     ]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let readFacts = readsFor (StatementId 2) graph
         assertBool
             "an unresolved qualifier emits no column use"
@@ -270,7 +270,7 @@ checks =
             (has (StatementId 1) deps && has (StatementId 2) deps)
     , testCase "TRUNCATE records a table write" $ do
         let sql = BSC.unlines ["CREATE TABLE items (id INT);", "TRUNCATE TABLE items;"]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let writes = writesFor (StatementId 2) graph
         assertBool
             "TRUNCATE modifies its target table"
@@ -503,44 +503,6 @@ checks =
             (definedColumns ["EventsLog"] (opsFor (StatementId 1) graph))
         assertBool "SELECT EventId depends on EventsLog" (has (StatementId 1) depsS3)
         assertBool "SELECT EventId has no dependency on OtherLog" (not (has (StatementId 2) depsS3))
-    , testCase "Oracle dependency extraction handles tables, DUAL, and identifier casing" $ do
-        let sql =
-                BSC.unlines
-                    [ "CREATE TABLE dept (\"DeptId\" NUMBER(10), DeptName VARCHAR2(50));"
-                    , "CREATE TABLE other (id NUMBER(10));"
-                    , "SELECT \"DeptId\", DeptName FROM dept;"
-                    , "SELECT 1 FROM dual;"
-                    ]
-        graph <- analyze Oracle sql
-        let depsS3 = dependenciesFor (StatementId 3) graph
-            depsS4 = dependenciesFor (StatementId 4) graph
-        assertEqual
-            "Oracle folds unquoted identifiers to upper case and preserves quoted identifier case"
-            ["DeptId", "DEPTNAME"]
-            (definedColumns ["DEPT"] (opsFor (StatementId 1) graph))
-        assertBool "SELECT from dept depends on dept" (has (StatementId 1) depsS3)
-        assertBool "SELECT from dept does not depend on other" (not (has (StatementId 2) depsS3))
-        assertBool
-            "SELECT from dual records a read on dual"
-            (hasRead ["DUAL"] (opsFor (StatementId 4) graph))
-        assertBool
-            "SELECT from dual does not depend on other tables"
-            (not (has (StatementId 1) depsS4 || has (StatementId 2) depsS4))
-    , testCase "MsSql dependency extraction handles bracketed identifiers and schema qualification" $ do
-        let sql =
-                BSC.unlines
-                    [ "CREATE TABLE [dbo].[users] ([UserId] INT, [UserName] NVARCHAR(50));"
-                    , "CREATE TABLE [dbo].[other] ([id] INT);"
-                    , "SELECT [UserId], [UserName] FROM [dbo].[users];"
-                    ]
-        graph <- analyze MsSql sql
-        let depsS3 = dependenciesFor (StatementId 3) graph
-        assertEqual
-            "MsSql folds case-insensitive bracketed identifiers"
-            ["userid", "username"]
-            (definedColumns ["dbo", "users"] (opsFor (StatementId 1) graph))
-        assertBool "SELECT from users depends on users" (has (StatementId 1) depsS3)
-        assertBool "SELECT from users does not depend on other" (not (has (StatementId 2) depsS3))
     , testCase "triggers do not create global serialization barriers across unrelated tables" $ do
         let sql =
                 BSC.unlines
@@ -606,7 +568,7 @@ checks =
                     , "CREATE TABLE untouched_tbl (id INT);"
                     , "MERGE INTO target_tbl USING source_tbl ON target_tbl.id = source_tbl.id WHEN MATCHED THEN UPDATE SET val = source_tbl.val;"
                     ]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let mergeDeps = dependenciesFor (StatementId 4) graph
         assertBool
             "MERGE has a write on target_tbl"

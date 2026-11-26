@@ -138,7 +138,9 @@ tests =
                 ( \extra ->
                     mapM_
                         ( \command -> withCLIInput "SELECT 1;" $ \input outFile -> do
-                            (code, _, _) <- runOccamCLI ([input, "--oracle", command, "--out", outFile, "--quiet"] ++ extra)
+                            (code, _, _) <-
+                                runOccamCLI
+                                    ([input, "--dialect", "sqlite", "--oracle", command, "--out", outFile, "--quiet"] ++ extra)
                             assertBool ("Noninteresting input was accepted: " ++ command) (code /= ExitSuccess)
                             exists <- doesFileExist outFile
                             assertBool "Reduction started before the initial predicate accepted" (not exists)
@@ -161,7 +163,9 @@ tests =
                         ++ " -c \"import sys; s=sys.stdin.read(); sys.exit(0 if 'WHERE a > 0' in s and 'CREATE TABLE t1' in s and 'INSERT INTO t1' in s else 1)\""
             mapM_
                 ( \extra -> withCLIInput initialSQL $ \input outFile -> do
-                    (code, _, err) <- runOccamCLI ([input, "--oracle", predicate, "--out", outFile, "--quiet"] ++ extra)
+                    (code, _, err) <-
+                        runOccamCLI
+                            ([input, "--dialect", "sqlite", "--oracle", predicate, "--out", outFile, "--quiet"] ++ extra)
                     assertEqual ("Reduction failed: " ++ err) ExitSuccess code
                     reduced <- BSC.readFile outFile
                     (verified, _, _) <- readCreateProcessWithExitCode (shell predicate) (BSC.unpack reduced)
@@ -180,6 +184,8 @@ tests =
                             (code, _, _) <-
                                 runOccamCLI
                                     ( [ input
+                                      , "--dialect"
+                                      , "sqlite"
                                       , "--oracle"
                                       , predicate
                                       , "--max-oracle-executions"
@@ -232,7 +238,10 @@ tests =
                     mapM_
                         ( \jobs -> withCLIInput "SELECT 1;" $ \input outFile -> do
                             (code, _, _) <-
-                                runOccamCLI ([input, "--oracle", "exit 0", "--out", outFile, "--jobs", jobs, "--quiet"] ++ extra)
+                                runOccamCLI
+                                    ( [input, "--dialect", "sqlite", "--oracle", "exit 0", "--out", outFile, "--jobs", jobs, "--quiet"]
+                                        ++ extra
+                                    )
                             assertBool ("invalid --jobs was accepted: " ++ jobs) (code /= ExitSuccess)
                             exists <- doesFileExist outFile
                             assertBool "reduction started with invalid --jobs" (not exists)
@@ -248,7 +257,18 @@ tests =
                 mapM_
                     ( \mode -> do
                         (code, _, _) <-
-                            runOccamCLI [input, "--oracle", "exit 0", "--out", outFile, "--column-mode", mode, "--quiet"]
+                            runOccamCLI
+                                [ input
+                                , "--dialect"
+                                , "sqlite"
+                                , "--oracle"
+                                , "exit 0"
+                                , "--out"
+                                , outFile
+                                , "--column-mode"
+                                , mode
+                                , "--quiet"
+                                ]
                         assertBool ("bad --column-mode was accepted: " ++ mode) (code /= ExitSuccess)
                         exists <- doesFileExist outFile
                         assertBool "reduction started with bad --column-mode" (not exists)
@@ -261,7 +281,18 @@ tests =
                     mapM_
                         ( \mode -> do
                             (code, _, err) <-
-                                runOccamCLI [input, "--oracle", oracle, "--out", outFile, "--column-mode", mode, "--quiet"]
+                                runOccamCLI
+                                    [ input
+                                    , "--dialect"
+                                    , "sqlite"
+                                    , "--oracle"
+                                    , oracle
+                                    , "--out"
+                                    , outFile
+                                    , "--column-mode"
+                                    , mode
+                                    , "--quiet"
+                                    ]
                             assertBool ("column mode without intra-statement was accepted: " ++ mode) (code /= ExitSuccess)
                             assertBool "wrong rejection reason" ("--intra-statement" `elem` words err)
                             exists <- doesFileExist outFile
@@ -275,7 +306,10 @@ tests =
             assertEqual "help must exit zero" ExitSuccess helpCode
             assertEqual
                 "usage and options should appear before any explanatory text"
-                ["Usage: occam INPUT.sql (--oracle COMMAND | --result-oracle) [OPTIONS]", "", "Available options:"]
+                [ "Usage: occam INPUT.sql -d DIALECT (--oracle COMMAND | --result-oracle) [OPTIONS]"
+                , ""
+                , "Available options:"
+                ]
                 (take 3 (lines helpOut))
             assertEqual
                 "input, oracle, and output should be listed first"
@@ -305,12 +339,13 @@ tests =
             withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
                 let predicate = "grep -q 'SELECT 2'"
                 (code, out, _) <-
-                    runOccamCLI [input, "-c", predicate, "--max-oracle-executions", "2", "--quiet"]
+                    runOccamCLI [input, "-d", "sqlite", "-c", predicate, "--max-oracle-executions", "2", "--quiet"]
                 assertBool "budget exhaustion must remain nonzero" (code /= ExitSuccess)
                 assertEqual "preflight must leave one call for reduction" "SELECT 2;" out
         , testCase "--out - keeps stdout pure SQL under --verbose" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\n" $ \input _ -> do
-                (code, out, _) <- runOccamCLI [input, "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
+                (code, out, _) <-
+                    runOccamCLI [input, "-d", "sqlite", "--oracle", "grep -q INSERT", "--out", "-", "--verbose"]
                 assertEqual "reduction failed" ExitSuccess code
                 assertBool "stdout missing reduced SQL" ("INSERT" `isInfixOf` out)
         , testCase "--dump-facts emits per-statement JSON and stays hidden from --help" $
@@ -328,6 +363,7 @@ tests =
             assertEqual "--list-dialects exit code" ExitSuccess dCode
             assertBool "missing sqlite in --list-dialects" ("sqlite" `isInfixOf` dOut)
             assertBool "missing postgresql in --list-dialects" ("postgresql" `isInfixOf` dOut)
+            assertBool "missing mariadb in --list-dialects" ("mariadb" `isInfixOf` dOut)
 
             (mCode, mOut, _) <- runOccamCLI ["--list-column-modes"]
             assertEqual "--list-column-modes exit code" ExitSuccess mCode
@@ -346,7 +382,7 @@ tests =
                 Right defaults -> do
                     assertEqual "default timeout" (Just (Number 10)) (Map.lookup "timeout" defaults)
                     assertEqual "default jobs" (Just (Number 1)) (Map.lookup "jobs" defaults)
-                    assertEqual "default dialect" (Just (String "generic")) (Map.lookup "dialect" defaults)
+                    assertEqual "no default dialect" Nothing (Map.lookup "dialect" defaults)
                     assertEqual "default strategy" (Just (String "full")) (Map.lookup "strategy" defaults)
                     assertEqual
                         "default statement_order"
@@ -401,6 +437,7 @@ tests =
             assertEqual "dialect completion exit code" ExitSuccess dCode
             assertBool "completion includes postgresql" ("postgresql" `isInfixOf` dOut)
             assertBool "completion includes mysql" ("mysql" `isInfixOf` dOut)
+            assertBool "completion includes mariadb" ("mariadb" `isInfixOf` dOut)
             assertBool "completion includes sqlite" ("sqlite" `isInfixOf` dOut)
 
             (sCode, sOut, _) <-
@@ -509,7 +546,7 @@ tests =
             assertBool "invalid shell error message" ("Expected 'bash', 'zsh', or 'fish'" `isInfixOf` invErr)
         , testCase "CLI requires in-place mode to overwrite the input" $
             withCLIInput "SELECT 1; SELECT 2;" $ \input _ -> do
-                (code, _, err) <- runOccamCLI [input, "-c", "exit 0", "--out", input]
+                (code, _, err) <- runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--out", input]
                 assertEqual ("--out input must exit 2: " ++ err) (ExitFailure 2) code
                 inputAfter <- BS.readFile input
                 assertEqual "input file changed" "SELECT 1; SELECT 2;" inputAfter
@@ -527,61 +564,65 @@ tests =
         , testCase "CLI rejects --stats paths that collide with input or output" $
             withCLIInput "SELECT 1;" $ \input outFile -> do
                 (inputCode, _, inputErr) <-
-                    runOccamCLI [input, "-c", "exit 0", "--stats", input]
+                    runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--stats", input]
                 assertEqual ("--stats input must exit 2: " ++ inputErr) (ExitFailure 2) inputCode
                 inputAfter <- BS.readFile input
                 assertEqual "input was overwritten by stats" "SELECT 1;" inputAfter
 
                 (outputCode, _, outputErr) <-
-                    runOccamCLI [input, "-c", "exit 0", "--out", outFile, "--stats", outFile]
+                    runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--out", outFile, "--stats", outFile]
                 assertEqual ("--stats output must exit 2: " ++ outputErr) (ExitFailure 2) outputCode
 
                 let backup = input ++ ".bak"
                 (backupCode, _, backupErr) <-
-                    runOccamCLI [input, "-i", "-c", "exit 0", "--stats", backup]
+                    runOccamCLI [input, "-d", "sqlite", "-i", "-c", "exit 0", "--stats", backup]
                 assertEqual ("--stats backup must exit 2: " ++ backupErr) (ExitFailure 2) backupCode
                 backupExists <- doesFileExist backup
                 when backupExists (removeFile backup)
         , testCase "CLI strictly rejects conflicting arguments with exit code 2" $ do
-            (code1, _, err1) <- runOccamCLI ["input.sql", "--verbose", "--quiet", "-c", "exit 0"]
+            (code1, _, err1) <-
+                runOccamCLI ["input.sql", "-d", "sqlite", "--verbose", "--quiet", "-c", "exit 0"]
             assertEqual "verbose + quiet must exit 2" (ExitFailure 2) code1
             assertBool
                 "wrong error for verbose + quiet"
                 ("Cannot specify both --verbose and --quiet" `isInfixOf` err1)
 
-            (code2, _, err2) <- runOccamCLI ["input.sql", "-i", "-o", "out.sql", "-c", "exit 0"]
+            (code2, _, err2) <- runOccamCLI ["input.sql", "-d", "sqlite", "-i", "-o", "out.sql", "-c", "exit 0"]
             assertEqual "in-place + out must exit 2" (ExitFailure 2) code2
             assertBool
                 "wrong error for in-place + out"
                 ("Cannot specify both --in-place and --out" `isInfixOf` err2)
 
-            (code3, _, err3) <- runOccamCLI ["-", "-i", "-c", "exit 0"]
+            (code3, _, err3) <- runOccamCLI ["-", "-d", "sqlite", "-i", "-c", "exit 0"]
             assertEqual "in-place on stdin must exit 2" (ExitFailure 2) code3
             assertBool "wrong error for in-place on stdin" ("Cannot modify stdin in place" `isInfixOf` err3)
 
             (code4, _, err4) <-
-                runOccamCLI ["input.sql", "--strategy", "ddmin-only", "--slicing", "-c", "exit 0"]
+                runOccamCLI ["input.sql", "-d", "sqlite", "--strategy", "ddmin-only", "--slicing", "-c", "exit 0"]
             assertEqual "ddmin-only + slicing must exit 2" (ExitFailure 2) code4
             assertBool
                 "wrong error for ddmin-only + slicing"
                 ("--slicing conflicts with --strategy ddmin-only" `isInfixOf` err4)
 
             (code5, _, err5) <-
-                runOccamCLI ["input.sql", "--strategy", "audit-only", "--intra-statement", "-c", "exit 0"]
+                runOccamCLI
+                    ["input.sql", "-d", "sqlite", "--strategy", "audit-only", "--intra-statement", "-c", "exit 0"]
             assertEqual "audit-only + intra-statement must exit 2" (ExitFailure 2) code5
             assertBool
                 "wrong error for audit-only + intra-statement"
                 ("--intra-statement conflicts with --strategy audit-only" `isInfixOf` err5)
 
             (code6, _, err6) <-
-                runOccamCLI ["input.sql", "--strategy", "ddmin-only", "--intra-statement", "-c", "exit 0"]
+                runOccamCLI
+                    ["input.sql", "-d", "sqlite", "--strategy", "ddmin-only", "--intra-statement", "-c", "exit 0"]
             assertEqual "ddmin-only + intra-statement must exit 2" (ExitFailure 2) code6
             assertBool
                 "wrong error for ddmin-only + intra-statement"
                 ("--intra-statement conflicts with --strategy ddmin-only" `isInfixOf` err6)
 
             (code7, _, err7) <-
-                runOccamCLI ["input.sql", "--strategy", "audit-only", "--unrestricted", "-c", "exit 0"]
+                runOccamCLI
+                    ["input.sql", "-d", "sqlite", "--strategy", "audit-only", "--unrestricted", "-c", "exit 0"]
             assertEqual "audit-only + unrestricted must exit 2" (ExitFailure 2) code7
             assertBool
                 "wrong error for audit-only + unrestricted"
@@ -589,28 +630,37 @@ tests =
 
             (code8, _, err8) <-
                 runOccamCLI
-                    ["input.sql", "--strategy", "audit-only", "--statement-order", "complement-first", "-c", "exit 0"]
+                    [ "input.sql"
+                    , "-d"
+                    , "sqlite"
+                    , "--strategy"
+                    , "audit-only"
+                    , "--statement-order"
+                    , "complement-first"
+                    , "-c"
+                    , "exit 0"
+                    ]
             assertEqual "audit-only + statement-order must exit 2" (ExitFailure 2) code8
             assertBool
                 "wrong error for audit-only + statement-order"
                 ("--statement-order conflicts with --strategy audit-only" `isInfixOf` err8)
 
             (code9, _, err9) <-
-                runOccamCLI ["input.sql", "--literal-batches", "-c", "exit 0"]
+                runOccamCLI ["input.sql", "-d", "sqlite", "--literal-batches", "-c", "exit 0"]
             assertEqual "literal-batches without intra-statement must exit 2" (ExitFailure 2) code9
             assertBool
                 "wrong error for literal-batches without intra-statement"
                 ("--literal-batches requires --intra-statement" `isInfixOf` err9)
 
             (code10, _, err10) <-
-                runOccamCLI ["input.sql", "--adaptive-values", "-c", "exit 0"]
+                runOccamCLI ["input.sql", "-d", "sqlite", "--adaptive-values", "-c", "exit 0"]
             assertEqual "adaptive-values without intra-statement must exit 2" (ExitFailure 2) code10
             assertBool
                 "wrong error for adaptive-values without intra-statement"
                 ("--adaptive-values requires --intra-statement" `isInfixOf` err10)
 
             (code11, _, err11) <-
-                runOccamCLI ["input.sql", "--ast-batching", "-c", "exit 0"]
+                runOccamCLI ["input.sql", "-d", "sqlite", "--ast-batching", "-c", "exit 0"]
             assertEqual "ast-batching without intra-statement must exit 2" (ExitFailure 2) code11
             assertBool
                 "wrong error for ast-batching without intra-statement"
@@ -667,13 +717,32 @@ tests =
                         let _ = val
                         pure ()
                 removeFile statsFile
+        , testCase "CLI requires explicit --dialect with exit code 2 before starting any oracle" $
+            withCLIInput "SELECT 1;" $ \input _ ->
+                withCLIInput "" $ \calls _ -> do
+                    let oracle = "cat >/dev/null; printf x >> " ++ show calls
+                    (code, _, err) <- runOccamCLI [input, "--oracle", oracle]
+                    assertEqual "omitted --dialect must exit 2" (ExitFailure 2) code
+                    assertBool "missing --dialect error text" ("Missing required --dialect" `isInfixOf` err)
+                    observed <- BSC.readFile calls
+                    assertEqual "oracle ran despite missing --dialect" "" observed
+
+                    (dumpCode, _, dumpErr) <- runOccamCLI [input, "--dump-facts"]
+                    assertEqual "--dump-facts without --dialect must exit 2" (ExitFailure 2) dumpCode
+                    assertBool "missing --dialect error text for --dump-facts" ("--dialect" `isInfixOf` dumpErr)
+
+                    (mariaCode, mariaOut, mariaErr) <- runOccamCLI [input, "--dump-facts", "-d", "mariadb"]
+                    assertEqual ("mariadb --dump-facts failed: " ++ mariaErr) ExitSuccess mariaCode
+                    assertBool "mariadb --dump-facts missing statements" ("\"statements\"" `isInfixOf` mariaOut)
         , testCase "CLI rejects missing input files with exit code 1" $ do
-            (code, _, err) <- runOccamCLI ["nonexistent-test-file-never-created.sql", "-c", "exit 0"]
+            (code, _, err) <-
+                runOccamCLI ["nonexistent-test-file-never-created.sql", "-d", "sqlite", "-c", "exit 0"]
             assertEqual "missing input file must exit 1" (ExitFailure 1) code
             assertBool "error message mentions missing file" ("No such file or directory" `isInfixOf` err)
         , testCase "--quiet suppresses jobs without reset warning" $
             withCLIInput "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n" $ \input _ -> do
-                (code, _, err) <- runOccamCLI [input, "-c", "grep -q INSERT", "-j", "2", "--quiet", "--out", "-"]
+                (code, _, err) <-
+                    runOccamCLI [input, "-d", "sqlite", "-c", "grep -q INSERT", "-j", "2", "--quiet", "--out", "-"]
                 assertEqual "reduction should succeed" ExitSuccess code
                 assertBool "warning should be suppressed by --quiet" (not ("state contamination" `isInfixOf` err))
         , testCase "CLI reads stdin only with explicit '-' and rejects omitted input" $ do
@@ -685,15 +754,15 @@ tests =
             assertEqual "explicit '-' reduced SQL mismatch" "SELECT 42 AS answer;" okOut
 
             (missCode, _, missErr) <-
-                runOccamCLIWithStdin ["-c", "exit 0", "--quiet"] "SELECT 1;"
+                runOccamCLIWithStdin ["-d", "sqlite", "-c", "exit 0", "--quiet"] "SELECT 1;"
             assertBool "omitted input must be rejected even when stdin is piped" (missCode /= ExitSuccess)
             assertBool "missing input error should name INPUT.sql" ("Missing: INPUT.sql" `isInfixOf` missErr)
         , testCase "CLI rejects --stats - stdout collision before reading stdin" $ do
             bin <- getOccamBinary
             let baseProc =
                     if bin == "cabal"
-                        then proc "cabal" ["run", "-v0", "occam", "--", "-", "-c", "exit 0", "--stats", "-"]
-                        else proc bin ["-", "-c", "exit 0", "--stats", "-"]
+                        then proc "cabal" ["run", "-v0", "occam", "--", "-", "-d", "sqlite", "-c", "exit 0", "--stats", "-"]
+                        else proc bin ["-", "-d", "sqlite", "-c", "exit 0", "--stats", "-"]
                 cliProc =
                     baseProc
                         { std_in = CreatePipe

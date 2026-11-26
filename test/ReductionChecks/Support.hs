@@ -14,7 +14,7 @@ import Occam.Logger (nullLogger)
 import Occam.Oracle (OracleObservation (..))
 import Occam.Parser (SQLDialect, countStatements)
 import Occam.Pool (OraclePool, PoolConfig (..), newOraclePool, observationDetails)
-import Occam.Reducer (ReductionConfig (..), defaultReductionConfig, reduceSQLWithConfig)
+import Occam.Reducer (ReductionConfig (..), defaultReductionConfigFor, reduceSQLWithConfig)
 import System.Exit (ExitCode (..))
 import Test.Tasty.HUnit (assertFailure)
 
@@ -61,11 +61,10 @@ testPoolWith jobs decide =
 syntaxOnly :: SQLDialect -> OraclePool -> ByteString -> IO ByteString
 syntaxOnly dialect =
     reduceSQLWithConfig
-        defaultReductionConfig
+        (defaultReductionConfigFor dialect)
             { reductionSlicing = False
             , reductionClosure = False
             , reductionUnrestricted = False
             , reductionIntraStatement = True
-            , reductionDialect = dialect
             }
         nullLogger

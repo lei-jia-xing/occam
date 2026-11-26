@@ -42,7 +42,8 @@ main = do
             | isEmpty (helpUsage helpText) = helpText
             | otherwise =
                 helpText
-                    { helpUsage = stringChunk "Usage: occam INPUT.sql (--oracle COMMAND | --result-oracle) [OPTIONS]"
+                    { helpUsage =
+                        stringChunk "Usage: occam INPUT.sql -d DIALECT (--oracle COMMAND | --result-oracle) [OPTIONS]"
                     }
 
 runAction :: Action -> IO ()
@@ -73,7 +74,6 @@ runAction ActionPrintDefaults = do
             object
                 [ "timeout" .= rawTimeoutSecs opts
                 , "jobs" .= rawJobs opts
-                , "dialect" .= dialectName (rawDialect opts)
                 , "strategy" .= strategyName (getSpecified (rawStrategy opts))
                 , "statement_order" .= statementSearchPolicyName (getSpecified (rawStatementOrder opts))
                 , "column_mode" .= columnModeName (getSpecified (rawColumnMode opts))

@@ -1,8 +1,6 @@
 use crate::DialectKind;
 use sqlparser::dialect::{
-    AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
-    GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
-    RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect, SparkSqlDialect, TeradataDialect,
+    ClickHouseDialect, Dialect, DuckDbDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan};
@@ -100,22 +98,11 @@ impl SourceMap {
 /// Returns the sqlparser dialect instance for the given [`DialectKind`].
 pub(super) fn dialect(kind: DialectKind) -> &'static dyn Dialect {
     match kind {
-        DialectKind::Generic => &GenericDialect {},
         DialectKind::PostgreSql => &PostgreSqlDialect {},
         DialectKind::MySql => &MySqlDialect {},
         DialectKind::SQLite => &SQLiteDialect {},
         DialectKind::DuckDB => &DuckDbDialect {},
         DialectKind::ClickHouse => &ClickHouseDialect {},
-        DialectKind::Oracle => &OracleDialect {},
-        DialectKind::Ansi => &AnsiDialect {},
-        DialectKind::BigQuery => &BigQueryDialect {},
-        DialectKind::Databricks => &DatabricksDialect {},
-        DialectKind::Hive => &HiveDialect {},
-        DialectKind::MsSql => &MsSqlDialect {},
-        DialectKind::Redshift => &RedshiftSqlDialect {},
-        DialectKind::Snowflake => &SnowflakeDialect {},
-        DialectKind::Spark => &SparkSqlDialect {},
-        DialectKind::Teradata => &TeradataDialect {},
     }
 }
 

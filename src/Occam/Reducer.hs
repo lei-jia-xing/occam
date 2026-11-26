@@ -21,7 +21,7 @@ module Occam.Reducer (
     ColumnMode (..),
     columnModeName,
     reductionSearchPolicy,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     isValidClosure,
     isValidClosureFast,
     closeSet,
@@ -105,7 +105,7 @@ import Occam.Reducer.Config (
     convergedRankedScheduleConfig,
     defaultDistributedBatchConfig,
     defaultRankedScheduleConfig,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     nullStageReporter,
     reductionSearchPolicy,
     reductionStageName,
@@ -156,7 +156,7 @@ reduceSQL dialect = reduceSQLWithLogger dialect nullLogger
 -- | Reduce SQL test case using custom logger and dialect.
 reduceSQLWithLogger :: SQLDialect -> Logger -> OraclePool -> ByteString -> IO ByteString
 reduceSQLWithLogger dialect =
-    reduceSQLWithConfig (defaultReductionConfig {reductionDialect = dialect})
+    reduceSQLWithConfig (defaultReductionConfigFor dialect)
 
 -- | Reduce SQL test case using custom configuration, logger, and oracle pool.
 reduceSQLWithConfig :: ReductionConfig -> Logger -> OraclePool -> ByteString -> IO ByteString

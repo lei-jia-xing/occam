@@ -19,23 +19,18 @@ import DependencyChecks.Support (
     readSources,
     ref,
     tableDefinition,
-    writesFor,
  )
 import Occam.Core (
-    BarrierScope (..),
     CatalogOp (..),
     ConflictAction (..),
     DataWrite (..),
     Ident (..),
-    NameRef (..),
     ReadFact (..),
-    ScopedBarrier (..),
     SemanticFacts (..),
     StatementId (..),
     TableDef (..),
     UpdateScope (..),
     WriteKind (..),
-    nameText,
  )
 import Occam.Dependency (DependencyGraph (..))
 import Occam.Parser (SQLDialect (..))
@@ -191,55 +186,6 @@ checks =
         assertBool
             "the post-detach read drops the detached child"
             (not (has (StatementId 2) postDetach) && not (has (StatementId 4) postDetach))
-    , testCase "OUTPUT INTO adds a write edge to the target table" $ do
-        let sql =
-                BSC.unlines
-                    [ "CREATE TABLE t (a INT);"
-                    , "CREATE TABLE t2 (a INT);"
-                    , "INSERT INTO t (a) OUTPUT inserted.a INTO t2 SELECT a FROM t;"
-                    , "SELECT * FROM t2;"
-                    ]
-        graph <- analyze MsSql sql
-        assertBool
-            "OUTPUT INTO a real table carries no fence"
-            (null (factBarriers (factsFor (StatementId 3) graph)))
-        assertEqual
-            "the host and OUTPUT writes are both recorded"
-            (Set.fromList ["t", "t2"])
-            ( Set.fromList
-                [nameText (nameRefName (dataWriteTarget write)) | write <- writesFor (StatementId 3) graph]
-            )
-        assertBool
-            "later reads of the OUTPUT target retain the statement"
-            (has (StatementId 3) (dependenciesFor (StatementId 4) graph))
-    , testCase "OUTPUT INTO a table variable fences at relation scope" $ do
-        let sql =
-                BSC.unlines
-                    [ "CREATE TABLE t (a INT);"
-                    , "UPDATE t SET a = 1 OUTPUT deleted.a INTO @var;"
-                    ]
-        graph <- analyze MsSql sql
-        assertEqual
-            "the table variable is fenced without a global barrier"
-            [RelationScope (ref ["@var"])]
-            [barrierScope barrier | barrier <- factBarriers (factsFor (StatementId 2) graph)]
-        assertBool
-            "the host write is still recorded"
-            (hasWrite ["t"] (UpdateWrite UpdateAllRows) (opsFor (StatementId 2) graph))
-    , testCase "OUTPUT without INTO adds no edge and no fence" $ do
-        let sql =
-                BSC.unlines
-                    [ "CREATE TABLE t (a INT);"
-                    , "DELETE FROM t OUTPUT deleted.*;"
-                    ]
-        graph <- analyze MsSql sql
-        assertBool
-            "a read-only OUTPUT projection carries no fence"
-            (null (factBarriers (factsFor (StatementId 2) graph)))
-        assertEqual
-            "no extra write edge is recorded"
-            1
-            (length (writesFor (StatementId 2) graph))
     , testCase "INHERIT adds and NO INHERIT drops inheritance parents" $ do
         let sql =
                 BSC.unlines

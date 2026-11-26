@@ -65,7 +65,7 @@ import Occam.Reducer (
     ReductionResult (..),
     closeSet,
     cutRemovedStatementIds,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     parseStatementsFast,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
@@ -292,11 +292,11 @@ syntheticSQL tables = BSC.unlines (concatMap tableBlock [0 .. tables - 1])
 
 -- | Parser payload per tier, mirroring the reducer's own option sets.
 optionsForKind :: ParseKind -> ParseOptions
-optionsForKind ParseStatementOnly = defaultParseOptions GenericSQL
+optionsForKind ParseStatementOnly = defaultParseOptions SQLite
 optionsForKind ParseSyntaxChunks =
-    (defaultParseOptions GenericSQL) {parseChunkEdits = True, parseSyntaxEdits = True}
+    (defaultParseOptions SQLite) {parseChunkEdits = True, parseSyntaxEdits = True}
 optionsForKind ParseColumnIR =
-    (defaultParseOptions GenericSQL)
+    (defaultParseOptions SQLite)
         { parseChunkEdits = True
         , parseSyntaxEdits = True
         , parseColumnIR = True
@@ -348,7 +348,7 @@ runInProcessReductionPath contract sql = do
             ReductionResult reducedSql _evidence <-
                 reduceSQLWithEvidence
                     (\_ -> pure ())
-                    (defaultReductionConfig {reductionDialect = SQLite})
+                    (defaultReductionConfigFor SQLite)
                     nullLogger
                     pool
                     sql
@@ -366,7 +366,7 @@ runInProcessDuckDBReductionPath contract sql = do
             ReductionResult reducedSql _evidence <-
                 reduceSQLWithEvidence
                     (\_ -> pure ())
-                    (defaultReductionConfig {reductionDialect = DuckDB})
+                    (defaultReductionConfigFor DuckDB)
                     nullLogger
                     pool
                     sql
@@ -642,7 +642,7 @@ runTimingBenchmarks = do
                         whnfIO $
                             withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
                                 reduceSQLWithConfig
-                                    (defaultReductionConfig {reductionDialect = SQLite})
+                                    (defaultReductionConfigFor SQLite)
                                     nullLogger
                                     pool
                                     sqlScale64
@@ -651,7 +651,7 @@ runTimingBenchmarks = do
                             whnfIO $
                                 withPredicatePool 1 True (fmap (== OracleAccepted) . oracleScale64) $ \pool ->
                                     reduceSQLWithConfig
-                                        (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                        ((defaultReductionConfigFor SQLite) {reductionIntraStatement = True})
                                         nullLogger
                                         pool
                                         sqlScale64
@@ -665,7 +665,7 @@ runTimingBenchmarks = do
                             ( whnfIO $
                                 withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
                                     reduceSQLWithConfig
-                                        (defaultReductionConfig {reductionDialect = SQLite})
+                                        (defaultReductionConfigFor SQLite)
                                         nullLogger
                                         pool
                                         sql
@@ -675,7 +675,7 @@ runTimingBenchmarks = do
                                         whnfIO $
                                             withPredicatePool 1 True (fmap (== OracleAccepted) . sqliteContractOracle contract) $ \pool ->
                                                 reduceSQLWithConfig
-                                                    (defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True})
+                                                    ((defaultReductionConfigFor SQLite) {reductionIntraStatement = True})
                                                     nullLogger
                                                     pool
                                                     sql

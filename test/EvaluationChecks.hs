@@ -45,7 +45,7 @@ import Occam.Pool (observationDetails, poolLiveWorkers, poolOracle, testOrdered,
 import Occam.Reducer (
     ReductionConfig (..),
     ReductionEvidence (..),
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQL,
     reduceSQLWithConfig,
  )
@@ -73,7 +73,7 @@ tests =
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -144,12 +144,11 @@ tests =
                 oracleCfg = predicateOracle 500000 predicate
                 config = evaluationConfig False Nothing (Just 8)
                 reducerConfig =
-                    defaultReductionConfig
+                    (defaultReductionConfigFor SQLite)
                         { reductionSlicing = False
                         , reductionClosure = False
                         , reductionIntraStatement = True
                         , reductionUnrestricted = False
-                        , reductionDialect = SQLite
                         }
                 action _ _ pool =
                     ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
@@ -179,12 +178,11 @@ tests =
                 oracleCfg = predicateOracle 500000 predicate
                 config = evaluationConfig False Nothing (Just 9)
                 reducerConfig =
-                    defaultReductionConfig
+                    (defaultReductionConfigFor SQLite)
                         { reductionSlicing = False
                         , reductionClosure = False
                         , reductionIntraStatement = True
                         , reductionUnrestricted = False
-                        , reductionDialect = SQLite
                         }
                 action _ _ pool =
                     ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
@@ -224,12 +222,11 @@ tests =
                 oracleCfg = predicateOracle 500000 predicate
                 config = evaluationConfig False Nothing (Just 11)
                 reducerConfig =
-                    defaultReductionConfig
+                    (defaultReductionConfigFor SQLite)
                         { reductionSlicing = False
                         , reductionClosure = False
                         , reductionIntraStatement = True
                         , reductionUnrestricted = False
-                        , reductionDialect = SQLite
                         }
                 action _ _ pool =
                     ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
@@ -268,7 +265,7 @@ tests =
                             runEvaluatedReduction
                                 Nothing
                                 config
-                                GenericSQL
+                                SQLite
                                 oracleCfg
                                 Nothing
                                 nullLogger
@@ -304,7 +301,7 @@ tests =
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -331,7 +328,7 @@ tests =
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -358,7 +355,7 @@ tests =
                     runEvaluatedReduction
                         Nothing
                         config
-                        GenericSQL
+                        SQLite
                         oracleCfg
                         Nothing
                         nullLogger
@@ -388,7 +385,7 @@ tests =
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -425,44 +422,34 @@ tests =
             assertEqual "parser failure is reported" EvaluationError (evaluationStatus metrics)
             assertEqual "evaluation returns the last accepted SQL" candidate (evaluatedSQL result)
         , testCase "dialect flags parse to their dependency dialect" $ do
-            assertEqual "generic dialect" (Right GenericSQL) (parseSQLDialect "generic")
             assertEqual "PostgreSQL dialect" (Right PostgreSQL) (parseSQLDialect "POSTGRESQL")
+            assertEqual "postgres alias" (Right PostgreSQL) (parseSQLDialect "postgres")
             assertEqual "MySQL dialect" (Right MySQL) (parseSQLDialect "mysql")
+            assertEqual "MariaDB dialect" (Right MariaDB) (parseSQLDialect "mariadb")
             assertEqual "SQLite dialect" (Right SQLite) (parseSQLDialect "sqlite")
             assertEqual "DuckDB dialect" (Right DuckDB) (parseSQLDialect "duckdb")
             assertEqual "ClickHouse dialect" (Right ClickHouse) (parseSQLDialect "clickhouse")
-            assertEqual "Oracle dialect" (Right Oracle) (parseSQLDialect "oracle")
-            assertEqual "Ansi dialect" (Right Ansi) (parseSQLDialect "ansi")
-            assertEqual "BigQuery dialect" (Right BigQuery) (parseSQLDialect "bigquery")
-            assertEqual "Databricks dialect" (Right Databricks) (parseSQLDialect "databricks")
-            assertEqual "Hive dialect" (Right Hive) (parseSQLDialect "hive")
-            assertEqual "MsSql dialect" (Right MsSql) (parseSQLDialect "mssql")
-            assertEqual "SqlServer alias" (Right MsSql) (parseSQLDialect "sqlserver")
-            assertEqual "Redshift dialect" (Right Redshift) (parseSQLDialect "redshift")
-            assertEqual "Snowflake dialect" (Right Snowflake) (parseSQLDialect "snowflake")
-            assertEqual "Spark dialect" (Right Spark) (parseSQLDialect "spark")
-            assertEqual "SparkSql alias" (Right Spark) (parseSQLDialect "sparksql")
-            assertEqual "Teradata dialect" (Right Teradata) (parseSQLDialect "teradata")
+            assertEqual
+                "removed generic dialect rejected"
+                True
+                (case parseSQLDialect "generic" of Left _ -> True; Right _ -> False)
+            assertEqual
+                "removed oracle dialect rejected"
+                True
+                (case parseSQLDialect "oracle" of Left _ -> True; Right _ -> False)
             assertEqual
                 "invalid dialect rejected"
                 True
                 (case parseSQLDialect "invalid" of Left _ -> True; Right _ -> False)
             assertEqual "dialect serialized using CLI spelling" "postgresql" (sqlDialectName PostgreSQL)
+            assertEqual "MySQL serialized using CLI spelling" "mysql" (sqlDialectName MySQL)
+            assertEqual "MariaDB serialized using CLI spelling" "mariadb" (sqlDialectName MariaDB)
+            assertEqual "SQLite serialized using CLI spelling" "sqlite" (sqlDialectName SQLite)
             assertEqual "DuckDB serialized using CLI spelling" "duckdb" (sqlDialectName DuckDB)
             assertEqual "ClickHouse serialized using CLI spelling" "clickhouse" (sqlDialectName ClickHouse)
-            assertEqual "Oracle serialized using CLI spelling" "oracle" (sqlDialectName Oracle)
-            assertEqual "Ansi serialized using CLI spelling" "ansi" (sqlDialectName Ansi)
-            assertEqual "BigQuery serialized using CLI spelling" "bigquery" (sqlDialectName BigQuery)
-            assertEqual "Databricks serialized using CLI spelling" "databricks" (sqlDialectName Databricks)
-            assertEqual "Hive serialized using CLI spelling" "hive" (sqlDialectName Hive)
-            assertEqual "MsSql serialized using CLI spelling" "mssql" (sqlDialectName MsSql)
-            assertEqual "Redshift serialized using CLI spelling" "redshift" (sqlDialectName Redshift)
-            assertEqual "Snowflake serialized using CLI spelling" "snowflake" (sqlDialectName Snowflake)
-            assertEqual "Spark serialized using CLI spelling" "spark" (sqlDialectName Spark)
-            assertEqual "Teradata serialized using CLI spelling" "teradata" (sqlDialectName Teradata)
         , testCase "all selected dialects round-trip name, parse, and code" $ do
             let dialects = [minBound .. maxBound] :: [SQLDialect]
-            assertEqual "sixteen selected dialects" 16 (length dialects)
+            assertEqual "six active dialects" 6 (length dialects)
             mapM_
                 ( \dialect -> do
                     let name = dialectName dialect
@@ -470,9 +457,9 @@ tests =
                     assertEqual ("parse round-trip " ++ show dialect) (Right dialect) (parseSQLDialect (T.unpack name))
                 )
                 dialects
-            assertEqual "distinct FFI codes 0..15" [0 .. 15] (sort (map dialectCode dialects))
+            assertEqual "distinct FFI codes 0..5" [0 .. 5] (sort (map dialectCode dialects))
             counts <- mapM (`countStatements` "SELECT 1; SELECT 2;") dialects
-            assertEqual "every dialect counts two statements over FFI" (replicate 16 (Right 2)) counts
+            assertEqual "every dialect counts two statements over FFI" (replicate 6 (Right 2)) counts
         , testCase "speculative losers are cancelled without timeout or error inflation" $
             withSentinelPath $ \sentinel -> do
                 let acceptSQL = "SELECT 1;\n"
@@ -494,7 +481,7 @@ tests =
                     runEvaluatedReduction
                         Nothing
                         config
-                        GenericSQL
+                        SQLite
                         oracleCfg
                         Nothing
                         nullLogger
@@ -523,7 +510,7 @@ tests =
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -540,14 +527,14 @@ tests =
             let initial = "SELECT 1;\nSELECT 2;\nSELECT 3;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
-                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                reducerConfig = defaultReductionConfigFor SQLite
                 action _ _ pool =
                     ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluatedReduction
                     Nothing
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -572,7 +559,7 @@ tests =
                         { requestOnProgress = \_ -> pure ()
                         , requestMetricsPolicy = Nothing
                         , requestConfig = config
-                        , requestDialect = GenericSQL
+                        , requestDialect = SQLite
                         , requestOracleConfig = oracleCfg
                         , requestPreflightObservation = Nothing
                         , requestLogger = nullLogger
@@ -591,7 +578,7 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
                 config = evaluationConfig False Nothing (Just 3)
-                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                reducerConfig = defaultReductionConfigFor SQLite
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
                     _ <- poolOracle pool candidate
@@ -603,7 +590,7 @@ tests =
                 runEvaluatedReduction
                     (Just policy)
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -626,7 +613,7 @@ tests =
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 5000000 "exit 0"
                 config = evaluationConfig True (Just 4000000) Nothing
-                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                reducerConfig = defaultReductionConfigFor SQLite
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
                     threadDelay 30000000
@@ -638,7 +625,7 @@ tests =
                 runEvaluatedReduction
                     (Just policy)
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger
@@ -664,7 +651,7 @@ tests =
                         2000000
                         "sql=$(cat); case \"$sql\" in *SLEEP*) sleep 10;; *) exit 0;; esac"
                 config = evaluationConfig True Nothing Nothing
-                reducerConfig = defaultReductionConfig {reductionDialect = GenericSQL}
+                reducerConfig = defaultReductionConfigFor SQLite
                 action _ _ pool = do
                     _ <- poolOracle pool candidate
                     _ <- poolOracle pool sleeping
@@ -676,7 +663,7 @@ tests =
                 runEvaluatedReduction
                     (Just policy)
                     config
-                    GenericSQL
+                    SQLite
                     oracleCfg
                     Nothing
                     nullLogger

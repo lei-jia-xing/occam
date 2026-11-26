@@ -89,50 +89,13 @@ pub(crate) fn sequence_function_effect(
     })
 }
 
-/// Oracle and Snowflake expose sequence state through `seq.NEXTVAL` /
-/// `seq.CURRVAL` rather than PostgreSQL's functions.
-pub(crate) fn sequence_member_effect(
-    idents: &[Ident],
-    rules: &ir::IdentifierRules,
-) -> Option<SequenceEffect> {
-    let (last, name) = idents.split_last()?;
-    if !(last.value.eq_ignore_ascii_case("nextval") || last.value.eq_ignore_ascii_case("currval"))
-        || name.is_empty()
-    {
-        return None;
-    }
-    if last.quote_style.is_some() {
-        return Some(SequenceEffect::Unknown);
-    }
-    let reference = ir::NameRef {
-        name: ir::Name(
-            name.iter()
-                .map(|ident| canonical_ident(ident, rules, ir::IdentifierClass::Relation))
-                .collect(),
-        ),
-        temp: false,
-    };
-    Some(if last.value.eq_ignore_ascii_case("currval") {
-        SequenceEffect::Read(reference)
-    } else {
-        SequenceEffect::Write(reference)
-    })
-}
-
 pub(crate) fn sequence_expr_effect(
     expr: &Expr,
     dialect: DialectKind,
     rules: &ir::IdentifierRules,
 ) -> Option<SequenceEffect> {
     match expr {
-        Expr::CompoundIdentifier(idents)
-            if matches!(dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
-        {
-            sequence_member_effect(idents, rules)
-        }
-        Expr::Function(function)
-            if matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift) =>
-        {
+        Expr::Function(function) if dialect == DialectKind::PostgreSql => {
             sequence_function_effect(function, rules)
         }
         _ => None,

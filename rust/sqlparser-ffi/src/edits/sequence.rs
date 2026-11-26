@@ -53,10 +53,9 @@ impl Visitor for SequenceVisitor<'_> {
             Some(SequenceEffect::Read(sequence)) => self.reads.push(sequence),
             Some(SequenceEffect::Unknown) => self.unknown = true,
             None if matches!(expr, Expr::Function(_)) => {
-                // Only Generic keyword calls and unconditional COUNT calls lift
-                // the routine fence; unknown, volatile, sequence-adjacent, and
-                // shadowed calls keep it. `VALUES(col)` markers in `ON DUPLICATE KEY UPDATE`
-                // never fence (ignored root, populated only when unshadowed).
+                // Only unconditional COUNT calls and explicitly ignored roots
+                // (`VALUES(col)` in `ON DUPLICATE KEY UPDATE`) lift the routine
+                // fence; all unproved function calls keep it conservatively.
                 let is_unconditional_count = crate::actions::is_unconditional_count_expr(
                     expr,
                     self.dialect,
@@ -69,10 +68,7 @@ impl Visitor for SequenceVisitor<'_> {
                         expr.span(),
                     );
                 if !ignored {
-                    let pure = self.pure_table_enabled
-                        && matches!(expr, Expr::Function(function)
-                            if crate::pure::is_pure_builtin(function, self.dialect, self.rules));
-                    self.unknown |= !pure;
+                    self.unknown = true;
                 }
             }
             _ => {}

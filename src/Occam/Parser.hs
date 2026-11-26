@@ -3,7 +3,20 @@ module Occam.Parser (
     SQLDialect (..),
     dialectName,
     dialectCode,
-    defaultSQLDialect,
+    CaseFolding (..),
+    applyCaseFolding,
+    LexicalProfile (..),
+    IdentifierProfile (..),
+    DialectFeature (..),
+    NamespaceRule (..),
+    IndexScopeRule (..),
+    TriggerScopeRule (..),
+    SemanticsProfile (..),
+    DialectProfile (..),
+    allDialectProfiles,
+    dialectProfile,
+    lookupDialectByName,
+    dialectHasFeature,
     ServerConfig (..),
     defaultServerConfig,
     ParseOptions (..),
@@ -57,6 +70,22 @@ import Occam.Facts (
  )
 import Occam.Metrics (MetricsStore, ParseKind (..), recordParseTiming)
 import Occam.Parser.Binary (binaryMagic, decodeBinaryResponse)
+import Occam.Parser.Dialect (
+    CaseFolding (..),
+    DialectFeature (..),
+    DialectProfile (..),
+    IdentifierProfile (..),
+    IndexScopeRule (..),
+    LexicalProfile (..),
+    NamespaceRule (..),
+    SemanticsProfile (..),
+    TriggerScopeRule (..),
+    allDialectProfiles,
+    applyCaseFolding,
+    dialectHasFeature,
+    dialectProfile,
+    lookupDialectByName,
+ )
 import Occam.Parser.Facts (factDumpJson)
 import Occam.Parser.Native (
     NativeResponse (..),
@@ -76,7 +105,6 @@ import Occam.Parser.Types (
     SQLDialect (..),
     ServerConfig (..),
     defaultParseOptions,
-    defaultSQLDialect,
     defaultServerConfig,
     dialectName,
  )

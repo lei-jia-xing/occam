@@ -22,7 +22,7 @@ module Occam.Reducer.Config (
     DistributedBatchConfig (..),
     defaultDistributedBatchConfig,
     ReductionConfig (..),
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reductionSearchPolicy,
     literalBatchPolicy,
     distributedLiteralBatchPolicy,
@@ -43,7 +43,7 @@ module Occam.Reducer.Config (
 
 import Data.ByteString (ByteString)
 import Data.Text qualified as T
-import Occam.Parser.Types (SQLDialect, defaultSQLDialect)
+import Occam.Parser.Types (SQLDialect)
 
 -- | Column co-reduction mode: disabled, single-site, or atomic multi-site bundles.
 data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
@@ -312,9 +312,9 @@ data ReductionConfig = ReductionConfig
     }
     deriving (Eq, Show)
 
--- | Default reduction pipeline configuration.
-defaultReductionConfig :: ReductionConfig
-defaultReductionConfig =
+-- | Default reduction pipeline configuration for a specific SQL dialect.
+defaultReductionConfigFor :: SQLDialect -> ReductionConfig
+defaultReductionConfigFor dialect =
     ReductionConfig
         { reductionSlicing = True
         , reductionGroupProposals = True
@@ -331,7 +331,7 @@ defaultReductionConfig =
         , reductionAdaptiveValues = False
         , reductionFullSyntaxReparse = False
         , reductionUnrestricted = True
-        , reductionDialect = defaultSQLDialect
+        , reductionDialect = dialect
         , reductionColumnMode = ColumnOff
         }
 

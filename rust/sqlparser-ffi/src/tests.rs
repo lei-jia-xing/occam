@@ -517,7 +517,7 @@ fn conflict_writes_nested_ctes_and_group_by_all_are_handled() {
     }
 
     let group_sql = "SELECT a FROM t GROUP BY ALL;";
-    let group = parse(group_sql, DialectKind::Generic).unwrap();
+    let group = parse(group_sql, DialectKind::DuckDB).unwrap();
     let edit = group[0]
         .facts
         .as_ref()
@@ -756,7 +756,7 @@ fn cte_production_cases_have_native_facts() {
     for (sql, dialect) in [
         (
             "CREATE TABLE base_a (id INT); CREATE TABLE base_b (id INT); CREATE TABLE base_c (id INT); WITH cte_union AS (SELECT id FROM base_a UNION ALL SELECT id FROM base_b) SELECT id FROM cte_union WHERE EXISTS (SELECT 1 FROM base_c WHERE base_c.id = cte_union.id);",
-            DialectKind::Generic,
+            DialectKind::PostgreSql,
         ),
         (
             "CREATE TABLE base (id INT); CREATE TABLE inside_cte (id INT); CREATE TABLE nested_cte (id INT); WITH base AS (SELECT id FROM inside_cte) SELECT id FROM base WHERE EXISTS (WITH base AS (SELECT id FROM nested_cte) SELECT id FROM base);",
@@ -823,7 +823,7 @@ fn cascading_foreign_keys_and_on_commit_actions() {
 #[test]
 fn clause_and_scalar_edits_cover_parentheses() {
     let sql = "SELECT t_target.id, t_join.id FROM t_target JOIN t_join ON t_target.id = t_join.target_ref_id WHERE (col_timestamp_2 IS NOT NULL AND col_timestamp_1 IS NOT NULL);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edit = units[0]
         .facts
         .as_ref()
@@ -848,7 +848,7 @@ fn clause_and_scalar_edits_cover_parentheses() {
     );
 
     let sql = "SELECT t_target.id, t_join.id FROM t_target JOIN t_join ON t_target.id = t_join.target_ref_id WHERE ((col_numeric_1 + 1.0) > 0.0 AND 1 = 1);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edit = units[0]
         .facts
         .as_ref()
@@ -1113,143 +1113,49 @@ fn clickhouse_dialect_parsing_and_statement_boundaries() {
 }
 
 #[test]
-fn oracle_dialect_parsing_and_statement_boundaries() {
-    let sql = "SELECT 42 FROM dual;\nCREATE TABLE employees (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100));\nSELECT a.id, b.name FROM a, b WHERE a.id = b.id(+);\nSELECT id, name FROM employees START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id;";
-    assert_eq!(count_units(sql, DialectKind::Oracle), Ok(4));
-    let mut ffi_count = 0;
-    let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), 6, &mut ffi_count) };
-    assert_eq!(status, 0);
-    assert_eq!(ffi_count, 4);
-
-    let units = parse(sql, DialectKind::Oracle).unwrap();
-    assert_eq!(units.len(), 4);
-    assert_eq!(&sql[units[0].start..units[0].end], "SELECT 42 FROM dual");
-    assert_eq!(
-        &sql[units[1].start..units[1].end],
-        "CREATE TABLE employees (id NUMBER(10) PRIMARY KEY, name VARCHAR2(100))"
-    );
-    assert_eq!(
-        &sql[units[2].start..units[2].end],
-        "SELECT a.id, b.name FROM a, b WHERE a.id = b.id(+)"
-    );
-    assert_eq!(
-        &sql[units[3].start..units[3].end],
-        "SELECT id, name FROM employees START WITH mgr_id IS NULL CONNECT BY PRIOR id = mgr_id"
-    );
-
-    for unit in &units {
-        assert!(unit.facts.is_some());
-        assert!(unit.parse_error.is_none());
-    }
-
-    let facts0 = facts(&units[0]);
-    assert_eq!(relation_reads(facts0), vec!["DUAL"]);
-
-    let facts1 = facts(&units[1]);
-    let employees = table_def(facts1).expect("employees definition");
-    assert_eq!(employees.name, Name(vec![Ident("EMPLOYEES".to_string())]));
-    let columns: Vec<_> = employees
-        .columns
-        .iter()
-        .map(|column| column.name.0.as_str())
-        .collect();
-    assert_eq!(columns, vec!["ID", "NAME"]);
-
-    let facts2 = facts(&units[2]);
-    let mut used = relation_reads(facts2);
-    used.sort();
-    assert_eq!(used, vec!["A", "B"]);
-
-    let facts3 = facts(&units[3]);
-    assert_eq!(relation_reads(facts3), vec!["EMPLOYEES"]);
-
-    let quoted_sql = "CREATE TABLE dept (\"DeptId\" NUMBER(10), DeptName VARCHAR2(50));";
-    let quoted_units = parse(quoted_sql, DialectKind::Oracle).unwrap();
-    let quoted_facts = facts(&quoted_units[0]);
-    let dept = table_def(quoted_facts).expect("dept definition");
-    let columns: Vec<_> = dept
-        .columns
-        .iter()
-        .map(|column| column.name.0.as_str())
-        .collect();
-    assert_eq!(columns, vec!["DeptId", "DEPTNAME"]);
-}
-
-#[test]
-fn additional_sqlparser_dialects_parsing_and_facts() {
+fn active_dialects_parsing_and_ffi_mapping() {
     let test_cases = [
         (
-            DialectKind::Ansi,
-            7u32,
+            0u32,
             "SELECT 1 FROM \"t1\";\nSELECT 2 FROM \"t2\";",
             2,
             "t1",
         ),
         (
-            DialectKind::BigQuery,
-            8u32,
-            "SELECT `id` FROM `proj.dataset.tbl`;\nSELECT 42;",
-            2,
-            "proj.dataset.tbl",
-        ),
-        (
-            DialectKind::Databricks,
-            9u32,
+            1u32,
             "CREATE TABLE `events` (`id` INT);\nSELECT `id` FROM `events`;",
             2,
             "events",
         ),
         (
-            DialectKind::Hive,
-            10u32,
-            "CREATE TABLE `logs` (`msg` STRING);\nSELECT `msg` FROM `logs`;",
+            2u32,
+            "CREATE TABLE `maria_tbl` (`id` INT);\nSELECT `id` FROM `maria_tbl`;",
             2,
-            "logs",
+            "maria_tbl",
         ),
         (
-            DialectKind::MsSql,
-            11u32,
-            "SELECT TOP 10 [id], [name] FROM [dbo].[users];\nSELECT 1;",
+            3u32,
+            "CREATE TABLE t_sqlite (id INT);\nSELECT id FROM t_sqlite;",
             2,
-            "dbo.users",
+            "t_sqlite",
         ),
+        (4u32, "SELECT * FROM range(5) AS r;\nSELECT 1;", 2, ""),
         (
-            DialectKind::Redshift,
-            12u32,
-            "CREATE TABLE dist_tbl (id INT) DISTKEY(id);\nSELECT id FROM dist_tbl;",
+            5u32,
+            "CREATE TABLE EventsLog (EventId UInt64) ENGINE = Memory;\nSELECT EventId FROM EventsLog;",
             2,
-            "dist_tbl",
-        ),
-        (
-            DialectKind::Snowflake,
-            13u32,
-            "SELECT \"ColA\" FROM \"MyTable\";\nSELECT 1;",
-            2,
-            "MyTable",
-        ),
-        (
-            DialectKind::Spark,
-            14u32,
-            "CREATE TABLE `spark_tbl` (`x` INT);\nSELECT `x` FROM `spark_tbl`;",
-            2,
-            "spark_tbl",
-        ),
-        (
-            DialectKind::Teradata,
-            15u32,
-            "SELECT \"id\" FROM \"tera_tbl\";\nSELECT 1;",
-            2,
-            "tera_tbl",
+            "EventsLog",
         ),
     ];
 
-    for (kind, code, sql, expected_count, expected_table) in test_cases {
-        assert_eq!(count_units(sql, kind), Ok(expected_count));
+    for (code, sql, expected_count, expected_table) in test_cases {
         let mut ffi_count = 0;
         let status = unsafe { occam_sql_count(sql.as_ptr(), sql.len(), code, &mut ffi_count) };
         assert_eq!(status, 0);
         assert_eq!(ffi_count, expected_count);
 
+        let kind = crate::ffi::dialect_from_code(code).expect("valid code");
+        assert_eq!(count_units(sql, kind), Ok(expected_count));
         let units = parse(sql, kind).unwrap();
         assert_eq!(units.len(), expected_count);
         for unit in &units {
@@ -1257,41 +1163,52 @@ fn additional_sqlparser_dialects_parsing_and_facts() {
             assert!(unit.parse_error.is_none());
         }
 
-        let first_facts = facts(&units[0]);
-        assert!(
-            mentioned_relations(first_facts)
-                .iter()
-                .any(|name| name == expected_table),
-            "Dialect {:?} should identify table {} in {:?}",
-            code,
-            expected_table,
-            mentioned_relations(first_facts)
-        );
+        if !expected_table.is_empty() {
+            let first_facts = facts(&units[0]);
+            assert!(
+                mentioned_relations(first_facts)
+                    .iter()
+                    .any(|name| name == expected_table),
+                "Dialect {:?} (code {code}) should identify table {} in {:?}",
+                kind,
+                expected_table,
+                mentioned_relations(first_facts)
+            );
+        }
     }
 }
 
 #[test]
 fn identifier_case_folding_follows_dialect_semantics() {
-    let oracle_units = parse(
-        "CREATE TABLE Dept (DeptName INT, \"QuotedName\" INT);",
-        DialectKind::Oracle,
+    let ch_units = parse(
+        "CREATE TABLE Dept (DeptName Int32, \"QuotedName\" Int32) ENGINE = Memory;",
+        DialectKind::ClickHouse,
     )
     .unwrap();
-    let oracle_facts = facts(&oracle_units[0]);
-    let dept = table_def(oracle_facts).expect("oracle table definition");
-    assert_eq!(dept.name, Name(vec![Ident("DEPT".to_string())]));
+    let ch_facts = facts(&ch_units[0]);
+    let dept = table_def(ch_facts).expect("clickhouse table definition");
+    assert_eq!(dept.name, Name(vec![Ident("Dept".to_string())]));
     let columns: Vec<_> = dept
         .columns
         .iter()
         .map(|column| column.name.0.as_str())
         .collect();
-    assert_eq!(columns, vec!["DEPTNAME", "QuotedName"]);
+    assert_eq!(columns, vec!["DeptName", "QuotedName"]);
 
-    let postgres_units =
-        parse("CREATE TABLE Dept (DeptName INT);", DialectKind::PostgreSql).unwrap();
+    let postgres_units = parse(
+        "CREATE TABLE Dept (DeptName INT, \"QuotedName\" INT);",
+        DialectKind::PostgreSql,
+    )
+    .unwrap();
     let postgres_facts = facts(&postgres_units[0]);
-    let dept = table_def(postgres_facts).expect("postgres table definition");
-    assert_eq!(dept.name, Name(vec![Ident("dept".to_string())]));
+    let pg_dept = table_def(postgres_facts).expect("postgres table definition");
+    assert_eq!(pg_dept.name, Name(vec![Ident("dept".to_string())]));
+    let pg_columns: Vec<_> = pg_dept
+        .columns
+        .iter()
+        .map(|column| column.name.0.as_str())
+        .collect();
+    assert_eq!(pg_columns, vec!["deptname", "QuotedName"]);
 }
 
 #[test]
@@ -1322,7 +1239,7 @@ fn mysql_drop_index_records_its_table_use() {
 #[test]
 fn constraint_stripping_and_deeper_ast_pruning() {
     let sql = "CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'abc', PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p(id));";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &units[0].facts.as_ref().unwrap().edits;
     let constraint_edits: Vec<_> = edits
         .iter()
@@ -1340,7 +1257,7 @@ fn constraint_stripping_and_deeper_ast_pruning() {
     );
 
     let expr_sql = "SELECT CASE WHEN a = 1 THEN 42 ELSE 0 END, COALESCE(x, y), z IS NOT NULL, b BETWEEN 1 AND 10 FROM t;";
-    let expr_units = parse(expr_sql, DialectKind::Generic).unwrap();
+    let expr_units = parse(expr_sql, DialectKind::PostgreSql).unwrap();
     let expr_edits = &expr_units[0].facts.as_ref().unwrap().edits;
     assert!(expr_edits.iter().any(|e| e.label == "simplify-case_result"));
     assert!(
@@ -1496,33 +1413,12 @@ fn qualified_columns_resolve_through_table_aliases() {
     let found = reads(facts(&units[0]));
     assert_eq!(found.len(), 1);
     assert!(found[0].columns.is_empty(), "{:?}", found[0].columns);
-
-    // BigQuery preserves relation-name case but folds column names. The
-    // qualifier must use relation folding so it still matches the alias or
-    // table name.
-    let units = parse(
-        "SELECT T.id FROM dataset.MyTable AS T;",
-        DialectKind::BigQuery,
-    )
-    .unwrap();
-    let found = reads(facts(&units[0]));
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].columns, vec![Ident("id".to_string())]);
-
-    let units = parse(
-        "SELECT dataset.MyTable.id FROM dataset.MyTable;",
-        DialectKind::BigQuery,
-    )
-    .unwrap();
-    let found = reads(facts(&units[0]));
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].columns, vec![Ident("id".to_string())]);
 }
 
 #[test]
 fn named_table_constraints_are_removed_with_their_prefix() {
     let sql = "CREATE TABLE t (id INT, CONSTRAINT pk PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id), name TEXT);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &units[0].facts.as_ref().unwrap().edits;
     let removed: Vec<_> = edits
         .iter()
@@ -1756,10 +1652,6 @@ fn using_index_and_rename_carry_index_schema_placement() {
             .expect("using-index constraint")
     };
     assert_eq!(
-        using_index(DialectKind::Oracle),
-        IndexSchemaPlacement::CurrentSchema
-    );
-    assert_eq!(
         using_index(DialectKind::PostgreSql),
         IndexSchemaPlacement::TableSchema
     );
@@ -1782,10 +1674,6 @@ fn using_index_and_rename_carry_index_schema_placement() {
             })
             .expect("rename op")
     };
-    assert_eq!(
-        rename_placement(DialectKind::Oracle),
-        IndexSchemaPlacement::CurrentSchema
-    );
     assert_eq!(
         rename_placement(DialectKind::PostgreSql),
         IndexSchemaPlacement::TableSchema
@@ -1853,31 +1741,6 @@ fn copy_statement_records_read_and_write_facts() {
 }
 
 #[test]
-fn use_warehouse_and_role_are_distinct_session_variables() {
-    let units = parse(
-        "USE WAREHOUSE wh; USE ROLE analyst;",
-        DialectKind::Snowflake,
-    )
-    .unwrap();
-    assert!(matches!(
-        facts(&units[0]).session.as_slice(),
-        [SessionEffect::SetVariable {
-            name,
-            value: SessionValue::Text { value },
-            ..
-        }] if name_text(name) == "warehouse" && value == "wh"
-    ));
-    assert!(matches!(
-        facts(&units[1]).session.as_slice(),
-        [SessionEffect::SetVariable {
-            name,
-            value: SessionValue::Text { value },
-            ..
-        }] if name_text(name) == "role" && value == "analyst"
-    ));
-}
-
-#[test]
 fn clickhouse_ephemeral_columns_are_not_generated_or_defaulted() {
     let units = parse(
         "CREATE TABLE t (a Int32 EPHEMERAL, b Int32 DEFAULT 1) ENGINE = Memory;",
@@ -1910,23 +1773,12 @@ fn change_column_only_renames_when_the_name_changes() {
 }
 
 #[test]
-fn end_commits_a_transaction_but_try_blocks_do_not() {
+fn end_commits_a_transaction() {
     let units = parse("BEGIN; END;", DialectKind::PostgreSql).unwrap();
     assert!(matches!(
         facts(&units[1]).post_tx.as_slice(),
         [TxEffect::Commit { chain: false }]
     ));
-
-    let units = parse("END TRY; END CATCH;", DialectKind::MsSql).unwrap();
-    for unit in &units {
-        assert!(
-            !facts(unit)
-                .post_tx
-                .iter()
-                .any(|effect| matches!(effect, TxEffect::Commit { .. })),
-            "END TRY/END CATCH must not commit"
-        );
-    }
 }
 
 #[test]
@@ -2228,14 +2080,14 @@ fn set_operation_output_columns_require_matching_arity() {
 }
 
 #[test]
-fn implicit_commit_is_limited_to_mysql_and_oracle() {
+fn implicit_commit_is_limited_to_mysql() {
     let units = parse("LOCK TABLES t WRITE;", DialectKind::MySql).unwrap();
     assert!(matches!(
         facts(&units[0]).post_tx.as_slice(),
         [TxEffect::Commit { chain: false }]
     ));
 
-    let units = parse("CREATE TABLE t (id INT);", DialectKind::Snowflake).unwrap();
+    let units = parse("CREATE TABLE t (id INT);", DialectKind::PostgreSql).unwrap();
     assert!(facts(&units[0]).post_tx.is_empty());
 }
 
@@ -2243,8 +2095,6 @@ fn implicit_commit_is_limited_to_mysql_and_oracle() {
 fn implicit_commit_covers_grants_and_routines() {
     for (sql, dialect) in [
         ("GRANT SELECT ON t TO u;", DialectKind::MySql),
-        ("GRANT SELECT ON t TO u;", DialectKind::Oracle),
-        ("CREATE USER u;", DialectKind::Oracle),
         (
             "CREATE PROCEDURE p() AS BEGIN SELECT 1; END;",
             DialectKind::MySql,
@@ -2387,26 +2237,6 @@ fn merge_reads_target_rows() {
 }
 
 #[test]
-fn update_from_resolves_alias_to_physical_table() {
-    let units = parse(
-        "UPDATE a SET x = 1 FROM actual_table AS a WHERE a.id = 2;",
-        DialectKind::MsSql,
-    )
-    .unwrap();
-    let targets: Vec<String> = writes(facts(&units[0]))
-        .into_iter()
-        .map(|write| name_text(&write.target.name))
-        .collect();
-    assert_eq!(targets, vec!["actual_table".to_string()]);
-    assert!(
-        writes(facts(&units[0]))
-            .iter()
-            .flat_map(|write| write.reads.iter())
-            .any(|read| name_text(&read.source.name) == "actual_table")
-    );
-}
-
-#[test]
 fn delete_alias_resolves_to_physical_table() {
     let units = parse(
         "DELETE a FROM actual_table AS a WHERE a.id = 2;",
@@ -2488,29 +2318,17 @@ fn nextval_writes_sequence_state() {
         assert_eq!(sequences(facts(&units[0])), vec!["s".to_string()], "{sql}");
         assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
     }
-
-    let units = parse("SELECT s.NEXTVAL FROM DUAL;", DialectKind::Oracle).unwrap();
-    assert_eq!(sequences(facts(&units[0])), vec!["S".to_string()]);
 }
 
 #[test]
 fn sequence_state_reads_and_unknown_calls_are_preserved() {
-    for (dialect, sql, name) in [
-        (
-            DialectKind::PostgreSql,
-            "SELECT pg_catalog.currval('s'::regclass);",
-            "s",
-        ),
-        (DialectKind::Oracle, "SELECT s.CURRVAL FROM DUAL;", "S"),
-        (DialectKind::Snowflake, "SELECT s.CURRVAL;", "S"),
-    ] {
-        let units = parse(sql, dialect).unwrap();
-        assert!(sequences(facts(&units[0])).is_empty(), "{sql}");
-        assert!(
-            relation_reads(facts(&units[0])).contains(&name.to_string()),
-            "{sql}"
-        );
-    }
+    let units = parse(
+        "SELECT pg_catalog.currval('s'::regclass);",
+        DialectKind::PostgreSql,
+    )
+    .unwrap();
+    assert!(sequences(facts(&units[0])).is_empty());
+    assert!(relation_reads(facts(&units[0])).contains(&"s".to_string()));
     for sql in [
         "SELECT pg_catalog.nextval(seq_name) FROM seqs;",
         "SELECT pg_catalog.nextval(seqs.seq_name) FROM seqs;",
@@ -2537,23 +2355,6 @@ fn sequence_state_reads_and_unknown_calls_are_preserved() {
                 .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
             "{sql}"
         );
-    }
-    for dialect in [DialectKind::Oracle, DialectKind::Snowflake] {
-        for sql in [
-            "SELECT s.\"NEXTVAL\" FROM s;",
-            "SELECT s.\"currval\" FROM s;",
-        ] {
-            let units = parse(sql, dialect).unwrap();
-            let facts = facts(&units[0]);
-            assert!(sequences(facts).is_empty(), "{sql}");
-            assert!(
-                facts
-                    .barriers
-                    .iter()
-                    .any(|barrier| { matches!(barrier.scope, BarrierScope::Global) }),
-                "{sql}"
-            );
-        }
     }
 }
 
@@ -3090,14 +2891,6 @@ fn filter_call_shapes_stay_fenced_with_condition_reads() {
         assert!(units[0].parse_error.is_none(), "{sql}");
         assert!(has_routine_barrier(facts(&units[0])), "{sql}");
     }
-    // Generic never lifts FILTER (the keyword rule covers plain calls only).
-    let units = parse(
-        "SELECT coalesce(a, b) FILTER (WHERE c > 0) FROM t;",
-        DialectKind::Generic,
-    )
-    .unwrap();
-    assert!(units[0].parse_error.is_none());
-    assert!(has_routine_barrier(facts(&units[0])));
     // FILTER with OVER still fences (window gate dominates).
     let units = parse(
         "SELECT sum(a) FILTER (WHERE b > 0) OVER (PARTITION BY c) FROM t;",
@@ -3168,68 +2961,39 @@ fn filter_and_within_group_condition_columns_are_extracted_while_fenced() {
 }
 
 #[test]
-fn generic_keyword_subset_lifts_but_other_names_still_fence() {
-    for (call, columns) in [
-        ("coalesce(a, b)", vec!["a", "b"]),
-        ("COALESCE(a, b)", vec!["a", "b"]),
-        ("Coalesce(a, b)", vec!["a", "b"]),
-        ("nullif(a, b)", vec!["a", "b"]),
-        ("NULLIF(a, b)", vec!["a", "b"]),
+fn unproved_functions_fence_conservatively_across_all_dialects() {
+    for dialect in [
+        DialectKind::PostgreSql,
+        DialectKind::MySql,
+        DialectKind::SQLite,
+        DialectKind::DuckDB,
+        DialectKind::ClickHouse,
     ] {
-        let sql = format!("SELECT {call} FROM t;");
-        let units = parse(&sql, DialectKind::Generic).unwrap();
-        let unit_facts = facts(&units[0]);
+        for call in [
+            "coalesce(a, b)",
+            "COALESCE(a, b)",
+            "nullif(a, b)",
+            "NULLIF(a, b)",
+            "abs(a)",
+            "concat(a, b)",
+            "sum(a)",
+            "count(a)",
+            "frobnicate(a)",
+        ] {
+            let sql = format!("SELECT {call} FROM t;");
+            let units = parse(&sql, dialect).unwrap();
+            let unit_facts = facts(&units[0]);
+            assert!(
+                has_routine_barrier(unit_facts),
+                "{sql} on {dialect:?} must fence conservatively"
+            );
+            assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
+        }
+        // Unconditional count(*) lifts the routine fence when unshadowed.
+        let count_star_units = parse("SELECT count(*) FROM t;", dialect).unwrap();
         assert!(
-            unit_facts.barriers.is_empty(),
-            "{sql}: {:?}",
-            unit_facts.barriers
-        );
-        assert_eq!(relation_reads(unit_facts), vec!["t".to_string()], "{sql}");
-        assert_eq!(
-            read_column_names(unit_facts),
-            columns.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "{sql}"
-        );
-    }
-    // Ordinary names — scalars and aggregates alike — still fence on
-    // Generic: on an unknown engine they may resolve to user routines.
-    for sql in [
-        "SELECT abs(a) FROM t;",
-        "SELECT concat(a, b) FROM t;",
-        "SELECT sum(a) FROM t;",
-        "SELECT count(a) FROM t;",
-        "SELECT frobnicate(a) FROM t;",
-        // Quoted spellings are identifiers, not keywords.
-        "SELECT \"coalesce\"(a, b) FROM t;",
-        "SELECT \"NULLIF\"(a, b) FROM t;",
-    ] {
-        let units = parse(sql, DialectKind::Generic).unwrap();
-        assert!(has_routine_barrier(facts(&units[0])), "{sql}");
-    }
-    // Unconditional count lifts the routine fence even on Generic.
-    let count_star_units = parse("SELECT count(*) FROM t;", DialectKind::Generic).unwrap();
-    assert!(!has_routine_barrier(facts(&count_star_units[0])));
-    // Every non-Generic dialect keeps the blanket fence bit-identically —
-    // cutback: SQLite, PostgreSQL, and MySQL join the always-fence set.
-    for (dialect, sql) in [
-        (DialectKind::Snowflake, "SELECT abs(a) FROM t;"),
-        (DialectKind::Snowflake, "SELECT coalesce(a, b) FROM t;"),
-        (DialectKind::DuckDB, "SELECT sum(a) FROM t;"),
-        (DialectKind::DuckDB, "SELECT nullif(a, b) FROM t;"),
-        (DialectKind::SQLite, "SELECT coalesce(a, b) FROM t;"),
-        (DialectKind::SQLite, "SELECT nullif(a, b) FROM t;"),
-        (DialectKind::SQLite, "SELECT abs(a) FROM t;"),
-        (DialectKind::PostgreSql, "SELECT coalesce(a, b) FROM t;"),
-        (DialectKind::PostgreSql, "SELECT nullif(a, b) FROM t;"),
-        (DialectKind::PostgreSql, "SELECT sum(a) FROM t;"),
-        (DialectKind::MySql, "SELECT coalesce(a, b) FROM t;"),
-        (DialectKind::MySql, "SELECT nullif(a, b) FROM t;"),
-        (DialectKind::MySql, "SELECT abs(a) FROM t;"),
-    ] {
-        let units = parse(sql, dialect).unwrap();
-        assert!(
-            has_routine_barrier(facts(&units[0])),
-            "{sql} on {dialect:?}"
+            !has_routine_barrier(facts(&count_star_units[0])),
+            "SELECT count(*) on {dialect:?}"
         );
     }
 }
@@ -3258,9 +3022,6 @@ fn volatile_and_sequence_calls_still_fence() {
 
 #[test]
 fn former_per_dialect_case_folded_names_stay_fenced() {
-    // Cutback: no engine-specific dialect lifts any spelling, folded or
-    // not. (Generic keyword case-folding — COALESCE/Coalesce/NULLIF — is
-    // pinned by the Generic subset test above.)
     for sql in [
         "SELECT ABS(a) FROM t;",
         "SELECT \"abs\"(a) FROM t;",
@@ -3279,11 +3040,11 @@ fn former_per_dialect_case_folded_names_stay_fenced() {
 }
 
 #[test]
-fn shadowed_pure_builtins_still_fence() {
+fn shadowed_routines_and_parse_errors_still_fence() {
     let create =
         "CREATE FUNCTION abs(x INT) RETURNS INT AS $$ BEGIN RETURN x; END; $$ LANGUAGE plpgsql;";
     let select = "SELECT abs(a) FROM t;";
-    // Shadowing disables the rule regardless of definition position.
+    // Shadowing disables routine assumptions regardless of definition position.
     for script in [format!("{create} {select}"), format!("{select} {create}")] {
         let units = parse(&script, DialectKind::PostgreSql).unwrap();
         assert_eq!(units.len(), 2);
@@ -3298,9 +3059,6 @@ fn shadowed_pure_builtins_still_fence() {
     .unwrap();
     assert_eq!(units.len(), 2);
     assert!(has_routine_barrier(facts(&units[1])));
-    // The coarse disable covers the Generic keyword rule too (the
-    // PostgreSQL `sum` case below fences unconditionally since the
-    // cutback; the Generic `coalesce` case is what pins the disable).
     let units = parse(
         "DROP FUNCTION sum; SELECT sum(a) FROM t;",
         DialectKind::PostgreSql,
@@ -3309,57 +3067,39 @@ fn shadowed_pure_builtins_still_fence() {
     assert_eq!(units.len(), 2);
     assert!(has_routine_barrier(facts(&units[1])));
     let units = parse(
-        "DROP FUNCTION coalesce; SELECT coalesce(a, b) FROM t;",
-        DialectKind::Generic,
-    )
-    .unwrap();
-    assert_eq!(units.len(), 2);
-    assert!(has_routine_barrier(facts(&units[1])));
-    // Macros are callable routines too: a shadowing macro disables the
-    // Generic keyword table (CREATE MACRO parses on Generic/DuckDB only,
-    // so Generic is where the disable is observable).
-    let units = parse(
-        "CREATE MACRO coalesce(a, b) AS a; SELECT coalesce(a, b) FROM t;",
-        DialectKind::Generic,
+        "CREATE MACRO count(a) AS a; SELECT count(*) FROM t;",
+        DialectKind::DuckDB,
     )
     .unwrap();
     assert_eq!(units.len(), 2);
     assert!(units[0].parse_error.is_none());
     assert!(facts(&units[0]).barriers.is_empty());
     assert!(has_routine_barrier(facts(&units[1])));
-    // A parse error anywhere also disables the rule: unparsed routine
-    // DDL cannot be ruled out. (This SQLite `abs` case fences
-    // unconditionally since the cutback; the Generic cases above pin
-    // the disable itself.)
-    let units = parse("SELECT abs(a) FROM t; SELECT FROM;", DialectKind::SQLite).unwrap();
+    // A parse error anywhere also disables count(*) specialization.
+    let units = parse("SELECT count(*) FROM t; SELECT FROM;", DialectKind::SQLite).unwrap();
     assert_eq!(units.len(), 2);
     assert!(has_routine_barrier(facts(&units[0])));
     assert!(units[1].facts.is_none());
 }
 
 #[test]
-fn stored_generic_keywords_lift_but_other_stored_calls_still_fence() {
-    // The Generic keyword rule lifts in stored positions too.
-    for sql in [
-        "CREATE TABLE t (x INT DEFAULT coalesce(1, 2));",
-        "CREATE VIEW v AS SELECT coalesce(a, b) FROM t;",
-    ] {
-        let units = parse(sql, DialectKind::Generic).unwrap();
-        assert!(
-            facts(&units[0]).barriers.is_empty(),
-            "{sql}: {:?}",
-            facts(&units[0]).barriers
-        );
-    }
-    // Cutback: the per-dialect stored lifts are gone, so these fence.
+fn stored_calls_fence_conservatively() {
     for (dialect, sql) in [
         (
             DialectKind::SQLite,
             "CREATE TABLE t (x INT DEFAULT abs(5));",
         ),
         (
+            DialectKind::SQLite,
+            "CREATE TABLE t (x INT DEFAULT coalesce(1, 2));",
+        ),
+        (
             DialectKind::PostgreSql,
             "CREATE TABLE t (x INT DEFAULT coalesce(1, 2));",
+        ),
+        (
+            DialectKind::PostgreSql,
+            "CREATE VIEW v AS SELECT coalesce(a, b) FROM t;",
         ),
         (DialectKind::MySql, "CREATE TABLE t (x INT DEFAULT abs(5));"),
         (
@@ -3665,66 +3405,6 @@ fn only_marker_threads_through_reads_and_writes() {
     }
 }
 
-#[test]
-fn output_into_table_adds_write_edge() {
-    for sql in [
-        "INSERT INTO t (a) OUTPUT inserted.a INTO t2 SELECT a FROM s;",
-        "UPDATE t SET a = 1 OUTPUT inserted.a INTO t2;",
-        "DELETE FROM t OUTPUT deleted.a INTO t2;",
-        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = 1 OUTPUT inserted.a INTO t2;",
-    ] {
-        let units = parse(sql, DialectKind::MsSql).unwrap();
-        assert!(facts(&units[0]).barriers.is_empty(), "{sql}");
-        let targets: Vec<String> = writes(facts(&units[0]))
-            .iter()
-            .map(|write| name_text(&write.target.name))
-            .collect();
-        assert_eq!(targets, vec!["t".to_string(), "t2".to_string()], "{sql}");
-        assert!(
-            matches!(writes(facts(&units[0]))[1].kind, WriteKind::Insert { .. }),
-            "{sql}"
-        );
-    }
-    // A qualified target resolves through the same path.
-    let units = parse(
-        "DELETE FROM t OUTPUT deleted.a INTO dbo.t2;",
-        DialectKind::MsSql,
-    )
-    .unwrap();
-    assert!(facts(&units[0]).barriers.is_empty());
-    assert_eq!(
-        name_text(&writes(facts(&units[0]))[1].target.name),
-        "dbo.t2".to_string()
-    );
-}
-
-#[test]
-fn output_into_variable_fences_at_relation_scope() {
-    let units = parse(
-        "UPDATE t SET a = 1 OUTPUT deleted.a INTO @var;",
-        DialectKind::MsSql,
-    )
-    .unwrap();
-    assert_eq!(facts(&units[0]).barriers.len(), 1);
-    assert!(matches!(
-        facts(&units[0]).barriers.as_slice(),
-        [ScopedBarrier {
-            scope: BarrierScope::Relation { .. },
-            reason: BarrierReason::UnknownDml,
-            ..
-        }]
-    ));
-    // The host write is still recorded.
-    assert_eq!(writes(facts(&units[0])).len(), 1);
-}
-
-#[test]
-fn output_without_into_has_no_extra_edge() {
-    let units = parse("DELETE FROM t OUTPUT deleted.*;", DialectKind::MsSql).unwrap();
-    assert!(facts(&units[0]).barriers.is_empty());
-    assert_eq!(writes(facts(&units[0])).len(), 1);
-    assert_eq!(reads(facts(&units[0])).len(), 0);
-}
 #[test]
 fn mysql_foreign_key_checks_scope_forms() {
     for (sql, scope, value) in [
@@ -4220,7 +3900,7 @@ fn sqlite_create_virtual_table_scopes_barrier_to_relation() {
 #[test]
 fn unconditional_and_filtered_update_scope() {
     let sql = "UPDATE t SET a = 1;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let write = writes(facts(&units[0]));
     assert_eq!(write.len(), 1);
     assert!(
@@ -4235,7 +3915,7 @@ fn unconditional_and_filtered_update_scope() {
     );
 
     let sql = "UPDATE t SET a = 1 WHERE b = 2;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let write = writes(facts(&units[0]));
     assert_eq!(write.len(), 1);
     assert!(
@@ -4267,7 +3947,7 @@ fn unconditional_and_filtered_update_scope() {
     );
 
     let sql = "UPDATE t SET a = (SELECT 1 FROM t);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let write = writes(facts(&units[0]));
     assert_eq!(write.len(), 1);
     assert!(
@@ -4305,7 +3985,6 @@ fn row_count_respects_routine_identifier_folding() {
             r#"pg_catalog."COUNT"(1)"#,
             ReadMode::Data,
         ),
-        (DialectKind::Redshift, r#""COUNT"(1)"#, ReadMode::Data),
         (DialectKind::SQLite, r#""COUNT"(1)"#, ReadMode::RowCount),
         (DialectKind::SQLite, "pg_catalog.count(1)", ReadMode::Data),
     ] {
@@ -4350,73 +4029,73 @@ fn read_mode_classification_row_count_and_existence() {
     assert!(read_facts[0].columns.is_empty());
 
     let sql = "SELECT COUNT(1) AS c FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::RowCount);
 
     // COUNT(col) reads column data because nulls are filtered
     let sql = "SELECT COUNT(col) FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::Data);
 
     // COUNT(*) with WHERE reads column data
     let sql = "SELECT COUNT(*) FROM t WHERE x > 1;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::Data);
 
     // COUNT(*) with GROUP BY reads column data
     let sql = "SELECT COUNT(*) FROM t GROUP BY x;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::Data);
 
     // Pure existence check with LIMIT 1
     let sql = "SELECT 1 FROM t LIMIT 1;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
 
     // Pure existence check with EXISTS
     let sql = "SELECT EXISTS (SELECT 1 FROM t);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
 
     let sql = "SELECT EXISTS (SELECT * FROM t);";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts.len(), 1);
     assert_eq!(read_facts[0].mode, ReadMode::RowExistence);
 
     // COUNT(*) OVER () window function must fall back to Data
     let sql = "SELECT COUNT(*) OVER () FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts[0].mode, ReadMode::Data);
 
     // COUNT(NULL) ignores nulls and does not count rows
     let sql = "SELECT COUNT(NULL) FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts[0].mode, ReadMode::Data);
 
     // Non-null constant literal in count position is RowCount
     let sql = "SELECT COUNT('hello') FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let read_facts = reads(facts(&units[0]));
     assert_eq!(read_facts[0].mode, ReadMode::RowCount);
 
     // Zero limit produces empty results, not pure existence check
     for zero_limit in ["SELECT 1 FROM t LIMIT 0;", "SELECT 1 FROM t LIMIT 00;"] {
-        let units = parse(zero_limit, DialectKind::Generic).unwrap();
+        let units = parse(zero_limit, DialectKind::PostgreSql).unwrap();
         let read_facts = reads(facts(&units[0]));
         assert_eq!(read_facts[0].mode, ReadMode::Data, "{zero_limit}");
     }
@@ -4535,7 +4214,7 @@ fn test_file_table_functions() {
 #[test]
 fn test_update_and_delete_syntax_edits() {
     let sql = "UPDATE t SET a = 1, b = 2, c = 3 WHERE id = 10;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     if units[0].facts.is_none() {
         panic!("parse error: {:?}", units[0].parse_error);
     }
@@ -4615,7 +4294,7 @@ fn test_update_and_delete_syntax_edits() {
 #[test]
 fn test_set_operation_syntax_edits() {
     let sql = "SELECT 1 UNION ALL SELECT 2;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &facts(&units[0]).edits;
 
     let applied: Vec<String> = edits
@@ -4643,7 +4322,7 @@ fn test_set_operation_syntax_edits() {
     );
 
     let sql2 = "(SELECT 1) UNION ALL (SELECT 2);";
-    let units2 = parse(sql2, DialectKind::Generic).unwrap();
+    let units2 = parse(sql2, DialectKind::PostgreSql).unwrap();
     let edits2 = &facts(&units2[0]).edits;
 
     let applied2: Vec<String> = edits2
@@ -4665,7 +4344,7 @@ fn test_set_operation_syntax_edits() {
     assert_eq!(applied2, vec!["(SELECT 1);", "(SELECT 2);",]);
 
     let sql3 = "SELECT 1 UNION ALL SELECT 2 ORDER BY 1 LIMIT 1;";
-    let units3 = parse(sql3, DialectKind::Generic).unwrap();
+    let units3 = parse(sql3, DialectKind::PostgreSql).unwrap();
     let edits3 = &facts(&units3[0]).edits;
 
     let applied3: Vec<String> = edits3
@@ -4693,7 +4372,7 @@ fn test_set_operation_syntax_edits() {
     );
 
     let sql4 = "SELECT 999 AS noise UNION ALL (SELECT 888 AS noise) UNION ALL SELECT 42 AS target;";
-    let units4 = parse(sql4, DialectKind::Generic).unwrap();
+    let units4 = parse(sql4, DialectKind::PostgreSql).unwrap();
     let edits4 = &facts(&units4[0]).edits;
     let applied4 = edits4
         .iter()
@@ -4718,7 +4397,7 @@ fn test_set_operation_syntax_edits() {
 #[test]
 fn test_distinct_and_group_by_syntax_edits() {
     let sql = "SELECT DISTINCT a, b FROM t GROUP BY a, b ORDER BY a, b;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &facts(&units[0]).edits;
 
     let distinct_edit = edits.iter().find(|e| e.label == "remove-distinct").unwrap();
@@ -4764,7 +4443,7 @@ fn test_distinct_and_group_by_syntax_edits() {
     );
 
     let sql2 = "SELECT ALL a FROM t;";
-    let units2 = parse(sql2, DialectKind::Generic).unwrap();
+    let units2 = parse(sql2, DialectKind::PostgreSql).unwrap();
     let edits2 = &facts(&units2[0]).edits;
     let all_edit = edits2
         .iter()
@@ -4803,7 +4482,7 @@ fn test_distinct_and_group_by_syntax_edits() {
     );
 
     let sql4 = "SELECT count(DISTINCT x) FROM t;";
-    let units4 = parse(sql4, DialectKind::Generic).unwrap();
+    let units4 = parse(sql4, DialectKind::PostgreSql).unwrap();
     let edits4 = &facts(&units4[0]).edits;
     let count_distinct_edit = edits4
         .iter()
@@ -4820,7 +4499,7 @@ fn test_distinct_and_group_by_syntax_edits() {
 #[test]
 fn test_window_spec_syntax_edits() {
     let sql = "SELECT sum(x) OVER (PARTITION BY a, b ORDER BY c, d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &facts(&units[0]).edits;
 
     let empty_edit = edits
@@ -4900,10 +4579,10 @@ fn test_window_spec_syntax_edits() {
 }
 
 #[test]
-fn lexical_suffix_preserves_prefix_and_disables_pure_builtins() {
-    let sql = "SELECT coalesce(1, 2); /* unfinished";
-    let units = parse(sql, DialectKind::Generic).unwrap();
-    assert_eq!(count_units(sql, DialectKind::Generic), Ok(units.len()));
+fn lexical_suffix_preserves_prefix_and_disables_count_specialization() {
+    let sql = "SELECT count(*) FROM t; /* unfinished";
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
+    assert_eq!(count_units(sql, DialectKind::PostgreSql), Ok(units.len()));
     assert_eq!(units.len(), 2);
     assert!(!facts(&units[0]).barriers.is_empty());
     assert_eq!(&sql[units[1].start..units[1].end], "/* unfinished");
@@ -4913,7 +4592,7 @@ fn lexical_suffix_preserves_prefix_and_disables_pure_builtins() {
 #[test]
 fn test_cast_simplification_syntax_edits() {
     let sql = "SELECT CAST(col AS VARCHAR(255)) FROM t;";
-    let units = parse(sql, DialectKind::Generic).unwrap();
+    let units = parse(sql, DialectKind::PostgreSql).unwrap();
     let edits = &facts(&units[0]).edits;
     let cast_edit = edits.iter().find(|e| e.label == "simplify-cast").unwrap();
     let mut s = sql.to_string();
@@ -4929,7 +4608,7 @@ fn test_cast_simplification_syntax_edits() {
     assert_eq!(s2, "SELECT col FROM t;");
 
     let sql3 = "SELECT TRY_CAST(col AS INT) FROM t;";
-    let units3 = parse(sql3, DialectKind::Generic).unwrap();
+    let units3 = parse(sql3, DialectKind::DuckDB).unwrap();
     let edits3 = &facts(&units3[0]).edits;
     let cast_edit3 = edits3.iter().find(|e| e.label == "simplify-cast").unwrap();
     let mut s3 = sql3.to_string();

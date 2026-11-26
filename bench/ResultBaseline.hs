@@ -99,7 +99,7 @@ import Occam.Reducer (
     StatementSearchPolicy (..),
     defaultDistributedBatchConfig,
     defaultRankedScheduleConfig,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQLWithResultTrace,
     statementRanked,
  )
@@ -1654,7 +1654,7 @@ runComparison pairs out wallLimit callLimit censoredStatuses arms casesToRun = d
 runFixture ::
     Int -> Maybe Int -> Maybe Int -> [EvaluationStatus] -> (Arm, Arm) -> Fixture -> IO (Value, [String])
 runFixture pairs wallLimit callLimit censoredStatuses (control, treatment) Fixture {..} = do
-    let config = defaultReductionConfig {reductionDialect = fixtureDialect}
+    let config = defaultReductionConfigFor fixtureDialect
         prepare remember sql =
             prepareResultOracleWithValidation True Nothing remember fixtureDialect probeTimeout sql
                 >>= require fixtureName

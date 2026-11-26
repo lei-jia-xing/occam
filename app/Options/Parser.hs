@@ -242,15 +242,16 @@ rawOptionsParser =
             "unrestricted fallback search"
             (getSpecified (rawUnrestricted defaultRawOptions))
         <*> toggleSpecified "cache" "no-cache" "candidate caching" (getSpecified (rawCache defaultRawOptions))
-        <*> option
-            (eitherReader parseSQLDialect)
-            ( long "dialect"
-                <> short 'd'
-                <> metavar "DIALECT"
-                <> value (rawDialect defaultRawOptions)
-                <> help
-                    "Dialect (default: generic). See --list-dialects."
-                <> completeWith (map (T.unpack . dialectName) [minBound .. maxBound])
+        <*> optional
+            ( option
+                (eitherReader parseSQLDialect)
+                ( long "dialect"
+                    <> short 'd'
+                    <> metavar "DIALECT"
+                    <> help
+                        "SQL dialect (required). See --list-dialects."
+                    <> completeWith (map (T.unpack . dialectName) [minBound .. maxBound])
+                )
             )
         <*> strategyParser
         <*> switch

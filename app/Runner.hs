@@ -65,7 +65,7 @@ import Occam.Reducer (
     StageReporter,
     StatementSearchPolicy,
     columnModeName,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     parseStatementsFast,
     reduceSQLWithResultTraceFull,
     reuseLatestSQLWithSeed,
@@ -511,7 +511,7 @@ buildReductionConfig ::
     SQLDialect ->
     ReductionConfig
 buildReductionConfig slicing closure statementOrder intra literalBatches astBatching adaptiveValues columnMode unrestricted dialect =
-    defaultReductionConfig
+    (defaultReductionConfigFor dialect)
         { reductionSlicing = slicing
         , reductionClosure = closure
         , reductionStatementSearch = statementOrder
@@ -521,7 +521,6 @@ buildReductionConfig slicing closure statementOrder intra literalBatches astBatc
         , reductionAdaptiveValues = adaptiveValues
         , reductionColumnMode = columnMode
         , reductionUnrestricted = unrestricted
-        , reductionDialect = dialect
         }
 
 buildBudgetConfig ::

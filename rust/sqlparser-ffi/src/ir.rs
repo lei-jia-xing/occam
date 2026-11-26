@@ -796,7 +796,6 @@ pub enum IdentifierClass {
 pub enum CaseFolding {
     Lower,
     AsciiLower,
-    Upper,
     Preserve,
 }
 
@@ -806,7 +805,6 @@ impl CaseFolding {
         match self {
             Self::Lower => value.to_lowercase(),
             Self::AsciiLower => value.to_ascii_lowercase(),
-            Self::Upper => value.to_uppercase(),
             Self::Preserve => value.to_owned(),
         }
     }
@@ -828,16 +826,12 @@ impl IdentifierRules {
     pub fn for_dialect(dialect: crate::DialectKind, server: &ServerConfig) -> Self {
         use crate::DialectKind::*;
         let (unquoted, quoted) = match dialect {
-            PostgreSql | Redshift => (CaseFolding::Lower, CaseFolding::Preserve),
-            Oracle | Ansi | Snowflake | Teradata => (CaseFolding::Upper, CaseFolding::Preserve),
+            PostgreSql => (CaseFolding::Lower, CaseFolding::Preserve),
             ClickHouse => (CaseFolding::Preserve, CaseFolding::Preserve),
             SQLite | DuckDB => (CaseFolding::AsciiLower, CaseFolding::AsciiLower),
-            // These dialects are case-preserving but compare identifiers
-            // case-insensitively, so folding both classes to lower-case models
-            // their matching semantics.
-            MsSql | BigQuery | Hive | Spark | Databricks | MySql | Generic => {
-                (CaseFolding::Lower, CaseFolding::Lower)
-            }
+            // MySQL/MariaDB compare identifiers case-insensitively, so folding
+            // both classes to lower-case models their matching semantics.
+            MySql => (CaseFolding::Lower, CaseFolding::Lower),
         };
         let mut rules = Self {
             unquoted,
@@ -847,12 +841,6 @@ impl IdentifierRules {
             column_unquoted: None,
             column_quoted: None,
         };
-        if dialect == BigQuery {
-            rules.relation_unquoted = Some(CaseFolding::Preserve);
-            rules.relation_quoted = Some(CaseFolding::Preserve);
-            rules.column_unquoted = Some(CaseFolding::Lower);
-            rules.column_quoted = Some(CaseFolding::Lower);
-        }
         if dialect == MySql {
             let relation = match server.lower_case_table_names {
                 0 => CaseFolding::Preserve,

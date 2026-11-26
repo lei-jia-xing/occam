@@ -34,7 +34,6 @@ import Data.Aeson (
     withText,
  )
 import Data.ByteString (ByteString)
-import Data.Char (toLower)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -48,7 +47,7 @@ import Occam.Oracle (
     OracleObservationDetails,
     OracleStatus,
  )
-import Occam.Parser (SQLDialect (..), dialectName)
+import Occam.Parser (SQLDialect (..), dialectName, lookupDialectByName)
 import Occam.Pool (OraclePool)
 import Occam.Reducer (
     ColumnMode (..),
@@ -141,28 +140,11 @@ instance FromJSON MinimalityClaim where
         maybe (fail ("unknown minimality claim: " <> T.unpack name)) pure (parseMinimalityClaimName name)
 
 parseSQLDialect :: String -> Either String SQLDialect
-parseSQLDialect value = case map toLower value of
-    "generic" -> Right GenericSQL
-    "postgres" -> Right PostgreSQL
-    "postgresql" -> Right PostgreSQL
-    "mysql" -> Right MySQL
-    "sqlite" -> Right SQLite
-    "duckdb" -> Right DuckDB
-    "clickhouse" -> Right ClickHouse
-    "oracle" -> Right Oracle
-    "ansi" -> Right Ansi
-    "bigquery" -> Right BigQuery
-    "databricks" -> Right Databricks
-    "hive" -> Right Hive
-    "mssql" -> Right MsSql
-    "sqlserver" -> Right MsSql
-    "redshift" -> Right Redshift
-    "snowflake" -> Right Snowflake
-    "spark" -> Right Spark
-    "sparksql" -> Right Spark
-    "teradata" -> Right Teradata
-    _ ->
-        Left ("Expected one of: " ++ T.unpack (T.intercalate ", " (map dialectName [minBound .. maxBound])))
+parseSQLDialect value =
+    case lookupDialectByName (T.pack value) of
+        Just dialect -> Right dialect
+        Nothing ->
+            Left ("Expected one of: " ++ T.unpack (T.intercalate ", " (map dialectName [minBound .. maxBound])))
 
 -- | Canonical CLI dialect spelling.
 sqlDialectName :: SQLDialect -> Text

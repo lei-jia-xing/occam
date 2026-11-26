@@ -15,7 +15,6 @@ mod ffi;
 mod ir;
 mod oracle;
 mod parser;
-mod pure;
 mod source;
 
 pub use ffi::{occam_sql_count, occam_sql_free, occam_sql_parse, occam_sql_parse_error};
@@ -24,11 +23,9 @@ pub(crate) use ir::*;
 /// Supported SQL dialect variants for parser configuration and keyword folding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum DialectKind {
-    #[serde(rename = "generic")]
-    Generic,
     #[serde(rename = "postgresql")]
     PostgreSql,
-    #[serde(rename = "mysql")]
+    #[serde(rename = "mysql", alias = "mariadb")]
     MySql,
     #[serde(rename = "sqlite")]
     SQLite,
@@ -36,26 +33,6 @@ enum DialectKind {
     DuckDB,
     #[serde(rename = "clickhouse")]
     ClickHouse,
-    #[serde(rename = "oracle")]
-    Oracle,
-    #[serde(rename = "ansi")]
-    Ansi,
-    #[serde(rename = "bigquery")]
-    BigQuery,
-    #[serde(rename = "databricks")]
-    Databricks,
-    #[serde(rename = "hive")]
-    Hive,
-    #[serde(rename = "mssql")]
-    MsSql,
-    #[serde(rename = "redshift")]
-    Redshift,
-    #[serde(rename = "snowflake")]
-    Snowflake,
-    #[serde(rename = "spark")]
-    Spark,
-    #[serde(rename = "teradata")]
-    Teradata,
 }
 
 /// Root response payload returned to Occam callers.

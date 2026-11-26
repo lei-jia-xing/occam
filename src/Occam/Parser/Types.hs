@@ -1,6 +1,5 @@
 module Occam.Parser.Types (
     SQLDialect (..),
-    defaultSQLDialect,
     dialectName,
     ServerConfig (..),
     defaultServerConfig,
@@ -19,28 +18,15 @@ import Data.Word (Word8)
 import Occam.Core (SessionInit)
 import Occam.Facts (ColumnTarget, StatementUnit)
 
--- | Supported SQL dialects.
+-- | Supported SQL dialects matching the 6 target DBMS harnesses.
 data SQLDialect
-    = GenericSQL
-    | PostgreSQL
+    = PostgreSQL
     | MySQL
+    | MariaDB
     | SQLite
     | DuckDB
     | ClickHouse
-    | Oracle
-    | Ansi
-    | BigQuery
-    | Databricks
-    | Hive
-    | MsSql
-    | Redshift
-    | Snowflake
-    | Spark
-    | Teradata
     deriving (Eq, Ord, Show, Enum, Bounded)
-
-defaultSQLDialect :: SQLDialect
-defaultSQLDialect = GenericSQL
 
 -- | Initial server and session configuration.
 data ServerConfig = ServerConfig
@@ -157,19 +143,9 @@ data ParsedSQL = ParsedSQL
     deriving (Eq, Show)
 
 dialectName :: SQLDialect -> Text
-dialectName GenericSQL = "generic"
 dialectName PostgreSQL = "postgresql"
 dialectName MySQL = "mysql"
+dialectName MariaDB = "mariadb"
 dialectName SQLite = "sqlite"
 dialectName DuckDB = "duckdb"
 dialectName ClickHouse = "clickhouse"
-dialectName Oracle = "oracle"
-dialectName Ansi = "ansi"
-dialectName BigQuery = "bigquery"
-dialectName Databricks = "databricks"
-dialectName Hive = "hive"
-dialectName MsSql = "mssql"
-dialectName Redshift = "redshift"
-dialectName Snowflake = "snowflake"
-dialectName Spark = "spark"
-dialectName Teradata = "teradata"

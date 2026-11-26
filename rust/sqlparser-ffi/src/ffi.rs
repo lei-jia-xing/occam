@@ -97,25 +97,16 @@ fn facts_json(sql: &str, config: &ParseConfig) -> Option<Vec<u8>> {
     .ok()
 }
 
-/// Maps FFI integer dialect code (0–15) to its corresponding [`DialectKind`].
-fn dialect_from_code(code: u32) -> Option<DialectKind> {
+/// Maps FFI integer dialect code (0–5) to its corresponding [`DialectKind`].
+///
+/// Code 2 (`mariadb`) temporarily maps to `DialectKind::MySql` during Phase 0.
+pub(crate) fn dialect_from_code(code: u32) -> Option<DialectKind> {
     match code {
-        0 => Some(DialectKind::Generic),
-        1 => Some(DialectKind::PostgreSql),
-        2 => Some(DialectKind::MySql),
+        0 => Some(DialectKind::PostgreSql),
+        1 | 2 => Some(DialectKind::MySql),
         3 => Some(DialectKind::SQLite),
         4 => Some(DialectKind::DuckDB),
         5 => Some(DialectKind::ClickHouse),
-        6 => Some(DialectKind::Oracle),
-        7 => Some(DialectKind::Ansi),
-        8 => Some(DialectKind::BigQuery),
-        9 => Some(DialectKind::Databricks),
-        10 => Some(DialectKind::Hive),
-        11 => Some(DialectKind::MsSql),
-        12 => Some(DialectKind::Redshift),
-        13 => Some(DialectKind::Snowflake),
-        14 => Some(DialectKind::Spark),
-        15 => Some(DialectKind::Teradata),
         _ => None,
     }
 }
@@ -444,19 +435,22 @@ mod tests {
 
     #[test]
     fn dialect_codes_cover_all_dialects_exactly_once() {
-        // Guards the u32 code table against duplicate and out-of-range codes.
-        // Haskell's dialect round-trip exercises every u32 code through
-        // countStatements/FFI into dialect_from_code: range errors fail there,
-        // while a swapped-but-valid code would still pass.
-        let kinds: Vec<DialectKind> = (0..16).filter_map(dialect_from_code).collect();
-        assert_eq!(kinds.len(), 16);
-        for (i, left) in kinds.iter().enumerate() {
-            for right in &kinds[i + 1..] {
-                assert_ne!(left, right);
-            }
-        }
-        assert_eq!(dialect_from_code(16), None);
+        // Guards the u32 code table against out-of-range codes and verifies the
+        // temporary Phase 0 MariaDB -> MySql FFI mapping.
+        let kinds: Vec<DialectKind> = (0..6).filter_map(dialect_from_code).collect();
+        assert_eq!(kinds.len(), 6);
+        assert_eq!(dialect_from_code(0), Some(DialectKind::PostgreSql));
+        assert_eq!(dialect_from_code(1), Some(DialectKind::MySql));
+        assert_eq!(dialect_from_code(2), Some(DialectKind::MySql));
+        assert_eq!(dialect_from_code(3), Some(DialectKind::SQLite));
+        assert_eq!(dialect_from_code(4), Some(DialectKind::DuckDB));
+        assert_eq!(dialect_from_code(5), Some(DialectKind::ClickHouse));
+        assert_eq!(dialect_from_code(6), None);
         assert_eq!(dialect_from_code(u32::MAX), None);
+
+        let mariadb_cfg: ParseConfig =
+            serde_json::from_str(r#"{"dialect":"mariadb"}"#).expect("mariadb JSON alias");
+        assert_eq!(mariadb_cfg.dialect, DialectKind::MySql);
     }
 
     #[test]

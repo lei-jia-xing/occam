@@ -47,7 +47,7 @@ checks =
                     , "SELECT id FROM child;"
                     , "SELECT x FROM unrelated;"
                     ]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let childQueryDeps = dependenciesFor (StatementId 5) graph
             unrelatedQueryDeps = dependenciesFor (StatementId 6) graph
         assertBool "Child query depends on parent deletion via cascade" (has (StatementId 4) childQueryDeps)
@@ -65,7 +65,7 @@ checks =
                     , "DELETE FROM grand_parent WHERE id = 10;"
                     , "SELECT id FROM child;"
                     ]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let childQueryDeps = dependenciesFor (StatementId 5) graph
         assertBool
             "Child query depends on grand_parent deletion via transitive cascade"
@@ -79,7 +79,7 @@ checks =
                     , "DELETE FROM parent WHERE id = 1;"
                     , "SELECT id FROM child;"
                     ]
-        graph <- analyze GenericSQL sql
+        graph <- analyze PostgreSQL sql
         let childQueryDeps = dependenciesFor (StatementId 4) graph
         assertBool
             "Child query does not depend on parent deletion without cascade"

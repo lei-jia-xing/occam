@@ -2068,13 +2068,39 @@ mod tests {
         assert_eq!(target(&targets, "b").blocked, None);
     }
 
+    fn parse_mysql_without_implicit_commit(
+        sql: &str,
+    ) -> (Vec<crate::NativeUnit>, Vec<ColumnTarget>) {
+        let mut units = crate::parser::parse_units(
+            sql,
+            &ParseConfig {
+                dialect: DialectKind::MySql,
+                server: ServerConfig::default(),
+                chunk_edits: false,
+                column_ir: true,
+                column_bundles: true,
+                syntax_edits: true,
+                syntax_only: false,
+                span_only: false,
+            },
+        )
+        .expect("parse");
+        for unit in &mut units {
+            if let Some(facts) = &mut unit.facts {
+                facts.pre_tx.clear();
+                facts.post_tx.clear();
+            }
+        }
+        let targets = assemble_columns(&units, sql);
+        (units, targets)
+    }
+
     #[test]
     fn modify_column_plain_fences_target_only() {
-        // Generic parses the same MySQL rewrite syntax (`MODIFY`, `CHANGE`,
-        // `FIRST`/`AFTER`, `AUTO_INCREMENT`) without MySQL's implicit-commit
-        // DDL effects, which fence every bundle as unknown.
+        // Isolate AlterColumn generation fencing without MySQL's implicit-commit
+        // DDL effect, which fences every bundle at the transaction layer.
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT NOT NULL;\nINSERT INTO t(a, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2085,7 +2111,7 @@ mod tests {
     #[test]
     fn modify_column_default_ref_fences_target_and_refs() {
         let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t MODIFY COLUMN a INT DEFAULT (b);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2102,7 +2128,7 @@ mod tests {
         // `AFTER` repositions: ordinals may shift and the anchor names an
         // uncarried sibling.
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT AFTER b;\nINSERT INTO t(a, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2116,7 +2142,7 @@ mod tests {
     #[test]
     fn change_column_first_fences_all() {
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t CHANGE COLUMN a a INT FIRST;\nINSERT INTO t(a, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2132,7 +2158,7 @@ mod tests {
         // Rename `a` to `a2` plus a plain rewrite: `a` fences as the
         // rename source, `b` is untouched and lifts.
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t CHANGE COLUMN a a2 INT NOT NULL;\nINSERT INTO t(a2, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2145,7 +2171,7 @@ mod tests {
         // `AUTO_INCREMENT` parses to unparsed dialect `Token` text, so
         // absence of column references is unprovable: opaque, fences all.
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT AUTO_INCREMENT;\nINSERT INTO t(a, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2159,7 +2185,7 @@ mod tests {
     #[test]
     fn modify_column_self_fk_explicit_narrows() {
         let sql = "CREATE TABLE t(a INT, b INT, c INT);\nALTER TABLE t MODIFY COLUMN a INT REFERENCES t(b);\nINSERT INTO t(a, b, c) VALUES (1, 2, 3);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)
@@ -2176,7 +2202,7 @@ mod tests {
         // Implicit parent columns mean the parent key: unnameable here,
         // so the rewrite stays opaque and fences all.
         let sql = "CREATE TABLE t(a INT, b INT);\nALTER TABLE t MODIFY COLUMN a INT REFERENCES t;\nINSERT INTO t(a, b) VALUES (1, 2);";
-        let (_, targets) = parse_dialect(sql, DialectKind::Generic);
+        let (_, targets) = parse_mysql_without_implicit_commit(sql);
         assert_eq!(
             target(&targets, "a").blocked.as_deref(),
             Some(BLOCK_GENERATION)

@@ -103,11 +103,7 @@ pub(crate) fn is_unconditional_count_expr(
         [
             ObjectNamePart::Identifier(schema),
             ObjectNamePart::Identifier(ident),
-        ] if matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift)
-            && matches_name(schema, "pg_catalog") =>
-        {
-            ident
-        }
+        ] if dialect == DialectKind::PostgreSql && matches_name(schema, "pg_catalog") => ident,
         _ => return false,
     };
     if !matches_name(ident, "count") {
@@ -358,10 +354,7 @@ pub(crate) fn select_into_definition(
 ) -> Option<ir::TableDef> {
     // Other dialects use the same AST for variable assignment. Parser
     // acceptance alone does not establish table-creation semantics.
-    if !matches!(
-        dialect,
-        DialectKind::PostgreSql | DialectKind::Redshift | DialectKind::MsSql
-    ) {
+    if dialect != DialectKind::PostgreSql {
         return None;
     }
     let into = select.into.as_ref()?;
@@ -1516,29 +1509,12 @@ pub(crate) fn table_transactional(dialect: DialectKind, temporary: bool) -> bool
     if dialect == DialectKind::MySql {
         !temporary
     } else {
-        !matches!(
-            dialect,
-            DialectKind::Oracle
-                | DialectKind::ClickHouse
-                | DialectKind::Hive
-                | DialectKind::Spark
-                | DialectKind::Databricks
-                | DialectKind::Snowflake
-        )
+        dialect != DialectKind::ClickHouse
     }
 }
 
 pub(crate) fn sequence_transactional(dialect: DialectKind) -> bool {
-    !matches!(
-        dialect,
-        DialectKind::Oracle
-            | DialectKind::MySql
-            | DialectKind::ClickHouse
-            | DialectKind::Hive
-            | DialectKind::Spark
-            | DialectKind::Databricks
-            | DialectKind::Snowflake
-    )
+    !matches!(dialect, DialectKind::MySql | DialectKind::ClickHouse)
 }
 
 pub(crate) fn index_ref(
@@ -1546,7 +1522,7 @@ pub(crate) fn index_ref(
     table: Option<&ir::NameRef>,
     dialect: DialectKind,
 ) -> ir::IndexRef {
-    if matches!(dialect, DialectKind::MySql | DialectKind::MsSql)
+    if dialect == DialectKind::MySql
         && let (Some(table), Some(last)) = (table, last_ident(name))
     {
         return ir::IndexRef::Table {
@@ -1557,13 +1533,8 @@ pub(crate) fn index_ref(
     ir::IndexRef::Named { name: name.clone() }
 }
 
-pub(crate) fn index_schema_placement(dialect: DialectKind) -> ir::IndexSchemaPlacement {
-    match dialect {
-        // Oracle creates an index in the schema of its owner, even when the
-        // indexed table is in another schema.
-        DialectKind::Oracle => ir::IndexSchemaPlacement::CurrentSchema,
-        _ => ir::IndexSchemaPlacement::TableSchema,
-    }
+pub(crate) fn index_schema_placement(_dialect: DialectKind) -> ir::IndexSchemaPlacement {
+    ir::IndexSchemaPlacement::TableSchema
 }
 
 pub(crate) fn trigger_ref(
@@ -3438,17 +3409,11 @@ pub(crate) fn use_effect(
         Use::Object(name) | Use::Schema(name) | Use::Database(name) | Use::Catalog(name) => {
             let namespace = name_parts(name, rules, ir::IdentifierClass::Relation).filter(
                 |parts| match dialect {
-                    DialectKind::MySql | DialectKind::ClickHouse | DialectKind::Hive => {
+                    DialectKind::MySql | DialectKind::ClickHouse => {
                         parts.len() == 1 && !matches!(use_statement, Use::Catalog(_))
                     }
                     DialectKind::DuckDB => {
                         parts.len() == 2 && matches!(use_statement, Use::Object(_))
-                    }
-                    DialectKind::Snowflake => {
-                        parts.len() == 2 && matches!(use_statement, Use::Object(_) | Use::Schema(_))
-                    }
-                    DialectKind::Databricks | DialectKind::Spark => {
-                        parts.len() == 2 && !matches!(use_statement, Use::Catalog(_))
                     }
                     _ => false,
                 },
@@ -3512,14 +3477,13 @@ pub(crate) fn begin_policy(dialect: DialectKind) -> ir::BeginPolicy {
     match dialect {
         DialectKind::MySql => ir::BeginPolicy::CommitActive,
         DialectKind::SQLite => ir::BeginPolicy::Error,
-        DialectKind::MsSql => ir::BeginPolicy::Ignore,
         _ => ir::BeginPolicy::Warn,
     }
 }
 
-/// Returns true if `statement` implicitly commits an active transaction on MySQL or Oracle.
+/// Returns true if `statement` implicitly commits an active transaction on MySQL/MariaDB.
 ///
-/// On MySQL, DDL and table administrative commands (LOCK TABLES, OPTIMIZE) force an implicit commit,
+/// On MySQL/MariaDB, DDL and table administrative commands (LOCK TABLES, OPTIMIZE) force an implicit commit,
 /// except for operations specifically on TEMPORARY tables.
 pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bool {
     let ddl = matches!(
@@ -3573,9 +3537,8 @@ pub(crate) fn implicit_commit(dialect: DialectKind, statement: &Statement) -> bo
                 )
             }
         },
-        DialectKind::Oracle => ddl,
-        // ClickHouse, Hive, Spark, Databricks and Snowflake do not expose the
-        // MySQL/Oracle style implicit-commit transaction boundary around DDL.
+        // ClickHouse, PostgreSQL, SQLite, and DuckDB do not expose MySQL-style
+        // implicit-commit transaction boundaries around DDL.
         _ => false,
     }
 }
@@ -3593,7 +3556,7 @@ pub(crate) fn drop_mode(
         // RESTRICT form for dropping a schema/database.
         (
             ObjectType::Schema | ObjectType::Database,
-            DialectKind::MySql | DialectKind::BigQuery | DialectKind::ClickHouse,
+            DialectKind::MySql | DialectKind::ClickHouse,
         ) => ir::DropMode::Cascade,
         _ => ir::DropMode::Restrict,
     }
@@ -4259,10 +4222,9 @@ pub(crate) fn analyze_statement(
     // provably irrelevant to dependencies and need no fence. Every other
     // variable effect keeps the blanket barrier.
     let mut inert_pragma_effects = false;
-    // Sequence value changes survive rollback in PostgreSQL/Redshift even
+    // Sequence value changes survive rollback in PostgreSQL even
     // though creation and removal of the sequence itself are transactional.
-    let transactional = sequence_transactional(dialect)
-        && !matches!(dialect, DialectKind::PostgreSql | DialectKind::Redshift);
+    let transactional = sequence_transactional(dialect) && dialect != DialectKind::PostgreSql;
     let sequences = match visitor.sequences.take() {
         Some(seq) => seq,
         None => {

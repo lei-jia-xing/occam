@@ -25,7 +25,7 @@ occam input.sql \
 
 ```bash
 # Pipe from stdin to stdout
-cat crash.sql | occam - -c './interesting.sh' > reduced.sql
+cat crash.sql | occam - -d sqlite -c './interesting.sh' > reduced.sql
 ```
 
 ### In-process result oracle (`--result-oracle`)
@@ -50,7 +50,7 @@ Run `occam --help` for the full flag list, or use `--list-dialects`, `--list-str
 | `-c, --oracle COMMAND` | External predicate reading candidate SQL on `stdin` (exit `0` accepts) |
 | `--reset COMMAND` | State reset command executed before each oracle check |
 | `--result-oracle` | In-process result-preserving oracle (`--dialect sqlite` or `duckdb`) |
-| `-d, --dialect DIALECT` | SQL dialect (`generic` default; 16 dialects via `--list-dialects`) |
+| `-d, --dialect DIALECT` | SQL dialect (**required**; 6 active dialects via `--list-dialects`) |
 | `-o, --out PATH` / `-i, --in-place` | Output destination (`-` / `stdout` default) or safe in-place replacement |
 | `--stats FILE` | Write structured JSON reduction and evaluation metrics |
 | `--timeout` / `--budget` / `--max-oracle-executions` | Per-probe timeout (`10s` default), total wall-time budget, uncached attempt cap |
@@ -94,7 +94,7 @@ make check        # Full gate: fmt, hlint, build, tests, clippy, harness tests, 
 | Document | Contents |
 | :--- | :--- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline, dependency fences, ordered scheduler, oracle/process contract, `stats.json`, verification boundaries |
-| [docs/DIALECTS.md](docs/DIALECTS.md) | 16 SQL dialects, modeled dependency effects, and explicit opaque boundaries |
+| [docs/DIALECTS.md](docs/DIALECTS.md) | 6 supported SQL dialects, modeled dependency effects, and explicit opaque boundaries |
 | [docs/UPSTREAM_TRACKER.md](docs/UPSTREAM_TRACKER.md) | Upstream `sqlparser-rs` gaps, workarounds, and local patching workflow |
 | [benchmarks/README.md](benchmarks/README.md) | 4-tier benchmark suite, flame graphs, and search/result baseline scripts |
 | [benchmarks/real_fuzz_corpus/README.md](benchmarks/real_fuzz_corpus/README.md) | 71 multi-statement real DBMS crash cases across 6 DBMS targets |

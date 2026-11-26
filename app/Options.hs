@@ -27,9 +27,8 @@ import Occam.Logger (LogFormat (..), LogLevel (..))
 import Occam.Parser (SQLDialect (..))
 import Occam.Reducer (
     ColumnMode (..),
-    ReductionConfig (..),
     StatementSearchPolicy,
-    defaultReductionConfig,
+    statementRankedFallback,
  )
 import System.Environment (lookupEnv)
 
@@ -124,7 +123,7 @@ data RawOptions = RawOptions
     , rawColumnMode :: !(Specified ColumnMode)
     , rawUnrestricted :: !(Specified Bool)
     , rawCache :: !(Specified Bool)
-    , rawDialect :: !SQLDialect
+    , rawDialect :: !(Maybe SQLDialect)
     , rawStrategy :: !(Specified ReductionStrategy)
     , rawDumpFacts :: !Bool
     , rawDumpFactsFkOn :: !Bool
@@ -154,14 +153,14 @@ defaultRawOptions =
         , rawSlicing = Default True
         , rawClosure = Default True
         , rawIntraStatement = Default False
-        , rawStatementOrder = Default (reductionStatementSearch defaultReductionConfig)
-        , rawLiteralBatches = Default (reductionLiteralBatches defaultReductionConfig)
-        , rawAstBatching = Default (reductionAstBatching defaultReductionConfig)
-        , rawAdaptiveValues = Default (reductionAdaptiveValues defaultReductionConfig)
+        , rawStatementOrder = Default statementRankedFallback
+        , rawLiteralBatches = Default False
+        , rawAstBatching = Default False
+        , rawAdaptiveValues = Default False
         , rawColumnMode = Default ColumnOff
         , rawUnrestricted = Default True
         , rawCache = Default True
-        , rawDialect = GenericSQL
+        , rawDialect = Nothing
         , rawStrategy = Default StrategyFull
         , rawDumpFacts = False
         , rawDumpFactsFkOn = False
@@ -213,6 +212,8 @@ data ValidatedOptions = ValidatedOptions
 
 validateCliOptions :: RawOptions -> Either String ValidatedOptions
 validateCliOptions opts@RawOptions {..} = do
+    dialect <- maybe (Left "Missing required --dialect (see --list-dialects)") Right rawDialect
+
     -- 1. Mutually exclusive flags
     when (rawVerbose && rawQuiet) $
         Left "Cannot specify both --verbose and --quiet"
@@ -223,7 +224,7 @@ validateCliOptions opts@RawOptions {..} = do
     when rawResultOracle $ do
         when (isJust rawOracleCmd || isJust rawResetCmd) $
             Left "--result-oracle cannot be combined with --oracle or --reset"
-        when (rawDialect /= SQLite && rawDialect /= DuckDB) $
+        when (dialect /= SQLite && dialect /= DuckDB) $
             Left "--result-oracle requires --dialect sqlite or duckdb"
 
     -- 2. Strategy conflicts
@@ -283,7 +284,7 @@ validateCliOptions opts@RawOptions {..} = do
             , valColumnMode = colMode
             , valUnrestricted = effUnrestricted
             , valCache = getSpecified rawCache
-            , valDialect = rawDialect
+            , valDialect = dialect
             , valStrategy = strategy
             , valDumpFacts = rawDumpFacts
             , valDumpFactsFkOn = rawDumpFactsFkOn

@@ -22,7 +22,7 @@ import Occam.Pool (OraclePool, PoolConfig (..), newOraclePool, predicateDetails)
 import Occam.Reducer (
     ColumnMode (..),
     ReductionConfig (..),
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQLWithConfig,
  )
 import System.Exit (ExitCode (..))
@@ -137,9 +137,8 @@ testPoolWith predicate =
 reduceWith :: ColumnMode -> OraclePool -> ByteString -> IO ByteString
 reduceWith mode =
     reduceSQLWithConfig
-        ( defaultReductionConfig
-            { reductionDialect = SQLite
-            , reductionIntraStatement = True
+        ( (defaultReductionConfigFor SQLite)
+            { reductionIntraStatement = True
             , reductionColumnMode = mode
             }
         )

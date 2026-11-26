@@ -20,7 +20,6 @@ use std::borrow::Cow;
 pub(crate) struct AnalysisVisitor<'a> {
     pub(crate) dialect: DialectKind,
     pub(crate) rules: &'a crate::ir::IdentifierRules,
-    pure_table_enabled: bool,
     /// Nested DML statements are analyzed separately by `merge_nested`, so
     /// their relations and columns must not leak into the enclosing statement.
     pub(crate) gate_nested_dml: bool,
@@ -67,7 +66,6 @@ impl<'a> AnalysisVisitor<'a> {
         Self {
             dialect: context.dialect,
             rules: context.rules,
-            pure_table_enabled: context.pure_table_enabled,
             gate_nested_dml: true,
             statement_depth: 0,
             nested_dml_depth: 0,
@@ -3018,26 +3016,7 @@ impl Visitor for AnalysisVisitor<'_> {
         // routine, and both affect row placement or key shape, not
         // table-level dependencies.
         let ignored = Self::in_ignored_function_root(&self.ignored_function_roots, expr.span());
-        self.has_function |= !ignored
-            && match expr {
-                Expr::Function(function) => {
-                    // Stored pure expressions (DEFAULT, CHECK, view/index bodies)
-                    // lift the deferred fence like evaluated ones; everything
-                    // else keeps it.
-                    !(self.pure_table_enabled
-                        && crate::pure::is_pure_builtin(function, self.dialect, self.rules))
-                }
-                Expr::CompoundIdentifier(idents)
-                    if matches!(self.dialect, DialectKind::Oracle | DialectKind::Snowflake) =>
-                {
-                    idents.len() > 1
-                        && idents.last().is_some_and(|ident| {
-                            ident.value.eq_ignore_ascii_case("nextval")
-                                || ident.value.eq_ignore_ascii_case("currval")
-                        })
-                }
-                _ => false,
-            };
+        self.has_function |= !ignored && matches!(expr, Expr::Function(_));
         if !self.ignored_user_var_spans.contains(&expr.span()) {
             match expr {
                 Expr::Identifier(ident) if crate::actions::is_user_variable_ident(ident) => {

@@ -33,7 +33,7 @@ import Occam.Reducer (
     ColumnMode (..),
     ReductionConfig (..),
     applyParserEdits,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     findInterestingPrefix,
     reduceSQL,
     reduceSQLWithConfig,
@@ -66,9 +66,8 @@ checks =
                     let accepted = all (`BSC.isInfixOf` candidate) ["CREATE TABLE t(", "SELECT a", "FROM t"]
                     pure (if accepted then OracleAccepted else OracleRejected)
                 let config =
-                        defaultReductionConfig
-                            { reductionDialect = dialect
-                            , reductionIntraStatement = True
+                        (defaultReductionConfigFor dialect)
+                            { reductionIntraStatement = True
                             , reductionLiteralBatches = True
                             , reductionAdaptiveValues = True
                             , reductionFullSyntaxReparse = fullReparse
@@ -100,9 +99,8 @@ checks =
                     modifyIORef' candidates (candidate :)
                     pure (if candidate `elem` accepted then OracleAccepted else OracleRejected)
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionIntraStatement = True
+                        (defaultReductionConfigFor SQLite)
+                            { reductionIntraStatement = True
                             , reductionFullSyntaxReparse = fullReparse
                             }
                 reduced <- reduceSQLWithConfig cfg nullLogger pool original
@@ -163,9 +161,8 @@ checks =
                     modifyIORef' controlCalls (+ 1)
                     pure (if accepted c then OracleAccepted else OracleRejected)
                 let controlCfg =
-                        defaultReductionConfig
-                            { reductionDialect = dialect
-                            , reductionSlicing = False
+                        (defaultReductionConfigFor dialect)
+                            { reductionSlicing = False
                             , reductionClosure = False
                             , reductionUnrestricted = False
                             , reductionIntraStatement = True
@@ -208,9 +205,8 @@ checks =
                     && BSC.isInfixOf "SELECT a FROM t" candidate
         pool <- predicatePool accepted
         let cfg =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionSlicing = False
+                (defaultReductionConfigFor SQLite)
+                    { reductionSlicing = False
                     , reductionClosure = False
                     , reductionUnrestricted = False
                     , reductionIntraStatement = True
@@ -235,7 +231,7 @@ checks =
                     [ "UPDATE t SET noise_col = 999, target_col = 42, other_noise = 888 WHERE dead_cond = 1;"
                     , "DELETE FROM t WHERE dead_delete_cond = 1;"
                     ]
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "keeps target assignment" (BSC.isInfixOf "target_col = 42" reduced)
         assertBool "removes noise_col assignment" (not (BSC.isInfixOf "noise_col" reduced))
@@ -247,7 +243,7 @@ checks =
         pool <- predicatePool (BSC.isInfixOf "42")
         let sql =
                 "SELECT 999 UNION ALL (SELECT 888) UNION ALL SELECT 42;"
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
         assertBool "removes noise branch 999" (not (BSC.isInfixOf "999" reduced))
@@ -257,7 +253,7 @@ checks =
         pool <- predicatePool (BSC.isInfixOf "42")
         let sql =
                 "SELECT DISTINCT sum(42) OVER (PARTITION BY noise_part ORDER BY noise_ord ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t GROUP BY a, noise_grp ORDER BY x, noise_order;"
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
         assertBool "removes distinct modifier" (not (BSC.isInfixOf "DISTINCT" reduced))
@@ -269,13 +265,13 @@ checks =
     , testCase "Intra-statement rewrites unwrap CAST expressions" $ do
         pool <- predicatePool (BSC.isInfixOf "42")
         let sql = "SELECT CAST(42 AS VARCHAR(255));"
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertEqual "unwraps cast to inner expression" "SELECT 42;" reduced
     , testCase "Intra-statement rewrites unwrap CASE expressions to matching branch" $ do
         pool <- predicatePool (BSC.isInfixOf "42")
         let sql = "SELECT CASE WHEN cond THEN 42 ELSE 99 END;"
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertEqual "unwraps case expression to inner branch" "SELECT 42;" reduced
     , testCase "Interleaving statement audit and intra-statement rewrites reaches a global fixed point" $ do
@@ -289,7 +285,7 @@ checks =
                     , "INSERT INTO main_tbl VALUES (42);"
                     , "SELECT id FROM main_tbl WHERE id = 42 AND (SELECT COUNT(*) FROM helper) > 0;"
                     ]
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "keeps main table" (BSC.isInfixOf "main_tbl" reduced)
         assertBool "keeps target value" (BSC.isInfixOf "42" reduced)
@@ -301,15 +297,15 @@ checks =
             final = BSC.pack "SELECT 303;\n"
         pool <-
             predicatePool (\candidate -> candidate == sql || candidate == accepted || candidate == final)
-        fixedPoint <- statementAudit GenericSQL pool sql
+        fixedPoint <- statementAudit SQLite pool sql
         assertEqual "a statement becomes removable only after an earlier deletion" final fixedPoint
         emptyPool <- predicatePool (const True)
-        empty <- statementAudit GenericSQL emptyPool "SELECT 7;"
+        empty <- statementAudit SQLite emptyPool "SELECT 7;"
         assertEqual "the empty candidate is not prohibited" BS.empty empty
         keepPool <- predicatePool (BSC.isInfixOf "SELECT 11")
         let bytes = BSC.pack "SELECT 11;\r\nSELECT 22;\n"
             firstStatement = BSC.pack "SELECT 11;\r\n"
-        byteResult <- statementDdmin GenericSQL keepPool bytes
+        byteResult <- statementDdmin SQLite keepPool bytes
         assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
     , testCase "statement audit distinguishes identical statements with different trailing comments" $ do
         let kept = "SELECT 1; -- A\n"
@@ -323,7 +319,7 @@ checks =
             predicatePool
                 (\candidate -> BSC.isInfixOf "SELECT 2" candidate && BSC.isInfixOf "SELECT 3" candidate)
         let sql = BSC.pack "SELECT 1;\r\n\r\nSELECT 2;\r\nSELECT 3;\r\n"
-        reduced <- statementDdmin GenericSQL pool sql
+        reduced <- statementDdmin SQLite pool sql
         assertEqual
             "the removed statement takes its CRLF and blank separator with it"
             (BSC.pack "SELECT 2;\r\nSELECT 3;\r\n")
@@ -461,28 +457,20 @@ checks =
         sqliteCount <- countOrFail SQLite "SELECT /*; block */ 'a;b'; -- line; comment\nSELECT [g;h];"
         postgresCount <-
             countOrFail PostgreSQL "SELECT $tag$semi;colon$tag$; -- line; comment\nSELECT E'a\\';semi';"
-        mysqlCount <- countOrFail MySQL "SELECT `g;h`; -- line; comment\nSELECT 'a;b';"
+        mysqlCount <- countOrFail MySQL "SELECT `a;b`, 'x''y'; -- comment\nSELECT 2;"
+        mariadbCount <- countOrFail MariaDB "SELECT `a;b`, 'x''y'; -- comment\nSELECT 2;"
         assertEqual "SQLite quoted/comment semicolons stay within units" 2 sqliteCount
         assertEqual "PostgreSQL dollar and escaped strings stay within units" 2 postgresCount
         assertEqual "MySQL backticks and strings stay within units" 2 mysqlCount
+        assertEqual "MariaDB backticks and strings stay within units" 2 mariadbCount
         duckdbCount <- countOrFail DuckDB "SELECT [1, 2, 3]; -- comment\nSELECT * FROM range(5);"
         clickhouseCount <- countOrFail ClickHouse "SELECT number FROM numbers(10); -- comment\nSELECT 1;"
-        oracleCount <- countOrFail Oracle "SELECT 1 FROM dual; -- comment\nSELECT 2 FROM dual;"
-        ansiCount <- countOrFail Ansi "SELECT 1; -- comment\nSELECT 2;"
-        mssqlCount <- countOrFail MsSql "SELECT [a;b]; -- comment\nSELECT TOP 1 * FROM [t];"
-        snowflakeCount <- countOrFail Snowflake "SELECT \"a;b\"; -- comment\nSELECT 2;"
-        bigqueryCount <- countOrFail BigQuery "SELECT `a;b`; -- comment\nSELECT 2;"
         assertEqual "DuckDB statements stay within units" 2 duckdbCount
         assertEqual "ClickHouse statements stay within units" 2 clickhouseCount
-        assertEqual "Oracle statements stay within units" 2 oracleCount
-        assertEqual "Ansi statements stay within units" 2 ansiCount
-        assertEqual "MsSql statements stay within units" 2 mssqlCount
-        assertEqual "Snowflake statements stay within units" 2 snowflakeCount
-        assertEqual "BigQuery statements stay within units" 2 bigqueryCount
     , testCase "inconclusive oracle outcomes abort reduction" $ do
         pool <- outcomePool (\_ -> pure OracleInconclusive)
         result <-
-            try (reduceSQL GenericSQL pool "SELECT 1;") ::
+            try (reduceSQL SQLite pool "SELECT 1;") ::
                 IO (Either OracleInconclusiveError ByteString)
         case result of
             Left _ -> pure ()
@@ -642,7 +630,7 @@ checks =
         mapM_
             ( \jobs -> do
                 pool <- jobsPool jobs interesting
-                reduced <- statementDdmin GenericSQL pool sql
+                reduced <- statementDdmin SQLite pool sql
                 assertEqual ("ddmin reaches C,M with jobs=" ++ show jobs) expected reduced
             )
             [1, 4]
@@ -667,9 +655,9 @@ checks =
                 wide <- reduce widePool sql
                 assertEqual (name ++ " agrees across job counts") serial wide
             )
-            [ ("statement audit", statementAudit GenericSQL)
-            , ("statement ddmin", statementDdmin GenericSQL)
-            , ("syntax only", syntaxOnly GenericSQL)
+            [ ("statement audit", statementAudit SQLite)
+            , ("statement ddmin", statementDdmin SQLite)
+            , ("syntax only", syntaxOnly SQLite)
             ]
     , testCase "dead earlier update on a column is pruned by dependency slice" $ do
         pool <-
@@ -687,7 +675,7 @@ checks =
                     , "SELECT a FROM t;"
                     ]
         let config =
-                defaultReductionConfig
+                (defaultReductionConfigFor SQLite)
                     { reductionUnrestricted = False
                     , reductionIntraStatement = False
                     }
@@ -711,7 +699,7 @@ checks =
                     , "UPDATE t SET a = 2;"
                     , "SELECT a FROM t;"
                     ]
-        reduced <- reduceSQL GenericSQL pool sql
+        reduced <- reduceSQL SQLite pool sql
         assertBool "dead earlier update (a = 1) must be eliminated" (not (BSC.isInfixOf "a = 1" reduced))
         assertBool "effective update (a = 2) must be preserved" (BSC.isInfixOf "a = 2" reduced)
         assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
@@ -731,7 +719,7 @@ checks =
                     , "UPDATE t SET b = 2;"
                     , "SELECT a, b FROM t;"
                     ]
-        reduced <- reduceSQL GenericSQL pool sql
+        reduced <- reduceSQL SQLite pool sql
         assertBool
             "both updates must be preserved"
             (BSC.isInfixOf "a = 1" reduced && BSC.isInfixOf "b = 2" reduced)
@@ -750,7 +738,7 @@ checks =
                     , "UPDATE t SET a = 2;"
                     , "SELECT COUNT(*) FROM t;"
                     ]
-        reduced <- reduceSQL GenericSQL pool sql
+        reduced <- reduceSQL SQLite pool sql
         assertBool "all updates must be eliminated" (not (BSC.isInfixOf "UPDATE t" reduced))
         assertBool "insert must be preserved" (BSC.isInfixOf "INSERT INTO t" reduced)
         assertBool "count query must be preserved" (BSC.isInfixOf "SELECT COUNT(*) FROM t;" reduced)
@@ -770,9 +758,8 @@ checks =
                     , "SELECT a FROM t;"
                     ]
         let config =
-                defaultReductionConfig
-                    { reductionDialect = MySQL
-                    , reductionUnrestricted = False
+                (defaultReductionConfigFor MySQL)
+                    { reductionUnrestricted = False
                     , reductionIntraStatement = False
                     }
         reduced <- reduceSQLWithConfig config nullLogger pool sql
@@ -802,9 +789,8 @@ checks =
                         , "SELECT a FROM t;"
                         ]
             let config =
-                    defaultReductionConfig
-                        { reductionDialect = SQLite
-                        , reductionSlicing = False
+                    (defaultReductionConfigFor SQLite)
+                        { reductionSlicing = False
                         , reductionClosure = False
                         , reductionIntraStatement = True
                         , reductionColumnMode = ColumnAtomic
@@ -831,9 +817,8 @@ checks =
                     , "CREATE VIRTUAL TABLE vt USING fts5(content);"
                     ]
         let config =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionSlicing = False
+                (defaultReductionConfigFor SQLite)
+                    { reductionSlicing = False
                     , reductionClosure = False
                     , reductionIntraStatement = True
                     , reductionColumnMode = ColumnAtomic

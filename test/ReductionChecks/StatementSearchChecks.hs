@@ -42,7 +42,7 @@ import Occam.Reducer (
     StatementSearchPolicy (..),
     closureDdmin,
     defaultRankedScheduleConfig,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
     reduceSQLWithResultSlicing,
@@ -78,12 +78,11 @@ checks =
         pool <- predicatePool (BSC.isInfixOf "SELECT id")
         let sql = BSC.pack "CREATE TABLE \"MiXeD\" (id INT);\nSELECT id FROM \"mixed\";\n"
             config dialect =
-                defaultReductionConfig
+                (defaultReductionConfigFor dialect)
                     { reductionSlicing = False
                     , reductionClosure = True
                     , reductionIntraStatement = False
                     , reductionUnrestricted = False
-                    , reductionDialect = dialect
                     }
         postgres <- reduceSQLWithConfig (config PostgreSQL) nullLogger pool sql
         sqlite <- reduceSQLWithConfig (config SQLite) nullLogger pool sql
@@ -94,7 +93,7 @@ checks =
         assertEqual "SQLite folds quoted identifiers for closure" sql sqlite
     , testCase "An unchanged globally fenced slice tries unrestricted deletion before closure" $ do
         let sql = "CREATE TABLE noise (id INT); SELECT sum(1);"
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
         pool <- predicatePool (BSC.isInfixOf "SELECT sum(1)")
         stages <- newIORef []
         let report (StageStarted stage) = modifyIORef' stages (stage :)
@@ -108,7 +107,7 @@ checks =
     , testCase "Result slicing tries the observed statement before other candidates" $ do
         let sql = "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);"
             expected = "SELECT 42 AS answer;"
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             locate bytes = pure (if bytes == sql then Just (ResultStatement 3 1) else Nothing)
         candidates <- newIORef []
         pool <- outcomePool $ \candidate -> do
@@ -123,7 +122,7 @@ checks =
     , testCase "A relaxed global slice requires oracle acceptance" $ do
         let sql = "CREATE TABLE noise (x INT);SELECT sum(1);"
             proposal = "SELECT sum(1);"
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             locate bytes = pure (if bytes == sql then Just (ResultStatement 2 1) else Nothing)
             run acceptsProposal = do
                 candidates <- newIORef []
@@ -144,7 +143,7 @@ checks =
         let primary = "SELECT sum(1);"
             retry = "SELECT sum(2);" <> primary
             sql = "CREATE TABLE noise (x INT);" <> retry
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             locate bytes = pure (if bytes == sql then Just (ResultStatement 3 2) else Nothing)
         attempts <- newIORef []
         pool <- outcomePool $ \candidate -> do
@@ -162,7 +161,7 @@ checks =
             seed = "SELECT 1000;"
             prefix = "SELECT 0;" <> create <> noise <> earlier
             sql = prefix <> seed
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             locate bytes = pure (if bytes == sql then Just (ResultStatement 5 4) else Nothing)
         attempts <- newIORef []
         pool <- outcomePool $ \candidate -> do
@@ -181,7 +180,7 @@ checks =
         let earlier = "CREATE TABLE noise(x INT);"
             seed = "SELECT 1;"
             sql = earlier <> seed
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             locate bytes = pure (if bytes == sql then Just (ResultStatement 2 1) else Nothing)
         attempts <- newIORef []
         pool <- outcomePool $ \candidate -> do
@@ -195,7 +194,7 @@ checks =
     , testCase "Unaligned result statement metadata follows the last-statement search" $ do
         let sql = "CREATE TABLE noise (x INT);SELECT 42 AS answer;CREATE TABLE tail (x INT);"
             expected = "SELECT 42 AS answer;"
-            config = defaultReductionConfig {reductionDialect = SQLite}
+            config = defaultReductionConfigFor SQLite
             run location = do
                 candidates <- newIORef []
                 pool <- outcomePool $ \candidate -> do
@@ -225,7 +224,7 @@ checks =
                     , "DROP TABLE t;"
                     , "SELECT x FROM b.t;"
                     ]
-            config = defaultReductionConfig {reductionDialect = PostgreSQL, reductionSlicing = False}
+            config = (defaultReductionConfigFor PostgreSQL) {reductionSlicing = False}
         parsed <- parseSQL (defaultParseOptions PostgreSQL) sql
         case parsed of
             Left err -> assertFailure (show err)
@@ -258,7 +257,7 @@ checks =
                     , "SELECT * FROM crash_tbl WHERE id = 42;"
                     ]
             config =
-                defaultReductionConfig
+                (defaultReductionConfigFor PostgreSQL)
                     { reductionIntraStatement = False
                     , reductionUnrestricted = False
                     }
@@ -284,10 +283,9 @@ checks =
                     , "DROP TABLE vt1;"
                     ]
             config =
-                defaultReductionConfig
+                (defaultReductionConfigFor SQLite)
                     { reductionIntraStatement = False
                     , reductionUnrestricted = False
-                    , reductionDialect = SQLite
                     }
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "keeps target vt1 drop" (BSC.isInfixOf "DROP TABLE vt1" reduced)
@@ -308,7 +306,7 @@ checks =
                     [ "CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'abc', PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p(id));"
                     , "SELECT CASE WHEN id = 1 THEN 42 ELSE 0 END, COALESCE(id, 0), id IS NOT NULL FROM t;"
                     ]
-            config = defaultReductionConfig {reductionDialect = GenericSQL, reductionIntraStatement = True}
+            config = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
         reduced <- reduceSQLWithConfig config nullLogger pool sql
         assertBool "strips table constraint" (not (BSC.isInfixOf "PRIMARY KEY" reduced))
         assertBool "strips foreign key constraint" (not (BSC.isInfixOf "FOREIGN KEY" reduced))
@@ -318,7 +316,7 @@ checks =
         let original = "SELECT 1234, 1234, 9999, 9999;"
             allChanged = "SELECT 0, 0, 0, 0;"
             expected = "SELECT 0, 0, 9999, 9999;"
-            cfg = defaultReductionConfig {reductionDialect = SQLite, reductionIntraStatement = True}
+            cfg = (defaultReductionConfigFor SQLite) {reductionIntraStatement = True}
             accepted sql = sql == original || sql == expected
         control <- predicatePool accepted
         reducedControl <- reduceSQLWithConfig cfg nullLogger control original
@@ -343,9 +341,8 @@ checks =
             complement = "SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
             expected = "SELECT 30;SELECT 40;"
             config =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionSlicing = False
+                (defaultReductionConfigFor SQLite)
+                    { reductionSlicing = False
                     , reductionClosure = False
                     , reductionStatementSearch = StatementComplementFirst
                     }
@@ -477,9 +474,8 @@ checks =
                     modifyIORef' testedRef (candidate :)
                     pure (if candidate == original then OracleAccepted else OracleRejected)
                 let config =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionSlicing = False
+                        (defaultReductionConfigFor SQLite)
+                            { reductionSlicing = False
                             , reductionUnrestricted = False
                             , reductionStatementSearch = policy
                             }
@@ -530,9 +526,8 @@ checks =
                         , rankedFallbackMaxShrinkPct = 0
                         }
             config =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionStatementSearch = fallbackPolicy
+                (defaultReductionConfigFor SQLite)
+                    { reductionStatementSearch = fallbackPolicy
                     }
         activations <- newIORef (0 :: Int)
         let captureLogger =
@@ -608,9 +603,8 @@ checks =
                 let runWith useGroups = do
                         pool <- outcomePool (sqliteContractOracle contract)
                         let cfg =
-                                defaultReductionConfig
-                                    { reductionDialect = SQLite
-                                    , reductionGroupProposals = useGroups
+                                (defaultReductionConfigFor SQLite)
+                                    { reductionGroupProposals = useGroups
                                     }
                         reduceSQLWithConfig cfg nullLogger pool sql
                 withoutGroups <- runWith False
@@ -639,9 +633,8 @@ checks =
             Right contract -> do
                 pool <- outcomePool (sqliteContractOracle contract)
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionGroupProposals = True
+                        (defaultReductionConfigFor SQLite)
+                            { reductionGroupProposals = True
                             }
                 reduced <- reduceSQLWithConfig cfg nullLogger pool sql
                 assertBool
@@ -674,9 +667,8 @@ checks =
                 pure (observationOutcome (detailedObservation details))
         pool <- outcomePool decide
         let cfg =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionGroupProposals = True
+                (defaultReductionConfigFor SQLite)
+                    { reductionGroupProposals = True
                     }
         ReductionResult out _ <-
             reduceSQLWithResultTrace lookupTrace (const (pure ())) cfg nullLogger pool sql
@@ -690,9 +682,8 @@ checks =
             pairReduction = "SELECT 20;SELECT 40;"
             predicate sql = sql == original || sql == pairReduction
             config =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionSlicing = False
+                (defaultReductionConfigFor SQLite)
+                    { reductionSlicing = False
                     , reductionClosure = False
                     }
         pool <- predicatePool predicate
@@ -708,9 +699,8 @@ checks =
             singleton = "INSERT INTO t VALUES (2), (3), (4), (5), (6), (7), (8);"
             expected = "INSERT INTO t VALUES (1), (2), (5), (6), (7), (8);"
             config =
-                defaultReductionConfig
-                    { reductionDialect = SQLite
-                    , reductionIntraStatement = True
+                (defaultReductionConfigFor SQLite)
+                    { reductionIntraStatement = True
                     , reductionAdaptiveValues = True
                     }
         attempts <- newIORef []

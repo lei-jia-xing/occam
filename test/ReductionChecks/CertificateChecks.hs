@@ -42,7 +42,7 @@ import Occam.Reducer (
     ReductionConfig (..),
     ReductionResult (..),
     cutRemovedStatementInts,
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQLWithConfig,
     reduceSQLWithResultSlicing,
     reduceSQLWithResultTrace,
@@ -364,9 +364,8 @@ checks =
                         pure (observationOutcome (detailedObservation details))
                 pool <- outcomePool decide
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionEarlyReject = earlyReject
+                        (defaultReductionConfigFor SQLite)
+                            { reductionEarlyReject = earlyReject
                             }
                 ReductionResult out _ <-
                     reduceSQLWithResultTrace lookupTrace (const (pure ())) cfg logger pool sql
@@ -399,9 +398,8 @@ checks =
                     (\cand -> BSC.isInfixOf "CREATE TABLE keep" cand && BSC.isInfixOf "INSERT INTO keep" cand)
             let locate _ = pure (Just (ResultStatement 3 2))
                 cfg =
-                    defaultReductionConfig
-                        { reductionDialect = SQLite
-                        , reductionEarlyReject = True
+                    (defaultReductionConfigFor SQLite)
+                        { reductionEarlyReject = True
                         }
             ReductionResult out _ <-
                 reduceSQLWithResultSlicing locate (const (pure ())) cfg nullLogger pool sql
@@ -440,9 +438,8 @@ checks =
                             pure (observationOutcome (detailedObservation details))
                     pool <- outcomePool decide
                     let cfg =
-                            defaultReductionConfig
-                                { reductionDialect = SQLite
-                                , reductionIntraStatement = True
+                            (defaultReductionConfigFor SQLite)
+                                { reductionIntraStatement = True
                                 , reductionEarlyReject = earlyReject
                                 }
                     ReductionResult out _ <-
@@ -475,9 +472,8 @@ checks =
         let runWith fullReparse = do
                 pool <- outcomePool (sqliteContractOracle contract)
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionIntraStatement = True
+                        (defaultReductionConfigFor SQLite)
+                            { reductionIntraStatement = True
                             , reductionFullSyntaxReparse = fullReparse
                             }
                 reduceSQLWithConfig cfg nullLogger pool sql

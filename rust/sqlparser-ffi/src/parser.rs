@@ -331,16 +331,14 @@ fn walk_units(
     }
 
     // Coarse shadowing rule: any routine DDL or parse error anywhere in the
-    // script disables the pure-builtin table for every unit, restoring the
-    // blanket routine fence. Analysis runs only now so the flag is known.
+    // script disables unshadowed builtin table assumptions (e.g. COUNT(*) /
+    // MySQL ON DUPLICATE KEY UPDATE VALUES(col)) script-wide.
     let pure_table_enabled = detailed
         && lexical_suffix.is_none()
         && !pending.iter().any(|unit| unit.has_parse_error)
-        && !pending.iter().any(|unit| {
-            unit.statement
-                .as_ref()
-                .is_some_and(crate::pure::is_routine_ddl)
-        });
+        && !pending
+            .iter()
+            .any(|unit| unit.statement.as_ref().is_some_and(is_routine_ddl));
     if detailed {
         let source_map = source_map
             .as_ref()
@@ -456,6 +454,19 @@ fn statement_cannot_produce_result(statement: &Statement) -> bool {
         Statement::Delete(delete) => delete.returning.is_none() && delete.output.is_none(),
         _ => false,
     }
+}
+
+fn is_routine_ddl(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::CreateFunction(_)
+            | Statement::CreateAggregate(_)
+            | Statement::CreateProcedure { .. }
+            | Statement::CreateMacro { .. }
+            | Statement::DropFunction(_)
+            | Statement::DropProcedure { .. }
+            | Statement::AlterFunction(_)
+    )
 }
 
 #[cfg(test)]

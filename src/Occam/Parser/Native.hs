@@ -147,22 +147,12 @@ parserErrorMessageFor (ParserUnknownFailure code) =
     "unknown sqlparser native error " <> T.pack (show code)
 
 dialectCode :: SQLDialect -> CUInt
-dialectCode GenericSQL = 0
-dialectCode PostgreSQL = 1
-dialectCode MySQL = 2
+dialectCode PostgreSQL = 0
+dialectCode MySQL = 1
+dialectCode MariaDB = 2
 dialectCode SQLite = 3
 dialectCode DuckDB = 4
 dialectCode ClickHouse = 5
-dialectCode Oracle = 6
-dialectCode Ansi = 7
-dialectCode BigQuery = 8
-dialectCode Databricks = 9
-dialectCode Hive = 10
-dialectCode MsSql = 11
-dialectCode Redshift = 12
-dialectCode Snowflake = 13
-dialectCode Spark = 14
-dialectCode Teradata = 15
 
 -- | Decode the native error message for a non-zero parse status.
 nativeError :: CInt -> IO ParserError

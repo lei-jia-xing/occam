@@ -39,7 +39,7 @@ import Occam.Reducer (
     ReductionResult (..),
     ReductionStage (..),
     StageEvent (..),
-    defaultReductionConfig,
+    defaultReductionConfigFor,
     reduceSQLWithConfig,
     reduceSQLWithResultTrace,
  )
@@ -81,9 +81,8 @@ checks =
                     calls <- readIORef syntaxCallsRef
                     pure (out, calls)
                 baseCfg =
-                    defaultReductionConfig
-                        { reductionDialect = SQLite
-                        , reductionSlicing = False
+                    (defaultReductionConfigFor SQLite)
+                        { reductionSlicing = False
                         , reductionClosure = False
                         , reductionUnrestricted = False
                         , reductionIntraStatement = True
@@ -217,9 +216,8 @@ checks =
                             modifyIORef' callsRef (+ 1)
                             sqliteContractOracle contract cand
                         let cfg =
-                                defaultReductionConfig
-                                    { reductionDialect = SQLite
-                                    , reductionSlicing = False
+                                (defaultReductionConfigFor SQLite)
+                                    { reductionSlicing = False
                                     , reductionClosure = False
                                     , reductionUnrestricted = False
                                     , reductionIntraStatement = True
@@ -272,9 +270,8 @@ checks =
                                 modifyIORef' traceRef (cand :)
                                 pure (if accepted cand then OracleAccepted else OracleRejected)
                             let cfg =
-                                    defaultReductionConfig
-                                        { reductionDialect = dialect
-                                        , reductionSlicing = False
+                                    (defaultReductionConfigFor dialect)
+                                        { reductionSlicing = False
                                         , reductionClosure = False
                                         , reductionUnrestricted = False
                                         , reductionIntraStatement = True
@@ -316,9 +313,8 @@ checks =
                             modifyIORef' traceRef (cand :)
                             pure (if accepted cand then OracleAccepted else OracleRejected)
                         let cfg =
-                                defaultReductionConfig
-                                    { reductionDialect = dialect
-                                    , reductionSlicing = False
+                                (defaultReductionConfigFor dialect)
+                                    { reductionSlicing = False
                                     , reductionClosure = False
                                     , reductionUnrestricted = False
                                     , reductionIntraStatement = True
@@ -357,9 +353,8 @@ checks =
                     when inSyn (modifyIORef' traceRef (cand :))
                     sqliteContractOracle contract cand
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionSlicing = False
+                        (defaultReductionConfigFor SQLite)
+                            { reductionSlicing = False
                             , reductionClosure = False
                             , reductionUnrestricted = False
                             , reductionIntraStatement = True
@@ -420,9 +415,8 @@ checks =
                 modifyIORef' traceRef (cand :)
                 sqliteContractOracle contract cand
             let cfg =
-                    defaultReductionConfig
-                        { reductionDialect = SQLite
-                        , reductionSlicing = False
+                    (defaultReductionConfigFor SQLite)
+                        { reductionSlicing = False
                         , reductionClosure = False
                         , reductionUnrestricted = False
                         , reductionIntraStatement = True
@@ -506,9 +500,8 @@ checks =
                                         pure OracleAccepted
                                     else pure OracleRejected
                     let cfg =
-                            defaultReductionConfig
-                                { reductionDialect = SQLite
-                                , reductionSlicing = False
+                            (defaultReductionConfigFor SQLite)
+                                { reductionSlicing = False
                                 , reductionClosure = False
                                 , reductionUnrestricted = False
                                 , reductionIntraStatement = True
@@ -547,9 +540,8 @@ checks =
         let runSqlite deferRec = do
                 pool <- outcomePool (sqliteContractOracle sqliteContract)
                 let cfg =
-                        defaultReductionConfig
-                            { reductionDialect = SQLite
-                            , reductionIntraStatement = True
+                        (defaultReductionConfigFor SQLite)
+                            { reductionIntraStatement = True
                             , reductionDeferRecursivePredicates = deferRec
                             }
                 reduceSQLWithConfig cfg nullLogger pool sqliteSql
@@ -572,9 +564,8 @@ checks =
             let runDuck deferRec = do
                     pool <- outcomePool (duckdbContractOracleTimeout duckTimeoutMicros duckContract)
                     let cfg =
-                            defaultReductionConfig
-                                { reductionDialect = DuckDB
-                                , reductionIntraStatement = True
+                            (defaultReductionConfigFor DuckDB)
+                                { reductionIntraStatement = True
                                 , reductionDeferRecursivePredicates = deferRec
                                 }
                     reduceSQLWithConfig cfg nullLogger pool duckSql

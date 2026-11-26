@@ -46,9 +46,7 @@ pub(crate) fn strip_temp_schema(parts: &mut Vec<ir::Ident>, dialect: DialectKind
     }
     let first = parts[0].0.as_str();
     let is_temp = match dialect {
-        DialectKind::PostgreSql | DialectKind::Redshift => {
-            first == "pg_temp" || first.starts_with("pg_temp_")
-        }
+        DialectKind::PostgreSql => first == "pg_temp" || first.starts_with("pg_temp_"),
         DialectKind::SQLite | DialectKind::DuckDB => first == "temp",
         _ => false,
     };
