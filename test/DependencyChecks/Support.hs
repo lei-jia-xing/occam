@@ -149,7 +149,7 @@ isTruncateKind TruncateWrite {} = True
 isTruncateKind _ = False
 
 defaultSessionInit :: SessionInit
-defaultSessionInit = SessionInit [] [] Nothing True True Map.empty
+defaultSessionInit = SessionInit [] [] Nothing True True Map.empty False False True
 
 analyzeParsed :: SQLDialect -> ByteString -> IO DependencyGraph
 analyzeParsed dialect sql = do

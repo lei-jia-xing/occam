@@ -91,27 +91,37 @@ sequenceRefFromExpr rules = \case
                         T.toLower (TE.decodeUtf8 raw) `elem` ["regclass", "text"]
                     _ -> False
 
--- | Classify a function call as a PostgreSQL sequence read, write, or unknown call.
-sequenceFunctionEffect :: IdentifierRules -> AST.FunctionCall -> Maybe SequenceEffect
-sequenceFunctionEffect rules fn = do
+-- | Classify a function call as a PostgreSQL or DuckDB sequence read, write, or unknown call.
+sequenceFunctionEffect ::
+    SQLDialect -> Bool -> IdentifierRules -> AST.FunctionCall -> Maybe SequenceEffect
+sequenceFunctionEffect dialect pureEnabled rules fn = do
     L _ identPart <- case AST.nameParts (locValue (AST.functionName fn)) of
         [] -> Nothing
         parts -> Just (last parts)
     let rawLower = T.toLower (unquoteNamePart identPart)
     seqOp <- case rawLower of
         "nextval" -> Just ("nextval" :: Text)
-        "setval" -> Just "setval"
         "currval" -> Just "currval"
-        "lastval" -> Just "lastval"
+        "setval" | dialect == PostgreSQL -> Just "setval"
+        "lastval" | dialect == PostgreSQL -> Just "lastval"
         _ -> Nothing
     let builtinIdent part expected
             | AST.namePartQuoted part = unquoteNamePart part == expected
             | otherwise = T.toLower (unquoteNamePart part) == expected
-        isBuiltin =
-            builtinIdent identPart seqOp
-                && case AST.nameParts (locValue (AST.functionName fn)) of
-                    [L _ schema, _] -> builtinIdent schema "pg_catalog"
-                    _ -> False
+        isBuiltin = case dialect of
+            PostgreSQL ->
+                builtinIdent identPart seqOp
+                    && case AST.nameParts (locValue (AST.functionName fn)) of
+                        [L _ schema, _] -> builtinIdent schema "pg_catalog"
+                        _ -> False
+            DuckDB ->
+                pureEnabled
+                    && case AST.nameParts (locValue (AST.functionName fn)) of
+                        [_] -> True
+                        [L _ schema, _] ->
+                            T.toLower (unquoteNamePart schema) `elem` ["main", "system"]
+                        _ -> False
+            _ -> False
     let args = AST.functionArgs fn
         validArity = case seqOp of
             "nextval" -> length args == 1
@@ -136,11 +146,12 @@ sequenceFunctionEffect rules fn = do
                     Nothing -> Just SeqUnknown
             _ -> Just SeqUnknown
 
--- | Classify an expression as a PostgreSQL sequence effect if applicable.
+-- | Classify an expression as a PostgreSQL or DuckDB sequence effect if applicable.
 sequenceExprEffect :: AnalysisContext -> AST.Expr -> Maybe SequenceEffect
 sequenceExprEffect ctx = \case
     AST.ExprCall (L _ fn)
-        | ctxDialect ctx == PostgreSQL -> sequenceFunctionEffect (ctxIdentRules ctx) fn
+        | ctxDialect ctx `elem` [PostgreSQL, DuckDB] ->
+            sequenceFunctionEffect (ctxDialect ctx) (ctxPureTableEnabled ctx) (ctxIdentRules ctx) fn
     _ -> Nothing
 
 -- | Update 'SequenceState' when visiting an expression node.

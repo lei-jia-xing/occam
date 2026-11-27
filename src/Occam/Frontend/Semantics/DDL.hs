@@ -84,7 +84,7 @@ implicitCommit ctx stmt
         AST.StatementCreate (L _ cr) -> case locValue (AST.createObject cr) of
             AST.CreateTableObject _ -> not (AST.createTemp cr)
             _ -> True
-        AST.StatementDrop _ -> True
+        AST.StatementDrop (L _ dr) -> not (AST.dropTemp dr)
         AST.StatementAlter _ -> True
         AST.StatementRenameTable _ -> True
         AST.StatementTruncate _ -> True
@@ -720,7 +720,7 @@ createSchemaFacts ctx cs baseFacts =
 createDatabaseFacts ::
     AnalysisContext -> AST.CreateStmt -> AST.CreateDatabase -> Core.SemanticFacts -> Core.SemanticFacts
 createDatabaseFacts ctx createStmt db baseFacts
-    | ctxDialect ctx `elem` [MySQL, MariaDB]
+    | ctxDialect ctx `elem` [MySQL, MariaDB, ClickHouse]
     , not (AST.createOrReplace createStmt)
     , null (AST.createDatabaseOptions db) =
         case nameFromAST ctx IdentRelation (locValue (AST.createDatabaseName db)) of
@@ -1035,16 +1035,18 @@ dropFacts ctx stmt baseFacts = case locValue (AST.dropObject stmt) of
                         }
     where
         dropObj mTable kind name = case kind of
-            AST.DropTable -> flip Core.DropRelation Core.TableRelation <$> relationRef ctx name
-            AST.DropView -> flip Core.DropRelation Core.ViewRelation <$> relationRef ctx name
-            AST.DropMaterializedView -> flip Core.DropRelation Core.MaterializedViewRelation <$> relationRef ctx name
+            AST.DropTable -> flip Core.DropRelation Core.TableRelation . markTemp <$> relationRef ctx name
+            AST.DropView -> flip Core.DropRelation Core.ViewRelation . markTemp <$> relationRef ctx name
+            AST.DropMaterializedView ->
+                flip Core.DropRelation Core.MaterializedViewRelation . markTemp <$> relationRef ctx name
             AST.DropIndex -> do
                 idxName <- nameFromAST ctx IdentOther name
                 pure (Core.DropIndex (indexRef ctx idxName mTable))
-            AST.DropSequence -> Core.DropSequence <$> relationRef ctx name
+            AST.DropSequence -> Core.DropSequence . markTemp <$> relationRef ctx name
             AST.DropSchema -> Core.DropSchema <$> nameFromAST ctx IdentRelation name
             AST.DropDatabase -> Core.DropSchema <$> nameFromAST ctx IdentRelation name
             _ -> Nothing
+        markTemp ref = ref {Core.nameRefTemp = Core.nameRefTemp ref || AST.dropTemp stmt}
 
 alterFacts ::
     AnalysisContext -> VisitorState -> AST.AlterStmt -> Core.SemanticFacts -> Core.SemanticFacts
@@ -1064,13 +1066,22 @@ alterFacts ctx visitor stmt baseFacts = case AST.alterObject stmt of
         Just table ->
             let (changes, ops, barriers) = foldl' (stepAction table) ([], [], []) (AST.alterActions stmt)
                 alterOp = [Core.AlterTableOp (Core.AlterTable table changes) | not (null changes)]
+                hasMutation = any (isMutation . locValue) (AST.alterActions stmt)
+                finalBarriers =
+                    if hasMutation
+                        then addUnmodeledBarriers visitor [] (Core.factBarriers baseFacts ++ barriers)
+                        else Core.factBarriers baseFacts ++ barriers
              in baseFacts
                     { Core.factOps = Core.factOps baseFacts ++ alterOp ++ ops
-                    , Core.factBarriers = Core.factBarriers baseFacts ++ barriers
+                    , Core.factBarriers = finalBarriers
                     }
     where
+        isMutation = \case
+            AST.AlterUpdate {} -> True
+            AST.AlterDelete {} -> True
+            _ -> False
         stepAction table (chAcc, opAcc, bAcc) (L sp action) =
-            let (chs, ops, bs) = alterChange ctx table sp action
+            let (chs, ops, bs) = alterChange ctx visitor table sp action
              in (chAcc ++ chs, opAcc ++ ops, bAcc ++ bs)
 
 alterViewFacts ::
@@ -1152,11 +1163,12 @@ alterViewFacts ctx visitor stmt baseFacts = case map locValue (AST.alterActions 
 
 alterChange ::
     AnalysisContext ->
+    VisitorState ->
     Core.NameRef ->
     ByteSpan ->
     AST.AlterAction ->
     ([Core.AlterChange], [Core.CatalogOp], [Core.ScopedBarrier])
-alterChange ctx table actionSpan action =
+alterChange ctx visitor table actionSpan action =
     let detail = TE.decodeUtf8 (unsafeSliceSource ctx actionSpan)
      in case action of
             AST.AlterAddColumn _ cols _ ->
@@ -1249,7 +1261,53 @@ alterChange ctx table actionSpan action =
                 , map (T.toUpper . unquoteNamePart . locValue) (AST.tableOptionName opt)
                     `elem` [["ALGORITHM"], ["LOCK"]] ->
                     ([], [], [Core.ScopedBarrier (Core.RelationScope table) Core.UnknownAlterBarrier (Just detail)])
+            AST.AlterMaterializeTtl ->
+                ([], [], [Core.ScopedBarrier (Core.RelationScope table) Core.UnknownAlterBarrier (Just detail)])
+            AST.AlterModifySetting _ ->
+                ([], [], [Core.ScopedBarrier (Core.RelationScope table) Core.UnknownAlterBarrier (Just detail)])
+            AST.AlterSetLogged _ ->
+                ([], [], [Core.ScopedBarrier (Core.RelationScope table) Core.UnknownAlterBarrier (Just detail)])
+            AST.AlterRowLevelSecurity _ ->
+                ([], [], [Core.ScopedBarrier (Core.RelationScope table) Core.UnknownAlterBarrier (Just detail)])
+            AST.AlterUpdate assigns _ _ ->
+                let writtenCols =
+                        dedupCols
+                            [ col
+                            | L _ asgn <- assigns
+                            , Just name <- [nameFromAST ctx IdentColumn (locValue (AST.assignTarget asgn))]
+                            , Just col <- [listToMaybe (reverse (Core.nameParts name))]
+                            ]
+                    readFacts = visitorReads visitor [] Core.ReadData
+                    dw =
+                        Core.DataWrite
+                            { Core.dataWriteTarget = table
+                            , Core.dataWriteKind = Core.UpdateWrite Core.UpdateFilteredRows
+                            , Core.dataWriteColumns = []
+                            , Core.dataWriteUnqualifiedColumns = writtenCols
+                            , Core.dataWriteReads = readFacts
+                            , Core.dataWriteOnly = False
+                            }
+                 in ([], [Core.WriteDataOp dw], [])
+            AST.AlterDelete _ _ ->
+                let readFacts = visitorReads visitor [] Core.ReadData
+                    dw =
+                        Core.DataWrite
+                            { Core.dataWriteTarget = table
+                            , Core.dataWriteKind = Core.DeleteWrite Core.DeleteFilteredRows
+                            , Core.dataWriteColumns = []
+                            , Core.dataWriteUnqualifiedColumns = []
+                            , Core.dataWriteReads = readFacts
+                            , Core.dataWriteOnly = False
+                            }
+                 in ([], [Core.WriteDataOp dw], [])
             _ -> ([], [], [Core.ScopedBarrier Core.GlobalScope Core.UnknownAlterBarrier (Just detail)])
+    where
+        dedupCols =
+            reverse
+                . fst
+                . foldl'
+                    (\(acc, seen) c -> if Set.member c seen then (acc, seen) else (c : acc, Set.insert c seen))
+                    ([], Set.empty)
 
 alterOpColumns :: AnalysisContext -> AST.AlterColumnAction -> [Core.Ident]
 alterOpColumns ctx = \case
@@ -1330,17 +1388,21 @@ renameTableFacts ctx renames baseFacts = foldl' step baseFacts renames
         step acc (L spOld oldName, L spNew newName) =
             case (relationRef ctx oldName, nameFromAST ctx IdentRelation newName) of
                 (Just fromRef, Just toName) ->
-                    acc
-                        { Core.factOps =
-                            Core.factOps acc
-                                ++ [ Core.RenameOp
-                                        ( Core.RenameRelation
-                                            fromRef
-                                            (qualifyRename (Core.nameRefName fromRef) toName)
-                                            (indexSchemaPlacement ctx)
-                                        )
-                                   ]
-                        }
+                    let mkRename =
+                            if ctxDialect ctx == MySQL
+                                then Core.RenamePermanentRelation
+                                else Core.RenameRelation
+                     in acc
+                            { Core.factOps =
+                                Core.factOps acc
+                                    ++ [ Core.RenameOp
+                                            ( mkRename
+                                                fromRef
+                                                (qualifyRename (Core.nameRefName fromRef) toName)
+                                                (indexSchemaPlacement ctx)
+                                            )
+                                       ]
+                            }
                 _ ->
                     let detail =
                             TE.decodeUtf8 (unsafeSliceSource ctx spOld)

@@ -72,6 +72,7 @@ import Occam.Dependency.Resolve (
     resolveRelationKeys,
     resolveSequenceKeys,
     resolveTriggerKeys,
+    resolveViewSourceKeys,
  )
 import Occam.Dependency.State (
     Catalog (..),
@@ -117,7 +118,7 @@ import Occam.Dependency.State (
     relTriggersL,
     relUnresolvedSourcesL,
  )
-import Occam.Dependency.Write (processRead)
+import Occam.Dependency.Write (processRead, processReadWith)
 
 -- Shared definition helpers
 tableConstraintValues :: TableDef -> [Constraint]
@@ -136,26 +137,42 @@ foreignKeyParentDeps session catalog constraints =
         , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
         ]
 
-resolvedSourceKeys :: SessionState -> Catalog -> [ReadFact] -> Set RelationKey
-resolvedSourceKeys session catalog readFacts =
+resolvedSourceKeysWith ::
+    (SessionState -> Catalog -> NameRef -> [RelationKey]) ->
+    SessionState ->
+    Catalog ->
+    [ReadFact] ->
+    Set RelationKey
+resolvedSourceKeysWith resolveFn session catalog readFacts =
     Set.fromList
         [ key
         | readFact <- readFacts
-        , key <- resolveRelationKeys session catalog (readSource readFact)
+        , key <- resolveFn session catalog (readSource readFact)
         , Map.member key (catalogRelations catalog)
         ]
 
-unresolvedSourceRefs :: SessionState -> Catalog -> [ReadFact] -> Set NameRef
-unresolvedSourceRefs session catalog readFacts =
+resolvedSourceKeys :: SessionState -> Catalog -> [ReadFact] -> Set RelationKey
+resolvedSourceKeys = resolvedSourceKeysWith resolveRelationKeys
+
+unresolvedSourceRefsWith ::
+    (SessionState -> Catalog -> NameRef -> [RelationKey]) ->
+    SessionState ->
+    Catalog ->
+    [ReadFact] ->
+    Set NameRef
+unresolvedSourceRefsWith resolveFn session catalog readFacts =
     Set.fromList
         [ readSource readFact
         | readFact <- readFacts
         , null
             [ key
-            | key <- resolveRelationKeys session catalog (readSource readFact)
+            | key <- resolveFn session catalog (readSource readFact)
             , Map.member key (catalogRelations catalog)
             ]
         ]
+
+unresolvedSourceRefs :: SessionState -> Catalog -> [ReadFact] -> Set NameRef
+unresolvedSourceRefs = unresolvedSourceRefsWith resolveRelationKeys
 
 -- Tables, views, indexes
 processDefineTable :: StatementId -> Eval -> TableDef -> Eval
@@ -230,14 +247,15 @@ processDefineView sid eval definition
             RelationKey
                 (viewTemporary definition)
                 (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
+        resolveSource s = resolveViewSourceKeys s (viewTemporary definition)
         existing = lookupRelation catalog key
-        evalReads = foldl' processRead eval (viewSources definition)
+        evalReads = foldl' (processReadWith resolveSource) eval (viewSources definition)
         existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
         eval1 =
             addTouches
                 (relationTouchKeys key)
                 (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (relationKeyName key)) evalReads)
-        unresolved = unresolvedSourceRefs session catalog (viewSources definition)
+        unresolved = unresolvedSourceRefsWith resolveSource session catalog (viewSources definition)
         eval2 = addUnresolvedSourceBarriers "view" (viewName definition) unresolved eval1
         kind
             | viewMaterialized definition = MaterializedViewRelation
@@ -246,7 +264,7 @@ processDefineView sid eval definition
             newRelation kind
                 & relDefinitionL ?~ sid
                 & relColumnsL .~ Set.fromList (viewColumns definition)
-                & relSourcesL .~ resolvedSourceKeys session catalog (viewSources definition)
+                & relSourcesL .~ resolvedSourceKeysWith resolveSource session catalog (viewSources definition)
                 & relUnresolvedSourcesL .~ unresolved
                 & relSourceReadsL .~ viewSources definition
                 & relColumnLineageL .~ viewColumnLineage definition
@@ -457,6 +475,7 @@ processDefineSequence sid eval definition =
         state =
             SequenceState
                 (Just sid)
+                Set.empty
                 Set.empty
                 Nothing
                 (sequenceTransactional definition)

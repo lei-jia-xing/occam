@@ -124,7 +124,7 @@ code asserts them with `requireDialectP` or `requireFeatureP`; both report
   `INSERT ... VALUES ROW(...)`), multi-table UPDATE/DELETE (`ORDER BY` /
   `LIMIT` / `RETURNING` rejected on multi-table `DELETE`), `RETURNING` is
   rejected.
-- DDL: CREATE/DROP/ALTER TABLE, INDEX (including FULLTEXT, prefix lengths, and
+- DDL: CREATE/DROP/ALTER TABLE (`DROP TEMPORARY TABLE`), INDEX (including FULLTEXT, prefix lengths, and
   double-parenthesized functional key parts `((expr))`), VIEW (`ALGORITHM`),
   DATABASE, TRIGGER, FUNCTION/PROCEDURE, table options (`ENGINE`, `DEFAULT
   CHARSET`, `COLLATE`, `AUTO_INCREMENT`, ...).
@@ -136,8 +136,8 @@ code asserts them with `requireDialectP` or `requireFeatureP`; both report
 
 - Same statement families as MySQL, with MariaDB extensions: `TABLE t`
   queries, `RETURNING` after INSERT/REPLACE/UPDATE/DELETE (single-table),
-  `CREATE [OR REPLACE] SEQUENCE`/`INDEX`/`DATABASE`/`SCHEMA`, `PREPARE ... FROM`
-  expressions, `USING HASH` index methods, expression index keys `(f(col))`,
+  `CREATE [OR REPLACE] SEQUENCE`/`INDEX`/`DATABASE`/`SCHEMA`, `DROP TEMPORARY TABLE/SEQUENCE`,
+  `PREPARE ... FROM` expressions, `USING HASH` index methods, expression index keys `(f(col))`,
   and `ALTER TABLE ... ALGORITHM=...`. `LATERAL` is not accepted; `WITHIN GROUP
   (ORDER BY ...)` requires an `OVER (...)` window specification.
 - `ON DUPLICATE KEY UPDATE`, `FULLTEXT`, and index prefix lengths apply as in
@@ -181,7 +181,8 @@ code asserts them with `requireDialectP` or `requireFeatureP`; both report
 - DML: INSERT, UPDATE/DELETE via `ALTER TABLE ... UPDATE/DELETE` (lightweight
   mutations), no `RETURNING`.
 - DDL: CREATE/DROP/ALTER TABLE (including `ENGINE`, `SETTINGS`, projections,
-  skipping indexes, partitions), CREATE `[TEMP|OR REPLACE]` VIEW, CREATE
+  skipping indexes, partitions, trailing `ALTER TABLE ... SETTINGS`),
+  DROP `TEMPORARY TABLE`/`VIEW`, CREATE `[TEMP|OR REPLACE]` VIEW, CREATE
   `[OR REPLACE]` MATERIALIZED VIEW (`TO`, `ENGINE`, `SETTINGS`, `POPULATE`;
   `CREATE TEMPORARY MATERIALIZED VIEW` and `DROP MATERIALIZED VIEW` are
   rejected), CREATE `[OR REPLACE]` FUNCTION, DATABASE, sequences are not

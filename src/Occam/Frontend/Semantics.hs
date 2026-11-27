@@ -9,6 +9,7 @@ module Occam.Frontend.Semantics (
 ) where
 
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Occam.Core qualified as Core
 import Occam.Frontend.AST qualified as AST
@@ -94,6 +95,7 @@ analyzeStatement ctx stmt =
             _ -> False
         needSharedSeqs = case stmt of
             AST.StatementQuery _ -> True
+            AST.StatementPivot _ -> True
             AST.StatementInsert _ -> True
             AST.StatementUpdate _ -> True
             AST.StatementDelete _ -> True
@@ -112,9 +114,7 @@ analyzeStatement ctx stmt =
         seqState = case vsSequences visitor of
             Just s -> s
             Nothing -> sequenceEffectsForStatement ctx stmt
-        seqTransactional =
-            semSequenceTransactional (dialectSemantics (ctxProfile ctx))
-                && dialect /= PostgreSQL
+        seqTransactional = semSequenceTransactional (dialectSemantics (ctxProfile ctx))
         seqOps =
             [ Core.WriteSequenceOp (Core.SequenceWrite s seqTransactional)
             | s <- seqWrites seqState
@@ -124,6 +124,7 @@ analyzeStatement ctx stmt =
                    ]
         allowsDeferredCall = case stmt of
             AST.StatementQuery _ -> True
+            AST.StatementPivot _ -> True
             AST.StatementInsert _ -> True
             AST.StatementUpdate _ -> True
             AST.StatementDelete _ -> True
@@ -213,6 +214,8 @@ dispatchStatement ::
 dispatchStatement ctx visitor stmt baseFacts = case stmt of
     AST.StatementQuery (L _ query) ->
         (queryFacts ctx visitor query baseFacts, False)
+    AST.StatementPivot (L _ piv) ->
+        (pivotFacts analyzeStatement ctx visitor piv baseFacts, False)
     AST.StatementInsert (L sp ins) ->
         (insertFacts analyzeStatement ctx visitor sp ins baseFacts, False)
     AST.StatementUpdate (L sp upd) ->
@@ -264,6 +267,40 @@ dispatchStatement ctx visitor stmt baseFacts = case stmt of
                 , Core.factBarriers =
                     Core.factBarriers baseFacts
                         ++ [Core.ScopedBarrier (Core.RelationScope target) Core.UnknownAlterBarrier (Just "OPTIMIZE TABLE")]
+                }
+            , False
+            )
+    AST.StatementAttach (L _ (AST.AttachObject kindTok (L _ table) _))
+        | ctxDialect ctx == ClickHouse
+        , T.toUpper (TE.decodeUtf8 (locValue kindTok)) == "TABLE"
+        , Just target <- relationRef ctx table ->
+            ( baseFacts
+                { Core.factOps =
+                    Core.factOps baseFacts ++ [Core.ReadOp (Core.ReadFact target Core.ReadSchema [] False)]
+                , Core.factBarriers =
+                    Core.factBarriers baseFacts
+                        ++ [ Core.ScopedBarrier
+                                (Core.RelationScope target)
+                                Core.UnknownStatementBarrier
+                                (Just (TE.decodeUtf8 (unitSource ctx)))
+                           ]
+                }
+            , False
+            )
+    AST.StatementDetach (L _ (AST.DetachObject kindTok (L _ table) _ _))
+        | ctxDialect ctx == ClickHouse
+        , T.toUpper (TE.decodeUtf8 (locValue kindTok)) == "TABLE"
+        , Just target <- relationRef ctx table ->
+            ( baseFacts
+                { Core.factOps =
+                    Core.factOps baseFacts ++ [Core.ReadOp (Core.ReadFact target Core.ReadSchema [] False)]
+                , Core.factBarriers =
+                    Core.factBarriers baseFacts
+                        ++ [ Core.ScopedBarrier
+                                (Core.RelationScope target)
+                                Core.UnknownStatementBarrier
+                                (Just (TE.decodeUtf8 (unitSource ctx)))
+                           ]
                 }
             , False
             )
@@ -328,6 +365,24 @@ queryFacts ctx visitor query baseFacts =
         facts1 =
             baseFacts
                 { Core.factOps = Core.factOps baseFacts ++ ops'
+                , Core.factBarriers = barriers'
+                }
+     in mergeNested facts1 nested
+
+pivotFacts ::
+    (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
+    AnalysisContext ->
+    VisitorState ->
+    AST.PivotStmt ->
+    Core.SemanticFacts ->
+    Core.SemanticFacts
+pivotFacts analyzeStmt ctx visitor piv baseFacts =
+    let nested = analyzeNested analyzeStmt ctx False (AST.StatementPivot (L (ByteSpan 0 0) piv))
+        readFacts = visitorReads visitor [] Core.ReadData
+        barriers' = addUnmodeledBarriers visitor [] (Core.factBarriers baseFacts)
+        facts1 =
+            baseFacts
+                { Core.factOps = Core.factOps baseFacts ++ map Core.ReadOp readFacts
                 , Core.factBarriers = barriers'
                 }
      in mergeNested facts1 nested

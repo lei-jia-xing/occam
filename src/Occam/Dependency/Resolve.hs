@@ -7,6 +7,8 @@ module Occam.Dependency.Resolve (
     relationFallbackKey,
     sequenceFallbackKey,
     resolveRelationKeys,
+    resolvePermanentRelationKeys,
+    resolveViewSourceKeys,
     resolveSequenceKeys,
     resolveIndexKeys,
     resolveTriggerKeys,
@@ -36,7 +38,7 @@ import Occam.Dependency.State (
     ObjectKey (..),
     RelationKey (..),
     SequenceKey (..),
-    SessionState,
+    SessionState (..),
     TriggerKey (..),
     effectiveNamespacePrefix,
     effectiveSearchPath,
@@ -46,15 +48,17 @@ import Occam.Dependency.State (
 
 qualifyDefinitionName :: SessionState -> Name -> Bool -> Name
 qualifyDefinitionName session name@(Name parts) temporary
-    | temporary = name
     | length parts /= 1 = name
+    | temporary && not (sessTempInNamespace session) = name
     | otherwise =
         case effectiveNamespacePrefix session of
             prefix@(_ : _) -> Name (prefix ++ parts)
-            [] ->
-                case effectiveSearchPath session of
-                    Name searchParts : _ | not (null searchParts) -> Name (searchParts ++ parts)
-                    _ -> name
+            []
+                | temporary -> name
+                | otherwise ->
+                    case effectiveSearchPath session of
+                        Name searchParts : _ | not (null searchParts) -> Name (searchParts ++ parts)
+                        _ -> name
 
 qualifyObjectName :: SessionState -> Name -> Name
 qualifyObjectName session name = qualifyDefinitionName session name False
@@ -70,14 +74,14 @@ qualifyRenameName (Name oldParts) newName@(Name newParts)
 
 relationFallbackKey :: SessionState -> NameRef -> RelationKey
 relationFallbackKey session (NameRef name temporary)
-    | temporary = RelationKey True name
-    | length (nameParts name) > 1 = RelationKey False name
+    | length (nameParts name) > 1 = RelationKey temporary name
+    | temporary = RelationKey True (qualifyDefinitionName session name True)
     | otherwise = RelationKey False (qualifyReferenceName session name)
 
 sequenceFallbackKey :: SessionState -> NameRef -> SequenceKey
 sequenceFallbackKey session (NameRef name temporary)
-    | temporary = SequenceKey True name
-    | length (nameParts name) > 1 = SequenceKey False name
+    | length (nameParts name) > 1 = SequenceKey temporary name
+    | temporary = SequenceKey True (qualifyDefinitionName session name True)
     | otherwise = SequenceKey False (qualifyReferenceName session name)
 
 class ScopedKey k where
@@ -95,6 +99,7 @@ instance ScopedKey SequenceKey where
 -- | Resolve namespaced catalog keys for relations and sequences.
 resolveNamespacedKeys ::
     (Ord k, ScopedKey k) =>
+    Bool ->
     (Catalog -> Map.Map k v) ->
     (Catalog -> Name -> [k]) ->
     (SessionState -> NameRef -> k) ->
@@ -102,29 +107,39 @@ resolveNamespacedKeys ::
     Catalog ->
     NameRef ->
     [k]
-resolveNamespacedKeys entriesOf wildcardOf fallbackKeyOf session catalog (NameRef name temporary)
-    | temporary = [temporaryKey]
-    | isQualified = [scopedKey False name]
-    | Map.member temporaryKey entries = [temporaryKey]
+resolveNamespacedKeys allowTemp entriesOf wildcardOf fallbackKeyOf session catalog (NameRef name temporary)
+    | temporary && not allowTemp = []
+    | temporary = [qualifiedTempKey]
+    | isQualified =
+        if allowTemp && sessTempInNamespace session && Map.member temporaryKey entries
+            then [temporaryKey]
+            else [scopedKey False name]
+    | allowTemp && Map.member qualifiedTempKey entries = [qualifiedTempKey]
     | not (null prefixKeys) = prefixKeys
     | null (effectiveSearchPath session) =
         if Map.member directKey entries
             then [directKey]
             else case wildcardMatches of
-                [] -> [fallbackKey]
+                [] -> [permFallbackKey]
                 matches -> matches
     | otherwise =
         case firstExisting searchKeys of
             Just key -> [key]
-            Nothing -> [fallbackKey]
+            Nothing -> [permFallbackKey]
     where
         entries = entriesOf catalog
         isQualified = case nameParts name of
             (_ : _ : _) -> True
             _ -> False
         temporaryKey = scopedKey True name
+        qualifiedTempKey =
+            if sessTempInNamespace session && not isQualified
+                then case effectiveNamespacePrefix session of
+                    [] -> temporaryKey
+                    prefix -> scopedKey True (Name (prefix ++ nameParts name))
+                else temporaryKey
         directKey = scopedKey False name
-        fallbackKey = fallbackKeyOf session (NameRef name temporary)
+        permFallbackKey = fallbackKeyOf session (NameRef name False)
         prefixKeys =
             case effectiveNamespacePrefix session of
                 [] -> []
@@ -167,10 +182,19 @@ resolveRelationWildcard catalog name =
                     ]
 
 resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
-resolveRelationKeys = resolveNamespacedKeys catalogRelations resolveRelationWildcard relationFallbackKey
+resolveRelationKeys = resolveNamespacedKeys True catalogRelations resolveRelationWildcard relationFallbackKey
+
+resolvePermanentRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
+resolvePermanentRelationKeys = resolveNamespacedKeys False catalogRelations resolveRelationWildcard relationFallbackKey
+
+resolveViewSourceKeys :: SessionState -> Bool -> Catalog -> NameRef -> [RelationKey]
+resolveViewSourceKeys session viewIsTemp catalog ref
+    | not viewIsTemp && sessPermViewIgnoresTemp session =
+        resolvePermanentRelationKeys session catalog ref
+    | otherwise = resolveRelationKeys session catalog ref
 
 resolveSequenceKeys :: SessionState -> Catalog -> NameRef -> [SequenceKey]
-resolveSequenceKeys = resolveNamespacedKeys catalogSequences (wildcardScan catalogSequences) sequenceFallbackKey
+resolveSequenceKeys = resolveNamespacedKeys True catalogSequences (wildcardScan catalogSequences) sequenceFallbackKey
 
 resolveIndexKeys :: SessionState -> Catalog -> IndexRef -> [IndexKey]
 resolveIndexKeys session catalog indexRef =

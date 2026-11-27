@@ -311,6 +311,7 @@ data DropOp = DropOp
 
 data RenameOp
     = RenameRelation !NameRef !Name !IndexSchemaPlacement
+    | RenamePermanentRelation !NameRef !Name !IndexSchemaPlacement
     | RenameColumnOp !NameRef !Ident !Ident
     deriving (Eq, Show)
 

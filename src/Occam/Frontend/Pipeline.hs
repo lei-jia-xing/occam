@@ -138,6 +138,9 @@ sessionInit options =
                 (semDefaultForeignKeyChecks (dialectSemantics profile))
                 (serverForeignKeyChecks server)
         , Core.sessionVariables = serverVariables server
+        , Core.sessionTempInNamespace = semTempInNamespace (dialectSemantics profile)
+        , Core.sessionPermViewIgnoresTemp = semPermViewIgnoresTemp (dialectSemantics profile)
+        , Core.sessionViewsBoundToRelations = semViewsBoundToRelations (dialectSemantics profile)
         }
     where
         dialect = parseDialect options

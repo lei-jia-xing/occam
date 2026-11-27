@@ -64,6 +64,9 @@ data SessionInit = SessionInit
     , sessionAutocommit :: !Bool
     , sessionForeignKeyChecks :: !Bool
     , sessionVariables :: !(Map Text Text)
+    , sessionTempInNamespace :: !Bool
+    , sessionPermViewIgnoresTemp :: !Bool
+    , sessionViewsBoundToRelations :: !Bool
     }
     deriving (Eq, Show)
 

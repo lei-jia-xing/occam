@@ -392,6 +392,13 @@ stepOp unitIdx acc = \case
                 , baDdlNames = Set.insert fromName (Set.insert toName (baDdlNames acc))
                 , baRenamesRev = RelRename unitIdx fromRef toName : baRenamesRev acc
                 }
+    Core.RenameOp (Core.RenamePermanentRelation fromRef toName _) ->
+        let fromName = Core.nameRefName fromRef
+         in acc
+                { baRelNames = Set.insert fromName (Set.insert toName (baRelNames acc))
+                , baDdlNames = Set.insert fromName (Set.insert toName (baDdlNames acc))
+                , baRenamesRev = RelRename unitIdx (fromRef {Core.nameRefTemp = False}) toName : baRenamesRev acc
+                }
     Core.RenameOp (Core.RenameColumnOp tbl _ _) ->
         let tName = Core.nameRefName tbl
          in acc
@@ -465,6 +472,7 @@ collectTouched facts colUnit readsList =
             Core.AlterTableOp a -> [Core.nameRefName (Core.alterTableTarget a)]
             Core.DefineTriggerOp tr -> [Core.nameRefName (Core.triggerTable tr)]
             Core.RenameOp (Core.RenameRelation from to _) -> [Core.nameRefName from, to]
+            Core.RenameOp (Core.RenamePermanentRelation from to _) -> [Core.nameRefName from, to]
             Core.RenameOp (Core.RenameColumnOp tbl _ _) -> [Core.nameRefName tbl]
             Core.DropCatalogOp d -> [Core.nameRefName nr | Core.DropRelation nr _ <- Core.dropObjects d]
             _ -> []

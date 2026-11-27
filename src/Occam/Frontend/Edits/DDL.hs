@@ -422,6 +422,7 @@ visitAlterStmt visitStmt alter = do
         AST.AlterViewSetOptions items -> forM_ items (visitE . AST.settingValue . locValue)
         AST.AlterViewAsQuery q -> visitQ q
         _ -> pure ()
+    forM_ (AST.alterSettings alter) (visitE . AST.settingValue . locValue)
 
 visitColumnExprs :: (Located AST.Expr -> EditM ()) -> AST.ColumnDef -> EditM ()
 visitColumnExprs visitE col = do

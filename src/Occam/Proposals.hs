@@ -300,6 +300,7 @@ opRelations = \case
     DetachInheritOp pl -> [canonName (nameRefName (linkChild pl))]
     DropCatalogOp dropOp -> [canonName (nameRefName nr) | DropRelation nr _ <- dropObjects dropOp]
     RenameOp (RenameRelation nr newName _) -> [canonName (nameRefName nr), canonName newName]
+    RenameOp (RenamePermanentRelation nr newName _) -> [canonName (nameRefName nr), canonName newName]
     RenameOp (RenameColumnOp nr _ _) -> [canonName (nameRefName nr)]
     RefreshCatalogOp rf -> [canonName (nameRefName (refreshTarget rf))]
     _ -> []

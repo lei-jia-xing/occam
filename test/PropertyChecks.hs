@@ -113,7 +113,7 @@ buildFactGraph rawFacts =
         ]
 
 defaultSessionInit :: SessionInit
-defaultSessionInit = SessionInit [] [] Nothing True True Map.empty
+defaultSessionInit = SessionInit [] [] Nothing True True Map.empty False False True
 
 -- Data.Graph independently computes reachability along each statement's predecessors.
 backwardReachabilityOracle ::

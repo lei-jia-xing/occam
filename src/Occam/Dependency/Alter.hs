@@ -57,7 +57,7 @@ import Occam.Dependency.State (
     Eval (..),
     IndexKey (..),
     IndexState (..),
-    RelationKey,
+    RelationKey (..),
     RelationState (..),
     SessionState,
     addDeps,
@@ -125,7 +125,7 @@ viewTransitiveDependsOn session catalog visited tableKey column currentKey reque
             Just relation
                 | relKind relation `elem` [ViewRelation, MaterializedViewRelation] ->
                     let visited' = Set.insert currentKey visited
-                        reqs = viewSourceRequirements session catalog relation requestedCols
+                        reqs = viewSourceRequirements session catalog (relationKeyTemp currentKey) relation requestedCols
                      in any (checkSource visited') (Map.toList reqs)
                 | otherwise ->
                     currentKey == tableKey

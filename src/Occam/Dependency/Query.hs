@@ -46,7 +46,7 @@ import Occam.Core (
     ViewColumnLineage (..),
     WriteKind (..),
  )
-import Occam.Dependency.Resolve (resolveIndexKeys, resolveRelationKeys)
+import Occam.Dependency.Resolve (resolveIndexKeys, resolveRelationKeys, resolveViewSourceKeys)
 import Occam.Dependency.State (
     Catalog (..),
     ConstraintIdentity (..),
@@ -205,15 +205,16 @@ childrenWith session catalog key parents
 viewSourceRequirements ::
     SessionState ->
     Catalog ->
+    Bool ->
     RelationState ->
     Maybe (Set Ident) ->
     Map.Map RelationKey (Maybe (Set Ident))
-viewSourceRequirements session catalog relation requestedCols
-    | null (relColumnLineage relation) = conservativeViewReqs session catalog relation
+viewSourceRequirements session catalog viewIsTemp relation requestedCols
+    | null (relColumnLineage relation) = conservativeViewReqs session catalog viewIsTemp relation
     | otherwise =
         maybe
-            (conservativeViewReqs session catalog relation)
-            (buildLineageReqs session catalog relation . concat)
+            (conservativeViewReqs session catalog viewIsTemp relation)
+            (buildLineageReqs session catalog viewIsTemp relation . concat)
             (traverse lookupSources cols)
     where
         lineageMap = Map.fromList [(lineageColumn l, l) | l <- relColumnLineage relation]
@@ -224,17 +225,17 @@ combineViewReq :: Maybe (Set Ident) -> Maybe (Set Ident) -> Maybe (Set Ident)
 combineViewReq (Just a) (Just b) = Just (a `Set.union` b)
 combineViewReq _ _ = Nothing
 
-resolvedViewUnresolvedSources :: SessionState -> Catalog -> RelationState -> [RelationKey]
-resolvedViewUnresolvedSources session catalog relation =
+resolvedViewUnresolvedSources :: SessionState -> Catalog -> Bool -> RelationState -> [RelationKey]
+resolvedViewUnresolvedSources session catalog viewIsTemp relation =
     [ sourceKey
     | reference <- Set.toList (relUnresolvedSources relation)
-    , sourceKey <- resolveRelationKeys session catalog reference
+    , sourceKey <- resolveViewSourceKeys session viewIsTemp catalog reference
     , Map.member sourceKey (catalogRelations catalog)
     ]
 
 conservativeViewReqs ::
-    SessionState -> Catalog -> RelationState -> Map.Map RelationKey (Maybe (Set Ident))
-conservativeViewReqs session catalog relation =
+    SessionState -> Catalog -> Bool -> RelationState -> Map.Map RelationKey (Maybe (Set Ident))
+conservativeViewReqs session catalog viewIsTemp relation =
     Set.foldl' insertWildcard fromReads allSourceKeys
     where
         colsOf readFact
@@ -245,11 +246,11 @@ conservativeViewReqs session catalog relation =
                 combineViewReq
                 [ (sourceKey, colsOf readFact)
                 | readFact <- relSourceReads relation
-                , sourceKey <- resolveRelationKeys session catalog (readSource readFact)
+                , sourceKey <- resolveViewSourceKeys session viewIsTemp catalog (readSource readFact)
                 ]
         allSourceKeys =
             relSources relation
-                `Set.union` Set.fromList (resolvedViewUnresolvedSources session catalog relation)
+                `Set.union` Set.fromList (resolvedViewUnresolvedSources session catalog viewIsTemp relation)
         insertWildcard m k
             | Map.member k m = m
             | otherwise = Map.insert k Nothing m
@@ -257,19 +258,22 @@ conservativeViewReqs session catalog relation =
 buildLineageReqs ::
     SessionState ->
     Catalog ->
+    Bool ->
     RelationState ->
     [SourceColumn] ->
     Map.Map RelationKey (Maybe (Set Ident))
-buildLineageReqs session catalog relation collectedSCs =
+buildLineageReqs session catalog viewIsTemp relation collectedSCs =
     foldl' addSourceCol initMap (collectedSCs ++ relConditionColumns relation)
     where
         baseMap = Map.fromList [(sourceKey, Just Set.empty) | sourceKey <- Set.toList (relSources relation)]
         unresolvedBase =
             Map.fromList
-                [(sourceKey, Just Set.empty) | sourceKey <- resolvedViewUnresolvedSources session catalog relation]
+                [ (sourceKey, Just Set.empty)
+                | sourceKey <- resolvedViewUnresolvedSources session catalog viewIsTemp relation
+                ]
         initMap = baseMap `Map.union` unresolvedBase
         addSourceCol m sc =
-            let keys = resolveRelationKeys session catalog (sourceColumnRelation sc)
+            let keys = resolveViewSourceKeys session viewIsTemp catalog (sourceColumnRelation sc)
                 col = sourceColumnName sc
              in foldl' (\acc k -> Map.insertWith combineViewReq k (Just (Set.singleton col)) acc) m keys
 
@@ -287,17 +291,18 @@ relationReadDeps session catalog key mode columns only =
                 let seen' = Set.insert current seen
                     base = relationDefinitionDeps catalog current `Set.union` relationIndexDeps catalog relation
                     dataDeps = readModeDataDeps session catalog current relation currentMode currentCols
-                    sourceDeps = viewReadDeps seen' relation currentCols
+                    sourceDeps = viewReadDeps seen' current relation currentCols
                     childDeps = childReadDeps seen' current currentMode currentCols
                  in base `Set.union` dataDeps `Set.union` sourceDeps `Set.union` childDeps
             | otherwise = Set.empty
         -- View sources are evaluated with ReadData for column dependencies.
-        viewReadDeps seen' relation currentCols
+        viewReadDeps seen' viewKey relation currentCols
             | relKind relation /= ViewRelation = Set.empty
             | otherwise =
                 Set.unions
                     [ go seen' sourceKey ReadData neededCols
-                    | (sourceKey, neededCols) <- Map.toList (viewSourceRequirements session catalog relation currentCols)
+                    | (sourceKey, neededCols) <-
+                        Map.toList (viewSourceRequirements session catalog (relationKeyTemp viewKey) relation currentCols)
                     , Map.member sourceKey (catalogRelations catalog)
                     ]
         -- Child relations contribute rows to parent reads unless ONLY is set.

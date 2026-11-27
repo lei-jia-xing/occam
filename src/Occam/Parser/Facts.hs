@@ -24,6 +24,7 @@ import Occam.Core (
     Ident (..),
     IndexDef (..),
     IndexRef (..),
+    Name,
     NameRef (..),
     ObjectRef (..),
     PartitionLink (..),
@@ -214,18 +215,22 @@ dropObjectJson mode obj =
         relKindName MaterializedViewRelation = "drop-materialized-view"
 
 renameJson :: RenameOp -> Value
-renameJson (RenameRelation old new _) =
-    object
-        [ "op" .= ("rename-relation" :: T.Text)
-        , "target" .= nameText (nameRefName old)
-        , "name" .= nameText new
-        ]
+renameJson (RenameRelation old new _) = renameRelationJson old new
+renameJson (RenamePermanentRelation old new _) = renameRelationJson old new
 renameJson (RenameColumnOp t old new) =
     object
         [ "op" .= ("rename-column" :: T.Text)
         , "target" .= nameText (nameRefName t)
         , "name" .= identText new
         , "detail" .= identText old
+        ]
+
+renameRelationJson :: NameRef -> Name -> Value
+renameRelationJson old new =
+    object
+        [ "op" .= ("rename-relation" :: T.Text)
+        , "target" .= nameText (nameRefName old)
+        , "name" .= nameText new
         ]
 
 indexRefName :: IndexRef -> T.Text

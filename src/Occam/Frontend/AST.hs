@@ -1213,7 +1213,8 @@ data TableOption = TableOption
 
 -- | DROP object kind, names, and modifiers.
 data DropStmt = DropStmt
-    { dropObject :: !(Located DropObject)
+    { dropTemp :: !Bool
+    , dropObject :: !(Located DropObject)
     , dropIfExists :: !Bool
     , dropNames :: ![Located Name]
     , dropOnTable :: !(Maybe (Located Name))
@@ -1253,6 +1254,7 @@ data AlterStmt = AlterStmt
     , alterOnly :: !Bool
     , alterTable :: !(Located Name)
     , alterActions :: ![Located AlterAction]
+    , alterSettings :: ![Located SettingItem]
     }
     deriving (Eq, Ord, Show, Data)
 

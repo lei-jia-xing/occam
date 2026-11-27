@@ -1,6 +1,7 @@
 -- | Reads, data writes, triggers, sequences, foreign-key cascades, refresh.
 module Occam.Dependency.Write (
     processRead,
+    processReadWith,
     sequenceReadDeps,
     DmlTag (..),
     dmlTagFor,
@@ -63,7 +64,12 @@ import Occam.Dependency.Query (
     relationReadDeps,
     relationWriteDeps,
  )
-import Occam.Dependency.Resolve (relationFallbackKey, resolveRelationKeys, resolveSequenceKeys)
+import Occam.Dependency.Resolve (
+    relationFallbackKey,
+    resolveRelationKeys,
+    resolveSequenceKeys,
+    resolveViewSourceKeys,
+ )
 import Occam.Dependency.Session (applySessionEffects)
 import Occam.Dependency.State (
     BarrierKey (..),
@@ -90,6 +96,7 @@ import Occam.Dependency.State (
     relCardinalityWritesL,
     relColumnWritesL,
     relDataWritesL,
+    sequenceNonTxWritesL,
     sequenceWritesL,
     writeSignature,
  )
@@ -139,13 +146,16 @@ insertColumnWrites sid columns current =
 
 -- Reads
 processRead :: Eval -> ReadFact -> Eval
-processRead eval readFact =
+processRead = processReadWith resolveRelationKeys
+
+processReadWith :: (SessionState -> Catalog -> NameRef -> [RelationKey]) -> Eval -> ReadFact -> Eval
+processReadWith resolveRelKeys eval readFact =
     let session = evalSession eval
         catalog = evalCatalog eval
         relationKeys =
             filter
                 (`Map.member` catalogRelations catalog)
-                (resolveRelationKeys session catalog (readSource readFact))
+                (resolveRelKeys session catalog (readSource readFact))
         sequenceKeys =
             filter
                 (`Map.member` catalogSequences catalog)
@@ -182,7 +192,7 @@ processRead eval readFact =
             , reference <- Set.toList (relUnresolvedSources relation)
             , null
                 [ sourceKey
-                | sourceKey <- resolveRelationKeys session catalog reference
+                | sourceKey <- resolveViewSourceKeys session (relationKeyTemp key) catalog reference
                 , Map.member sourceKey (catalogRelations catalog)
                 ]
             ]
@@ -417,8 +427,8 @@ processDmlEvent sid eval event =
 
 processSequenceWrite :: StatementId -> Eval -> SequenceWrite -> Eval
 processSequenceWrite sid eval write
-    | not transactional && evalTransactionActive eval =
-        -- Non-transactional sequence changes during an active transaction require a barrier.
+    | not transactional && evalTransactionActive eval && null keys =
+        -- Unresolved non-transactional sequence calls inside an active transaction fall back to a barrier.
         addBarrier
             ( ScopedBarrier
                 GlobalScope
@@ -437,10 +447,14 @@ processSequenceWrite sid eval write
             current
                 & addTouches (sequenceTouchKeys key)
                 & addDeps deps
-                & evalCatalogL . catalogSequencesL %~ Map.insert key (state & sequenceWritesL %~ Set.insert sid)
+                & evalCatalogL . catalogSequencesL %~ Map.insert key nextState
             where
                 existing = Map.lookup key (catalogSequences (evalCatalog current))
-                state = fromMaybe (SequenceState Nothing Set.empty Nothing transactional) existing
+                state = fromMaybe (SequenceState Nothing Set.empty Set.empty Nothing transactional) existing
+                nextState =
+                    state
+                        & sequenceWritesL %~ Set.insert sid
+                        & (if transactional then id else sequenceNonTxWritesL %~ Set.insert sid)
                 deps =
                     Set.fromList (catMaybes [sequenceDefinition state, sequenceRestoredBy state])
                         `Set.union` sequenceWrites state

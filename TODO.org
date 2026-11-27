@@ -50,6 +50,14 @@ Replaced `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary
   - Conservative pure-builtin mode without `Generic`-only special cases.
   - Exact-span intra-statement edit generation (including ClickHouse `PREWHERE`/`SETTINGS` and DuckDB `QUALIFY` clause deletions) and atomic column co-reduction site extraction.
 
+*** Phase 3b: Six-Engine Live Semantic Alignment
+- [X] Align `SemanticsProfile` / `SessionInit` / `SessionState` and `Occam.Dependency` with live six-engine runtime behavior (`test/SemanticAlignmentChecks.hs`):
+  - DuckDB 1.5.5: non-transactional `nextval`/`currval`, `BeginError` nested transaction policy, zero-barrier `PIVOT` relation/column slicing, and lazy/name-bound view resolution across `DROP TABLE` (`semViewsBoundToRelations = False`).
+  - PostgreSQL 18: OID-bound view dependencies (`semViewsBoundToRelations = True`), relation-scoped `ALTER TABLE ... RLS / SET UNLOGGED`, `pg_temp` persistence across `search_path`, and rollback-preserving `sequenceNonTxWrites` without false global fences on resolved sequences.
+  - MySQL 8.4.11 & MariaDB 11.4.13: non-committing `DROP TEMPORARY TABLE/SEQUENCE` vs implicit-commit `DROP TABLE` / `CREATE TEMPORARY SEQUENCE`, `USE`-scoped `TEMPORARY` tables (`semTempInNamespace = True`), and divergent `RENAME TABLE` (`RenamePermanentRelation` on MySQL vs `RenameRelation` on MariaDB).
+  - SQLite 3.53.3: permanent views ignoring `TEMP` shadows (`semPermViewIgnoresTemp = True`), `DROP TABLE` unshadowing `TEMP` first, `BeginError`, and tx `PRAGMA foreign_keys` no-ops.
+  - ClickHouse 26.8.7.19-lts: `DROP TEMPORARY TABLE/VIEW`, trailing `ALTER TABLE ... SETTINGS`, relation-scoped `ALTER TABLE ... UPDATE/DELETE` and `DETACH`/`ATTACH TABLE`, `CREATE DATABASE`, and `CREATE MATERIALIZED VIEW ... TO` slice equivalence.
+
 *** Phase 4: Cutover, Verification & Rust/FFI Removal
 - [X] Use the Haskell splitter for the public statement count and cover it with the seed corpus and all six dialect fuzz properties.
 - [X] Switch `Occam.Parser` to the pure-Haskell frontend (`Occam.Frontend.Pipeline.parseFrontend`); verified full unit/property/integration/corpus regression parity, `occam-bench` `parse` microbenchmark throughput, and 71-case `benchmarks/real_fuzz_corpus/` barrier census.

@@ -86,6 +86,7 @@ module Occam.Dependency.State (
     relColumnLineageL,
     relConditionColumnsL,
     sequenceWritesL,
+    sequenceNonTxWritesL,
     modifyCatalog,
     modifySession,
     modifyRelation,
@@ -141,6 +142,9 @@ data SessionState = SessionState
     , sessTxSessionUser :: !(Maybe (Maybe Ident))
     , sessTxCurrentUser :: !(Maybe (Maybe Ident))
     , sessTxVariables :: !(Map Text SessionValue)
+    , sessTempInNamespace :: !Bool
+    , sessPermViewIgnoresTemp :: !Bool
+    , sessViewsBoundToRelations :: !Bool
     }
     deriving (Eq, Show)
 
@@ -161,6 +165,9 @@ sessionFromInit SessionInit {..} =
         , sessTxSessionUser = Nothing
         , sessTxCurrentUser = Nothing
         , sessTxVariables = Map.empty
+        , sessTempInNamespace = sessionTempInNamespace
+        , sessPermViewIgnoresTemp = sessionPermViewIgnoresTemp
+        , sessViewsBoundToRelations = sessionViewsBoundToRelations
         }
 
 effectiveNamespacePrefix :: SessionState -> [Ident]

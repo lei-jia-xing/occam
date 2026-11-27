@@ -28,6 +28,7 @@ module Occam.Dependency.State.Lenses (
     relColumnLineageL,
     relConditionColumnsL,
     sequenceWritesL,
+    sequenceNonTxWritesL,
     modifyRelation,
 ) where
 
@@ -171,6 +172,10 @@ relConditionColumnsL = lens relConditionColumns (\r c -> r {relConditionColumns 
 -- | Lens for sequence writes in a sequence state.
 sequenceWritesL :: Lens' SequenceState (Set StatementId)
 sequenceWritesL = lens sequenceWrites (\s w -> s {sequenceWrites = w})
+
+-- | Lens for non-transactional sequence writes preserved across rollback.
+sequenceNonTxWritesL :: Lens' SequenceState (Set StatementId)
+sequenceNonTxWritesL = lens sequenceNonTxWrites (\s w -> s {sequenceNonTxWrites = w})
 
 -- | Modify a relation state within a catalog if present.
 modifyRelation :: RelationKey -> (RelationState -> RelationState) -> Catalog -> Catalog

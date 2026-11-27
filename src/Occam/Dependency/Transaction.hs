@@ -487,24 +487,46 @@ triggerTransactionalIn catalog state =
 stripTriggerRestored :: TriggerState -> TriggerState
 stripTriggerRestored state = state {triggerRestoredBy = Nothing}
 
-sequenceRestorePolicy :: RestorePolicy SequenceState
-sequenceRestorePolicy =
-    RestorePolicy
-        { policyMark = \sid state -> state {sequenceRestoredBy = Just sid}
-        , policyStrip = stripSequenceRestored
-        , policyKeepsBoth = \old new ->
-            not (sequenceStateTransactional old)
-                || not (sequenceStateTransactional new)
-        , policyKeepsSnapshot = not . sequenceStateTransactional
-        , policyKeepsCurrent = not . sequenceStateTransactional
-        }
-
 restoreSequenceMap ::
     StatementId ->
     Map SequenceKey SequenceState ->
     Map SequenceKey SequenceState ->
     Map SequenceKey SequenceState
-restoreSequenceMap = restoreMap sequenceRestorePolicy
+restoreSequenceMap sid snapshot current =
+    Map.fromList
+        [ (key, state)
+        | key <- Set.toList (Set.union (Map.keysSet snapshot) (Map.keysSet current))
+        , Just state <- [restoreKey key]
+        ]
+    where
+        restoreKey key = case (Map.lookup key snapshot, Map.lookup key current) of
+            (Just old, Just new)
+                | not (sequenceStateTransactional old) || not (sequenceStateTransactional new) ->
+                    Just new
+                | otherwise ->
+                    let survived = sequenceNonTxWrites new `Set.difference` sequenceNonTxWrites old
+                        baseNew =
+                            new
+                                { sequenceWrites = sequenceWrites new `Set.difference` survived
+                                , sequenceNonTxWrites = sequenceNonTxWrites old
+                                }
+                        changed = stripSequenceRestored baseNew /= stripSequenceRestored old
+                        baseRestored =
+                            if changed
+                                then old {sequenceRestoredBy = Just sid}
+                                else old
+                     in Just
+                            baseRestored
+                                { sequenceWrites = sequenceWrites baseRestored `Set.union` survived
+                                , sequenceNonTxWrites = sequenceNonTxWrites baseRestored `Set.union` survived
+                                }
+            (Just old, Nothing)
+                | not (sequenceStateTransactional old) -> Nothing
+                | otherwise -> Just (old {sequenceRestoredBy = Just sid})
+            (Nothing, Just new)
+                | not (sequenceStateTransactional new) -> Just new
+                | otherwise -> Nothing
+            (Nothing, Nothing) -> Nothing
 
 stripSequenceRestored :: SequenceState -> SequenceState
 stripSequenceRestored state = state {sequenceRestoredBy = Nothing}

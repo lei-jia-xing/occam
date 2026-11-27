@@ -61,7 +61,7 @@ import Occam.Dependency.State (
     RelationState (..),
     SequenceKey (..),
     SequenceState (..),
-    SessionState,
+    SessionState (sessViewsBoundToRelations),
     TriggerKey (..),
     TriggerState (..),
     addDeps,
@@ -259,7 +259,9 @@ removeRelationCascade session mode = go Set.empty
                  in clearRelationObjects currentKey catalog2
             where
                 seen' = Set.insert currentKey seen
-                dependentViews = dependentViewKeys session catalog currentKey
+                dependentViews
+                    | sessViewsBoundToRelations session = dependentViewKeys session catalog currentKey
+                    | otherwise = []
                 foreignKeys = dependentForeignKeys session catalog currentKey
 
 dependentViewKeys :: SessionState -> Catalog -> RelationKey -> [RelationKey]

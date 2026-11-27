@@ -136,6 +136,9 @@ data SemanticsProfile = SemanticsProfile
     , semTriggerScope :: !TriggerScopeRule
     , semDefaultTriggerForEachRow :: !Bool
     , semTempSchemas :: ![Text]
+    , semTempInNamespace :: !Bool
+    , semPermViewIgnoresTemp :: !Bool
+    , semViewsBoundToRelations :: !Bool
     }
 
 -- | Complete capability specification for a concrete SQL dialect.
@@ -259,6 +262,9 @@ postgresqlProfile =
                 , semTriggerScope = TriggerTableScoped
                 , semDefaultTriggerForEachRow = False
                 , semTempSchemas = ["pg_temp"]
+                , semTempInNamespace = False
+                , semPermViewIgnoresTemp = False
+                , semViewsBoundToRelations = True
                 }
         }
 
@@ -294,6 +300,9 @@ mysqlSharedSemantics =
         , semTriggerScope = TriggerSchemaScoped
         , semDefaultTriggerForEachRow = True
         , semTempSchemas = []
+        , semTempInNamespace = True
+        , semPermViewIgnoresTemp = False
+        , semViewsBoundToRelations = False
         }
 
 mysqlProfile :: DialectProfile
@@ -415,7 +424,7 @@ sqliteProfile =
             SemanticsProfile
                 { semDefaultForeignKeyChecks = False
                 , semTableTransactional = const True
-                , semSequenceTransactional = True
+                , semSequenceTransactional = False
                 , semImplicitDdlCommit = False
                 , semBeginPolicy = BeginError
                 , semNamespaceRule = NamespaceNone
@@ -423,6 +432,9 @@ sqliteProfile =
                 , semTriggerScope = TriggerSchemaScoped
                 , semDefaultTriggerForEachRow = True
                 , semTempSchemas = ["temp"]
+                , semTempInNamespace = False
+                , semPermViewIgnoresTemp = True
+                , semViewsBoundToRelations = False
                 }
         }
 
@@ -489,14 +501,17 @@ duckdbProfile =
             SemanticsProfile
                 { semDefaultForeignKeyChecks = True
                 , semTableTransactional = const True
-                , semSequenceTransactional = True
+                , semSequenceTransactional = False
                 , semImplicitDdlCommit = False
-                , semBeginPolicy = BeginWarn
+                , semBeginPolicy = BeginError
                 , semNamespaceRule = NamespaceTwoPartDuckDB
                 , semIndexScope = IndexSchemaScoped
                 , semTriggerScope = TriggerSchemaScoped
                 , semDefaultTriggerForEachRow = False
                 , semTempSchemas = ["temp"]
+                , semTempInNamespace = False
+                , semPermViewIgnoresTemp = False
+                , semViewsBoundToRelations = False
                 }
         }
 
@@ -563,5 +578,8 @@ clickhouseProfile =
                 , semTriggerScope = TriggerSchemaScoped
                 , semDefaultTriggerForEachRow = False
                 , semTempSchemas = []
+                , semTempInNamespace = False
+                , semPermViewIgnoresTemp = False
+                , semViewsBoundToRelations = False
                 }
         }

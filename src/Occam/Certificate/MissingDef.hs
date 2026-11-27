@@ -127,6 +127,7 @@ opDefinedRelNames = \case
     DefineViewOp vd -> [baseRelName (viewName vd)]
     DefineSequenceOp sd -> [baseRelName (sequenceName sd)]
     RenameOp (RenameRelation _ newName _) -> [baseRelName newName]
+    RenameOp (RenamePermanentRelation _ newName _) -> [baseRelName newName]
     _ -> []
 
 opReferencedRelNames :: CatalogOp -> [Text]

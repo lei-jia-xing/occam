@@ -339,6 +339,7 @@ visitStatement stmt = do
 visitStatementBody :: AST.Statement -> VisitM ()
 visitStatementBody = \case
     AST.StatementQuery (L _ q) -> visitQuery q
+    AST.StatementPivot (L _ piv) -> visitPivot piv
     AST.StatementInsert (L _ ins) -> visitInsert ins
     AST.StatementUpdate (L _ upd) -> visitUpdate upd
     AST.StatementDelete (L _ del) -> visitDelete del
@@ -556,7 +557,20 @@ visitAlter alt = case AST.alterObject alt of
         forM_ (AST.alterActions alt) \(L _ action) -> case action of
             AST.AlterViewAsQuery (L _ q) -> visitQuery q
             _ -> pure ()
-    AST.AlterObjectTable ->
+    AST.AlterObjectTable -> do
+        ctx <- gets vsContext
+        nested <- gets vsNestedDmlDepth
+        let isMutationAction = \case
+                AST.AlterUpdate {} -> True
+                AST.AlterDelete {} -> True
+                _ -> False
+        when (nested == 0 && any (isMutationAction . locValue) (AST.alterActions alt)) do
+            let L tSpan tName = AST.alterTable alt
+                mRef = relationRef ctx tName
+                targetParts = map Core.identText . Core.nameParts . Core.nameRefName <$> mRef
+            factorIdx <- nextFactor
+            recordRelationWith mRef tSpan factorIdx Nothing False
+            recordAliasOpt Nothing targetParts
         forM_ (AST.alterActions alt) \(L _ action) -> case action of
             AST.AlterAddColumn _ cols _ -> traverse_ (visitColumnDef . locValue) cols
             AST.AlterAddConstraint (L _ tc) -> visitTableConstraint tc
@@ -567,7 +581,24 @@ visitAlter alt = case AST.alterObject alt of
                 AST.AlterSetDefault e -> visitLocatedExpr e
                 AST.AlterType _ mUsing -> traverse_ visitLocatedExpr mUsing
                 _ -> pure ()
+            AST.AlterUpdate assigns parts whereExpr -> do
+                traverse_ (visitLocatedExpr . AST.assignValue . locValue) assigns
+                traverse_ visitLocatedExpr parts
+                visitLocatedExpr whereExpr
+            AST.AlterDelete parts whereExpr -> do
+                traverse_ visitLocatedExpr parts
+                visitLocatedExpr whereExpr
             _ -> pure ()
+        forM_ (AST.alterSettings alt) \(L _ si) ->
+            visitLocatedExpr (AST.settingValue si)
+
+visitPivot :: AST.PivotStmt -> VisitM ()
+visitPivot piv = do
+    visitTableRef (locValue (AST.pivotSource piv))
+    traverse_ visitLocatedExpr (AST.pivotOn piv)
+    traverse_ visitLocatedExpr (AST.pivotIn piv)
+    traverse_ (visitLocatedExpr . AST.selectItemExpr . locValue) (AST.pivotUsing piv)
+    traverse_ visitLocatedExpr (AST.pivotGroupBy piv)
 
 visitSet :: AST.SetStmt -> VisitM ()
 visitSet stmt =

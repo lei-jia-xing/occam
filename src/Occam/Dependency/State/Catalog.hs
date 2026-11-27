@@ -167,6 +167,7 @@ data TriggerState = TriggerState
 data SequenceState = SequenceState
     { sequenceDefinition :: !(Maybe StatementId)
     , sequenceWrites :: !(Set StatementId)
+    , sequenceNonTxWrites :: !(Set StatementId)
     , sequenceRestoredBy :: !(Maybe StatementId)
     , sequenceStateTransactional :: !Bool
     }

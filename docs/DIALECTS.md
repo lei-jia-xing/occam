@@ -13,9 +13,9 @@ Recognized AST paths share named table/view/index/trigger/sequence/type/schema d
 | Dialects | Shared paths & dialect specializations |
 | :--- | :--- |
 | `postgresql` | Quoted/unquoted identifier rules, search paths, table-target `SELECT INTO`, transaction/savepoint snapshots, inheritance/partitions, `TABLE t`, `CREATE STATISTICS`, policy/rule DDL, and provable `pg_catalog` sequence calls. |
-| `mysql`, `mariadb` | Configurable `lower_case_table_names` for relation/namespace parts; multi-table `UPDATE`/`DELETE` targets; implicit DDL commits; optionless `CREATE DATABASE` and one-level `USE`; distinct first-class `mysql` vs `mariadb` dialect capabilities (`RETURNING`, `CREATE SEQUENCE`, `LATERAL`, `PREPARE ... FROM`). |
-| `sqlite`, `duckdb` | ASCII-only/insensitive identifier matching and CTAS snapshots; dedicated SQLite foreign-key and inert storage `PRAGMA` effects plus virtual-table shadow edges (`_segdir`, `_content`); explicit two-part DuckDB `USE catalog.schema`, `PIVOT`, `QUALIFY`, and `CREATE MACRO`. |
-| `clickhouse` | Shared named DDL/DML/query extraction with case-preserving identifiers and one-level database namespaces, `PREWHERE`/`SETTINGS`/`OPTIMIZE TABLE` modeling, and `ENGINE`/`ARRAY JOIN` support. Persistent `CREATE VIEW ... TO` routing and partition/overwrite effects remain opaque. |
+| `mysql`, `mariadb` | Configurable `lower_case_table_names` for relation/namespace parts; multi-table `UPDATE`/`DELETE` targets; implicit DDL commits (`DROP TEMPORARY TABLE/SEQUENCE` do not commit whereas `CREATE TEMPORARY SEQUENCE` does); `USE`-scoped `TEMPORARY` namespaces (`d.t` shadows perm `d.t`); divergent `RENAME TABLE` vs `ALTER TABLE RENAME` temporary-shadow resolution (`MySQL` vs `MariaDB`); optionless `CREATE DATABASE` and one-level `USE`; distinct `mysql` vs `mariadb` capabilities (`RETURNING`, `CREATE SEQUENCE`, `LATERAL`, `PREPARE ... FROM`). |
+| `sqlite`, `duckdb` | ASCII-only/insensitive identifier matching and CTAS snapshots; SQLite permanent views ignoring `TEMP` shadows, `PRAGMA foreign_keys` (no-op in active transactions) / inert storage pragmas, and virtual-table shadow edges (`_segdir`, `_content`); DuckDB two-part `USE catalog.schema`, `PIVOT`, `QUALIFY`, `CREATE MACRO`, `BeginError` nested transactions, non-transactional `nextval`/`currval`, and dynamic view resolution across `DROP TABLE`. |
+| `clickhouse` | Shared named DDL/DML/query extraction with case-preserving identifiers and one-level database namespaces, `PREWHERE`/`SETTINGS`/`OPTIMIZE TABLE`, relation-scoped `ALTER TABLE ... UPDATE/DELETE` (including trailing `SETTINGS`), relation-scoped `DETACH`/`ATTACH TABLE`, `DROP TEMPORARY TABLE/VIEW`, `CREATE DATABASE`, `ENGINE`/`ARRAY JOIN` support. Persistent `CREATE VIEW ... TO` routing and partition/overwrite effects remain fenced (`WriteThroughViewBarrier` / relation barriers). |
 
 ---
 
@@ -31,11 +31,13 @@ Recognized AST paths share named table/view/index/trigger/sequence/type/schema d
 - **Session & storage settings**:
   - Scoped `foreign_key_checks` assignments (`bare` / `SESSION` / `GLOBAL` / `@@`; `@user` variables and foreign qualifiers still fence).
   - SQLite `PRAGMA foreign_keys` and inert storage pragmas (`journal_mode`, `synchronous`, `temp_store`, `cache_size`, `page_size`); `recursive_triggers` and effectful pragmas still fence.
+  - **Views & temporary shadowing**: `postgresql` models OID-bound views (`semViewsBoundToRelations = True`, so `RESTRICT` rejects drops and `CASCADE` drops dependent views), whereas `sqlite`, `duckdb`, `mysql`, `mariadb`, and `clickhouse` model name-bound views (`semViewsBoundToRelations = False`, allowing `DROP TABLE` unshadowing and late binding). `sqlite` permanent views ignore `TEMP` shadows (`semPermViewIgnoresTemp = True`); `mysql`/`mariadb` scope `TEMPORARY` tables by active database (`semTempInNamespace = True`) while `mysql` `RENAME TABLE` skips shadowing `TEMPORARY` tables (`RenamePermanentRelation`) and `mariadb` `RENAME TABLE` renames them (`RenameRelation`).
 - **Routines & sequences**:
   - Unproved scalar routines and deferred stored expressions (including sequence defaults) fence conservatively across all dialects while preserving argument column reads.
   - MySQL/MariaDB index length prefixes (`b(1)`) are recognized structurally in key position as first-class AST nodes.
-  - PostgreSQL sequence calls are precise only for explicit `pg_catalog.nextval`/`setval`/`currval` with provable literal names (including supported `text`/`regclass` casts). Unqualified/custom calls, dynamic targets, `lastval`, and nontransactional sequence advances inside explicit transactions or with autocommit disabled are fenced.
+  - Non-transactional sequence advances (`PostgreSQL` `pg_catalog.nextval`/`setval`/`currval`, `DuckDB` `nextval`/`currval`, `MariaDB` `NEXTVAL`/`NEXT VALUE FOR`) preserve `sequenceNonTxWrites` across `ROLLBACK` / `ROLLBACK TO SAVEPOINT` without globally fencing unrelated tables when the sequence exists in the catalog; unresolved sequence targets inside active transactions, unqualified/custom calls, dynamic targets, and `lastval` still fence conservatively.
   - Any script containing routine DDL or a parse error stays fenced.
+- **Live multi-engine verification**: [SemanticAlignmentChecks.hs](../test/SemanticAlignmentChecks.hs) verifies dependency-slicing and semantic facts against in-process SQLite 3 and DuckDB 1.5.5, PostgreSQL 18 policy checks, live `mysqld` 8.4.11, live `mariadbd` 11.4.13, and live `clickhouse local` 26.8.7.19-lts inside `nix develop .#syntax`.
 
 ---
 

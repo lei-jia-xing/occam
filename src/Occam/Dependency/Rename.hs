@@ -36,7 +36,11 @@ import Occam.Core (
  )
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Query (relationAllDeps, relationConstraintDeps, schemaPrefixDeps)
-import Occam.Dependency.Resolve (qualifyRenameName, resolveRelationKeys)
+import Occam.Dependency.Resolve (
+    qualifyRenameName,
+    resolvePermanentRelationKeys,
+    resolveRelationKeys,
+ )
 import Occam.Dependency.State (
     Catalog (..),
     ConstraintKey (..),
@@ -103,33 +107,9 @@ renameConstraintChildColumns rename constraint =
 -- RENAME
 processRename :: StatementId -> Eval -> RenameOp -> Eval
 processRename sid eval (RenameRelation from to placement) =
-    mutateResolved stepKey eval keys
-    where
-        session = evalSession eval
-        catalog = evalCatalog eval
-        keys = filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog from)
-        stepKey current oldKey =
-            current
-                & addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey)
-                & addDeps deps
-                & evalCatalogL .~ catalog2
-            where
-                currentCatalog = evalCatalog current
-                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog oldKey)
-                newKey = RelationKey (relationKeyTemp oldKey) (qualifyRenameName (relationKeyName oldKey) to)
-                deps =
-                    relationAllDeps session currentCatalog oldKey
-                        `Set.union` relationConstraintDeps currentCatalog relation
-                        `Set.union` schemaPrefixDeps currentCatalog (relationKeyName newKey)
-                (catalog1, relation1) =
-                    moveRelationObjects placement sid oldKey newKey relation currentCatalog
-                relation2 = relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
-                catalog2 =
-                    insertRelation newKey relation2 (deleteRelation oldKey catalog1)
-                        & updateTriggerRelations session currentCatalog oldKey newKey
-                        & updateViewSources session currentCatalog oldKey newKey
-                        & updateForeignKeyParents session currentCatalog oldKey newKey
-                        & updatePartitionParents session currentCatalog oldKey newKey
+    renameRelationWith sid resolveRelationKeys eval from to placement
+processRename sid eval (RenamePermanentRelation from to placement) =
+    renameRelationWith sid resolvePermanentRelationKeys eval from to placement
 processRename sid eval (RenameColumnOp table from to) =
     mutateResolved stepKey eval keys
     where
@@ -152,6 +132,43 @@ processRename sid eval (RenameColumnOp table from to) =
                         `Set.union` relationConstraintDeps currentCatalog relation
                 relation1 = renameRelationColumns from to sid relation
                 catalog1 = renameCatalogColumns session currentCatalog key renameColumn
+
+renameRelationWith ::
+    StatementId ->
+    (SessionState -> Catalog -> NameRef -> [RelationKey]) ->
+    Eval ->
+    NameRef ->
+    Name ->
+    IndexSchemaPlacement ->
+    Eval
+renameRelationWith sid resolveFn eval from to placement =
+    mutateResolved stepKey eval keys
+    where
+        session = evalSession eval
+        catalog = evalCatalog eval
+        keys = filter (`Map.member` catalogRelations catalog) (resolveFn session catalog from)
+        stepKey current oldKey =
+            current
+                & addTouches (relationTouchKeys newKey ++ relationTouchKeys oldKey)
+                & addDeps deps
+                & evalCatalogL .~ catalog2
+            where
+                currentCatalog = evalCatalog current
+                relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog oldKey)
+                newKey = RelationKey (relationKeyTemp oldKey) (qualifyRenameName (relationKeyName oldKey) to)
+                deps =
+                    relationAllDeps session currentCatalog oldKey
+                        `Set.union` relationConstraintDeps currentCatalog relation
+                        `Set.union` schemaPrefixDeps currentCatalog (relationKeyName newKey)
+                (catalog1, relation1) =
+                    moveRelationObjects placement sid oldKey newKey relation currentCatalog
+                relation2 = relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
+                catalog2 =
+                    insertRelation newKey relation2 (deleteRelation oldKey catalog1)
+                        & updateTriggerRelations session currentCatalog oldKey newKey
+                        & updateViewSources session currentCatalog oldKey newKey
+                        & updateForeignKeyParents session currentCatalog oldKey newKey
+                        & updatePartitionParents session currentCatalog oldKey newKey
 
 renameRelationColumns :: Ident -> Ident -> StatementId -> RelationState -> RelationState
 renameRelationColumns from to sid relation =

@@ -257,6 +257,7 @@ test-suite occam-test
                     , ReductionChecks.StatementSearchChecks
                     , ReductionChecks.Support
                     , ReductionChecks.SyntaxAndColumnChecks
+                    , SemanticAlignmentChecks
                     , SqliteOracleChecks
                     , SyntaxAlignmentChecks
                     , Occam.Oracle.Inline

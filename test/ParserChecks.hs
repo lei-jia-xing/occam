@@ -950,6 +950,30 @@ dialectTests =
                 "CREATE TABLE t (id INT) ENGINE=InnoDB SECONDARY_ENGINE=NULL;"
                 ParseUnsupported
                 Nothing
+            , acceptCase
+                "MySQL, MariaDB, and ClickHouse accept DROP TEMPORARY TABLE"
+                mysqlProfile
+                "DROP TEMPORARY TABLE IF EXISTS t;"
+            , acceptCase
+                "MariaDB accepts DROP TEMPORARY SEQUENCE"
+                mariadbProfile
+                "DROP TEMPORARY SEQUENCE IF EXISTS s;"
+            , acceptCase
+                "ClickHouse accepts DROP TEMPORARY VIEW"
+                clickhouseProfile
+                "DROP TEMPORARY VIEW IF EXISTS v;"
+            , rejectCase
+                "MySQL rejects DROP TEMPORARY VIEW"
+                mysqlProfile
+                "DROP TEMPORARY VIEW IF EXISTS v;"
+                ParseUnsupported
+                Nothing
+            , rejectCase
+                "PostgreSQL rejects DROP TEMPORARY TABLE"
+                postgresqlProfile
+                "DROP TEMPORARY TABLE IF EXISTS t;"
+                ParseUnsupported
+                Nothing
             ]
         ]
     where

@@ -84,8 +84,8 @@ tests =
             let withGlobal = length (filter fst barrierCounts)
                 zeroGlobal = length barrierCounts - withGlobal
                 barrierFree = length (filter (not . snd) barrierCounts)
-            assertBool "at least 27 real fuzz cases have zero global fences" (zeroGlobal >= 27)
-            assertBool "at least 20 real fuzz cases are completely barrier-free" (barrierFree >= 20)
+            assertBool "at least 29 real fuzz cases have zero global fences" (zeroGlobal >= 29)
+            assertBool "at least 21 real fuzz cases are completely barrier-free" (barrierFree >= 21)
         , testCase "benchmark corpus parses cleanly under full options with valid spans and typed tiers" $ do
             cases <- either assertFailure pure =<< loadBenchmarkCorpus "benchmarks/corpus"
             assertBool "loaded benchmark corpus" (not (null cases))

@@ -26,6 +26,7 @@ import PoolChecks qualified
 import PoolMetricsChecks qualified
 import PropertyChecks qualified
 import ReductionChecks qualified
+import SemanticAlignmentChecks qualified
 import SqliteOracleChecks qualified
 import SyntaxAlignmentChecks qualified
 import Test.Tasty (TestTree, defaultMain, testGroup)
@@ -35,10 +36,11 @@ main =
     withExtraOracles \extraOracles -> do
         frontendSeedTests <- FrontendSeedChecks.tests extraOracles
         syntaxAlignmentTests <- SyntaxAlignmentChecks.tests extraOracles
-        defaultMain (tests frontendSeedTests syntaxAlignmentTests)
+        defaultMain
+            (tests frontendSeedTests syntaxAlignmentTests (SemanticAlignmentChecks.tests extraOracles))
 
-tests :: TestTree -> TestTree -> TestTree
-tests frontendSeedTests syntaxAlignmentTests =
+tests :: TestTree -> TestTree -> TestTree -> TestTree
+tests frontendSeedTests syntaxAlignmentTests semanticAlignmentTests =
     testGroup
         "Occam Test Suite"
         [ DialectAndControlChecks.phase3Tests
@@ -52,6 +54,7 @@ tests frontendSeedTests syntaxAlignmentTests =
         , ParserChecks.tests
         , frontendSeedTests
         , syntaxAlignmentTests
+        , semanticAlignmentTests
         , CliChecks.tests
         , CacheChecks.tests
         , DialectAndControlChecks.phase7Tests

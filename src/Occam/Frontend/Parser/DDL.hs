@@ -1516,6 +1516,10 @@ parseTableOptionName = do
 parseDrop :: P (Located DropStmt)
 parseDrop = withLocated do
     _ <- expectWordCI "DROP"
+    tempTokOpt <- matchWordCI "TEMPORARY"
+    traverse_
+        (\tok -> requireDialectP [MySQL, MariaDB, ClickHouse] (locSpan tok) "DROP TEMPORARY")
+        tempTokOpt
     (objTok, objRaw) <-
         currentWord >>= maybe (unexpectedHere "expected an object type after DROP") pure
     let upper = asciiUpperBS objRaw
@@ -1527,6 +1531,14 @@ parseDrop = withLocated do
                 viewTok <- expectWordCI "VIEW"
                 pure (DropMaterializedView, mergeSpan (locSpan materializedTok) (locSpan viewTok))
             else (,locSpan objTok) <$> parseDropObjectWord upper objTok
+    traverse_
+        ( \tok -> case dropObj of
+            DropTable -> requireDialectP [MySQL, MariaDB, ClickHouse] (locSpan tok) "DROP TEMPORARY TABLE"
+            DropView -> requireDialectP [ClickHouse] (locSpan tok) "DROP TEMPORARY VIEW"
+            DropSequence -> requireDialectP [MariaDB] (locSpan tok) "DROP TEMPORARY SEQUENCE"
+            _ -> throwParse ParseUnsupported (locSpan tok) "TEMPORARY is only valid for DROP TABLE/VIEW/SEQUENCE"
+        )
+        tempTokOpt
     ifExists <- parseIfExists
     names <- parseCommaSeparated parseName
     onTable <- whenWordTok "ON" \tok -> do
@@ -1566,7 +1578,7 @@ parseDrop = withLocated do
     syncFlag <-
         isJust <$> whenWordTok "SYNC" \tok ->
             requireDialectP [ClickHouse] (locSpan tok) "DROP ... SYNC"
-    pure (DropStmt (L objSpan dropObj) ifExists names onTable behavior syncFlag)
+    pure (DropStmt (isJust tempTokOpt) (L objSpan dropObj) ifExists names onTable behavior syncFlag)
 
 parseDropObjectWord :: ByteString -> SpannedToken -> P DropObject
 parseDropObjectWord upper objTok =
@@ -1636,6 +1648,12 @@ parseAlter = withLocated do
     actions <- case objectKind of
         AlterObjectTable -> parseCommaSeparated parseAlterAction
         AlterObjectView -> (: []) <$> parseAlterViewAction
+    settings <- case objectKind of
+        AlterObjectTable ->
+            fromMaybe [] <$> whenWordTok "SETTINGS" \tok -> do
+                requireFeatureP FeaturePrewhereSettings (locSpan tok) "ALTER TABLE ... SETTINGS"
+                parseCommaSeparated parseSettingItem
+        AlterObjectView -> pure []
     pg <- isDialect PostgreSQL
     case actions of
         firstAct : _ : _
@@ -1645,7 +1663,7 @@ parseAlter = withLocated do
                     (locSpan firstAct)
                     "PostgreSQL ALTER TABLE RENAME cannot be combined with other actions"
         _ -> pure ()
-    pure (AlterStmt objectKind ifExists only table actions)
+    pure (AlterStmt objectKind ifExists only table actions settings)
     where
         isPgStandaloneRename (L _ (AlterRenameTable _)) = True
         isPgStandaloneRename (L _ (AlterRenameColumn _ _)) = True

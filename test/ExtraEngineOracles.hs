@@ -13,11 +13,13 @@ module ExtraEngineOracles (
     isMariaDBAvailable,
     clickhouseSyntaxCheck,
     clickhouseSyntaxCheckSingle,
+    clickhouseLocalQuery,
     withExtraOracles,
     mysqlSyntaxCheck,
     mysqlSyntaxCheckIsolated,
     mysqlCrossRejectCheck,
     mysqlClientScriptCheck,
+    mysqlClientExecIsolated,
 ) where
 
 import Control.Applicative ((<|>))
@@ -25,12 +27,13 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (bracket, finally)
 import Control.Exception.Safe (SomeException, displayException, try)
-import Control.Monad (filterM, guard, unless, when)
+import Control.Monad (filterM, guard, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, sortOn)
 import Data.Maybe (isJust, isNothing)
@@ -421,13 +424,16 @@ requireMariadbAPI =
 -- ---------------------------------------------------------------------------
 
 clickhouseSyntaxCheck :: ByteString -> IO (Either Text ())
-clickhouseSyntaxCheck = runClickHouseFormat ["--quiet", "--multiquery"]
+clickhouseSyntaxCheck = fmap void . runClickHouse ["format", "--quiet", "--multiquery"]
 
 clickhouseSyntaxCheckSingle :: ByteString -> IO (Either Text ())
-clickhouseSyntaxCheckSingle = runClickHouseFormat ["--quiet"]
+clickhouseSyntaxCheckSingle = fmap void . runClickHouse ["format", "--quiet"]
 
-runClickHouseFormat :: [String] -> ByteString -> IO (Either Text ())
-runClickHouseFormat args sql
+clickhouseLocalQuery :: ByteString -> IO (Either Text Text)
+clickhouseLocalQuery = runClickHouse ["local", "--multiquery"]
+
+runClickHouse :: [String] -> ByteString -> IO (Either Text Text)
+runClickHouse args sql
     | BS.elem 0 sql = pure (Left "NUL byte in SQL input")
     | otherwise = do
         chBin <-
@@ -435,12 +441,12 @@ runClickHouseFormat args sql
                 >>= maybe
                     (ioError (userError "ClickHouse binary not found; set OCCAM_CLICKHOUSE_BIN"))
                     pure
-        (code, _out, err) <- runBinaryStdin chBin ("format" : args) sql
+        (code, out, err) <- runBinaryStdin chBin args sql
         pure $ case code of
-            ExitSuccess -> Right ()
+            ExitSuccess -> Right (TE.decodeUtf8With lenientDecode out)
             ExitFailure _ ->
                 let decoded = T.strip (TE.decodeUtf8With lenientDecode err)
-                 in Left (if T.null decoded then "clickhouse format rejected SQL" else decoded)
+                 in Left (if T.null decoded then "clickhouse rejected SQL" else decoded)
 
 -- ---------------------------------------------------------------------------
 -- Temporary unix-socket MySQL 8.4 & MariaDB 11.4 lifecycle
@@ -748,7 +754,13 @@ mysqlSyntaxCheckIsolatedWith extraCodes srv sql =
             restoreDefault =
                 resetReadOnly
                     >> voidRight
-                        (execRawQuery [] engine api conn "ROLLBACK; DROP DATABASE IF EXISTS occam_case; USE occam_syntax;")
+                        ( execRawQuery
+                            []
+                            engine
+                            api
+                            conn
+                            "ROLLBACK; UNLOCK TABLES; DROP DATABASE IF EXISTS occam_case; USE occam_syntax;"
+                        )
         resetReadOnly
         voidRight (execRawQuery [] engine api conn setupIsolated)
         ( case splitSQL profile sql of
@@ -777,35 +789,62 @@ mysqlSyntaxCheckIsolatedWith extraCodes srv sql =
 
 mysqlClientScriptCheck :: MysqlServer -> ByteString -> IO (Either Text ())
 mysqlClientScriptCheck srv scriptSql =
+    void
+        <$> runMysqlClient
+            srv
+            []
+            ["-S", srvSocket srv, "-u", "root", "--batch", "occam_cli_case"]
+            scriptSql
+
+mysqlClientExecIsolated :: MysqlServer -> [ByteString] -> ByteString -> IO (Either Text Text)
+mysqlClientExecIsolated srv extraDbs =
+    runMysqlClient
+        srv
+        extraDbs
+        ["-S", srvSocket srv, "-u", "root", "--batch", "--raw", "-N", "occam_cli_case"]
+
+runMysqlClient :: MysqlServer -> [ByteString] -> [String] -> ByteString -> IO (Either Text Text)
+runMysqlClient srv extraDbs args scriptSql =
     case srvClientBin srv of
         Nothing ->
-            ioError (userError "MySQL/MariaDB client binary unavailable for DELIMITER verification")
+            ioError (userError "MySQL/MariaDB client binary unavailable")
         Just clientBin ->
             withMVar (srvConnLock srv) \conn -> do
                 let engine = srvEngine srv
                     api = srvApi srv
+                    dropExtra =
+                        for_ extraDbs \db ->
+                            execRawQuery [] engine api conn ("DROP DATABASE IF EXISTS " <> db <> ";")
                     cleanup =
-                        execRawQuery [] engine api conn "DROP DATABASE IF EXISTS occam_cli_case; USE occam_syntax;"
-                _ <-
-                    execRawQuery
-                        []
-                        engine
-                        api
-                        conn
-                        "DROP DATABASE IF EXISTS occam_cli_case; CREATE DATABASE occam_cli_case;"
+                        dropExtra
+                            >> execRawQuery [] engine api conn "DROP DATABASE IF EXISTS occam_cli_case; USE occam_syntax;"
+                dropExtra
+                execRawStrict
+                    engine
+                    api
+                    conn
+                    "ROLLBACK; UNLOCK TABLES; DROP DATABASE IF EXISTS occam_cli_case; CREATE DATABASE occam_cli_case;"
                 ( do
-                        (code, out, err) <-
-                            runBinaryStdin
-                                clientBin
-                                ["-S", srvSocket srv, "-u", "root", "--batch", "occam_cli_case"]
-                                scriptSql
+                        (code, out, err) <- runBinaryStdin clientBin args scriptSql
                         let combined = out <> err
                         pure $
                             if code /= ExitSuccess || "ERROR " `BS.isInfixOf` combined
                                 then Left (T.strip (TE.decodeUtf8With lenientDecode combined))
-                                else Right ()
+                                else Right (TE.decodeUtf8With lenientDecode out)
                     )
                     `finally` cleanup
+    where
+        execRawStrict eng a c s =
+            execRawQuery [] eng a c s
+                >>= either
+                    (\err -> ioError (userError ("Unexpected setup syntax error: " <> show err)))
+                    pure
+                >> checkStrictErr a c
+        checkStrictErr a c = do
+            code :: Word32 <- fromIntegral <$> apiErrno a c
+            when (code /= 0) $ do
+                msg <- peekCString =<< apiError a c
+                ioError (userError ("Unexpected MySQL/MariaDB setup error " <> show code <> ": " <> msg))
 
 execRawQuery ::
     [Word32] ->

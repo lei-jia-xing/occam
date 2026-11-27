@@ -206,13 +206,20 @@ applyDrop _ catalog _ = catalog
 
 applyRename :: SessionInit -> RenameOp -> Map TableKey TableInfo -> Map TableKey TableInfo
 applyRename initial (RenameRelation old new _) catalog =
+    applyRenameRelation initial old new catalog
+applyRename initial (RenamePermanentRelation old new _) catalog =
+    applyRenameRelation initial (old {nameRefTemp = False}) new catalog
+applyRename initial (RenameColumnOp target old new) catalog =
+    renameColumn initial target old new catalog
+
+applyRenameRelation ::
+    SessionInit -> NameRef -> Name -> Map TableKey TableInfo -> Map TableKey TableInfo
+applyRenameRelation initial old new catalog =
     fromMaybe catalog do
         oldKey <- resolveTableKey initial catalog old
         info <- Map.lookup oldKey catalog
         let newRef = NameRef new (nameRefTemp old)
         pure (Map.insert (tableKeyOf newRef) (info {infoRef = newRef}) (Map.delete oldKey catalog))
-applyRename initial (RenameColumnOp target old new) catalog =
-    renameColumn initial target old new catalog
 
 renameColumn ::
     SessionInit -> NameRef -> Ident -> Ident -> Map TableKey TableInfo -> Map TableKey TableInfo
