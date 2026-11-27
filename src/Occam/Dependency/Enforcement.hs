@@ -3,6 +3,7 @@ module Occam.Dependency.Enforcement (
     cascadeWrites,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -130,9 +131,12 @@ cascadeWrites initial = go (sessionForeignKeyChecks initial) Map.empty (initialS
                 extras
                     | enforced = concatMap (expand initial catalog) ops
                     | otherwise = []
-                catalog' = foldl' (applyOp initial) catalog ops
+                catalog' = Foldable.foldl' (applyOp initial) catalog ops
                 enforced' =
-                    foldl' (applySession (sessionForeignKeyChecks initial) (transactionActive before)) enforced effects
+                    Foldable.foldl'
+                        (applySession (sessionForeignKeyChecks initial) (transactionActive before))
+                        enforced
+                        effects
                 tailMap = go enforced' catalog' (finishStatement sid after) rest
              in if null extras then tailMap else Map.insert sid extras tailMap
 
@@ -151,8 +155,8 @@ applyOp initial catalog op = case op of
         let info = collectTable def
          in Map.insert (tableKeyOf (infoRef info)) info catalog
     AlterTableOp alter ->
-        foldl' (applyChange initial (alterTableTarget alter)) catalog (alterTableChanges alter)
-    DropCatalogOp dropOp -> foldl' (applyDrop initial) catalog (dropObjects dropOp)
+        Foldable.foldl' (applyChange initial (alterTableTarget alter)) catalog (alterTableChanges alter)
+    DropCatalogOp dropOp -> Foldable.foldl' (applyDrop initial) catalog (dropObjects dropOp)
     RenameOp rename -> applyRename initial rename catalog
     _ -> catalog
 

@@ -14,6 +14,7 @@ module Occam.Dependency.Barrier (
     touchersForBarrier,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -96,7 +97,7 @@ barrierKeysForScope session catalog scope =
         UserVariableScope ident -> [UserVariableBarrierKey ident]
 
 lastBarrierDeps :: ScanState -> [BarrierKey] -> Set StatementId
-lastBarrierDeps state = foldl' addLast Set.empty
+lastBarrierDeps state = Foldable.foldl' addLast Set.empty
     where
         barriers = scanLastBarriers state
         addLast !acc key = case Map.lookup key barriers of

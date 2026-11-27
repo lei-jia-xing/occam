@@ -6,7 +6,7 @@ import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
-import Data.Foldable (for_)
+import Data.Foldable as Foldable (foldl', for_)
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -1172,7 +1172,7 @@ assertSingleStatementValid label profile sql =
 
 hullOf :: [SpannedToken] -> ByteSpan
 hullOf [] = error "hullOf: empty token list"
-hullOf (L firstSpan _ : rest) = foldl' (\accumulator (L nextSpan _) -> mergeSpan accumulator nextSpan) firstSpan rest
+hullOf (L firstSpan _ : rest) = Foldable.foldl' (\accumulator (L nextSpan _) -> mergeSpan accumulator nextSpan) firstSpan rest
 
 spanWithin :: ByteSpan -> ByteSpan -> Bool
 spanWithin child parent =

@@ -22,6 +22,7 @@ module Occam.Dependency.Write (
     processRefresh,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
@@ -142,7 +143,7 @@ applyWriteState sid TruncateWrite {} _ relation =
 insertColumnWrites ::
     StatementId -> [Ident] -> Map.Map Ident (Set StatementId) -> Map.Map Ident (Set StatementId)
 insertColumnWrites sid columns current =
-    foldl' (\m column -> Map.insert column (Set.singleton sid) m) current columns
+    Foldable.foldl' (\m column -> Map.insert column (Set.singleton sid) m) current columns
 
 -- Reads
 processRead :: Eval -> ReadFact -> Eval
@@ -161,7 +162,7 @@ processReadWith resolveRelKeys eval readFact =
                 (`Map.member` catalogSequences catalog)
                 (resolveSequenceKeys session catalog (readSource readFact))
         evalRelations =
-            foldl'
+            Foldable.foldl'
                 ( \current key ->
                     addTouches
                         (relationTouchKeys key)
@@ -173,7 +174,7 @@ processReadWith resolveRelKeys eval readFact =
                 eval
                 relationKeys
         evalSequences =
-            foldl'
+            Foldable.foldl'
                 ( \current key ->
                     addTouches
                         (sequenceTouchKeys key)
@@ -196,7 +197,7 @@ processReadWith resolveRelKeys eval readFact =
                 , Map.member sourceKey (catalogRelations catalog)
                 ]
             ]
-        evalBarriers = foldl' (flip addBarrier) evalSequences unresolvedBarriers
+        evalBarriers = Foldable.foldl' (flip addBarrier) evalSequences unresolvedBarriers
      in if null relationKeys && null sequenceKeys
             then
                 addTouch
@@ -268,7 +269,7 @@ matchingTriggers catalog key tag =
 -- Data writes
 processDataWrite :: StatementId -> Eval -> DataWrite -> Eval
 processDataWrite sid eval write =
-    let evalReads = foldl' processRead eval (dataWriteReads write)
+    let evalReads = Foldable.foldl' processRead eval (dataWriteReads write)
         session = evalSession evalReads
         catalog = evalCatalog evalReads
         targetKeys = resolveRelationKeys session catalog (dataWriteTarget write)
@@ -313,14 +314,18 @@ writeRelation sid eval key kind columns only =
             if suppressOriginal
                 then evalDeps
                 else evalDeps & evalCatalogL %~ insertRelation key (applyWriteState sid kind columns relation)
-        evalTriggers = foldl' (\current (triggerKey, _) -> expandTrigger sid current triggerKey) evalWrite matching
+        evalTriggers =
+            Foldable.foldl'
+                (\current (triggerKey, _) -> expandTrigger sid current triggerKey)
+                evalWrite
+                matching
         evalCascades = applyForeignKeys sid evalTriggers key kind columns
         -- Fan out parent write to partition/inheritance children unless ONLY is specified.
         evalChildren =
             if only
                 then evalCascades
                 else
-                    foldl'
+                    Foldable.foldl'
                         (writePartitionChild sid kind columns)
                         evalCascades
                         ( case kind of
@@ -340,7 +345,7 @@ writePartitionChild sid kind columns current childKey =
 
 addViewWriteBarriers :: Eval -> RelationKey -> Eval
 addViewWriteBarriers eval key =
-    foldl'
+    Foldable.foldl'
         (flip addBarrier)
         eval
         [ ScopedBarrier
@@ -370,13 +375,13 @@ expandTrigger sid eval triggerKey
             definitionDeps =
                 Set.fromList (catMaybes [triggerDefinition trigger, triggerRestoredBy trigger])
             eval2 = addTouches (triggerTouchKeys triggerKey tableKey) (addDeps definitionDeps eval1)
-            eval3 = foldl' processRead eval2 (triggerStateWhenReads trigger)
+            eval3 = Foldable.foldl' processRead eval2 (triggerStateWhenReads trigger)
          in applyTriggerBody sid eval3 (triggerStateBody trigger)
     | otherwise = eval
 
 applyTriggerBody :: StatementId -> Eval -> TriggerBody -> Eval
 applyTriggerBody sid eval = \case
-    TriggerInline effects -> foldl' (processTriggerEffect sid) eval effects
+    TriggerInline effects -> Foldable.foldl' (processTriggerEffect sid) eval effects
     TriggerFunction name _ ->
         addBarrier
             ( ScopedBarrier
@@ -471,9 +476,9 @@ applyForeignKeys sid eval key kind columns
 
 applyChildChecks :: Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
 applyChildChecks eval key kind _columns = case kind of
-    InsertWrite _ -> foldl' checkParent eval (allForeignKeys catalog)
-    UpdateWrite _ -> foldl' checkParent eval (allForeignKeys catalog)
-    MergeWrite -> foldl' checkParent eval (allForeignKeys catalog)
+    InsertWrite _ -> Foldable.foldl' checkParent eval (allForeignKeys catalog)
+    UpdateWrite _ -> Foldable.foldl' checkParent eval (allForeignKeys catalog)
+    MergeWrite -> Foldable.foldl' checkParent eval (allForeignKeys catalog)
     _ -> eval
     where
         catalog = evalCatalog eval
@@ -491,13 +496,13 @@ applyChildChecks eval key kind _columns = case kind of
 applyParentActions :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
 applyParentActions sid eval key kind columns = case kind of
     DeleteWrite _ ->
-        foldl' (\current item -> parentAction current (DeleteWrite DeleteAllRows) [] item) eval fks
+        Foldable.foldl' (\current item -> parentAction current (DeleteWrite DeleteAllRows) [] item) eval fks
     UpdateWrite scope ->
-        foldl' (\current item -> parentAction current (UpdateWrite scope) columns item) eval fks
+        Foldable.foldl' (\current item -> parentAction current (UpdateWrite scope) columns item) eval fks
     TruncateWrite TruncateCascade _ ->
-        foldl' cascadeTruncate eval fks
+        Foldable.foldl' cascadeTruncate eval fks
     TruncateWrite {} ->
-        foldl' addForeignKeyDep eval fks
+        Foldable.foldl' addForeignKeyDep eval fks
     _ -> eval
     where
         catalog = evalCatalog eval
@@ -577,7 +582,7 @@ processRefresh sid eval refresh =
                 mode = refreshSourceMode refresh
                 deps = relationReadDeps session currentCatalog key ReadSchema [] False
                 sourceReads = [readFact {readMode = mode} | readFact <- relSourceReads relation]
-                evalReads = foldl' processRead current sourceReads
+                evalReads = Foldable.foldl' processRead current sourceReads
                 relation1 =
                     relation
                         & relDataWritesL .~ Set.singleton sid

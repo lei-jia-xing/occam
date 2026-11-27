@@ -13,6 +13,7 @@ module Occam.Dependency.Rename (
     renameForeignKeyParentColumn,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
@@ -223,11 +224,20 @@ moveRelationObjects placement _sid _oldKey newKey relation catalog =
     (catalog3, relation1)
     where
         (catalog1, newIndexes) =
-            foldl' (moveRelationIndex placement newKey) (catalog, Set.empty) (Set.toList (relIndexes relation))
+            Foldable.foldl'
+                (moveRelationIndex placement newKey)
+                (catalog, Set.empty)
+                (Set.toList (relIndexes relation))
         (catalog2, newTriggers) =
-            foldl' (moveRelationTrigger newKey) (catalog1, Set.empty) (Set.toList (relTriggers relation))
+            Foldable.foldl'
+                (moveRelationTrigger newKey)
+                (catalog1, Set.empty)
+                (Set.toList (relTriggers relation))
         (catalog3, newConstraints) =
-            foldl' (moveRelationConstraint newKey) (catalog2, Set.empty) (Set.toList (relConstraints relation))
+            Foldable.foldl'
+                (moveRelationConstraint newKey)
+                (catalog2, Set.empty)
+                (Set.toList (relConstraints relation))
         relation1 =
             relation
                 & relIndexesL .~ newIndexes

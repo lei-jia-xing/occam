@@ -24,13 +24,20 @@ common warnings
                  -O2
 
 common language
-    default-language: GHC2024
+    default-language: GHC2021
     default-extensions:
         BlockArguments
+        DataKinds
         DeriveAnyClass
+        DerivingStrategies
+        DisambiguateRecordFields
+        ExplicitNamespaces
+        GADTs
         LambdaCase
+        MonoLocalBinds
         OverloadedStrings
         RecordWildCards
+        RoleAnnotations
 
 common core-deps
     build-depends:    base >= 4.18 && < 5

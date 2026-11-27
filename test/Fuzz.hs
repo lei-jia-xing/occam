@@ -2,6 +2,7 @@ module Fuzz (fuzzTests, generativeFuzzTests, main) where
 
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
+import Data.Foldable qualified as Foldable
 import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -81,7 +82,7 @@ renderScriptSQL FuzzScript {..} =
     TE.encodeUtf8 (T.intercalate "\n" (scriptDdl ++ scriptDml))
 
 lastMay :: [a] -> Maybe a
-lastMay = foldl' (\_ x -> Just x) Nothing
+lastMay = Foldable.foldl' (\_ x -> Just x) Nothing
 
 -- ----------------------------------------------------------------------------
 -- SQL Rendering Helpers
@@ -305,7 +306,7 @@ genTableDefWithLast name mFk = do
     firstExtra <- genCol mFk (1 :: Int)
     restExtra <- mapM (genCol mFk) [2 .. extraColsCount]
     let extraCols = firstExtra : restExtra
-        lastExtra = foldl' (\_ col -> col) firstExtra restExtra
+        lastExtra = Foldable.foldl' (\_ col -> col) firstExtra restExtra
         pkCol =
             ColumnDef
                 { colName = "id"

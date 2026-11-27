@@ -8,7 +8,7 @@ import Control.Monad.Trans.Cont (evalContT)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.Foldable (for_)
+import Data.Foldable as Foldable (foldl', for_)
 import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, modifyIORef')
 import Data.IntSet qualified as IntSet
@@ -170,7 +170,7 @@ combineLiteralEdits sql first rest =
     where
         ordered = sortOn parserEditStart (first : rest)
         start = minimum (map parserEditStart ordered)
-        (end, parts) = foldl' append (start, []) ordered
+        (end, parts) = Foldable.foldl' append (start, []) ordered
         append (previous, acc) edit =
             ( parserEditEnd edit
             , parserEditReplacement edit : BS.take (parserEditStart edit - previous) (BS.drop previous sql) : acc
@@ -179,7 +179,7 @@ combineLiteralEdits sql first rest =
 primaryUnitLiterals :: SyntaxContext -> StatementUnit -> [ParserEdit]
 primaryUnitLiterals context unit
     | deferLiterals == DeferLiteralsOff = eligible
-    | otherwise = reverse (fst (foldl' step ([], Set.empty) eligible))
+    | otherwise = reverse (fst (Foldable.foldl' step ([], Set.empty) eligible))
     where
         deferLiterals = syntaxDeferLiteralVariants context
         eligible = unitNonRecursiveLiterals context unit
@@ -206,7 +206,7 @@ distributedLiteralGroups ::
 distributedLiteralGroups context maxBatch rejectedByRepl preferredRepl units =
     sortOn groupOrder nonEmptyGroups
     where
-        byRepl = foldl' addUnit Map.empty units
+        byRepl = Foldable.foldl' addUnit Map.empty units
         addUnit groups unit =
             let sid = unStatementId (stmtId (unitStatement unit))
                 bestPerRepl =

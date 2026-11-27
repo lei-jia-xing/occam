@@ -23,6 +23,7 @@ module Occam.Dependency.Query (
     relationConstraintDeps,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
@@ -263,7 +264,7 @@ buildLineageReqs ::
     [SourceColumn] ->
     Map.Map RelationKey (Maybe (Set Ident))
 buildLineageReqs session catalog viewIsTemp relation collectedSCs =
-    foldl' addSourceCol initMap (collectedSCs ++ relConditionColumns relation)
+    Foldable.foldl' addSourceCol initMap (collectedSCs ++ relConditionColumns relation)
     where
         baseMap = Map.fromList [(sourceKey, Just Set.empty) | sourceKey <- Set.toList (relSources relation)]
         unresolvedBase =
@@ -275,7 +276,7 @@ buildLineageReqs session catalog viewIsTemp relation collectedSCs =
         addSourceCol m sc =
             let keys = resolveViewSourceKeys session viewIsTemp catalog (sourceColumnRelation sc)
                 col = sourceColumnName sc
-             in foldl' (\acc k -> Map.insertWith combineViewReq k (Just (Set.singleton col)) acc) m keys
+             in Foldable.foldl' (\acc k -> Map.insertWith combineViewReq k (Just (Set.singleton col)) acc) m keys
 
 relationReadDeps ::
     SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Bool -> Set StatementId
@@ -413,7 +414,7 @@ installConstraints ::
     (Catalog, Set ConstraintKey)
 installConstraints session sid key constraints catalog =
     let (catalog', keys, _) =
-            foldl' install (catalog, Set.empty, catalogNextUnnamedConstraint catalog) constraints
+            Foldable.foldl' install (catalog, Set.empty, catalogNextUnnamedConstraint catalog) constraints
      in (catalog', keys)
     where
         install (current, keys, next) constraint =

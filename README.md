@@ -15,6 +15,60 @@
 
 ---
 
+## Installation
+
+### Nix (Flakes)
+
+Run directly without installing, or install into your profile (includes shell completions and `libduckdb` support for `--result-oracle --dialect duckdb`):
+
+```bash
+# Run once
+nix run github:lei-jia-xing/occam -- --help
+
+# Install into Nix profile
+nix profile install github:lei-jia-xing/occam
+```
+
+For NixOS / Home Manager flake configurations, `overlays.default` provides `pkgs.occam`, and `packages.<system>.default` exposes the standalone wrapped binary.
+
+### Arch Linux (AUR `PKGBUILD`)
+
+A ready-to-publish AUR `occam-git` package definition lives in [packaging/aur/PKGBUILD](packaging/aur/PKGBUILD) (with [packaging/aur/.SRCINFO](packaging/aur/.SRCINFO)), building against Arch `extra/ghc` (`9.6.7`) and `extra/haskell-*` packages without requiring GitHub releases:
+
+```bash
+cd packaging/aur
+makepkg -si
+```
+
+Install optional `duckdb` if using `--result-oracle --dialect duckdb`.
+
+### From Source (Cabal / Stack)
+
+Occam compiles with GHC `>= 9.6` (`base >= 4.18`).
+
+#### Cabal
+
+```bash
+git clone https://github.com/lei-jia-xing/occam.git
+cd occam
+cabal update
+cabal install exe:occam
+```
+
+#### Stack
+
+Using [stack.yaml](stack.yaml) (`lts-24.68`, GHC `9.10.3`):
+
+```bash
+git clone https://github.com/lei-jia-xing/occam.git
+cd occam
+stack install
+```
+
+Optionally install shell completions via `make install-completions` (or `occam --completion bash|zsh|fish`), and ensure `libduckdb` is available on the system library path (or via `OCCAM_DUCKDB_LIB`) if using `--result-oracle --dialect duckdb`.
+
+---
+
 ## Quick Start
 
 ### External predicate (`--oracle`)
@@ -67,6 +121,7 @@ Run `occam --help` for the full flag list, or use `--list-dialects`, `--list-str
 | `--timeout` / `--budget` / `--max-oracle-executions` | Per-probe timeout (`10s` default), total wall-time budget, uncached attempt cap |
 | `-j, --jobs N` | Max concurrent oracle/reset executions (`1` default; caller must isolate DB state) |
 | `--strategy STRATEGY` | `full` (default), `ddmin-only`, or `audit-only` |
+| `--config FILE` | Load JSON option presets (e.g. from `config/generated/profiles/*.json`); explicit CLI flags override |
 | `--intra-statement` / `--column-mode MODE` | Opt-in exact-span intra-statement reduction and column co-reduction (`off`\|`single`\|`atomic`) |
 | `--completion bash\|zsh\|fish` | Emit shell completion script |
 

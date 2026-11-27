@@ -3,6 +3,7 @@ module Occam.Certificate.MissingDef (
     buildMissingDefReqs,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
@@ -46,7 +47,7 @@ data MissingDefAcc = MissingDefAcc
 -- | Precompute per-statement required prior definers/openers in source order.
 buildMissingDefReqs :: [StatementUnit] -> IntMap [IntSet]
 buildMissingDefReqs =
-    mdaReqs . foldl' stepMissingDefUnit emptyAcc
+    mdaReqs . Foldable.foldl' stepMissingDefUnit emptyAcc
     where
         emptyAcc = MissingDefAcc Map.empty IntSet.empty Map.empty IntSet.empty IntSet.empty IntMap.empty
 
@@ -97,11 +98,11 @@ stepMissingDefFacts sid acc facts =
             ]
         allReqs = dedupIntSetsSmall (relReqs ++ txReqs)
         relDefs' =
-            foldl'
+            Foldable.foldl'
                 (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m)
                 (mdaRelDefs acc)
                 (Set.toList selfDefined)
-        (txOpens', spOpens') = foldl' (recordTxOpener sid) (mdaTxOpens acc, mdaSpOpens acc) txs
+        (txOpens', spOpens') = Foldable.foldl' (recordTxOpener sid) (mdaTxOpens acc, mdaSpOpens acc) txs
 
 isDeferredOrDropOp :: CatalogOp -> Bool
 isDeferredOrDropOp = \case

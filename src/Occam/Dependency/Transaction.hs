@@ -36,6 +36,7 @@ module Occam.Dependency.Transaction (
     stripDefinitionRestored,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.List (find)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -141,7 +142,7 @@ settleAutocommit sid prior next
 control valid when replayed as part of a backward slice.
 -}
 applyTxEffects :: StatementId -> [TxEffect] -> ScanState -> (ScanState, Set StatementId)
-applyTxEffects sid effects state = foldl' step (state, Set.empty) effects
+applyTxEffects sid effects state = Foldable.foldl' step (state, Set.empty) effects
     where
         step (current, deps) effect =
             let next = applyTxEffect sid current effect
@@ -280,7 +281,7 @@ applyOnCommit :: Int -> SessionState -> Catalog -> Catalog
 applyOnCommit transactionId session catalog
     | not (catalogMayHaveOnCommit catalog) = catalog
     | otherwise =
-        foldl'
+        Foldable.foldl'
             (flip (removeRelationCascade session DropCascade))
             (catalog {catalogRelations = relations})
             dropKeys

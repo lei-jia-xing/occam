@@ -16,6 +16,37 @@
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     in
     {
+      packages = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          rawPkg = pkgs.haskellPackages.callPackage ./nix/package.nix {
+            sqlite = pkgs.sqlite;
+          };
+          occam = pkgs.haskell.lib.compose.justStaticExecutables rawPkg;
+        in
+        {
+          inherit occam;
+          default = occam;
+        }
+      );
+
+      apps = forAllSystems (system: {
+        occam = {
+          type = "app";
+          program = "${self.packages.${system}.occam}/bin/occam";
+          meta.description = "Cross-Platform Dependency-Aware SQL Test Case Minimizer";
+        };
+        default = self.apps.${system}.occam;
+      });
+
+      overlays.default = final: _prev: {
+        occam = self.packages.${final.stdenv.hostPlatform.system}.occam;
+      };
+
+      checks = forAllSystems (system: {
+        occam = self.packages.${system}.occam;
+      });
+
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
@@ -33,6 +64,9 @@
             fourmolu
             hlint
             elan
+            dhall
+            dhall-json
+            dhall-yaml
             python3
             duckdb
             libpg_query

@@ -8,6 +8,7 @@ module Occam.Frontend.Semantics (
     emptySemanticFacts,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -196,7 +197,7 @@ analyzeStatement ctx stmt =
             }
 
 dedupSequenceWrites :: [Core.CatalogOp] -> [Core.CatalogOp]
-dedupSequenceWrites = reverse . fst . foldl' step ([], Set.empty)
+dedupSequenceWrites = reverse . fst . Foldable.foldl' step ([], Set.empty)
     where
         step (acc, seen) op@(Core.WriteSequenceOp sw) =
             let target = Core.sequenceWriteTarget sw

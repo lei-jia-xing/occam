@@ -21,6 +21,7 @@ module Occam.Frontend.Columns.Assemble (
 import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
 import Data.Char (isAsciiUpper, toLower)
+import Data.Foldable qualified as Foldable
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -256,7 +257,7 @@ buildAssembly views =
                 , baRenamesRev = []
                 , baDrops = Set.empty
                 }
-        acc = foldl' stepUnit acc0 views
+        acc = Foldable.foldl' stepUnit acc0 views
      in Assembly
             { asmViews = views
             , asmRefs = reverse (baRefsRev acc)
@@ -324,7 +325,7 @@ stepUnit acc view = case uvFacts view of
                     , baSchema = schF
                     , baRelNames = Set.union (baRelNames acc) relNamesFromRefs
                     }
-         in foldl' (stepOp (uvIndex view)) accWithFences (Core.factOps facts)
+         in Foldable.foldl' (stepOp (uvIndex view)) accWithFences (Core.factOps facts)
     where
         applyTxClear txs b
             | any isEndTx txs = False
@@ -367,7 +368,7 @@ stepOp unitIdx acc = \case
                     , baDdlNames = Set.insert tName (baDdlNames acc)
                     , baDefineNames = Set.insert tName (baDefineNames acc)
                     }
-         in foldl' recordParentFk acc' parents
+         in Foldable.foldl' recordParentFk acc' parents
     Core.DefineTriggerOp tr ->
         let tbl = Core.nameRefName (Core.triggerTable tr)
          in acc
@@ -382,9 +383,9 @@ stepOp unitIdx acc = \case
                     { baRelNames = Set.insert tbl (baRelNames acc)
                     , baDdlNames = Set.insert tbl (baDdlNames acc)
                     }
-         in foldl' recordParentFk acc' parents
+         in Foldable.foldl' recordParentFk acc' parents
     Core.DropCatalogOp dr ->
-        foldl' recordDrop acc (Core.dropObjects dr)
+        Foldable.foldl' recordDrop acc (Core.dropObjects dr)
     Core.RenameOp (Core.RenameRelation fromRef toName _) ->
         let fromName = Core.nameRefName fromRef
          in acc
@@ -562,8 +563,8 @@ collectTableFences ::
     (Set Core.Name, Set Core.Name, Set Core.Name) ->
     (Set Core.Name, Set Core.Name, Set Core.Name)
 collectTableFences facts (dep0, rel0, sch0) =
-    let dep1 = foldl' addTrig dep0 (Core.factOps facts)
-     in foldl' addBarrier (dep1, rel0, sch0) (Core.factBarriers facts)
+    let dep1 = Foldable.foldl' addTrig dep0 (Core.factOps facts)
+     in Foldable.foldl' addBarrier (dep1, rel0, sch0) (Core.factBarriers facts)
     where
         addTrig dep = \case
             Core.DefineTriggerOp tr -> Set.insert (Core.nameRefName (Core.triggerTable tr)) dep
@@ -658,8 +659,8 @@ foldGenerationChange chain implicit change gen = case change of
                     { fsTouched = Set.insert (Core.columnName col) (fsTouched gen)
                     , fsAll = fsAll gen || Core.columnGenerated col || implicit
                     }
-            gen2 = foldl' (flip (foldConstraint chain)) gen1 constraints
-         in foldl' addSelfFk gen2 (Core.columnReferences col)
+            gen2 = Foldable.foldl' (flip (foldConstraint chain)) gen1 constraints
+         in Foldable.foldl' addSelfFk gen2 (Core.columnReferences col)
     Core.DropColumn col _ ->
         gen
             { fsTouched = Set.insert col (fsTouched gen)
@@ -709,7 +710,7 @@ buildScope asm define defineUnit = case buildChain asm define defineUnit of
             }
     Just (chain, edgeUnits) ->
         let implicit = any (hasImplicitForChain chain) (asmViews asm)
-            gen = foldl' (stepView chain implicit) emptyFenceSet (asmViews asm)
+            gen = Foldable.foldl' (stepView chain implicit) emptyFenceSet (asmViews asm)
          in TableScope
                 { tsChain = chain
                 , tsEdgeUnits = edgeUnits
@@ -725,11 +726,11 @@ buildScope asm define defineUnit = case buildChain asm define defineUnit of
                 && isNothing (insertExplicit ins)
         stepView chain implicit acc view = case uvFacts view of
             Nothing -> acc
-            Just facts -> foldl' (stepScopeOp chain implicit) acc (Core.factOps facts)
+            Just facts -> Foldable.foldl' (stepScopeOp chain implicit) acc (Core.factOps facts)
         stepScopeOp chain implicit acc = \case
             Core.AlterTableOp alt
                 | Core.nameRefName (Core.alterTableTarget alt) `elem` chain ->
-                    foldl' (flip (foldGenerationChange chain implicit)) acc (Core.alterTableChanges alt)
+                    Foldable.foldl' (flip (foldGenerationChange chain implicit)) acc (Core.alterTableChanges alt)
             Core.RenameOp (Core.RenameColumnOp tbl fromCol toCol)
                 | Core.nameRefName tbl `elem` chain ->
                     acc {fsTouched = Set.insert fromCol (Set.insert toCol (fsTouched acc))}
@@ -740,8 +741,8 @@ buildSiblingScope asm chain
     | Set.null siblings = emptyFenceSet
     | any isSibling (Set.toList (asmDdlNames asm)) = FenceSet True Set.empty
     | otherwise =
-        let amb0 = foldl' stepRef emptyFenceSet (catMaybes (asmRefs asm))
-            amb1 = foldl' stepViewInserts amb0 (asmViews asm)
+        let amb0 = Foldable.foldl' stepRef emptyFenceSet (catMaybes (asmRefs asm))
+            amb1 = Foldable.foldl' stepViewInserts amb0 (asmViews asm)
             amb2 = Map.foldlWithKey' stepParentCols amb1 (asmParentColumns asm)
          in if any isSibling (Set.toList (asmParentOpaque asm))
                 then amb2 {fsAll = True}
@@ -761,7 +762,7 @@ buildSiblingScope asm chain
                         then amb {fsAll = True}
                         else amb
                 amb2 =
-                    foldl'
+                    Foldable.foldl'
                         ( \a r ->
                             if isSibling (Core.nameRefName (Core.readSource r))
                                 then a {fsTouched = Set.union (fsTouched a) (Set.fromList (Core.readColumns r))}
@@ -769,7 +770,7 @@ buildSiblingScope asm chain
                         )
                         amb1
                         (urReads refs)
-             in foldl'
+             in Foldable.foldl'
                     ( \a (tgt, cols) ->
                         if isSibling tgt
                             then a {fsTouched = Set.union (fsTouched a) (Set.fromList cols)}
@@ -779,7 +780,7 @@ buildSiblingScope asm chain
                     (urWrites refs)
         stepViewInserts amb view = case uvFacts view of
             Nothing -> amb
-            Just _ -> foldl' stepIns amb (cuInserts (uvColumn view))
+            Just _ -> Foldable.foldl' stepIns amb (cuInserts (uvColumn view))
         stepIns amb ins = case insertTarget ins of
             Just tgt | isSibling (Core.nameRefName tgt) -> case insertShape ins of
                 ShapeExotic -> amb {fsAll = True}
@@ -812,12 +813,12 @@ planTables views =
     , Just defsRev <- [Map.lookup name tablesMap]
     ]
     where
-        (orderRev, tablesMap) = foldl' stepView ([], Map.empty) views
+        (orderRev, tablesMap) = Foldable.foldl' stepView ([], Map.empty) views
         stepView acc view = case uvFacts view of
             Nothing -> acc
             Just facts ->
                 let creates = cuCreates (uvColumn view)
-                 in snd $ foldl' (stepOpDef (uvIndex view)) (creates, acc) (Core.factOps facts)
+                 in snd $ Foldable.foldl' (stepOpDef (uvIndex view)) (creates, acc) (Core.factOps facts)
         stepOpDef unitIdx (creates, acc@(ordRev, m)) = \case
             Core.DefineTableOp tbl ->
                 let (mGeom, createsRest) = case creates of
@@ -853,7 +854,7 @@ validateSites views source rawSites =
                 _ -> False
 
 referenceFence :: Assembly -> [Core.Name] -> Core.Ident -> Maybe Text
-referenceFence asm chain col = foldl' (<|>) Nothing (map checkRefs (catMaybes (asmRefs asm)))
+referenceFence asm chain col = Foldable.foldl' (<|>) Nothing (map checkRefs (catMaybes (asmRefs asm)))
     where
         inChain n = n `elem` chain
         checkRefs refs
@@ -952,7 +953,7 @@ columnTarget asm source tbl (unitIdx, tblDef) createArity createDupNames scope (
         initSites = createSites unitIdx createSpan
 
         blockedStatic =
-            foldl'
+            Foldable.foldl'
                 (<|>)
                 Nothing
                 [ blockSpan <$ guardMaybe (isNothing createSpan)

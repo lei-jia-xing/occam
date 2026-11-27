@@ -8,6 +8,7 @@ module Occam.Dependency.Session (
     setVariable,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -35,7 +36,7 @@ import Occam.Dependency.State (
 applySessionEffects :: StatementId -> [SessionEffect] -> Eval -> (Eval, Bool)
 applySessionEffects _ effects eval =
     let eval' =
-            foldl'
+            Foldable.foldl'
                 applyEffect
                 eval
                 effects

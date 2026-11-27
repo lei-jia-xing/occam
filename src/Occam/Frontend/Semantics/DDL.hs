@@ -30,6 +30,7 @@ module Occam.Frontend.Semantics.DDL (
 import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable qualified as Foldable
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -191,7 +192,7 @@ columnDefinition :: AnalysisContext -> AST.ColumnDef -> (Core.ColumnDef, [Core.C
 columnDefinition ctx col =
     let colName = canonicalIdent ctx IdentColumn (locValue (AST.columnName col))
         (notNull, hasDefault, generated, refs, cons) =
-            foldl' (step colName Nothing) (False, False, False, [], []) (AST.columnConstraints col)
+            Foldable.foldl' (step colName Nothing) (False, False, False, [], []) (AST.columnConstraints col)
      in ( Core.ColumnDef
             { Core.columnName = colName
             , Core.columnNotNull = notNull
@@ -245,7 +246,7 @@ tableDefinition ::
 tableDefinition ctx createStmt ct sources like partitionParent inheritParents = do
     (name, temporary) <-
         definitionName ctx (AST.createTemp createStmt) (locValue (AST.createTableName ct))
-    let (revCols, revCons) = foldl' stepElem ([], []) (AST.createTableElements ct)
+    let (revCols, revCons) = Foldable.foldl' stepElem ([], []) (AST.createTableElements ct)
         cols0 = reverse revCols
         cons = reverse revCons
         cols =
@@ -919,7 +920,7 @@ createRuleFacts analyzeStmt ctx visitor crRule baseFacts =
         dedupRefs =
             reverse
                 . fst
-                . foldl'
+                . Foldable.foldl'
                     (\(acc, seen) r -> if Set.member r seen then (acc, seen) else (r : acc, Set.insert r seen))
                     ([], Set.empty)
 
@@ -929,7 +930,7 @@ createStatisticsFacts ctx cs baseFacts = case AST.createStatisticsFrom cs of
     Just (L sp tblName) -> case relationRef ctx tblName of
         Just target ->
             let cols = concatMap (exprColumns ctx . locValue) (AST.createStatisticsColumns cs)
-                dedupCols = reverse (fst (foldl' dedup ([], Set.empty) cols))
+                dedupCols = reverse (fst (Foldable.foldl' dedup ([], Set.empty) cols))
              in baseFacts
                     { Core.factOps =
                         Core.factOps baseFacts ++ [Core.ReadOp (Core.ReadFact target Core.ReadSchema dedupCols False)]
@@ -1064,7 +1065,7 @@ alterFacts ctx visitor stmt baseFacts = case AST.alterObject stmt of
                            ]
                 }
         Just table ->
-            let (changes, ops, barriers) = foldl' (stepAction table) ([], [], []) (AST.alterActions stmt)
+            let (changes, ops, barriers) = Foldable.foldl' (stepAction table) ([], [], []) (AST.alterActions stmt)
                 alterOp = [Core.AlterTableOp (Core.AlterTable table changes) | not (null changes)]
                 hasMutation = any (isMutation . locValue) (AST.alterActions stmt)
                 finalBarriers =
@@ -1305,7 +1306,7 @@ alterChange ctx visitor table actionSpan action =
         dedupCols =
             reverse
                 . fst
-                . foldl'
+                . Foldable.foldl'
                     (\(acc, seen) c -> if Set.member c seen then (acc, seen) else (c : acc, Set.insert c seen))
                     ([], Set.empty)
 
@@ -1320,7 +1321,7 @@ alterOpColumns ctx = \case
         dedupCols xs =
             reverse
                 ( fst
-                    ( foldl'
+                    ( Foldable.foldl'
                         (\(acc, seen) x -> if Set.member x seen then (acc, seen) else (x : acc, Set.insert x seen))
                         ([], Set.empty)
                         xs
@@ -1342,9 +1343,9 @@ changeModifyChange ctx colName cdef mPos detail table =
 
 changeModifyRefs :: AnalysisContext -> AST.ColumnDef -> Core.NameRef -> Maybe [Core.Ident]
 changeModifyRefs ctx cdef table =
-    fmap (reverse . fst) (foldl' step (Just ([], Set.empty)) (AST.columnConstraints cdef))
+    fmap (reverse . fst) (Foldable.foldl' step (Just ([], Set.empty)) (AST.columnConstraints cdef))
     where
-        pushList = foldl' pushOne
+        pushList = Foldable.foldl' pushOne
         pushOne (acc, seen) c
             | Set.member c seen = (acc, seen)
             | otherwise = (c : acc, Set.insert c seen)
@@ -1383,7 +1384,7 @@ renameTableFacts ::
     [(Located AST.Name, Located AST.Name)] ->
     Core.SemanticFacts ->
     Core.SemanticFacts
-renameTableFacts ctx renames baseFacts = foldl' step baseFacts renames
+renameTableFacts ctx renames baseFacts = Foldable.foldl' step baseFacts renames
     where
         step acc (L spOld oldName, L spNew newName) =
             case (relationRef ctx oldName, nameFromAST ctx IdentRelation newName) of
@@ -1422,7 +1423,7 @@ analyzeFacts ctx stmt baseFacts
                 Core.factBarriers baseFacts
                     ++ [Core.ScopedBarrier Core.GlobalScope Core.UnknownDDLBarrier (Just (TE.decodeUtf8 (unitSource ctx)))]
             }
-    | otherwise = foldl' step baseFacts (AST.analyzeTables stmt)
+    | otherwise = Foldable.foldl' step baseFacts (AST.analyzeTables stmt)
     where
         step acc (L _ (AST.AnalyzeTable (L sp name) cols)) =
             let rawName = TE.decodeUtf8 (unsafeSliceSource ctx sp)

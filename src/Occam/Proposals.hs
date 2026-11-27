@@ -13,6 +13,7 @@ module Occam.Proposals (
     projectTransactionBlocks,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.HashSet qualified as HashSet
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
@@ -92,7 +93,7 @@ isNoncontiguousIn statements removed =
     case positions of
         [] -> False
         firstPos : rest ->
-            let (lastPos, count) = foldl' (\(_, n) p -> (p, n + 1)) (firstPos, 1 :: Int) rest
+            let (lastPos, count) = Foldable.foldl' (\(_, n) p -> (p, n + 1)) (firstPos, 1 :: Int) rest
              in lastPos - firstPos + 1 > count
     where
         positions =
@@ -275,12 +276,12 @@ weaklyConnectedComponents nodes fastEdges = collect IntSet.empty (IntSet.toList 
 
 relationStatementMap :: [Statement] -> DependencyGraph -> Map Text IntSet
 relationStatementMap statements graph =
-    foldl' addStmt Map.empty statements
+    Foldable.foldl' addStmt Map.empty statements
     where
         addStmt acc stmt =
             let sid = unStatementId (stmtId stmt)
                 rels = maybe [] statementRelations (Map.lookup (stmtId stmt) (graphFacts graph))
-             in foldl' (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m) acc rels
+             in Foldable.foldl' (\m rel -> Map.insertWith IntSet.union rel (IntSet.singleton sid) m) acc rels
 
 statementRelations :: SemanticFacts -> [Text]
 statementRelations facts = concatMap opRelations (factOps facts)
@@ -322,11 +323,11 @@ extractTransactionGroups statements graph targetId =
         indexed = zip [0 :: Int ..] statements
         idsBetween startIdx endIdx =
             IntSet.fromList [unStatementId (stmtId s) | (i, s) <- indexed, i >= startIdx && i <= endIdx]
-        (_, _, blocks, wrappers) = foldl' stepTx ([], [], [], []) indexed
+        (_, _, blocks, wrappers) = Foldable.foldl' stepTx ([], [], [], []) indexed
         stepTx acc (idx, stmt) =
             let sid = unStatementId (stmtId stmt)
                 effects = maybe [] (\f -> factPreTx f ++ factPostTx f) (Map.lookup (stmtId stmt) (graphFacts graph))
-             in foldl' (applyTxGroupEffect targetId idsBetween idx sid) acc effects
+             in Foldable.foldl' (applyTxGroupEffect targetId idsBetween idx sid) acc effects
 
 applyTxGroupEffect ::
     Maybe Int -> (Int -> Int -> IntSet) -> Int -> Int -> TxGroupState -> TxEffect -> TxGroupState

@@ -25,6 +25,7 @@ module Occam.Certificate (
 
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable qualified as Foldable
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
@@ -177,7 +178,7 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
                 ++ repeat Nothing
 
         uniqueDefiners = IntMap.foldlWithKey' addUniqueDefiners IntMap.empty missingDefReqs
-        addUniqueDefiners acc sid = foldl' (addUniqueDefiner sid) acc
+        addUniqueDefiners acc sid = Foldable.foldl' (addUniqueDefiner sid) acc
         addUniqueDefiner sid m req
             | Just (defSid, rest) <- IntSet.minView req
             , IntSet.null rest

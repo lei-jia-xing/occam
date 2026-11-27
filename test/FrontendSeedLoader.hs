@@ -21,6 +21,7 @@ import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (listToMaybe)
 import Data.Text (Text)
@@ -204,7 +205,7 @@ parseDialects line raw =
                                 <> "; use canonical names only: "
                                 <> T.unpack (T.intercalate ", " (map dialectCanonicalName allDialectProfiles))
                             )
-        dedupe = foldl' (\acc d -> if d `elem` acc then acc else acc ++ [d]) []
+        dedupe = Foldable.foldl' (\acc d -> if d `elem` acc then acc else acc ++ [d]) []
 
 parseUnits :: Line -> ByteString -> Either String [UnitExpectation]
 parseUnits line raw =
@@ -230,7 +231,7 @@ parseUnits line raw =
 
 validateCaseIds :: [SeedCase] -> Either String [SeedCase]
 validateCaseIds cases = do
-    _ <- foldl' check (Right Map.empty) cases
+    _ <- Foldable.foldl' check (Right Map.empty) cases
     pure cases
     where
         check (Left err) _ = Left err
@@ -265,7 +266,7 @@ expectedUnitDirective = \case
 change the splitter state; ordinary statement terminators never do.
 -}
 activeDelimiterAfter :: SeedCase -> [ByteString]
-activeDelimiterAfter seedCase = snd (foldl' step (";", []) (seedCaseUnits seedCase))
+activeDelimiterAfter seedCase = snd (Foldable.foldl' step (";", []) (seedCaseUnits seedCase))
     where
         step (active, acc) = \case
             ExpectDirective delimiter -> (delimiter, acc ++ [delimiter])

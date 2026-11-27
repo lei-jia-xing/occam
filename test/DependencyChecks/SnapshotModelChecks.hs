@@ -2,6 +2,7 @@ module DependencyChecks.SnapshotModelChecks (prop_catalogTransitions) where
 
 import Data.Bifunctor qualified as Bifunctor
 import Data.ByteString.Char8 qualified as BSC
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import DependencyChecks.Support (analyze, dependenciesFor)
@@ -107,7 +108,7 @@ tableDependencies table tables =
         Just (definition, writes) -> Set.insert definition writes
 
 writeMany :: [Int] -> CatalogTrace -> CatalogTrace
-writeMany tables trace = foldl' (flip writeTable) trace tables
+writeMany tables trace = Foldable.foldl' (flip writeTable) trace tables
 
 readBoth :: Int -> Int -> CatalogTrace -> CatalogTrace
 readBoth first second = readTable second . readTable first
@@ -129,7 +130,7 @@ catalogTrace plan =
         other = 1 - target
         initialOrder = if planReverseInitial plan then [1, 0] else [0, 1]
         initial =
-            foldl'
+            Foldable.foldl'
                 (\trace table -> writeTable table (createTable table trace))
                 emptyTrace
                 initialOrder

@@ -28,6 +28,7 @@ module Occam.Reducer.Syntax.Index (
 
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable qualified as Foldable
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sortOn)
 import Data.Sequence (Seq)
@@ -159,7 +160,7 @@ data SyntaxIndex
 
 indexUnitEdits :: SyntaxContext -> StatementUnit -> IndexedUnitEdits
 indexUnitEdits context unit =
-    IntMap.mapWithKey finalize (fst (foldl' insertEdit (IntMap.empty, Set.empty) filtered))
+    IntMap.mapWithKey finalize (fst (Foldable.foldl' insertEdit (IntMap.empty, Set.empty) filtered))
     where
         edits = maybe [] factEdits (unitFacts unit)
         filtered = filter (syntaxShouldRun context) edits

@@ -94,7 +94,7 @@ import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.State.Strict (StateT (..), evalStateT, get, gets, modify')
 import Data.ByteString (ByteString)
-import Data.Foldable (find, traverse_)
+import Data.Foldable as Foldable (find, foldl', traverse_)
 import Data.Functor (($>))
 import Data.HashSet qualified as HashSet
 import Data.Maybe (fromMaybe, isJust)
@@ -486,7 +486,7 @@ parseName = do
     first <- parseNamePart
     rest <- manyPrefix dotWordAhead parseNamePart
     let parts = first : rest
-        sp = foldl' (\acc p -> mergeSpan acc (locSpan p)) (locSpan first) rest
+        sp = Foldable.foldl' (\acc p -> mergeSpan acc (locSpan p)) (locSpan first) rest
     pure (L sp (Name parts))
     where
         dotWordAhead = runMaybeT do

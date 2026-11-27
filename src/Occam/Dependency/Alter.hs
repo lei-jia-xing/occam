@@ -15,6 +15,7 @@ module Occam.Dependency.Alter (
     indexKeyName,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
@@ -196,7 +197,7 @@ alterRelationKey session sid changes foreignKeyDeps current key =
                 `Set.union` validationDeps
                 `Set.union` dropColumnViewDeps
         current1 = addTouches (relationTouchKeys key) (addDeps deps current)
-        (catalog1, relation1) = foldl' (applyAlterChange session sid key) (currentCatalog, relation) changes
+        (catalog1, relation1) = Foldable.foldl' (applyAlterChange session sid key) (currentCatalog, relation) changes
         relation2 = relation1 & relSchemaWritesL %~ Set.insert sid
 
 -- | Process @ALTER TABLE ... ATTACH PARTITION@.
@@ -374,7 +375,7 @@ applyDropColumn session key (catalog, relation) column cascade =
         catalog1 =
             if cascade
                 then
-                    foldl'
+                    Foldable.foldl'
                         (flip (removeRelationCascade session DropCascade))
                         catalog
                         dependentViews
@@ -382,9 +383,9 @@ applyDropColumn session key (catalog, relation) column cascade =
      in if not cascade && hasExternalDependents
             then (catalog, relation)
             else
-                ( foldl'
+                ( Foldable.foldl'
                     (flip deleteIndex)
-                    (foldl' (flip deleteConstraint) catalog1 removedKeys)
+                    (Foldable.foldl' (flip deleteConstraint) catalog1 removedKeys)
                     sameTableIndexes
                 , relation
                     & relColumnsL %~ Set.delete column
@@ -449,7 +450,7 @@ applyDropConstraint session key (catalog, relation) name cascade =
                 , dependsOn target keyValue
                 ]
         removedKeys = matching ++ dependentKeys
-        catalog1 = foldl' (flip deleteConstraint) catalog removedKeys
+        catalog1 = Foldable.foldl' (flip deleteConstraint) catalog removedKeys
      in if not cascade && not (null dependentKeys)
             then (catalog, relation)
             else
@@ -467,7 +468,7 @@ applyRenameConstraint ::
     Ident ->
     (Catalog, RelationState)
 applyRenameConstraint key (catalog, relation) from to =
-    ( foldl' renameOne catalog matching
+    ( Foldable.foldl' renameOne catalog matching
     , relation
         { relConstraints =
             Set.union newKeys (Set.difference (relConstraints relation) (Set.fromList matching))
@@ -504,7 +505,7 @@ applyValidateConstraint ::
     Ident ->
     (Catalog, RelationState)
 applyValidateConstraint (catalog, relation) name =
-    (foldl' validateOne catalog matching, relation)
+    (Foldable.foldl' validateOne catalog matching, relation)
     where
         matching =
             [ constraintKey
@@ -530,7 +531,7 @@ applyDropIndexChange (catalog, relation) name =
             | indexKey <- Set.toList (relIndexes relation)
             , indexKeyName indexKey == Just name
             ]
-        catalog1 = foldl' (flip deleteIndex) catalog indexKeys
+        catalog1 = Foldable.foldl' (flip deleteIndex) catalog indexKeys
      in ( catalog1
         , relation
             { relIndexes =

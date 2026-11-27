@@ -12,6 +12,7 @@ module Occam.Frontend.Semantics.DML (
 ) where
 
 import Control.Applicative ((<|>))
+import Data.Foldable qualified as Foldable
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -285,7 +286,7 @@ updateFacts analyzeStmt ctx visitor stmtSpan upd baseFacts =
                         qual = [canonicalIdentText ctx IdentRelation (locValue p) | p <- init (AST.nameParts astName)]
                      in Just (if null qualTexts then Nothing else Just qual, colIdent)
                 [] -> Nothing
-        splitCols src = foldl' step ([], [])
+        splitCols src = Foldable.foldl' step ([], [])
             where
                 step (cs, ucs) (Nothing, c) =
                     if c `elem` ucs then (cs, ucs) else (cs, ucs ++ [c])
@@ -434,7 +435,7 @@ truncateFacts ctx tr baseFacts
                             (Just (TE.decodeUtf8 (unitSource ctx)))
                        ]
             }
-    | otherwise = foldl' step baseFacts (AST.truncateTables tr)
+    | otherwise = Foldable.foldl' step baseFacts (AST.truncateTables tr)
     where
         behavior =
             if AST.truncateBehavior tr == Just AST.DropCascade
@@ -548,7 +549,7 @@ copyFacts analyzeStmt ctx visitor cp baseFacts =
         isExternal _ = False
 
 dedupPreserve :: (Ord a) => [a] -> [a]
-dedupPreserve = reverse . fst . foldl' step ([], Set.empty)
+dedupPreserve = reverse . fst . Foldable.foldl' step ([], Set.empty)
     where
         step (acc, seen) x
             | Set.member x seen = (acc, seen)

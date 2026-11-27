@@ -1,0 +1,115 @@
+# Maintainer: Hunter <leij49456@gmail.com>
+
+pkgname=occam-git
+_hkgname=occam
+pkgver=0.1.0.0.r0.g0000000
+pkgrel=1
+pkgdesc="Dependency-aware test case reducer for multi-statement SQL"
+arch=('x86_64' 'aarch64')
+url="https://github.com/lei-jia-xing/occam"
+license=('MIT')
+provides=("${_hkgname}")
+conflicts=("${_hkgname}")
+options=('!debug' '!lto')
+depends=(
+  'ghc-libs'
+  'haskell-aeson'
+  'haskell-ansi-terminal'
+  'haskell-base16-bytestring'
+  'haskell-direct-sqlite'
+  'haskell-fast-logger'
+  'haskell-hashable'
+  'haskell-microlens'
+  'haskell-optparse-applicative'
+  'haskell-safe-exceptions'
+  'haskell-temporary'
+  'haskell-terminal-progress-bar'
+  'haskell-unordered-containers'
+  'haskell-vector'
+  'sqlite'
+)
+optdepends=(
+  'duckdb: in-process DuckDB result oracle (--result-oracle --dialect duckdb)'
+)
+makedepends=(
+  'ghc'
+  'git'
+)
+checkdepends=(
+  'duckdb'
+  'haskell-quickcheck'
+  'haskell-tasty'
+  'haskell-tasty-hunit'
+  'haskell-tasty-quickcheck'
+  'python'
+  'sqlite'
+)
+source=("${pkgname}::git+https://github.com/lei-jia-xing/occam.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${pkgname}"
+  if git describe --long --tags --abbrev=7 >/dev/null 2>&1; then
+    git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    local cabal_ver
+    cabal_ver="$(awk '/^version:/ {print $2; exit}' occam.cabal)"
+    printf "%s.r%s.%s" "${cabal_ver}" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  fi
+}
+
+prepare() {
+  cd "${pkgname}"
+  cat > Setup.hs <<'EOF'
+import Distribution.Simple
+
+main :: IO ()
+main = defaultMain
+EOF
+}
+
+build() {
+  cd "${pkgname}"
+  local _check_flag="--disable-tests"
+  if (( CHECKFUNC )); then
+    _check_flag="--enable-tests"
+  fi
+
+  runhaskell Setup.hs configure -O \
+    --enable-shared \
+    --enable-executable-dynamic \
+    --disable-library-vanilla \
+    --prefix=/usr \
+    --docdir="/usr/share/doc/${pkgname}" \
+    --datasubdir="${_hkgname}" \
+    --dynlibdir=/usr/lib \
+    --libsubdir='$compiler/site-local/$pkgid' \
+    --ghc-option=-optl-Wl,-z,relro,-z,now \
+    --ghc-option='-pie' \
+    "${_check_flag}"
+
+  runhaskell Setup.hs build -j"$(nproc)"
+  runhaskell Setup.hs register --gen-script
+  runhaskell Setup.hs unregister --gen-script
+  sed -i -r -e "s|ghc-pkg.*update[^ ]* |&'--force' |" register.sh
+  sed -i -r -e "s|ghc-pkg.*unregister[^ ]* |&'--force' |" unregister.sh
+}
+
+check() {
+  cd "${pkgname}"
+  OCCAM_BIN="${PWD}/dist/build/occam/occam" \
+  LD_LIBRARY_PATH="${PWD}/dist/build${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    runhaskell Setup.hs test --show-details=direct
+}
+
+package() {
+  cd "${pkgname}"
+  install -D -m744 register.sh "${pkgdir}/usr/share/haskell/register/${pkgname}.sh"
+  install -D -m744 unregister.sh "${pkgdir}/usr/share/haskell/unregister/${pkgname}.sh"
+  runhaskell Setup.hs copy --destdir="${pkgdir}"
+  install -D -m644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -D -m644 completions/occam.bash "${pkgdir}/usr/share/bash-completion/completions/occam"
+  install -D -m644 completions/_occam "${pkgdir}/usr/share/zsh/site-functions/_occam"
+  install -D -m644 completions/occam.fish "${pkgdir}/usr/share/fish/vendor_completions.d/occam.fish"
+  rm -f "${pkgdir}/usr/share/doc/${pkgname}/LICENSE"
+}

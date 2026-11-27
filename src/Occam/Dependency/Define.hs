@@ -16,6 +16,7 @@ module Occam.Dependency.Define (
     processDefineSchema,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
@@ -187,7 +188,7 @@ processDefineTable sid eval definition
                 (tableTemporary definition)
                 (qualifyDefinitionName session (tableName definition) (tableTemporary definition))
         existing = lookupRelation catalog key
-        evalReads = foldl' processRead eval (tableSources definition)
+        evalReads = Foldable.foldl' processRead eval (tableSources definition)
         likeDeps =
             maybe
                 Set.empty
@@ -249,7 +250,7 @@ processDefineView sid eval definition
                 (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
         resolveSource s = resolveViewSourceKeys s (viewTemporary definition)
         existing = lookupRelation catalog key
-        evalReads = foldl' (processReadWith resolveSource) eval (viewSources definition)
+        evalReads = Foldable.foldl' (processReadWith resolveSource) eval (viewSources definition)
         existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
         eval1 =
             addTouches
@@ -272,7 +273,7 @@ processDefineView sid eval definition
 
 addUnresolvedSourceBarriers :: Text -> Name -> Set NameRef -> Eval -> Eval
 addUnresolvedSourceBarriers kindLabel objName unresolved eval0 =
-    foldl'
+    Foldable.foldl'
         (flip addBarrier)
         eval0
         [ ScopedBarrier
@@ -329,7 +330,7 @@ installDefinedIndex sid definition catalog tableKeys tableDeps current indexKey
         newState = IndexState (Just sid) (listToMaybe tableKeys) (indexColumns definition) Nothing
         catalog1 = catalog0 & catalogIndexesL %~ Map.insert indexKey newState
         catalog2 =
-            foldl'
+            Foldable.foldl'
                 (\cat' tableKey -> modifyRelation tableKey (relIndexesL %~ Set.insert indexKey) cat')
                 catalog1
                 tableKeys
@@ -450,7 +451,7 @@ installDefinedTrigger sid definition catalog tableKeys current triggerKey
                 Nothing
         catalog1 = catalog0 & catalogTriggersL %~ Map.insert triggerKey newState
         catalog2 =
-            foldl'
+            Foldable.foldl'
                 (\cat' tableKey -> modifyRelation tableKey (relTriggersL %~ Set.insert triggerKey) cat')
                 catalog1
                 tableKeys

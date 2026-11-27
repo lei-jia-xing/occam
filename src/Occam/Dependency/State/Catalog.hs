@@ -38,6 +38,7 @@ module Occam.Dependency.State.Catalog (
     nameLast,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
@@ -356,11 +357,11 @@ clearRelationObjects key catalog =
         Nothing -> catalog
         Just relation ->
             let withoutIndexes =
-                    foldl' (flip deleteIndex) catalog (Set.toList (relIndexes relation))
+                    Foldable.foldl' (flip deleteIndex) catalog (Set.toList (relIndexes relation))
                 withoutTriggers =
-                    foldl' (flip deleteTrigger) withoutIndexes (Set.toList (relTriggers relation))
+                    Foldable.foldl' (flip deleteTrigger) withoutIndexes (Set.toList (relTriggers relation))
                 withoutConstraints =
-                    foldl' (flip deleteConstraint) withoutTriggers (Set.toList (relConstraints relation))
+                    Foldable.foldl' (flip deleteConstraint) withoutTriggers (Set.toList (relConstraints relation))
              in deleteRelation key withoutConstraints
 
 -- Write signatures

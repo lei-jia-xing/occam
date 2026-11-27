@@ -7,6 +7,7 @@ module Occam.Dependency (
     cascadeWrites,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.IntMap.Lazy (IntMap)
 import Data.IntMap.Lazy qualified as IntMap
 import Data.IntSet (IntSet)
@@ -128,7 +129,7 @@ analyzeStatements initialSession units =
 buildGraph :: SessionInit -> [(StatementId, SemanticFacts)] -> DependencyGraph
 buildGraph initialSession stmtFacts =
     let (finalState, fastEdges, barrierEdgeCount, barrierStmtCount, barrierActionCount) =
-            foldl' step (initialScanState initialSession, IntMap.empty, 0, 0, 0) stmtFacts
+            Foldable.foldl' step (initialScanState initialSession, IntMap.empty, 0, 0, 0) stmtFacts
         !edgeCount = sum (map IntSet.size (IntMap.elems fastEdges))
         -- Derive public Map/Set views on demand
         edges =
@@ -158,8 +159,8 @@ step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount)
         (state2, preTxDeps) = applyTxEffects sid (factPreTx facts) state1
         state3 = ensureFrameForOps state2
         eval0 = initialEval sid state3
-        eval1 = foldl' (processOp sid) eval0 (factOps facts)
-        eval1' = foldl' (flip addBarrier) eval1 (factBarriers facts)
+        eval1 = Foldable.foldl' (processOp sid) eval0 (factOps facts)
+        eval1' = Foldable.foldl' (flip addBarrier) eval1 (factBarriers facts)
         (eval2, sessionTouched) = applySessionEffects sid (factSession facts) eval1'
         state4 = evalToState eval2 state3
         state5 = settleAutocommit sid state3 state4
@@ -260,14 +261,14 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
         inheritedGlobal = [GlobalBarrierKey | hasGlobalFence]
         registrationKeys = barrierKeys ++ sessionKeys ++ inheritedGlobal
         lastBarriers =
-            foldl'
+            Foldable.foldl'
                 (\current key -> Map.insert key sid current)
                 (scanLastBarriers priorState)
                 registrationKeys
         !sidSet = Set.singleton sid
         addToucher !acc key = Map.insertWith (\_ old -> Set.insert sid old) key sidSet acc
         touchers1 = Set.foldl' addToucher (scanTouchers priorState) (evalTouches eval)
-        touchers = foldl' addToucher touchers1 registrationKeys
+        touchers = Foldable.foldl' addToucher touchers1 registrationKeys
         addSchemaToucher (!byLast, !emptySet) = \case
             SchemaBarrierKey name -> case nameLast name of
                 Nothing -> (byLast, Set.insert sid emptySet)
@@ -282,7 +283,7 @@ finalizeStatement sid eval sessionTouched priorState resolutionState =
                 (scanSchemaTouchersByLast priorState, scanSchemaTouchersEmpty priorState)
                 (evalTouches eval)
         (!schemaTouchers, !schemaEmpty) =
-            foldl' addSchemaToucher (schemaTouchers1, schemaEmpty1) registrationKeys
+            Foldable.foldl' addSchemaToucher (schemaTouchers1, schemaEmpty1) registrationKeys
         state' =
             resolutionState
                 { scanLastBarriers = lastBarriers

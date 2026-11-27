@@ -17,6 +17,7 @@ import Control.Monad.ST (runST)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
+import Data.Foldable qualified as Foldable
 import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Lazy qualified as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe, mapMaybe)
@@ -172,7 +173,7 @@ insertListItemSpans shift tokens cols = do
     let spans = [(shift + spanStart sp, shift + spanEnd sp) | L sp _ <- cols]
     case spans of
         (firstSpan : _ : _) -> do
-            let lastEnd = foldl' (\_ (_, e) -> e) (snd firstSpan) spans
+            let lastEnd = Foldable.foldl' (\_ (_, e) -> e) (snd firstSpan) spans
             (open, close) <- enclosingParentheses tokens (fst firstSpan) lastEnd
             guard (all (\(s, e) -> s > open && e < close) spans)
             pure spans
@@ -184,7 +185,7 @@ valuesItemSpans _ _ [] = Just []
 valuesItemSpans shift tokens items@(firstItem : _) = do
     let spans = [(shift + spanStart sp, shift + spanEnd sp) | L sp _ <- items]
         !firstStart = shift + spanStart (locSpan firstItem)
-        !lastEnd = foldl' (\_ (s, e) -> max s e) firstStart spans
+        !lastEnd = Foldable.foldl' (\_ (s, e) -> max s e) firstStart spans
     (rowOpen, rowClose) <- innermostParentheses tokens firstStart lastEnd
     guard (all (\(s, e) -> s >= rowOpen && e <= rowClose) spans)
     pure spans
@@ -223,7 +224,7 @@ partitionPoint predicate vec = go 0 (V.length vec)
 
 enclosingParentheses :: TokenTable -> Int -> Int -> Maybe (Int, Int)
 enclosingParentheses tokens start end =
-    foldl' (\_ bounds -> Just bounds) Nothing (containingParentheses tokens start end)
+    Foldable.foldl' (\_ bounds -> Just bounds) Nothing (containingParentheses tokens start end)
 
 innermostParentheses :: TokenTable -> Int -> Int -> Maybe (Int, Int)
 innermostParentheses tokens start end =

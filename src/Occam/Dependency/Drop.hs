@@ -14,6 +14,7 @@ module Occam.Dependency.Drop (
     schemaContains,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
@@ -89,7 +90,7 @@ import Occam.Dependency.State (
 
 processDrop :: StatementId -> Eval -> DropOp -> Eval
 processDrop sid eval dropOp =
-    foldl' (dropOne sid (dropMode dropOp)) eval (dropObjects dropOp)
+    Foldable.foldl' (dropOne sid (dropMode dropOp)) eval (dropObjects dropOp)
 
 -- | Statement dependencies recorded by a definition and its last rollback.
 definitionDeps :: Maybe StatementId -> Maybe StatementId -> Set StatementId
@@ -233,7 +234,7 @@ dropSchema sid mode eval key =
         deps = schemaDeps `Set.union` schemaContentsDeps session catalog contents
         catalog1 = case mode of
             DropCascade ->
-                foldl'
+                Foldable.foldl'
                     (flip (markResolutionChange sid))
                     (removeSchemaCascade session key catalog)
                     (contentsRelations contents)
@@ -254,8 +255,8 @@ removeRelationCascade session mode = go Set.empty
             | DropRestrict <- mode =
                 clearRelationObjects currentKey catalog
             | otherwise =
-                let catalog1 = foldl' (flip (go seen')) catalog dependentViews
-                    catalog2 = foldl' (flip deleteConstraint) catalog1 foreignKeys
+                let catalog1 = Foldable.foldl' (flip (go seen')) catalog dependentViews
+                    catalog2 = Foldable.foldl' (flip deleteConstraint) catalog1 foreignKeys
                  in clearRelationObjects currentKey catalog2
             where
                 seen' = Set.insert currentKey seen
@@ -384,16 +385,17 @@ removeSchemaCascade :: SessionState -> Name -> Catalog -> Catalog
 removeSchemaCascade session schema catalog =
     let contents = schemaContents catalog schema
         catalog1 =
-            foldl'
+            Foldable.foldl'
                 (flip (removeRelationCascade session DropCascade))
                 catalog
                 (contentsRelations contents)
-        catalog2 = foldl' (flip deleteSequence) catalog1 (contentsSequences contents)
-        catalog3 = foldl' (flip deleteIndex) catalog2 (contentsIndexes contents)
-        catalog4 = foldl' (flip deleteTrigger) catalog3 (contentsTriggers contents)
+        catalog2 = Foldable.foldl' (flip deleteSequence) catalog1 (contentsSequences contents)
+        catalog3 = Foldable.foldl' (flip deleteIndex) catalog2 (contentsIndexes contents)
+        catalog4 = Foldable.foldl' (flip deleteTrigger) catalog3 (contentsTriggers contents)
      in catalog4
-            & catalogTypesL %~ (\types -> foldl' (flip Map.delete) types (contentsTypes contents))
-            & catalogSchemasL %~ (\schemas -> foldl' (flip Map.delete) schemas (contentsSchemas contents))
+            & catalogTypesL %~ (\types -> Foldable.foldl' (flip Map.delete) types (contentsTypes contents))
+            & catalogSchemasL
+                %~ (\schemas -> Foldable.foldl' (flip Map.delete) schemas (contentsSchemas contents))
 
 indexKeyInSchema :: Name -> IndexKey -> Bool
 indexKeyInSchema schema key =

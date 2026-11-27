@@ -12,6 +12,7 @@ module Occam.Frontend.Semantics.Sequence (
 ) where
 
 import Data.ByteString (ByteString)
+import Data.Foldable qualified as Foldable
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -189,14 +190,14 @@ sequenceEffectsForStatement ctx stmt = case stmt of
         _ -> initialSequenceState []
     AST.StatementAlter (L _ alter)
         | AST.alterObject alter == AST.AlterObjectTable ->
-            foldl' visitAlterAction (initialSequenceState []) (AST.alterActions alter)
+            Foldable.foldl' visitAlterAction (initialSequenceState []) (AST.alterActions alter)
     _ -> initialSequenceState []
     where
         visitAlterAction st (L _ action) = case action of
-            AST.AlterAddColumn _ cols _ -> foldl' visitColDefaults st cols
+            AST.AlterAddColumn _ cols _ -> Foldable.foldl' visitColDefaults st cols
             _ -> st
         visitColDefaults st (L _ col) =
-            foldl' visitColConstraint st (AST.columnConstraints col)
+            Foldable.foldl' visitColConstraint st (AST.columnConstraints col)
         visitColConstraint st (L _ cc) = case cc of
             AST.ColumnConstraintNamed _ inner -> visitColConstraint st (L (ByteSpan 0 0) inner)
             AST.ColumnConstraintOnConflict inner _ -> visitColConstraint st (L (ByteSpan 0 0) inner)
@@ -222,7 +223,11 @@ visitExprSeq ctx sp expr st0 =
             AST.ExprCall (L _ fn) -> visitFunctionCallSeq ctx fn st1
             AST.ExprCase (AST.CaseExpr mOp whens mElse) ->
                 let st2 = maybe st1 (\(L s e) -> visitExprSeq ctx s e st1) mOp
-                    st3 = foldl' (\acc (L sw ew, L sr er) -> visitExprSeq ctx sr er (visitExprSeq ctx sw ew acc)) st2 whens
+                    st3 =
+                        Foldable.foldl'
+                            (\acc (L sw ew, L sr er) -> visitExprSeq ctx sr er (visitExprSeq ctx sw ew acc))
+                            st2
+                            whens
                  in maybe st3 (\(L s e) -> visitExprSeq ctx s e st3) mElse
             AST.ExprExists (L _ q) -> visitQuerySeq ctx q st1
             AST.ExprIsNull _ (L s e) -> visitExprSeq ctx s e st1
@@ -233,16 +238,19 @@ visitExprSeq ctx sp expr st0 =
             AST.ExprBetween _ (L s e) (L s1 e1) (L s2 e2) ->
                 visitExprSeq ctx s2 e2 (visitExprSeq ctx s1 e1 (visitExprSeq ctx s e st1))
             AST.ExprInList _ (L s e) xs ->
-                foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) (visitExprSeq ctx s e st1) xs
+                Foldable.foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) (visitExprSeq ctx s e st1) xs
             AST.ExprInSubquery _ (L s e) (L _ q) -> visitQuerySeq ctx q (visitExprSeq ctx s e st1)
             AST.ExprLike _ _ (L s1 e1) (L s2 e2) mEsc ->
                 let st2 = visitExprSeq ctx s2 e2 (visitExprSeq ctx s1 e1 st1)
                  in maybe st2 (\(L s3 e3) -> visitExprSeq ctx s3 e3 st2) mEsc
             AST.ExprQuantified _ _ (L s1 e1) (L s2 e2) -> visitExprSeq ctx s2 e2 (visitExprSeq ctx s1 e1 st1)
-            AST.ExprArray xs -> foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) st1 xs
+            AST.ExprArray xs -> Foldable.foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) st1 xs
             AST.ExprStruct pairs ->
-                foldl' (\acc (L sk ek, L sv ev) -> visitExprSeq ctx sv ev (visitExprSeq ctx sk ek acc)) st1 pairs
-            AST.ExprTuple xs -> foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) st1 xs
+                Foldable.foldl'
+                    (\acc (L sk ek, L sv ev) -> visitExprSeq ctx sv ev (visitExprSeq ctx sk ek acc))
+                    st1
+                    pairs
+            AST.ExprTuple xs -> Foldable.foldl' (\acc (L sx ex) -> visitExprSeq ctx sx ex acc) st1 xs
             AST.ExprSubquery (L _ q) -> visitQuerySeq ctx q st1
             AST.ExprParen (L s e) -> visitExprSeq ctx s e st1
             AST.ExprCollate (L s e) _ -> visitExprSeq ctx s e st1
@@ -250,14 +258,14 @@ visitExprSeq ctx sp expr st0 =
 
 visitFunctionCallSeq :: AnalysisContext -> AST.FunctionCall -> SequenceState -> SequenceState
 visitFunctionCallSeq ctx fn st0 =
-    let st1 = foldl' visitArg st0 (AST.functionArgs fn)
+    let st1 = Foldable.foldl' visitArg st0 (AST.functionArgs fn)
         st2 =
-            foldl'
+            Foldable.foldl'
                 (\acc (L _ oi) -> let L s e = AST.orderExpr oi in visitExprSeq ctx s e acc)
                 st1
                 (AST.functionOrderBy fn)
         st3 =
-            foldl'
+            Foldable.foldl'
                 (\acc (L _ oi) -> let L s e = AST.orderExpr oi in visitExprSeq ctx s e acc)
                 st2
                 (AST.functionWithinGroup fn)
@@ -273,9 +281,9 @@ visitFunctionCallSeq ctx fn st0 =
 
 visitWindowSpecSeq :: AnalysisContext -> AST.WindowSpec -> SequenceState -> SequenceState
 visitWindowSpecSeq ctx spec st0 =
-    let st1 = foldl' (\acc (L s e) -> visitExprSeq ctx s e acc) st0 (AST.windowPartitionBy spec)
+    let st1 = Foldable.foldl' (\acc (L s e) -> visitExprSeq ctx s e acc) st0 (AST.windowPartitionBy spec)
         st2 =
-            foldl'
+            Foldable.foldl'
                 (\acc (L _ oi) -> let L s e = AST.orderExpr oi in visitExprSeq ctx s e acc)
                 st1
                 (AST.windowOrderBy spec)
@@ -294,7 +302,7 @@ visitQuerySeq ctx q st0 =
     let st1 = maybe st0 (visitWithSeq . locValue) (AST.queryWith q)
         st2 = visitQueryBodySeq (locValue (AST.queryBody q)) st1
         st3 =
-            foldl'
+            Foldable.foldl'
                 (\acc (L _ oi) -> let L s e = AST.orderExpr oi in visitExprSeq ctx s e acc)
                 st2
                 (AST.queryOrderBy q)
@@ -303,17 +311,23 @@ visitQuerySeq ctx q st0 =
         st6 = maybe st5 (\(L _ f) -> visitFetchSeq f st5) (AST.queryFetch q)
      in maybe
             st6
-            (foldl' (\acc (L _ si) -> let L s e = AST.settingValue si in visitExprSeq ctx s e acc) st6 . locValue)
+            ( Foldable.foldl' (\acc (L _ si) -> let L s e = AST.settingValue si in visitExprSeq ctx s e acc) st6
+                . locValue
+            )
             (AST.querySettings q)
     where
-        visitWithSeq w = foldl' (\acc (L _ cte) -> visitCteBodySeq (locValue (AST.cteBody cte)) acc) st0 (AST.withCtes w)
+        visitWithSeq w =
+            Foldable.foldl'
+                (\acc (L _ cte) -> visitCteBodySeq (locValue (AST.cteBody cte)) acc)
+                st0
+                (AST.withCtes w)
         visitCteBodySeq (AST.CteQuery (L _ iq)) acc = visitQuerySeq ctx iq acc
         visitCteBodySeq (AST.CteStatement _) acc = acc
         visitQueryBodySeq body acc = case body of
             AST.QueryBodySelect sc -> visitSelectCoreSeq sc acc
             AST.QueryBodyFrom sc -> visitSelectCoreSeq sc acc
             AST.QueryBodySet _ _ (L _ l) (L _ r) -> visitQueryBodySeq r (visitQueryBodySeq l acc)
-            AST.QueryBodyValues rows -> foldl' (foldl' (\a (L s e) -> visitExprSeq ctx s e a)) acc rows
+            AST.QueryBodyValues rows -> Foldable.foldl' (Foldable.foldl' (\a (L s e) -> visitExprSeq ctx s e a)) acc rows
             AST.QueryBodyTable _ -> acc
             AST.QueryBodyParen (L _ iq) -> visitQuerySeq ctx iq acc
         visitLimitSeq lim acc =
@@ -322,35 +336,39 @@ visitQuerySeq ctx q st0 =
         visitFetchSeq f acc = maybe acc (\(L s e) -> visitExprSeq ctx s e acc) (AST.fetchCount f)
         visitSelectCoreSeq sc acc =
             let a1 = case AST.selectQuantifier sc of
-                    AST.SelectDistinctOn exprs -> foldl' (\a (L s e) -> visitExprSeq ctx s e a) acc exprs
+                    AST.SelectDistinctOn exprs -> Foldable.foldl' (\a (L s e) -> visitExprSeq ctx s e a) acc exprs
                     _ -> acc
                 a2 =
-                    foldl'
+                    Foldable.foldl'
                         (\a (L _ si) -> let L s e = AST.selectItemExpr si in visitExprSeq ctx s e a)
                         a1
                         (AST.selectItems sc)
                 a3 = maybe a2 (visitFromSeq a2) (AST.selectFrom sc)
                 a4 = maybe a3 (\(L s e) -> visitExprSeq ctx s e a3) (AST.selectWhere sc)
                 a5 = maybe a4 (\(L _ (L s e)) -> visitExprSeq ctx s e a4) (AST.selectPrewhere sc)
-                a6 = foldl' visitGroupBy a5 (AST.selectGroupBy sc)
+                a6 = Foldable.foldl' visitGroupBy a5 (AST.selectGroupBy sc)
                 a7 = maybe a6 (\(L s e) -> visitExprSeq ctx s e a6) (AST.selectHaving sc)
-                a8 = foldl' (\a (L _ wd) -> visitWindowSpecSeq ctx (AST.windowDefSpec wd) a) a7 (AST.selectWindows sc)
+                a8 =
+                    Foldable.foldl'
+                        (\a (L _ wd) -> visitWindowSpecSeq ctx (AST.windowDefSpec wd) a)
+                        a7
+                        (AST.selectWindows sc)
              in maybe a8 (\(L _ (L s e)) -> visitExprSeq ctx s e a8) (AST.selectQualify sc)
         visitGroupBy acc (L _ item) = case item of
             AST.GroupByExpr (L s e) -> visitExprSeq ctx s e acc
-            AST.GroupByParens xs -> foldl' visitGroupBy acc xs
-            AST.GroupByGroupingSets xs -> foldl' visitGroupBy acc xs
-            AST.GroupByRollup xs -> foldl' visitGroupBy acc xs
-            AST.GroupByCube xs -> foldl' visitGroupBy acc xs
-        visitFromSeq acc (AST.FromClause refs) = foldl' (\a (L _ r) -> visitTableRefSeq a r) acc refs
+            AST.GroupByParens xs -> Foldable.foldl' visitGroupBy acc xs
+            AST.GroupByGroupingSets xs -> Foldable.foldl' visitGroupBy acc xs
+            AST.GroupByRollup xs -> Foldable.foldl' visitGroupBy acc xs
+            AST.GroupByCube xs -> Foldable.foldl' visitGroupBy acc xs
+        visitFromSeq acc (AST.FromClause refs) = Foldable.foldl' (\a (L _ r) -> visitTableRefSeq a r) acc refs
         visitTableRefSeq acc r =
             let a1 = visitTableSourceSeq acc (locValue (AST.tableRefSource r))
                 a2 = maybe a1 (visitSampleSeq a1 . locValue) (AST.tableRefSample r)
-             in foldl' visitJoinSeq a2 (AST.tableRefJoins r)
+             in Foldable.foldl' visitJoinSeq a2 (AST.tableRefJoins r)
         visitTableSourceSeq acc = \case
             AST.TableSourceName _ -> acc
             AST.TableSourceSubquery (L _ iq) -> visitQuerySeq ctx iq acc
-            AST.TableSourceValues rows -> foldl' (foldl' (\a (L s e) -> visitExprSeq ctx s e a)) acc rows
+            AST.TableSourceValues rows -> Foldable.foldl' (Foldable.foldl' (\a (L s e) -> visitExprSeq ctx s e a)) acc rows
             AST.TableSourceFunction (L _ fn) -> visitFunctionCallSeq ctx fn acc
             AST.TableSourceParens fc -> visitFromSeq acc fc
             AST.TableSourceLateral (L _ inner) -> visitTableSourceSeq acc inner
@@ -362,7 +380,10 @@ visitQuerySeq ctx q st0 =
             let a1 = case AST.joinTarget j of
                     AST.JoinTargetTable (L _ tr) -> visitTableRefSeq acc tr
                     AST.JoinTargetArray items ->
-                        foldl' (\a (L _ it) -> let L s e = AST.arrayJoinExpr it in visitExprSeq ctx s e a) acc items
+                        Foldable.foldl'
+                            (\a (L _ it) -> let L s e = AST.arrayJoinExpr it in visitExprSeq ctx s e a)
+                            acc
+                            items
              in case AST.joinConstraint j of
                     Just (AST.JoinOn (L s e)) -> visitExprSeq ctx s e a1
                     _ -> a1

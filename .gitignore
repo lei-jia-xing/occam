@@ -16,6 +16,7 @@ cabal.project.local~
 
 # Stack
 .stack-work/
+stack.yaml.lock
 
 # Editor / OS
 .DS_Store
@@ -46,3 +47,9 @@ benchmarks/benchmark_artifacts/
 benchmarks/cross_validate_report.json
 benchmarks/*.summary.json
 benchmarks/fuzz_benchmark_summary.*
+
+# Packaging build artifacts
+packaging/aur/src/
+packaging/aur/pkg/
+packaging/aur/occam-git/
+packaging/aur/*.pkg.tar.*

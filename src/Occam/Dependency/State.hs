@@ -101,6 +101,7 @@ module Occam.Dependency.State (
     rebuildRelationsByLast,
 ) where
 
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -327,7 +328,7 @@ addTouch key eval = eval {evalTouches = Set.insert key (evalTouches eval)}
 
 addTouches :: [BarrierKey] -> Eval -> Eval
 addTouches keys eval =
-    eval {evalTouches = foldl' (flip Set.insert) (evalTouches eval) keys}
+    eval {evalTouches = Foldable.foldl' (flip Set.insert) (evalTouches eval) keys}
 
 addBarrier :: ScopedBarrier -> Eval -> Eval
 addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
@@ -375,7 +376,7 @@ mutateResolved :: (Eval -> key -> Eval) -> Eval -> [key] -> Eval
 mutateResolved apply eval keys =
     case keys of
         _ : _ : _ -> ambiguousMutation eval
-        _ -> foldl' apply eval keys
+        _ -> Foldable.foldl' apply eval keys
 
 evalToState :: Eval -> ScanState -> ScanState
 evalToState eval state =

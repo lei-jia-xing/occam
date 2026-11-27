@@ -36,7 +36,7 @@ module Occam.Frontend.Semantics.Query (
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify')
-import Data.Foldable (find, traverse_)
+import Data.Foldable as Foldable (find, foldl', traverse_)
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
@@ -981,7 +981,7 @@ relationColumns ::
     Core.NameRef -> RelationUse -> [([Text], Int)] -> [WholeRowUse] -> Seq AliasScope -> [Core.Ident]
 relationColumns relation usage columns wholeRows aliases
     | relationWholeRow relation usage wholeRows aliases = []
-    | otherwise = reverse (fst (foldl' step ([], Set.empty) columns))
+    | otherwise = reverse (fst (Foldable.foldl' step ([], Set.empty) columns))
     where
         step (acc, seen) (parts, colScope) = case reverse parts of
             col : revQual
@@ -992,7 +992,7 @@ relationColumns relation usage columns wholeRows aliases
 
 -- | Deduplicated non-CTE physical relation uses from @visitor@, excluding @excluded@ spans.
 visitorRelations :: VisitorState -> [ByteSpan] -> [(Core.NameRef, RelationUse)]
-visitorRelations st excluded = reverse (fst (foldl' step ([], Set.empty) (vsRelations st)))
+visitorRelations st excluded = reverse (fst (Foldable.foldl' step ([], Set.empty) (vsRelations st)))
     where
         step (acc, seen) rel
             | relIsCte rel
@@ -1296,7 +1296,7 @@ extractViewLineage ctx query mExplicitCols visitor excluded
             AST.GroupByExpr (L _ e) -> collectExprColParts e
             _ -> Nothing
 
-        dedupPreserve xs = reverse (fst (foldl' step ([], Set.empty) xs))
+        dedupPreserve xs = reverse (fst (Foldable.foldl' step ([], Set.empty) xs))
             where
                 step (acc, seen) x
                     | Set.member x seen = (acc, seen)
@@ -1384,16 +1384,16 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
             AST.StatementInsert (L _ ins) ->
                 let a1 = maybe acc (collectWith depth acc . locValue) (AST.insertWith ins)
                     a2 = case AST.insertSource ins of
-                        AST.InsertValues rows -> foldl' (foldl' (\a (L _ e) -> collectExpr depth a e)) a1 rows
+                        AST.InsertValues rows -> Foldable.foldl' (Foldable.foldl' (\a (L _ e) -> collectExpr depth a e)) a1 rows
                         AST.InsertQuery (L _ q) -> collectQuery depth a1 q
                         AST.InsertDefaultValues -> a1
                     a3 = maybe a2 (collectOnConflict depth a2 . locValue) (AST.insertOnConflict ins)
                     a4 =
                         maybe
                             a3
-                            (foldl' (\a (L _ asgn) -> collectExpr depth a (locValue (AST.assignValue asgn))) a3)
+                            (Foldable.foldl' (\a (L _ asgn) -> collectExpr depth a (locValue (AST.assignValue asgn))) a3)
                             (AST.insertOnDuplicate ins)
-                 in foldl'
+                 in Foldable.foldl'
                         (\a (L _ si) -> collectExpr depth a (locValue (AST.selectItemExpr si)))
                         a4
                         (AST.insertReturning ins)
@@ -1401,16 +1401,19 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
                 let a1 = maybe acc (collectWith depth acc . locValue) (AST.updateWith upd)
                     a2 = collectFrom depth a1 (AST.updateTargets upd)
                     a3 =
-                        foldl'
+                        Foldable.foldl'
                             (\a (L _ asgn) -> collectExpr depth a (locValue (AST.assignValue asgn)))
                             a2
                             (AST.updateAssignments upd)
                     a4 = maybe a3 (collectFrom depth a3) (AST.updateFrom upd)
                     a5 = maybe a4 (collectExpr depth a4 . locValue) (AST.updateWhere upd)
                     a6 =
-                        foldl' (\a (L _ oi) -> collectExpr depth a (locValue (AST.orderExpr oi))) a5 (AST.updateOrderBy upd)
+                        Foldable.foldl'
+                            (\a (L _ oi) -> collectExpr depth a (locValue (AST.orderExpr oi)))
+                            a5
+                            (AST.updateOrderBy upd)
                     a7 = maybe a6 (collectLimit depth a6 . locValue) (AST.updateLimit upd)
-                 in foldl'
+                 in Foldable.foldl'
                         (\a (L _ si) -> collectExpr depth a (locValue (AST.selectItemExpr si)))
                         a7
                         (AST.updateReturning upd)
@@ -1420,9 +1423,12 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
                     a3 = maybe a2 (collectFrom depth a2) (AST.deleteUsing del)
                     a4 = maybe a3 (collectExpr depth a3 . locValue) (AST.deleteWhere del)
                     a5 =
-                        foldl' (\a (L _ oi) -> collectExpr depth a (locValue (AST.orderExpr oi))) a4 (AST.deleteOrderBy del)
+                        Foldable.foldl'
+                            (\a (L _ oi) -> collectExpr depth a (locValue (AST.orderExpr oi)))
+                            a4
+                            (AST.deleteOrderBy del)
                     a6 = maybe a5 (collectLimit depth a5 . locValue) (AST.deleteLimit del)
-                 in foldl'
+                 in Foldable.foldl'
                         (\a (L _ si) -> collectExpr depth a (locValue (AST.selectItemExpr si)))
                         a6
                         (AST.deleteReturning del)
@@ -1430,8 +1436,8 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
                 let a1 = maybe acc (collectWith depth acc . locValue) (AST.mergeWith m)
                     a2 = collectTableRef depth a1 (locValue (AST.mergeSource m))
                     a3 = collectExpr depth a2 (locValue (AST.mergeOn m))
-                    a4 = foldl' (collectMergeClause depth) a3 (AST.mergeClauses m)
-                 in foldl'
+                    a4 = Foldable.foldl' (collectMergeClause depth) a3 (AST.mergeClauses m)
+                 in Foldable.foldl'
                         (\a (L _ si) -> collectExpr depth a (locValue (AST.selectItemExpr si)))
                         a4
                         (AST.mergeReturning m)
@@ -1447,15 +1453,15 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
                 AST.CopySourceQuery (L _ q) -> collectQuery depth acc q
                 _ -> acc
             AST.StatementSet (L _ st) ->
-                foldl'
-                    (\a (L _ it) -> foldl' (\a' (L _ e) -> collectExpr depth a' e) a (AST.setItemValue it))
+                Foldable.foldl'
+                    (\a (L _ it) -> Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e) a (AST.setItemValue it))
                     acc
                     (AST.setItems st)
             _ -> acc
 
         collectOnConflict depth a occ =
             let a1 =
-                    foldl'
+                    Foldable.foldl'
                         (\a' (L _ kp) -> collectExpr depth a' (locValue (AST.indexKeyExpr kp)))
                         a
                         (AST.onConflictKeys occ)
@@ -1463,17 +1469,29 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
              in case AST.onConflictAction occ of
                     AST.OnConflictDoNothing -> a2
                     AST.OnConflictDoUpdate assigns mWhere ->
-                        let a3 = foldl' (\a' (L _ asgn) -> collectExpr depth a' (locValue (AST.assignValue asgn))) a2 assigns
+                        let a3 =
+                                Foldable.foldl'
+                                    (\a' (L _ asgn) -> collectExpr depth a' (locValue (AST.assignValue asgn)))
+                                    a2
+                                    assigns
                          in maybe a3 (collectExpr depth a3 . locValue) mWhere
 
         collectMergeClause depth a (L _ cl) =
             let a1 = maybe a (collectExpr depth a . locValue) (AST.mergeClauseCondition cl)
              in case AST.mergeClauseAction cl of
-                    AST.MergeUpdate assigns -> foldl' (\a' (L _ asgn) -> collectExpr depth a' (locValue (AST.assignValue asgn))) a1 assigns
-                    AST.MergeInsert _ es -> foldl' (\a' (L _ e) -> collectExpr depth a' e) a1 es
+                    AST.MergeUpdate assigns ->
+                        Foldable.foldl'
+                            (\a' (L _ asgn) -> collectExpr depth a' (locValue (AST.assignValue asgn)))
+                            a1
+                            assigns
+                    AST.MergeInsert _ es -> Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e) a1 es
                     _ -> a1
 
-        collectWith depth a w = foldl' (\a' (L _ cte) -> collectCteBody depth a' (locValue (AST.cteBody cte))) a (AST.withCtes w)
+        collectWith depth a w =
+            Foldable.foldl'
+                (\a' (L _ cte) -> collectCteBody depth a' (locValue (AST.cteBody cte)))
+                a
+                (AST.withCtes w)
         collectCteBody depth a (AST.CteQuery (L _ q)) = collectQuery depth a q
         collectCteBody depth a (AST.CteStatement (L _ s)) = collectStmt False depth a s
 
@@ -1481,14 +1499,19 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
             let a1 = maybe a (collectWith depth a . locValue) (AST.queryWith q)
                 a2 = collectQueryBody depth a1 (locValue (AST.queryBody q))
                 a3 =
-                    foldl' (\a' (L _ oi) -> collectExpr depth a' (locValue (AST.orderExpr oi))) a2 (AST.queryOrderBy q)
+                    Foldable.foldl'
+                        (\a' (L _ oi) -> collectExpr depth a' (locValue (AST.orderExpr oi)))
+                        a2
+                        (AST.queryOrderBy q)
                 a4 = maybe a3 (collectLimit depth a3 . locValue) (AST.queryLimit q)
                 a5 = maybe a4 (collectExpr depth a4 . locValue) (AST.queryOffset q)
                 a6 =
                     maybe a5 (maybe a5 (collectExpr depth a5 . locValue) . AST.fetchCount . locValue) (AST.queryFetch q)
              in maybe
                     a6
-                    (foldl' (\a' (L _ si) -> collectExpr depth a' (locValue (AST.settingValue si))) a6 . locValue)
+                    ( Foldable.foldl' (\a' (L _ si) -> collectExpr depth a' (locValue (AST.settingValue si))) a6
+                        . locValue
+                    )
                     (AST.querySettings q)
 
         collectLimit depth a lim =
@@ -1499,45 +1522,49 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
             AST.QueryBodySelect sc -> collectSelect depth a sc
             AST.QueryBodyFrom sc -> collectSelect depth a sc
             AST.QueryBodySet _ _ (L _ l) (L _ r) -> collectQueryBody depth (collectQueryBody depth a l) r
-            AST.QueryBodyValues rows -> foldl' (foldl' (\a' (L _ e) -> collectExpr depth a' e)) a rows
+            AST.QueryBodyValues rows -> Foldable.foldl' (Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e)) a rows
             AST.QueryBodyTable _ -> a
             AST.QueryBodyParen (L _ iq) -> collectQuery depth a iq
 
         collectSelect depth a sc =
             let a1 = case AST.selectQuantifier sc of
-                    AST.SelectDistinctOn es -> foldl' (\a' (L _ e) -> collectExpr depth a' e) a es
+                    AST.SelectDistinctOn es -> Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e) a es
                     _ -> a
                 a2 =
-                    foldl'
+                    Foldable.foldl'
                         (\a' (L _ si) -> collectExpr depth a' (locValue (AST.selectItemExpr si)))
                         a1
                         (AST.selectItems sc)
                 a3 = maybe a2 (collectFrom depth a2) (AST.selectFrom sc)
                 a4 = maybe a3 (collectExpr depth a3 . locValue . locValue) (AST.selectPrewhere sc)
                 a5 = maybe a4 (collectExpr depth a4 . locValue) (AST.selectWhere sc)
-                a6 = foldl' (collectGroupBy depth) a5 (AST.selectGroupBy sc)
+                a6 = Foldable.foldl' (collectGroupBy depth) a5 (AST.selectGroupBy sc)
                 a7 = maybe a6 (collectExpr depth a6 . locValue) (AST.selectHaving sc)
-                a8 = foldl' (\a' (L _ wd) -> collectWindow depth a' (AST.windowDefSpec wd)) a7 (AST.selectWindows sc)
+                a8 =
+                    Foldable.foldl'
+                        (\a' (L _ wd) -> collectWindow depth a' (AST.windowDefSpec wd))
+                        a7
+                        (AST.selectWindows sc)
              in maybe a8 (collectExpr depth a8 . locValue . locValue) (AST.selectQualify sc)
 
         collectGroupBy depth a (L _ item) = case item of
             AST.GroupByExpr (L _ e) -> collectExpr depth a e
-            AST.GroupByParens xs -> foldl' (collectGroupBy depth) a xs
-            AST.GroupByGroupingSets xs -> foldl' (collectGroupBy depth) a xs
-            AST.GroupByRollup xs -> foldl' (collectGroupBy depth) a xs
-            AST.GroupByCube xs -> foldl' (collectGroupBy depth) a xs
+            AST.GroupByParens xs -> Foldable.foldl' (collectGroupBy depth) a xs
+            AST.GroupByGroupingSets xs -> Foldable.foldl' (collectGroupBy depth) a xs
+            AST.GroupByRollup xs -> Foldable.foldl' (collectGroupBy depth) a xs
+            AST.GroupByCube xs -> Foldable.foldl' (collectGroupBy depth) a xs
 
-        collectFrom depth a (AST.FromClause refs) = foldl' (\a' (L _ tr) -> collectTableRef depth a' tr) a refs
+        collectFrom depth a (AST.FromClause refs) = Foldable.foldl' (\a' (L _ tr) -> collectTableRef depth a' tr) a refs
 
         collectTableRef depth a tr =
             let a1 = collectTableSource depth a (locValue (AST.tableRefSource tr))
                 a2 = maybe a1 (collectSample depth a1 . locValue) (AST.tableRefSample tr)
-             in foldl' (collectJoin depth) a2 (AST.tableRefJoins tr)
+             in Foldable.foldl' (collectJoin depth) a2 (AST.tableRefJoins tr)
 
         collectTableSource depth a = \case
             AST.TableSourceName _ -> a
             AST.TableSourceSubquery (L _ q) -> collectQuery depth a q
-            AST.TableSourceValues rows -> foldl' (foldl' (\a' (L _ e) -> collectExpr depth a' e)) a rows
+            AST.TableSourceValues rows -> Foldable.foldl' (Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e)) a rows
             AST.TableSourceFunction (L _ fn) -> collectFn depth a fn
             AST.TableSourceParens fc -> collectFrom depth a fc
             AST.TableSourceLateral (L _ inner) -> collectTableSource depth a inner
@@ -1550,20 +1577,20 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
         collectJoin depth a (L _ j) =
             let a1 = case AST.joinTarget j of
                     AST.JoinTargetTable (L _ tr) -> collectTableRef depth a tr
-                    AST.JoinTargetArray items -> foldl' (\a' (L _ it) -> collectExpr depth a' (locValue (AST.arrayJoinExpr it))) a items
+                    AST.JoinTargetArray items -> Foldable.foldl' (\a' (L _ it) -> collectExpr depth a' (locValue (AST.arrayJoinExpr it))) a items
              in case AST.joinConstraint j of
                     Just (AST.JoinOn (L _ e)) -> collectExpr depth a1 e
                     _ -> a1
 
         collectFn depth a fn =
-            let a1 = foldl' collectArg a (AST.functionArgs fn)
+            let a1 = Foldable.foldl' collectArg a (AST.functionArgs fn)
                 a2 =
-                    foldl'
+                    Foldable.foldl'
                         (\a' (L _ oi) -> collectExpr depth a' (locValue (AST.orderExpr oi)))
                         a1
                         (AST.functionOrderBy fn)
                 a3 =
-                    foldl'
+                    Foldable.foldl'
                         (\a' (L _ oi) -> collectExpr depth a' (locValue (AST.orderExpr oi)))
                         a2
                         (AST.functionWithinGroup fn)
@@ -1578,9 +1605,9 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
                     AST.FunctionArgStar -> a'
 
         collectWindow depth a spec =
-            let a1 = foldl' (\a' (L _ e) -> collectExpr depth a' e) a (AST.windowPartitionBy spec)
+            let a1 = Foldable.foldl' (\a' (L _ e) -> collectExpr depth a' e) a (AST.windowPartitionBy spec)
                 a2 =
-                    foldl'
+                    Foldable.foldl'
                         (\a' (L _ oi) -> collectExpr depth a' (locValue (AST.orderExpr oi)))
                         a1
                         (AST.windowOrderBy spec)
@@ -1610,7 +1637,7 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
             AST.ExprCall (L _ fn) -> collectFn depth a fn
             AST.ExprCase (AST.CaseExpr mOp whens mElse) ->
                 let a1 = maybe a (collectExpr depth a . locValue) mOp
-                    a2 = foldl' (\a' (L _ c, L _ r) -> collectExpr depth (collectExpr depth a' c) r) a1 whens
+                    a2 = Foldable.foldl' (\a' (L _ c, L _ r) -> collectExpr depth (collectExpr depth a' c) r) a1 whens
                  in maybe a2 (collectExpr depth a2 . locValue) mElse
             AST.ExprExists (L _ q) -> collectQuery depth a q
             AST.ExprIsNull _ (L _ e) -> collectExpr depth a e
@@ -1619,15 +1646,15 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
             AST.ExprIsUnknown _ (L _ e) -> collectExpr depth a e
             AST.ExprIsDistinct _ (L _ l) (L _ r) -> collectExpr depth (collectExpr depth a l) r
             AST.ExprBetween _ (L _ e) (L _ l) (L _ h) -> collectExpr depth (collectExpr depth (collectExpr depth a e) l) h
-            AST.ExprInList _ (L _ e) xs -> foldl' (\a' (L _ x) -> collectExpr depth a' x) (collectExpr depth a e) xs
+            AST.ExprInList _ (L _ e) xs -> Foldable.foldl' (\a' (L _ x) -> collectExpr depth a' x) (collectExpr depth a e) xs
             AST.ExprInSubquery _ (L _ e) (L _ q) -> collectQuery depth (collectExpr depth a e) q
             AST.ExprLike _ _ (L _ e) (L _ pat) mEsc ->
                 let a1 = collectExpr depth (collectExpr depth a e) pat
                  in maybe a1 (collectExpr depth a1 . locValue) mEsc
             AST.ExprQuantified _ _ (L _ l) (L _ r) -> collectExpr depth (collectExpr depth a l) r
-            AST.ExprArray xs -> foldl' (\a' (L _ x) -> collectExpr depth a' x) a xs
-            AST.ExprStruct pairs -> foldl' (\a' (L _ k, L _ v) -> collectExpr depth (collectExpr depth a' k) v) a pairs
-            AST.ExprTuple xs -> foldl' (\a' (L _ x) -> collectExpr depth a' x) a xs
+            AST.ExprArray xs -> Foldable.foldl' (\a' (L _ x) -> collectExpr depth a' x) a xs
+            AST.ExprStruct pairs -> Foldable.foldl' (\a' (L _ k, L _ v) -> collectExpr depth (collectExpr depth a' k) v) a pairs
+            AST.ExprTuple xs -> Foldable.foldl' (\a' (L _ x) -> collectExpr depth a' x) a xs
             AST.ExprSubquery (L _ q) -> collectQuery depth a q
             AST.ExprParen (L _ e) -> collectExpr depth a e
             AST.ExprCollate (L _ e) _ -> collectExpr depth a e
@@ -1635,7 +1662,7 @@ analyzeNested analyzeStmt ctx skipRoot rootStmt =
 
 -- | Merge nested DML facts into the enclosing statement's facts in source order.
 mergeNested :: Core.SemanticFacts -> [Core.SemanticFacts] -> Core.SemanticFacts
-mergeNested = foldl' step
+mergeNested = Foldable.foldl' step
     where
         step acc nested =
             acc

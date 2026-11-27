@@ -45,6 +45,7 @@ module Occam.Parser (
 
 import Control.Exception (evaluate)
 import Data.ByteString (ByteString)
+import Data.Foldable qualified as Foldable
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (SemanticFacts (..))
@@ -142,7 +143,7 @@ microsBetween start end = fromIntegral ((end - start) `div` 1000)
 forceParsed :: Either ParserError ParsedSQL -> Either ParserError ParsedSQL
 forceParsed (Left err) = err `seq` Left err
 forceParsed (Right parsed) =
-    foldl' (\() unit -> unit `seq` forceUnitFacts (unitFacts unit)) () (parsedUnits parsed) `seq`
+    Foldable.foldl' (\() unit -> unit `seq` forceUnitFacts (unitFacts unit)) () (parsedUnits parsed) `seq`
         length (parsedColumns parsed) `seq`
             Right parsed
     where

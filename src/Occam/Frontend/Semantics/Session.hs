@@ -11,6 +11,7 @@ module Occam.Frontend.Semantics.Session (
 import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable qualified as Foldable
 import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -303,9 +304,9 @@ setStatementEffects ctx stmt
                                ]
                         , txs
                         )
-         in foldl' step ([], [], []) (AST.setTransactionModes stmt)
+         in Foldable.foldl' step ([], [], []) (AST.setTransactionModes stmt)
     | otherwise =
-        let (effs, bars) = foldl' stepItem ([], []) (AST.setItems stmt)
+        let (effs, bars) = Foldable.foldl' stepItem ([], []) (AST.setItems stmt)
          in (effs, bars, [])
     where
         stepItem (effAcc, barAcc) (L _ item) =

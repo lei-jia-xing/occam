@@ -17,6 +17,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Foldable qualified as Foldable
 import Data.List (partition, sortOn)
 import Data.Maybe (isNothing)
 import Data.Ord (Down (..))
@@ -98,7 +99,7 @@ applySpans spans source = case spans of
 selectIndependentEdits :: [ParserEdit] -> [ParserEdit]
 selectIndependentEdits =
     sortOn parserEditStart
-        . foldl' pick []
+        . Foldable.foldl' pick []
         . sortOn (\e -> (Down (literalSavings e), parserEditStart e))
     where
         pick acc edit
@@ -235,7 +236,10 @@ updateSyntaxBatchSnapshot context category currentUnits index currentBundles bat
         (freshUnits, freshIndex, unitDeltasRev) <-
             updateBatchUnits context category currentBundles 0 0 [] index [] currentUnits sortedEdits
         let freshBundles =
-                foldl' (\bs (oldEnd, delta) -> map (shiftColumnTarget oldEnd delta) bs) currentBundles unitDeltasRev
+                Foldable.foldl'
+                    (\bs (oldEnd, delta) -> map (shiftColumnTarget oldEnd delta) bs)
+                    currentBundles
+                    unitDeltasRev
         pure (freshUnits, freshIndex, freshBundles)
     maybe (parseSyntaxSnapshot context acceptedBytes) pure incremental
     where

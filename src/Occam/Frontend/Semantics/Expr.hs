@@ -7,6 +7,7 @@ module Occam.Frontend.Semantics.Expr (
 ) where
 
 import Control.Monad (foldM)
+import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -160,7 +161,7 @@ foldExprChildren step expr st = case expr of
     AST.ExprCall (L _ fn) -> foldFunctionCall step fn st
     AST.ExprCase (AST.CaseExpr mOp whens mElse) ->
         let s1 = maybe st (flip step st . locValue) mOp
-            s2 = foldl' (\a (L _ c, L _ r) -> step r (step c a)) s1 whens
+            s2 = Foldable.foldl' (\a (L _ c, L _ r) -> step r (step c a)) s1 whens
          in maybe s2 (flip step s2 . locValue) mElse
     AST.ExprExists (L _ q) -> foldQueryExprs step q st
     AST.ExprIsNull _ (L _ e) -> step e st
@@ -169,15 +170,15 @@ foldExprChildren step expr st = case expr of
     AST.ExprIsUnknown _ (L _ e) -> step e st
     AST.ExprIsDistinct _ (L _ l) (L _ r) -> step r (step l st)
     AST.ExprBetween _ (L _ e) (L _ l) (L _ h) -> step h (step l (step e st))
-    AST.ExprInList _ (L _ e) xs -> foldl' (\a (L _ x) -> step x a) (step e st) xs
+    AST.ExprInList _ (L _ e) xs -> Foldable.foldl' (\a (L _ x) -> step x a) (step e st) xs
     AST.ExprInSubquery _ (L _ e) (L _ q) -> foldQueryExprs step q (step e st)
     AST.ExprLike _ _ (L _ e) (L _ pat) mEsc ->
         let s1 = step pat (step e st)
          in maybe s1 (flip step s1 . locValue) mEsc
     AST.ExprQuantified _ _ (L _ l) (L _ r) -> step r (step l st)
-    AST.ExprArray xs -> foldl' (\a (L _ x) -> step x a) st xs
-    AST.ExprStruct pairs -> foldl' (\a (L _ k, L _ v) -> step v (step k a)) st pairs
-    AST.ExprTuple xs -> foldl' (\a (L _ x) -> step x a) st xs
+    AST.ExprArray xs -> Foldable.foldl' (\a (L _ x) -> step x a) st xs
+    AST.ExprStruct pairs -> Foldable.foldl' (\a (L _ k, L _ v) -> step v (step k a)) st pairs
+    AST.ExprTuple xs -> Foldable.foldl' (\a (L _ x) -> step x a) st xs
     AST.ExprSubquery (L _ q) -> foldQueryExprs step q st
     AST.ExprParen (L _ e) -> step e st
     AST.ExprCollate (L _ e) _ -> step e st
@@ -185,9 +186,13 @@ foldExprChildren step expr st = case expr of
 
 foldFunctionCall :: (AST.Expr -> s -> s) -> AST.FunctionCall -> s -> s
 foldFunctionCall step fn st0 =
-    let s1 = foldl' foldArg st0 (AST.functionArgs fn)
-        s2 = foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s1 (AST.functionOrderBy fn)
-        s3 = foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s2 (AST.functionWithinGroup fn)
+    let s1 = Foldable.foldl' foldArg st0 (AST.functionArgs fn)
+        s2 = Foldable.foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s1 (AST.functionOrderBy fn)
+        s3 =
+            Foldable.foldl'
+                (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a)
+                s2
+                (AST.functionWithinGroup fn)
         s4 = maybe s3 (flip step s3 . locValue) (AST.functionFilter fn)
      in case AST.functionOver fn of
             Just (AST.WindowRefSpec spec) -> foldWindowSpec step spec s4
@@ -200,8 +205,8 @@ foldFunctionCall step fn st0 =
 
 foldWindowSpec :: (AST.Expr -> s -> s) -> AST.WindowSpec -> s -> s
 foldWindowSpec step spec st0 =
-    let s1 = foldl' (\a (L _ e) -> step e a) st0 (AST.windowPartitionBy spec)
-        s2 = foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s1 (AST.windowOrderBy spec)
+    let s1 = Foldable.foldl' (\a (L _ e) -> step e a) st0 (AST.windowPartitionBy spec)
+        s2 = Foldable.foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s1 (AST.windowOrderBy spec)
      in case AST.windowFrame spec of
             Nothing -> s2
             Just frame ->
@@ -216,23 +221,24 @@ foldQueryExprs :: (AST.Expr -> s -> s) -> AST.Query -> s -> s
 foldQueryExprs step q st0 =
     let s1 = maybe st0 (flip foldWith st0 . locValue) (AST.queryWith q)
         s2 = foldQueryBody (locValue (AST.queryBody q)) s1
-        s3 = foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s2 (AST.queryOrderBy q)
+        s3 = Foldable.foldl' (\a (L _ oi) -> step (locValue (AST.orderExpr oi)) a) s2 (AST.queryOrderBy q)
         s4 = maybe s3 (flip foldLimit s3 . locValue) (AST.queryLimit q)
         s5 = maybe s4 (flip step s4 . locValue) (AST.queryOffset q)
         s6 = maybe s5 (maybe s5 (flip step s5 . locValue) . AST.fetchCount . locValue) (AST.queryFetch q)
      in maybe
             s6
-            (foldl' (\a (L _ si) -> step (locValue (AST.settingValue si)) a) s6 . locValue)
+            (Foldable.foldl' (\a (L _ si) -> step (locValue (AST.settingValue si)) a) s6 . locValue)
             (AST.querySettings q)
     where
-        foldWith w a = foldl' (\acc (L _ cte) -> foldCteBody (locValue (AST.cteBody cte)) acc) a (AST.withCtes w)
+        foldWith w a =
+            Foldable.foldl' (\acc (L _ cte) -> foldCteBody (locValue (AST.cteBody cte)) acc) a (AST.withCtes w)
         foldCteBody (AST.CteQuery (L _ iq)) a = foldQueryExprs step iq a
         foldCteBody (AST.CteStatement _) a = a
         foldQueryBody body a = case body of
             AST.QueryBodySelect sc -> foldSelectCore sc a
             AST.QueryBodyFrom sc -> foldSelectCore sc a
             AST.QueryBodySet _ _ (L _ l) (L _ r) -> foldQueryBody r (foldQueryBody l a)
-            AST.QueryBodyValues rows -> foldl' (foldl' (\acc (L _ e) -> step e acc)) a rows
+            AST.QueryBodyValues rows -> Foldable.foldl' (Foldable.foldl' (\acc (L _ e) -> step e acc)) a rows
             AST.QueryBodyTable _ -> a
             AST.QueryBodyParen (L _ iq) -> foldQueryExprs step iq a
         foldLimit lim a =
@@ -240,35 +246,42 @@ foldQueryExprs step q st0 =
              in maybe a1 (flip step a1 . locValue) (AST.limitSecond lim)
         foldSelectCore sc a =
             let a1 = case AST.selectQuantifier sc of
-                    AST.SelectDistinctOn exprs -> foldl' (\acc (L _ e) -> step e acc) a exprs
+                    AST.SelectDistinctOn exprs -> Foldable.foldl' (\acc (L _ e) -> step e acc) a exprs
                     _ -> a
-                a2 = foldl' (\acc (L _ si) -> step (locValue (AST.selectItemExpr si)) acc) a1 (AST.selectItems sc)
+                a2 =
+                    Foldable.foldl'
+                        (\acc (L _ si) -> step (locValue (AST.selectItemExpr si)) acc)
+                        a1
+                        (AST.selectItems sc)
                 a3 = maybe a2 (foldFrom a2) (AST.selectFrom sc)
                 a4 = maybe a3 (flip step a3 . locValue) (AST.selectWhere sc)
                 a5 = maybe a4 (flip step a4 . locValue . locValue) (AST.selectPrewhere sc)
                 a6 = case AST.selectGroupBy sc of
                     [L _ (AST.GroupByExpr (L _ (AST.ExprColumn (L _ (AST.Name [L _ (AST.NamePart raw False)])))))]
                         | T.toUpper (TE.decodeUtf8 raw) == "ALL" -> a5
-                    items -> foldl' foldGroupBy a5 items
+                    items -> Foldable.foldl' foldGroupBy a5 items
                 a7 = maybe a6 (flip step a6 . locValue) (AST.selectHaving sc)
                 a8 =
-                    foldl' (\acc (L _ wd) -> foldWindowSpec step (AST.windowDefSpec wd) acc) a7 (AST.selectWindows sc)
+                    Foldable.foldl'
+                        (\acc (L _ wd) -> foldWindowSpec step (AST.windowDefSpec wd) acc)
+                        a7
+                        (AST.selectWindows sc)
              in maybe a8 (flip step a8 . locValue . locValue) (AST.selectQualify sc)
         foldGroupBy a (L _ item) = case item of
             AST.GroupByExpr (L _ e) -> step e a
-            AST.GroupByParens xs -> foldl' foldGroupBy a xs
-            AST.GroupByGroupingSets xs -> foldl' foldGroupBy a xs
-            AST.GroupByRollup xs -> foldl' foldGroupBy a xs
-            AST.GroupByCube xs -> foldl' foldGroupBy a xs
-        foldFrom a (AST.FromClause refs) = foldl' (\acc (L _ r) -> foldTableRef acc r) a refs
+            AST.GroupByParens xs -> Foldable.foldl' foldGroupBy a xs
+            AST.GroupByGroupingSets xs -> Foldable.foldl' foldGroupBy a xs
+            AST.GroupByRollup xs -> Foldable.foldl' foldGroupBy a xs
+            AST.GroupByCube xs -> Foldable.foldl' foldGroupBy a xs
+        foldFrom a (AST.FromClause refs) = Foldable.foldl' (\acc (L _ r) -> foldTableRef acc r) a refs
         foldTableRef a r =
             let a1 = foldTableSource a (locValue (AST.tableRefSource r))
                 a2 = maybe a1 (foldSample a1 . locValue) (AST.tableRefSample r)
-             in foldl' foldJoin a2 (AST.tableRefJoins r)
+             in Foldable.foldl' foldJoin a2 (AST.tableRefJoins r)
         foldTableSource a = \case
             AST.TableSourceName _ -> a
             AST.TableSourceSubquery (L _ iq) -> foldQueryExprs step iq a
-            AST.TableSourceValues rows -> foldl' (foldl' (\acc (L _ e) -> step e acc)) a rows
+            AST.TableSourceValues rows -> Foldable.foldl' (Foldable.foldl' (\acc (L _ e) -> step e acc)) a rows
             AST.TableSourceFunction (L _ fn) -> foldFunctionCall step fn a
             AST.TableSourceParens fc -> foldFrom a fc
             AST.TableSourceLateral (L _ inner) -> foldTableSource a inner
@@ -280,7 +293,7 @@ foldQueryExprs step q st0 =
             let a1 = case AST.joinTarget j of
                     AST.JoinTargetTable (L _ tr) -> foldTableRef a tr
                     AST.JoinTargetArray items ->
-                        foldl' (\acc (L _ it) -> step (locValue (AST.arrayJoinExpr it)) acc) a items
+                        Foldable.foldl' (\acc (L _ it) -> step (locValue (AST.arrayJoinExpr it)) acc) a items
              in case AST.joinConstraint j of
                     Just (AST.JoinOn (L _ e)) -> step e a1
                     _ -> a1

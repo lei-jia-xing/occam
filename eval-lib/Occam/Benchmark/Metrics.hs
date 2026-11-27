@@ -28,6 +28,7 @@ import Data.Aeson (
  )
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
+import Data.Foldable qualified as Foldable
 import Data.IntMap.Strict qualified as IntMap
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
@@ -123,7 +124,7 @@ computeAttemptAuc initialBytes curve totalAttempts
             step (!best, !area) i =
                 let !curBest = maybe best (min best) (IntMap.lookup i bestAt)
                  in (curBest, area + (fromIntegral curBest / fromIntegral initialBytes))
-            (_, totalArea) = foldl' step (initialBytes, 0.0) [1 .. totalAttempts]
+            (_, totalArea) = Foldable.foldl' step (initialBytes, 0.0) [1 .. totalAttempts]
          in totalArea / fromIntegral totalAttempts
 
 -- | Parse FFI + decode + candidate-build micros from cost attribution.
