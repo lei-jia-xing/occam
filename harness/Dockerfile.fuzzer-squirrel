@@ -2,7 +2,30 @@
 # Builds SQUIRREL's dialect mutators (libsqlite_mutator.so, libmysql_mutator.so,
 # libpostgresql_mutator.so), db_driver, AFL++, and an optional AFL++-instrumented
 # target binary (SQUIRREL_TARGET=sqlite|postgresql|mysql|mariadb|all|none).
-FROM ubuntu:22.04
+FROM docker.io/library/haskell:9.10.3-slim-bullseye AS occam-harness-build
+WORKDIR /build
+
+COPY cabal.project occam.cabal LICENSE README.md ./
+RUN cabal update
+COPY app ./app
+COPY eval-lib ./eval-lib
+COPY src ./src
+RUN cabal build exe:occam-harness --disable-tests --disable-benchmarks \
+    && install -Dm755 "$(cabal list-bin exe:occam-harness --disable-tests --disable-benchmarks)" /usr/local/bin/occam-harness
+# The Bullseye GHC bindist uses libffi.so.7. Keep it alongside Ubuntu's system libffi.
+RUN install -Dm644 "/usr/lib/$(gcc -print-multiarch)/libffi.so.7" /usr/local/lib/libffi.so.7
+
+FROM docker.io/library/ubuntu:22.04 AS squirrel-config
+ENV LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends libgmp10 libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=occam-harness-build /usr/local/bin/occam-harness /usr/local/bin/occam-harness
+COPY --from=occam-harness-build /usr/local/lib/libffi.so.7 /usr/local/lib/libffi.so.7
+COPY config/generated/harness.json /usr/local/share/occam/config/generated/harness.json
+RUN ldconfig && occam-harness check-config \
+    && occam-harness render-squirrel-yaml --dbms sqlite --squirrel-home /opt/squirrel > /dev/null
+
+FROM squirrel-config
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
@@ -170,8 +193,6 @@ LABEL org.occam.fuzzer="squirrel" \
       org.occam.fuzzer.target="${SQUIRREL_TARGET}" \
       org.occam.fuzzer.targets="sqlite,postgresql,mysql,mariadb"
 
-COPY harness/dhall_config.py /usr/local/share/occam/harness/dhall_config.py
-COPY config/generated/harness.json /usr/local/share/occam/config/generated/harness.json
 COPY harness/squirrel_driver.sh /usr/local/bin/squirrel-driver
 RUN chmod +x /usr/local/bin/squirrel-driver
 

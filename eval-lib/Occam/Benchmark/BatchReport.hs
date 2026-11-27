@@ -1,4 +1,4 @@
--- | Typed aggregation, decision-log summary, and Markdown report generation for Occam batch evaluations.
+-- | Typed aggregation and decision-log summaries for Occam batch evaluations.
 module Occam.Benchmark.BatchReport (
     AggregatedReport (..),
     BatchJobResult (..),
@@ -19,12 +19,10 @@ module Occam.Benchmark.BatchReport (
     collectRunRecord,
     collectRunRecordIO,
     metricSummary,
-    renderSummaryMarkdown,
     summarizeDecisionLog,
     summarizeDecisionLogBytes,
 ) where
 
-import Control.Applicative ((<|>))
 import Control.Exception.Safe (IOException, try)
 import Data.Aeson (
     FromJSON (..),
@@ -48,17 +46,25 @@ import Data.Foldable qualified as Foldable
 import Data.List (sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, getCurrentTime)
-import Numeric (showFFloat)
-import Occam.AtomicFile (writeAtomicBytes, writeAtomicLazyBytes)
+import Occam.AtomicFile (writeAtomicLazyBytes)
 import Occam.Benchmark.Metrics (computeAttemptAuc, engineOverheadMicros)
 import Occam.Evaluation (EvaluationPoint (..))
+import Occam.Harness.Checkpoints (
+    BatchJobResult (..),
+    DecisionSummary (..),
+    JobState (..),
+    emptyDecisionSummary,
+    readJsonIfExists,
+ )
+import Occam.Harness.Replay (QualificationResult (..), ReplayVerification (..))
+import Occam.Harness.Signature (CrashSignature (..), categoryName)
 import Occam.Metrics (MetricsSnapshot)
 import System.Directory (
     doesDirectoryExist,
@@ -67,41 +73,6 @@ import System.Directory (
     makeAbsolute,
  )
 import System.FilePath ((</>))
-
--- | Summary counters extracted from an @oracle_decisions.jsonl@ log.
-data DecisionSummary = DecisionSummary
-    { dsTotalCalls :: !Int
-    , dsAcceptedCalls :: !Int
-    , dsConfirmedFaults :: !Int
-    , dsHealthyNoFault :: !Int
-    , dsMissingEvidence :: !Int
-    , dsSlippageEvents :: !Int
-    , dsUniqueFaultSignatures :: ![Text]
-    }
-    deriving (Eq, Show)
-
-instance ToJSON DecisionSummary where
-    toJSON ds =
-        object
-            [ "total_calls" .= dsTotalCalls ds
-            , "accepted_calls" .= dsAcceptedCalls ds
-            , "confirmed_faults" .= dsConfirmedFaults ds
-            , "healthy_no_fault" .= dsHealthyNoFault ds
-            , "missing_evidence" .= dsMissingEvidence ds
-            , "slippage_events" .= dsSlippageEvents ds
-            , "unique_fault_signatures" .= dsUniqueFaultSignatures ds
-            ]
-
-instance FromJSON DecisionSummary where
-    parseJSON = withObject "DecisionSummary" \obj ->
-        DecisionSummary
-            <$> obj .:? "total_calls" .!= 0
-            <*> obj .:? "accepted_calls" .!= 0
-            <*> obj .:? "confirmed_faults" .!= 0
-            <*> obj .:? "healthy_no_fault" .!= 0
-            <*> obj .:? "missing_evidence" .!= 0
-            <*> obj .:? "slippage_events" .!= 0
-            <*> obj .:? "unique_fault_signatures" .!= []
 
 -- | Non-empty summary statistics over numeric values.
 data MetricSummary = MetricSummary
@@ -131,29 +102,6 @@ instance FromJSON MetricSummary where
             <*> obj .:? "mean" .!= 0.0
             <*> obj .:? "min" .!= 0.0
             <*> obj .:? "max" .!= 0.0
-
--- | Reduced-SQL multi-run replay verification attached to @job_result.json@.
-data ReplayVerification = ReplayVerification
-    { rvRunsRequired :: !Int
-    , rvRunsPassed :: !(Maybe Int)
-    , rvAllPassed :: !Bool
-    , rvConsistentSignature :: !Bool
-    , rvMatchesBaseline :: !Bool
-    , rvSlippageCount :: !(Maybe Int)
-    , rvObservedSignatureIds :: !(Maybe [Text])
-    }
-    deriving (Eq, Show)
-
-instance FromJSON ReplayVerification where
-    parseJSON = withObject "ReplayVerification" \obj ->
-        ReplayVerification
-            <$> obj .:? "runs_required" .!= 0
-            <*> obj .:? "runs_passed"
-            <*> obj .:? "all_passed" .!= False
-            <*> obj .:? "consistent_signature" .!= False
-            <*> obj .:? "matches_baseline" .!= False
-            <*> obj .:? "slippage_count"
-            <*> obj .:? "observed_signature_ids"
 
 -- | Lenient @evaluation_curve@ entry supporting partial test fixtures and legacy camelCase.
 data CurvePointInput = CurvePointInput
@@ -255,63 +203,20 @@ instance FromJSON StatsSnapshot where
             <*> obj .:? "evaluation_budget"
             <*> obj .:? "evaluation_metrics"
 
--- | Per-job record persisted to @runs/<job_id>/job_result.json@.
-data BatchJobResult = BatchJobResult
-    { bjrJobId :: !(Maybe Text)
-    , bjrCaseId :: !(Maybe Text)
-    , bjrDbms :: !(Maybe Text)
-    , bjrDialect :: !(Maybe Text)
-    , bjrProfile :: !(Maybe Text)
-    , bjrRepeat :: !(Maybe Int)
-    , bjrState :: !(Maybe Text)
-    , bjrEvalStatus :: !(Maybe Text)
-    , bjrInitialBytes :: !(Maybe Int)
-    , bjrInputQualified :: !(Maybe Bool)
-    , bjrBaselineSignatureId :: !(Maybe Text)
-    , bjrBaselineSignatureHash :: !(Maybe Text)
-    , bjrBaselineCategory :: !(Maybe Text)
-    , bjrStatsPath :: !(Maybe FilePath)
-    , bjrReducedReplayVerification :: !(Maybe ReplayVerification)
-    , bjrOracleDecisionsSummary :: !(Maybe Value)
-    }
-    deriving (Eq, Show)
-
-instance FromJSON BatchJobResult where
-    parseJSON = withObject "BatchJobResult" \obj ->
-        BatchJobResult
-            <$> obj .:? "job_id"
-            <*> obj .:? "case_id"
-            <*> obj .:? "dbms"
-            <*> obj .:? "dialect"
-            <*> obj .:? "profile"
-            <*> obj .:? "repeat"
-            <*> obj .:? "state"
-            <*> obj .:? "eval_status"
-            <*> obj .:? "initial_bytes"
-            <*> obj .:? "input_qualified"
-            <*> obj .:? "baseline_signature_id"
-            <*> obj .:? "baseline_signature_hash"
-            <*> obj .:? "baseline_category"
-            <*> obj .:? "stats_path"
-            <*> obj .:? "reduced_replay_verification"
-            <*> obj .:? "oracle_decisions_summary"
-
 -- | Normalized per-run record emitted inside @aggregated_stats.json@.
 data BatchRunRecord = BatchRunRecord
-    { recJobId :: !(Maybe Text)
-    , recCaseId :: !(Maybe Text)
-    , recDbms :: !(Maybe Text)
-    , recDialect :: !(Maybe Text)
-    , recProfile :: !(Maybe Text)
-    , recRepeat :: !(Maybe Int)
-    , recJobState :: !(Maybe Text)
+    { recJobId :: !Text
+    , recCaseId :: !Text
+    , recDbms :: !Text
+    , recDialect :: !Text
+    , recProfile :: !Text
+    , recRepeat :: !Int
+    , recJobState :: !JobState
     , recStatus :: !(Maybe Text)
     , recIsCompleted :: !Bool
     , recIsCensored :: !Bool
-    , recInputQualified :: !(Maybe Bool)
-    , recBaselineSignatureId :: !(Maybe Text)
-    , recBaselineSignatureHash :: !(Maybe Text)
-    , recBaselineCategory :: !(Maybe Text)
+    , recInputQualified :: !Bool
+    , recBaselineSignature :: !(Maybe CrashSignature)
     , recStratificationSignature :: !Text
     , recInitialBytes :: !(Maybe Int)
     , recReducedBytes :: !(Maybe Int)
@@ -343,7 +248,7 @@ data BatchRunRecord = BatchRunRecord
     , recReducedReplayMatchesBaseline :: !(Maybe Bool)
     , recReducedReplaySlippageCount :: !(Maybe Int)
     , recReducedReplayObservedSignatures :: !(Maybe [Text])
-    , recOracleDecisionsSummary :: !(Maybe Value)
+    , recOracleDecisionsSummary :: !(Maybe DecisionSummary)
     }
     deriving (Eq, Show)
 
@@ -361,9 +266,7 @@ instance ToJSON BatchRunRecord where
             , "is_completed" .= recIsCompleted r
             , "is_censored" .= recIsCensored r
             , "input_qualified" .= recInputQualified r
-            , "baseline_signature_id" .= recBaselineSignatureId r
-            , "baseline_signature_hash" .= recBaselineSignatureHash r
-            , "baseline_category" .= recBaselineCategory r
+            , "baseline_signature" .= recBaselineSignature r
             , "stratification_signature" .= recStratificationSignature r
             , "initial_bytes" .= recInitialBytes r
             , "reduced_bytes" .= recReducedBytes r
@@ -556,7 +459,7 @@ data AggregatedReport = AggregatedReport
     , aggGeneratedAt :: !Text
     , aggOutDir :: !FilePath
     , aggOverview :: !BatchOverview
-    , aggQualifications :: !(Map Text Value)
+    , aggQualifications :: !(Map Text QualificationResult)
     , aggByProfile :: !(Map Text GroupSummary)
     , aggByDbms :: !(Map Text GroupSummary)
     , aggBySignature :: !(Map Text SignatureGroupSummary)
@@ -598,9 +501,6 @@ summarizeDecisionLog path
             else do
                 res <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
                 pure (either (const emptyDecisionSummary) summarizeDecisionLogBytes res)
-
-emptyDecisionSummary :: DecisionSummary
-emptyDecisionSummary = DecisionSummary 0 0 0 0 0 0 []
 
 -- | Purely summarize JSONL bytes from @oracle_decisions.jsonl@.
 summarizeDecisionLogBytes :: BS.ByteString -> DecisionSummary
@@ -691,8 +591,9 @@ collectRunRecordIO jobRes = do
 collectRunRecord :: BatchJobResult -> Maybe StatsSnapshot -> BatchRunRecord
 collectRunRecord jobRes mStats =
     let mEm = stEvaluationMetrics =<< mStats
-        evalStatus = firstNonEmpty [stStatus =<< mStats, bjrEvalStatus jobRes, bjrState jobRes]
-        initBytes = (stInitialBytes =<< mStats) <|> bjrInitialBytes jobRes
+        evalStatus = firstNonEmpty [stStatus =<< mStats, bjrEvalStatus jobRes]
+        initBytes = stInitialBytes =<< mStats
+        initBytesVal = if bjrInitialBytes jobRes > 0 then Just (bjrInitialBytes jobRes) else initBytes
         redBytes = stReducedBytes =<< mStats
         redRatio = stReductionRatio =<< mStats
         initStmts = stInitialStatements =<< mStats
@@ -703,11 +604,11 @@ collectRunRecord jobRes mStats =
                     Just ((fromIntegral (iS - rS) / fromIntegral iS) * 100.0)
             _ -> Nothing
         attempts = stOracleAttempts =<< mStats
-        fallbackBytes = fromMaybe 0 initBytes
+        fallbackBytes = fromMaybe 0 initBytesVal
         curve = maybe [] (map (toEvaluationPoint fallbackBytes) . semCurve) mEm
         peakIdx = Foldable.foldl' (\acc pt -> max acc (pointCallIndex pt)) 0 curve
         totalAucCalls = max (fromMaybe 0 attempts) peakIdx
-        attemptAuc = case (mStats, initBytes) of
+        attemptAuc = case (mStats, initBytesVal) of
             (Just _, Just ib) | ib /= 0 -> Just (computeAttemptAuc ib curve totalAucCalls)
             _ -> Nothing
         overheadUs = engineOverheadMicros (semCostAttribution =<< mEm)
@@ -715,15 +616,13 @@ collectRunRecord jobRes mStats =
         isCompleted = evalStatus == Just "completed" && fromMaybe False validationPassed
         isCensored = evalStatus == Just "timeout" || evalStatus == Just "execution-budget"
 
-        hasReplay = case bjrReducedReplayVerification jobRes of
-            Just rv -> rvRunsRequired rv > 0
-            Nothing -> False
+        hasReplay = maybe False ((> 0) . rvRunsRequired) (bjrReducedReplayVerification jobRes)
         mReplay = if hasReplay then bjrReducedReplayVerification jobRes else Nothing
 
-        dbmsLabel = fromNonEmptyOr "unknown" (bjrDbms jobRes)
-        stratSig = case bjrBaselineSignatureId jobRes of
+        dbmsLabel = if T.null (bjrDbms jobRes) then "unknown" else bjrDbms jobRes
+        stratSig = case csId <$> bjrBaselineSignature jobRes of
             Just sid | not (T.null sid) -> dbmsLabel <> "::" <> sid
-            _ -> dbmsLabel <> "::unqualified:" <> fromMaybe "null" (bjrCaseId jobRes)
+            _ -> dbmsLabel <> "::unqualified:" <> bjrCaseId jobRes
 
         evalJobs = case stEvaluationBudget =<< mStats of
             Just budgetObj -> case KM.lookup "evaluation_jobs" budgetObj of
@@ -742,11 +641,9 @@ collectRunRecord jobRes mStats =
             , recIsCompleted = isCompleted
             , recIsCensored = isCensored
             , recInputQualified = bjrInputQualified jobRes
-            , recBaselineSignatureId = bjrBaselineSignatureId jobRes
-            , recBaselineSignatureHash = bjrBaselineSignatureHash jobRes
-            , recBaselineCategory = bjrBaselineCategory jobRes
+            , recBaselineSignature = bjrBaselineSignature jobRes
             , recStratificationSignature = stratSig
-            , recInitialBytes = initBytes
+            , recInitialBytes = initBytesVal
             , recReducedBytes = redBytes
             , recReductionRatio = redRatio
             , recInitialStatements = initStmts
@@ -770,13 +667,13 @@ collectRunRecord jobRes mStats =
             , recEngineOverheadUs = overheadUs
             , recEvaluationJobs = evalJobs
             , recReducedReplayRunsRequired = maybe 0 rvRunsRequired mReplay
-            , recReducedReplayRunsPassed = rvRunsPassed =<< mReplay
+            , recReducedReplayRunsPassed = rvRunsPassed <$> mReplay
             , recReducedReplayAllPassed = rvAllPassed <$> mReplay
             , recReducedReplayConsistentSignature = rvConsistentSignature <$> mReplay
-            , recReducedReplayMatchesBaseline = rvMatchesBaseline <$> mReplay
-            , recReducedReplaySlippageCount = rvSlippageCount =<< mReplay
+            , recReducedReplayMatchesBaseline = mReplay >>= rvMatchesBaseline
+            , recReducedReplaySlippageCount = rvSlippageCount <$> mReplay
             , recReducedReplayObservedSignatures =
-                if hasReplay then mReplay >>= rvObservedSignatureIds else Just []
+                if hasReplay then rvObservedSignatureIds <$> mReplay else Just []
             , recOracleDecisionsSummary = bjrOracleDecisionsSummary jobRes
             }
 
@@ -786,11 +683,6 @@ firstNonEmpty (Just t : rest)
     | not (T.null t) = Just t
     | otherwise = firstNonEmpty rest
 firstNonEmpty (Nothing : rest) = firstNonEmpty rest
-
-fromNonEmptyOr :: Text -> Maybe Text -> Text
-fromNonEmptyOr defVal mTxt = case mTxt of
-    Just t | not (T.null t) -> t
-    _ -> defVal
 
 -- | Aggregate a slice of run records into completed/censored/replay metrics.
 aggregateGroup :: [BatchRunRecord] -> GroupSummary
@@ -822,9 +714,9 @@ aggregateGroup records =
                 | r <- records
                 , not (recIsCompleted r)
                 , not (recIsCensored r)
-                , recJobState r /= Just "skipped_unstable_input"
+                , recJobState r /= JobSkippedUnstableInput
                 ]
-        skippedUnstable = length (filter ((== Just "skipped_unstable_input") . recJobState) records)
+        skippedUnstable = length (filter ((== JobSkippedUnstableInput) . recJobState) records)
         validationPassed = length (filter ((== Just True) . recValidationPassed) records)
         minimality1Min =
             length (filter ((== Just "statement-deletion-1-minimal") . recMinimalityClaim) records)
@@ -865,11 +757,13 @@ aggregateGroup records =
                 }
 
 -- | Purely construct the full @AggregatedReport@ from qualifications and run records.
-aggregateReport :: UTCTime -> FilePath -> Map Text Value -> [BatchRunRecord] -> AggregatedReport
+aggregateReport ::
+    UTCTime -> FilePath -> Map Text QualificationResult -> [BatchRunRecord] -> AggregatedReport
 aggregateReport now outAbs qualifications runRecords =
-    let profileGroups = groupByKey (fromMaybe "unknown" . recProfile) runRecords
+    let nonEmptyOr d t = if T.null t then d else t
+        profileGroups = groupByKey (nonEmptyOr "unknown" . recProfile) runRecords
         byProfile = Map.map aggregateGroup profileGroups
-        dbmsGroups = groupByKey (fromMaybe "unknown" . recDbms) runRecords
+        dbmsGroups = groupByKey (nonEmptyOr "unknown" . recDbms) runRecords
         byDbms = Map.map aggregateGroup dbmsGroups
         sigGroups = groupByKey recStratificationSignature runRecords
         bySignature = Map.map buildSignatureGroup sigGroups
@@ -877,19 +771,16 @@ aggregateReport now outAbs qualifications runRecords =
             Map.fromSet (buildSignatureStratified bySignature) (Map.keysSet profileGroups)
 
         qualVals = Map.elems qualifications
-        stableCount = length (filter isQualifiedVal qualVals)
+        stableCount = length (filter qrQualified qualVals)
         uniqueQualSigs =
             Set.fromList
-                [ (mDbms, sigId)
-                | Object qObj <- qualVals
-                , KM.lookup "qualified" qObj == Just (Bool True)
-                , Just sigId <- [kmText qObj "baseline_signature_id"]
-                , not (T.null sigId)
-                , let mDbms = case KM.lookup "dbms" qObj of
-                        Just (String d) -> Just d
-                        _ -> Nothing
+                [ (qrDbms qr, csId sig)
+                | qr <- qualVals
+                , qrQualified qr
+                , Just sig <- [qrBaselineSignature qr]
+                , not (T.null (csId sig))
                 ]
-        casesInRuns = Set.size (Set.fromList (mapMaybe recCaseId runRecords))
+        casesInRuns = Set.size (Set.fromList (filter (not . T.null) (map recCaseId runRecords)))
         generatedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q+00:00" now)
         overview =
             BatchOverview
@@ -918,18 +809,19 @@ aggregateReport now outAbs qualifications runRecords =
         groupByKey keyFn =
             Map.map reverse . Foldable.foldl' (\acc x -> Map.insertWith (++) (keyFn x) [x] acc) Map.empty
 
-        firstNonEmptyField f xs = firstNonEmpty (map f xs)
+        nonEmptyTxt d t = if T.null t then d else t
 
         buildSignatureGroup recs =
-            let sigProfGroups = groupByKey (fromMaybe "unknown" . recProfile) recs
-                caseIds = Set.toAscList (Set.fromList (mapMaybe recCaseId recs))
+            let sigProfGroups = groupByKey (nonEmptyTxt "unknown" . recProfile) recs
+                caseIds = Set.toAscList (Set.fromList (filter (not . T.null) (map recCaseId recs)))
                 firstDbms = case recs of
-                    (r : _) -> recDbms r
-                    [] -> Nothing
+                    (r : _) | not (T.null (recDbms r)) -> Just (recDbms r)
+                    _ -> Nothing
+                mFirstSig = listToMaybe (mapMaybe recBaselineSignature recs)
              in SignatureGroupSummary
-                    { sgsSignatureId = firstNonEmptyField recBaselineSignatureId recs
-                    , sgsSignatureHash = firstNonEmptyField recBaselineSignatureHash recs
-                    , sgsCategory = firstNonEmptyField recBaselineCategory recs
+                    { sgsSignatureId = csId <$> mFirstSig
+                    , sgsSignatureHash = csHash <$> mFirstSig
+                    , sgsCategory = categoryName . csCategory <$> mFirstSig
                     , sgsDbms = firstDbms
                     , sgsCaseIds = caseIds
                     , sgsCaseCount = length caseIds
@@ -978,10 +870,7 @@ aggregateReport now outAbs qualifications runRecords =
         maybeCons (Just x) xs = x : xs
         maybeCons Nothing xs = xs
 
-        isQualifiedVal (Object obj) = KM.lookup "qualified" obj == Just (Bool True)
-        isQualifiedVal _ = False
-
--- | Aggregate all runs and qualifications under @outDir@ and atomically write @aggregated_stats.json@ and @summary.md@.
+-- | Aggregate all runs and qualifications under @outDir@ and atomically write @aggregated_stats.json@.
 aggregateOutDir :: FilePath -> IO AggregatedReport
 aggregateOutDir outDir = do
     outAbs <- makeAbsolute outDir
@@ -993,12 +882,10 @@ aggregateOutDir outDir = do
     now <- getCurrentTime
     let agg = aggregateReport now outAbs qualifications runRecords
         aggPath = outAbs </> "aggregated_stats.json"
-        mdPath = outAbs </> "summary.md"
     writeAtomicLazyBytes aggPath (encode agg <> BSL.pack [10])
-    writeAtomicBytes mdPath (TE.encodeUtf8 (renderSummaryMarkdown agg))
     pure agg
 
-loadQualifications :: FilePath -> IO (Map Text Value)
+loadQualifications :: FilePath -> IO (Map Text QualificationResult)
 loadQualifications qualRoot = do
     exists <- doesDirectoryExist qualRoot
     if not exists
@@ -1010,12 +897,12 @@ loadQualifications qualRoot = do
     where
         loadOne caseDir = do
             let qPath = qualRoot </> caseDir </> "input_replay.json"
-            mVal <- readJsonIfExists qPath
-            pure $ case mVal of
-                Just val@(Object obj) ->
-                    let cid = fromMaybe (T.pack caseDir) (kmText obj "case_id")
-                     in Just (cid, val)
-                _ -> Nothing
+            mQr <- readJsonIfExists qPath
+            pure $ case mQr of
+                Just qr ->
+                    let cid = if T.null (qrCaseId qr) then T.pack caseDir else qrCaseId qr
+                     in Just (cid, qr)
+                Nothing -> Nothing
 
 loadJobResults :: FilePath -> IO [BatchJobResult]
 loadJobResults runsRoot = do
@@ -1027,134 +914,3 @@ loadJobResults runsRoot = do
             catMaybes <$> mapM loadOne dirs
     where
         loadOne jobDir = readJsonIfExists (runsRoot </> jobDir </> "job_result.json")
-
-readJsonIfExists :: (FromJSON a) => FilePath -> IO (Maybe a)
-readJsonIfExists path = do
-    exists <- doesFileExist path
-    if not exists
-        then pure Nothing
-        else do
-            res <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
-            pure $ case res of
-                Left _ -> Nothing
-                Right raw -> either (const Nothing) Just (eitherDecodeStrict' raw)
-
--- | Render the Markdown summary matching @summary.md@.
-renderSummaryMarkdown :: AggregatedReport -> Text
-renderSummaryMarkdown agg =
-    let ov = aggOverview agg
-        headerLines =
-            [ "# Occam Horizontal Batch Evaluation Summary"
-            , ""
-            , "- **Generated:** `" <> aggGeneratedAt agg <> "`"
-            , "- **Input cases qualified:** "
-                <> showT (ovInputStableCases ov)
-                <> "/"
-                <> showT (ovQualifiedCasesEvaluated ov)
-                <> " stable (5/5 consistent signature)"
-            , "- **Unique crash signatures:** " <> showT (ovUniqueQualifiedCrashSignatures ov)
-            , "- **Total reduction runs:** " <> showT (ovTotalJobRuns ov)
-            , ""
-            , "## 1. Profile Comparison (Completed-Only Medians + Stability)"
-            , ""
-            , "| Profile | Completed / Total | Censored | Reduced B (med) | Byte Red % (med) | Attempts (med) | Attempt-AUC (med) | Elapsed s (med) | 5/5 Replay | Zero-Slip |"
-            , "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-            ]
-        profileRows = map renderProfileRow (Map.toAscList (aggByProfile agg))
-        stratHeader =
-            [ ""
-            , "## 2. Stratified Summary by Unique Crash Signature (Macro-Median Across Signatures)"
-            , ""
-            , "| Profile | Signatures Completed | Zero-Slip Signatures | Sig-Median Byte Red % | Sig-Median Attempts | Sig-Median AUC |"
-            , "|---|---:|---:|---:|---:|---:|"
-            ]
-        stratRows = map renderStratRow (Map.toAscList (aggSignatureStratifiedByProfile agg))
-        dbmsHeader =
-            [ ""
-            , "## 3. Breakdown by DBMS"
-            , ""
-            , "| DBMS | Completed / Total | Censored | 5/5 Replay | Zero-Slip | Byte Red % (med) |"
-            , "|---|---:|---:|---:|---:|---:|"
-            ]
-        dbmsRows = map renderDbmsRow (Map.toAscList (aggByDbms agg))
-        allLines = headerLines <> profileRows <> stratHeader <> stratRows <> dbmsHeader <> dbmsRows <> [""]
-     in T.intercalate "\n" allLines
-    where
-        renderProfileRow (prof, pdata) =
-            let comp = gsCompletedOnly pdata
-             in "| `"
-                    <> prof
-                    <> "` | "
-                    <> showT (gsCompletedRuns pdata)
-                    <> " / "
-                    <> showT (gsTotalRuns pdata)
-                    <> " | "
-                    <> showT (gsCensoredRuns pdata)
-                    <> " | "
-                    <> fmtMetric 0 "" (subReducedBytes comp)
-                    <> " | "
-                    <> fmtMetric 2 "%" (subReductionRatio comp)
-                    <> " | "
-                    <> fmtMetric 0 "" (subOracleAttempts comp)
-                    <> " | "
-                    <> fmtMetric 4 "" (subAttemptAuc comp)
-                    <> " | "
-                    <> fmtMetric 2 "" (subElapsedSeconds comp)
-                    <> " | "
-                    <> showT (gsReducedReplay5of5Runs pdata)
-                    <> "/"
-                    <> showT (gsReducedReplayCheckedRuns pdata)
-                    <> " | "
-                    <> showT (gsReducedReplayZeroSlippageRuns pdata)
-                    <> "/"
-                    <> showT (gsReducedReplayCheckedRuns pdata)
-                    <> " |"
-
-        renderStratRow (prof, sdata) =
-            "| `"
-                <> prof
-                <> "` | "
-                <> showT (spsSignaturesWithCompletedRuns sdata)
-                <> "/"
-                <> showT (spsSignaturesObserved sdata)
-                <> " | "
-                <> showT (spsSignaturesZeroSlippageAllRuns sdata)
-                <> "/"
-                <> showT (spsSignaturesObserved sdata)
-                <> " | "
-                <> fmtMetric 2 "%" (spsCompletedSignatureMedianReductionRatio sdata)
-                <> " | "
-                <> fmtMetric 0 "" (spsCompletedSignatureMedianOracleAttempts sdata)
-                <> " | "
-                <> fmtMetric 4 "" (spsCompletedSignatureMedianAttemptAuc sdata)
-                <> " |"
-
-        renderDbmsRow (dbms, ddata) =
-            let comp = gsCompletedOnly ddata
-             in "| `"
-                    <> dbms
-                    <> "` | "
-                    <> showT (gsCompletedRuns ddata)
-                    <> " / "
-                    <> showT (gsTotalRuns ddata)
-                    <> " | "
-                    <> showT (gsCensoredRuns ddata)
-                    <> " | "
-                    <> showT (gsReducedReplay5of5Runs ddata)
-                    <> "/"
-                    <> showT (gsReducedReplayCheckedRuns ddata)
-                    <> " | "
-                    <> showT (gsReducedReplayZeroSlippageRuns ddata)
-                    <> "/"
-                    <> showT (gsReducedReplayCheckedRuns ddata)
-                    <> " | "
-                    <> fmtMetric 2 "%" (subReductionRatio comp)
-                    <> " |"
-
-        fmtMetric :: Int -> String -> Maybe MetricSummary -> Text
-        fmtMetric _ _ Nothing = "-"
-        fmtMetric decimals suffix (Just ms) =
-            T.pack (showFFloat (Just decimals) (msMedian ms) suffix)
-
-        showT :: (Show a) => a -> Text
-        showT = T.pack . show

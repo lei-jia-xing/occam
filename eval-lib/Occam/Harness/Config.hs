@@ -9,6 +9,7 @@ module Occam.Harness.Config (
     SquirrelSpec (..),
     decodeHarnessConfig,
     defaultRenderOptionsForSpec,
+    loadExperimentPlan,
     loadHarnessConfig,
     lookupDbmsSpec,
     lookupSquirrelSpec,
@@ -17,28 +18,40 @@ module Occam.Harness.Config (
     squirrelFieldText,
 ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception.Safe (IOException, try)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (except, runExceptT, throwE)
 import Data.Aeson (
     FromJSON (..),
-    Value,
+    ToJSON (..),
+    Value (..),
     eitherDecodeStrict',
     encode,
+    object,
     withObject,
     (.:),
     (.:?),
+    (.=),
  )
+import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Types (parseEither)
+import Data.Bifunctor (first)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.List (find)
 import Data.Map.Strict (Map)
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Numeric.Natural (Natural)
-import System.Directory (doesFileExist, getCurrentDirectory)
+import System.Directory (doesFileExist, findExecutable, getCurrentDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath (takeDirectory, (</>))
+import System.Exit (ExitCode (..))
+import System.FilePath (takeDirectory, takeExtension, (<.>), (</>))
+import System.Process (readProcessWithExitCode)
 
 -- | Per-DBMS connection, dialect, and container configuration from Dhall.
 data DbmsSpec = DbmsSpec
@@ -94,6 +107,17 @@ instance FromJSON OracleDefaults where
             <*> obj .: "timeout_secs"
             <*> obj .: "verbose"
 
+instance ToJSON OracleDefaults where
+    toJSON defaults =
+        object
+            [ "allow_psql_meta" .= odAllowPsqlMeta defaults
+            , "allow_stderr_only" .= odAllowStderrOnly defaults
+            , "reject_on_slippage" .= odRejectOnSlippage defaults
+            , "stack_frames" .= odStackFrames defaults
+            , "timeout_secs" .= odTimeoutSecs defaults
+            , "verbose" .= odVerbose defaults
+            ]
+
 -- | Named batch experiment plan.
 data ExperimentPlan = ExperimentPlan
     { planName :: !Text
@@ -126,6 +150,65 @@ instance FromJSON ExperimentPlan where
             <*> obj .: "no_cache"
             <*> obj .: "container_wait_secs"
             <*> obj .: "oracle"
+
+instance ToJSON ExperimentPlan where
+    toJSON plan =
+        object
+            [ "name" .= planName plan
+            , "dbms" .= planDbms plan
+            , "profiles" .= planProfiles plan
+            , "repeats" .= planRepeats plan
+            , "timeout_secs" .= planTimeoutSecs plan
+            , "budget_secs" .= planBudgetSecs plan
+            , "max_oracle_executions" .= planMaxOracleExecutions plan
+            , "worker_jobs" .= planWorkerJobs plan
+            , "occam_jobs" .= planOccamJobs plan
+            , "no_cache" .= planNoCache plan
+            , "container_wait_secs" .= planContainerWaitSecs plan
+            , "oracle" .= planOracle plan
+            ]
+
+-- | Resolve a named plan or load a file, using the smoke plan for omitted fields.
+loadExperimentPlan :: FilePath -> HarnessConfig -> Text -> IO (Either String ExperimentPlan)
+loadExperimentPlan configPath cfg reference = do
+    result <- try (runExceptT load) :: IO (Either IOException (Either String ExperimentPlan))
+    pure (either (Left . show) id result)
+    where
+        key = T.strip reference
+        plans = hcPlans cfg
+        builtIn = Map.lookup key plans <|> Map.lookup (T.replace "-" "_" key) plans
+        generated = takeDirectory configPath
+        inPlans dir extension = dir </> "plans" </> T.unpack key <.> extension
+
+        load
+            | T.null key = throwE "Empty config path or plan name"
+            | Just plan <- builtIn = pure plan
+            | otherwise = do
+                path <-
+                    findPlanPath
+                        [T.unpack key, inPlans generated "json", inPlans (takeDirectory generated </> "dhall") "dhall"]
+                bytes <- if takeExtension path == ".dhall" then compile path else lift (BS.readFile path)
+                smoke <-
+                    maybe (throwE "Harness config is missing the smoke plan defaults") pure (Map.lookup "smoke" plans)
+                let parse value = parseEither parseJSON (overlay value (toJSON smoke))
+                except $ first ((path <> ": ") <>) (eitherDecodeStrict' bytes >>= parse)
+
+        findPlanPath [] = throwE ("Experiment plan '" <> T.unpack key <> "' not found")
+        findPlanPath (path : rest) = do
+            exists <- lift (doesFileExist path)
+            if exists then pure path else findPlanPath rest
+
+        compile path = do
+            found <- lift (findExecutable "dhall-to-json")
+            executable <-
+                maybe (throwE ("Cannot load '" <> path <> "' without dhall-to-json on PATH")) pure found
+            (status, output, err) <- lift (readProcessWithExitCode executable ["--file", path] "")
+            case status of
+                ExitSuccess -> pure (encodeUtf8 (T.pack output))
+                ExitFailure _ -> throwE ("dhall-to-json failed on '" <> path <> "': " <> err)
+
+        overlay (Object custom) (Object defaults) = Object (KM.unionWith overlay custom defaults)
+        overlay custom _ = custom
 
 -- | Named reduction profile with both CLI flags and Occam JSON patch.
 data ReductionProfile = ReductionProfile
@@ -252,10 +335,9 @@ resolveHarnessConfigPath :: Maybe FilePath -> IO FilePath
 resolveHarnessConfigPath (Just p) = pure p
 resolveHarnessConfigPath Nothing = do
     mJson <- lookupEnv "OCCAM_HARNESS_JSON"
-    mLegacy <- lookupEnv "OCCAM_HARNESS_CONFIG"
-    case listToMaybe [path | Just path <- [mJson, mLegacy], not (null path)] of
-        Just path -> pure path
-        Nothing -> getCurrentDirectory >>= walkParents
+    case mJson of
+        Just path | not (null path) -> pure path
+        _ -> getCurrentDirectory >>= walkParents
     where
         relativePath = "config" </> "generated" </> "harness.json"
         walkParents dir = do
@@ -280,7 +362,7 @@ lookupDbmsSpec hc name = find ((== name) . dbmsId) (hcDbms hc)
 lookupSquirrelSpec :: HarnessConfig -> Text -> Maybe SquirrelSpec
 lookupSquirrelSpec hc name = find ((== name) . sqDbms) (hcSquirrel hc)
 
--- | Extract a scalar SQUIRREL template field matching @dhall_config.py squirrel-field@.
+-- | Extract a scalar SQUIRREL template field for the @squirrel-field@ subcommand.
 squirrelFieldText :: SquirrelSpec -> Text -> Maybe Text
 squirrelFieldText spec field = case field of
     "dbms" -> Just (sqDbms spec)

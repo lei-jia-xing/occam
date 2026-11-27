@@ -2,7 +2,7 @@
 
 This directory contains **71 authentic, unreduced, multi-statement fuzz crash cases** extracted from official DBMS defect trackers and fuzzer reports across all 6 DBMS targets supported by [`harness/`](../../harness/README.md).
 
-| DBMS | Occam Dialect (`DBMS_TO_OCCAM_DIALECT`) | Case Count | Target Image / Version Focus | Local Live-5/5 Verification |
+| DBMS | Occam Dialect | Case Count | Target Image / Version Focus | Local Live-5/5 Verification |
 | :--- | :--- | :---: | :--- | :--- |
 | PostgreSQL (`postgres`) | `postgres` | 12 | PostgreSQL `13.0` / `12.0` (`--enable-cassert --enable-debug`) | Upstream-provenance (no local PG container) |
 | MySQL (`mysql`) | `mysql` | 15 | MySQL `8.0.20-debug` (`-DWITH_DEBUG=1`), `8.0.1`–`8.0.12-debug` | Upstream-provenance (no local MySQL container) |
@@ -18,8 +18,8 @@ This directory contains **71 authentic, unreduced, multi-statement fuzz crash ca
 All cases follow four criteria:
 1. **Authentic Provenance**: Every case originates directly from official DBMS bug trackers or commit regression tests (PostgreSQL `pgsql-bugs`/`pgsql-hackers`, MySQL Bugs & commits, MariaDB Jira `MDEV-*`, ClickHouse GitHub Issues & AST fuzzer, SQLite Fossil timeline/tickets, DuckDB GitHub Issues), discovered by leading DBMS fuzzers and bug-finding tools (**SQUIRREL**, **SQLsmith**, **SQLancer**, **pquery/RQG**, **ClickHouse AST fuzzer**, **OSS-Fuzz**).
 2. **Multi-Statement Dependency**: Every case in the corpus is an ordered multi-statement sequence (`statement_count >= 2`, typically 3–27 statements) combining schema setup (`CREATE TABLE`, `CREATE VIEW`, `CREATE INDEX`), state mutations (`INSERT`, `UPDATE`, `ALTER`), settings/views/rules, and a triggering query/DML. None are isolated 1-line crashes.
-3. **Deterministic Crash Signature & Self-Containment**: Each case specifies an `expected_signature` regex compatible with `harness/crash_oracle.py`, and avoids harness-incompatible state (no `USE test;`, no `default.` ClickHouse DB qualifiers, no mysqltest directives, no psql backslash meta-commands, and no global role/policy state that leaks past `harness/reset_db.sh`).
-4. **5-Replay Reproducibility Protocol & Verification Scope**: All 9 new SQLite `3.31.0` cases (`localhost/occam-target-sqlite:latest`) and both local DuckDB `v1.5.5` cases (`duckdb` in PATH) were live-verified across **5 consecutive clean replays** via `harness/crash_oracle.py --print-signature`, producing identical deterministic crash signatures (`5/5`). Server-DBMS (`postgres`, `mysql`, `mariadb`, `clickhouse`) and `v1.1.3` DuckDB additions lack local target builds in this environment and are grounded in upstream bug-tracker provenance plus offline verification against `crash_oracle.extract_dbms_evidence`, `occam` parsing, and `harness/batch_eval.py --dry-run`.
+3. **Deterministic Crash Signature & Self-Containment**: Each case specifies an `expected_signature` regex compatible with `occam-harness oracle` (`Occam.Harness.Regex`), and avoids harness-incompatible state (no `USE test;`, no `default.` ClickHouse DB qualifiers, no mysqltest directives, no psql backslash meta-commands, and no global role/policy state that leaks past `occam-harness reset`).
+4. **5-Replay Reproducibility Protocol & Verification Scope**: All 9 new SQLite `3.31.0` cases (`localhost/occam-target-sqlite:latest`) and both local DuckDB `v1.5.5` cases (`duckdb` in PATH) were live-verified across **5 consecutive clean replays**, producing identical deterministic crash signatures (`5/5`). Server-DBMS (`postgres`, `mysql`, `mariadb`, `clickhouse`) and `v1.1.3` DuckDB additions lack local target builds in this environment and are grounded in upstream bug-tracker provenance plus verification against `Occam.Harness.Evidence` regexes, `occam` parsing, and `occam-harness batch --dry-run`.
 
 ---
 
@@ -188,8 +188,8 @@ Each `.meta.json` file pairs with the raw `.sql` file to drive automated reducti
 # Example reduction run with Occam on PostgreSQL. Use the exact
 # crash_signature.expected_signature value from the case's .meta.json.
 occam benchmarks/real_fuzz_corpus/pg_fuzzer_mcv_clauses.sql \
-  --oracle "python3 harness/crash_oracle.py --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
-  --reset "./harness/reset_db.sh --dbms postgres --container-name occam-target-pg" \
+  --oracle "occam-harness oracle --dbms postgres --container-name occam-target-pg --expected-signature 'clauses != NIL'" \
+  --reset "occam-harness reset --dbms postgres --container-name occam-target-pg" \
   --dialect postgresql \
   --timeout 10 \
   --jobs 1 \

@@ -1,10 +1,12 @@
 module Main (main) where
 
 import BatchReportChecks qualified
+import BatchRunnerChecks qualified
 import BenchmarkMetricsChecks qualified
 import CacheChecks qualified
 import CliChecks qualified
 import ColumnChecks qualified
+import CrashEvidenceChecks qualified
 import DependencyChecks qualified
 import DialectAndControlChecks qualified
 import DialectFuzz qualified
@@ -21,6 +23,7 @@ import FrontendSeedChecks qualified
 import FrontendSemanticsChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
+import OracleAndResetChecks qualified
 import OracleChecks qualified
 import ParserChecks qualified
 import PoolChecks qualified
@@ -71,6 +74,9 @@ tests frontendSeedTests syntaxAlignmentTests semanticAlignmentTests =
         , DuckDBOracleChecks.tests
         , BenchmarkMetricsChecks.tests
         , BatchReportChecks.tests
+        , BatchRunnerChecks.tests
+        , CrashEvidenceChecks.tests
+        , OracleAndResetChecks.tests
         , PropertyChecks.tests
         , generativeFuzzTests
         , mutationalFuzzTests

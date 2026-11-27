@@ -5,6 +5,7 @@
 , base16-bytestring
 , bytestring
 , containers
+, cryptohash-sha256
 , direct-sqlite
 , directory
 , duckdb
@@ -92,12 +93,15 @@ mkDerivation {
   executableHaskellDepends = [
     aeson
     base
+    base16-bytestring
     bytestring
     containers
+    cryptohash-sha256
     direct-sqlite
     directory
     filepath
     optparse-applicative
+    process
     safe-exceptions
     text
     time
@@ -111,8 +115,10 @@ mkDerivation {
   testHaskellDepends = [
     aeson
     base
+    base16-bytestring
     bytestring
     containers
+    cryptohash-sha256
     direct-sqlite
     directory
     filepath
@@ -154,6 +160,7 @@ mkDerivation {
 
   preCheck = ''
     export OCCAM_BIN="$PWD/dist/build/occam/occam"
+    export OCCAM_HARNESS_BIN="$PWD/dist/build/occam-harness/occam-harness"
     export OCCAM_DUCKDB_LIB="${duckdbLibDir}/libduckdb${sharedExt}"
     export OCCAM_PG_QUERY_LIB="${pgQueryLibDir}/libpg_query${sharedExt}"
   '';

@@ -6,10 +6,7 @@ module FrontendCorpusChecks (
     loadRegressionCases,
 ) where
 
-import Control.Applicative ((<|>))
 import Control.Monad (forM, forM_, when)
-import Data.Aeson (Value (..), eitherDecodeStrict')
-import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
@@ -37,6 +34,7 @@ import Occam.Facts (
     StatementUnit (..),
  )
 import Occam.Frontend.Span (isUtf8Boundary)
+import Occam.Harness.Corpus (CorpusCase (..), loadRealFuzzCorpus)
 import Occam.Parser (
     ParseOptions (..),
     ParsedSQL (..),
@@ -46,7 +44,7 @@ import Occam.Parser (
     parseSQL,
  )
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import System.FilePath (dropExtension, takeExtension, (</>))
+import System.FilePath (takeExtension, (</>))
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
@@ -108,12 +106,6 @@ tests =
                 parsed <- parseOrFail (corpusId item) (fullOptions (corpusDialect item)) (corpusSql item)
                 assertValidParsed (T.unpack (corpusId item)) (corpusSql item) parsed
         ]
-
-data CorpusCase = CorpusCase
-    { corpusId :: !Text
-    , corpusDialect :: !SQLDialect
-    , corpusSql :: !ByteString
-    }
 
 fullOptions :: SQLDialect -> ParseOptions
 fullOptions dialect =
@@ -201,47 +193,6 @@ loadBenchmarkCorpus dir = do
                 sql <- BS.readFile (dir </> name)
                 pure (CorpusCase ("corpus:" <> T.pack name) SQLite sql)
             pure (Right cases)
-
-loadRealFuzzCorpus :: FilePath -> IO (Either String [CorpusCase])
-loadRealFuzzCorpus dir = do
-    exists <- doesDirectoryExist dir
-    if not exists
-        then pure (Left ("missing real fuzz corpus directory: " <> dir))
-        else do
-            files <- sort . filter ((== ".sql") . takeExtension) <$> listDirectory dir
-            results <- forM files \name -> do
-                let sqlPath = dir </> name
-                    metaPath = dir </> (dropExtension name <> ".meta.json")
-                sql <- BS.readFile sqlPath
-                metaExists <- doesFileExist metaPath
-                if not metaExists
-                    then pure (Left ("missing metadata file: " <> metaPath))
-                    else do
-                        metaBytes <- BS.readFile metaPath
-                        pure $
-                            CorpusCase ("real_fuzz:" <> T.pack name)
-                                <$> parseMetaDialect metaPath metaBytes
-                                <*> Right sql
-            pure (sequence results)
-
-parseMetaDialect :: FilePath -> ByteString -> Either String SQLDialect
-parseMetaDialect path bytes = do
-    val <- eitherDecodeStrict' bytes
-    case val of
-        Object obj -> do
-            let targetDbms = case KM.lookup "target" obj of
-                    Just (Object tObj) -> case KM.lookup "dbms" tObj of
-                        Just (String s) -> Just s
-                        _ -> Nothing
-                    _ -> Nothing
-                topDialect = case KM.lookup "dialect" obj of
-                    Just (String s) -> Just s
-                    _ -> Nothing
-                chosen = targetDbms <|> topDialect
-            case chosen >>= lookupDialectByName of
-                Just d -> Right d
-                Nothing -> Left (path <> ": unrecognized dialect " <> show chosen)
-        _ -> Left (path <> ": expected JSON object")
 
 loadRegressionCases :: FilePath -> IO (Either String [CorpusCase])
 loadRegressionCases path = do

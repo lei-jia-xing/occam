@@ -210,7 +210,7 @@ realFuzzCorpusAlignment pgAvail extraOracles =
                     assertEqual "MariaDB real_fuzz_corpus count" 12 (length mariaCases)
                     forM_ mariaCases \item -> do
                         _ <- parseCorpusStmts mariadbProfile item
-                        if corpusId item == "real_fuzz:mariadb_mdev22462_in_to_exists_assert.sql"
+                        if corpusId item == "mariadb_mdev22462_in_to_exists_assert"
                             then do
                                 -- Squirrel MDEV-22462 triggers on statement #3; statement #5
                                 -- emits `RANK(v1) OVER w` (MariaDB RANK() takes 0 args).

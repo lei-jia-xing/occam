@@ -1,14 +1,46 @@
 #!/usr/bin/env python3
 """Contract tests for harness/sqlancer_driver.sh and harness/squirrel_driver.sh."""
 
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 SQLANCER_DRIVER = os.path.join(HARNESS_DIR, "sqlancer_driver.sh")
 SQUIRREL_DRIVER = os.path.join(HARNESS_DIR, "squirrel_driver.sh")
+DEFAULT_HARNESS_JSON = os.path.normpath(
+    os.path.join(HARNESS_DIR, "..", "config", "generated", "harness.json")
+)
+
+
+def resolve_repo_binary(name, env_var=None):
+    import shutil
+
+    if env_var and os.environ.get(env_var):
+        path = os.path.abspath(os.path.expanduser(os.environ[env_var]))
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    found = shutil.which(name)
+    if found:
+        return found
+    repo_root = os.path.normpath(os.path.join(HARNESS_DIR, ".."))
+    nix_dist = os.path.join(repo_root, "dist", "build", name, name)
+    if os.path.isfile(nix_dist) and os.access(nix_dist, os.X_OK):
+        return nix_dist
+    listed = subprocess.run(
+        ["cabal", "list-bin", f"exe:{name}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    candidate = listed.stdout.strip()
+    if listed.returncode == 0 and candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    raise unittest.SkipTest(f"Could not locate executable '{name}'")
 
 
 class TestFuzzerDrivers(unittest.TestCase):
@@ -46,6 +78,80 @@ class TestFuzzerDrivers(unittest.TestCase):
             handle.write("#!/bin/sh\nset -e\n" + body)
         os.chmod(path, 0o755)
         return path
+
+    def test_squirrel_driver_loads_compiled_config_from_outside_the_checkout(self):
+        harness_bin = resolve_repo_binary("occam-harness", "OCCAM_HARNESS_BIN")
+        default_config = DEFAULT_HARNESS_JSON
+        with open(default_config, encoding="utf-8") as handle:
+            config = json.load(handle)
+        sqlite = next(spec for spec in config["squirrel"] if spec["dbms"] == "sqlite")
+        sqlite["required"].append("输入")
+        del config["dbms"][0]["sqlancer_subcommand"]
+        config["oracle"]["timeout_secs"] = 0.25
+        config["plans"]["smoke"].update(
+            timeout_secs=1.25, budget_secs=12.5, max_oracle_executions=42
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            config_path = os.path.join(td, "custom harness.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle)
+            subprocess.run(
+                [harness_bin, "check-config", config_path],
+                cwd=td,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            env = self._clean_env()
+            env.pop("OCCAM_HARNESS_BIN", None)
+            env.pop("OCCAM_HARNESS_JSON", None)
+            command = [
+                SQUIRREL_DRIVER,
+                "sqlite",
+                "--squirrel-home",
+                "/opt/squirrel",
+                "--dry-run",
+            ]
+
+            for name, overrides in (
+                ("checkout", {}),
+                ("primary", {
+                    "OCCAM_HARNESS_BIN": harness_bin,
+                    "OCCAM_HARNESS_JSON": config_path,
+                }),
+            ):
+                with self.subTest(config_source=name):
+                    out_dir = os.path.join(td, name)
+                    result = subprocess.run(
+                        [*command, "--output-dir", out_dir],
+                        cwd=td,
+                        env={**env, **overrides},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with open(os.path.join(out_dir, "squirrel_config_sqlite.yml"), encoding="utf-8") as handle:
+                        rendered = handle.read()
+                    if name == "checkout":
+                        self.assertIn("db: sqlite", rendered)
+                    else:
+                        self.assertIn('"输入"', rendered)
+
+            yaml_path = os.path.join(td, "custom.yml")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("---\ndb: sqlite\n")
+            explicit = subprocess.run(
+                [*command, "--config", yaml_path, "--output-dir", os.path.join(td, "explicit")],
+                cwd=td,
+                env={**env, "OCCAM_HARNESS_BIN": os.path.join(td, "missing")},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(explicit.returncode, 0, explicit.stderr)
+            self.assertIn(yaml_path, explicit.stdout)
 
     def test_sqlancer_help_and_validation(self):
         res_help = subprocess.run(

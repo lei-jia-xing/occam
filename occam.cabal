@@ -206,11 +206,28 @@ executable occam-harness
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
     other-modules:    Occam.Benchmark.BatchReport
                     , Occam.Benchmark.Metrics
+                    , Occam.Harness.BarrierCensus
+                    , Occam.Harness.Batch
+                    , Occam.Harness.BatchInputs
+                    , Occam.Harness.BatchPlan
+                    , Occam.Harness.Checkpoints
                     , Occam.Harness.Cli
+                    , Occam.Harness.Collect
                     , Occam.Harness.Config
+                    , Occam.Harness.Corpus
+                    , Occam.Harness.DbmsExec
+                    , Occam.Harness.Evidence
+                    , Occam.Harness.Oracle
+                    , Occam.Harness.Regex
+                    , Occam.Harness.Replay
+                    , Occam.Harness.Reset
+                    , Occam.Harness.Signature
                     , Occam.Harness.SqlancerSanitize
     build-depends:    occam
+                    , base16-bytestring >= 1.0 && < 1.1
+                    , cryptohash-sha256 >= 0.11 && < 0.12
                     , optparse-applicative >= 0.17 && < 0.20
+                    , process >= 1.6 && < 1.7
                     , safe-exceptions >= 0.1 && < 0.2
                     , time
     hs-source-dirs:   app eval-lib
@@ -241,13 +258,16 @@ test-suite occam-test
                     , ExtraEngineOracles
                     , Fuzz
                     , MutationalFuzz
+                    , OracleAndResetChecks
                     , PgQueryOracle
                     , TestSupport
                     , BenchmarkMetricsChecks
                     , BatchReportChecks
+                    , BatchRunnerChecks
                     , CacheChecks
                     , CliChecks
                     , ColumnChecks
+                    , CrashEvidenceChecks
                     , DependencyChecks
                     , DependencyChecks.CascadeAndSessionChecks
                     , DependencyChecks.CoreChecks
@@ -296,11 +316,27 @@ test-suite occam-test
                     , Occam.Oracle.DuckDB.Result
                     , Occam.Benchmark.BatchReport
                     , Occam.Benchmark.Metrics
+                    , Occam.Harness.BarrierCensus
+                    , Occam.Harness.Batch
+                    , Occam.Harness.BatchInputs
+                    , Occam.Harness.BatchPlan
+                    , Occam.Harness.Checkpoints
                     , Occam.Harness.Cli
+                    , Occam.Harness.Collect
                     , Occam.Harness.Config
+                    , Occam.Harness.Corpus
+                    , Occam.Harness.DbmsExec
+                    , Occam.Harness.Evidence
+                    , Occam.Harness.Oracle
+                    , Occam.Harness.Regex
+                    , Occam.Harness.Replay
+                    , Occam.Harness.Reset
+                    , Occam.Harness.Signature
                     , Occam.Harness.SqlancerSanitize
     main-is:          Spec.hs
     build-depends:    occam
+                    , base16-bytestring >= 1.0 && < 1.1
+                    , cryptohash-sha256 >= 0.11 && < 0.12
                     , process
                     , optparse-applicative
                     , tasty

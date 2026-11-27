@@ -14,7 +14,7 @@ Occam communicates with external test harnesses using standard POSIX stream and 
 | **`--reset <cmd>`** | Executed before candidate evaluation when specified.<br>• PostgreSQL: drops and recreates `occam_test` from `template_occam`.<br>• MySQL: clears `super_read_only` / `read_only`, drops and recreates `occam_test`.<br>• MariaDB: clears `read_only`, drops and recreates `occam_test`.<br>• ClickHouse: synchronously drops (`DROP DATABASE ... SYNC`) and recreates `occam_test`.<br>• SQLite / DuckDB: stateless `:memory:` per-probe execution; if `--container-name` is passed, restarts/verifies the idle target container.<br>• Restarts or waits for the server/container after a crash.<br>• **Exit 0**: State cleanly reset and target ready.<br>• **Exit non-zero**: Infrastructure failure. This is the only clean infrastructure-error channel in Occam's predicate contract. |
 | **`OCCAM_WORKDIR`** | Occam provides a clean candidate temporary directory in `OCCAM_WORKDIR`, `TMPDIR`, `TMP`, and `TEMP`. The oracle uses it as the client working directory. |
 
-**Timeout ownership.** `crash_oracle.py` disables its own client timeout by default (`--timeout 0`). Under Occam, leave it disabled and let Occam's `--timeout` kill the whole process group. Occam starts its timer before reset, so an internal oracle timeout that fires first would turn an inconclusive candidate into a rejection. Pass `--timeout` only for standalone use.
+**Timeout ownership.** `occam-harness oracle` disables its own client timeout by default (`--timeout 0`). Under Occam, leave it disabled and let Occam's `--timeout` kill the whole process group. Occam starts its timer before reset, so an internal oracle timeout that fires first would turn an inconclusive candidate into a rejection. Pass `--timeout` only for standalone use.
 
 ---
 
@@ -119,9 +119,9 @@ docker run -d --name occam-target-duckdb --restart unless-stopped occam-target-d
 
 ---
 
-## 4. Crash Oracle (`crash_oracle.py`)
+## 4. Crash Oracle (`occam-harness oracle`)
 
-`harness/crash_oracle.py` executes candidate SQL from stdin, collects server logs or embedded engine status/stderr, validates crash signatures, and extracts normalized crash signatures for deduplication and RQ3 slippage analysis.
+`occam-harness oracle` executes candidate SQL from stdin, collects server logs or embedded engine status/stderr, validates crash signatures, and extracts normalized crash signatures for deduplication and RQ3 slippage analysis.
 
 ### Arguments
 
@@ -149,7 +149,7 @@ docker run -d --name occam-target-duckdb --restart unless-stopped occam-target-d
 
 ### Structured Crash Signatures & Slippage Tracking (RQ3)
 
-Whenever a fault is detected, `crash_oracle.py` builds a deterministic `crash_signature` record in `--decision-log` (and optionally stdout with `--print-signature`), stripping volatile PIDs, timestamps, ASLR `0x...` addresses, build directory prefixes, and signal/sanitizer wrapper frames (`__asan_*`, `handle_fatal_signal`, `BaseDaemon`, `abort`, etc.):
+Whenever a fault is detected, `occam-harness oracle` builds a deterministic `crash_signature` record in `--decision-log` (and optionally stdout with `--print-signature`), stripping volatile PIDs, timestamps, ASLR `0x...` addresses, build directory prefixes, and signal/sanitizer wrapper frames (`__asan_*`, `handle_fatal_signal`, `BaseDaemon`, `abort`, etc.):
 
 - **`id` / `hash`**: Canonical normalized identifier and 16-char SHA-256 hash across:
   - Sanitizer findings (`asan:<kind>:<top_non_wrapper_frame>` / `ubsan:<kind>:<loc>`)
@@ -162,14 +162,14 @@ Whenever a fault is detected, `crash_oracle.py` builds a deterministic `crash_si
 
 ```bash
 # PostgreSQL
-python3 harness/crash_oracle.py \
+occam-harness oracle \
   --dbms postgres --host 127.0.0.1 --port 5432 \
   --log-file /tmp/occam-pg-log/postgresql.log \
   --expected-signature "FailedAssertion.*subselect.c" \
   < candidate.sql
 
 # Embedded SQLite inside target container
-python3 harness/crash_oracle.py \
+occam-harness oracle \
   --dbms sqlite --container-name occam-target-sqlite \
   --expected-signature "sqlite3VdbeExec" \
   --print-signature \
@@ -178,9 +178,9 @@ python3 harness/crash_oracle.py \
 
 ---
 
-## 5. State Reset (`reset_db.sh`)
+## 5. State Reset (`occam-harness reset`)
 
-`harness/reset_db.sh` restores target database state before each candidate execution.
+`occam-harness reset` restores target database state before each candidate execution.
 
 - **PostgreSQL**: terminates active connections to `occam_test` and recreates it from `template_occam`.
 - **MySQL**: clears `super_read_only` / `read_only` globals (for cases such as `mysql_bug_91975`), then drops and recreates `occam_test`.
@@ -190,10 +190,10 @@ python3 harness/crash_oracle.py \
 - If a server/container died from a prior candidate crash, waits for recovery or restarts it within `--max-wait`.
 
 ```bash
-./harness/reset_db.sh --dbms postgres --container-name occam-target-pg
-./harness/reset_db.sh --dbms mariadb --container-name occam-target-mariadb
-./harness/reset_db.sh --dbms clickhouse --container-name occam-target-clickhouse
-./harness/reset_db.sh --dbms sqlite --container-name occam-target-sqlite
+occam-harness reset --dbms postgres --container-name occam-target-pg
+occam-harness reset --dbms mariadb --container-name occam-target-mariadb
+occam-harness reset --dbms clickhouse --container-name occam-target-clickhouse
+occam-harness reset --dbms sqlite --container-name occam-target-sqlite
 ```
 
 **Limitations.** Server resets are database-level, not cluster-level: roles, external extensions, other databases, and non-read-only global variables persist across candidates unless using fresh containers or template datadir restores.
@@ -206,15 +206,15 @@ python3 harness/crash_oracle.py \
 
 ```bash
 occam /path/to/crash_repro.sql \
-  --oracle "python3 harness/crash_oracle.py --dbms postgres --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
-  --reset "./harness/reset_db.sh --dbms postgres --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
+  --oracle "occam-harness oracle --dbms postgres --host 127.0.0.1 --port 5432 --log-file /tmp/occam-pg-log/postgresql.log --expected-signature 'TRAP: FailedAssertion'" \
+  --reset "occam-harness reset --dbms postgres --host 127.0.0.1 --port 5432 --container-name occam-target-pg" \
   --dialect postgresql \
   --timeout 10 \
   --jobs 1 \
   --out /tmp/occam-reduced.sql
 ```
 
-`--timeout 10` belongs to Occam. Do not also pass a smaller `--timeout` to `crash_oracle.py`; a nonzero oracle exit is a rejection, not a timeout.
+`--timeout 10` belongs to Occam. Do not also pass a smaller `--timeout` to `occam-harness oracle`; a nonzero oracle exit is a rejection, not a timeout.
 
 ---
 
@@ -238,6 +238,8 @@ docker run --rm --network host -v /tmp/sqlancer_pg:/fuzz_out \
 
 Builds SQUIRREL's mutators (`libsqlite_mutator.so`, `libmysql_mutator.so`, `libpostgresql_mutator.so`), `db_driver`, `AFLplusplus`, and an optional AFL++-instrumented target (`--build-arg SQUIRREL_TARGET=sqlite|postgresql|mysql|mariadb|all|none`, default `sqlite`).
 
+The driver calls `occam-harness` to generate its YAML from the compiled Dhall config. The image includes the helper. For a local checkout, build it with `cabal build exe:occam-harness` or set `OCCAM_HARNESS_BIN` to its path. Pass `--config FILE` to use an existing YAML file.
+
 ```bash
 docker build -t occam-fuzzer-squirrel -f harness/Dockerfile.fuzzer-squirrel .
 
@@ -253,12 +255,20 @@ Drives `sqlsmith` against PostgreSQL using `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSE
 
 ---
 
-## 8. Crash Harvesting (`collect_fuzzer_crashes.py`)
+## 8. Offline Artifact Collection
 
-Normalizes raw fuzzer outputs (`squirrel` `crashes/id:*`, `sqlancer` `.log`/`-cur.log` stripping Java stack traces and harness `DROP/CREATE DATABASE`/`\c` preambles, `sqlsmith`, or `raw`), deduplicates exact bytes, and optionally runs 5-replay verification + RQ3 crash-signature deduplication into a `manifest.json`:
+`occam-harness collect` imports existing `squirrel`, `sqlancer`, `sqlsmith`, or `raw` outputs, normalizes SQLancer logs, and deduplicates exact SQL bytes. It writes SQL under `cases/<sha256>.sql` and atomically publishes the `manifest.json` used by batch planning. An edited SQL file gets a new path on the next collection, so manifests from earlier runs still point to their original SQL.
 
 ```bash
-python3 harness/collect_fuzzer_crashes.py \
+cabal run -v0 occam-harness -- collect \
+  --source raw --dbms sqlite \
+  --input-dir /tmp/sql-inputs --out-dir /tmp/collected
+```
+
+`occam-harness collect --verify` uses the same collection command before clean-state replay verification and crash-signature deduplication.
+
+```bash
+cabal run -v0 occam-harness -- collect \
   --source sqlancer --dbms postgres \
   --input-dir /tmp/sqlancer_pg/logs/postgres \
   --out-dir /tmp/harvested_pg \
@@ -267,26 +277,30 @@ python3 harness/collect_fuzzer_crashes.py \
 
 ---
 
-## 9. Resumable Horizontal Batch Orchestrator (`batch_eval.py`)
+## 9. Resumable Horizontal Batch Orchestrator (`occam-harness batch`)
 
-`harness/batch_eval.py` coordinates multi-case, multi-profile, multi-repeat crash reductions across `--jobs` isolated worker containers (one target container per worker, with `--occam-jobs 1` enforced on server DBMSes sharing `occam_test`, or `--local-embedded` for local SQLite/DuckDB):
+`occam-harness batch` coordinates multi-case, multi-profile, multi-repeat crash reductions across `--jobs` isolated worker containers (one target container per worker with bind-mounted server logs, `--occam-jobs 1` enforced on server DBMSes sharing `occam_test`, `--containers` for pre-started containers, or `--local-embedded` for local SQLite/DuckDB):
 
-- **Phase 1 (Input 5-Replay Qualification)**: Replays each case 5 times on clean state (`reset_db.sh` + `crash_oracle.py --print-signature`), recording `baseline_signature` and filtering unstable cases (`skipped_unstable_input`).
+- **Phase 1 (Input 5-Replay Qualification)**: Replays each case 5 times on clean state via native `Occam.Harness.Replay` (`resetDb` + `probeCrashOracleCancellable`), recording `baseline_signature` and filtering unstable cases (`skipped_unstable_input`).
 - **Phase 2 (Resumable Reduction + Post-Reduction 5-Replay & RQ3 Slippage)**: Runs `occam` across profiles (`audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep`, or custom `--profile-spec`), verifies the reduced SQL with 5 clean-state replays, and records exact match vs RQ3 signature slippage.
 - **Resumability**: Commits per-run `job_result.json` atomically; re-running skips valid completed/censored checkpoints (`--rerun-failed` retries errors) and cleans partial artifacts. On `SIGINT`/`SIGTERM`, terminates active `occam` process groups and removes managed worker containers.
-- **Aggregation**: Produces `aggregated_stats.json` and `summary.md`, keeping `completed` separate from `timeout`/`execution-budget` censoring, computing Attempt-AUC and engine overhead, and stratifying results by unique crash signature (`by_signature`, `signature_stratified_by_profile`).
+- **Aggregation** writes `aggregated_stats.json` with per-run records, Attempt-AUC, engine overhead, and summaries by profile, DBMS, and crash signature. The JSON keeps completed runs separate from runs censored by time or execution budgets. Use `--aggregate-only` to refresh the JSON and tools such as `jq` or a notebook to build tables and charts from it.
+- **Barrier census** emits JSON with per-case, per-dialect, and corpus-wide counts from the Haskell frontend and dependency graph. Run `cabal run -v0 occam-harness -- barrier-census benchmarks/real_fuzz_corpus` to analyze the checked-in fixtures. Each SQL file needs a companion `.meta.json` with its dialect. Join the census and batch reports on `case_id`. The census counts declared barriers by reason and scope and includes graph-level barrier actions, statements, and edges.
 
 ```bash
-# Dry-run Stage 2 thesis plan from config/dhall/Experiment.dhall (71 cases x 6 profiles x 3 repeats)
-python3 harness/batch_eval.py \
+# Plan or execute Stage 2 from config/dhall/Experiment.dhall (71 cases x 6 profiles x 3 repeats)
+cabal run -v0 occam-harness -- batch \
   --plan stage2-thesis \
   --corpus-dir benchmarks/real_fuzz_corpus \
-  --out-dir occam-out/thesis_eval --dry-run
+  --out-dir occam-out/thesis_eval \
+  --dry-run
 ```
 
-Shared DBMS specs, ablation profiles, SQUIRREL YAML schemas, and experiment plans live in [`config/dhall/`](../config/dhall/) and compile deterministically to JSON under `config/generated/` (`make dhall-gen` / `make dhall-check`). Typed batch aggregation (`aggregated_stats.json` / `summary.md`), decision-log summaries, Dhall config validation, SQUIRREL YAML rendering, and SQLancer log sanitization run in the compiled Haskell helper [`occam-harness`](../app/HarnessMain.hs) (`cabal build occam-harness`).
+Shared DBMS specs, ablation profiles, SQUIRREL YAML schemas, and experiment plans live in [`config/dhall/`](../config/dhall/) and compile deterministically to JSON under `config/generated/` (`make dhall-gen` / `make dhall-check`). The compiled Haskell binary [`occam-harness`](../app/HarnessMain.hs) implements `oracle`, `reset`, `collect`, `batch`, `plan-batch`, `aggregate`, `barrier-census`, Dhall config validation, SQUIRREL YAML rendering, and SQLancer log sanitization (`cabal build exe:occam-harness`).
 
-GitHub Actions runs `make dhall-check` with the Dhall tools from the pinned Nix flake. Set `OCCAM_HARNESS_JSON` to use a custom `harness.json` with either SQUIRREL renderer. `OCCAM_HARNESS_CONFIG` is a fallback alias, and an explicit path passed to `occam-harness` takes precedence over both.
+`occam-harness plan-config PLAN` prints a typed experiment plan as JSON for a built-in name or a JSON or Dhall file, and `plan-batch` writes `plan.json` directly from corpus/manifest/raw-SQL inputs. Only a source `.dhall` plan needs `dhall-to-json` on `PATH`.
+
+GitHub Actions runs `make dhall-check` with the Dhall tools from the pinned Nix flake. Set `OCCAM_HARNESS_JSON` to use a custom `harness.json`; an explicit `--config` path passed to `occam-harness` takes precedence.
 
 ---
 
@@ -295,19 +309,21 @@ GitHub Actions runs `make dhall-check` with the Dhall tools from the pinned Nix 
 This harness executes untrusted SQL and is **not a sandbox**.
 
 - Target containers use passwordless/trust authentication; bind published ports to `127.0.0.1`, not all interfaces.
-- `crash_oracle.py` rejects line-leading psql backslash meta-commands by default, and passes `--binary-mode` to MySQL/MariaDB clients to disable `system`/`source`. `--allow-psql-meta` disables the psql protection.
+- `occam-harness oracle` rejects line-leading psql backslash meta-commands by default, and passes `--binary-mode` to MySQL/MariaDB clients to disable `system`/`source`. `--allow-psql-meta` disables the psql protection.
 - Server-side commands (`COPY ... FROM PROGRAM`, file/table functions) can still execute with DBMS process privileges. Use isolated containers and networks for untrusted corpora.
 - Passwords should be supplied through environment variables (`PGPASSWORD`, `MYSQL_PWD`, `MARIADB_PWD`, `CLICKHOUSE_PASSWORD`) rather than CLI `--password`.
 - Do not run this against a database you care about.
 
 ---
 
-## 11. Unit Tests
+## 11. Unit & End-to-End Tests
 
 ```bash
-python3 -m unittest discover -s harness -p "test_*.py" -v
-# or
+# Haskell oracle, reset, collect, N-replay, and batch orchestration suites
+cabal test occam-test --ghc-options=-Werror
+
+# Fuzzer bash driver & shellcheck suite
 make harness-check
 ```
 
-The suite uses mock DBMS clients, mock embedded binaries, mock fuzzer binaries, and mock `docker` commands (requiring neither a built `occam` binary nor live DBMS containers, while running an optional E2E check when `occam` is built) to verify exit-code contracts, server-log-only evidence for `postgres`/`mysql`/`mariadb`/`clickhouse`, `occam-exec`/local execution and anti-spoofing for `sqlite`/`duckdb`, OOM/`SQLITE_ABORT` handling, RQ3 crash signature normalization and slippage tracking, `reset_db.sh` state resets across all 6 DBMSes, SQLancer/SQUIRREL driver flag/env contracts, fuzzer crash collection/deduplication, and resumable `--jobs`-aligned batch orchestration + `stats.json` aggregation.
+`occam-test` exercises `Occam.Harness.{Regex,Signature,Evidence,DbmsExec,Reset,Oracle,Replay,Collect,Batch,BatchInputs,BatchPlan,Checkpoints,BatchReport}` using both pure/mocked targets (verifying server-log-only evidence across server DBMSes, embedded `occam-exec`/local execution and anti-spoofing for `sqlite`/`duckdb`, OOM/`SQLITE_ABORT` handling, RQ3 crash signature normalization and slippage tracking, resets across all 6 DBMSes, N-replay filtering/cancellation, container lifecycle/port recovery) and real `occam` end-to-end execution across all 6 ablation profiles, budgets, checkpoints, and `SIGINT` resume; `make harness-check` verifies SQLancer/SQUIRREL fuzzer driver flags and environment contracts (`test_fuzzer_drivers.py`).

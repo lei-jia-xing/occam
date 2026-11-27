@@ -67,14 +67,20 @@ Replaced `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary
 Eliminate ad-hoc hardcoded config dicts, env parsing, and bash YAML heredocs across `harness/` via strongly-typed Dhall (`config/dhall/`), keeping `lib:occam` / `exe:occam` free of Hackage `dhall` runtime bloat by compiling Dhall to deterministic JSON under `config/generated/` via `dhall-to-json` in dev/CI.
 *** Phase A: Dhall Toolchain & Typed Single-Source Schemas (`config/dhall/`) [DONE]
 - [X] Add `pkgs.dhall`, `pkgs.dhall-json`, and `pkgs.dhall-yaml` to `flake.nix` devShells and add `dhall-gen` / `dhall-check` targets to `Makefile` (`make check`) for static type-checking and zero-drift JSON verification.
-- [X] Define `DbmsSpecs.dhall` (`postgres | mysql | mariadb | clickhouse | sqlite | duckdb`) covering `occam_dialect`, `container_image`, `default_port`, `default_db`, and `server_based`; fix `"mariadb": "mysql"` dialect drift in `harness/collect_fuzzer_crashes.py` (`DBMS_TO_OCCAM_DIALECT`).
+- [X] Define `DbmsSpecs.dhall` (`postgres | mysql | mariadb | clickhouse | sqlite | duckdb`) covering `occam_dialect`, `container_image`, `default_port`, `default_db`, and `server_based`. Use the compiled DBMS spec for the collector dialect, including MariaDB.
 - [X] Define `Experiment.dhall` and `Profiles.dhall` unifying `harness/batch_eval.py` (`DEFAULT_IMAGES`, `DEFAULT_CONTAINER_PORTS`, `BUILTIN_PROFILES`: `audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep`, plus `--plan`), `harness/crash_oracle.py` oracle knobs (`ORACLE_TIMEOUT`, `ORACLE_STACK_FRAMES`, `ORACLE_REJECT_ON_SLIPPAGE`), and Stage 2 repeats/budget settings.
-- [X] Replace `harness/squirrel_driver.sh` `cat <<EOF` YAML heredocs with `harness/dhall_config.py render-squirrel-yaml` driven by typed `config/dhall/Squirrel.dhall` specs (copied into `harness/Dockerfile.fuzzer-squirrel` cleanly).
+- [X] Generate SQUIRREL YAML from the specs in `config/dhall/Squirrel.dhall` and ship the compiled config in `harness/Dockerfile.fuzzer-squirrel`.
 *** Phase B: Occam CLI `--config` & Python Script Consolidation
 - [X] Add `--config <json>` to `app/Options.hs` / `app/Options/Parser.hs` (`RawOptions` decoded via existing `aeson`, with explicit CLI flags overriding config defaults) plus Dhall presets (`config/dhall/profiles/*.dhall` -> `config/generated/profiles/*.json`) and `CliChecks` syncing `--print-defaults` against `config/generated/occam_defaults.json`.
-- [X] Extract reporting, metrics, sanitization, and Dhall config/YAML validation into typed Haskell (`app/HarnessMain.hs`, `Occam.Benchmark.BatchReport`, `Occam.Harness.{Cli,Config,SqlancerSanitize}` -> `exe:occam-harness`): eliminated duplicated AUC/overhead/aggregation/Markdown reporting and SQLancer regex sanitization from `harness/batch_eval.py` and `harness/collect_fuzzer_crashes.py`.
-- [X] Run Dhall type and JSON drift checks in CI, align Haskell decoding with optional and fractional schema fields, and share `OCCAM_HARNESS_JSON` across both SQUIRREL renderers.
-- [ ] Migrate remaining Python container execution, qualification/replay workers, and crash-signature classifiers (`harness/batch_eval.py`, `harness/collect_fuzzer_crashes.py`, `harness/crash_oracle.py`) into `occam-harness`.
+- [X] Move batch aggregation, AUC and overhead metrics, SQLancer log sanitization, and Dhall config/YAML validation into typed Haskell (`exe:occam-harness`). Emit structured batch data in `aggregated_stats.json` for external reporting tools.
+- [X] Run Dhall type and JSON drift checks in CI, align Haskell decoding with optional and fractional schema fields, and standardize harness config overrides on `OCCAM_HARNESS_JSON`.
+- [X] Use the Haskell SQUIRREL YAML renderer in the local driver. Remove the Python renderer and its command-line entry points.
+- [X] Verify the Haskell renderer in the `squirrel-config` container build stage and run the SQUIRREL driver in dry-run mode for SQLite, PostgreSQL, MySQL, and MariaDB.
+- [X] Verify compiled DBMS specs and profile presets in the Haskell test suite. Keep configuration integration tests with their respective drivers and remove `harness/test_dhall_config.py`.
+- [X] Move batch input selection, validation, image resolution, and experiment plan loading to `occam-harness`. Remove `harness/dhall_config.py` and use the native commands from the existing batch entry point.
+- [X] Generate `plan.json` with `occam-harness plan-batch`, including profile resolution, job IDs, and worker settings. The Python batch runner consumes the same plan and preserves existing checkpoint fingerprints.
+- [X] Move offline artifact discovery, SQLancer cleanup, exact-byte deduplication, and manifest generation to `occam-harness collect`. Existing verification consumes the same manifest.
+- [X] Migrate remaining Python container execution, qualification/replay workers, and crash-signature classifiers (`harness/batch_eval.py`, `harness/collect_fuzzer_crashes.py`, `harness/crash_oracle.py`, `harness/reset_db.sh`) into native `occam-harness` (`oracle`, `reset`, `collect --verify`, `batch`, unified `Occam.Harness.*` ADTs), bind-mount worker logs cleanly, port all tests to `occam-test`, and remove legacy Python runner scripts & mirrors.
 
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (DONE)
@@ -82,7 +88,8 @@ Eliminate ad-hoc hardcoded config dicts, env parsing, and bash YAML heredocs acr
 *** Stage 2: Server-backed corpus build, barrier census & thesis evaluation
 - [ ] Build all 6 target images on rented server and verify end-to-end reproduction and reduction on `benchmarks/real_fuzz_corpus/` (including Fossil snapshots for historical SQLite bugs).
 - [ ] Run a 24-48h multi-DBMS fuzzing pilot to measure crash yield, deduplicated signature count, and per-case reduction cost.
-- [ ] Evidence-driven semantic barrier census across real collected crashes after switching to the Haskell frontend.
+- [X] Measure semantic barriers in the 71 checked-in real fuzz cases with `occam-harness barrier-census`. The Haskell frontend found 383 statements, 0 syntax errors, and 42 cases with global fences.
+- [ ] Refresh the semantic barrier census on the Stage 2 corpus after collecting the new cases.
 - [ ] Execute full RQ1-RQ4 thesis experiments (`audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep` x 3 repeats), reporting results stratified by unique crash signature.
 
 ** TODO [#B] Reducer & runtime follow-ups

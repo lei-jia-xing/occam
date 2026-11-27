@@ -1,12 +1,16 @@
 module BatchReportChecks (tests) where
 
 import Control.Exception.Safe (finally)
-import Data.Aeson (Value (..), decodeStrict', encode, object, (.=))
+import Control.Monad (forM_)
+import Data.Aeson (Value (..), decode, decodeStrict', encode, object, toJSON, (.=))
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BSL
+import Data.Foldable (toList)
 import Data.List (isInfixOf)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
+import Data.Maybe (maybeToList)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Occam.Benchmark.BatchReport (
@@ -19,7 +23,6 @@ import Occam.Benchmark.BatchReport (
     SignatureProfileStratified (..),
     aggregateOutDir,
     metricSummary,
-    renderSummaryMarkdown,
     summarizeDecisionLog,
     summarizeDecisionLogBytes,
  )
@@ -31,11 +34,20 @@ import Occam.Evaluation (
     MinimalityClaim (..),
     Stats (..),
  )
+import Occam.Harness.BarrierCensus (barrierCensus)
+import Occam.Harness.BatchInputs (BatchInputOptions (..), BatchInputSource (..), loadBatchInputs)
 import Occam.Harness.Cli (HarnessCommand (..), parseHarnessArgs)
+import Occam.Harness.Collect (ArtifactSource (..), collectArtifacts, defaultCollectOptions)
 import Occam.Harness.Config (
+    DbmsSpec (..),
+    ExperimentPlan (..),
     HarnessConfig (..),
+    OracleDefaults (..),
+    ReductionProfile (..),
     SquirrelRenderOptions (..),
+    loadExperimentPlan,
     loadHarnessConfig,
+    lookupDbmsSpec,
     lookupSquirrelSpec,
     renderSquirrelYaml,
     resolveHarnessConfigPath,
@@ -95,6 +107,142 @@ tests =
         , testCase "summarizeDecisionLog handles missing path" do
             summary <- summarizeDecisionLog "/nonexistent/oracle_decisions.jsonl"
             assertEqual "empty summary" (DecisionSummary 0 0 0 0 0 0 []) summary
+        , testCase "batch inputs resolve image precedence and keep normalized case metadata" do
+            withTempDir "occam-batch-inputs-check" \outDir -> do
+                config <- either assertFailure pure =<< loadHarnessConfig "config/generated/harness.json"
+                forM_ ["a", "b", "c", "d"] \name -> BSC.writeFile (outDir </> name <> ".sql") "SELECT 1;"
+                let entry cid dbms version =
+                        object
+                            [ "id" .= (cid :: T.Text)
+                            , "dbms" .= (dbms :: T.Text)
+                            , "version" .= (version :: T.Text)
+                            , "file" .= (T.unpack cid <> ".sql")
+                            , "image" .= ("metadata-image" :: T.Text)
+                            ]
+                    inputs = [entry "a" "sqlite3" "1", entry "b" "sqlite" "1", entry "c" "sqlite" "2", entry "d" "duckdb" "1"]
+                    source = outDir </> "manifest.json"
+                    options =
+                        BatchInputOptions
+                            (ManifestFile source)
+                            ""
+                            ""
+                            ""
+                            ""
+                            ["sqlite=dbms-image", "sqlite@1=version-image", "case:a=case-image"]
+                BSL.writeFile source (encode (object ["cases" .= inputs]))
+                report <- either assertFailure (pure . toJSON) =<< loadBatchInputs config options
+                case report of
+                    Array rows ->
+                        assertEqual
+                            "case ordering, normalized DBMS, and image overrides"
+                            [ [String "d", String "duckdb", String "metadata-image"]
+                            , [String "a", String "sqlite", String "case-image"]
+                            , [String "c", String "sqlite", String "dbms-image"]
+                            , [String "b", String "sqlite", String "version-image"]
+                            ]
+                            [ [value | key <- ["id", "dbms", "image"], Just value <- [KM.lookup key row]]
+                            | Object row <- toList rows
+                            ]
+                    other -> assertFailure ("Unexpected batch inputs: " <> show other)
+        , testCase "raw batch inputs preserve dotfile stems and duplicate suffixes" do
+            withTempDir "occam-batch-raw-inputs-check" \outDir -> do
+                config <- either assertFailure pure =<< loadHarnessConfig "config/generated/harness.json"
+                let hidden = outDir </> ".sql"
+                    throughParent = outDir </> "absent" </> ".." </> ".sql"
+                    options = BatchInputOptions (SqlFiles (hidden :| [throughParent])) "sqlite" "" "" "" []
+                BSC.writeFile hidden "SELECT 1;"
+                report <- either assertFailure (pure . toJSON) =<< loadBatchInputs config options
+                case report of
+                    Array rows ->
+                        assertEqual
+                            "legacy paths and job ID stems"
+                            [(Just (String "sql"), Just (toJSON hidden)), (Just (String "sql_2"), Just (toJSON hidden))]
+                            [(KM.lookup "id" row, KM.lookup "file" row) | Object row <- toList rows]
+                    other -> assertFailure ("Unexpected raw batch inputs: " <> show other)
+        , testCase "collect publishes batch manifests without changing earlier SQL snapshots" do
+            withTempDir "occam-collect-check" \inputDir -> do
+                config <- either assertFailure pure =<< loadHarnessConfig "config/generated/harness.json"
+                let output = inputDir </> "collected"
+                    first = inputDir </> "a.sql"
+                    second = inputDir </> "b.sql"
+                    options = defaultCollectOptions Raw "sqlite3" inputDir output
+                    manifestPath = output </> "manifest.json"
+                    batchOptions = BatchInputOptions (ManifestFile manifestPath) "" "" "" "" []
+                    importCase count = do
+                        summary <- either assertFailure pure =<< collectArtifacts config options
+                        case summary of
+                            Object fields -> do
+                                assertEqual
+                                    "input discovery count"
+                                    (Just (Number count))
+                                    (KM.lookup "raw_candidates_discovered" fields)
+                                assertEqual "manifest case count" (Just (Number 1)) (KM.lookup "manifest_case_count" fields)
+                            other -> assertFailure ("Unexpected collection summary: " <> show other)
+                        cases <- either assertFailure pure =<< loadBatchInputs config batchOptions
+                        case map toJSON cases of
+                            [Object item] -> do
+                                assertEqual "case ID" (Just (String "a")) (KM.lookup "id" item)
+                                assertEqual "normalized DBMS" (Just (String "sqlite")) (KM.lookup "dbms" item)
+                                case KM.lookup "file" item of
+                                    Just (String path) -> pure (T.unpack path)
+                                    other -> assertFailure ("Missing case path: " <> show other)
+                            other -> assertFailure ("Unexpected batch inventory: " <> show other)
+                BSC.writeFile first "SELECT 1;"
+                BSC.writeFile second "SELECT 1;"
+                old <- importCase 2
+                BSC.writeFile first "SELECT 2;"
+                BSC.writeFile second " \n"
+                latest <- importCase 1
+                assertBool "new SQL receives a different path" (old /= latest)
+                assertEqual "previous SQL stays readable" "SELECT 1;" =<< BSC.readFile old
+                assertEqual "new manifest points to changed SQL" "SELECT 2;" =<< BSC.readFile latest
+        , testCase "experiment plan loading preserves named plans and fills nested JSON defaults" do
+            withTempDir "occam-experiment-plan-check" \outDir -> do
+                let configPath = "config/generated/harness.json"
+                    planPath = outDir </> "partial.json"
+                config <- either assertFailure pure =<< loadHarnessConfig configPath
+                named <- either assertFailure pure =<< loadExperimentPlan configPath config "stage2-thesis"
+                assertEqual "named plan repeats" 3 (planRepeats named)
+                BSC.writeFile planPath "{\"repeats\":2,\"budget_secs\":0.25,\"oracle\":{\"stack_frames\":7}}"
+                custom <- either assertFailure pure =<< loadExperimentPlan configPath config (T.pack planPath)
+                assertEqual "custom repeats" 2 (planRepeats custom)
+                assertEqual "custom budget" (Just 0.25) (planBudgetSecs custom)
+                assertEqual "default worker count" 1 (planWorkerJobs custom)
+                assertEqual "custom stack frames" 7 (odStackFrames (planOracle custom))
+                assertEqual "default slippage setting" False (odRejectOnSlippage (planOracle custom))
+        , testCase "barrier census reports syntax fallback fences and normalizes dialect aliases" do
+            withTempDir "occam-barrier-census-check" \outDir -> do
+                BSC.writeFile (outDir </> "valid.sql") "SELECT 1;"
+                BSC.writeFile (outDir </> "valid.meta.json") "{\"dialect\":\"sqlite\"}"
+                BSC.writeFile (outDir </> "invalid.sql") "SELECT FROM;"
+                BSC.writeFile
+                    (outDir </> "invalid.meta.json")
+                    "{\"id\":\"bad-sql\",\"target\":{\"dbms\":\"postgres\"}}"
+                result <- barrierCensus outDir
+                case result of
+                    Right (Object obj) -> do
+                        case KM.lookup "overall" obj of
+                            Just (Object overall) -> do
+                                assertEqual "two fixture cases" (Just (Number 2)) (KM.lookup "case_count" overall)
+                                assertEqual "one syntax error" (Just (Number 1)) (KM.lookup "syntax_errors" overall)
+                                assertEqual "one global fence" (Just (Number 1)) (KM.lookup "cases_with_global_fences" overall)
+                                assertEqual
+                                    "fallback barrier counted by reason"
+                                    (Just (object ["SyntaxErrorBarrier" .= (1 :: Int)]))
+                                    (KM.lookup "declared_by_reason" overall)
+                            other -> assertFailure ("Unexpected overall census: " <> show other)
+                        case KM.lookup "by_dialect" obj of
+                            Just (Object byDialect) ->
+                                assertBool "normalizes the postgres alias" (KM.member "postgresql" byDialect)
+                            other -> assertFailure ("Unexpected dialect summaries: " <> show other)
+                        case KM.lookup "cases" obj of
+                            Just (Array cases) ->
+                                assertEqual
+                                    "IDs match batch metadata and filename fallback"
+                                    [Just (String "bad-sql"), Just (String "valid")]
+                                    [KM.lookup "case_id" row | Object row <- toList cases]
+                            other -> assertFailure ("Unexpected census cases: " <> show other)
+                    other -> assertFailure ("Unexpected barrier census: " <> show other)
         , testCase "metricSummary computes median/mean/min/max for odd and even counts" do
             assertEqual "empty list" Nothing (metricSummary [])
             assertEqual
@@ -105,37 +253,64 @@ tests =
                 "even list"
                 (Just (MetricSummary 4 25.0 30.0 10.0 60.0))
                 (metricSummary [60.0, 10.0, 30.0, 20.0])
-        , testCase "aggregateOutDir computes stratified metrics, full Stats decoding, and Markdown" do
+        , testCase "aggregateOutDir decodes full Stats and writes JSON with stratified metrics" do
             withTempDir "occam-batch-report" \outDir -> do
                 let writeJson p val = do
                         createDirectoryIfMissing True (takeDirectory p)
                         BSL.writeFile p (encode val)
+                let sampleSig sid =
+                        object
+                            [ "id" .= (sid :: T.Text)
+                            , "hash" .= (sid <> "_hash")
+                            , "category" .= ("assertion" :: T.Text)
+                            , "frames" .= ([] :: [T.Text])
+                            , "top_frames" .= (5 :: Int)
+                            ]
+                    emptyReplay qualifiedFlag sig =
+                        object
+                            [ "runs_required" .= (5 :: Int)
+                            , "runs_passed" .= (if qualifiedFlag then 5 else 0 :: Int)
+                            , "all_passed" .= qualifiedFlag
+                            , "consistent_signature" .= qualifiedFlag
+                            , "baseline_signature" .= sig
+                            , "matches_baseline" .= (Nothing :: Maybe Bool)
+                            , "slippage_count" .= (0 :: Int)
+                            , "observed_signatures" .= maybeToList sig
+                            , "observed_signature_ids" .= ([] :: [T.Text])
+                            , "interrupted" .= False
+                            , "runs" .= ([] :: [Value])
+                            ]
                 writeJson (outDir </> "qualified" </> "c1" </> "input_replay.json") $
                     object
                         [ "case_id" .= ("c1" :: T.Text)
                         , "dbms" .= ("sqlite" :: T.Text)
                         , "qualified" .= True
-                        , "baseline_signature_id" .= ("sig-A" :: T.Text)
+                        , "baseline_signature" .= sampleSig "sig-A"
+                        , "replay" .= emptyReplay True (Just (sampleSig "sig-A"))
                         ]
                 writeJson (outDir </> "qualified" </> "c2" </> "input_replay.json") $
                     object
                         [ "case_id" .= ("c2" :: T.Text)
                         , "dbms" .= ("sqlite" :: T.Text)
                         , "qualified" .= True
-                        , "baseline_signature_id" .= ("sig-A" :: T.Text)
+                        , "baseline_signature" .= sampleSig "sig-A"
+                        , "replay" .= emptyReplay True (Just (sampleSig "sig-A"))
                         ]
                 writeJson (outDir </> "qualified" </> "c3" </> "input_replay.json") $
                     object
                         [ "case_id" .= ("c3" :: T.Text)
                         , "dbms" .= ("postgres" :: T.Text)
                         , "qualified" .= True
-                        , "baseline_signature_id" .= ("sig-B" :: T.Text)
+                        , "baseline_signature" .= sampleSig "sig-B"
+                        , "replay" .= emptyReplay True (Just (sampleSig "sig-B"))
                         ]
                 writeJson (outDir </> "qualified" </> "c_bad" </> "input_replay.json") $
                     object
                         [ "case_id" .= ("c_bad" :: T.Text)
                         , "dbms" .= ("postgres" :: T.Text)
                         , "qualified" .= False
+                        , "baseline_signature" .= (Nothing :: Maybe Value)
+                        , "replay" .= emptyReplay False (Nothing :: Maybe Value)
                         ]
 
                 let statsDir = outDir </> "runs"
@@ -252,7 +427,7 @@ tests =
                                 , "eval_status" .= (Nothing :: Maybe T.Text)
                                 , "initial_bytes" .= (200 :: Int)
                                 , "input_qualified" .= True
-                                , "baseline_signature_id" .= sig
+                                , "baseline_signature" .= sampleSig sig
                                 , "stats_path" .= statsFile
                                 , "reduced_replay_verification"
                                     .= object
@@ -306,15 +481,8 @@ tests =
                             (Just 75.0)
                             (msMedian <$> spsCompletedSignatureMedianReducedBytes strat)
 
-                let md = renderSummaryMarkdown agg
-                assertBool
-                    "Markdown heading present"
-                    ("# Occam Horizontal Batch Evaluation Summary" `T.isInfixOf` md)
-                assertBool "Markdown Ours-S row present" ("| `Ours-S` | 3 / 4 | 1 |" `T.isInfixOf` md)
-                aggExists <- doesFileExist (outDir </> "aggregated_stats.json")
-                mdExists <- doesFileExist (outDir </> "summary.md")
-                assertBool "aggregated_stats.json created" aggExists
-                assertBool "summary.md created" mdExists
+                report <- BSL.readFile (outDir </> "aggregated_stats.json")
+                assertEqual "persisted report" (Just (toJSON agg)) (decode report)
         , testCase "aggregateOutDir decodes minimal partial curve points cleanly" do
             withTempDir "occam-partial-curve" \outDir -> do
                 let rdir = outDir </> "runs" </> "j_partial"
@@ -364,6 +532,30 @@ tests =
                             "AUC with partial point"
                             (Just 0.5)
                             (msMedian <$> subAttemptAuc (gsCompletedOnly prof))
+        , testCase "compiled harness DBMS specs and reducer presets agree" do
+            let generated = "config" </> "generated"
+            config <- either assertFailure pure =<< loadHarnessConfig (generated </> "harness.json")
+            assertEqual
+                "six DBMS IDs"
+                ["postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb"]
+                (map dbmsId (hcDbms config))
+            assertEqual
+                "PostgreSQL CLI dialect"
+                (Just "postgresql")
+                (dbmsOccamDialect <$> lookupDbmsSpec config "postgres")
+            assertEqual
+                "MariaDB CLI dialect"
+                (Just "mariadb")
+                (dbmsOccamDialect <$> lookupDbmsSpec config "mariadb")
+            assertEqual
+                "built-in profile names"
+                ["audit-only", "ddmin-only", "ours-s", "ours-si", "ours-full", "ours-nodep"]
+                (map profileKey (hcProfiles config))
+            forM_ (hcProfiles config) \profile -> do
+                let key = T.unpack (profileKey profile)
+                preset <- BSL.readFile (generated </> "profiles" </> (key <> ".json"))
+                assertEqual (key <> " JSON preset") (Just (profileConfig profile)) (decode preset)
+                assertBool (key <> " strategy flag") ("--strategy" `elem` profileCliFlags profile)
         , testCase "Harness.Config decodes real config/generated/harness.json and renders SQUIRREL YAML" do
             cfgPath <- resolveHarnessConfigPath Nothing
             exists <- doesFileExist cfgPath

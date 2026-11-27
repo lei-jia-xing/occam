@@ -49,6 +49,7 @@ data SqlancerSanitizeResult = SqlancerSanitizeResult
     deriving (Eq, Show)
 
 instance ToJSON SqlancerSanitizeResult where
+    toJSON :: SqlancerSanitizeResult -> Value
     toJSON res =
         object
             [ "sql" .= TE.decodeUtf8With TEE.lenientDecode (sanitizedSql res)
