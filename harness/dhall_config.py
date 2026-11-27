@@ -19,8 +19,10 @@ DEFAULT_HARNESS_JSON = os.path.join(REPO_ROOT, "config", "generated", "harness.j
 
 
 def _locate_harness_json():
+    override = os.environ.get("OCCAM_HARNESS_JSON") or os.environ.get("OCCAM_HARNESS_CONFIG")
+    if override:
+        return override
     candidates = [
-        os.environ.get("OCCAM_HARNESS_JSON", "").strip(),
         DEFAULT_HARNESS_JSON,
         os.path.join(HARNESS_DIR, "harness.json"),
         "/usr/local/share/occam/config/generated/harness.json",
@@ -128,13 +130,47 @@ def load_experiment_plan(plan_ref):
     return load_json_or_dhall(key, kind="plans")
 
 
+def resolve_repo_binary(binary_name, env_var, explicit_path=""):
+    if explicit_path:
+        path = os.path.abspath(os.path.expanduser(explicit_path))
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise FileNotFoundError(f"{binary_name} binary is not executable: {path}")
+        return path
+
+    env_bin = os.environ.get(env_var, "").strip()
+    if env_bin:
+        path = os.path.abspath(os.path.expanduser(env_bin))
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    which_bin = shutil.which(binary_name)
+    if which_bin:
+        return which_bin
+
+    dist_dir = os.path.join(REPO_ROOT, "dist-newstyle")
+    if os.path.isdir(dist_dir):
+        matches = []
+        for dirpath, _, filenames in os.walk(dist_dir):
+            if binary_name in filenames and os.path.basename(dirpath) == binary_name:
+                cand = os.path.join(dirpath, binary_name)
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    matches.append((os.path.getmtime(cand), cand))
+        if matches:
+            matches.sort(reverse=True)
+            return matches[0][1]
+
+    raise FileNotFoundError(
+        f"Could not locate '{binary_name}' binary. Set {env_var} or build with 'cabal build all'."
+    )
+
+
 def _yaml_quote(value):
     escaped = str(value).replace("'", "''")
     return f"'{escaped}'"
 
 
 def _yaml_list(items):
-    return "[" + ", ".join(json.dumps(item) for item in items) + "]"
+    return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in items) + "]"
 
 
 def render_squirrel_yaml(

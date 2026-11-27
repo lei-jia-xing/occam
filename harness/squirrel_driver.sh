@@ -371,24 +371,29 @@ elif [[ "$SQUIRREL_DBMS" == "mysql" || "$SQUIRREL_DBMS" == "mariadb" ]]; then
     DB_NAME="${DB_NAME:-test}"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DHALL_CFG_HELPER=""
-for _cand in \
-    "${SCRIPT_DIR}/dhall_config.py" \
-    "/usr/local/share/occam/harness/dhall_config.py"; do
-    if [[ -f "$_cand" ]]; then
-        DHALL_CFG_HELPER="$_cand"
-        break
-    fi
-done
-
 if [[ -z "$CONFIG_FILE" ]]; then
     CONFIG_FILE="${OUTPUT_DIR}/squirrel_config_${SQUIRREL_DBMS}.yml"
-    if [[ -z "$DHALL_CFG_HELPER" ]]; then
-        echo "Error: could not locate dhall_config.py for SQUIRREL YAML rendering." >&2
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_CONFIG="${SCRIPT_DIR}/../config/generated/harness.json"
+    if [[ -z "${OCCAM_HARNESS_JSON:-}${OCCAM_HARNESS_CONFIG:-}" && -f "$REPO_CONFIG" ]]; then
+        export OCCAM_HARNESS_JSON="$REPO_CONFIG"
+    fi
+
+    HARNESS_BIN="${OCCAM_HARNESS_BIN:-}"
+    if [[ -z "$HARNESS_BIN" ]] && command -v occam-harness >/dev/null 2>&1; then
+        HARNESS_BIN="$(command -v occam-harness)"
+    fi
+    if [[ -n "$HARNESS_BIN" && -x "$HARNESS_BIN" ]]; then
+        RENDERER=("$HARNESS_BIN")
+    elif [[ -f "${SCRIPT_DIR}/dhall_config.py" ]]; then
+        RENDERER=(python3 "${SCRIPT_DIR}/dhall_config.py")
+    elif [[ -f "/usr/local/share/occam/harness/dhall_config.py" ]]; then
+        RENDERER=(python3 "/usr/local/share/occam/harness/dhall_config.py")
+    else
+        echo "Error: could not locate occam-harness or dhall_config.py for SQUIRREL YAML rendering." >&2
         exit 1
     fi
-    python3 "$DHALL_CFG_HELPER" render-squirrel-yaml \
+    "${RENDERER[@]}" render-squirrel-yaml \
         --dbms "$SQUIRREL_DBMS" \
         --squirrel-home "$SQUIRREL_HOME" \
         --host "$HOST" \

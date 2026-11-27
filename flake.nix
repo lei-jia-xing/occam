@@ -57,6 +57,7 @@
             fi
             echo "Occam dev environment ready (GHC $(ghc --numeric-version), Cabal $(cabal --numeric-version))"
           '';
+          dhallInputs = with pkgs; [ dhall dhall-json ];
           baseInputs = with pkgs; [
             ghc
             cabal-install
@@ -64,16 +65,19 @@
             fourmolu
             hlint
             elan
-            dhall
-            dhall-json
             dhall-yaml
             python3
             duckdb
             libpg_query
             bashInteractive
-          ];
+          ] ++ dhallInputs;
         in
         {
+          dhall = pkgs.mkShell {
+            name = "occam-dhall";
+            nativeBuildInputs = dhallInputs;
+          };
+
           default = pkgs.mkShell {
             name = "occam-dev";
             nativeBuildInputs = baseInputs;

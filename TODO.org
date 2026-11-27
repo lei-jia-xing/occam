@@ -72,7 +72,9 @@ Eliminate ad-hoc hardcoded config dicts, env parsing, and bash YAML heredocs acr
 - [X] Replace `harness/squirrel_driver.sh` `cat <<EOF` YAML heredocs with `harness/dhall_config.py render-squirrel-yaml` driven by typed `config/dhall/Squirrel.dhall` specs (copied into `harness/Dockerfile.fuzzer-squirrel` cleanly).
 *** Phase B: Occam CLI `--config` & Python Script Consolidation
 - [X] Add `--config <json>` to `app/Options.hs` / `app/Options/Parser.hs` (`RawOptions` decoded via existing `aeson`, with explicit CLI flags overriding config defaults) plus Dhall presets (`config/dhall/profiles/*.dhall` -> `config/generated/profiles/*.json`) and `CliChecks` syncing `--print-defaults` against `config/generated/occam_defaults.json`.
-- [ ] Slim down or replace remaining Python harness orchestration (`harness/batch_eval.py` 2.3k LoC, `harness/collect_fuzzer_crashes.py`, `harness/crash_oracle.py`): migrate container/execution/reporting pipelines from Python into typed Haskell or minimal thin wrappers now that configuration is cleanly factored into Dhall.
+- [X] Extract reporting, metrics, sanitization, and Dhall config/YAML validation into typed Haskell (`app/HarnessMain.hs`, `Occam.Benchmark.BatchReport`, `Occam.Harness.{Cli,Config,SqlancerSanitize}` -> `exe:occam-harness`): eliminated duplicated AUC/overhead/aggregation/Markdown reporting and SQLancer regex sanitization from `harness/batch_eval.py` and `harness/collect_fuzzer_crashes.py`.
+- [X] Run Dhall type and JSON drift checks in CI, align Haskell decoding with optional and fractional schema fields, and share `OCCAM_HARNESS_JSON` across both SQUIRREL renderers.
+- [ ] Migrate remaining Python container execution, qualification/replay workers, and crash-signature classifiers (`harness/batch_eval.py`, `harness/collect_fuzzer_crashes.py`, `harness/crash_oracle.py`) into `occam-harness`.
 
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (DONE)

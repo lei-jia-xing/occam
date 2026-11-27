@@ -178,22 +178,6 @@ class TestBatchEval(unittest.TestCase):
         self.assertIn("--column-mode", profs[4]["flags"])
         self.assertIn("atomic", profs[4]["flags"])
 
-        # Stepwise AUC check: initial=100, at call 1->50, total=4 -> (50+50+50+50)/(100*4) = 0.5
-        auc = batch_eval.compute_attempt_auc(
-            100,
-            [{"point_call_index": 1, "point_candidate_bytes": 50, "point_accepted": True}],
-            4,
-        )
-        self.assertAlmostEqual(auc, 0.5, places=6)
-
-        stats = _make_sample_stats()
-        self.assertEqual(
-            batch_eval.compute_engine_overhead_us(
-                stats["evaluation_metrics"]["evaluation_cost_attribution"]
-            ),
-            300 + 80 + 120,
-        )
-
     def test_cli_validation_contracts_and_dry_run_real_corpus(self):
         with tempfile.TemporaryDirectory() as td:
             # 1. --occam-jobs > 1 on server DBMS must fail fast (exit 2)

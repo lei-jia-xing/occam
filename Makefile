@@ -92,37 +92,34 @@ dhall-gen:
 	if command -v dhall-to-json >/dev/null 2>&1; then \
 		bash -c "$$gen_cmd"; \
 	else \
-		nix develop --command bash -c "$$gen_cmd"; \
+		nix develop .#dhall --command bash -c "$$gen_cmd"; \
 	fi
 
 dhall-check:
 	@chk_cmd=' \
 		set -eo pipefail; \
 		for f in config/dhall/*.dhall config/dhall/profiles/*.dhall config/dhall/plans/*.dhall; do \
-			dhall type --quiet --file "$$f"; \
+			dhall type --quiet --file "$$f" > /dev/null; \
 		done; \
 		tmp=$$(mktemp -d); \
 		trap "rm -rf \"$$tmp\"" EXIT; \
 		mkdir -p "$$tmp/profiles" "$$tmp/plans"; \
 		dhall-to-json --file config/dhall/Harness.dhall > "$$tmp/harness.json"; \
 		dhall-to-json --file config/dhall/OccamDefaultsJson.dhall > "$$tmp/occam_defaults.json"; \
-		diff -u config/generated/harness.json "$$tmp/harness.json"; \
-		diff -u config/generated/occam_defaults.json "$$tmp/occam_defaults.json"; \
 		for f in config/dhall/profiles/*.dhall; do \
 			name=$$(basename "$$f" .dhall); \
 			dhall-to-json --file "$$f" > "$$tmp/profiles/$${name}.json"; \
-			diff -u "config/generated/profiles/$${name}.json" "$$tmp/profiles/$${name}.json"; \
 		done; \
 		for f in config/dhall/plans/*.dhall; do \
 			name=$$(basename "$$f" .dhall); \
 			dhall-to-json --file "$$f" > "$$tmp/plans/$${name}.json"; \
-			diff -u "config/generated/plans/$${name}.json" "$$tmp/plans/$${name}.json"; \
 		done; \
+		diff -ru config/generated "$$tmp"; \
 	'; \
 	if command -v dhall >/dev/null 2>&1 && command -v dhall-to-json >/dev/null 2>&1; then \
 		bash -c "$$chk_cmd"; \
 	else \
-		nix develop --command bash -c "$$chk_cmd"; \
+		nix develop .#dhall --command bash -c "$$chk_cmd"; \
 	fi
 
 check: fmt-check lint build-check dhall-check test harness-check proof-check

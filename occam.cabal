@@ -200,6 +200,21 @@ executable occam
                       eval-lib/cbits/sqlite_authorizer.c
     hs-source-dirs:   app eval-lib
 
+executable occam-harness
+    import:           warnings, language, core-deps, io-deps
+    main-is:          HarnessMain.hs
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
+    other-modules:    Occam.Benchmark.BatchReport
+                    , Occam.Benchmark.Metrics
+                    , Occam.Harness.Cli
+                    , Occam.Harness.Config
+                    , Occam.Harness.SqlancerSanitize
+    build-depends:    occam
+                    , optparse-applicative >= 0.17 && < 0.20
+                    , safe-exceptions >= 0.1 && < 0.2
+                    , time
+    hs-source-dirs:   app eval-lib
+
 test-suite occam-fuzz
     import:           warnings, language, core-deps, rts-threaded
     type:             exitcode-stdio-1.0
@@ -229,6 +244,7 @@ test-suite occam-test
                     , PgQueryOracle
                     , TestSupport
                     , BenchmarkMetricsChecks
+                    , BatchReportChecks
                     , CacheChecks
                     , CliChecks
                     , ColumnChecks
@@ -278,7 +294,11 @@ test-suite occam-test
                     , Occam.Oracle.DuckDB.FFI
                     , Occam.Oracle.DuckDB.Replay
                     , Occam.Oracle.DuckDB.Result
+                    , Occam.Benchmark.BatchReport
                     , Occam.Benchmark.Metrics
+                    , Occam.Harness.Cli
+                    , Occam.Harness.Config
+                    , Occam.Harness.SqlancerSanitize
     main-is:          Spec.hs
     build-depends:    occam
                     , process

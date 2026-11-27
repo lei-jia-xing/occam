@@ -29,7 +29,6 @@ import re
 import shlex
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import threading
@@ -49,7 +48,6 @@ from collect_fuzzer_crashes import (
     DBMS_TO_OCCAM_DIALECT,
     SERVER_DBMS,
     SUPPORTED_DBMS,
-    _atomic_write_bytes,
     atomic_write_json,
     normalize_dbms,
     resolve_engine_bin,
@@ -60,43 +58,16 @@ from dhall_config import (
     DEFAULT_CONTAINER_PORTS,
     DEFAULT_IMAGES,
     load_experiment_plan,
+    resolve_repo_binary,
 )
 
 
 def resolve_occam_binary(explicit_path=""):
-    if explicit_path:
-        path = os.path.abspath(os.path.expanduser(explicit_path))
-        if not os.path.isfile(path) or not os.access(path, os.X_OK):
-            raise FileNotFoundError(f"occam binary is not executable: {path}")
-        return path
+    return resolve_repo_binary("occam", "OCCAM_BIN", explicit_path)
 
-    env_bin = os.environ.get("OCCAM_BIN", "").strip()
-    if env_bin:
-        path = os.path.abspath(os.path.expanduser(env_bin))
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
 
-    which_bin = shutil.which("occam")
-    if which_bin:
-        return which_bin
-
-    dist_dir = os.path.join(REPO_ROOT, "dist-newstyle")
-    if os.path.isdir(dist_dir):
-        matches = []
-        for dirpath, _, filenames in os.walk(dist_dir):
-            if "occam" in filenames:
-                cand = os.path.join(dirpath, "occam")
-                if os.path.isfile(cand) and os.access(cand, os.X_OK):  # noqa: SIM102
-                    # Prefer build/occam/occam over tmp artifacts
-                    if os.path.basename(dirpath) == "occam":
-                        matches.append((os.path.getmtime(cand), cand))
-        if matches:
-            matches.sort(reverse=True)
-            return matches[0][1]
-
-    raise FileNotFoundError(
-        "Could not locate 'occam' binary. Pass --occam-bin PATH, set OCCAM_BIN, or build with 'cabal build'."
-    )
+def resolve_harness_binary(explicit_path=""):
+    return resolve_repo_binary("occam-harness", "OCCAM_HARNESS_BIN", explicit_path)
 
 
 def parse_profiles(profile_names_csv, custom_specs=None):
@@ -410,91 +381,30 @@ def load_cases_from_inputs(input_files, dbms, default_expected_sig=""):
     return cases
 
 
-def compute_attempt_auc(initial_bytes, curve, total_attempts):
-    """Exact port of Occam.Benchmark.Metrics.computeAttemptAuc."""
-    if initial_bytes <= 0 or total_attempts <= 0:
-        return 1.0
-    best_at = {}
-    for pt in curve or []:
-        if not pt.get("point_accepted"):
-            continue
-        idx = int(pt.get("point_call_index", 0))
-        c_bytes = int(pt.get("point_candidate_bytes", initial_bytes))
-        if idx not in best_at or c_bytes < best_at[idx]:
-            best_at[idx] = c_bytes
-
-    cur_best = initial_bytes
-    area = 0.0
-    for i in range(1, total_attempts + 1):
-        if i in best_at and best_at[i] < cur_best:
-            cur_best = best_at[i]
-        area += cur_best / float(initial_bytes)
-    return area / float(total_attempts)
-
-
-def compute_engine_overhead_us(cost_attribution):
-    """Exact port of Occam.Benchmark.Metrics.engineOverheadMicros."""
-    if not isinstance(cost_attribution, dict):
-        return None
-    ffi = sum(int(v) for v in (cost_attribution.get("snapshot_parse_ffi_micros") or {}).values())
-    decode = sum(
-        int(v) for v in (cost_attribution.get("snapshot_parse_decode_micros") or {}).values()
-    )
-    cand_build = sum(
-        int((entry.get("counters") or {}).get("candidate_build_micros", 0))
-        for entry in (cost_attribution.get("snapshot_families") or [])
-        if isinstance(entry, dict)
-    )
-    return ffi + decode + cand_build
-
-
 def summarize_decision_log(path):
-    summary = {
-        "total_calls": 0,
-        "accepted_calls": 0,
-        "confirmed_faults": 0,
-        "healthy_no_fault": 0,
-        "missing_evidence": 0,
-        "slippage_events": 0,
-        "unique_fault_signatures": [],
-    }
+    """Summarize oracle_decisions.jsonl using the typed Haskell occam-harness CLI."""
     if not path or not os.path.isfile(path):
-        return summary
-    seen_sigs = []
-    seen_set = set()
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                summary["total_calls"] += 1
-                if rec.get("verdict") == "accepted":
-                    summary["accepted_calls"] += 1
-                cls = rec.get("classification")
-                if cls == "confirmed_fault":
-                    summary["confirmed_faults"] += 1
-                elif cls == "healthy_no_fault":
-                    summary["healthy_no_fault"] += 1
-                elif cls == "missing_evidence":
-                    summary["missing_evidence"] += 1
-                slip = rec.get("slippage")
-                if isinstance(slip, dict) and slip.get("slipped") is True:
-                    summary["slippage_events"] += 1
-                csig = rec.get("crash_signature")
-                if isinstance(csig, dict) and csig.get("id"):
-                    sid = csig["id"]
-                    if sid not in seen_set:
-                        seen_set.add(sid)
-                        seen_sigs.append(sid)
-    except OSError:
-        pass
-    summary["unique_fault_signatures"] = seen_sigs
-    return summary
+        return {
+            "total_calls": 0,
+            "accepted_calls": 0,
+            "confirmed_faults": 0,
+            "healthy_no_fault": 0,
+            "missing_evidence": 0,
+            "slippage_events": 0,
+            "unique_fault_signatures": [],
+        }
+    harness_bin = resolve_harness_binary()
+    proc = subprocess.run(
+        [harness_bin, "summarize-decisions", path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"occam-harness summarize-decisions failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return json.loads(proc.stdout)
 
 
 class WorkerTarget:
@@ -1274,430 +1184,26 @@ def execute_job_on_worker(
     return result
 
 
-def _metric_summary(values):
-    clean = [float(v) for v in values if v is not None]
-    if not clean:
-        return None
-    clean.sort()
-    return {
-        "n": len(clean),
-        "median": statistics.median(clean),
-        "mean": sum(clean) / len(clean),
-        "min": clean[0],
-        "max": clean[-1],
-    }
-
-
-def _collect_run_record(job_res):
-    stats_path = job_res.get("stats_path")
-    stats = None
-    if stats_path and os.path.isfile(stats_path):
-        try:
-            with open(stats_path, encoding="utf-8") as handle:
-                stats = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            stats = None
-
-    em = (stats or {}).get("evaluation_metrics") or {}
-    eval_status = (stats or {}).get("status") or job_res.get("eval_status") or job_res.get("state")
-
-    init_bytes = (stats or {}).get("initial_bytes", job_res.get("initial_bytes"))
-    red_bytes = (stats or {}).get("reduced_bytes")
-    red_ratio = (stats or {}).get("reduction_ratio")
-    init_stmts = (stats or {}).get("initial_statements")
-    red_stmts = (stats or {}).get("reduced_statements")
-    stmt_ratio = None
-    if init_stmts is not None and red_stmts is not None and init_stmts > 0:
-        stmt_ratio = ((init_stmts - red_stmts) / float(init_stmts)) * 100.0
-
-    attempts = (stats or {}).get("oracle_attempts")
-    curve = em.get("evaluation_curve") or []
-    peak_idx = max([int(p.get("point_call_index", 0)) for p in curve], default=0)
-    total_auc_calls = max(int(attempts or 0), peak_idx)
-    attempt_auc = (
-        compute_attempt_auc(int(init_bytes), curve, total_auc_calls)
-        if stats is not None and init_bytes
-        else None
-    )
-    overhead_us = compute_engine_overhead_us(em.get("evaluation_cost_attribution"))
-
-    replay = job_res.get("reduced_replay_verification") or {}
-    has_replay = bool(replay and replay.get("runs_required", 0) > 0)
-    replay_all_passed = bool(replay.get("all_passed")) if has_replay else None
-    replay_consistent = bool(replay.get("consistent_signature")) if has_replay else None
-    replay_matches_base = bool(replay.get("matches_baseline")) if has_replay else None
-    replay_slip_count = replay.get("slippage_count") if has_replay else None
-
-    is_completed = (
-        eval_status == "completed" and bool(em.get("evaluation_validation_passed"))
-    )
-    is_censored = eval_status in ("timeout", "execution-budget")
-
-    dbms = job_res.get("dbms") or "unknown"
-    sig_id = job_res.get("baseline_signature_id")
-    strat_sig = (
-        f"{dbms}::{sig_id}"
-        if sig_id
-        else f"{dbms}::unqualified:{job_res.get('case_id')}"
-    )
-
-    return {
-        "job_id": job_res.get("job_id"),
-        "case_id": job_res.get("case_id"),
-        "dbms": job_res.get("dbms"),
-        "dialect": job_res.get("dialect"),
-        "profile": job_res.get("profile"),
-        "repeat": job_res.get("repeat"),
-        "job_state": job_res.get("state"),
-        "status": eval_status,
-        "is_completed": is_completed,
-        "is_censored": is_censored,
-        "input_qualified": job_res.get("input_qualified"),
-        "baseline_signature_id": sig_id,
-        "baseline_signature_hash": job_res.get("baseline_signature_hash"),
-        "baseline_category": job_res.get("baseline_category"),
-        "stratification_signature": strat_sig,
-        "initial_bytes": init_bytes,
-        "reduced_bytes": red_bytes,
-        "reduction_ratio": red_ratio,
-        "initial_statements": init_stmts,
-        "reduced_statements": red_stmts,
-        "statement_reduction_ratio": stmt_ratio,
-        "oracle_executions": (stats or {}).get("oracle_executions"),
-        "oracle_attempts": attempts,
-        "cache_hits": (stats or {}).get("cache_hits"),
-        "cache_misses": (stats or {}).get("cache_misses"),
-        "cache_joins": (stats or {}).get("cache_joins"),
-        "cache_hit_ratio": (stats or {}).get("cache_hit_ratio"),
-        "cancelled_observations": (stats or {}).get("cancelled_observations"),
-        "elapsed_seconds": (stats or {}).get("elapsed_seconds"),
-        "oracle_seconds": em.get("evaluation_oracle_seconds"),
-        "reset_seconds": em.get("evaluation_reset_seconds"),
-        "audit_seconds": em.get("evaluation_audit_seconds"),
-        "validation_seconds": em.get("evaluation_validation_seconds"),
-        "validation_passed": em.get("evaluation_validation_passed"),
-        "minimality_claim": em.get("evaluation_minimality_claim"),
-        "attempt_auc": attempt_auc,
-        "engine_overhead_us": overhead_us,
-        "evaluation_jobs": ((stats or {}).get("evaluation_budget") or {}).get(
-            "evaluation_jobs"
-        ),
-        "reduced_replay_runs_required": replay.get("runs_required") if has_replay else 0,
-        "reduced_replay_runs_passed": replay.get("runs_passed") if has_replay else None,
-        "reduced_replay_all_passed": replay_all_passed,
-        "reduced_replay_consistent_signature": replay_consistent,
-        "reduced_replay_matches_baseline": replay_matches_base,
-        "reduced_replay_slippage_count": replay_slip_count,
-        "reduced_replay_observed_signatures": (
-            replay.get("observed_signature_ids") if has_replay else []
-        ),
-        "oracle_decisions_summary": job_res.get("oracle_decisions_summary"),
-    }
-
-
-def _aggregate_group(records):
-    completed = [r for r in records if r["is_completed"]]
-    censored = [r for r in records if r["is_censored"]]
-    with_checkpoints = [
-        r for r in records if r["reduced_bytes"] is not None and (r["is_completed"] or r["is_censored"])
-    ]
-
-    replay_checked = [r for r in records if r["reduced_replay_runs_required"] > 0]
-    replay_passed_5 = [r for r in replay_checked if r["reduced_replay_all_passed"] is True]
-    replay_zero_slip = [
-        r
-        for r in replay_checked
-        if r["reduced_replay_all_passed"] is True
-        and r["reduced_replay_matches_baseline"] is True
-    ]
-    replay_slipped = [
-        r for r in replay_checked if (r["reduced_replay_slippage_count"] or 0) > 0
-    ]
-
-    def extract_metrics(subset):
-        return {
-            "count": len(subset),
-            "reduced_bytes": _metric_summary([r["reduced_bytes"] for r in subset]),
-            "reduction_ratio": _metric_summary([r["reduction_ratio"] for r in subset]),
-            "reduced_statements": _metric_summary([r["reduced_statements"] for r in subset]),
-            "statement_reduction_ratio": _metric_summary(
-                [r["statement_reduction_ratio"] for r in subset]
-            ),
-            "oracle_executions": _metric_summary([r["oracle_executions"] for r in subset]),
-            "oracle_attempts": _metric_summary([r["oracle_attempts"] for r in subset]),
-            "cache_hit_ratio": _metric_summary([r["cache_hit_ratio"] for r in subset]),
-            "elapsed_seconds": _metric_summary([r["elapsed_seconds"] for r in subset]),
-            "oracle_seconds": _metric_summary([r["oracle_seconds"] for r in subset]),
-            "reset_seconds": _metric_summary([r["reset_seconds"] for r in subset]),
-            "audit_seconds": _metric_summary([r["audit_seconds"] for r in subset]),
-            "validation_seconds": _metric_summary([r["validation_seconds"] for r in subset]),
-            "attempt_auc": _metric_summary([r["attempt_auc"] for r in subset]),
-            "engine_overhead_us": _metric_summary([r["engine_overhead_us"] for r in subset]),
-        }
-
-    return {
-        "total_runs": len(records),
-        "completed_runs": len(completed),
-        "censored_runs": len(censored),
-        "error_or_failed_runs": sum(
-            1
-            for r in records
-            if not r["is_completed"]
-            and not r["is_censored"]
-            and r["job_state"] != "skipped_unstable_input"
-        ),
-        "skipped_unstable_runs": sum(
-            1 for r in records if r["job_state"] == "skipped_unstable_input"
-        ),
-        "validation_passed_runs": sum(1 for r in records if r["validation_passed"] is True),
-        "minimality_1_minimal_runs": sum(
-            1 for r in records if r["minimality_claim"] == "statement-deletion-1-minimal"
-        ),
-        "reduced_replay_checked_runs": len(replay_checked),
-        "reduced_replay_5of5_runs": len(replay_passed_5),
-        "reduced_replay_zero_slippage_runs": len(replay_zero_slip),
-        "reduced_replay_slipped_runs": len(replay_slipped),
-        "completed_only": extract_metrics(completed),
-        "all_with_checkpoints": extract_metrics(with_checkpoints),
-    }
-
-
 def aggregate_out_dir(out_dir):
+    """Aggregate batch results and render summary.md using typed Haskell occam-harness."""
     out_abs = os.path.abspath(out_dir)
-    qual_root = os.path.join(out_abs, "qualified")
-    runs_root = os.path.join(out_abs, "runs")
-
-    qualifications = {}
-    if os.path.isdir(qual_root):
-        for case_dir in sorted(os.listdir(qual_root)):
-            qpath = os.path.join(qual_root, case_dir, "input_replay.json")
-            if os.path.isfile(qpath):
-                try:
-                    with open(qpath, encoding="utf-8") as handle:
-                        qdata = json.load(handle)
-                    qualifications[qdata.get("case_id", case_dir)] = qdata
-                except (OSError, json.JSONDecodeError):
-                    pass
-
-    run_records = []
-    if os.path.isdir(runs_root):
-        for job_dir in sorted(os.listdir(runs_root)):
-            jpath = os.path.join(runs_root, job_dir, "job_result.json")
-            if not os.path.isfile(jpath):
-                continue
-            try:
-                with open(jpath, encoding="utf-8") as handle:
-                    jdata = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-            run_records.append(_collect_run_record(jdata))
-
-    by_profile = {}
-    profile_groups = {}
-    for rec in run_records:
-        profile_groups.setdefault(rec["profile"], []).append(rec)
-    for prof, recs in sorted(profile_groups.items()):
-        by_profile[prof] = _aggregate_group(recs)
-
-    by_dbms = {}
-    dbms_groups = {}
-    for rec in run_records:
-        dbms_groups.setdefault(rec["dbms"], []).append(rec)
-    for dbms, recs in sorted(dbms_groups.items()):
-        by_dbms[dbms] = _aggregate_group(recs)
-
-    by_signature = {}
-    sig_groups = {}
-    for rec in run_records:
-        sig_groups.setdefault(rec["stratification_signature"], []).append(rec)
-    for sig_key, recs in sorted(sig_groups.items()):
-        sig_prof_groups = {}
-        for rec in recs:
-            sig_prof_groups.setdefault(rec["profile"], []).append(rec)
-        sig_id = next(
-            (r["baseline_signature_id"] for r in recs if r.get("baseline_signature_id")),
-            None,
-        )
-        sig_hash = next(
-            (r["baseline_signature_hash"] for r in recs if r.get("baseline_signature_hash")),
-            None,
-        )
-        sig_cat = next(
-            (r["baseline_category"] for r in recs if r.get("baseline_category")),
-            None,
-        )
-        by_signature[sig_key] = {
-            "signature_id": sig_id,
-            "signature_hash": sig_hash,
-            "category": sig_cat,
-            "dbms": recs[0]["dbms"],
-            "case_ids": sorted({r["case_id"] for r in recs}),
-            "case_count": len({r["case_id"] for r in recs}),
-            "overall": _aggregate_group(recs),
-            "by_profile": {
-                prof: _aggregate_group(precs)
-                for prof, precs in sorted(sig_prof_groups.items())
-            },
-        }
-
-    # Signature-stratified macro averages across unique signatures per profile
-    # (prevents duplicate crash triggers of the same bug from skewing averages).
-    sig_stratified_by_profile = {}
-    for prof in sorted(profile_groups):
-        sig_medians_ratio = []
-        sig_medians_bytes = []
-        sig_medians_attempts = []
-        sig_medians_auc = []
-        sig_medians_elapsed = []
-        sig_zero_slip = 0
-        sig_with_completed = 0
-        for sig_entry in by_signature.values():
-            p_agg = sig_entry["by_profile"].get(prof)
-            if not p_agg:
-                continue
-            comp = p_agg["completed_only"]
-            if comp["count"] > 0:
-                sig_with_completed += 1
-                if comp["reduction_ratio"]:
-                    sig_medians_ratio.append(comp["reduction_ratio"]["median"])
-                if comp["reduced_bytes"]:
-                    sig_medians_bytes.append(comp["reduced_bytes"]["median"])
-                if comp["oracle_attempts"]:
-                    sig_medians_attempts.append(comp["oracle_attempts"]["median"])
-                if comp["attempt_auc"]:
-                    sig_medians_auc.append(comp["attempt_auc"]["median"])
-                if comp["elapsed_seconds"]:
-                    sig_medians_elapsed.append(comp["elapsed_seconds"]["median"])
-            if (
-                p_agg["reduced_replay_checked_runs"] > 0
-                and p_agg["reduced_replay_zero_slippage_runs"] == p_agg["reduced_replay_checked_runs"]
-            ):
-                sig_zero_slip += 1
-
-        sig_stratified_by_profile[prof] = {
-            "signatures_observed": sum(1 for s in by_signature.values() if prof in s["by_profile"]),
-            "signatures_with_completed_runs": sig_with_completed,
-            "signatures_zero_slippage_all_runs": sig_zero_slip,
-            "completed_signature_median_reduction_ratio": _metric_summary(sig_medians_ratio),
-            "completed_signature_median_reduced_bytes": _metric_summary(sig_medians_bytes),
-            "completed_signature_median_oracle_attempts": _metric_summary(sig_medians_attempts),
-            "completed_signature_median_attempt_auc": _metric_summary(sig_medians_auc),
-            "completed_signature_median_elapsed_seconds": _metric_summary(sig_medians_elapsed),
-        }
-
-    unique_qualified_sigs = {
-        (q.get("dbms"), q["baseline_signature_id"])
-        for q in qualifications.values()
-        if q.get("qualified") and q.get("baseline_signature_id")
-    }
-
-    aggregated = {
-        "schema_version": 1,
-        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
-        "out_dir": out_abs,
-        "overview": {
-            "cases_in_runs": len({r["case_id"] for r in run_records}),
-            "qualified_cases_evaluated": len(qualifications),
-            "input_stable_cases": sum(1 for q in qualifications.values() if q.get("qualified")),
-            "input_unstable_cases": sum(
-                1 for q in qualifications.values() if not q.get("qualified")
-            ),
-            "unique_qualified_crash_signatures": len(unique_qualified_sigs),
-            "total_job_runs": len(run_records),
-            "unique_stratification_groups": len(by_signature),
-        },
-        "qualifications": qualifications,
-        "by_profile": by_profile,
-        "by_dbms": by_dbms,
-        "by_signature": by_signature,
-        "signature_stratified_by_profile": sig_stratified_by_profile,
-        "runs": run_records,
-    }
-
-    agg_path = os.path.join(out_abs, "aggregated_stats.json")
-    atomic_write_json(agg_path, aggregated)
-
-    md_path = os.path.join(out_abs, "summary.md")
-    md_text = render_summary_markdown(aggregated)
-    _atomic_write_bytes(md_path, md_text.encode("utf-8"))
-
-    return aggregated, agg_path, md_path
-
-
-def _fmt_num(metric, fmt="{:.2f}"):
-    if not isinstance(metric, dict) or metric.get("median") is None:
-        return "-"
-    return fmt.format(metric["median"])
-
-
-def render_summary_markdown(agg):
-    ov = agg["overview"]
-    lines = [
-        "# Occam Horizontal Batch Evaluation Summary",
-        "",
-        f"- **Generated:** `{agg['generated_at']}`",
-        f"- **Input cases qualified:** {ov['input_stable_cases']}/{ov['qualified_cases_evaluated']} stable (5/5 consistent signature)",
-        f"- **Unique crash signatures:** {ov['unique_qualified_crash_signatures']}",
-        f"- **Total reduction runs:** {ov['total_job_runs']}",
-        "",
-        "## 1. Profile Comparison (Completed-Only Medians + Stability)",
-        "",
-        "| Profile | Completed / Total | Censored | Reduced B (med) | Byte Red % (med) | Attempts (med) | Attempt-AUC (med) | Elapsed s (med) | 5/5 Replay | Zero-Slip |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for prof, pdata in sorted(agg["by_profile"].items()):
-        comp = pdata["completed_only"]
-        lines.append(
-            f"| `{prof}` | {pdata['completed_runs']} / {pdata['total_runs']} | "
-            f"{pdata['censored_runs']} | "
-            f"{_fmt_num(comp['reduced_bytes'], '{:.0f}')} | "
-            f"{_fmt_num(comp['reduction_ratio'], '{:.2f}%')} | "
-            f"{_fmt_num(comp['oracle_attempts'], '{:.0f}')} | "
-            f"{_fmt_num(comp['attempt_auc'], '{:.4f}')} | "
-            f"{_fmt_num(comp['elapsed_seconds'], '{:.2f}')} | "
-            f"{pdata['reduced_replay_5of5_runs']}/{pdata['reduced_replay_checked_runs']} | "
-            f"{pdata['reduced_replay_zero_slippage_runs']}/{pdata['reduced_replay_checked_runs']} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## 2. Stratified Summary by Unique Crash Signature (Macro-Median Across Signatures)",
-            "",
-            "| Profile | Signatures Completed | Zero-Slip Signatures | Sig-Median Byte Red % | Sig-Median Attempts | Sig-Median AUC |",
-            "|---|---:|---:|---:|---:|---:|",
-        ]
+    harness_bin = resolve_harness_binary()
+    proc = subprocess.run(
+        [harness_bin, "aggregate", "--print-json", out_abs],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    for prof, sdata in sorted(agg["signature_stratified_by_profile"].items()):
-        lines.append(
-            f"| `{prof}` | {sdata['signatures_with_completed_runs']}/{sdata['signatures_observed']} | "
-            f"{sdata['signatures_zero_slippage_all_runs']}/{sdata['signatures_observed']} | "
-            f"{_fmt_num(sdata['completed_signature_median_reduction_ratio'], '{:.2f}%')} | "
-            f"{_fmt_num(sdata['completed_signature_median_oracle_attempts'], '{:.0f}')} | "
-            f"{_fmt_num(sdata['completed_signature_median_attempt_auc'], '{:.4f}')} |"
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"occam-harness aggregate failed ({proc.returncode}): {proc.stderr.strip()}"
         )
-
-    lines.extend(
-        [
-            "",
-            "## 3. Breakdown by DBMS",
-            "",
-            "| DBMS | Completed / Total | Censored | 5/5 Replay | Zero-Slip | Byte Red % (med) |",
-            "|---|---:|---:|---:|---:|---:|",
-        ]
+    aggregated = json.loads(proc.stdout)
+    return (
+        aggregated,
+        os.path.join(out_abs, "aggregated_stats.json"),
+        os.path.join(out_abs, "summary.md"),
     )
-    for dbms, ddata in sorted(agg["by_dbms"].items()):
-        comp = ddata["completed_only"]
-        lines.append(
-            f"| `{dbms}` | {ddata['completed_runs']} / {ddata['total_runs']} | "
-            f"{ddata['censored_runs']} | "
-            f"{ddata['reduced_replay_5of5_runs']}/{ddata['reduced_replay_checked_runs']} | "
-            f"{ddata['reduced_replay_zero_slippage_runs']}/{ddata['reduced_replay_checked_runs']} | "
-            f"{_fmt_num(comp['reduction_ratio'], '{:.2f}%')} |"
-        )
-
-    lines.append("")
-    return "\n".join(lines)
 
 
 def main():

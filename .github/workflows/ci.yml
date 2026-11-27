@@ -16,6 +16,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dhall-config:
+    name: Check Dhall configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v32
+      - run: nix develop .#dhall --command make dhall-check
+
   build-and-test:
     name: Build & Test (Linux x86_64)
     runs-on: ubuntu-latest

@@ -28,27 +28,13 @@ from dhall_config import (  # noqa: E402
     DBMS_TO_OCCAM_DIALECT,
     SERVER_DBMS,
     SUPPORTED_DBMS,
+    resolve_repo_binary,
 )
 
 CRASH_ORACLE_PATH = os.path.join(HARNESS_DIR, "crash_oracle.py")
 RESET_DB_PATH = os.path.join(HARNESS_DIR, "reset_db.sh")
 
 SUPPORTED_SOURCES = ("squirrel", "sqlancer", "sqlsmith", "raw")
-
-JAVA_STACK_LINE_RE = re.compile(
-    r"^(?:--\s*)?(?:"
-    r"(?:java|javax|jdk|com|org|ru|io|net|ch|sqlancer)\.[A-Za-z0-9_.$]+(?:Exception|Error|Throwable)?\b.*|"
-    r"Exception in thread\s+\"[^\"]+\"\s+.*|"
-    r"at\s+(?:[A-Za-z0-9_.-]+/+)?[A-Za-z0-9_.$<>-]+\([^)]*\)|"
-    r"(?:Caused by|Suppressed):\s+.*|"
-    r"\.\.\.\s+\d+\s+more"
-    r")\s*$"
-)
-SQLANCER_META_RE = re.compile(
-    r"^--+\s*(Time|Database|Database version|seed value):\s*(.+?)\s*$",
-    re.IGNORECASE,
-)
-PSQL_CONNECT_RE = re.compile(r"^\s*\\c\s+\S+", re.IGNORECASE)
 
 
 def normalize_dbms(value):
@@ -87,59 +73,23 @@ def atomic_write_json(path, payload):
 def sanitize_sqlancer_log(raw_bytes):
     """
     Convert a SQLancer `.log` or `-cur.log` file into replayable SQL targeting
-    the harness's pre-created test database (`occam_test` / `:memory:`).
-
-    Strips Java exception stacktrace preambles, psql `\\c` meta-commands, and
-    ephemeral per-thread `DROP/CREATE DATABASE`/`USE` harness setup statements,
-    while preserving `-- Database:` / `-- seed value:` metadata.
+    the harness's pre-created test database (`occam_test` / `:memory:`),
+    delegating parsing/sanitization to the typed Haskell `occam-harness` CLI.
     """
-    text = raw_bytes.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-
-    metadata = {}
-    logged_db = None
-    for line in lines:
-        m = SQLANCER_META_RE.match(line.strip())
-        if m:
-            key = m.group(1).lower().replace(" ", "_")
-            val = m.group(2).strip()
-            metadata[key] = val
-            if key == "database":
-                logged_db = val
-
-    db_pattern = r"(?:`?\"?)?(?:database\d+"
-    if logged_db:
-        db_pattern += r"|" + re.escape(logged_db)
-    db_pattern += r")(?:`?\"?)?"
-
-    drop_db_re = re.compile(
-        rf"^\s*DROP\s+DATABASE\s+(?:FORCE\s+)?(?:IF\s+EXISTS\s+)?{db_pattern}\s*;?\s*$",
-        re.IGNORECASE,
+    harness_bin = resolve_repo_binary("occam-harness", "OCCAM_HARNESS_BIN")
+    proc = subprocess.run(
+        [harness_bin, "sanitize-sqlancer", "--json"],
+        input=raw_bytes,
+        capture_output=True,
+        check=False,
     )
-    create_db_re = re.compile(
-        rf"^\s*CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?{db_pattern}(?:\s+[^;]*)?;?\s*$",
-        re.IGNORECASE,
-    )
-    use_db_re = re.compile(
-        rf"^\s*USE\s+{db_pattern}\s*;?\s*$",
-        re.IGNORECASE,
-    )
-
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        if JAVA_STACK_LINE_RE.match(stripped):
-            continue
-        if PSQL_CONNECT_RE.match(stripped):
-            continue
-        if drop_db_re.match(stripped) or create_db_re.match(stripped) or use_db_re.match(stripped):
-            continue
-        cleaned.append(line)
-
-    out_text = "\n".join(cleaned).strip()
-    if out_text:
-        out_text += "\n"
-    return out_text.encode("utf-8"), metadata
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"occam-harness sanitize-sqlancer failed ({proc.returncode}): {stderr}"
+        )
+    payload = json.loads(proc.stdout.decode("utf-8"))
+    return payload["sql"].encode("utf-8"), payload["metadata"]
 
 
 def _safe_case_id(raw_name):

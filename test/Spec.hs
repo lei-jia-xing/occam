@@ -1,5 +1,6 @@
 module Main (main) where
 
+import BatchReportChecks qualified
 import BenchmarkMetricsChecks qualified
 import CacheChecks qualified
 import CliChecks qualified
@@ -69,6 +70,7 @@ tests frontendSeedTests syntaxAlignmentTests semanticAlignmentTests =
         , SqliteOracleChecks.tests
         , DuckDBOracleChecks.tests
         , BenchmarkMetricsChecks.tests
+        , BatchReportChecks.tests
         , PropertyChecks.tests
         , generativeFuzzTests
         , mutationalFuzzTests

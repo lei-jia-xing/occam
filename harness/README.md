@@ -284,7 +284,9 @@ python3 harness/batch_eval.py \
   --out-dir occam-out/thesis_eval --dry-run
 ```
 
-Shared DBMS specs, ablation profiles, SQUIRREL YAML schemas, and experiment plans live in [`config/dhall/`](../config/dhall/) and compile deterministically to JSON under `config/generated/` (`make dhall-gen` / `make dhall-check`).
+Shared DBMS specs, ablation profiles, SQUIRREL YAML schemas, and experiment plans live in [`config/dhall/`](../config/dhall/) and compile deterministically to JSON under `config/generated/` (`make dhall-gen` / `make dhall-check`). Typed batch aggregation (`aggregated_stats.json` / `summary.md`), decision-log summaries, Dhall config validation, SQUIRREL YAML rendering, and SQLancer log sanitization run in the compiled Haskell helper [`occam-harness`](../app/HarnessMain.hs) (`cabal build occam-harness`).
+
+GitHub Actions runs `make dhall-check` with the Dhall tools from the pinned Nix flake. Set `OCCAM_HARNESS_JSON` to use a custom `harness.json` with either SQUIRREL renderer. `OCCAM_HARNESS_CONFIG` is a fallback alias, and an explicit path passed to `occam-harness` takes precedence over both.
 
 ---
 
