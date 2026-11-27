@@ -78,11 +78,7 @@ parseCreateObject upper objTok flags =
                     if isJust (cfVirtual flags)
                         then CreateVirtualTableObject <$> parseCreateVirtualTable
                         else CreateTableObject <$> parseCreateTable
-            "INDEX" ->
-                build
-                    ( requireDialectP [PostgreSQL, MySQL, MariaDB, SQLite, DuckDB] sp "CREATE INDEX"
-                        *> (CreateIndexObject <$> parseCreateIndex)
-                    )
+            "INDEX" -> build (CreateIndexObject <$> parseCreateIndex)
             "VIEW" -> build (CreateViewObject <$> parseCreateView (isJust (cfMaterialized flags)))
             "SEQUENCE" ->
                 build
@@ -202,23 +198,29 @@ validateCreateFlags flags objRaw = do
     where
         checkOrReplace sp = case objRaw of
             "TABLE" -> requireDialectP [DuckDB, ClickHouse, MariaDB] sp "CREATE OR REPLACE TABLE"
+            "INDEX" -> requireDialectP [MariaDB] sp "CREATE OR REPLACE INDEX"
             "VIEW"
                 | isJust (cfMaterialized flags) ->
                     requireDialectP [ClickHouse] sp "CREATE OR REPLACE MATERIALIZED VIEW"
                 | otherwise ->
                     requireDialectP [PostgreSQL, MySQL, MariaDB, DuckDB, ClickHouse] sp "CREATE OR REPLACE VIEW"
-            "FUNCTION" -> requireDialectP [PostgreSQL, MariaDB] sp "CREATE OR REPLACE FUNCTION"
+            "FUNCTION" -> requireDialectP [PostgreSQL, MariaDB, ClickHouse] sp "CREATE OR REPLACE FUNCTION"
             "PROCEDURE" -> requireDialectP [PostgreSQL, MariaDB] sp "CREATE OR REPLACE PROCEDURE"
             "AGGREGATE" -> requireDialectP [PostgreSQL] sp "CREATE OR REPLACE AGGREGATE"
             "TRIGGER" -> requireDialectP [PostgreSQL, MariaDB] sp "CREATE OR REPLACE TRIGGER"
             "SEQUENCE" -> requireDialectP [MariaDB, DuckDB] sp "CREATE OR REPLACE SEQUENCE"
-            "SCHEMA" -> requireDialectP [DuckDB] sp "CREATE OR REPLACE SCHEMA"
+            "DATABASE" -> requireDialectP [MariaDB] sp "CREATE OR REPLACE DATABASE"
+            "SCHEMA" -> requireDialectP [DuckDB, MariaDB] sp "CREATE OR REPLACE SCHEMA"
             "MACRO" -> requireDialectP [DuckDB] sp "CREATE OR REPLACE MACRO"
             "RULE" -> requireDialectP [PostgreSQL] sp "CREATE OR REPLACE RULE"
             _ -> throwParse ParseUnsupported sp ("CREATE OR REPLACE " <> decodeBS objRaw <> " is not supported")
         checkTemp sp = case objRaw of
             "TABLE" -> pure ()
-            "VIEW" -> requireDialectP [PostgreSQL, SQLite, DuckDB] sp "TEMP VIEW"
+            "VIEW"
+                | isJust (cfMaterialized flags) ->
+                    throwParse ParseUnsupported sp "CREATE TEMPORARY MATERIALIZED VIEW is not supported"
+                | otherwise ->
+                    requireDialectP [PostgreSQL, SQLite, DuckDB, ClickHouse] sp "TEMP VIEW"
             "SEQUENCE" -> requireDialectP [PostgreSQL, DuckDB, MariaDB] sp "TEMP SEQUENCE"
             "MACRO" -> requireDialectP [DuckDB] sp "TEMP MACRO"
             "POLICY" -> throwParse ParseUnsupported sp "CREATE TEMP POLICY is not valid in PostgreSQL"
@@ -495,16 +497,23 @@ parseTableLikeOptions = go []
 parseParenNamePartList :: P [Located NamePart]
 parseParenNamePartList = parseParenList parseNamePart
 
--- | Parse @name [type] [constraints]@, optionally with ClickHouse SETTINGS.
-parseColumnDef :: P (Located ColumnDef)
-parseColumnDef = parseColumnDefWith False
+{- | Parse @name [type] [constraints]@, optionally with ClickHouse SETTINGS.
+| Options controlling context-specific column clauses (placement and inline FK).
+-}
+data ColumnDefOpts = ColumnDefOpts
+    { cdoAllowPosition :: !Bool
+    , cdoAllowReferences :: !Bool
+    }
 
-parseColumnDefWith :: Bool -> P (Located ColumnDef)
-parseColumnDefWith allowPosition = withLocated do
+parseColumnDef :: P (Located ColumnDef)
+parseColumnDef = parseColumnDefWith (ColumnDefOpts False True)
+
+parseColumnDefWith :: ColumnDefOpts -> P (Located ColumnDef)
+parseColumnDefWith opts = withLocated do
     namePart <- parseNamePart
     mt <- peekTok
     mType <- if tokenStartsType mt then Just <$> parseTypeName else pure Nothing
-    constraints <- parseColumnConstraints allowPosition []
+    constraints <- parseColumnConstraints opts []
     clickhouse <- isDialect ClickHouse
     settings <-
         if clickhouse
@@ -536,14 +545,15 @@ columnConstraintStarters =
     , "AS"
     ]
 
-parseColumnConstraints :: Bool -> [Located ColumnConstraint] -> P [Located ColumnConstraint]
-parseColumnConstraints allowPosition acc =
+parseColumnConstraints ::
+    ColumnDefOpts -> [Located ColumnConstraint] -> P [Located ColumnConstraint]
+parseColumnConstraints opts acc =
     peekTok >>= \case
         Nothing -> pure (reverse acc)
         Just (L _ TokComma) -> pure (reverse acc)
         Just (L _ TokRParen) -> pure (reverse acc)
         Just (L _ (TokWord wt))
-            | allowPosition
+            | cdoAllowPosition opts
             , Just uw <- unquotedWord wt
             , wordIn ["FIRST", "AFTER"] (wordRaw uw) ->
                 pure (reverse acc)
@@ -558,32 +568,39 @@ parseColumnConstraints allowPosition acc =
                 ch <- isDialect ClickHouse
                 if ch
                     then do
-                        constraint <- parseColumnConstraint
-                        parseColumnConstraints allowPosition (constraint : acc)
+                        constraint <- parseColumnConstraint (cdoAllowReferences opts)
+                        parseColumnConstraints opts (constraint : acc)
                     else unexpectedHere "expected a column constraint, ',' or ')'"
             | Just uw <- unquotedWord wt
             , wordIn (columnConstraintStarters ++ ["CHARACTER", "BINARY", "KEY"]) (wordRaw uw) -> do
-                constraint <- parseColumnConstraint
-                parseColumnConstraints allowPosition (constraint : acc)
+                constraint <- parseColumnConstraint (cdoAllowReferences opts)
+                parseColumnConstraints opts (constraint : acc)
         _ -> unexpectedHere "expected a column constraint, ',' or ')'"
 
-parseColumnConstraint :: P (Located ColumnConstraint)
-parseColumnConstraint = do
+parseColumnConstraint :: Bool -> P (Located ColumnConstraint)
+parseColumnConstraint allowReferences = do
     start <- currentSpan
     locatedSpanning start =<< evalContT do
         onWordTok "CONSTRAINT" \tok -> do
             requireNonClickHouseColumnConstraint tok "named column constraint"
             namePart <- parseNamePart
-            ColumnConstraintNamed namePart . locValue <$> parseColumnConstraint
+            ColumnConstraintNamed namePart . locValue <$> parseColumnConstraint allowReferences
         onWord "NOT" do
             matchWordCI "NULL"
                 >>= maybe
                     (throwParse ParseUnsupported start "only NOT NULL column constraints are supported")
                     (const (withConflict ColumnConstraintNotNull))
         onWord "NULL" (withConflict ColumnConstraintNull)
-        onWord "DEFAULT" (ColumnConstraintDefault <$> parseExpr)
-        onWordTok "PRIMARY" \tok -> do
-            requireNonClickHouseColumnConstraint tok "column PRIMARY KEY constraint"
+        onWordTok "DEFAULT" \tok -> do
+            expr <- parseExpr
+            mysql <- isDialect MySQL
+            when (mysql && not (isValidMySQLDefaultExpr (locValue expr))) $
+                throwParse
+                    ParseUnsupported
+                    (locSpan tok)
+                    "MySQL DEFAULT requires a literal, CURRENT_TIMESTAMP, or parenthesized expression"
+            pure (ColumnConstraintDefault expr)
+        onWord "PRIMARY" do
             _ <- expectWordCI "KEY"
             ac <- currentHeadWord
             when (maybe False (wordIn ["ASC", "DESC"]) ac) $ do
@@ -599,6 +616,11 @@ parseColumnConstraint = do
             ColumnConstraintCheck <$> inParens parseExpr
         onWordTok "REFERENCES" \tok -> do
             requireNonClickHouseColumnConstraint tok "column REFERENCES constraint"
+            unless allowReferences $
+                throwParse
+                    ParseUnsupported
+                    (locSpan tok)
+                    "ALTER TABLE MODIFY/CHANGE COLUMN does not support inline REFERENCES"
             ColumnConstraintReferences <$> (locatedSpanning (locSpan tok) =<< parseForeignKeyRefAfter)
         onWord "COLLATE" (ColumnConstraintCollate <$> parseNameOrLiteralRaw)
         onWordTok "KEY" \tok ->
@@ -664,6 +686,33 @@ parseColumnConstraint = do
                     pure (ColumnConstraintOnConflict constraint action)
                 else pure constraint
         parseGeneratedBody = flip ColumnConstraintGenerated <$> inParens parseExpr <*> parseGeneratedStorage
+        isValidMySQLDefaultExpr = \case
+            ExprLiteral _ -> True
+            ExprNull -> True
+            ExprBoolean _ -> True
+            ExprParen _ -> True
+            ExprTypedString {} -> True
+            ExprCharsetString {} -> True
+            ExprUnary op (L _ inner)
+                | op `elem` [UnaryPositive, UnaryNegate] ->
+                    case inner of
+                        ExprLiteral _ -> True
+                        _ -> False
+            ExprColumn (L _ (Name [L _ (NamePart raw False)])) ->
+                wordIn
+                    ["CURRENT_TIMESTAMP", "NOW", "LOCALTIME", "LOCALTIMESTAMP", "UTC_TIMESTAMP", "UTC_DATE", "UTC_TIME"]
+                    raw
+            ExprCall (L _ fn) -> case locValue (functionName fn) of
+                Name [L _ (NamePart raw False)]
+                    | wordIn
+                        ["CURRENT_TIMESTAMP", "NOW", "LOCALTIME", "LOCALTIMESTAMP", "UTC_TIMESTAMP", "UTC_DATE", "UTC_TIME"]
+                        raw ->
+                        null (functionWithinGroup fn)
+                            && isNothing (functionFilter fn)
+                            && isNothing (functionOver fn)
+                            && length (functionArgs fn) <= 1
+                _ -> False
+            _ -> False
 
 parseNameOrLiteralRaw :: P (Located ByteString)
 parseNameOrLiteralRaw =
@@ -741,19 +790,27 @@ parseCreateIndex = do
         sp <- currentSpan
         requireDialectP [PostgreSQL] sp "unnamed CREATE INDEX"
     name <- if noName then pure Nothing else Just <$> parseName
-    mMethodBefore <- whenWord "USING" parseName
+    let parseIndexUsing =
+            whenWordTok "USING" \tok ->
+                requireDialectP [PostgreSQL, MySQL, MariaDB, DuckDB] (locSpan tok) "CREATE INDEX ... USING"
+                    *> parseName
+    mMethodBefore <- parseIndexUsing
     _ <- expectWordCI "ON"
     table <- parseName
-    mMethod <- whenWord "USING" parseName
+    mMethod <- parseIndexUsing
     keys <- parseIndexKeyList
     includes <-
         fromMaybe [] <$> whenWordTok "INCLUDE" \tok -> do
             requireDialectP [PostgreSQL] (locSpan tok) "CREATE INDEX ... INCLUDE"
             parseParenList parseNamePart
-    mMethodAfter <- whenWord "USING" parseName
+    mMethodAfter <- parseIndexUsing
     whereExpr <- whenWordTok "WHERE" \tok -> do
         requireDialectP [PostgreSQL, SQLite] (locSpan tok) "CREATE INDEX ... WHERE"
         parseExpr
+    ch <- isDialect ClickHouse
+    when ch $
+        void $
+            whenWord "TYPE" (parseTypeName *> whenWord "GRANULARITY" parseExpr)
     pure
         CreateIndex
             { createIndexName = name
@@ -1070,6 +1127,9 @@ data RoutineAcc = RoutineAcc
 parseCreateRoutine :: Bool -> P CreateRoutine
 parseCreateRoutine isProcedure = do
     name <- parseName
+    mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
+    when (mysqlLike && hasUnquotedReservedRoutineName (locValue name)) $
+        throwParse ParseUnexpectedToken (locSpan name) "reserved keyword cannot be used as routine name"
     ch <- isDialect ClickHouse
     if ch
         then do
@@ -1090,7 +1150,6 @@ parseCreateRoutine isProcedure = do
             params <- parseOptionalParenList parseRoutineParam
             RoutineAcc returnsType language mBody <-
                 execStateT parseClauses (RoutineAcc Nothing Nothing Nothing)
-            mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
             when (mysqlLike && not isProcedure && isNothing returnsType) $
                 unexpectedHere "MySQL/MariaDB CREATE FUNCTION requires RETURNS"
             body <- maybe (unexpectedHere "expected a routine body") pure mBody
@@ -1105,6 +1164,49 @@ parseCreateRoutine isProcedure = do
                     , createRoutineBody = body {opaqueBodyKind = kind}
                     }
     where
+        hasUnquotedReservedRoutineName (Name parts) =
+            any
+                ( \(L _ (NamePart raw quoted)) ->
+                    not quoted && wordIn mysqlReservedRoutineNames raw
+                )
+                parts
+        mysqlReservedRoutineNames =
+            [ "VALUES"
+            , "SELECT"
+            , "FROM"
+            , "WHERE"
+            , "INSERT"
+            , "UPDATE"
+            , "DELETE"
+            , "TABLE"
+            , "ORDER"
+            , "GROUP"
+            , "HAVING"
+            , "JOIN"
+            , "UNION"
+            , "EXCEPT"
+            , "INTERSECT"
+            , "CREATE"
+            , "DROP"
+            , "ALTER"
+            , "SET"
+            , "INTO"
+            , "AS"
+            , "ON"
+            , "AND"
+            , "OR"
+            , "NOT"
+            , "NULL"
+            , "TRUE"
+            , "FALSE"
+            , "DEFAULT"
+            , "CASE"
+            , "WHEN"
+            , "THEN"
+            , "ELSE"
+            , "END"
+            , "RETURN"
+            ]
         parseClauses :: StateT RoutineAcc P ()
         parseClauses =
             lift currentHeadWord >>= \case
@@ -1430,7 +1532,7 @@ parseDrop = withLocated do
     onTable <- whenWordTok "ON" \tok -> do
         case dropObj of
             DropIndex ->
-                requireDialectP [MySQL, MariaDB] (locSpan tok) "DROP INDEX ... ON table"
+                requireDialectP [MySQL, MariaDB, ClickHouse] (locSpan tok) "DROP INDEX ... ON table"
             DropTrigger ->
                 requireDialectP [PostgreSQL] (locSpan tok) "DROP TRIGGER ... ON table"
             DropPolicy ->
@@ -1441,6 +1543,7 @@ parseDrop = withLocated do
                 unexpectedUnsupported tok "DROP ... ON table is not valid for this object type"
         parseName
     mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
+    ch <- isDialect ClickHouse
     let isIndexDrop = case dropObj of
             DropIndex -> True
             _ -> False
@@ -1450,8 +1553,8 @@ parseDrop = withLocated do
             DropRule -> True
             _ -> False
     when
-        (mysqlLike && isIndexDrop && isNothing onTable)
-        (throwParse ParseUnsupported objSpan "DROP INDEX requires ON table in MySQL/MariaDB")
+        ((mysqlLike || ch) && isIndexDrop && isNothing onTable)
+        (throwParse ParseUnsupported objSpan "DROP INDEX requires ON table in MySQL/MariaDB/ClickHouse")
     postgres <- isDialect PostgreSQL
     when
         (postgres && requiresOn && isNothing onTable)
@@ -1473,7 +1576,7 @@ parseDropObjectWord upper objTok =
             "TABLE" -> step (pure DropTable)
             "INDEX" ->
                 step
-                    ( requireDialectP [PostgreSQL, MySQL, MariaDB, SQLite, DuckDB] sp "DROP INDEX"
+                    ( requireDialectP [PostgreSQL, MySQL, MariaDB, SQLite, DuckDB, ClickHouse] sp "DROP INDEX"
                         $> DropIndex
                     )
             "VIEW" -> step (pure DropView)
@@ -1596,14 +1699,14 @@ parseAlterAction = withLocated $ evalContT do
             requireDialectP [MySQL, MariaDB, ClickHouse] (locSpan tok) "ALTER TABLE ... MODIFY"
             _ <- matchWordCI "COLUMN"
             mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
-            col <- parseColumnDefWith mysqlLike
+            col <- parseColumnDefWith (ColumnDefOpts mysqlLike (not mysqlLike))
             pos <- if mysqlLike then parseOptionalColumnPosition else pure Nothing
             pure (AlterModifyColumn [col] pos)
     onWordTok "CHANGE" \tok -> do
         requireDialectP [MySQL, MariaDB] (locSpan tok) "ALTER TABLE ... CHANGE"
         _ <- matchWordCI "COLUMN"
         oldName <- parseNamePart
-        col <- parseColumnDefWith True
+        col <- parseColumnDefWith (ColumnDefOpts True False)
         AlterChangeColumn oldName col <$> parseOptionalColumnPosition
     onWordTok "MATERIALIZE" \tok -> do
         requireDialectP [ClickHouse] (locSpan tok) "ALTER TABLE ... MATERIALIZE TTL"
@@ -1744,7 +1847,7 @@ parseAlterAddColumns = do
             pure (AlterAddColumn ifNotExists cols Nothing)
         _ -> do
             mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
-            col <- parseColumnDefWith mysqlLike
+            col <- parseColumnDefWith (ColumnDefOpts mysqlLike True)
             pos <- if mysqlLike then parseOptionalColumnPosition else pure Nothing
             pure (AlterAddColumn ifNotExists [col] pos)
 

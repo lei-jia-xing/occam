@@ -11,11 +11,12 @@ module Occam.Frontend.Parser.Query (
 ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (unless, void, when)
+import Control.Monad (unless, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Cont (evalContT)
 import Control.Monad.Trans.State.Strict (StateT, execStateT, gets, modify')
 import Data.ByteString (ByteString)
+import Data.Either (partitionEithers)
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.Maybe (fromMaybe, isJust, isNothing)
@@ -42,11 +43,9 @@ parseCte :: P (Located Cte)
 parseCte = withLocated do
     namePart <- parseNamePart
     cols <- parseOptionalColumnNames
-    unless (null cols) $
-        requireDialectP [PostgreSQL, MySQL, MariaDB, SQLite, DuckDB] (locSpan namePart) "CTE column list"
     _ <- expectWordCI "AS"
     materialized <- parseMaterializedHint
-    body <- inParens $ withLocated do
+    body <- inParens $ inSubqueryP $ withLocated do
         mHead <- currentHeadWord
         if maybe False (wordIn ["INSERT", "UPDATE", "DELETE", "MERGE"]) mHead
             then CteStatement <$> parseStatementHook
@@ -227,7 +226,11 @@ parseForClause = do
                 tok <- expectWordCI "KEY"
                 requireDialectP [PostgreSQL] (locSpan tok) "FOR KEY SHARE"
                 expectWordCI "SHARE" $> ForKeyShare
-        tables <- fromMaybe [] <$> whenWord "OF" (parseCommaSeparated parseName)
+        tables <-
+            fromMaybe []
+                <$> whenWordTok "OF" \ofTok ->
+                    requireDialectP [PostgreSQL, MySQL] (locSpan ofTok) "FOR UPDATE/SHARE OF"
+                        *> parseCommaSeparated parseName
         noWait <- isJust <$> matchWordCI "NOWAIT"
         skipLocked <- isJust <$> whenWord "SKIP" (expectWordCI "LOCKED")
         pure (ForClause strength tables skipLocked noWait)
@@ -270,7 +273,7 @@ parseQueryPrimary = evalContT do
         requireDialectP [PostgreSQL, MySQL, MariaDB, DuckDB] (locSpan tok) "standalone TABLE query"
         locatedSpanning (locSpan tok) . QueryBodyTable =<< parseName
     onWordTok "FROM" \tok -> do
-        requireDialectP [DuckDB] (locSpan tok) "FROM-first query"
+        requireDialectP [DuckDB, ClickHouse] (locSpan tok) "FROM-first query"
         fromClause <- parseFromClause
         (quantifier, items) <- fromMaybe (SelectDefault, []) <$> whenWord "SELECT" parseProjection
         core <- parseSelectCoreTail quantifier items Nothing (Just fromClause)
@@ -376,25 +379,42 @@ parseSelectCoreTail quantifier items into fromClause = do
 -- | Parse a PostgreSQL table destination or a MySQL/MariaDB variable list.
 parseSelectInto :: SpannedToken -> P (Located SelectInto)
 parseSelectInto tok = do
+    dialect <- gets (dialectId . psProfile)
+    subDepth <- gets psSubqueryDepth
+    when (dialect == MariaDB && subDepth > 0) $
+        throwParse
+            ParseUnsupported
+            (locSpan tok)
+            "SELECT ... INTO is not allowed inside subqueries in MariaDB"
     intoVariables <- hasFeatureP FeatureSelectIntoUserVar
-    next <- peekToken
-    destination <- case next of
-        Just (TokUserVar _) | intoVariables -> SelectIntoUserVars <$> parseCommaSeparated parseVariable
-        _ -> do
-            requireFeatureP FeatureSelectIntoCreatesTable (locSpan tok) "SELECT INTO table"
-            scope <- evalContT do
-                onWords ["TEMP", "TEMPORARY"] \_ _ -> pure SelectIntoTemporary
-                onWord "UNLOGGED" (pure SelectIntoUnlogged)
-                pure SelectIntoPersistent
-            tableKeyword <- isJust <$> matchWordCI "TABLE"
-            table <- parseName
-            pure (SelectInto table scope tableKeyword)
+    destination <-
+        if intoVariables
+            then do
+                targets <- parseCommaSeparated parseIntoTarget
+                pure $ case partitionEithers targets of
+                    (userVars, []) -> SelectIntoUserVars userVars
+                    (_, firstSpVar : _) ->
+                        SelectInto (L (locSpan firstSpVar) (Name [firstSpVar])) SelectIntoPersistent False
+            else do
+                requireFeatureP FeatureSelectIntoCreatesTable (locSpan tok) "SELECT INTO table"
+                scope <- evalContT do
+                    onWords ["TEMP", "TEMPORARY"] \_ _ -> pure SelectIntoTemporary
+                    onWord "UNLOGGED" (pure SelectIntoUnlogged)
+                    pure SelectIntoPersistent
+                tableKeyword <- isJust <$> matchWordCI "TABLE"
+                table <- parseName
+                pure (SelectInto table scope tableKeyword)
     locatedSpanning (locSpan tok) destination
     where
-        parseVariable =
+        parseIntoTarget :: P (Either (Located ByteString) (Located NamePart))
+        parseIntoTarget =
             peekTok >>= \case
-                Just (L sp (TokUserVar raw)) -> advanceTok $> L sp raw
-                _ -> unexpectedHere "expected a user variable in SELECT INTO"
+                Just (L sp (TokUserVar raw)) -> advanceTok $> Left (L sp raw)
+                Just mt@(L sp (TokWord wt))
+                    | isJust (wordQuote wt)
+                        || (tokenStartsBareAlias (Just mt) && not (wordIn ["OUTFILE", "DUMPFILE"] (wordRaw wt))) ->
+                        advanceTok $> Right (L sp (NamePart (wordRaw wt) (isJust (wordQuote wt))))
+                _ -> unexpectedHere "expected a variable in SELECT INTO"
 
 parseSelectQuantifier :: P SelectQuantifier
 parseSelectQuantifier = evalContT do
@@ -415,13 +435,17 @@ parseSelectItems = do
             | Just w <- headWordOf tok
             , isSelectClauseWord w ->
                 unexpectedHere "expected a projection expression"
-            | otherwise -> (:) <$> parseSelectItem <*> go
+            | otherwise -> do
+                item <- parseSelectItem
+                (item :) <$> go (isJust (selectItemAlias (locValue item)))
     where
-        go =
+        go lastHadAlias =
             matchTok TokComma >>= \case
                 Nothing -> pure []
                 Just _ -> do
-                    trailing <- (||) <$> isDialect DuckDB <*> isDialect ClickHouse
+                    duck <- isDialect DuckDB
+                    ch <- isDialect ClickHouse
+                    let trailing = duck || (ch && not lastHadAlias)
                     mt <- peekTok
                     case mt of
                         Just tok
@@ -429,7 +453,9 @@ parseSelectItems = do
                                 if trailing
                                     then pure []
                                     else unexpectedHere "expected a projection expression"
-                        _ -> (:) <$> parseSelectItem <*> go
+                        _ -> do
+                            item <- parseSelectItem
+                            (item :) <$> go (isJust (selectItemAlias (locValue item)))
         isSelectListEnd (L _ TokRParen) = True
         isSelectListEnd (L _ tok) = maybe False isSelectClauseWord (headWordOf tok)
 
@@ -546,8 +572,10 @@ parseTableRef = withLocated do
             pure $ case mw of
                 Nothing -> False
                 Just w ->
-                    wordIn ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ARRAY", "GLOBAL"] w
+                    wordIn ["JOIN", "INNER", "LEFT", "RIGHT", "CROSS", "NATURAL", "ARRAY", "GLOBAL"] w
+                        || (dialect `notElem` [MySQL, MariaDB] && asciiEqCI "FULL" w)
                         || (dialect `elem` [DuckDB, ClickHouse] && asciiEqCI "ASOF" w)
+                        || (dialect == ClickHouse && wordIn ["ALL", "ANY", "SEMI", "ANTI"] w)
 
 parseTableSample :: P (Maybe (Located TableSample))
 parseTableSample = do
@@ -591,15 +619,36 @@ sampleAmount = do
 parseJoinClause :: P (Located JoinClause)
 parseJoinClause = withLocated do
     natural <- isJust <$> matchWordCI "NATURAL"
-    globalFlag <-
-        isJust
-            <$> whenWordTok "GLOBAL" \tok ->
-                requireDialectP [ClickHouse] (locSpan tok) "GLOBAL JOIN" $> ()
+    mGlobalSpan <-
+        whenWordTok "GLOBAL" \tok ->
+            requireDialectP [ClickHouse] (locSpan tok) "GLOBAL JOIN" $> locSpan tok
+    let globalFlag = isJust mGlobalSpan
     strictness <- fmap (\(L sp _, w) -> L sp w) <$> matchAnyWordCI ["ALL", "ANY", "SEMI", "ANTI"]
     traverse_
         (\(L sp _) -> requireDialectP [ClickHouse] sp "join strictness")
         strictness
-    kind <- parseJoinKind
+    ParsedJoinKind {pjkKind = kind, pjkExplicitInner = explicitInner, pjkAsofBeforeDir = asofBeforeDir} <-
+        parseJoinKind
+    let isJoinArray (JoinArray _) = True
+        isJoinArray _ = False
+    traverse_
+        ( \gSp -> when (isJoinArray kind) (throwParse ParseUnsupported gSp "GLOBAL ARRAY JOIN is not supported")
+        )
+        mGlobalSpan
+    case strictness of
+        Nothing -> pure ()
+        Just (L strictSp strictRaw) -> do
+            when natural $
+                throwParse ParseUnsupported strictSp "NATURAL JOIN does not support join strictness"
+            when (kind == JoinCross || isJoinArray kind) $
+                throwParse ParseUnsupported strictSp "CROSS/ARRAY JOIN does not support join strictness"
+            when asofBeforeDir $
+                throwParse
+                    ParseUnsupported
+                    strictSp
+                    "ASOF must follow LEFT/RIGHT when combined with join strictness"
+            when (wordIn ["SEMI", "ANTI"] strictRaw && (explicitInner || kind == JoinFull)) $
+                throwParse ParseUnsupported strictSp "SEMI/ANTI JOIN only supports JOIN, LEFT, RIGHT, or ASOF"
     target <- case kind of
         JoinArray bool -> JoinTargetArray <$> parseArrayJoinItems bool
         _ -> JoinTargetTable <$> parseTableRef
@@ -629,8 +678,10 @@ parseJoinClause = withLocated do
                     when (isNothing mConstraint) do
                         dialect <- gets (dialectId . psProfile)
                         let needsCondition =
-                                dialect `elem` [PostgreSQL, DuckDB]
+                                dialect `elem` [PostgreSQL, DuckDB, ClickHouse]
                                     || case kind of
+                                        JoinLeft -> dialect `elem` [MySQL, MariaDB]
+                                        JoinRight -> dialect `elem` [MySQL, MariaDB]
                                         JoinAsof _ -> True
                                         _ -> False
                         when needsCondition $
@@ -638,30 +689,39 @@ parseJoinClause = withLocated do
                     pure mConstraint
     pure (JoinClause natural globalFlag strictness kind target constraint)
 
-parseJoinKind :: P JoinKind
+data ParsedJoinKind = ParsedJoinKind
+    { pjkKind :: !JoinKind
+    , pjkExplicitInner :: !Bool
+    , pjkAsofBeforeDir :: !Bool
+    }
+
+parseJoinKind :: P ParsedJoinKind
 parseJoinKind = evalContT do
-    onWord "JOIN" (pure JoinInner)
-    onWord "INNER" (expectWordCI "JOIN" $> JoinInner)
+    onWord "JOIN" (pure (ParsedJoinKind JoinInner False False))
+    onWord "INNER" (expectWordCI "JOIN" $> ParsedJoinKind JoinInner True False)
     onWordTok "LEFT" \tok -> evalContT do
         onWord "ARRAY" do
             requireDialectP [ClickHouse] (locSpan tok) "LEFT ARRAY JOIN"
-            expectWordCI "JOIN" $> JoinArray True
+            expectWordCI "JOIN" $> ParsedJoinKind (JoinArray True) False False
         onWord "ASOF" do
             requireDialectP [ClickHouse] (locSpan tok) "LEFT ASOF JOIN"
-            expectWordCI "JOIN" $> JoinAsof False
-        lift (matchWordCI "OUTER" *> expectWordCI "JOIN" $> JoinLeft)
-    onWord "RIGHT" (matchWordCI "OUTER" *> expectWordCI "JOIN" $> JoinRight)
-    onWord "FULL" (matchWordCI "OUTER" *> expectWordCI "JOIN" $> JoinFull)
-    onWord "CROSS" (expectWordCI "JOIN" $> JoinCross)
+            expectWordCI "JOIN" $> ParsedJoinKind (JoinAsof False) False False
+        lift (matchWordCI "OUTER" *> expectWordCI "JOIN" $> ParsedJoinKind JoinLeft False False)
+    onWord "RIGHT" (matchWordCI "OUTER" *> expectWordCI "JOIN" $> ParsedJoinKind JoinRight False False)
+    onWordTok "FULL" \tok -> do
+        requireDialectP [PostgreSQL, SQLite, DuckDB, ClickHouse] (locSpan tok) "FULL JOIN"
+        matchWordCI "OUTER" *> expectWordCI "JOIN" $> ParsedJoinKind JoinFull False False
+    onWord "CROSS" (expectWordCI "JOIN" $> ParsedJoinKind JoinCross False False)
     onWordTok "ARRAY" \tok -> do
         requireDialectP [ClickHouse] (locSpan tok) "ARRAY JOIN"
-        expectWordCI "JOIN" $> JoinArray False
+        expectWordCI "JOIN" $> ParsedJoinKind (JoinArray False) False False
     onWordTok "ASOF" \tok -> do
         requireDialectP [DuckDB, ClickHouse] (locSpan tok) "ASOF JOIN"
         mRight <- matchWordCI "RIGHT"
         traverse_ (\rTok -> requireDialectP [DuckDB] (locSpan rTok) "ASOF RIGHT JOIN") mRight
-        unless (isJust mRight) (void (matchWordCI "LEFT"))
-        expectWordCI "JOIN" $> JoinAsof (isJust mRight)
+        mLeft <- if isJust mRight then pure Nothing else matchWordCI "LEFT"
+        expectWordCI "JOIN"
+            $> ParsedJoinKind (JoinAsof (isJust mRight)) False (isJust mRight || isJust mLeft)
     lift (expectWordCI "JOIN" >>= (`unexpectedUnsupported` "expected JOIN"))
 
 parseArrayJoinItems :: Bool -> P [Located ArrayJoinItem]
@@ -687,7 +747,7 @@ parseTableSource :: P (Located TableSource)
 parseTableSource = evalContT do
     onWordTok "LATERAL" \tok -> do
         requireDialectP
-            [PostgreSQL, MySQL, DuckDB, ClickHouse]
+            [PostgreSQL, MySQL, DuckDB]
             (locSpan tok)
             "LATERAL table source"
         parseTableSourceBase >>= locatedSpanning (locSpan tok) . TableSourceLateral
@@ -700,7 +760,7 @@ parseTableSourceBase = do
         Just (L _ TokLParen) -> withLocated $ inParens do
             isQuery <- queryStartsAt 0
             if isQuery
-                then TableSourceSubquery <$> parseQuery
+                then TableSourceSubquery <$> inSubqueryP parseQuery
                 else TableSourceParens <$> parseFromClause
         Just (L tokSp (TokWord wt))
             | Just uw <- unquotedWord wt

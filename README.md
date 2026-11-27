@@ -1,8 +1,17 @@
-# Occam
+<p align="center">
+  <img src="docs/assets/occam-logo.png" width="180" alt="Occam logo" />
+</p>
 
-> *Entia non sunt multiplicanda praeter necessitatem.*
+<h1 align="center">Occam</h1>
 
-**Occam** is a dependency-aware test-case reducer for multi-statement SQL. Given a SQL script and an interestingness predicate, it minimizes statements (and optionally intra-statement syntax and columns) while preserving the target behavior.
+<p align="center">
+  <em>Entia non sunt multiplicanda praeter necessitatem.</em><br/>
+  Pure-Haskell, dependency-aware test-case reducer for multi-statement SQL.
+</p>
+
+---
+
+**Occam** minimizes multi-statement SQL scripts (plus optional exact-span intra-statement syntax and co-reduced columns) while preserving an interestingness predicate or embedded result set across **PostgreSQL**, **MySQL**, **MariaDB**, **SQLite**, **DuckDB**, and **ClickHouse**.
 
 ---
 
@@ -77,7 +86,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for process-group reaping, budg
 
 ## Building & Testing
 
-`nix develop` provides GHC, Cabal, Fourmolu, HLint, HLS, Lean (`elan`), DuckDB, and Python 3. Occam has a 100% pure-Haskell SQL frontend with zero FFI/Cargo/C-toolchain dependencies for SQL parsing. Run `make hooks` once per checkout to install the pre-commit hook.
+`nix develop` provides GHC, Cabal, Fourmolu, HLint, HLS, Lean (`elan`), DuckDB, `libpg_query`, and Python 3. `nix develop .#syntax` additionally provides prebuilt ClickHouse `26.8`, MySQL `8.4`, and MariaDB `11.4` binaries for full six-engine syntax conformance without Dockerfiles. Occam has a 100% pure-Haskell SQL frontend with zero FFI/Cargo/C-toolchain dependencies in production binaries. Run `make hooks` once per checkout to install the pre-commit hook.
 
 ```bash
 make build        # Build Haskell library and occam binary

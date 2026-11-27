@@ -1,4 +1,4 @@
-.PHONY: all build build-check test bench microbench bench-product flamegraph fmt fmt-check lint harness-check proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test syntax-check bench microbench bench-product flamegraph fmt fmt-check lint harness-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -10,6 +10,13 @@ build-check:
 
 test:
 	cabal test all --ghc-options=-Werror
+
+syntax-check:
+	@if [ -n "$$OCCAM_CLICKHOUSE_BIN" ] && [ -n "$$OCCAM_MYSQLD_BIN" ] && [ -n "$$OCCAM_MARIADBD_BIN" ]; then \
+		cabal test occam-test --ghc-options=-Werror; \
+	else \
+		nix develop .#syntax --command cabal test occam-test --ghc-options=-Werror; \
+	fi
 
 bench:
 	cabal bench --benchmark-options="-p corpus --stdev 20 --timeout 5s"

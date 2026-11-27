@@ -9,6 +9,7 @@ import DialectAndControlChecks qualified
 import DialectFuzz qualified
 import DuckDBOracleChecks qualified
 import EvaluationChecks qualified
+import ExtraEngineOracles (withExtraOracles)
 import FrontendChecks qualified
 import FrontendColumnsChecks qualified
 import FrontendCorpusChecks qualified
@@ -30,10 +31,11 @@ import SyntaxAlignmentChecks qualified
 import Test.Tasty (TestTree, defaultMain, testGroup)
 
 main :: IO ()
-main = do
-    frontendSeedTests <- FrontendSeedChecks.tests
-    syntaxAlignmentTests <- SyntaxAlignmentChecks.tests
-    defaultMain (tests frontendSeedTests syntaxAlignmentTests)
+main =
+    withExtraOracles \extraOracles -> do
+        frontendSeedTests <- FrontendSeedChecks.tests extraOracles
+        syntaxAlignmentTests <- SyntaxAlignmentChecks.tests extraOracles
+        defaultMain (tests frontendSeedTests syntaxAlignmentTests)
 
 tests :: TestTree -> TestTree -> TestTree
 tests frontendSeedTests syntaxAlignmentTests =

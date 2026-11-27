@@ -295,16 +295,16 @@ lexerTests =
                 "unterminated conditional comment in MySQL"
                 (Just (LexError LexUnterminatedComment 7 "unterminated conditional block comment"))
                 (lexError (lexSQL (dialectProfile MySQL) "SELECT /*!50000 1"))
-        , testCase "dialect isolation: $$tag$$ dollar-quoting only in PostgreSQL and DuckDB" $ do
+        , testCase "dialect isolation: $$tag$$ dollar-quoting in PostgreSQL, DuckDB, and ClickHouse" $ do
             let sql = "SELECT $tag$a;b$tag$, $$x$$;"
-            for_ [PostgreSQL, DuckDB] $ \d -> do
+            for_ [PostgreSQL, DuckDB, ClickHouse] $ \d -> do
                 let toks = map locValue (nonTriviaTokens (lexSQL (dialectProfile d) sql))
                 assertBool
                     (show d <> " lexes LitDollarString")
                     ( TokLiteral LitDollarString "$tag$a;b$tag$" `elem` toks
                         && TokLiteral LitDollarString "$$x$$" `elem` toks
                     )
-            for_ [MySQL, MariaDB, SQLite, ClickHouse] $ \d -> do
+            for_ [MySQL, MariaDB, SQLite] $ \d -> do
                 let toks = map locValue (nonTriviaTokens (lexSQL (dialectProfile d) sql))
                 assertBool
                     (show d <> " must NOT lex LitDollarString")

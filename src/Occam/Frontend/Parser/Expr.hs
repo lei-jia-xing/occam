@@ -25,9 +25,9 @@ import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.State.Strict (gets)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.Foldable (find)
+import Data.Foldable (find, traverse_)
 import Data.Functor (($>))
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Occam.Frontend.AST
 import Occam.Frontend.Lexer hiding (LiteralKind)
 import Occam.Frontend.Parser.Core
@@ -588,15 +588,16 @@ finishFunctionCall ::
 finishFunctionCall name distinct args orderBy = do
     _ <- expectTok TokRParen
     isWithinGroup <- (&&) <$> wordIsCurrent "WITHIN" <*> wordIsAt 1 "GROUP"
-    withinGroup <-
+    (withinTok, withinGroup) <-
         if isWithinGroup
             then do
                 tok <- expectWordCI "WITHIN"
                 requireDialectP [PostgreSQL, DuckDB, MariaDB] (locSpan tok) "WITHIN GROUP"
                 rejectCommonSubexprModifier tok "WITHIN GROUP"
                 _ <- expectWordCI "GROUP"
-                inParens (expectWordsCI ["ORDER", "BY"] *> parseCommaSeparated parseOrderItem)
-            else pure []
+                items <- inParens (expectWordsCI ["ORDER", "BY"] *> parseCommaSeparated parseOrderItem)
+                pure (Just (locSpan tok), items)
+            else pure (Nothing, [])
     nullTreatment <-
         matchAnyWordCI ["RESPECT", "IGNORE"] >>= traverse \(_, word) -> do
             _ <- expectWordCI "NULLS"
@@ -607,7 +608,15 @@ finishFunctionCall name distinct args orderBy = do
         inParens (expectWordCI "WHERE" *> parseExpr)
     overRef <- whenWordTok "OVER" \tok -> do
         rejectCommonSubexprModifier tok "OVER"
+        rejectDisallowedMySQLOver tok
         parseWindowRef
+    traverse_
+        ( \wSpan -> do
+            mariadb <- isDialect MariaDB
+            when (mariadb && isNothing overRef) $
+                throwParse ParseUnsupported wSpan "MariaDB WITHIN GROUP requires OVER (...)"
+        )
+        withinTok
     locatedSpanning
         (locSpan name)
         FunctionCall
@@ -631,6 +640,54 @@ finishFunctionCall name distinct args orderBy = do
         isPgCommonSubexpr (Name [L _ (NamePart raw False)]) =
             wordIn ["COALESCE", "GREATEST", "LEAST", "NULLIF"] raw
         isPgCommonSubexpr _ = False
+        rejectDisallowedMySQLOver tok = do
+            dialect <- gets (dialectId . psProfile)
+            when (dialect `elem` [MySQL, MariaDB] && not (isMySQLFamilyOverFunc dialect (locValue name))) $
+                throwParse
+                    ParseUnsupported
+                    (locSpan tok)
+                    ( "OVER is only valid on aggregate/window functions in "
+                        <> decodeBS (if dialect == MySQL then "mysql" else "mariadb")
+                    )
+        isMySQLFamilyOverFunc dialect (Name [L _ (NamePart raw False)]) =
+            wordIn mysqlWindowAggFuncs raw || (dialect == MariaDB && wordIn mariadbExtraWindowFuncs raw)
+        isMySQLFamilyOverFunc _ _ = False
+        mysqlWindowAggFuncs =
+            [ "AVG"
+            , "BIT_AND"
+            , "BIT_OR"
+            , "BIT_XOR"
+            , "COUNT"
+            , "CUME_DIST"
+            , "DENSE_RANK"
+            , "FIRST_VALUE"
+            , "GROUP_CONCAT"
+            , "JSON_ARRAYAGG"
+            , "JSON_OBJECTAGG"
+            , "LAG"
+            , "LAST_VALUE"
+            , "LEAD"
+            , "MAX"
+            , "MIN"
+            , "NTH_VALUE"
+            , "NTILE"
+            , "PERCENT_RANK"
+            , "RANK"
+            , "ROW_NUMBER"
+            , "STD"
+            , "STDDEV"
+            , "STDDEV_POP"
+            , "STDDEV_SAMP"
+            , "SUM"
+            , "VAR_POP"
+            , "VAR_SAMP"
+            , "VARIANCE"
+            ]
+        mariadbExtraWindowFuncs =
+            [ "MEDIAN"
+            , "PERCENTILE_CONT"
+            , "PERCENTILE_DISC"
+            ]
 
 parseFunctionArg :: P (Located FunctionArg)
 parseFunctionArg = withLocated do
@@ -711,9 +768,11 @@ parseSortDirection = evalContT do
 -- | Parse an optional @NULLS FIRST@/@NULLS LAST@.
 parseNullsOrder :: P (Maybe NullsOrder)
 parseNullsOrder = evalContT do
-    onWord "NULLS" $ evalContT do
-        onWord "FIRST" (pure (Just NullsFirst))
-        lift (expectWordCI "LAST" $> Just NullsLast)
+    onWordTok "NULLS" \tok -> do
+        requireDialectP [PostgreSQL, SQLite, DuckDB, ClickHouse] (locSpan tok) "NULLS FIRST/LAST"
+        evalContT do
+            onWord "FIRST" (pure (Just NullsFirst))
+            lift (expectWordCI "LAST" $> Just NullsLast)
     pure Nothing
 
 -- | Parse @name = expr@ in a SETTINGS list.
@@ -811,7 +870,11 @@ parseIndexKeyPart :: P (Located IndexKeyPart)
 parseIndexKeyPart = withLocated do
     mt <- peekTok
     (expr, prefix) <- case mt of
-        Just (L _ TokLParen) -> (,Nothing) <$> parseExpr
+        Just (L lpSp TokLParen) -> do
+            mariadb <- isDialect MariaDB
+            when mariadb $
+                throwParse ParseUnsupported lpSp "expression index keys are not supported by MariaDB"
+            (,Nothing) <$> parseExpr
         Just (L _ (TokWord _)) -> do
             name <- parseName
             next <- peekToken
@@ -827,6 +890,11 @@ parseIndexKeyPart = withLocated do
                         prefixExpr <- inParens parseExpr
                         pure (L (locSpan name) (ExprColumn name), Just prefixExpr)
                 (Just TokLParen, _, _) -> do
+                    when hasPrefixFeature $
+                        throwParse
+                            ParseUnsupported
+                            (locSpan name)
+                            "unparenthesized function calls are not valid index key parts in MySQL/MariaDB"
                     call <- parseFunctionCallTail name
                     pure (L (locSpan call) (ExprCall call), Nothing)
                 _ -> pure (L (locSpan name) (ExprColumn name), Nothing)

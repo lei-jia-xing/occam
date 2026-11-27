@@ -78,7 +78,7 @@ CREATE TEMP POLICY seed_invalid_pol ON seed_invalid_t;
 ALTER TABLE seed_invalid_t RENAME TO seed_invalid_u, ADD COLUMN c INT;
 
 -- @case: invalid_sqlite_within_group
--- @dialects: sqlite,mysql
+-- @dialects: sqlite,mysql,mariadb
 -- @units: sql=;
 SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM seed_invalid_t;
 

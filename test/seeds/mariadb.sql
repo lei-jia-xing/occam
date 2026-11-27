@@ -41,6 +41,14 @@ CREATE TABLE seed_maria_ret (id INT PRIMARY KEY, label VARCHAR(32) NOT NULL);
 INSERT INTO seed_maria_ret (id, label) VALUES (1, 'alpha'), (2, 'beta')
 RETURNING id, label;
 
+-- Window percentile
+-- @case: mariadb_window_within_group_over
+-- @dialects: mariadb
+-- @units: sql=;,sql=;
+CREATE TABLE seed_maria_wg (id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+-- @unit
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) OVER () AS p50 FROM seed_maria_wg;
+
 -- Utility
 -- @case: mariadb_prepare_from_expression
 -- @dialects: mariadb

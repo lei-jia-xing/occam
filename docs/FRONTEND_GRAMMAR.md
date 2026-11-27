@@ -117,24 +117,29 @@ code asserts them with `requireDialectP` or `requireFeatureP`; both report
 ### MySQL
 
 - Queries: WITH/CTE, SELECT (including `INTO @user_var`), `TABLE t`, `VALUES ROW(...)`, joins, LATERAL,
-  `LIMIT offset,count`, DISTINCT, GROUP BY/HAVING, window/OVER, `QUALIFY` is
-  not accepted (not in the engine grammar).
+  `LIMIT offset,count`, DISTINCT, GROUP BY/HAVING, window/OVER; `QUALIFY` is
+  rejected (MySQL 8.4 only enables `QUALIFY` with the experimental
+  `hypergraph_optimizer`).
 - DML: INSERT/REPLACE with `ON DUPLICATE KEY UPDATE` (including
-  `INSERT ... VALUES ROW(...)`), multi-table UPDATE/DELETE, `RETURNING` is
+  `INSERT ... VALUES ROW(...)`), multi-table UPDATE/DELETE (`ORDER BY` /
+  `LIMIT` / `RETURNING` rejected on multi-table `DELETE`), `RETURNING` is
   rejected.
-- DDL: CREATE/DROP/ALTER TABLE, INDEX (including FULLTEXT and prefix lengths),
-  VIEW (`ALGORITHM`), DATABASE, TRIGGER, FUNCTION/PROCEDURE, table options
-  (`ENGINE`, `DEFAULT CHARSET`, `COLLATE`, `AUTO_INCREMENT`, ...).
+- DDL: CREATE/DROP/ALTER TABLE, INDEX (including FULLTEXT, prefix lengths, and
+  double-parenthesized functional key parts `((expr))`), VIEW (`ALGORITHM`),
+  DATABASE, TRIGGER, FUNCTION/PROCEDURE, table options (`ENGINE`, `DEFAULT
+  CHARSET`, `COLLATE`, `AUTO_INCREMENT`, ...).
 - Utility: SET (including `SET NAMES`, `CHARACTER SET`, scoped values),
   transaction control, PREPARE/EXECUTE/DEALLOCATE, ANALYZE, OPTIMIZE, RENAME
-  TABLE, SHOW, TRUNCATE, EXPLAIN.
+  TABLE, SHOW, TRUNCATE, EXPLAIN; `RESET` is rejected.
 
 ### MariaDB
 
 - Same statement families as MySQL, with MariaDB extensions: `TABLE t`
-  queries, `RETURNING` after INSERT/REPLACE/UPDATE/DELETE, `CREATE SEQUENCE`,
-  `PREPARE ... FROM` expressions, `USING HASH` index methods, and
-  `ALTER TABLE ... ALGORITHM=...`. `LATERAL` is not accepted.
+  queries, `RETURNING` after INSERT/REPLACE/UPDATE/DELETE (single-table),
+  `CREATE [OR REPLACE] SEQUENCE`/`INDEX`/`DATABASE`/`SCHEMA`, `PREPARE ... FROM`
+  expressions, `USING HASH` index methods, expression index keys `(f(col))`,
+  and `ALTER TABLE ... ALGORITHM=...`. `LATERAL` is not accepted; `WITHIN GROUP
+  (ORDER BY ...)` requires an `OVER (...)` window specification.
 - `ON DUPLICATE KEY UPDATE`, `FULLTEXT`, and index prefix lengths apply as in
   MySQL.
 
@@ -166,16 +171,21 @@ code asserts them with `requireDialectP` or `requireFeatureP`; both report
 ### ClickHouse
 
 - Queries: SELECT with `PREWHERE`, `QUALIFY`, `SETTINGS`, `FORMAT`, `FINAL`,
-  `SAMPLE ... [OFFSET ...]`, `ARRAY JOIN`/`LEFT ARRAY JOIN`, `GLOBAL` and
-  strictness join modifiers, ASOF joins, `DISTINCT ON`, `LATERAL` subqueries,
+  `SAMPLE ... [OFFSET ...]`, `FROM`-first queries (`FROM t SELECT ...`),
+  `ARRAY JOIN`/`LEFT ARRAY JOIN`, `GLOBAL` and strictness join modifiers,
+  ASOF joins (`ASOF LEFT JOIN` and `LEFT ASOF JOIN`; `ASOF RIGHT JOIN` is
+  rejected to match ClickHouse execution), `DISTINCT ON`,
   `GROUPING SETS`/`ROLLUP`/`CUBE`, trailing SELECT-list commas, window
-  functions, lambda expressions, `.:` typed path casts, array subscripts.
+  functions, `FILTER (WHERE ...)`, lambda expressions, `.:` typed path casts,
+  array subscripts (`LATERAL` subqueries are rejected).
 - DML: INSERT, UPDATE/DELETE via `ALTER TABLE ... UPDATE/DELETE` (lightweight
   mutations), no `RETURNING`.
 - DDL: CREATE/DROP/ALTER TABLE (including `ENGINE`, `SETTINGS`, projections,
-  skipping indexes, partitions), CREATE VIEW/MATERIALIZED VIEW (`TO`,
-  `ENGINE`, `SETTINGS`, `POPULATE`), CREATE FUNCTION, DATABASE, sequences are
-  not supported, RENAME TABLE.
+  skipping indexes, partitions), CREATE `[TEMP|OR REPLACE]` VIEW, CREATE
+  `[OR REPLACE]` MATERIALIZED VIEW (`TO`, `ENGINE`, `SETTINGS`, `POPULATE`;
+  `CREATE TEMPORARY MATERIALIZED VIEW` and `DROP MATERIALIZED VIEW` are
+  rejected), CREATE `[OR REPLACE]` FUNCTION, DATABASE, sequences are not
+  supported, RENAME TABLE.
 - Utility: ATTACH/DETACH objects, OPTIMIZE TABLE, SHOW, TRUNCATE, USE, SET,
   EXPLAIN, `SYNC` drop/detach modifiers.
 
@@ -214,7 +224,7 @@ are not silently re-emitted as opaque bodies unless listed as opaque.
   - `NATURAL JOIN ... ON/USING` is now rejected across all dialects, `CROSS JOIN ...
     ON/USING` is rejected in PostgreSQL/DuckDB/ClickHouse, `FOR UPDATE`/`FOR SHARE`/
     `FOR NO KEY UPDATE`/`FOR KEY SHARE` are dialect-gated, `WITHIN GROUP` is gated to
-    PostgreSQL/DuckDB/MariaDB, `FILTER` is gated to PostgreSQL/SQLite/DuckDB/ClickHouse,
+    PostgreSQL, DuckDB, and (with `OVER`) MariaDB, `FILTER` is gated to PostgreSQL/SQLite/DuckDB/ClickHouse,
     `CREATE [TEMP|TEMPORARY|UNLOGGED]` is validated per object type and dialect, and
     PostgreSQL `ALTER TABLE RENAME` is rejected when combined with other actions.
   - Remaining broader productions: multi-name `DROP TABLE`, SQLite `REFERENCES schema.t`
@@ -235,12 +245,12 @@ SQL whose blocks can also be fed directly to the real engine CLIs.
 | --- | ---: | ---: | --- |
 | `test/seeds/postgresql.sql` | 17 | 41 | representative branches + shared cases |
 | `test/seeds/mysql.sql` | 9 | 20 | representative branches + shared cases |
-| `test/seeds/mariadb.sql` | 9 | 19 | representative branches + shared cases |
+| `test/seeds/mariadb.sql` | 10 | 21 | representative branches + shared cases |
 | `test/seeds/sqlite.sql` | 13 | 32 | representative branches + shared cases |
 | `test/seeds/duckdb.sql` | 12 | 29 | representative branches + shared cases |
 | `test/seeds/clickhouse.sql` | 13 | 25 | representative branches + shared cases |
 | `test/seeds/invalid.sql` | 16 | 16 | curated parser rejects |
-| **Total** | **89** | **182** | **in-process validated (PG, DuckDB, SQLite)** |
+| **Total** | **90** | **184** | **FULL — validated live against all six engines** |
 
 ### Block format
 
@@ -266,34 +276,46 @@ SQL whose blocks can also be fed directly to the real engine CLIs.
 ### Coverage ledger
 
 PostgreSQL (`libpg_query` 18.0.0), DuckDB (`libduckdb` 1.5.5), and SQLite
-(`direct-sqlite`) are validated in-process inside `occam-test`; MySQL, MariaDB,
-and ClickHouse remain covered by Occam's pure-Haskell seed matrix, parser tests,
-and fuzz corpus without live server binaries.
+(`direct-sqlite`) run in-process inside `occam-test`. When run inside
+`nix develop .#syntax` (or `make syntax-check`), ClickHouse (`26.8.7.19-lts`
+via `clickhouse format --multiquery`), MySQL (`8.4.11` `mysqld` via
+`dlopen libmariadb.so.3` and `mysql` CLI), and MariaDB (`11.4.13` `mariadbd`
+via `dlopen libmariadb.so.3` and `mariadb` CLI) also run live against seeds,
+fuzz corpus cases, regression cases, and differential fuzz properties with zero
+Dockerfiles and zero test-oracle linkage in production binaries.
 
 | Dialect | Representative branches covered | Explicitly not yet covered |
 | --- | --- | --- |
 | PostgreSQL | identity/generated/`UNLOGGED` table DDL; `INCLUDE` + partial index; `CREATE STATISTICS`; materialized views + `REFRESH`; range partitions; RLS/`POLICY`/`RULE`; `ON CONFLICT (key)` & `ON CONSTRAINT`; shared `MERGE`; `COPY`; `PREPARE`/`EXECUTE`/`DEALLOCATE`; transaction modes/savepoints; `FILTER`, `WITHIN GROUP`, `FOR NO KEY UPDATE SKIP LOCKED`, `DISTINCT ON`; dollar/E/UTF-8 lexical; sequence/view/rename/CTE/`RETURNING`/`LIMIT` | broader `ALTER TABLE` action combinations; `CREATE DOMAIN`/`TYPE`/`OPERATOR`/`CONVERSION` edge options |
 | MySQL | table options, prefix/fulltext keys, MySQL 8.0 collation; shared fulltext/hash index and `ALTER ... ALGORITHM`; before-insert trigger; `ON DUPLICATE KEY UPDATE`; multi-table `UPDATE`; `VALUES ROW`; `DELIMITER $$` procedure, `//` function, and glued `AS a$$` tail; UTF-8 introducer/cast; shared view, rename, recursive CTE, comma/offset limits | view algorithms and standalone `ALTER` DDL; multi-table `DELETE`; utility `PREPARE`/`SET`/`EXPLAIN`/`ANALYZE`/`OPTIMIZE`/`SHOW`; JSON query forms; window aggregates; `INSERT ... RETURNING` is a curated reject only |
-| MariaDB | shared sequence with PostgreSQL/DuckDB; shared fulltext/hash index with MySQL; shared `ALTER ... ALGORITHM`; `INSERT ... RETURNING` shared with PostgreSQL/SQLite/DuckDB; `PREPARE ... FROM` expression; `//` routine and glued `$$` tail; UTF-8 introducer/cast; shared view/rename/recursive CTE/limits | `UPDATE`/`DELETE ... RETURNING`; `TABLE` query; virtual-column `ALTER`; utility `SET`/`ANALYZE`/`OPTIMIZE`; JSON/fulltext query forms |
+| MariaDB | shared sequence with PostgreSQL/DuckDB; shared fulltext/hash index with MySQL; shared `ALTER ... ALGORITHM`; `INSERT ... RETURNING` shared with PostgreSQL/SQLite/DuckDB; `WITHIN GROUP (ORDER BY ...) OVER ()`; `PREPARE ... FROM` expression; `//` routine and glued `$$` tail; UTF-8 introducer/cast; shared view/rename/recursive CTE/limits | `UPDATE`/`DELETE ... RETURNING`; `TABLE` query; virtual-column `ALTER`; utility `SET`/`ANALYZE`/`OPTIMIZE`; JSON/fulltext query forms |
 | SQLite | `STRICT` table; shared partial index; `ALTER ADD`/`DROP`/`RENAME COLUMN`; upsert + `RETURNING`; opaque trigger body; `PRAGMA`/`ATTACH`/`DETACH`/`VACUUM`; `BEGIN IMMEDIATE` + savepoints; window aggregates + `FILTER`; recursive CTE; comma vs `OFFSET` limits; bracket vs double-quote + UTF-8/blob lexical; shared view | virtual tables/FTS (deliberately excluded until optional build features are verified); `RIGHT`/`FULL` joins |
 | DuckDB | `CREATE MACRO`, `CREATE OR REPLACE` table/macro; shared view; `INSERT`/`DELETE`/`UPDATE ... FROM ... RETURNING`; `FROM`-first query; `PIVOT`; `QUALIFY`; `ASOF RIGHT JOIN`; `ATTACH`/`DETACH`/`PRAGMA`/`PREPARE`/`EXECUTE`/`DEALLOCATE`; `COPY`; `GROUPING SETS`; nested block comments, dollar/E lexical, sequence/merge/upsert/rename/CTE/limits | nested `STRUCT`/`LIST` probes (removed as ambiguous for the initial corpus); temporal/ASOF edge variants |
-| ClickHouse | MergeTree with projection/TTL/settings; `CREATE FUNCTION` lambda; materialized view `TO`; `INSERT SELECT`; `ALTER ... UPDATE`/`DELETE`; `OPTIMIZE ... FINAL`; `PREWHERE`/`ARRAY JOIN`/`SETTINGS`/`FORMAT`; `.:` typed path cast; `arrayMap` lambda; `GLOBAL ANY LEFT JOIN`; `GROUPING SETS` and trailing select-list comma; `DETACH`/`ATTACH`; UTF-8/cast/bare select; `DISTINCT ON`, `QUALIFY`, view | JSON/Dynamic options; `FORMAT` variants beyond `Null`; `ON CLUSTER` |
-| Curated rejects | `DELIMITER;`; malformed `ALTER ... DROP KEY`; `BEFORE SELECT` trigger; missing routine body; `BEGIN FOOBAR`; ClickHouse `DROP MATERIALIZED VIEW`; SQLite `DELETE ... USING`; MySQL `INSERT ... RETURNING`; DuckDB `SAVEPOINT`; `NATURAL JOIN ... ON/USING`; non-locking `FOR UPDATE`; `CREATE TEMP POLICY`; PG multi-action `ALTER RENAME`; SQLite/MySQL `WITHIN GROUP`; `CROSS JOIN ... ON` | MySQL/MariaDB/ClickHouse live-engine verification (intentionally omitted) |
+| ClickHouse | MergeTree with projection/TTL/settings; `CREATE [OR REPLACE] FUNCTION` lambda; materialized view `TO`; `INSERT SELECT`; `ALTER ... UPDATE`/`DELETE`; `OPTIMIZE ... FINAL`; `FROM`-first query; `PREWHERE`/`ARRAY JOIN`/`SETTINGS`/`FORMAT`; `FILTER`; `.:` typed path cast; `arrayMap` lambda; `GLOBAL`/`ANY`/`ANTI`/`SEMI`/`ASOF` joins; `GROUPING SETS` and trailing select-list comma; `DETACH`/`ATTACH`; UTF-8/cast/bare select; `DISTINCT ON`, `QUALIFY`, view | JSON/Dynamic options; `FORMAT` variants beyond `Null`; `ON CLUSTER` |
+| Curated rejects | `DELIMITER;`; malformed `ALTER ... DROP KEY`; `BEFORE SELECT` trigger; missing routine body; `BEGIN FOOBAR`; ClickHouse `DROP MATERIALIZED VIEW`; SQLite `DELETE ... USING`; MySQL `INSERT ... RETURNING`; DuckDB `SAVEPOINT`; `NATURAL JOIN ... ON/USING`; non-locking `FOR UPDATE`; `CREATE TEMP POLICY`; PG multi-action `ALTER RENAME`; SQLite/MySQL and bare MariaDB `WITHIN GROUP`; `CROSS JOIN ... ON` | None — all six target engines are validated live via `occam-test` in `.#syntax` |
 
 ## Verification
 
 - `test/PgQueryOracle.hs` + `test/cbits/pg_query_shim.c` provide a test-only
   `dlopen` wrapper around `libpg_query` (PostgreSQL 18.0.0) without linking
   any C parser into `lib:occam` or `exe:occam`.
+- `test/ExtraEngineOracles.hs` provides test-only syntax oracles for
+  ClickHouse `26.8.7.19-lts` (`clickhouse format --multiquery`), MySQL
+  `8.4.11`, and MariaDB `11.4.13` (unix-socket `mysqld`/`mariadbd` daemons
+  queried via `dlopen libmariadb.so.3` plus client CLI for `DELIMITER` scripts),
+  without Dockerfiles or C oracle linkage in production binaries.
 - `test/FrontendChecks.hs` covers span/UTF-8 boundaries, lexer dialect
   isolation, splitter boundaries/DELIMITER, and oracle-proof parity.
-- `test/FrontendSeedChecks.hs` runs the 6-dialect seed matrix (`89` cases / `182`
-  units) plus bidirectional positive/invalid/cross-dialect alignment against
-  in-process `libpg_query`, `libduckdb`, and `direct-sqlite`.
+- `test/FrontendSeedChecks.hs` runs the 6-dialect seed matrix (`90` cases /
+  `184` units) plus bidirectional positive/invalid/cross-dialect alignment across
+  all six live engines (`libpg_query`, `libduckdb`, `direct-sqlite`, plus
+  ClickHouse 26.8, MySQL 8.4, and MariaDB 11.4 when `.#syntax` env vars are set).
 - `test/SyntaxAlignmentChecks.hs` checks `benchmarks/real_fuzz_corpus/*.sql`
-  (PG/DuckDB/SQLite), `test/seeds/regression_cases.sql` (PG/DuckDB), and 18
-  QuickCheck differential syntax fuzzing properties across PG, DuckDB, and
-  SQLite (100 tests each).
+  across all six dialects (`71` cases total), `test/seeds/regression_cases.sql`
+  (`PostgreSQL`, `DuckDB`, `ClickHouse`, `MySQL`, `MariaDB`), and 36
+  QuickCheck differential syntax fuzzing properties across all six engines
+  (100 tests each for PG/DuckDB/SQLite/MySQL/MariaDB, 25 tests each for
+  ClickHouse).
 - `test/ParserChecks.hs` covers exact spans, precedence, error spans, dialect
   accept/reject, representative AST shapes, scripts, and all 71
   `benchmarks/real_fuzz_corpus/*.sql` files.
@@ -306,4 +328,5 @@ and fuzz corpus without live server binaries.
   dialects. The properties check statement counts, syntax, predicate
   preservation, size monotonicity, distractor removal, and fixed points.
 - Run `cabal build all --enable-tests --ghc-options=-Werror` and
-  `cabal test occam-test` for the full integration suite.
+  `make syntax-check` (or `nix develop .#syntax --command cabal test occam-test --ghc-options=-Werror`)
+  for the full six-engine verification suite.

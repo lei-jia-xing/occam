@@ -236,9 +236,16 @@ parseOnConflictClause start = do
     locatedSpanning start (OnConflictClause constraint keys whereExpr action)
 
 parseOptionalReturning :: P [Located SelectItem]
-parseOptionalReturning =
+parseOptionalReturning = parseOptionalReturningFor True
+
+parseOptionalReturningFor :: Bool -> P [Located SelectItem]
+parseOptionalReturningFor allowMariadb =
     fromMaybe [] <$> whenWordTok "RETURNING" \tok -> do
         requireFeatureP FeatureReturningClause (locSpan tok) "RETURNING"
+        unless allowMariadb do
+            dialect <- gets (dialectId . psProfile)
+            when (dialect == MariaDB) $
+                throwParse ParseUnsupported (locSpan tok) "UPDATE ... RETURNING is not supported by mariadb"
         parseCommaSeparated parseSelectItem
 
 parseAssignmentList :: P [Located Assignment]
@@ -277,7 +284,7 @@ parseUpdateFrom start mWith = do
     limitClause <- whenWordTok "LIMIT" \tok -> do
         requireDialectP [MySQL, MariaDB, SQLite] (locSpan tok) "UPDATE ... LIMIT"
         parseLimitClause
-    returning <- parseOptionalReturning
+    returning <- parseOptionalReturningFor False
     locatedSpanning
         start
         UpdateStmt
@@ -348,15 +355,26 @@ parseDeleteFrom start mWith = do
                 pure
                     (False, False, deleteTargetName (locValue first), Nothing, first : rest, Just fromClause, Nothing)
     whereExpr <- whenWord "WHERE" parseExpr
+    let isMysqlMultiTable = mysqlLike && (isJust usingClause || isJust fromTables)
     orderBy <-
         fromMaybe [] <$> whenWordTok "ORDER" \tok -> do
+            when isMysqlMultiTable $
+                throwParse
+                    ParseUnsupported
+                    (locSpan tok)
+                    "multi-table DELETE does not support ORDER BY in MySQL/MariaDB"
             requireDialectP [MySQL, MariaDB, SQLite] (locSpan tok) "DELETE ... ORDER BY"
             expectWordCI "BY" *> parseCommaSeparated parseOrderItem
     limitClause <- whenWordTok "LIMIT" \tok -> do
+        when isMysqlMultiTable $
+            throwParse
+                ParseUnsupported
+                (locSpan tok)
+                "multi-table DELETE does not support LIMIT in MySQL/MariaDB"
         requireDialectP [MySQL, MariaDB, SQLite] (locSpan tok) "DELETE ... LIMIT"
         parseLimitClause
     returning <- parseOptionalReturning
-    when (mysqlLike && not (null returning) && (isJust usingClause || isJust fromTables)) $
+    when (isMysqlMultiTable && not (null returning)) $
         throwParse ParseUnsupported start "multi-table DELETE does not support RETURNING in MariaDB/MySQL"
     locatedSpanning
         start
@@ -503,7 +521,7 @@ parseSet = withLocated do
         Just modes -> do
             when (null modes) (unexpectedHere "expected a transaction mode after SET TRANSACTION")
             pure (SetStmt scope [] modes)
-        Nothing -> SetStmt scope <$> parseSetItems <*> pure []
+        Nothing -> SetStmt scope <$> parseSetItems (scope /= SetScopeNone) <*> pure []
 
 parseSetTransactionModes :: [Located ByteString] -> P [Located ByteString]
 parseSetTransactionModes acc = do
@@ -572,8 +590,8 @@ nextTransactionWord =
         Just (_, raw) -> advanceTok $> asciiUpperBS raw
         Nothing -> unexpectedHere "expected a transaction mode word"
 
-parseSetItems :: P [Located SetItem]
-parseSetItems = (:) <$> parseSetItem <*> go
+parseSetItems :: Bool -> P [Located SetItem]
+parseSetItems hasExplicitScope = (:) <$> parseSetItem hasExplicitScope <*> go
     where
         go =
             matchTok TokComma >>= \case
@@ -581,7 +599,7 @@ parseSetItems = (:) <$> parseSetItem <*> go
                 Just _ -> do
                     multiple <- allowsMultipleSetItems
                     if multiple
-                        then (:) <$> parseSetItem <*> go
+                        then (:) <$> parseSetItem False <*> go
                         else
                             peekTok >>= \case
                                 Nothing -> pure []
@@ -590,14 +608,21 @@ parseSetItems = (:) <$> parseSetItem <*> go
 allowsMultipleSetItems :: P Bool
 allowsMultipleSetItems = gets ((`elem` [MySQL, MariaDB, ClickHouse]) . dialectId . psProfile)
 
-parseSetItem :: P (Located SetItem)
-parseSetItem = withLocated $ evalContT do
+parseSetItem :: Bool -> P (Located SetItem)
+parseSetItem hasExplicitScope = withLocated $ evalContT do
     onWordTok "NAMES" \tok -> do
+        when hasExplicitScope $
+            throwParse ParseUnexpectedToken (locSpan tok) "SET NAMES cannot take a GLOBAL/SESSION scope prefix"
         requireDialectP [MySQL, MariaDB] (locSpan tok) "SET NAMES"
         cs <- parseSetValue
         coll <- whenWord "COLLATE" parseSetValue
         pure (SetItem (SetTargetSpecial (L (locSpan tok) "NAMES")) (cs : maybeToList coll) False)
     onWords ["CHARACTER", "CHARSET"] \tok hit -> do
+        when hasExplicitScope $
+            throwParse
+                ParseUnexpectedToken
+                (locSpan tok)
+                "SET CHARACTER SET cannot take a GLOBAL/SESSION scope prefix"
         requireDialectP [MySQL, MariaDB] (locSpan tok) "SET CHARACTER SET"
         when (asciiEqCI "CHARACTER" hit) (void (expectWordCI "SET"))
         cs <- parseSetValue
@@ -617,8 +642,14 @@ parseSetItem = withLocated $ evalContT do
     lift do
         mt <- peekTok
         target <- case mt of
-            Just (L sp (TokUserVar raw)) -> advanceTok $> SetTargetUserVar (L sp raw)
-            Just (L sp (TokSysVar raw)) -> advanceTok $> SetTargetSysVar (L sp raw)
+            Just (L sp (TokUserVar raw)) -> do
+                when hasExplicitScope $
+                    throwParse ParseUnexpectedToken sp "user variable cannot follow GLOBAL/SESSION/LOCAL"
+                advanceTok $> SetTargetUserVar (L sp raw)
+            Just (L sp (TokSysVar raw)) -> do
+                when hasExplicitScope $
+                    throwParse ParseUnexpectedToken sp "@@ system variable cannot follow GLOBAL/SESSION/LOCAL"
+                advanceTok $> SetTargetSysVar (L sp raw)
             _ -> SetTargetName <$> parseName
         (values, toSyntax) <- evalContT do
             onTok TokEq (liftValues False)
@@ -670,7 +701,7 @@ isBareSetValue = wordIn ["ON", "OFF", "YES", "NO", "MEMORY", "ALL", "NONE"]
 parseReset :: P (Located ResetStmt)
 parseReset = withLocated do
     tok <- expectWordCI "RESET"
-    requireDialectP [PostgreSQL, MySQL, MariaDB, DuckDB] (locSpan tok) "RESET"
+    requireDialectP [PostgreSQL, DuckDB] (locSpan tok) "RESET"
     evalContT do
         onWordTok "ALL" \allTok -> do
             requireDialectP [PostgreSQL, DuckDB] (locSpan allTok) "RESET ALL"

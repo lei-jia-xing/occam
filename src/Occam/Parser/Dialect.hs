@@ -510,7 +510,7 @@ clickhouseProfile =
             LexicalProfile
                 { lexBacktickQuotes = True
                 , lexBracketQuotes = False
-                , lexDollarQuoting = False
+                , lexDollarQuoting = True
                 , lexNestedBlockComments = True
                 , lexHashComments = False
                 , lexConditionalComments = False

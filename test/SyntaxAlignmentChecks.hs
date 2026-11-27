@@ -1,5 +1,7 @@
-{- | Multi-engine in-process syntax alignment & differential syntax fuzzing
-against PostgreSQL (libpg_query 18), DuckDB (libduckdb), and SQLite (direct-sqlite).
+{- | Multi-engine in-process & local-server syntax alignment & differential syntax
+fuzzing across all six dialects: PostgreSQL (libpg_query 18), DuckDB (libduckdb),
+SQLite (direct-sqlite), ClickHouse (clickhouse format), MySQL 8.4 (mysqld), and
+MariaDB 11.4 (mariadbd).
 -}
 module SyntaxAlignmentChecks (tests) where
 
@@ -13,6 +15,14 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Database.SQLite3 qualified as Sqlite
+import ExtraEngineOracles (
+    ExtraOracles (..),
+    MysqlServer,
+    clickhouseSyntaxCheck,
+    clickhouseSyntaxCheckSingle,
+    mysqlSyntaxCheck,
+    mysqlSyntaxCheckIsolated,
+ )
 import Foreign.C.String (peekCString)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (nullPtr)
@@ -32,7 +42,10 @@ import Occam.Oracle.DuckDB.FFI (
 import Occam.Parser (SQLDialect (..))
 import Occam.Parser.Dialect (
     DialectProfile,
+    clickhouseProfile,
     duckdbProfile,
+    mariadbProfile,
+    mysqlProfile,
     postgresqlProfile,
     sqliteProfile,
  )
@@ -46,27 +59,27 @@ import Test.QuickCheck (
     forAll,
     oneof,
  )
-import Test.Tasty (TestTree, testGroup)
+import Test.Tasty (TestTree, localOption, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
-import Test.Tasty.QuickCheck (testProperty)
+import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
 
-tests :: IO TestTree
-tests = do
+tests :: ExtraOracles -> IO TestTree
+tests extraOracles = do
     pgAvail <- isPgQueryAvailable
     pure $
         testGroup
             "Multi-engine syntax alignment"
-            [ realFuzzCorpusAlignment pgAvail
-            , regressionCorpusAlignment pgAvail
-            , differentialFuzzTests pgAvail
+            [ realFuzzCorpusAlignment pgAvail extraOracles
+            , regressionCorpusAlignment pgAvail extraOracles
+            , differentialFuzzTests pgAvail extraOracles
             ]
 
 -- ---------------------------------------------------------------------------
 -- 1. Real fuzz corpus alignment (benchmarks/real_fuzz_corpus/*.sql)
 -- ---------------------------------------------------------------------------
 
-realFuzzCorpusAlignment :: Bool -> TestTree
-realFuzzCorpusAlignment pgAvail =
+realFuzzCorpusAlignment :: Bool -> ExtraOracles -> TestTree
+realFuzzCorpusAlignment pgAvail extraOracles =
     testGroup
         "real_fuzz_corpus alignment"
         ( [ testCase "PostgreSQL (12 cases) match libpg_query acceptance and statement count" $ do
@@ -147,14 +160,86 @@ realFuzzCorpusAlignment pgAvail =
                                                             )
                                                     Right () -> pure ()
                ]
+            ++ [ testCase "ClickHouse (10 cases) accepted by both Occam and clickhouse format" $ do
+                    cases <- either assertFailure pure =<< loadRealFuzzCorpus "benchmarks/real_fuzz_corpus"
+                    let chCases = filter ((== ClickHouse) . corpusDialect) cases
+                    assertEqual "ClickHouse real_fuzz_corpus count" 10 (length chCases)
+                    forM_ chCases \item -> do
+                        _ <- parseCorpusStmts clickhouseProfile item
+                        case splitSQL clickhouseProfile (corpusSql item) of
+                            Left lexErr ->
+                                assertFailure (T.unpack (corpusId item) <> ": splitSQL failed: " <> show lexErr)
+                            Right units ->
+                                forM_ (zip [1 :: Int ..] units) \(idx, unit) ->
+                                    case sliceSpan (splitUnitSpan unit) (corpusSql item) of
+                                        Nothing ->
+                                            assertFailure (T.unpack (corpusId item) <> ": invalid split span")
+                                        Just unitSql -> do
+                                            res <- clickhouseSyntaxCheckSingle unitSql
+                                            case res of
+                                                Left synErr ->
+                                                    assertFailure
+                                                        ( T.unpack (corpusId item)
+                                                            <> " stmt #"
+                                                            <> show idx
+                                                            <> ": ClickHouse syntax error: "
+                                                            <> T.unpack synErr
+                                                            <> "\nSQL: "
+                                                            <> BSC.unpack unitSql
+                                                        )
+                                                Right () -> pure ()
+               | oracleClickHouse extraOracles
+               ]
+            ++ [ testCase "MySQL 8.4 (15 cases) parse with zero MySQL syntax errors" $ do
+                    cases <- either assertFailure pure =<< loadRealFuzzCorpus "benchmarks/real_fuzz_corpus"
+                    let mysqlCases = filter ((== MySQL) . corpusDialect) cases
+                    assertEqual "MySQL real_fuzz_corpus count" 15 (length mysqlCases)
+                    forM_ mysqlCases \item -> do
+                        _ <- parseCorpusStmts mysqlProfile item
+                        res <- mysqlSyntaxCheckIsolated srv (corpusSql item)
+                        case res of
+                            Left synErr ->
+                                assertFailure
+                                    (T.unpack (corpusId item) <> ": MySQL syntax error: " <> show synErr)
+                            Right () -> pure ()
+               | Just srv <- [oracleMySQL extraOracles]
+               ]
+            ++ [ testCase "MariaDB 11.4 (12 cases) parse with zero unexpected MariaDB syntax errors" $ do
+                    cases <- either assertFailure pure =<< loadRealFuzzCorpus "benchmarks/real_fuzz_corpus"
+                    let mariaCases = filter ((== MariaDB) . corpusDialect) cases
+                    assertEqual "MariaDB real_fuzz_corpus count" 12 (length mariaCases)
+                    forM_ mariaCases \item -> do
+                        _ <- parseCorpusStmts mariadbProfile item
+                        if corpusId item == "real_fuzz:mariadb_mdev22462_in_to_exists_assert.sql"
+                            then do
+                                -- Squirrel MDEV-22462 triggers on statement #3; statement #5
+                                -- emits `RANK(v1) OVER w` (MariaDB RANK() takes 0 args).
+                                -- Verify statements 1..4 parse cleanly in MariaDB 11.4.
+                                let prefixSql =
+                                        BSC.unlines (take 4 (BSC.lines (corpusSql item)))
+                                res <- mysqlSyntaxCheckIsolated srv prefixSql
+                                case res of
+                                    Left synErr ->
+                                        assertFailure
+                                            (T.unpack (corpusId item) <> " prefix: MariaDB syntax error: " <> show synErr)
+                                    Right () -> pure ()
+                            else do
+                                res <- mysqlSyntaxCheckIsolated srv (corpusSql item)
+                                case res of
+                                    Left synErr ->
+                                        assertFailure
+                                            (T.unpack (corpusId item) <> ": MariaDB syntax error: " <> show synErr)
+                                    Right () -> pure ()
+               | Just srv <- [oracleMariaDB extraOracles]
+               ]
         )
 
 -- ---------------------------------------------------------------------------
 -- 2. Regression corpus alignment (test/seeds/regression_cases.sql)
 -- ---------------------------------------------------------------------------
 
-regressionCorpusAlignment :: Bool -> TestTree
-regressionCorpusAlignment pgAvail =
+regressionCorpusAlignment :: Bool -> ExtraOracles -> TestTree
+regressionCorpusAlignment pgAvail extraOracles =
     testGroup
         "regression_cases.sql alignment"
         ( [ testCase "PostgreSQL regression cases match libpg_query acceptance and statement count" $ do
@@ -178,7 +263,57 @@ regressionCorpusAlignment pgAvail =
                         []
                         mismatches
                ]
+            ++ [ testCase "ClickHouse regression cases match clickhouse format acceptance" $ do
+                    cases <- either assertFailure pure =<< loadRegressionCases "test/seeds/regression_cases.sql"
+                    let chCases = filter ((== ClickHouse) . corpusDialect) cases
+                    assertBool "ClickHouse regression cases non-empty" (not (null chCases))
+                    mismatches <- collectClickHouseMismatches chCases
+                    assertEqual
+                        ("ClickHouse regression mismatches (" <> show (length mismatches) <> "):\n" <> unlines mismatches)
+                        []
+                        mismatches
+               | oracleClickHouse extraOracles
+               ]
+            ++ [ testCase "MySQL 8.4 regression cases match mysqld acceptance" $ do
+                    cases <- either assertFailure pure =<< loadRegressionCases "test/seeds/regression_cases.sql"
+                    let myCases = filter ((== MySQL) . corpusDialect) cases
+                    assertBool "MySQL regression cases non-empty" (not (null myCases))
+                    mismatches <- collectMysqlFamilyMismatches "MySQL 8.4" mysqlProfile srv myCases
+                    assertEqual
+                        ("MySQL 8.4 regression mismatches (" <> show (length mismatches) <> "):\n" <> unlines mismatches)
+                        []
+                        mismatches
+               | Just srv <- [oracleMySQL extraOracles]
+               ]
+            ++ [ testCase "MariaDB 11.4 regression cases match mariadbd acceptance" $ do
+                    cases <- either assertFailure pure =<< loadRegressionCases "test/seeds/regression_cases.sql"
+                    let mariaTagged = filter ((== MariaDB) . corpusDialect) cases
+                        sharedMyCases =
+                            [ c
+                            | c <- cases
+                            , corpusDialect c == MySQL
+                            , corpusId c `notElem` mysqlOnlyRegressionIds
+                            ]
+                        toCheck = mariaTagged ++ sharedMyCases
+                    assertBool "MariaDB regression check cases non-empty" (not (null toCheck))
+                    mismatches <- collectMysqlFamilyMismatches "MariaDB 11.4" mariadbProfile srv toCheck
+                    assertEqual
+                        ("MariaDB 11.4 regression mismatches (" <> show (length mismatches) <> "):\n" <> unlines mismatches)
+                        []
+                        mismatches
+               | Just srv <- [oracleMariaDB extraOracles]
+               ]
         )
+
+mysqlOnlyRegressionIds :: [Text]
+mysqlOnlyRegressionIds =
+    [ "rust:tests:mysql_duplicate_key_reads_cover_keys_and_set_sources:4" -- INSERT ... VALUES ... AS new
+    , "rust:tests:stored_calls_fence_conservatively:5" -- MySQL rejects unparenthesized DEFAULT abs(5); MariaDB allows it
+    , "rust:tests:mysql_index_prefix_lifts_but_real_index_calls_fence:8" -- MySQL ((lower(b))) functional index
+    , "rust:tests:mysql_index_prefix_lifts_but_real_index_calls_fence:9" -- MySQL ((f(b))) functional index
+    , "rust:tests:mysql_index_prefix_lifts_but_real_index_calls_fence:14" -- MySQL rejects unparenthesized DEFAULT f(1); MariaDB allows it
+    , "rust:tests:user_variables_are_excluded_from_table_reads_and_scoped:11" -- MariaDB aborts mid-parse SP lookup (1327: TEMPORARY) before rejecting @x
+    ]
 
 collectPgMismatches :: [CorpusCase] -> IO [String]
 collectPgMismatches [] = pure []
@@ -260,12 +395,73 @@ collectDuckMismatches extract (item : rest) = do
                 ]
     (here ++) <$> collectDuckMismatches extract rest
 
+collectClickHouseMismatches :: [CorpusCase] -> IO [String]
+collectClickHouseMismatches [] = pure []
+collectClickHouseMismatches (item : rest) = do
+    let sql = corpusSql item
+        cid = T.unpack (corpusId item)
+        occamRes = parseScript clickhouseProfile sql
+    chRes <- clickhouseSyntaxCheck sql
+    let here = case (occamRes, chRes) of
+            (Right _, Right ()) -> []
+            (Left _, Left _) -> []
+            (Right (ParsedScript stmts), Left err) ->
+                [ cid
+                    <> ": OVER-ACCEPTED by Occam ("
+                    <> show (length stmts)
+                    <> " stmts), rejected by ClickHouse: "
+                    <> T.unpack err
+                    <> " | sql="
+                    <> show sql
+                ]
+            (Left err, Right ()) ->
+                [ cid
+                    <> ": UNDER-ACCEPTED by Occam ("
+                    <> show err
+                    <> "), accepted by ClickHouse | sql="
+                    <> show sql
+                ]
+    (here ++) <$> collectClickHouseMismatches rest
+
+collectMysqlFamilyMismatches ::
+    String -> DialectProfile -> MysqlServer -> [CorpusCase] -> IO [String]
+collectMysqlFamilyMismatches _ _ _ [] = pure []
+collectMysqlFamilyMismatches label profile srv (item : rest) = do
+    let sql = corpusSql item
+        cid = T.unpack (corpusId item)
+        occamRes = parseScript profile sql
+    srvRes <- mysqlSyntaxCheckIsolated srv sql
+    let here = case (occamRes, srvRes) of
+            (Right _, Right ()) -> []
+            (Left _, Left _) -> []
+            (Right (ParsedScript stmts), Left err) ->
+                [ cid
+                    <> ": OVER-ACCEPTED by Occam ("
+                    <> show (length stmts)
+                    <> " stmts), rejected by "
+                    <> label
+                    <> ": "
+                    <> show err
+                    <> " | sql="
+                    <> show sql
+                ]
+            (Left err, Right ()) ->
+                [ cid
+                    <> ": UNDER-ACCEPTED by Occam ("
+                    <> show err
+                    <> "), accepted by "
+                    <> label
+                    <> " | sql="
+                    <> show sql
+                ]
+    (here ++) <$> collectMysqlFamilyMismatches label profile srv rest
+
 -- ---------------------------------------------------------------------------
 -- 3. QuickCheck differential syntax fuzzing (PG, DuckDB, SQLite)
 -- ---------------------------------------------------------------------------
 
-differentialFuzzTests :: Bool -> TestTree
-differentialFuzzTests pgAvail =
+differentialFuzzTests :: Bool -> ExtraOracles -> TestTree
+differentialFuzzTests pgAvail extraOracles =
     testGroup
         "QuickCheck differential syntax fuzzing"
         ( ( if pgAvail
@@ -307,6 +503,76 @@ differentialFuzzTests pgAvail =
                , testProperty
                     "SQLite vs sqlite3_prepare: expressions & lexical edge cases"
                     (propSqliteDiff genExprLexSql)
+               ]
+            ++ ( case oracleMySQL extraOracles of
+                    Just srv ->
+                        [ testProperty
+                            "MySQL 8.4 vs mysqld: JOIN & LATERAL combinations"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv genMySQLFamilyJoinSql)
+                        , testProperty
+                            "MySQL 8.4 vs mysqld: CREATE modifiers, TEMPORARY vs TEMP & objects"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv (genMySQLFamilyCreateSql MySQL))
+                        , testProperty
+                            "MySQL 8.4 vs mysqld: row-locking clauses"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv genRowLockSql)
+                        , testProperty
+                            "MySQL 8.4 vs mysqld: window, WITHIN GROUP, FILTER & QUALIFY"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv genMySQLFamilyWindowSql)
+                        , testProperty
+                            "MySQL 8.4 vs mysqld: DML tails, RETURNING & VALUES ROW"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv genMySQLFamilyDmlSql)
+                        , testProperty
+                            "MySQL 8.4 vs mysqld: PREPARE ... FROM & expressions"
+                            (propMysqlFamilyDiff "MySQL 8.4" mysqlProfile srv genMySQLFamilyExprSql)
+                        ]
+                    Nothing -> []
+               )
+            ++ ( case oracleMariaDB extraOracles of
+                    Just srv ->
+                        [ testProperty
+                            "MariaDB 11.4 vs mariadbd: JOIN & LATERAL combinations"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv genMySQLFamilyJoinSql)
+                        , testProperty
+                            "MariaDB 11.4 vs mariadbd: CREATE modifiers, TEMPORARY vs TEMP & SEQUENCE"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv (genMySQLFamilyCreateSql MariaDB))
+                        , testProperty
+                            "MariaDB 11.4 vs mariadbd: row-locking clauses"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv genRowLockSql)
+                        , testProperty
+                            "MariaDB 11.4 vs mariadbd: window, WITHIN GROUP [OVER], FILTER & QUALIFY"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv genMySQLFamilyWindowSql)
+                        , testProperty
+                            "MariaDB 11.4 vs mariadbd: DML tails, RETURNING & VALUES ROW"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv genMySQLFamilyDmlSql)
+                        , testProperty
+                            "MariaDB 11.4 vs mariadbd: PREPARE ... FROM & expressions"
+                            (propMysqlFamilyDiff "MariaDB 11.4" mariadbProfile srv genMySQLFamilyExprSql)
+                        ]
+                    Nothing -> []
+               )
+            ++ [ localOption (QuickCheckTests 25) $
+                    testGroup
+                        "ClickHouse 26.8 vs clickhouse format"
+                        [ testProperty
+                            "JOIN, ASOF, ARRAY JOIN & LATERAL"
+                            (propClickHouseDiff genClickHouseJoinSql)
+                        , testProperty
+                            "CREATE modifiers, ENGINE, SETTINGS & objects"
+                            (propClickHouseDiff genClickHouseCreateSql)
+                        , testProperty
+                            "row-locking clauses"
+                            (propClickHouseDiff genRowLockSql)
+                        , testProperty
+                            "window, WITHIN GROUP, FILTER & QUALIFY"
+                            (propClickHouseDiff genClickHouseWindowSql)
+                        , testProperty
+                            "PREWHERE, SETTINGS, trailing comma & DML"
+                            (propClickHouseDiff genClickHouseQueryDmlSql)
+                        , testProperty
+                            "::, .:, -> lambdas & lexical edge cases"
+                            (propClickHouseDiff genClickHouseExprLexSql)
+                        ]
+               | oracleClickHouse extraOracles
                ]
         )
 
@@ -366,6 +632,47 @@ propSqliteDiff gen = forAll gen \sql ->
                 <> show sqliteRes
             )
             (occamOk == sqliteOk)
+
+propMysqlFamilyDiff :: String -> DialectProfile -> MysqlServer -> Gen ByteString -> Property
+propMysqlFamilyDiff label profile srv gen = forAll gen \sql ->
+    let occamOk = case parseScript profile sql of
+            Right _ -> True
+            Left _ -> False
+        srvRes = unsafePerformIO (mysqlSyntaxCheck srv sql)
+        srvOk = case srvRes of
+            Right () -> True
+            Left _ -> False
+     in counterexample
+            ( label
+                <> " differential mismatch:\n  SQL: "
+                <> BSC.unpack sql
+                <> "\n  Occam: "
+                <> show (parseScript profile sql)
+                <> "\n  "
+                <> label
+                <> ": "
+                <> show srvRes
+            )
+            (occamOk == srvOk)
+
+propClickHouseDiff :: Gen ByteString -> Property
+propClickHouseDiff gen = forAll gen \sql ->
+    let occamOk = case parseScript clickhouseProfile sql of
+            Right _ -> True
+            Left _ -> False
+        chRes = unsafePerformIO (clickhouseSyntaxCheck sql)
+        chOk = case chRes of
+            Right () -> True
+            Left _ -> False
+     in counterexample
+            ( "ClickHouse differential mismatch:\n  SQL: "
+                <> BSC.unpack sql
+                <> "\n  Occam: "
+                <> show (parseScript clickhouseProfile sql)
+                <> "\n  ClickHouse: "
+                <> show chRes
+            )
+            (occamOk == chOk)
 
 -- ---------------------------------------------------------------------------
 -- Targeted SQL grammar surface generators
@@ -464,6 +771,10 @@ genWindowAggSql =
 
 genDmlTailSql :: Bool -> Gen ByteString
 genDmlTailSql includeUpdateOrderLimit =
+    genDmlTailSqlWith includeUpdateOrderLimit ["", " USING u"]
+
+genDmlTailSqlWith :: Bool -> [ByteString] -> Gen ByteString
+genDmlTailSqlWith includeUpdateOrderLimit usingOptions =
     oneof
         [ do
             conflict <-
@@ -484,7 +795,7 @@ genDmlTailSql includeUpdateOrderLimit =
             ret <- elements ["", " RETURNING a"]
             pure ("UPDATE t SET b = 2" <> fromPart <> wherePart <> orderLimit <> ret <> ";")
         , do
-            usingPart <- elements ["", " USING u"]
+            usingPart <- elements usingOptions
             wherePart <- elements ["", " WHERE t.a = 1"]
             orderLimit <-
                 if includeUpdateOrderLimit
@@ -509,6 +820,172 @@ genExprLexSql =
         , "SELECT a FROM t LIMIT 1 OFFSET 0;"
         , "SELECT a FROM t LIMIT 0, 1;"
         , "FROM t SELECT a;"
+        ]
+
+genMySQLFamilyJoinSql :: Gen ByteString
+genMySQLFamilyJoinSql =
+    oneof
+        [ genJoinSql
+        , do
+            lat <- elements ["LATERAL ", ""]
+            alias <- elements ["s", "AS s"]
+            pure ("SELECT 1 FROM t, " <> lat <> "(SELECT 1 AS a) " <> alias <> ";")
+        ]
+
+genMySQLFamilyCreateSql :: SQLDialect -> Gen ByteString
+genMySQLFamilyCreateSql dialect = do
+    modifier <- elements ["", "TEMP ", "TEMPORARY ", "OR REPLACE ", "UNLOGGED "]
+    let _ = dialect
+    obj <-
+        elements
+            [ "TABLE t_new (a INT, b TEXT)"
+            , "INDEX idx_new ON t (a)"
+            , "INDEX idx_expr ON t ((a + 1))"
+            , "INDEX idx_call ON t (f(a))"
+            , "INDEX idx_float ON t (a(1.5))"
+            , "SEQUENCE seq_new"
+            , "SCHEMA s_new"
+            , "VIEW v_new AS SELECT a FROM t"
+            , "MACRO m_new(x) AS x + 1"
+            ]
+    pure ("CREATE " <> modifier <> obj <> ";")
+
+genMySQLFamilyWindowSql :: Gen ByteString
+genMySQLFamilyWindowSql =
+    oneof
+        [ genWindowAggSql
+        , elements
+            [ "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t;"
+            , "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) OVER () FROM t;"
+            , "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY a) OVER (PARTITION BY b) FROM t;"
+            , "SELECT abs(a) OVER (PARTITION BY b) FROM t;"
+            , "SELECT sum(a) OVER (PARTITION BY b) FROM t;"
+            ]
+        ]
+
+genMySQLFamilyDmlSql :: Gen ByteString
+genMySQLFamilyDmlSql =
+    oneof
+        [ genDmlTailSqlWith True ["", " USING t JOIN u ON t.a = u.a"]
+        , do
+            wherePart <- elements ["", " WHERE t.a = 1"]
+            orderLimit <- elements ["", " ORDER BY a LIMIT 1"]
+            ret <- elements ["", " RETURNING a"]
+            pure ("DELETE t FROM t JOIN u ON t.a = u.a" <> wherePart <> orderLimit <> ret <> ";")
+        , do
+            rowKw <- elements ["", "ROW"]
+            dup <- elements ["", " ON DUPLICATE KEY UPDATE b = 3"]
+            ret <- elements ["", " RETURNING a"]
+            pure ("INSERT INTO t (a, b) VALUES " <> rowKw <> "(1, 2)" <> dup <> ret <> ";")
+        ]
+
+genMySQLFamilyExprSql :: Gen ByteString
+genMySQLFamilyExprSql =
+    elements
+        [ "SELECT CAST(a AS CHAR) FROM t;"
+        , "SELECT a::INT FROM t;"
+        , "SELECT /* outer /* inner */ still comment */ 1;"
+        , TE.encodeUtf8 "SELECT _utf8mb4'h\xe9llo';"
+        , "SELECT a FROM t LIMIT 0, 1;"
+        , "SELECT a FROM t LIMIT 1 OFFSET 0;"
+        , "PREPARE s1 FROM 'SELECT 1';"
+        , "PREPARE s2 FROM CONCAT('SELECT ', 1);"
+        , "RESET foreign_key_checks;"
+        , "SET GLOBAL @@session.autocommit = 0;"
+        ]
+
+genClickHouseJoinSql :: Gen ByteString
+genClickHouseJoinSql =
+    oneof
+        [ do
+            globalPart <- elements ["", "GLOBAL "]
+            strictPart <- elements ["", "ANY ", "ALL ", "SEMI ", "ANTI "]
+            joinKind <-
+                elements
+                    [ "INNER JOIN"
+                    , "LEFT JOIN"
+                    , "RIGHT JOIN"
+                    , "FULL OUTER JOIN"
+                    , "CROSS JOIN"
+                    , "ASOF JOIN"
+                    , "LEFT ASOF JOIN"
+                    , "ASOF LEFT JOIN"
+                    ]
+            cond <- elements ["", " ON t.a = u.a", " USING (a)"]
+            pure ("SELECT 1 FROM t " <> globalPart <> strictPart <> joinKind <> " u" <> cond <> ";")
+        , elements
+            [ "SELECT 1 FROM t NATURAL JOIN u ON t.a = u.a;"
+            , "SELECT 1 FROM t NATURAL JOIN u;"
+            , "SELECT 1 FROM t, LATERAL (SELECT 1) AS s;"
+            , "SELECT a, x FROM t ARRAY JOIN [1, 2] AS x;"
+            , "SELECT a, x FROM t LEFT ARRAY JOIN [1, 2] AS x;"
+            ]
+        ]
+
+genClickHouseCreateSql :: Gen ByteString
+genClickHouseCreateSql =
+    oneof
+        [ do
+            modifier <- elements ["", "TEMP ", "TEMPORARY ", "OR REPLACE ", "UNLOGGED "]
+            obj <-
+                elements
+                    [ "TABLE t_ch (a Int32, b String) ENGINE = MergeTree ORDER BY a SETTINGS index_granularity = 8192"
+                    , "TABLE t_ch_pk (a Int32 PRIMARY KEY, b String)"
+                    , "VIEW v_ch AS SELECT a FROM t"
+                    , "MATERIALIZED VIEW mv_ch TO t AS SELECT a FROM u"
+                    , "SEQUENCE seq_ch"
+                    , "DATABASE db_ch"
+                    , "FUNCTION fn_ch AS (x) -> x + 1"
+                    , "MACRO m_ch(x) AS x + 1"
+                    ]
+            pure ("CREATE " <> modifier <> obj <> ";")
+        , elements
+            [ "DROP MATERIALIZED VIEW mv_ch;"
+            , "DROP VIEW v_ch SYNC;"
+            ]
+        ]
+
+genClickHouseWindowSql :: Gen ByteString
+genClickHouseWindowSql =
+    oneof
+        [ genWindowAggSql
+        , elements
+            [ "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) OVER () FROM t;"
+            , "SELECT count(a) FILTER (WHERE b > 0) FROM t;"
+            ]
+        ]
+
+genClickHouseQueryDmlSql :: Gen ByteString
+genClickHouseQueryDmlSql =
+    elements
+        [ "SELECT a FROM t PREWHERE a > 0 WHERE b > 0 SETTINGS max_threads = 1 FORMAT Null;"
+        , "SELECT a, FROM t;"
+        , "SELECT a AS x, FROM t;"
+        , "SELECT a FROM t LIMIT 0, 1;"
+        , "SELECT a FROM t LIMIT 1 OFFSET 0;"
+        , "FROM t SELECT a;"
+        , "INSERT INTO t (a, b) VALUES (1, 2);"
+        , "INSERT INTO t (a, b) SELECT a, b FROM u;"
+        , "INSERT INTO t (a, b) SELECT a, b FROM u ON CONFLICT DO NOTHING;"
+        , "INSERT INTO t (a, b) SELECT a, b FROM u RETURNING a;"
+        , "ALTER TABLE t UPDATE b = 2 WHERE a = 1;"
+        , "ALTER TABLE t DELETE WHERE a = 1;"
+        , "OPTIMIZE TABLE t FINAL;"
+        ]
+
+genClickHouseExprLexSql :: Gen ByteString
+genClickHouseExprLexSql =
+    elements
+        [ "SELECT CAST(a, 'Int32') FROM t;"
+        , "SELECT a::Int32 FROM t;"
+        , "SELECT data.:Int64 FROM t;"
+        , "SELECT arrayMap(x -> x + 1, [1, 2, 3]);"
+        , "SELECT arrayMap((x, y) -> x + y, [1, 2], [3, 4]);"
+        , "SELECT $tag$hello 'world'$tag$;"
+        , "SELECT $$plain 'dollar'$$;"
+        , "SELECT E'line\\nbreak';"
+        , "SELECT /* outer /* inner */ still comment */ 1;"
+        , "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b;"
         ]
 
 -- ---------------------------------------------------------------------------

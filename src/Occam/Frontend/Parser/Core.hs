@@ -9,6 +9,7 @@ module Occam.Frontend.Parser.Core (
     PState (..),
     P,
     runParser,
+    inSubqueryP,
     parseQueryHook,
     parseStatementHook,
     throwParse,
@@ -130,7 +131,7 @@ import Occam.Parser.Dialect (
     DialectFeature,
     DialectProfile (..),
  )
-import Occam.Parser.Types (SQLDialect (ClickHouse, DuckDB))
+import Occam.Parser.Types (SQLDialect (ClickHouse, DuckDB, MariaDB, MySQL))
 
 -- ---------------------------------------------------------------------------
 -- Public error and result types
@@ -168,6 +169,7 @@ data PState = PState
     , psTokens :: !(Vector SpannedToken)
     , psPos :: !Int
     , psEndOffset :: !Int
+    , psSubqueryDepth :: !Int
     , psParseQuery :: P (Located Query)
     , psParseStatement :: P (Located Statement)
     }
@@ -185,11 +187,20 @@ runParser ::
     P a ->
     Either ParseError a
 runParser profile tokens endOffset parseQ parseS action =
-    evalStateT action (PState profile tokens 0 endOffset parseQ parseS)
+    evalStateT action (PState profile tokens 0 endOffset 0 parseQ parseS)
+
+-- | Run @action@ with increased subquery nesting depth for dialect-specific checks.
+inSubqueryP :: P a -> P a
+inSubqueryP action = do
+    prevDepth <- gets psSubqueryDepth
+    modify' (\s -> s {psSubqueryDepth = prevDepth + 1})
+    result <- action
+    modify' (\s -> s {psSubqueryDepth = prevDepth})
+    pure result
 
 -- | Re-enter the query parser (used for subqueries and CTE hooks).
 parseQueryHook :: P (Located Query)
-parseQueryHook = join (gets psParseQuery)
+parseQueryHook = inSubqueryP (join (gets psParseQuery))
 
 -- | Re-enter the statement parser (used for CTE bodies and nested statements).
 parseStatementHook :: P (Located Statement)
@@ -504,9 +515,13 @@ tokenStartsBareAliasP mt = case mt of
     Just (L _ (TokWord wt))
         | Nothing <- wordQuote wt -> do
             let upper = asciiUpperBS (wordRaw wt)
+            dialect <- gets (dialectId . psProfile)
             if upper == "ASOF"
-                then not <$> gets ((`elem` [DuckDB, ClickHouse]) . dialectId . psProfile)
-                else pure (tokenStartsBareAlias mt)
+                then pure (dialect `notElem` [DuckDB, ClickHouse])
+                else
+                    if upper == "FULL" && dialect `elem` [MySQL, MariaDB]
+                        then pure True
+                        else pure (tokenStartsBareAlias mt)
     _ -> pure (tokenStartsBareAlias mt)
 
 -- | Parse one alias, optionally with a parenthesized column list.
@@ -667,7 +682,7 @@ queryStartsAt :: Int -> P Bool
 queryStartsAt offset = do
     PState {psProfile, psTokens, psPos} <- get
     let token !i = locValue <$> (psTokens V.!? i)
-        fromFirst = dialectId psProfile == DuckDB
+        fromFirst = dialectId psProfile `elem` [DuckDB, ClickHouse]
         startsQuery =
             maybe
                 False

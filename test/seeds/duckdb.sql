@@ -32,7 +32,7 @@ RETURNING id;
 
 -- Query
 -- @case: duckdb_query_from_first
--- @dialects: duckdb
+-- @dialects: duckdb,clickhouse
 -- @units: sql=;
 FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, label)
 SELECT id, label

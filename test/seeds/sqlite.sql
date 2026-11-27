@@ -50,7 +50,7 @@ BEGIN
 END;
 
 -- @case: sqlite_ddl_rename_column
--- @dialects: postgresql,mysql,mariadb,sqlite,duckdb
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
 -- @units: sql=;,sql=;
 CREATE TABLE seed_shared_rename (id INTEGER PRIMARY KEY, old_name TEXT NOT NULL);
 -- @unit
@@ -58,7 +58,7 @@ ALTER TABLE seed_shared_rename RENAME COLUMN old_name TO new_name;
 
 -- Query
 -- @case: sqlite_query_recursive_cte
--- @dialects: postgresql,mysql,mariadb,sqlite,duckdb
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
 -- @units: sql=;
 WITH RECURSIVE seed_shared_n(n) AS (
     SELECT 1
@@ -110,7 +110,7 @@ DETACH DATABASE seed_sq_aux;
 VACUUM main;
 
 -- @case: sqlite_ddl_alter_add_drop_column
--- @dialects: postgresql,mysql,mariadb,sqlite,duckdb
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
 -- @units: sql=;,sql=;,sql=;
 CREATE TABLE seed_sq_alt (id INTEGER PRIMARY KEY, a TEXT);
 -- @unit
@@ -136,7 +136,7 @@ RELEASE SAVEPOINT seed_sq_sp;
 COMMIT;
 
 -- @case: sqlite_query_window_filter_agg
--- @dialects: postgresql,sqlite,duckdb
+-- @dialects: postgresql,sqlite,duckdb,clickhouse
 -- @units: sql=;,sql=;,sql=;
 CREATE TABLE seed_sq_win (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
 -- @unit

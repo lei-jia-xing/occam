@@ -216,6 +216,7 @@ test-suite occam-test
                       test/cbits/pg_query_shim.c
     hs-source-dirs:   test eval-lib
     other-modules:    DialectFuzz
+                    , ExtraEngineOracles
                     , Fuzz
                     , MutationalFuzz
                     , PgQueryOracle

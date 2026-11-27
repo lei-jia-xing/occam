@@ -2,15 +2,26 @@
 module FrontendSeedChecks (tests) where
 
 import Control.Exception (SomeException, bracket, try)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Vector qualified as V
 import Database.SQLite3 qualified as Sqlite
+import ExtraEngineOracles (
+    ExtraOracles (..),
+    MysqlServer,
+    MysqlSyntaxError (..),
+    clickhouseSyntaxCheck,
+    mysqlClientScriptCheck,
+    mysqlCrossRejectCheck,
+    mysqlSyntaxCheckIsolated,
+ )
 import Foreign.C.String (peekCString)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (nullPtr)
@@ -20,6 +31,7 @@ import FrontendSeedLoader (
     SeedCase (..),
     UnitExpectation (..),
     activeDelimiterAfter,
+    expectedUnitDirective,
     expectedUnitSqlOnlyCount,
     loadSeedCorpus,
     seedCorpusPath,
@@ -84,11 +96,14 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, assertEqual, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
-tests :: IO TestTree
-tests = do
+tests :: ExtraOracles -> IO TestTree
+tests extraOracles = do
     corpus <- loadSeedCorpus >>= either (ioError . userError . ("seed corpus: " <>)) pure
     pgAvail <- isPgQueryAvailable
-    let positive = filter (not . isInvalidCase) corpus
+    let chAvail = oracleClickHouse extraOracles
+        mMysqlSrv = oracleMySQL extraOracles
+        mMariaSrv = oracleMariaDB extraOracles
+        positive = filter (not . isInvalidCase) corpus
         invalid = filter isInvalidCase corpus
         multiUnit = filter ((>= 2) . length . seedCaseUnits) positive
         middle = filter (all (== ";") . activeDelimiterAfter) multiUnit
@@ -99,6 +114,15 @@ tests = do
         sqliteInvalid = filter (elem SQLite . seedCaseDialects) invalid
         duckdbPositive = filter (elem DuckDB . seedCaseDialects) positive
         duckdbInvalid = filter (elem DuckDB . seedCaseDialects) invalid
+        chPositive = filter (elem ClickHouse . seedCaseDialects) positive
+        chInvalid = filter (elem ClickHouse . seedCaseDialects) invalid
+        chCrossReject = filter (notElem ClickHouse . seedCaseDialects) positive
+        mysqlPositive = filter (elem MySQL . seedCaseDialects) positive
+        mysqlInvalid = filter (elem MySQL . seedCaseDialects) invalid
+        mysqlCrossReject = filter (notElem MySQL . seedCaseDialects) positive
+        mariaPositive = filter (elem MariaDB . seedCaseDialects) positive
+        mariaInvalid = filter (elem MariaDB . seedCaseDialects) invalid
+        mariaCrossReject = filter (notElem MariaDB . seedCaseDialects) positive
     pure $
         testGroup
             "Pure-Haskell Frontend seed conformance"
@@ -125,6 +149,40 @@ tests = do
                 [ testGroup "positive seeds" (map duckdbTest duckdbPositive)
                 , testGroup "invalid seeds" (map duckdbInvalidTest duckdbInvalid)
                 ]
+            , testGroup
+                "ClickHouse clickhouse-format alignment"
+                ( if chAvail
+                    then
+                        [ testGroup "positive seeds" (map chPositiveTest chPositive)
+                        , testGroup "invalid seeds" (map chInvalidTest chInvalid)
+                        , testGroup "cross-dialect non-ClickHouse seeds" (map chCrossRejectTest chCrossReject)
+                        ]
+                    else []
+                )
+            , testGroup
+                "MySQL 8.4 mysqld alignment"
+                ( case mMysqlSrv of
+                    Just srv ->
+                        [ testGroup "positive seeds" (map (mysqlFamilyPositiveTest "MySQL 8.4" srv) mysqlPositive)
+                        , testGroup "invalid seeds" (map (mysqlFamilyInvalidTest "MySQL 8.4" srv) mysqlInvalid)
+                        , testGroup
+                            "cross-dialect non-MySQL seeds"
+                            (map (mysqlFamilyCrossRejectTest "MySQL 8.4" srv) mysqlCrossReject)
+                        ]
+                    Nothing -> []
+                )
+            , testGroup
+                "MariaDB 11.4 mariadbd alignment"
+                ( case mMariaSrv of
+                    Just srv ->
+                        [ testGroup "positive seeds" (map (mysqlFamilyPositiveTest "MariaDB 11.4" srv) mariaPositive)
+                        , testGroup "invalid seeds" (map (mysqlFamilyInvalidTest "MariaDB 11.4" srv) mariaInvalid)
+                        , testGroup
+                            "cross-dialect non-MariaDB seeds"
+                            (map (mysqlFamilyCrossRejectTest "MariaDB 11.4" srv) mariaCrossReject)
+                        ]
+                    Nothing -> []
+                )
             , testGroup
                 "seed-derived QuickCheck mutation"
                 [ testProperty "tail truncation keeps the independently closed prefix" (propTailTruncation multiUnit)
@@ -230,6 +288,110 @@ pgCatalogOnlyCrossSeeds =
     [ "mysql_utf8_introducer_cast"
     , "mariadb_utf8_introducer_cast"
     ]
+
+chPositiveTest :: SeedCase -> TestTree
+chPositiveTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- clickhouseSyntaxCheck (seedCaseSql seedCase)
+    case result of
+        Left err ->
+            assertFailure
+                (seedLabel seedCase <> ": clickhouse format rejected positive ClickHouse seed: " <> T.unpack err)
+        Right () -> pure ()
+
+chInvalidTest :: SeedCase -> TestTree
+chInvalidTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- clickhouseSyntaxCheck (seedCaseSql seedCase)
+    case result of
+        Left _ -> pure ()
+        Right () ->
+            assertFailure (seedLabel seedCase <> ": clickhouse format accepted invalid ClickHouse seed")
+
+chCrossRejectTest :: SeedCase -> TestTree
+chCrossRejectTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- clickhouseSyntaxCheck (seedCaseSql seedCase)
+    if seedCaseId seedCase `elem` clickhouseFormatOnlyCrossSeeds
+        then
+            -- clickhouse format accepts these 3 grammar-quirk forms (ASOF RIGHT JOIN,
+            -- VALUES ROW(...), client-side COPY) that clickhouse-local/server reject
+            -- semantically (Code 48 / 27 / 78).
+            assertBool
+                (seedLabel seedCase <> ": expected clickhouse format quirk acceptance")
+                (case result of Right () -> True; Left _ -> False)
+        else case result of
+            Left _ -> pure ()
+            Right () ->
+                assertFailure
+                    ( seedLabel seedCase
+                        <> ": non-ClickHouse seed was accepted by clickhouse format while rejected by Occam"
+                    )
+
+clickhouseFormatOnlyCrossSeeds :: [Text]
+clickhouseFormatOnlyCrossSeeds =
+    [ "duckdb_query_asof_join"
+    , "mysql_dml_insert_values_row"
+    , "pg_utility_copy_shared"
+    ]
+
+mysqlFamilyPositiveTest :: String -> MysqlServer -> SeedCase -> TestTree
+mysqlFamilyPositiveTest label srv seedCase = testCase (seedLabel seedCase) $ do
+    res <- mysqlSyntaxCheckIsolated srv (seedCaseSql seedCase)
+    case res of
+        Left err ->
+            assertFailure
+                ( seedLabel seedCase
+                    <> ": "
+                    <> label
+                    <> " rejected positive seed ("
+                    <> show (mysqlErrCode err)
+                    <> "): "
+                    <> T.unpack (mysqlErrMessage err)
+                )
+        Right () -> pure ()
+    when (any (isJust . expectedUnitDirective) (seedCaseUnits seedCase)) $ do
+        cliRes <- mysqlClientScriptCheck srv (seedCaseSql seedCase)
+        case cliRes of
+            Left err ->
+                assertFailure
+                    ( seedLabel seedCase
+                        <> ": "
+                        <> label
+                        <> " CLI client rejected DELIMITER script: "
+                        <> T.unpack err
+                    )
+            Right () -> pure ()
+
+mysqlFamilyInvalidTest :: String -> MysqlServer -> SeedCase -> TestTree
+mysqlFamilyInvalidTest label srv seedCase = testCase (seedLabel seedCase) $ do
+    if seedCaseId seedCase == "invalid_mysql_delimiter_no_space"
+        then do
+            cliRes <- mysqlClientScriptCheck srv (seedCaseSql seedCase)
+            case cliRes of
+                Left _ -> pure ()
+                Right () ->
+                    assertFailure
+                        (seedLabel seedCase <> ": " <> label <> " CLI client accepted invalid DELIMITER; seed")
+        else do
+            res <- mysqlSyntaxCheckIsolated srv (seedCaseSql seedCase)
+            case res of
+                Left _ -> pure ()
+                Right () ->
+                    assertFailure
+                        (seedLabel seedCase <> ": " <> label <> " accepted invalid seed")
+
+mysqlFamilyCrossRejectTest :: String -> MysqlServer -> SeedCase -> TestTree
+mysqlFamilyCrossRejectTest label srv seedCase = testCase (seedLabel seedCase) $ do
+    res <- mysqlCrossRejectCheck srv (seedCaseSql seedCase)
+    case res of
+        Left _ -> pure ()
+        Right () ->
+            assertFailure
+                ( seedLabel seedCase
+                    <> ": non-"
+                    <> label
+                    <> " seed was accepted by "
+                    <> label
+                    <> " while rejected by Occam"
+                )
 
 sqliteTest :: SeedCase -> TestTree
 sqliteTest seedCase = testCase (seedLabel seedCase) $ do

@@ -189,7 +189,7 @@ accepted as crash evidence. Use `--jobs 1` because the harness shares one
 ## Unit & Contract Tests
 
 ```bash
-# Haskell & Rust test suites + verification checks:
+# Full Haskell test, lint, harness, and proof suites:
 make check
 
 # Crash oracle & harness contract tests:

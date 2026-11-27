@@ -614,9 +614,9 @@ dialectTests =
                 clickhouseProfile
                 "SELECT DISTINCT ON (a) a FROM t;"
             , acceptCase
-                "ClickHouse LATERAL subquery"
+                "ClickHouse CTE column lists"
                 clickhouseProfile
-                "SELECT * FROM t, LATERAL (SELECT 1) AS x;"
+                "WITH cte(n) AS (SELECT 1) SELECT n FROM cte;"
             , acceptCase
                 "ClickHouse trailing comma in SELECT list"
                 clickhouseProfile
@@ -933,9 +933,9 @@ dialectTests =
                 ParseUnsupported
                 Nothing
             , rejectCase
-                "ClickHouse rejects CTE column lists"
+                "ClickHouse rejects LATERAL subquery"
                 clickhouseProfile
-                "WITH cte(n) AS (SELECT 1) SELECT n FROM cte;"
+                "SELECT * FROM t, LATERAL (SELECT 1) AS x;"
                 ParseUnsupported
                 Nothing
             , rejectCase
@@ -1558,7 +1558,7 @@ grammarGapTests =
                         (map locValue (setTransactionModes setStmt))
                 other -> assertFailure ("expected SetStmt, got " <> show other)
             assertRejected mysqlProfile "SET TRANSACTION SNAPSHOT 'snap'"
-        , testCase "RESET statements across PostgreSQL and MySQL" $ do
+        , testCase "RESET statements across PostgreSQL, DuckDB, and MySQL/MariaDB rejections" $ do
             r1 <- parseSingleChecked postgresqlProfile "RESET ROLE"
             assertEqual "RESET ROLE" (StatementReset (L (ByteSpan 0 10) ResetRole)) (locValue r1)
             r2 <- parseSingleChecked postgresqlProfile "RESET SESSION AUTHORIZATION"
@@ -1573,16 +1573,12 @@ grammarGapTests =
             case locValue r4 of
                 StatementReset (L _ (ResetTarget (SetTargetName _))) -> pure ()
                 other -> assertFailure ("expected ResetTarget SetTargetName, got " <> show other)
-            _ <- parseSingleChecked mysqlProfile "RESET foreign_key_checks"
-            r5 <- parseSingleChecked mysqlProfile "RESET @search_path"
-            case locValue r5 of
-                StatementReset (L _ (ResetTarget (SetTargetUserVar (L _ "@search_path")))) -> pure ()
-                other -> assertFailure ("expected ResetTarget SetTargetUserVar, got " <> show other)
-            r6 <- parseSingleChecked mysqlProfile "RESET @@global.foreign_key_checks"
-            case locValue r6 of
-                StatementReset (L _ (ResetTarget (SetTargetSysVar (L _ "@@global.foreign_key_checks")))) -> pure ()
-                other -> assertFailure ("expected ResetTarget SetTargetSysVar, got " <> show other)
-            assertRejected sqliteProfile "RESET ALL"
+            _ <- parseSingleChecked duckdbProfile "RESET ALL"
+            forM_ [mysqlProfile, mariadbProfile, sqliteProfile] $ \prof -> do
+                assertRejected prof "RESET foreign_key_checks"
+                assertRejected prof "RESET ALL"
+            assertRejected mysqlProfile "RESET @search_path"
+            assertRejected mysqlProfile "RESET @@global.foreign_key_checks"
         , testCase "PostgreSQL ALTER TABLE USING INDEX, INHERIT/NO INHERIT, OWNER TO, SET LOGGED/UNLOGGED" $ do
             pk <- parseSingleChecked postgresqlProfile "ALTER TABLE s.t ADD PRIMARY KEY USING INDEX t_idx"
             case alterActionsOf pk of
@@ -1710,8 +1706,8 @@ grammarGapTests =
                             other -> assertFailure ("expected nested CteStatement Insert, got " <> show other)
                     other -> assertFailure ("expected outer WITH clause, got " <> show other)
                 other -> assertFailure ("expected InsertStmt, got " <> show other)
-        , testCase "Ordered-set aggregates WITHIN GROUP (ORDER BY ...)" $ do
-            forM_ [postgresqlProfile, duckdbProfile, mariadbProfile] $ \prof -> do
+        , testCase "Ordered-set aggregates WITHIN GROUP (ORDER BY ...) and MariaDB OVER requirement" $ do
+            forM_ [postgresqlProfile, duckdbProfile] $ \prof -> do
                 stmt <- parseSingleChecked prof "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) FROM t"
                 case locValue stmt of
                     StatementQuery (L _ q) -> case locValue (queryBody q) of
@@ -1721,8 +1717,23 @@ grammarGapTests =
                             other -> assertFailure ("expected ExprCall, got " <> show other)
                         other -> assertFailure ("expected SELECT, got " <> show other)
                     other -> assertFailure ("expected Query, got " <> show other)
-            forM_ [sqliteProfile, mysqlProfile] $ \prof ->
+            mariaStmt <-
+                parseSingleChecked
+                    mariadbProfile
+                    "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) OVER () FROM t"
+            case locValue mariaStmt of
+                StatementQuery (L _ q) -> case locValue (queryBody q) of
+                    QueryBodySelect core -> case map (locValue . selectItemExpr . locValue) (selectItems core) of
+                        [ExprCall (L _ fc)] -> do
+                            assertEqual "MariaDB within group order items" 1 (length (functionWithinGroup fc))
+                            assertBool "MariaDB within group OVER present" (isJust (functionOver fc))
+                        other -> assertFailure ("expected ExprCall, got " <> show other)
+                    other -> assertFailure ("expected SELECT, got " <> show other)
+                other -> assertFailure ("expected Query, got " <> show other)
+            assertRejected mariadbProfile "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) FROM t"
+            forM_ [sqliteProfile, mysqlProfile, clickhouseProfile] $ \prof -> do
                 assertRejected prof "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) FROM t"
+                assertRejected prof "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) OVER () FROM t"
         , testCase "PostgreSQL FROM ONLY t and FROM t * markers" $ do
             onlyStmt <- parseSingleChecked postgresqlProfile "SELECT * FROM ONLY t"
             case firstTableRef onlyStmt of
@@ -1775,13 +1786,11 @@ grammarGapTests =
                         [IndexKeyPart (L _ (ExprColumn _)) (Just _) Nothing Nothing] -> pure ()
                         other -> assertFailure ("expected MySQL index prefix length, got " <> show other)
                 other -> assertFailure ("expected CreateIndex, got " <> show other)
-            myFloatIdx <- parseSingleChecked mysqlProfile "CREATE INDEX sk ON t (b(1.5))"
-            case locValue myFloatIdx of
-                StatementCreate (L _ CreateStmt {createObject = L _ (CreateIndexObject ci)}) ->
-                    case map locValue (createIndexKeys ci) of
-                        [IndexKeyPart (L _ (ExprCall _)) Nothing Nothing Nothing] -> pure ()
-                        other -> assertFailure ("expected MySQL non-integer b(1.5) to parse as call, got " <> show other)
-                other -> assertFailure ("expected CreateIndex, got " <> show other)
+            assertRejected mysqlProfile "CREATE INDEX sk ON t (b(1.5))"
+            assertRejected mysqlProfile "CREATE INDEX sk ON t (f(b))"
+            assertRejected mariadbProfile "CREATE INDEX sk ON t ((lower(b)))"
+            _ <- parseSingleChecked mysqlProfile "CREATE INDEX sk ON t ((lower(b)))"
+            pure ()
         ]
     where
         parseSingleChecked profile sql = do

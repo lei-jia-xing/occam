@@ -64,14 +64,13 @@ ORDER BY id
 SETTINGS max_threads = 1
 FORMAT Null;
 
--- Trailing FORMAT Null isolates ClickHouse syntax from DuckDB (whose parser
--- also accepts trailing SELECT commas and GROUPING SETS, differing only on catalog).
+-- Trailing comma without alias isolates ClickHouse trailing-comma syntax.
 -- @case: clickhouse_query_grouping_sets_trailing_comma
 -- @dialects: clickhouse
 -- @units: sql=;
 SELECT
     number % 2 AS bucket,
-    count() AS total,
+    count(),
 FROM numbers(6)
 GROUP BY GROUPING SETS ((number % 2), ())
 ORDER BY bucket NULLS FIRST
