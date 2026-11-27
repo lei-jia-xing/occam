@@ -6,7 +6,7 @@ module Occam.Reducer.Closure (
     closureSearchWithAnalysis,
 ) where
 
-import Control.Monad (unless)
+import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Cont (evalContT)
 import Data.Aeson (toJSON)
@@ -36,7 +36,7 @@ import Occam.Reducer.Statement (
     statementSpanBytes,
  )
 import Occam.Reducer.Support (SQLAnalysis (..), earlyExit)
-import Occam.Slicer (backwardSliceFast, closeFromBoundary, successorIndex)
+import Occam.Slicer (closeFromBoundary, successorIndex)
 
 -- | Closure-constrained delta debugging.
 closureDdmin :: OraclePool -> ByteString -> [Statement] -> DependencyGraph -> IO [Statement]
@@ -65,17 +65,19 @@ closureDdminWithLogger policy logger pool baseSQL initialStatements graph = do
 data ClosureEnv = ClosureEnv
     { ceGraph :: !DependencyGraph
     , ceInitialClosed :: !Bool
+    , ceUseSinkCheck :: !Bool
     , cePredecessors :: !(IntMap.IntMap IntSet.IntSet)
     , ceSuccessors :: !(IntMap.IntMap IntSet.IntSet)
     , ceWeights :: !(IntMap.IntMap Int)
     , ceCache :: !(IORef (HashMap IntSet.IntSet IntSet.IntSet))
-    , ceFullRoots :: !(IORef (Maybe (IntSet.IntSet, IntSet.IntSet)))
+    , ceSinks :: !(IORef (Maybe (IntSet.IntSet, IntSet.IntSet)))
     , ceStats :: !(IORef ClosureStats)
     }
 
 data ClosureStats = ClosureStats
     { closureRequests :: !Int
     , closureCacheHits :: !Int
+    , closureUnchangedHits :: !Int
     , closureGainStatements :: !Int
     , closureGainBytes :: !Int
     }
@@ -92,19 +94,25 @@ closureDdminWithCert ::
     IO [Statement]
 closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements graph = do
     closureCache <- newIORef HashMap.empty
-    fullRootsCache <- newIORef Nothing
-    closureStats <- newIORef (ClosureStats 0 0 0 0)
+    sinksCache <- newIORef Nothing
+    closureStats <- newIORef (ClosureStats 0 0 0 0 0)
     let predecessors = graphFastEdges graph
+        initialIds = statementIdsInt initialStatements
+        initialClosed = isValidClosureFast graph initialIds
         env =
             ClosureEnv
                 { ceGraph = graph
-                , ceInitialClosed = isValidClosureFast graph (statementIdsInt initialStatements)
+                , ceInitialClosed = initialClosed
+                , ceUseSinkCheck =
+                    initialClosed
+                        && not (IntMap.null predecessors)
+                        && IntSet.foldr (\sid rest -> hasEarlierPredecessors predecessors sid && rest) True initialIds
                 , cePredecessors = predecessors
                 , ceSuccessors = successorIndex predecessors
                 , ceWeights =
                     IntMap.fromList [(unStatementId (stmtId s), statementSpanBytes s) | s <- initialStatements]
                 , ceCache = closureCache
-                , ceFullRoots = fullRootsCache
+                , ceSinks = sinksCache
                 , ceStats = closureStats
                 }
     result <-
@@ -122,31 +130,25 @@ closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements g
     logClosureStats logger stats
     pure result
 
-computeFullSliceRoots ::
-    IntMap.IntMap IntSet.IntSet -> DependencyGraph -> IntSet.IntSet -> IntSet.IntSet
-computeFullSliceRoots successors graph currentInts = case IntSet.minView sinks of
-    Just (sink, rest)
-        | IntSet.null rest
-        , backwardSliceFast sink graph == currentInts ->
-            IntSet.singleton sink
-    _ -> IntSet.empty
+-- Graphs constructed by callers may contain cycles, so check the temporal
+-- invariant that the sink criterion uses before applying it to any subset.
+hasEarlierPredecessors :: IntMap.IntMap IntSet.IntSet -> Int -> Bool
+hasEarlierPredecessors predecessors sid = IntSet.null deps || IntSet.findMax deps < sid
     where
-        sinks =
-            IntSet.filter
-                (\v -> IntSet.disjoint currentInts (IntMap.findWithDefault IntSet.empty v successors))
-                currentInts
+        deps = IntMap.findWithDefault IntSet.empty sid predecessors
 
-lookupFullSliceRoots :: ClosureEnv -> IntSet.IntSet -> IO IntSet.IntSet
-lookupFullSliceRoots env currentInts
-    | not (ceInitialClosed env) || IntMap.null (cePredecessors env) = pure IntSet.empty
-    | otherwise = do
-        cached <- readIORef (ceFullRoots env)
-        case cached of
-            Just (cachedCurrent, roots) | cachedCurrent == currentInts -> pure roots
-            _ -> do
-                let !roots = computeFullSliceRoots (ceSuccessors env) (ceGraph env) currentInts
-                writeIORef (ceFullRoots env) (Just (currentInts, roots))
-                pure roots
+lookupCurrentSinks :: ClosureEnv -> IntSet.IntSet -> IO IntSet.IntSet
+lookupCurrentSinks env currentInts = do
+    cached <- readIORef (ceSinks env)
+    case cached of
+        Just (cachedCurrent, sinks) | cachedCurrent == currentInts -> pure sinks
+        _ -> do
+            let !sinks = IntSet.filter hasNoConsumer currentInts
+            writeIORef (ceSinks env) (Just (currentInts, sinks))
+            pure sinks
+    where
+        hasNoConsumer sid =
+            IntSet.disjoint currentInts (IntMap.findWithDefault IntSet.empty sid (ceSuccessors env))
 
 closeClosureCandidate :: ClosureEnv -> IntSet.IntSet -> IntSet.IntSet -> IntSet.IntSet
 closeClosureCandidate env current seed
@@ -160,8 +162,12 @@ closeClosureCandidate env current seed
 buildClosureCandidate :: ClosureEnv -> IntSet.IntSet -> IntSet.IntSet -> IO (Maybe IntSet.IntSet)
 buildClosureCandidate env currentInts seedInts = evalContT do
     liftIO $ modifyIORef' (ceStats env) (\s -> s {closureRequests = closureRequests s + 1})
-    fullRoots <- liftIO $ lookupFullSliceRoots env currentInts
-    unless (IntSet.disjoint seedInts fullRoots) (earlyExit (Just currentInts))
+    when (ceUseSinkCheck env) do
+        -- See closeSet_same_members_iff_all_sinks in proofs/Proofs/DAG.lean.
+        sinks <- liftIO $ lookupCurrentSinks env currentInts
+        when (sinks `IntSet.isSubsetOf` seedInts) do
+            liftIO $ modifyIORef' (ceStats env) (\s -> s {closureUnchangedHits = closureUnchangedHits s + 1})
+            earlyExit (Just currentInts)
     closedInts <- liftIO $ lookupOrComputeClosure env currentInts seedInts
     -- A seed is a subset of the current set. If the initial set was closed,
     -- the seed closure stays inside it, and each accepted closure keeps the
@@ -203,20 +209,25 @@ logClosureStats logger stats
             logger
             "reducer"
             "Closure search accepted reduction"
-            [ ("gain_statements", toJSON gainStmts)
-            , ("gain_bytes", toJSON gainBytes)
-            ]
+            (("gain_statements", toJSON gainStmts) : ("gain_bytes", toJSON gainBytes) : counts)
     | otherwise =
         logDebug'
             logger
             "reducer"
             "Closure search found no further reductions"
-            [ ("closure_requests", toJSON (closureRequests stats))
-            , ("closure_cache_hits", toJSON (closureCacheHits stats))
-            ]
+            counts
     where
         gainStmts = closureGainStatements stats
         gainBytes = closureGainBytes stats
+        counts =
+            [ ("closure_requests", toJSON (closureRequests stats))
+            , ("closure_cache_hits", toJSON (closureCacheHits stats))
+            , ("closure_unchanged_hits", toJSON (closureUnchangedHits stats))
+            ,
+                ( "closure_computations"
+                , toJSON (closureRequests stats - closureCacheHits stats - closureUnchangedHits stats)
+                )
+            ]
 
 closureSearchWithAnalysis ::
     EarlyRejectTracker ->

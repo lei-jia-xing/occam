@@ -319,6 +319,64 @@ theorem closeSet_reachability (G : DAG) {u : StmtId} {roots : List StmtId} (hroo
     apply List.mem_flatMap.2
     exact ⟨r, hr_roots, hu_slice⟩
 
+def IsClosureSink (G : DAG) (current : List StmtId) (v : StmtId) : Prop :=
+  v ∈ current ∧ ∀ consumer ∈ current, v ∉ G.deps consumer
+
+private theorem sink_reachable_only_from_self (G : DAG) (current : List StmtId)
+    (hclosed : isValidClosure G current) {v root : StmtId}
+    (hsink : IsClosureSink G current v) (path : Reachable G v root) :
+    root ∈ current → root = v := by
+  induction path with
+  | refl =>
+    intro _
+    rfl
+  | @step dst pred hdep _ ih =>
+    intro hdst
+    have hpred := hclosed dst hdst pred hdep
+    have heq := ih hpred
+    subst pred
+    exact (hsink.2 dst hdst hdep).elim
+
+/-- For a closed current set, closure returns it exactly when the seed contains
+    every vertex with no consumer in the current set. Equality is extensional. -/
+theorem closeSet_same_members_iff_all_sinks (G : DAG) (current seed : List StmtId)
+    (hcurrent : current ⊆ G.stmts) (hclosed : isValidClosure G current)
+    (hseed : seed ⊆ current) :
+    (∀ v, v ∈ closeSet G seed ↔ v ∈ current) ↔
+      (∀ v, IsClosureSink G current v → v ∈ seed) := by
+  have hseedG := hseed.trans hcurrent
+  have hprojection := closeSet_isValidClosure G seed hseedG
+  constructor
+  · intro same v hsink
+    have hv := (same v).2 hsink.1
+    obtain ⟨root, hroot, path⟩ := (closeSet_reachability G hseedG).1 hv
+    simpa only [sink_reachable_only_from_self G current hclosed hsink path (hseed hroot)] using hroot
+  · intro allSinks v
+    refine ⟨fun hv => closeSet_minimal G seed current hseed hclosed hv, ?_⟩
+    intro hv
+    by_cases hin : v ∈ closeSet G seed
+    · exact hin
+    · let missing := current.filter (fun w => w ∉ closeSet G seed)
+      have hvMissing : v ∈ missing := by simp [missing, hv, hin]
+      have hNonempty : missing ≠ [] := by
+        intro h
+        simp [h] at hvMissing
+      obtain ⟨m, hmax⟩ := Option.ne_none_iff_exists'.1
+        (fun h => hNonempty (List.max?_eq_none_iff.1 h))
+      have ⟨hmMissing, hMaximal⟩ := List.max?_eq_some_iff.1 hmax
+      have hm : m ∈ current ∧ m ∉ closeSet G seed := by
+        simpa [missing] using hmMissing
+      have hsink : IsClosureSink G current m := by
+        refine ⟨hm.1, ?_⟩
+        intro consumer hc hdep
+        have hcMissing : consumer ∈ missing := by
+          have hcOut : consumer ∉ closeSet G seed :=
+            fun hcIn => hm.2 (hprojection consumer hcIn m hdep)
+          simp [missing, hc, hcOut]
+        exact (Nat.not_lt_of_ge (hMaximal consumer hcMissing))
+          (G.deps_temporal consumer (hcurrent hc) m hdep).1
+      exact (hm.2 (roots_subset_closeSet G seed (allSinks m hsink))).elim
+
 /-- To close a retained set, it suffices to close its missing direct predecessors.
     A reverse-edge index can find this boundary by scanning the deleted vertices
     instead of visiting every retained vertex. -/

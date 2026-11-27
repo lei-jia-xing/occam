@@ -1,9 +1,11 @@
 module ReductionChecks.StatementSearchChecks (checks) where
 
 import Control.Monad (when)
+import Data.Aeson (Value (Number))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.List (elemIndex, tails)
 import Data.Map.Strict qualified as Map
@@ -14,11 +16,18 @@ import Occam.Core (
     ResultStatement (..),
     ScopedBarrier (barrierScope),
     SemanticFacts (factBarriers),
+    Statement (stmtId),
     StatementId (..),
  )
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Facts (StatementUnit (..))
-import Occam.Logger (Logger (..), defaultLogConfig, nullLogger)
+import Occam.Logger (
+    LogConfig (logMinLevel),
+    LogLevel (LevelDebug),
+    Logger (..),
+    defaultLogConfig,
+    nullLogger,
+ )
 import Occam.Oracle (OracleObservationDetails (..), observationOutcome)
 import Occam.Oracle.Inline (newResultTraceTracker, prepareResultOracleWithTrace)
 import Occam.Oracle.Sqlite (generateSqliteContract, sqliteContractOracle)
@@ -381,6 +390,46 @@ checks =
                 assertBool
                     "a candidate with a missing predecessor is skipped"
                     ((prefix <> dependent) `notElem` tested)
+    , testCase "Closure search skips a seed that preserves every sink" $ do
+        let sql =
+                "CREATE TABLE a(x INT); CREATE TABLE b(x INT); "
+                    <> "SELECT x FROM a; SELECT x FROM b;"
+            config =
+                (defaultReductionConfigFor SQLite)
+                    { reductionSlicing = False
+                    , reductionUnrestricted = False
+                    , reductionStatementSearch = StatementComplementFirst
+                    }
+        hits <- newIORef []
+        let logger =
+                Logger
+                    defaultLogConfig {logMinLevel = LevelDebug}
+                    ( \_ _ _ fields -> case lookup "closure_unchanged_hits" fields of
+                        Just (Number n) -> modifyIORef' hits (n :)
+                        _ -> pure ()
+                    )
+                    (pure ())
+        pool <- predicatePool (== sql)
+        reduced <- reduceSQLWithConfig config logger pool sql
+        assertEqual "selected SQL" sql reduced
+        assertBool "the closure shortcut is used for two independent sinks" . any (> 0) =<< readIORef hits
+    , testCase "Closure search falls back for a cyclic component with no sinks" $ do
+        let sql = "SELECT 1; SELECT 2; SELECT 3;"
+        parsed <- parseSQL (defaultParseOptions SQLite) sql >>= either (assertFailure . show) pure
+        let units = parsedUnits parsed
+            graph =
+                (analyzeStatements (parsedInitialSession parsed) units)
+                    { graphFastEdges = IntMap.fromList [(1, IntSet.singleton 2), (2, IntSet.singleton 1)]
+                    , graphEdges =
+                        Map.fromList
+                            [ (StatementId 1, Set.singleton (StatementId 2))
+                            , (StatementId 2, Set.singleton (StatementId 1))
+                            ]
+                    , graphEdgeCount = 2
+                    }
+        pool <- predicatePool (BSC.isInfixOf "SELECT 3")
+        kept <- closureDdmin pool sql (map unitStatement units) graph
+        assertEqual "deleting the entire cycle is allowed" [StatementId 3] (map stmtId kept)
     , testCase "Byte-weighted singleton deletion resumes and wraps around" $ do
         let original = "SELECT 10;SELECT 20;SELECT 30;SELECT 40;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
             firstAccepted = "SELECT 10;SELECT 20;SELECT 30;SELECT 50;SELECT 60;SELECT 70;SELECT 80;"
