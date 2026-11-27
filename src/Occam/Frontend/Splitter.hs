@@ -3,13 +3,13 @@ module Occam.Frontend.Splitter (
     SplitUnit (..),
     splitSQL,
     splitTokens,
+    countSQLStatements,
 ) where
 
 import Control.Monad (guard)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
-import Data.Maybe (fromMaybe)
 import Data.Vector (Vector)
 import Data.Vector qualified as V
 import Occam.Frontend.Lexer (
@@ -57,18 +57,19 @@ data HeaderKind
     | HeaderDisallowCompound
     deriving (Eq, Show)
 
-data SplitState = SplitState
+data SplitState a = SplitState
     { ssParenDepth :: !Int
     , ssBracketDepth :: !Int
     , ssBraceDepth :: !Int
     , ssBlockStack :: ![BlockKind]
     , ssHeaderKind :: !HeaderKind
-    , ssStmtStartTok :: !(Maybe Int)
-    , ssLastNonTriviaTok :: !(Maybe Int)
+    , ssStmtStartTok :: !Int
+    -- ^ Negative when there is no current statement.
+    , ssLastNonTriviaTok :: !Int
     , ssPrevNonTrivia :: !(Maybe Token)
     , ssDelimiter :: !ByteString
     , ssLastTopLevelEndIdx :: !Int
-    , ssAcc :: ![SplitUnit]
+    , ssAcc :: !a
     }
 
 -- | Lex and split @sql@ into top-level statement units under @profile@.
@@ -79,15 +80,25 @@ splitSQL profile sql = splitTokens profile sql (lexSQL profile sql)
 splitTokens :: DialectProfile -> ByteString -> LexResult -> Either LexError [SplitUnit]
 splitTokens profile sql (LexResult vec mErr) = case mErr of
     Just err@LexError {lexErrorKind = LexInvalidUtf8} -> Left err
-    _ -> Right (runSplit profile sql vec mErr)
+    _ -> Right (reverse (runSplit profile sql vec mErr (flip (:)) (flip (:)) []))
+
+-- | Count the same statement units as 'splitSQL', excluding client directives.
+countSQLStatements :: DialectProfile -> ByteString -> Either LexError Int
+countSQLStatements profile sql = case lexSQL profile sql of
+    LexResult _ (Just err@LexError {lexErrorKind = LexInvalidUtf8}) -> Left err
+    LexResult vec mErr ->
+        Right $! runSplit profile sql vec mErr (\total _ -> total + 1) const 0
 
 runSplit ::
     DialectProfile ->
     ByteString ->
     Vector SpannedToken ->
     Maybe LexError ->
-    [SplitUnit]
-runSplit profile sql vec mErr = go 0 initState
+    (a -> SplitUnit -> a) ->
+    (a -> SplitUnit -> a) ->
+    a ->
+    a
+runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initState
     where
         !n = V.length vec
         !sqlLen = BS.length sql
@@ -103,12 +114,12 @@ runSplit profile sql vec mErr = go 0 initState
                 , ssBraceDepth = 0
                 , ssBlockStack = []
                 , ssHeaderKind = HeaderNone
-                , ssStmtStartTok = Nothing
-                , ssLastNonTriviaTok = Nothing
+                , ssStmtStartTok = -1
+                , ssLastNonTriviaTok = -1
                 , ssPrevNonTrivia = Nothing
                 , ssDelimiter = ";"
                 , ssLastTopLevelEndIdx = 0
-                , ssAcc = []
+                , ssAcc = initial
                 }
 
         {-# INLINE tokAt #-}
@@ -135,9 +146,8 @@ runSplit profile sql vec mErr = go 0 initState
         go !i !st
             | i >= n = finalize st
             | isTriviaToken tok = go (i + 1) st
-            | otherwise = case ssStmtStartTok st of
-                Nothing -> handleBetweenStatements i tok st
-                Just sIdx -> handleInStatement False i tok sIdx st
+            | ssStmtStartTok st < 0 = handleBetweenStatements i tok st
+            | otherwise = handleInStatement False i tok (ssStmtStartTok st) st
             where
                 tok = locValue (tokAt i)
 
@@ -151,7 +161,7 @@ runSplit profile sql vec mErr = go 0 initState
             , isDelimiterWord tok
             , Just (!delimEndByte, !newDelim, !afterArgIdx) <- parseDelimiterDirective i =
                 let !startByte = spanStart (locSpan (tokAt i))
-                    !unit =
+                    unit =
                         SplitUnit
                             { splitUnitSpan = ByteSpan startByte delimEndByte
                             , splitUnitDelimiterSpan = Nothing
@@ -165,7 +175,7 @@ runSplit profile sql vec mErr = go 0 initState
                         st
                             { ssDelimiter = newDelim
                             , ssLastTopLevelEndIdx = afterArgIdx
-                            , ssAcc = unit : ssAcc st
+                            , ssAcc = emitDirective (ssAcc st) unit
                             }
             | otherwise =
                 let !hdr = case tok of
@@ -175,8 +185,8 @@ runSplit profile sql vec mErr = go 0 initState
                     !stStarted =
                         st
                             { ssHeaderKind = hdr
-                            , ssStmtStartTok = Just i
-                            , ssLastNonTriviaTok = Just i
+                            , ssStmtStartTok = i
+                            , ssLastNonTriviaTok = i
                             }
                  in handleInStatement True i tok i stStarted
 
@@ -206,24 +216,24 @@ runSplit profile sql vec mErr = go 0 initState
             _ -> Nothing
 
         emitUnit !sIdx !delimSpan !clippedWord !nextIdx !st =
-            let !eIdx = fromMaybe sIdx (ssLastNonTriviaTok st)
-                !startByte = spanStart (locSpan (tokAt sIdx))
-                (!endByte, !tokens) = case clippedWord of
-                    Nothing -> (spanEnd (locSpan (tokAt eIdx)), V.slice sIdx (eIdx - sIdx + 1) vec)
-                    Just i ->
-                        let !end = spanStart delimSpan
-                            !wordStart = spanStart (locSpan (tokAt i))
-                            prefix = unsafeSliceSpan (ByteSpan wordStart end) sql
-                            offset (L (ByteSpan lo hi) tok) = L (ByteSpan (wordStart + lo) (wordStart + hi)) tok
-                         in (end, V.slice sIdx (i - sIdx) vec V.++ V.map offset (lexTokens (lexSQL profile prefix)))
-                !unit =
-                    SplitUnit
-                        { splitUnitSpan = ByteSpan startByte endByte
-                        , splitUnitDelimiterSpan = Just delimSpan
-                        , splitUnitTokens = tokens
-                        , splitUnitLexError = Nothing
-                        , splitUnitDelimiterDirective = Nothing
-                        }
+            let unit =
+                    let !eIdx = max sIdx (ssLastNonTriviaTok st)
+                        !startByte = spanStart (locSpan (tokAt sIdx))
+                        (!endByte, !tokens) = case clippedWord of
+                            Nothing -> (spanEnd (locSpan (tokAt eIdx)), V.slice sIdx (eIdx - sIdx + 1) vec)
+                            Just i ->
+                                let !end = spanStart delimSpan
+                                    !wordStart = spanStart (locSpan (tokAt i))
+                                    prefix = unsafeSliceSpan (ByteSpan wordStart end) sql
+                                    offset (L (ByteSpan lo hi) tok) = L (ByteSpan (wordStart + lo) (wordStart + hi)) tok
+                                 in (end, V.slice sIdx (i - sIdx) vec V.++ V.map offset (lexTokens (lexSQL profile prefix)))
+                     in SplitUnit
+                            { splitUnitSpan = ByteSpan startByte endByte
+                            , splitUnitDelimiterSpan = Just delimSpan
+                            , splitUnitTokens = tokens
+                            , splitUnitLexError = Nothing
+                            , splitUnitDelimiterDirective = Nothing
+                            }
              in go
                     nextIdx
                     st
@@ -232,11 +242,11 @@ runSplit profile sql vec mErr = go 0 initState
                         , ssBraceDepth = 0
                         , ssBlockStack = []
                         , ssHeaderKind = HeaderNone
-                        , ssStmtStartTok = Nothing
-                        , ssLastNonTriviaTok = Nothing
+                        , ssStmtStartTok = -1
+                        , ssLastNonTriviaTok = -1
                         , ssPrevNonTrivia = Nothing
                         , ssLastTopLevelEndIdx = nextIdx
-                        , ssAcc = unit : ssAcc st
+                        , ssAcc = emitStatement (ssAcc st) unit
                         }
 
         stepToken !isFirst !i !tok !st = case tok of
@@ -317,7 +327,7 @@ runSplit profile sql vec mErr = go 0 initState
             go
                 nextIdx
                 st
-                    { ssLastNonTriviaTok = Just (nextIdx - 1)
+                    { ssLastNonTriviaTok = nextIdx - 1
                     , ssPrevNonTrivia = Just lastTok
                     }
 
@@ -500,7 +510,7 @@ runSplit profile sql vec mErr = go 0 initState
                     !errToks = case mFirstSubstantive of
                         Just firstIdx -> V.drop firstIdx vec
                         Nothing -> V.empty
-                    !errUnit =
+                    errUnit =
                         SplitUnit
                             { splitUnitSpan = ByteSpan errStart sqlLen
                             , splitUnitDelimiterSpan = Nothing
@@ -508,12 +518,15 @@ runSplit profile sql vec mErr = go 0 initState
                             , splitUnitLexError = Just err
                             , splitUnitDelimiterDirective = Nothing
                             }
-                 in reverse (errUnit : ssAcc st)
-            Nothing -> case (ssStmtStartTok st, ssLastNonTriviaTok st) of
-                (Just sIdx, Just eIdx) ->
+                 in emitStatement (ssAcc st) errUnit
+            Nothing
+                | let sIdx = ssStmtStartTok st
+                      eIdx = ssLastNonTriviaTok st
+                , sIdx >= 0
+                , eIdx >= 0 ->
                     let !startByte = spanStart (locSpan (tokAt sIdx))
                         !endByte = spanEnd (locSpan (tokAt eIdx))
-                        !unit =
+                        unit =
                             SplitUnit
                                 { splitUnitSpan = ByteSpan startByte endByte
                                 , splitUnitDelimiterSpan = Nothing
@@ -521,5 +534,5 @@ runSplit profile sql vec mErr = go 0 initState
                                 , splitUnitLexError = Nothing
                                 , splitUnitDelimiterDirective = Nothing
                                 }
-                     in reverse (unit : ssAcc st)
-                _ -> reverse (ssAcc st)
+                     in emitStatement (ssAcc st) unit
+                | otherwise -> ssAcc st

@@ -787,7 +787,7 @@ scanAll :: forall s. DialectProfile -> HashMap ByteString Keyword -> ByteString 
 scanAll profile kwTable bs = do
     let !len = BS.length bs
         !lp = dialectLexical profile
-        !initCap = max 16 (len `div` 3)
+        !initCap = max 16 (min 16384 (len `div` 3))
     bufRef <- MV.new initCap >>= newSTRef
     sizeRef <- newSTRef (0 :: Int)
 

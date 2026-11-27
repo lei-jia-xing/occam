@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | Half-open UTF-8 byte spans, located values, and boundary validation.
 module Occam.Frontend.Span (
     ByteSpan (..),
@@ -105,6 +107,9 @@ unsafeSliceSpan (ByteSpan s e) bs = BSU.unsafeTake (e - s) (BSU.unsafeDrop s bs)
 pointing to the start byte of the first invalid UTF-8 sequence.
 -}
 validateUtf8 :: ByteString -> Either Int ()
+#if MIN_VERSION_bytestring(0,12,2)
+validateUtf8 bs | BS.isValidUtf8 bs = Right ()
+#endif
 validateUtf8 bs = go 0
     where
         !len = BS.length bs

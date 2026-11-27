@@ -46,7 +46,11 @@ prepareDuckDBReplayRunner ::
     (ByteString -> IO ()) ->
     IO (ObserveResult Bool -> ByteString -> IO (ExecutionResult Bool))
 prepareDuckDBReplayRunner micros baseline reportFailure = do
-    baselineUnits <- nativeDuckDBReplayUnits baseline
+    -- An eligible setup prefix needs a terminator for each of its statements.
+    baselineUnits <-
+        if BS.count 59 baseline >= minPrefixStatements
+            then nativeDuckDBReplayUnits baseline
+            else pure []
     let (setup, suffix) = span isSetup baselineUnits
         prefixCount = length setup
         tables =
@@ -55,7 +59,7 @@ prepareDuckDBReplayRunner micros baseline reportFailure = do
         readOnly unit =
             replayUnitKind unit == "query" && maybe True (`Set.member` tables) (replayUnitTable unit)
         prefix
-            | prefixCount >= 8
+            | prefixCount >= minPrefixStatements
             , all readOnly suffix
             , lastSetup : _ <- reverse setup
             , Just end <- replayUnitEnd lastSetup =
@@ -85,6 +89,7 @@ prepareDuckDBReplayRunner micros baseline reportFailure = do
                 executeOnReplayCheckpoint db readMatch reportFailure candidate prefix prefixCount remaining tailSQL
         maybe fresh pure replayed
     where
+        minPrefixStatements = 8
         isSetup unit = replayUnitKind unit == "create" || replayUnitKind unit == "insert"
 
 loadReplayCheckpoint ::

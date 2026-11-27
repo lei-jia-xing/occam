@@ -91,7 +91,7 @@ import Control.Monad (guard, join, unless)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
-import Control.Monad.Trans.State.Strict (StateT, evalStateT, get, gets, modify')
+import Control.Monad.Trans.State.Strict (StateT (..), evalStateT, get, gets, modify')
 import Data.ByteString (ByteString)
 import Data.Foldable (find, traverse_)
 import Data.Functor (($>))
@@ -353,10 +353,14 @@ advanceTok = do
 
 -- | Consume the next token when it equals @expected@.
 matchTok :: Token -> P (Maybe SpannedToken)
-matchTok expected = runMaybeT do
-    tok <- MaybeT peekTok
-    guard (locValue tok == expected)
-    lift advanceTok
+matchTok expected = matchNextToken (\tok -> tok <$ guard (locValue tok == expected))
+
+{-# INLINE matchNextToken #-}
+matchNextToken :: (SpannedToken -> Maybe a) -> P (Maybe a)
+matchNextToken select = StateT \st ->
+    case tokenAt st 0 >>= select of
+        Nothing -> Right (Nothing, st)
+        hit -> Right (hit, st {psPos = psPos st + 1})
 
 -- | Consume the next token or fail with an expected-token message.
 expectTok :: Token -> P SpannedToken
@@ -419,7 +423,10 @@ wordAt n = runMaybeT do
 
 -- | Case-insensitive keyword test at a fixed lookahead.
 wordIsAt :: Int -> ByteString -> P Bool
-wordIsAt n expected = maybe False (asciiEqCI expected . snd) <$> wordAt n
+wordIsAt n expected = gets \st ->
+    case tokenAt st n of
+        Just (L _ (TokWord WordToken {wordRaw = raw, wordQuote = Nothing})) -> asciiEqCI expected raw
+        _ -> False
 
 -- | Case-insensitive keyword test on the next token.
 wordIsCurrent :: ByteString -> P Bool
@@ -427,17 +434,16 @@ wordIsCurrent = wordIsAt 0
 
 -- | Consume the next unquoted word when it equals @expected@ (ASCII CI).
 matchWordCI :: ByteString -> P (Maybe SpannedToken)
-matchWordCI expected = runMaybeT do
-    (_, raw) <- MaybeT currentWord
+matchWordCI expected = matchNextToken \tok -> do
+    raw <- headWordOf (locValue tok)
     guard (asciiEqCI expected raw)
-    lift advanceTok
+    pure tok
 
 -- | Consume the next word when it matches one of @expected@.
 matchAnyWordCI :: [ByteString] -> P (Maybe (SpannedToken, ByteString))
-matchAnyWordCI expected = runMaybeT do
-    (_, raw) <- MaybeT currentWord
-    hit <- MaybeT . pure $ find (`asciiEqCI` raw) expected
-    tok <- lift advanceTok
+matchAnyWordCI expected = matchNextToken \tok -> do
+    raw <- headWordOf (locValue tok)
+    hit <- find (`asciiEqCI` raw) expected
     pure (tok, hit)
 
 -- | Consume a required keyword (ASCII case-insensitive).

@@ -233,7 +233,7 @@ rawOptionsParser =
         <*> toggleSpecified
             "adaptive-values"
             "no-adaptive-values"
-            "deferred fine VALUES chunks (requires --intra-statement)"
+            "deferred fine VALUES chunks (requires --intra-statement, on by default with --result-oracle)"
             (getSpecified (rawAdaptiveValues defaultRawOptions))
         <*> columnModeParser
         <*> toggleSpecified

@@ -235,7 +235,9 @@ validateCliOptions opts@RawOptions {..} = do
         intra = getSpecified rawIntraStatement
         litBatches = getSpecified rawLiteralBatches
         astBatches = getSpecified rawAstBatching
-        adaptValues = getSpecified rawAdaptiveValues
+        adaptValues = case rawAdaptiveValues of
+            Default _ -> rawResultOracle
+            Explicit enabled -> enabled
     when (colMode /= ColumnOff && not intra) $
         Left
             "--column-mode single|atomic requires --intra-statement to be enabled (add '--intra-statement')"

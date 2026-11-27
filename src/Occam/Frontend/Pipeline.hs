@@ -91,7 +91,8 @@ parseFrontend options sql = do
         !sqlLen = BS.length sql
         pending = parsePending profile sqlLen hasLexError splitUnits
         !pureTableEnabled =
-            not hasLexError
+            needsSemantics
+                && not hasLexError
                 && all (either (const False) (not . isRoutineDDL) . pendingResult) pending
     units <- buildUnits options sql hasLexError pureTableEnabled pending
     let rules = identifierRulesFor (parseDialect options) (parseServerConfig options)
@@ -117,6 +118,9 @@ parseFrontend options sql = do
     pure (ParsedSQL (sessionInit options) units columns)
     where
         profile = dialectProfile (parseDialect options)
+        needsSemantics =
+            not (parseSpanOnly options)
+                && (not (parseSyntaxOnly options) || parseColumnIR options || parseColumnBundles options)
 
 -- | Compute initial 'Core.SessionInit' from 'ParseOptions', folding configured identifiers.
 sessionInit :: ParseOptions -> Core.SessionInit

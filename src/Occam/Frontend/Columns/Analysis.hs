@@ -4,6 +4,7 @@ unknown-source recovery from 'StatementUnit' and source bytes.
 module Occam.Frontend.Columns.Analysis (
     PreParsedUnit (..),
     CreateColumns (..),
+    InsertList (..),
     InsertShape (..),
     InsertColumns (..),
     ColumnUnit (..),
@@ -17,6 +18,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Char (isAlphaNum, isAsciiUpper, toLower)
 import Data.List (nub)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -33,7 +36,7 @@ import Occam.Facts (
 import Occam.Frontend.AST qualified as AST
 import Occam.Frontend.Columns.Edits (
     buildTokenTable,
-    columnDefSpan,
+    columnDefSpans,
     commaDeleteSpans,
     insertListItemSpans,
     isInsertTainted,
@@ -85,11 +88,19 @@ data InsertShape
     | ShapeExotic
     deriving (Eq, Show)
 
+data InsertList = InsertList
+    { insertListWidth :: !Int
+    , insertListColumns :: !(Map Core.Ident (Maybe (Int, Maybe (Int, Int))))
+    -- ^ A present key with no position is an ambiguous duplicate name.
+    }
+    deriving (Eq, Show)
+
 -- | One @INSERT@ statement's column geometry.
 data InsertColumns = InsertColumns
     { insertTarget :: !(Maybe Core.NameRef)
-    , insertExplicit :: !(Maybe [(Core.Ident, Maybe (Int, Int))])
-    , insertRows :: ![[Maybe (Int, Int)]]
+    , insertExplicit :: !(Maybe InsertList)
+    , insertRows :: ![Vector (Maybe (Int, Int))]
+    , insertRowWidth :: !(Maybe Int)
     , insertShape :: !InsertShape
     }
     deriving (Eq, Show)
@@ -264,10 +275,7 @@ recoverCreates source tableDefs createDefEdits parsed =
                 AST.StatementCreate (L _ cs) -> case locValue (AST.createObject cs) of
                     AST.CreateTableObject ct ->
                         let tokTable = buildTokenTable tokens
-                         in Just
-                                [ fmap (shiftPair spanShift) (columnDefSpan astSrc 0 tokTable col)
-                                | L _ (AST.TableElementColumn (L _ col)) <- AST.createTableElements ct
-                                ]
+                         in Just (map (fmap (shiftPair spanShift)) (columnDefSpans astSrc 0 tokTable ct))
                     _ -> Nothing
                 _ -> Nothing
             Nothing -> Nothing
@@ -391,18 +399,31 @@ recoverInserts sem edits raw parsed =
                                     | length insertItemEdits == length astCols = map Just insertItemEdits
                                     | length explicitDels == length astCols = explicitDels
                                     | otherwise = replicate (length astCols) Nothing
-                             in Just (zip idents delSpans)
+                                positions =
+                                    Map.fromListWith
+                                        (\_ _ -> Nothing)
+                                        [ (name, Just (pos, geometry))
+                                        | (pos, name, geometry) <- zip3 [0 ..] idents delSpans
+                                        ]
+                             in Just (InsertList (length idents) positions)
                 (shape, rows)
                     | tainted = (ShapeExotic, [])
                     | otherwise = case AST.insertSource ins of
                         AST.InsertDefaultValues -> (ShapeNeutral, [])
                         AST.InsertQuery _ -> (ShapeSelectSource, [])
                         AST.InsertValues astRows ->
-                            (ShapePlainValues, recoverRows spanShift tokTable astRows)
+                            (ShapePlainValues, map V.fromList (recoverRows spanShift tokTable astRows))
+                width = case rows of
+                    first : rest
+                        | let n = V.length first
+                        , all ((== n) . V.length) rest ->
+                            Just n
+                    _ -> Nothing
              in InsertColumns
                     { insertTarget = target
                     , insertExplicit = explicit
                     , insertRows = rows
+                    , insertRowWidth = width
                     , insertShape = shape
                     }
 
@@ -442,6 +463,7 @@ recoverInserts sem edits raw parsed =
                 { insertTarget = fmap Core.dataWriteTarget (listToMaybe insertWrites)
                 , insertExplicit = Nothing
                 , insertRows = []
+                , insertRowWidth = Nothing
                 , insertShape = ShapeExotic
                 }
 

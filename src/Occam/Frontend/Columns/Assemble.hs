@@ -29,6 +29,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Vector qualified as V
 import Occam.Core qualified as Core
 import Occam.Facts (
     ColumnSite (..),
@@ -41,6 +42,7 @@ import Occam.Frontend.Columns.Analysis (
     ColumnUnit (..),
     CreateColumns (..),
     InsertColumns (..),
+    InsertList (..),
     InsertShape (..),
     PreParsedUnit (..),
     analyzeColumnUnitWith,
@@ -172,11 +174,31 @@ assembleColumnsWith source unitsWithAst =
             ]
         assembly = buildAssembly views
 
-        defineTargets plan mScope defTuple@(_, tblDef, _) =
+        defineTargets plan mScope (unitIdx, tblDef, mGeom) =
             let cols = Core.tableColumns tblDef
                 dupNames = hasDuplicateNames cols
                 arity = length cols
-             in mapMaybe (oneCol plan mScope defTuple dupNames cols) [0 .. arity - 1]
+                geometries = maybe [] createColumns mGeom
+                resolveGeometry defined = \case
+                    Just (name, spanForColumn) | name == Core.columnName defined -> spanForColumn
+                    _ -> Nothing
+                buildTarget ordinal defined geometry =
+                    let createSpan = resolveGeometry defined geometry
+                     in case mScope of
+                            Nothing ->
+                                let sites = createSites unitIdx createSpan
+                                 in Just (blockedTarget (tpName plan) (Core.columnName defined) ordinal sites blockGeneration)
+                            Just scope ->
+                                columnTarget
+                                    assembly
+                                    source
+                                    (tpName plan)
+                                    (unitIdx, tblDef)
+                                    arity
+                                    dupNames
+                                    scope
+                                    (ordinal, defined, createSpan)
+             in catMaybes (zipWith3 buildTarget [0 ..] cols (map Just geometries ++ repeat Nothing))
 
         planTargets plan =
             let unique = length (tpDefines plan) == 1
@@ -185,21 +207,10 @@ assembleColumnsWith source unitsWithAst =
                     _ -> Nothing
              in concatMap (defineTargets plan mScope) (tpDefines plan)
 
-        oneCol plan Nothing (unitIdx, _, mGeom) _ cols ordinal =
-            let col = cols !! ordinal
-                colName = Core.columnName col
-                sites = case mGeom >>= \g -> lookupCreateSpan g ordinal colName of
-                    Just (s, e) -> [ColumnSite (unitIdx + 1) s e CreateDefSite]
-                    Nothing -> []
-             in Just (blockedTarget (tpName plan) colName ordinal sites blockGeneration)
-        oneCol plan (Just scope) defTuple dupNames _ ordinal =
-            columnTarget assembly source (tpName plan) defTuple ordinal dupNames scope
-
-lookupCreateSpan :: CreateColumns -> Int -> Core.Ident -> Maybe (Int, Int)
-lookupCreateSpan (CreateColumns cols) ordinal expectedName =
-    case drop ordinal cols of
-        ((name, mSpan) : _) | name == expectedName -> mSpan
-        _ -> Nothing
+createSites :: Int -> Maybe (Int, Int) -> [ColumnSite]
+createSites unitIdx = \case
+    Just (s, e) -> [ColumnSite (unitIdx + 1) s e CreateDefSite]
+    Nothing -> []
 
 -- ---------------------------------------------------------------------------
 -- Assembly construction (single script pass)
@@ -769,7 +780,7 @@ buildSiblingScope asm chain
                 ShapePlainValues -> touchExplicit amb (insertExplicit ins)
             _ -> amb
         touchExplicit amb = \case
-            Just list -> amb {fsTouched = Set.union (fsTouched amb) (Set.fromList (map fst list))}
+            Just list -> amb {fsTouched = Set.union (fsTouched amb) (Map.keysSet (insertListColumns list))}
             Nothing -> amb {fsAll = True}
         stepParentCols amb pName cols
             | isSibling pName = amb {fsTouched = Set.union (fsTouched amb) cols}
@@ -862,31 +873,25 @@ insertContribution ins col ordinal createArity stmtId = case insertShape ins of
     ShapeExotic -> Left blockShape
     ShapeNeutral -> Right []
     ShapeSelectSource -> case insertExplicit ins of
-        Just list | any ((== col) . fst) list -> Left blockShape
+        Just list | Map.member col (insertListColumns list) -> Left blockShape
         Nothing -> Left blockShape
         _ -> Right []
     ShapePlainValues
         | null (insertRows ins) -> Left blockSpan
         | otherwise -> case insertExplicit ins of
-            Just list ->
-                let positions = [pos | (pos, (name, _)) <- zip [0 :: Int ..] list, name == col]
-                 in case positions of
-                        [] -> Right []
-                        [pos]
-                            | not (all ((== length list) . length) (insertRows ins)) -> Left blockSpan
-                            | otherwise -> case list !! pos of
-                                (_, Nothing) -> Left blockSpan
-                                (_, Just (s, e)) -> do
-                                    let headSite = ColumnSite stmtId s e InsertListSite
-                                    rowSites <- traverse (rowSiteAt pos) (insertRows ins)
-                                    Right (headSite : rowSites)
-                        _ -> Left blockAmbiguous
+            Just list -> case Map.lookup col (insertListColumns list) of
+                Nothing -> Right []
+                Just Nothing -> Left blockAmbiguous
+                Just (Just (pos, Just (s, e)))
+                    | insertRowWidth ins == Just (insertListWidth list) ->
+                        (ColumnSite stmtId s e InsertListSite :) <$> traverse (rowSiteAt pos) (insertRows ins)
+                Just (Just _) -> Left blockSpan
             Nothing
-                | not (all ((== createArity) . length) (insertRows ins)) -> Left blockSpan
+                | insertRowWidth ins /= Just createArity -> Left blockSpan
                 | otherwise -> traverse (rowSiteAt ordinal) (insertRows ins)
     where
-        rowSiteAt idx row = case drop idx row of
-            (Just (s, e) : _) -> Right (ColumnSite stmtId s e ValuesItemSite)
+        rowSiteAt idx row = case row V.!? idx of
+            Just (Just (s, e)) -> Right (ColumnSite stmtId s e ValuesItemSite)
             _ -> Left blockSpan
 
 blockedTarget :: Core.Name -> Core.Ident -> Int -> [ColumnSite] -> Text -> ColumnTarget
@@ -903,12 +908,13 @@ columnTarget ::
     Assembly ->
     ByteString ->
     Core.Name ->
-    (Int, Core.TableDef, Maybe CreateColumns) ->
+    (Int, Core.TableDef) ->
     Int ->
     Bool ->
     TableScope ->
+    (Int, Core.ColumnDef, Maybe (Int, Int)) ->
     Maybe ColumnTarget
-columnTarget asm source tbl (unitIdx, tblDef, mGeom) ordinal createDupNames scope
+columnTarget asm source tbl (unitIdx, tblDef) createArity createDupNames scope (ordinal, defined, createSpan)
     | asmOpaqueAll asm = Just (blockedTarget tbl col ordinal initSites blockUnknown)
     | isNothing blockedAfterInserts =
         case validateSites (asmViews asm) source finalSites of
@@ -934,12 +940,8 @@ columnTarget asm source tbl (unitIdx, tblDef, mGeom) ordinal createDupNames scop
                 , targetBlocked = blockedAfterInserts
                 }
     where
-        defined = Core.tableColumns tblDef !! ordinal
         col = Core.columnName defined
-        createSpan = mGeom >>= \g -> lookupCreateSpan g ordinal col
-        initSites = case createSpan of
-            Just (s, e) -> [ColumnSite (unitIdx + 1) s e CreateDefSite]
-            Nothing -> []
+        initSites = createSites unitIdx createSpan
 
         blockedStatic =
             foldl'
@@ -986,8 +988,6 @@ columnTarget asm source tbl (unitIdx, tblDef, mGeom) ordinal createDupNames scop
         (finalSites, blockedAfterInserts) = case blockedWithRefs of
             Just cause -> (initSites, Just cause)
             Nothing -> collectInserts initSites (asmViews asm)
-
-        createArity = length (Core.tableColumns tblDef)
 
         collectInserts accSites [] = (accSites, Nothing)
         collectInserts accSites (v : vs) = case uvFacts v of

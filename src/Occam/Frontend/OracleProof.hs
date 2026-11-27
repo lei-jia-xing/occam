@@ -13,6 +13,7 @@ import Data.Aeson (FromJSON (..), withObject, (.:), (.:?))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Builder qualified as BSB
+import Data.ByteString.Builder.Extra qualified as BSBExtra
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Text (Text)
@@ -34,7 +35,7 @@ import Occam.Frontend.Lexer (
     lexSQL,
  )
 import Occam.Frontend.Span (ByteSpan (..), Located (..), unsafeSliceSpan)
-import Occam.Parser.Dialect (DialectProfile (..), duckdbProfile)
+import Occam.Parser.Dialect (DialectProfile (..), LexicalProfile (..), duckdbProfile)
 import Occam.Parser.Types (SQLDialect (..))
 
 -- | Statement unit classified for DuckDB prefix checkpoint replay.
@@ -56,9 +57,9 @@ oracleCacheKey :: DialectProfile -> ByteString -> Maybe ByteString
 oracleCacheKey profile sql = do
     let !dialect = dialectId profile
     guard (dialect == SQLite || dialect == DuckDB)
-    guard (not (BS.elem 0 sql))
     guard (startsWithSelect sql)
-    guard (not (hasSemicolonBeforeQuote sql))
+    guard (not (hasInteriorSemicolon (lexBackslashEscapesInSingleQuote (dialectLexical profile)) sql))
+    guard (not (BS.elem 0 sql))
     toks <- lexNonWhitespace profile sql
     let !n = V.length toks
         !bare =
@@ -114,7 +115,10 @@ buildCanonicalKey sql toks = go 0 0 mempty
         go !i !prevEnd !builder
             | i >= n = do
                 guard (allAsciiWhitespace prevEnd len sql)
-                pure (BL.toStrict (BSB.toLazyByteString builder))
+                pure
+                    ( BL.toStrict
+                        (BSBExtra.toLazyByteStringWith (BSBExtra.safeStrategy 64 BSBExtra.smallChunkSize) BL.empty builder)
+                    )
             | otherwise = do
                 let !(L sp@(ByteSpan s e) _) = toks V.! i
                 guard (s /= e && allAsciiWhitespace prevEnd s sql)
@@ -132,20 +136,30 @@ startsWithSelect bs = go 0
             | otherwise =
                 asciiUpperEqAt bs i "SELECT"
 
-hasSemicolonBeforeQuote :: ByteString -> Bool
-hasSemicolonBeforeQuote bs =
+-- | Any interior semicolon in a cacheable SELECT must be inside a plain string literal.
+hasInteriorSemicolon :: Bool -> ByteString -> Bool
+hasInteriorSemicolon escapes bs =
     let !trimmedEnd = trimAsciiEndLen bs
         !bodyLen =
             if trimmedEnd > 0 && BSU.unsafeIndex bs (trimmedEnd - 1) == 59
                 then trimmedEnd - 1
                 else trimmedEnd
-     in scan 0 bodyLen
+     in outsideString 0 bodyLen
     where
-        scan !i !limit
+        outsideString !i !limit
             | i >= limit = False
             | b == 59 = True
-            | b == 39 = False
-            | otherwise = scan (i + 1) limit
+            | b == 39 = insideString (i + 1) limit
+            | otherwise = outsideString (i + 1) limit
+            where
+                b = BSU.unsafeIndex bs i
+
+        insideString !i !limit
+            | i >= limit = False
+            | escapes && b == 92 && i + 1 < limit = insideString (i + 2) limit
+            | b /= 39 = insideString (i + 1) limit
+            | i + 1 < limit && BSU.unsafeIndex bs (i + 1) == 39 = insideString (i + 2) limit
+            | otherwise = outsideString (i + 1) limit
             where
                 b = BSU.unsafeIndex bs i
 

@@ -49,8 +49,22 @@ int occam_sqlite_has_nondet_keyword(const uint8_t *buf, size_t len) {
 
 /* Returns 0 if valid UTF-8 without NUL, 1 if NUL byte present, 2 if invalid UTF-8. */
 int occam_sqlite_check_sql(const uint8_t *buf, size_t len) {
+    const uint64_t low_bits = UINT64_C(0x0101010101010101);
+    const uint64_t high_bits = UINT64_C(0x8080808080808080);
     size_t i = 0;
     while (i < len) {
+        /* Skip a word when all bytes are nonzero ASCII. */
+        while (len - i >= sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, buf + i, sizeof(word));
+            if ((word | ((word - low_bits) & ~word)) & high_bits) {
+                break;
+            }
+            i += sizeof(word);
+        }
+        if (i == len) {
+            break;
+        }
         uint8_t b0 = buf[i];
         if (b0 == 0) {
             return 1;

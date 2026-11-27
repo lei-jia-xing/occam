@@ -4,19 +4,22 @@ module Occam.Frontend.Columns.Edits (
     TokenEntry (..),
     TokenTable,
     buildTokenTable,
-    columnDefSpan,
+    columnDefSpans,
     insertListItemSpans,
     valuesItemSpans,
     commaDeleteSpans,
     isInsertTainted,
 ) where
 
+import Control.Applicative ((<|>))
 import Control.Monad (guard)
 import Control.Monad.ST (runST)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
-import Data.Maybe (catMaybes, isJust, mapMaybe)
+import Data.IntMap.Strict qualified as IntMap
+import Data.Map.Lazy qualified as Map
+import Data.Maybe (catMaybes, isJust, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Vector (Vector)
 import Data.Vector qualified as V
@@ -36,6 +39,7 @@ data TokenEntry = TokenEntry
     { teSpan :: !ByteSpan
     , teToken :: !Token
     , teParenEnd :: !Int
+    , teParent :: !Int
     }
     deriving (Eq, Show)
 
@@ -51,7 +55,10 @@ buildTokenTable tokens = runST do
             | i >= n = pure ()
             | otherwise = do
                 let L sp tok = V.unsafeIndex tokens i
-                MV.unsafeWrite mv i (TokenEntry sp tok (-1))
+                    parent = case stack of
+                        openIdx : _ -> openIdx
+                        [] -> -1
+                MV.unsafeWrite mv i (TokenEntry sp tok (-1) parent)
                 case tok of
                     TokLParen -> go (i + 1) (i : stack)
                     TokRParen -> case stack of
@@ -82,15 +89,8 @@ columnEdits ctx rawStmt
 
 createTableColumnEdits :: AnalysisContext -> TokenTable -> AST.CreateTable -> [ParserEdit]
 createTableColumnEdits ctx tokens ct =
-    mapMaybe emitDef cols
-    where
-        cols =
-            [ col
-            | L _ (AST.TableElementColumn (L _ col)) <- AST.createTableElements ct
-            ]
-        emitDef col = do
-            (s, e) <- columnDefSpan (ctxSource ctx) (ctxAstSpanShift ctx) tokens col
-            mkColumnEdit ctx s e "remove-column_create_def"
+    mapMaybe (\(s, e) -> mkColumnEdit ctx s e "remove-column_create_def") $
+        catMaybes (columnDefSpans (ctxSource ctx) (ctxAstSpanShift ctx) tokens ct)
 
 insertColumnEdits :: AnalysisContext -> TokenTable -> AST.InsertStmt -> [ParserEdit]
 insertColumnEdits ctx tokens ins =
@@ -144,31 +144,27 @@ mkColumnEdit ctx start end label
     where
         ByteSpan unitStart unitEnd = ctxUnitSpan ctx
 
--- | Deletion span for one @CREATE TABLE@ column definition, including its adjacent comma.
-columnDefSpan :: ByteString -> Int -> TokenTable -> AST.ColumnDef -> Maybe (Int, Int)
-columnDefSpan source shift tokens col = do
-    let ByteSpan nStart nEnd = locSpan (AST.columnName col)
-        !innerStart = shift + nStart
-        !innerEnd = shift + nEnd
-    (open, close) <- enclosingParentheses tokens innerStart innerEnd
-    let !bodyStart = open + 1
-        !bodyEnd = close - 1
-    guard (bodyStart <= bodyEnd)
-    (itemStart, itemEnd) <- tableBodyItem tokens bodyStart bodyEnd innerStart
-    let !idx = partitionPoint (\e -> spanEnd (teSpan e) <= itemStart) tokens
-    (_, firstSig) <- nextSignificant tokens idx itemEnd
-    guard (spanStart (teSpan firstSig) == innerStart)
-    if itemStart > bodyStart
-        then do
-            guard (itemStart >= 1)
-            let !commaStart = itemStart - 1
-                !editStart = precedingWhitespace source commaStart
-                !editEnd = min itemEnd bodyEnd
-            pure (editStart, editEnd)
-        else
-            if itemEnd < bodyEnd
-                then pure (itemStart, itemEnd + 1)
-                else Nothing
+-- | Index each table body once, then resolve column names to their deletion spans.
+columnDefSpans :: ByteString -> Int -> TokenTable -> AST.CreateTable -> [Maybe (Int, Int)]
+columnDefSpans source shift tokens ct =
+    [ do
+        bounds <- body
+        spans <- Map.lookup bounds bodies
+        IntMap.lookup start spans
+    | (start, body) <- columns
+    ]
+    where
+        columns =
+            [ (start, enclosingParentheses tokens start (shift + spanEnd nameSpan))
+            | L _ (AST.TableElementColumn (L _ col)) <- AST.createTableElements ct
+            , let nameSpan = locSpan (AST.columnName col)
+                  start = shift + spanStart nameSpan
+            ]
+        bodies =
+            Map.fromList
+                [ (bounds, IntMap.fromDistinctAscList (tableBodySpans source tokens (open + 1) (close - 1)))
+                | (_, Just bounds@(open, close)) <- columns
+                ]
 
 -- | Source spans of an @INSERT@ explicit column list, in order.
 insertListItemSpans :: Int -> TokenTable -> [Located AST.NamePart] -> Maybe [(Int, Int)]
@@ -225,73 +221,62 @@ partitionPoint predicate vec = go 0 (V.length vec)
                         then go (mid + 1) hi
                         else go lo mid
 
-nextSignificant :: TokenTable -> Int -> Int -> Maybe (Int, TokenEntry)
-nextSignificant tokens idx0 scopeEnd = go idx0
-    where
-        !n = V.length tokens
-        go !idx
-            | idx >= n = Nothing
-            | otherwise =
-                let entry = V.unsafeIndex tokens idx
-                 in if spanStart (teSpan entry) >= scopeEnd
-                        then Nothing
-                        else
-                            if isTriviaToken (teToken entry)
-                                then go (idx + 1)
-                                else Just (idx, entry)
-
 enclosingParentheses :: TokenTable -> Int -> Int -> Maybe (Int, Int)
-enclosingParentheses tokens start end = V.foldl' step Nothing tokens
-    where
-        step acc entry = case teToken entry of
-            TokLParen
-                | teParenEnd entry >= 0
-                , let !open = spanStart (teSpan entry)
-                , let !close = teParenEnd entry
-                , open < start && close >= end ->
-                    Just $ case acc of
-                        Nothing -> (open, close)
-                        Just best@(bestOpen, _) ->
-                            if open < bestOpen then (open, close) else best
-            _ -> acc
+enclosingParentheses tokens start end =
+    foldl' (\_ bounds -> Just bounds) Nothing (containingParentheses tokens start end)
 
 innermostParentheses :: TokenTable -> Int -> Int -> Maybe (Int, Int)
-innermostParentheses tokens start end = V.foldl' step Nothing tokens
-    where
-        step acc entry = case teToken entry of
-            TokLParen
-                | teParenEnd entry >= 0
-                , let !open = spanStart (teSpan entry)
-                , let !close = teParenEnd entry
-                , open < start && close >= end ->
-                    Just $ case acc of
-                        Nothing -> (open, close)
-                        Just best@(bestOpen, _) ->
-                            if open > bestOpen then (open, close) else best
-            _ -> acc
+innermostParentheses tokens start end =
+    listToMaybe (containingParentheses tokens start end)
 
-tableBodyItem :: TokenTable -> Int -> Int -> Int -> Maybe (Int, Int)
-tableBodyItem tokens bodyStart bodyEnd target = go idx0 bodyStart
+containingParentheses :: TokenTable -> Int -> Int -> [(Int, Int)]
+containingParentheses tokens start end =
+    case tokens V.!? idx0 of
+        Just entry -> go (teParent entry)
+        Nothing -> []
+    where
+        !idx0 = partitionPoint (\entry -> spanEnd (teSpan entry) <= start) tokens
+        go !idx
+            | idx < 0 = []
+            | otherwise =
+                let entry = V.unsafeIndex tokens idx
+                    !open = spanStart (teSpan entry)
+                    !close = teParenEnd entry
+                    rest = go (teParent entry)
+                 in if open < start && close >= end
+                        then (open, close) : rest
+                        else rest
+
+tableBodySpans :: ByteString -> TokenTable -> Int -> Int -> [(Int, (Int, Int))]
+tableBodySpans source tokens bodyStart bodyEnd = go idx0 bodyStart Nothing
     where
         !n = V.length tokens
         !idx0 = partitionPoint (\e -> spanEnd (teSpan e) <= bodyStart) tokens
-        go !idx !itemStart
-            | idx >= n = Just (itemStart, bodyEnd)
+        go !idx !itemStart !first
+            | idx >= n = emit itemStart bodyEnd first []
             | otherwise =
                 let entry = V.unsafeIndex tokens idx
                     ByteSpan s e = teSpan entry
+                    tok = teToken entry
                  in if s >= bodyEnd
-                        then Just (itemStart, bodyEnd)
-                        else case teToken entry of
+                        then emit itemStart bodyEnd first []
+                        else case tok of
+                            TokComma ->
+                                emit itemStart s first (go (idx + 1) e Nothing)
                             TokLParen ->
                                 let !pEnd = teParenEnd entry
                                  in if pEnd < 0 || pEnd > bodyEnd
-                                        then Nothing
-                                        else go (partitionPoint (\c -> spanStart (teSpan c) < pEnd) tokens) itemStart
-                            TokComma
-                                | s < target -> go (idx + 1) e
-                                | otherwise -> Just (itemStart, s)
-                            _ -> go (idx + 1) itemStart
+                                        then []
+                                        else go (partitionPoint (\c -> spanStart (teSpan c) < pEnd) tokens) itemStart (first <|> Just s)
+                            _
+                                | isTriviaToken tok -> go (idx + 1) itemStart first
+                                | otherwise -> go (idx + 1) itemStart (first <|> Just s)
+        emit itemStart itemEnd first rest = case first of
+            Just start
+                | itemStart > bodyStart ->
+                    (start, (precedingWhitespace source (itemStart - 1), itemEnd)) : rest
+                | itemEnd < bodyEnd -> (start, (itemStart, itemEnd + 1)) : rest
+            _ -> rest
 
 findComma :: TokenTable -> Int -> Int -> Maybe (Int, Int)
 findComma tokens start end = go idx0

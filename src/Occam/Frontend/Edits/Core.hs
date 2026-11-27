@@ -39,6 +39,7 @@ import Data.Bits (shiftL)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
+import Data.Vector.Unboxed qualified as VU
 import Occam.Facts (
     ClauseTier (..),
     EditTier (..),
@@ -294,7 +295,8 @@ listChunkRanges label spans = do
     when (ctxChunkEdits ctx && total >= 3 && spansOrdered spans) do
         ti <- askTokens
         let !clabel = chunkLabel label
-            spanAt idx = spans !! idx
+            !indexedSpans = VU.fromListN total spans
+            spanAt = (indexedSpans VU.!)
             loopLevel !level =
                 let !groups = (1 :: Int) `shiftL` level
                  in when (groups > 0 && groups <= total) do

@@ -45,6 +45,15 @@ tests =
                 "the last PRAGMA reads the setting"
                 [[SetSqliteForeignKeys True], [SetSqliteForeignKeys False], []]
                 (map factSession facts)
+        , testCase "statement counting follows client delimiters and lexical error suffixes" $ do
+            let mysql = "DELIMITER //\nSELECT 'a;';//\nDELIMITER ;\nSELECT 2;"
+                sqlite = "; -- empty statement\nSELECT 1; SELECT 'unfinished"
+            assertEqual "delimiter directives do not count" (Right 2) =<< countStatements MySQL mysql
+            assertEqual "unterminated suffix counts once" (Right 2) =<< countStatements SQLite sqlite
+            result <- countStatements SQLite (BS.pack [0xff])
+            case result of
+                Left err -> assertEqual "invalid encoding" ParserInvalidUtf8 (parserErrorKind err)
+                Right n -> assertFailure ("invalid input counted as " ++ show n)
         , testCase "PostgreSQL transaction modes and quoted savepoints survive lowering" $ do
             let sql = "BEGIN READ ONLY; SAVEPOINT \"Mixed\"; ROLLBACK TO \"Mixed\"; COMMIT AND CHAIN;"
             parsed <- parseOrFail (defaultParseOptions PostgreSQL) sql

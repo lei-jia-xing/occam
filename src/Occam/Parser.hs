@@ -45,7 +45,6 @@ module Occam.Parser (
 
 import Control.Exception (evaluate)
 import Data.ByteString (ByteString)
-import Data.Maybe (isNothing)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Core (SemanticFacts (..))
@@ -68,7 +67,7 @@ import Occam.Frontend.OracleProof (
     oracleCacheKey,
  )
 import Occam.Frontend.Pipeline (parseFrontend)
-import Occam.Frontend.Splitter (SplitUnit (..), splitSQL)
+import Occam.Frontend.Splitter (countSQLStatements)
 import Occam.Metrics (MetricsStore, ParseKind (..), recordParseTiming)
 import Occam.Parser.Dialect (
     CaseFolding (..),
@@ -132,13 +131,9 @@ spanOnlyOptions dialect = (defaultParseOptions dialect) {parseSpanOnly = True}
 countStatements :: SQLDialect -> ByteString -> IO (Either ParserError Int)
 countStatements dialect sql =
     pure $!
-        case splitSQL (dialectProfile dialect) sql of
+        case countSQLStatements (dialectProfile dialect) sql of
             Left err -> Left (ParserError ParserInvalidUtf8 (lexErrorMessage err))
-            Right units -> Right (foldl' countUnit 0 units)
-    where
-        countUnit total unit
-            | isNothing (splitUnitDelimiterDirective unit) = total + 1
-            | otherwise = total
+            Right count -> Right count
 
 microsBetween :: Word64 -> Word64 -> Int
 microsBetween start end = fromIntegral ((end - start) `div` 1000)

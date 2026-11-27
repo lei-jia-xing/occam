@@ -38,6 +38,8 @@ import Occam.Evaluation (
     runEvaluationRequestWithNativeValidation,
  )
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
+import Occam.Frontend.OracleProof (oracleCacheKey)
+import Occam.Frontend.Splitter (countSQLStatements)
 import Occam.Logger (nullLogger)
 import Occam.Metrics (MetricPolicy (..), ParseKind (..))
 import Occam.Oracle (OracleObservation (..), OracleObservationDetails (..))
@@ -54,7 +56,7 @@ import Occam.Parser (
     ParsedSQL (..),
     SQLDialect (..),
     defaultParseOptions,
-    nativeOracleCacheKey,
+    dialectProfile,
     parseSQLTimed,
  )
 import Occam.Pool (poolMetricsStore, withPredicatePool)
@@ -289,6 +291,17 @@ tableBlock i =
 
 syntheticSQL :: Int -> ByteString
 syntheticSQL tables = BSC.unlines (concatMap tableBlock [0 .. tables - 1])
+
+wideColumnSQL :: Int -> ByteString
+wideColumnSQL width =
+    BSC.pack $
+        "CREATE TABLE t("
+            ++ intercalate ", " ["c" ++ show i ++ " INT" | i <- ordinals]
+            ++ "); INSERT INTO t VALUES ("
+            ++ intercalate ", " (map show ordinals)
+            ++ "); SELECT c0 FROM t;"
+    where
+        ordinals = [0 .. width - 1]
 
 -- | Parser payload per tier, mirroring the reducer's own option sets.
 optionsForKind :: ParseKind -> ParseOptions
@@ -577,6 +590,11 @@ runTimingBenchmarks = do
                         bench "column-ir" $
                             whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR sql512)
                     ]
+                , bench "count-512" $ whnf (countSQLStatements (dialectProfile SQLite)) sql512
+                , bench "values-2x4096" $
+                    whnfIO (parsedWorkload <$> parseUnitsOrDie ParseSyntaxChunks (genScale 4096))
+                , bench "columns-1024" $
+                    whnfIO (parsedWorkload <$> parseUnitsOrDie ParseColumnIR (wideColumnSQL 1024))
                 ]
           , bgroup
                 "dag"
@@ -617,7 +635,12 @@ runTimingBenchmarks = do
                   , bcompare "$NF == \"hit\" && $(NF-1) == \"cache\"" $
                         bench "miss" $
                             whnfIO (cacheLookup cache CacheEnabled nonExistentKey)
-                  , bench "native-key-multi-statement" $ whnfIO (nativeOracleCacheKey SQLite (auditRemovable 512))
+                  , bench "native-key-multi-statement" $
+                        whnf (oracleCacheKey (dialectProfile SQLite)) (auditRemovable 512)
+                  , bench "native-key-quoted-multi-statement" $
+                        whnf (oracleCacheKey (dialectProfile SQLite)) ("SELECT ';'';' AS n;\n" <> auditRemovable 512)
+                  , bench "native-key-scalar" $
+                        whnf (maybe 0 BS.length . oracleCacheKey (dialectProfile SQLite)) "SELECT ';'';' AS n;"
                   ]
                     ++ [ bgroup
                             (show size ++ "-bytes")

@@ -717,6 +717,26 @@ tests =
                         let _ = val
                         pure ()
                 removeFile statsFile
+        , testCase "native result-oracle rewrites defer fine VALUES chunks by default" $
+            withCLIInput "SELECT 1 AS n;" $ \input outFile -> do
+                let args =
+                        [ input
+                        , "-d"
+                        , "sqlite"
+                        , "--result-oracle"
+                        , "--intra-statement"
+                        , "--quiet"
+                        , "--out"
+                        , outFile
+                        , "--stats"
+                        , "-"
+                        ]
+                (defCode, defStats, defErr) <- runOccamCLI args
+                (offCode, offStats, offErr) <- runOccamCLI (args ++ ["--no-adaptive-values"])
+                assertEqual defErr ExitSuccess defCode
+                assertEqual offErr ExitSuccess offCode
+                assertBool "native default defers fine chunks" ("\"adaptive_values\":true" `isInfixOf` defStats)
+                assertBool "explicit opt-out is respected" ("\"adaptive_values\":false" `isInfixOf` offStats)
         , testCase "CLI requires explicit --dialect with exit code 2 before starting any oracle" $
             withCLIInput "SELECT 1;" $ \input _ ->
                 withCLIInput "" $ \calls _ -> do

@@ -60,12 +60,12 @@ jobs:
         run: cabal update
 
       - name: Build occam executable
-        run: cabal build exe:occam
+        run: cabal build exe:occam --builddir=dist-newstyle/release --disable-tests --disable-benchmarks --enable-split-sections --ghc-options=-optl-Wl,--gc-sections
 
       - name: Package Binary & Generate Checksum
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
-          BIN_PATH="$(cabal list-bin occam)"
+          BIN_PATH="$(cabal list-bin exe:occam --builddir=dist-newstyle/release)"
           echo "Found binary at: ${BIN_PATH}"
 
           mkdir -p dist
@@ -73,6 +73,8 @@ jobs:
           STAGE_DIR="$(mktemp -d)"
 
           cp "${BIN_PATH}" "${STAGE_DIR}/occam"
+          strip --strip-unneeded "${STAGE_DIR}/occam"
+          "${STAGE_DIR}/occam" --version
           [ -f README.md ] && cp README.md "${STAGE_DIR}/"
           [ -f LICENSE ] && cp LICENSE "${STAGE_DIR}/"
 

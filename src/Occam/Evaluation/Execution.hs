@@ -384,13 +384,12 @@ retireCandidate onProgress reductionStart checkpoint state collectCurve callInde
         smaller <- checkpointIfSmaller state checkpoint candidate statements
         when smaller $
             onProgress (ProgressCandidateAccepted (BS.length candidate) statements)
-    modifyEvalState state \s -> s {evalCounts = Map.delete candidate (evalCounts s)}
-    when collectCurve $ do
-        now <- ticks
-        modifyEvalState state \s ->
-            s
-                { evalCurve =
-                    EvaluationPoint
+    extendCurve <-
+        if collectCurve
+            then do
+                now <- ticks
+                pure
+                    ( EvaluationPoint
                         { pointElapsedSeconds = seconds reductionStart now
                         , pointCallIndex = callIndex + 1
                         , pointCandidateBytes = BS.length candidate
@@ -398,8 +397,11 @@ retireCandidate onProgress reductionStart checkpoint state collectCurve callInde
                         , pointCacheHit = hit
                         , pointAccepted = accepted
                         }
-                        : evalCurve s
-                }
+                        :
+                    )
+            else pure id
+    modifyEvalState state \s ->
+        s {evalCounts = Map.delete candidate (evalCounts s), evalCurve = extendCurve (evalCurve s)}
 
 -- | Route reducer stage events to UI progress and per-stage summaries.
 evalStageReporter :: (EvaluationProgress -> IO ()) -> IORef EvalState -> StageReporter

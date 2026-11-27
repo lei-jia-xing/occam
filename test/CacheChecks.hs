@@ -136,6 +136,8 @@ tests =
                     =<< key "SELECT\t'a;''b' AS note;"
                 assertEqual "multiple statements require exact bytes" Nothing
                     =<< key "SELECT 1 AS n; SELECT 2 AS n;"
+                assertEqual "a quoted semicolon cannot hide a subsequent statement" Nothing
+                    =<< key "SELECT 'a;''b' AS note; SELECT 2 AS n;"
         , testCase "direct cacheLookup and newCache behavior" $ do
             let precompKey = BSC.pack "SELECT 42;"
                 precompObs = OracleFinished ExitSuccess

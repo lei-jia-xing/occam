@@ -39,6 +39,8 @@ occam input.sql --dialect duckdb --result-oracle --out reduced.sql
 
 Trailing statements after the last result set must still execute cleanly. Use deterministic queries (`ORDER BY`) to fix row order. SQLite starts with foreign keys disabled unless enabled in the script (`PRAGMA foreign_keys = ON`).
 
+With `--intra-statement`, the result oracle defers fine-grained `VALUES` chunk deletions until the main rewrite sweep stalls. Use `--no-adaptive-values` to keep all chunk sizes in the main sweep.
+
 ---
 
 ## CLI Summary
