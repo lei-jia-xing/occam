@@ -1050,7 +1050,7 @@ scanAll profile kwTable bs = do
                  in if hasByteAt tagEnd 36
                         then scanDollarBody i (tagEnd + 1) (slice i (tagEnd + 1))
                         else
-                            if lexDollarParameters lp
+                            if lexDollarParameters lp && (lexNamedParameters lp || dialectId profile == DuckDB)
                                 then emitSpan i tagEnd (TokParam (slice i tagEnd))
                                 else emitOp i 1
             | lexDollarParameters lp

@@ -69,6 +69,9 @@ import Occam.Parser (
     countStatements,
     dialectProfile,
  )
+import PgQueryOracle (PgSyntaxError (..), isPgQueryAvailable, pgQuerySplitCheck)
+import System.Directory (doesDirectoryExist)
+import System.Environment (lookupEnv)
 import Test.QuickCheck (
     Gen,
     Property,
@@ -84,19 +87,44 @@ import Test.Tasty.QuickCheck (testProperty)
 tests :: IO TestTree
 tests = do
     corpus <- loadSeedCorpus >>= either (ioError . userError . ("seed corpus: " <>)) pure
+    pgAvail <- isPgQueryAvailable
     let positive = filter (not . isInvalidCase) corpus
         invalid = filter isInvalidCase corpus
         multiUnit = filter ((>= 2) . length . seedCaseUnits) positive
         middle = filter (all (== ";") . activeDelimiterAfter) multiUnit
-        sqliteCases = filter (elem SQLite . seedCaseDialects) positive
-        duckdbCases = filter (elem DuckDB . seedCaseDialects) positive
+        pgPositive = filter (elem PostgreSQL . seedCaseDialects) positive
+        pgInvalid = filter (elem PostgreSQL . seedCaseDialects) invalid
+        pgCrossReject = filter (notElem PostgreSQL . seedCaseDialects) positive
+        sqlitePositive = filter (elem SQLite . seedCaseDialects) positive
+        sqliteInvalid = filter (elem SQLite . seedCaseDialects) invalid
+        duckdbPositive = filter (elem DuckDB . seedCaseDialects) positive
+        duckdbInvalid = filter (elem DuckDB . seedCaseDialects) invalid
     pure $
         testGroup
             "Pure-Haskell Frontend seed conformance"
             [ testGroup "positive six-dialect matrix" (map positiveTest positive)
             , testGroup "invalid reject matrix" (map invalidTest invalid)
-            , testGroup "in-process SQLite execution" (map sqliteTest sqliteCases)
-            , testGroup "DuckDB syntax extraction" (map duckdbTest duckdbCases)
+            , testGroup
+                "PostgreSQL libpg_query alignment"
+                ( pgAvailabilityTest pgAvail
+                    : if pgAvail
+                        then
+                            [ testGroup "positive seeds" (map pgPositiveTest pgPositive)
+                            , testGroup "invalid seeds" (map pgInvalidTest pgInvalid)
+                            , testGroup "cross-dialect non-PG seeds" (map pgCrossRejectTest pgCrossReject)
+                            ]
+                        else []
+                )
+            , testGroup
+                "in-process SQLite alignment"
+                [ testGroup "positive execution" (map sqliteTest sqlitePositive)
+                , testGroup "invalid syntax reject" (map sqliteInvalidTest sqliteInvalid)
+                ]
+            , testGroup
+                "DuckDB syntax extraction alignment"
+                [ testGroup "positive seeds" (map duckdbTest duckdbPositive)
+                , testGroup "invalid seeds" (map duckdbInvalidTest duckdbInvalid)
+                ]
             , testGroup
                 "seed-derived QuickCheck mutation"
                 [ testProperty "tail truncation keeps the independently closed prefix" (propTailTruncation multiUnit)
@@ -130,6 +158,79 @@ invalidTest seedCase =
     testCase (seedLabel seedCase) $
         for_ (seedCaseDialects seedCase) (assertRejectedInvalid seedCase . dialectProfile)
 
+pgAvailabilityTest :: Bool -> TestTree
+pgAvailabilityTest pgAvail =
+    testCase "libpg_query dynamic library available when configured" $ do
+        mEnv <- lookupEnv "OCCAM_PG_QUERY_LIB"
+        nixExists <- doesDirectoryExist "/nix/store"
+        case mEnv of
+            Just p
+                | not (null p) ->
+                    assertBool ("OCCAM_PG_QUERY_LIB is set (" <> p <> ") but libpg_query failed to load") pgAvail
+            _ ->
+                if pgAvail || not nixExists
+                    then pure ()
+                    else
+                        assertFailure
+                            "libpg_query was not loaded in a Nix environment; set OCCAM_PG_QUERY_LIB or install libpg_query"
+
+pgPositiveTest :: SeedCase -> TestTree
+pgPositiveTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- pgQuerySplitCheck (seedCaseSql seedCase)
+    case result of
+        Left err ->
+            assertFailure
+                ( seedLabel seedCase
+                    <> ": libpg_query rejected positive PostgreSQL seed at pos "
+                    <> show (pgErrCursorPos err)
+                    <> ": "
+                    <> T.unpack (pgErrMessage err)
+                )
+        Right count ->
+            assertEqual
+                (seedLabel seedCase <> ": libpg_query statement count")
+                (expectedUnitSqlOnlyCount seedCase)
+                count
+
+pgInvalidTest :: SeedCase -> TestTree
+pgInvalidTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- pgQuerySplitCheck (seedCaseSql seedCase)
+    case result of
+        Left _ -> pure ()
+        Right count ->
+            assertFailure
+                ( seedLabel seedCase
+                    <> ": libpg_query accepted invalid PostgreSQL seed ("
+                    <> show count
+                    <> " statements)"
+                )
+
+pgCrossRejectTest :: SeedCase -> TestTree
+pgCrossRejectTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- pgQuerySplitCheck (seedCaseSql seedCase)
+    if seedCaseId seedCase `elem` pgCatalogOnlyCrossSeeds
+        then
+            -- MySQL/MariaDB `_utf8mb4'...'` introducers are parsed by PG gram.y as
+            -- `TypeName 'string'` typed literals and only fail in PG catalog lookup.
+            assertBool
+                (seedLabel seedCase <> ": expected libpg_query to parse catalog-only introducer syntax")
+                (case result of Right _ -> True; Left _ -> False)
+        else case result of
+            Left _ -> pure ()
+            Right count ->
+                assertFailure
+                    ( seedLabel seedCase
+                        <> ": non-PostgreSQL seed was accepted by libpg_query ("
+                        <> show count
+                        <> " statements) while rejected by Occam PostgreSQL parser"
+                    )
+
+pgCatalogOnlyCrossSeeds :: [T.Text]
+pgCatalogOnlyCrossSeeds =
+    [ "mysql_utf8_introducer_cast"
+    , "mariadb_utf8_introducer_cast"
+    ]
+
 sqliteTest :: SeedCase -> TestTree
 sqliteTest seedCase = testCase (seedLabel seedCase) $ do
     result <-
@@ -144,6 +245,32 @@ sqliteTest seedCase = testCase (seedLabel seedCase) $ do
                 (seedLabel seedCase <> ": SQLite rejected the positive SQL: " <> show exception)
         Right () -> pure ()
 
+sqliteInvalidTest :: SeedCase -> TestTree
+sqliteInvalidTest seedCase = testCase (seedLabel seedCase) $ do
+    result <-
+        try
+            ( bracket (Sqlite.open ":memory:") Sqlite.close $ \database ->
+                Sqlite.exec database (TE.decodeUtf8 (seedCaseSql seedCase))
+            ) ::
+            IO (Either Sqlite.SQLError ())
+    case result of
+        Right () ->
+            assertFailure (seedLabel seedCase <> ": SQLite accepted invalid SQLite seed")
+        Left err ->
+            let details = T.toLower (Sqlite.sqlErrorDetails err)
+                isSyntaxErr =
+                    any
+                        (`T.isInfixOf` details)
+                        [ "syntax error"
+                        , "incomplete input"
+                        , "unrecognized token"
+                        , "natural join"
+                        , "cannot have both on and using"
+                        ]
+             in assertBool
+                    (seedLabel seedCase <> ": expected SQLite syntax error, got: " <> show err)
+                    isSyntaxErr
+
 duckdbTest :: SeedCase -> TestTree
 duckdbTest seedCase = testCase (seedLabel seedCase) $ do
     result <- duckdbSyntaxCount (seedCaseSql seedCase)
@@ -154,6 +281,19 @@ duckdbTest seedCase = testCase (seedLabel seedCase) $ do
                 (seedLabel seedCase <> ": DuckDB extracted statement count")
                 (expectedUnitSqlOnlyCount seedCase)
                 count
+
+duckdbInvalidTest :: SeedCase -> TestTree
+duckdbInvalidTest seedCase = testCase (seedLabel seedCase) $ do
+    result <- duckdbSyntaxCount (seedCaseSql seedCase)
+    case result of
+        Left _ -> pure ()
+        Right count ->
+            assertFailure
+                ( seedLabel seedCase
+                    <> ": DuckDB accepted invalid DuckDB seed ("
+                    <> show count
+                    <> " statements)"
+                )
 
 seedLabel :: SeedCase -> String
 seedLabel seedCase =

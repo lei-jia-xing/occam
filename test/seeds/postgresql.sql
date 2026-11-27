@@ -112,3 +112,84 @@ ORDER BY 1 NULLS LAST;
 -- @units: sql=;
 SELECT 1 AS one, 'héllo' AS label
 ORDER BY one;
+
+-- Extended DDL & analytics coverage (Phase 2b ledger)
+-- @case: pg_ddl_statistics
+-- @dialects: postgresql
+-- @units: sql=;,sql=;
+CREATE TABLE seed_pg_stats_tbl (a INT NOT NULL, b INT NOT NULL);
+-- @unit
+CREATE STATISTICS seed_pg_st (dependencies, ndistinct) ON a, b FROM seed_pg_stats_tbl;
+
+-- @case: pg_ddl_materialized_view_refresh
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;,sql=;
+CREATE TABLE seed_pg_mv_src (id INT PRIMARY KEY, v INT NOT NULL);
+-- @unit
+CREATE MATERIALIZED VIEW seed_pg_mv AS SELECT id, v FROM seed_pg_mv_src WITH DATA;
+-- @unit
+REFRESH MATERIALIZED VIEW seed_pg_mv;
+-- @unit
+DROP MATERIALIZED VIEW seed_pg_mv;
+
+-- @case: pg_ddl_partition_range
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;
+CREATE TABLE seed_pg_part (id INT NOT NULL, label TEXT) PARTITION BY RANGE (id);
+-- @unit
+CREATE TABLE seed_pg_part_p1 PARTITION OF seed_pg_part FOR VALUES FROM (1) TO (100);
+-- @unit
+CREATE TABLE seed_pg_part_def PARTITION OF seed_pg_part DEFAULT;
+
+-- @case: pg_ddl_rls_policy_rule
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;,sql=;
+CREATE TABLE seed_pg_rls (id INT PRIMARY KEY, owner_id INT NOT NULL);
+-- @unit
+ALTER TABLE seed_pg_rls ENABLE ROW LEVEL SECURITY;
+-- @unit
+CREATE POLICY seed_pg_rls_sel ON seed_pg_rls FOR SELECT USING (owner_id > 0);
+-- @unit
+CREATE OR REPLACE RULE seed_pg_rls_ins AS ON INSERT TO seed_pg_rls DO ALSO NOTHING;
+
+-- @case: pg_tx_modes_savepoints
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;,sql=;,sql=;
+BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE;
+-- @unit
+SAVEPOINT seed_pg_sp1;
+-- @unit
+ROLLBACK TO SAVEPOINT seed_pg_sp1;
+-- @unit
+RELEASE SAVEPOINT seed_pg_sp1;
+-- @unit
+COMMIT;
+
+-- @case: pg_utility_prepare_execute
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;
+PREPARE seed_pg_ps (INT) AS SELECT $1::INT + 1;
+-- @unit
+EXECUTE seed_pg_ps (41);
+-- @unit
+DEALLOCATE seed_pg_ps;
+
+-- @case: pg_query_unlogged_filter_within_group_locking
+-- @dialects: postgresql
+-- @units: sql=;,sql=;,sql=;
+CREATE UNLOGGED TABLE seed_pg_agg (id INT PRIMARY KEY, grp TEXT, val INT);
+-- @unit
+SELECT grp,
+       count(*) FILTER (WHERE val > 0) AS pos_cnt,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY val) AS med
+FROM seed_pg_agg
+GROUP BY grp;
+-- @unit
+SELECT id FROM seed_pg_agg ORDER BY id FOR NO KEY UPDATE SKIP LOCKED;
+
+-- @case: pg_utility_copy_shared
+-- @dialects: postgresql,duckdb
+-- @units: sql=;,sql=;
+CREATE TABLE seed_pg_copy (id INT, label TEXT);
+-- @unit
+COPY seed_pg_copy (id, label) TO STDOUT WITH (FORMAT csv);

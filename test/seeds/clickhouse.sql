@@ -98,3 +98,36 @@ SELECT 'héllo' AS label,
        CAST('42', 'UInt32') AS n
 FROM numbers(1)
 ORDER BY n;
+
+-- Extended ClickHouse coverage (Phase 2b ledger)
+-- @case: clickhouse_typed_path_cast
+-- @dialects: clickhouse
+-- @units: sql=;,sql=;
+CREATE TABLE seed_ch_json (data JSON) ENGINE = MergeTree ORDER BY tuple();
+-- @unit
+SELECT data.:Int64 AS v FROM seed_ch_json;
+
+-- @case: clickhouse_dml_alter_delete_optimize
+-- @dialects: clickhouse
+-- @units: sql=;,sql=;,sql=;
+CREATE TABLE seed_ch_del (id UInt64, v Int32) ENGINE = MergeTree ORDER BY id;
+-- @unit
+ALTER TABLE seed_ch_del DELETE WHERE id = 1;
+-- @unit
+OPTIMIZE TABLE seed_ch_del FINAL;
+
+-- @case: clickhouse_query_lambda_array_map
+-- @dialects: clickhouse
+-- @units: sql=;
+SELECT arrayMap(x -> x * 2, [1, 2, 3]) AS doubled FORMAT Null;
+
+-- @case: clickhouse_query_global_strictness_join
+-- @dialects: clickhouse
+-- @units: sql=;,sql=;,sql=;
+CREATE TABLE seed_ch_j1 (k UInt64) ENGINE = MergeTree ORDER BY k;
+-- @unit
+CREATE TABLE seed_ch_j2 (k UInt64) ENGINE = MergeTree ORDER BY k;
+-- @unit
+SELECT j1.k
+FROM seed_ch_j1 AS j1
+GLOBAL ANY LEFT JOIN seed_ch_j2 AS j2 ON j1.k = j2.k;

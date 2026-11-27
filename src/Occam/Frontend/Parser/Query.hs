@@ -18,13 +18,13 @@ import Control.Monad.Trans.State.Strict (StateT, execStateT, gets, modify')
 import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Occam.Frontend.AST
 import Occam.Frontend.Lexer hiding (LiteralKind)
 import Occam.Frontend.Parser.Core
 import Occam.Frontend.Parser.Expr
 import Occam.Frontend.Span (ByteSpan, Located (..), mergeSpan)
-import Occam.Parser.Dialect (DialectFeature (..))
+import Occam.Parser.Dialect (DialectFeature (..), DialectProfile (..))
 import Occam.Parser.Types (SQLDialect (..))
 
 -- ---------------------------------------------------------------------------
@@ -218,9 +218,15 @@ parseForClause = do
     withLocated do
         strength <- evalContT do
             onWord "UPDATE" (pure ForUpdate)
-            onWord "SHARE" (pure ForShare)
-            onWord "NO" (expectWordsCI ["KEY", "UPDATE"] $> ForNoKeyUpdate)
-            lift (expectWordsCI ["KEY", "SHARE"] $> ForKeyShare)
+            onWordTok "SHARE" \tok ->
+                requireDialectP [PostgreSQL, MySQL] (locSpan tok) "FOR SHARE" $> ForShare
+            onWordTok "NO" \tok -> do
+                requireDialectP [PostgreSQL] (locSpan tok) "FOR NO KEY UPDATE"
+                expectWordsCI ["KEY", "UPDATE"] $> ForNoKeyUpdate
+            lift do
+                tok <- expectWordCI "KEY"
+                requireDialectP [PostgreSQL] (locSpan tok) "FOR KEY SHARE"
+                expectWordCI "SHARE" $> ForKeyShare
         tables <- fromMaybe [] <$> whenWord "OF" (parseCommaSeparated parseName)
         noWait <- isJust <$> matchWordCI "NOWAIT"
         skipLocked <- isJust <$> whenWord "SKIP" (expectWordCI "LOCKED")
@@ -534,11 +540,14 @@ parseTableRef = withLocated do
     pure
         (TableRef onlyFlag source includeDescendants alias finalFlag (sample1 <|> sample2 <|> sample3) joins)
     where
-        isJoinStart =
-            maybe
-                False
-                (wordIn ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ASOF", "ARRAY", "GLOBAL"])
-                <$> currentHeadWord
+        isJoinStart = do
+            dialect <- gets (dialectId . psProfile)
+            mw <- currentHeadWord
+            pure $ case mw of
+                Nothing -> False
+                Just w ->
+                    wordIn ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ARRAY", "GLOBAL"] w
+                        || (dialect `elem` [DuckDB, ClickHouse] && asciiEqCI "ASOF" w)
 
 parseTableSample :: P (Maybe (Located TableSample))
 parseTableSample = do
@@ -594,14 +603,39 @@ parseJoinClause = withLocated do
     target <- case kind of
         JoinArray bool -> JoinTargetArray <$> parseArrayJoinItems bool
         _ -> JoinTargetTable <$> parseTableRef
-    constraint <- case kind of
-        JoinArray _ -> pure Nothing
-        JoinCross -> do
-            peekTok >>= traverse_ \(L sp tok) ->
-                when (maybe False (wordIn ["ON", "USING"]) (headWordOf tok)) $
-                    throwParse ParseUnsupported sp "CROSS JOIN does not accept ON/USING"
-            pure Nothing
-        _ -> parseJoinConstraint
+    constraint <-
+        if natural
+            then do
+                when (kind == JoinCross) do
+                    sp <- currentSpan
+                    requireDialectP [SQLite] sp "NATURAL CROSS JOIN"
+                peekTok >>= traverse_ \(L sp tok) ->
+                    when (maybe False (wordIn ["ON", "USING"]) (headWordOf tok)) $
+                        throwParse ParseUnsupported sp "NATURAL JOIN does not accept ON/USING"
+                pure Nothing
+            else case kind of
+                JoinArray _ -> pure Nothing
+                JoinCross -> do
+                    dialect <- gets (dialectId . psProfile)
+                    if dialect `elem` [SQLite, MySQL, MariaDB]
+                        then parseJoinConstraint
+                        else do
+                            peekTok >>= traverse_ \(L sp tok) ->
+                                when (maybe False (wordIn ["ON", "USING"]) (headWordOf tok)) $
+                                    throwParse ParseUnsupported sp "CROSS JOIN does not accept ON/USING"
+                            pure Nothing
+                _ -> do
+                    mConstraint <- parseJoinConstraint
+                    when (isNothing mConstraint) do
+                        dialect <- gets (dialectId . psProfile)
+                        let needsCondition =
+                                dialect `elem` [PostgreSQL, DuckDB]
+                                    || case kind of
+                                        JoinAsof _ -> True
+                                        _ -> False
+                        when needsCondition $
+                            unexpectedHere "JOIN requires ON or USING"
+                    pure mConstraint
     pure (JoinClause natural globalFlag strictness kind target constraint)
 
 parseJoinKind :: P JoinKind

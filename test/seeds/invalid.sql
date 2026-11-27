@@ -50,3 +50,39 @@ BEGIN FOOBAR;
 -- @dialects: duckdb
 -- @units: sql=;
 SAVEPOINT seed_invalid_sp;
+
+-- Join & locking & DDL tightening negatives (Phase 2b)
+-- @case: invalid_natural_join_on
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
+-- @units: sql=;
+SELECT t.a FROM (SELECT 1 AS a) AS t NATURAL JOIN (SELECT 1 AS a) AS u ON t.a = u.a;
+
+-- @case: invalid_natural_join_using
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
+-- @units: sql=;
+SELECT t.a FROM (SELECT 1 AS a) AS t NATURAL LEFT JOIN (SELECT 1 AS a) AS u USING (a);
+
+-- @case: invalid_for_update_non_locking
+-- @dialects: sqlite,duckdb,clickhouse
+-- @units: sql=;
+SELECT 1 FOR UPDATE;
+
+-- @case: invalid_postgresql_temp_policy
+-- @dialects: postgresql
+-- @units: sql=;
+CREATE TEMP POLICY seed_invalid_pol ON seed_invalid_t;
+
+-- @case: invalid_postgresql_alter_rename_multi
+-- @dialects: postgresql
+-- @units: sql=;
+ALTER TABLE seed_invalid_t RENAME TO seed_invalid_u, ADD COLUMN c INT;
+
+-- @case: invalid_sqlite_within_group
+-- @dialects: sqlite,mysql
+-- @units: sql=;
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM seed_invalid_t;
+
+-- @case: invalid_cross_join_on
+-- @dialects: postgresql,duckdb,clickhouse
+-- @units: sql=;
+SELECT t.a FROM t CROSS JOIN u ON t.a = u.a;

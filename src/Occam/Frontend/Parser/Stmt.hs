@@ -455,16 +455,28 @@ parsePragma = withLocated do
     pure (PragmaStmt name value)
 
 parsePragmaValueAfterEq :: P PragmaValue
-parsePragmaValueAfterEq =
-    currentWord >>= \case
-        Just (tok, raw) -> advanceTok $> PragmaBare (L (locSpan tok) raw)
-        Nothing -> PragmaValueExpr <$> parseExpr
+parsePragmaValueAfterEq = do
+    sqlite <- isDialect SQLite
+    if sqlite
+        then
+            currentWord >>= \case
+                Just (tok, raw) -> advanceTok $> PragmaBare (L (locSpan tok) raw)
+                Nothing -> PragmaValueExpr <$> parseExpr
+        else do
+            currentWord >>= traverse_ \(tok, raw) ->
+                when (wordIn ["ON", "DELETE", "TRUNCATE"] raw) $
+                    unexpectedUnsupported tok "SQLite bare PRAGMA keyword value is not supported in DuckDB"
+            PragmaValueExpr <$> parseExpr
 
 parsePragmaParenthesized :: P PragmaValue
-parsePragmaParenthesized =
-    currentWord >>= \case
-        Just (tok, raw) | isBarePragmaValue raw -> advanceTok $> PragmaBare (L (locSpan tok) raw)
-        _ -> PragmaValueExpr <$> parseExpr
+parsePragmaParenthesized = do
+    sqlite <- isDialect SQLite
+    if sqlite
+        then
+            currentWord >>= \case
+                Just (tok, raw) | isBarePragmaValue raw -> advanceTok $> PragmaBare (L (locSpan tok) raw)
+                _ -> PragmaValueExpr <$> parseExpr
+        else PragmaValueExpr <$> parseExpr
 
 isBarePragmaValue :: ByteString -> Bool
 isBarePragmaValue = wordIn ["ON", "OFF", "YES", "NO", "TRUE", "FALSE", "MEMORY", "WAL", "DELETE", "TRUNCATE"]
@@ -1159,6 +1171,8 @@ parsePrepare = withLocated do
             pure (PrepareStmt name [] (PrepareExpression expr))
         else do
             params <- parseOptParenList parseTypeName
+            unless (null params) $
+                requireDialectP [PostgreSQL] (locSpan tok) "typed PREPARE parameter list"
             PrepareStmt name params . PrepareStatement <$> (expectWordCI "AS" *> parseStatement)
     where
         isMySQLPrepareSource = \case

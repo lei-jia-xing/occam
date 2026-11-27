@@ -36,10 +36,10 @@ Replaced `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary
 - [X] Differential syntax alignment: focused latest-grammar regressions in `test/ParserChecks.hs` plus the 71/71 `benchmarks/real_fuzz_corpus` regression. The temporary grammar-exact seed matrix used during parser bring-up was removed; no version dimension.
 
 *** Phase 2b: Six-dialect seed conformance
-- [X] Shared `test/seeds/` block protocol (`@case`/`@dialects`/`@units` + literal `-- @unit` boundaries), seven required files, 62 focused cases / 109 units.
-- [ ] Expand seed coverage against the ledger in `docs/FRONTEND_GRAMMAR.md`.
-- [ ] Choose a lightweight way to check SQL grammar independently against each engine.
-- [ ] Mark corpus FULL after independent six-engine conformance, Phase 4 product facade cutover, and semantic-facade tests pass.
+- [X] Shared `test/seeds/` block protocol (`@case`/`@dialects`/`@units` + literal `-- @unit` boundaries), seven required files, expanded to 89 cases / 182 units.
+- [X] Expand seed coverage against the ledger in `docs/FRONTEND_GRAMMAR.md` and tighten over-acceptances (`NATURAL JOIN ... ON/USING`, dialect-gated row locks, `FILTER`/`WITHIN GROUP`, `CREATE TEMP/UNLOGGED`, PG multi-action `ALTER RENAME`, DuckDB nested block comments, PG positional `$N` vs `$name` lexing).
+- [X] Add lightweight in-process engine syntax alignment (`test/PgQueryOracle.hs` via `dlopen libpg_query.so` 18.0.0 for PostgreSQL, `libduckdb` 1.5.5 `duckdb_extract_statements` for DuckDB, and `direct-sqlite` for SQLite) across `test/seeds/`, `benchmarks/real_fuzz_corpus/`, `test/seeds/regression_cases.sql`, and 18 QuickCheck differential syntax fuzzing properties (`test/SyntaxAlignmentChecks.hs`); MySQL/MariaDB/ClickHouse omitted from live-engine syntax verification by choice.
+- [ ] Optional: add live-engine syntax conformance for MySQL/MariaDB/ClickHouse before marking all six dialects FULL.
 
 *** Phase 3: Refactor `SemanticFacts`, Exact-Span Edits & Column IR
 - [X] Lower selected transaction, SQLite PRAGMA, PostgreSQL TABLE, and ClickHouse OPTIMIZE statements from the Haskell AST through the product parser.

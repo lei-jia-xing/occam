@@ -1,5 +1,10 @@
 -- | Pure-Haskell corpus regression suite across real fuzz, benchmark, and regression cases.
-module FrontendCorpusChecks (tests) where
+module FrontendCorpusChecks (
+    tests,
+    CorpusCase (..),
+    loadRealFuzzCorpus,
+    loadRegressionCases,
+) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (forM, forM_, when)

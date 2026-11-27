@@ -591,15 +591,23 @@ finishFunctionCall name distinct args orderBy = do
     withinGroup <-
         if isWithinGroup
             then do
-                expectWordsCI ["WITHIN", "GROUP"]
+                tok <- expectWordCI "WITHIN"
+                requireDialectP [PostgreSQL, DuckDB, MariaDB] (locSpan tok) "WITHIN GROUP"
+                rejectCommonSubexprModifier tok "WITHIN GROUP"
+                _ <- expectWordCI "GROUP"
                 inParens (expectWordsCI ["ORDER", "BY"] *> parseCommaSeparated parseOrderItem)
             else pure []
     nullTreatment <-
         matchAnyWordCI ["RESPECT", "IGNORE"] >>= traverse \(_, word) -> do
             _ <- expectWordCI "NULLS"
             pure (if asciiEqCI "RESPECT" word then NullTreatmentRespect else NullTreatmentIgnore)
-    filterExpr <- whenWord "FILTER" (inParens (expectWordCI "WHERE" *> parseExpr))
-    overRef <- whenWord "OVER" parseWindowRef
+    filterExpr <- whenWordTok "FILTER" \tok -> do
+        requireDialectP [PostgreSQL, SQLite, DuckDB, ClickHouse] (locSpan tok) "aggregate FILTER clause"
+        rejectCommonSubexprModifier tok "FILTER"
+        inParens (expectWordCI "WHERE" *> parseExpr)
+    overRef <- whenWordTok "OVER" \tok -> do
+        rejectCommonSubexprModifier tok "OVER"
+        parseWindowRef
     locatedSpanning
         (locSpan name)
         FunctionCall
@@ -612,6 +620,17 @@ finishFunctionCall name distinct args orderBy = do
             , functionNullTreatment = nullTreatment
             , functionOver = overRef
             }
+    where
+        rejectCommonSubexprModifier tok clause = do
+            pgOrDuck <- (||) <$> isDialect PostgreSQL <*> isDialect DuckDB
+            when (pgOrDuck && isPgCommonSubexpr (locValue name)) $
+                throwParse
+                    ParseUnsupported
+                    (locSpan tok)
+                    (clause <> " is not allowed on SQL special value expression")
+        isPgCommonSubexpr (Name [L _ (NamePart raw False)]) =
+            wordIn ["COALESCE", "GREATEST", "LEAST", "NULLIF"] raw
+        isPgCommonSubexpr _ = False
 
 parseFunctionArg :: P (Located FunctionArg)
 parseFunctionArg = withLocated do

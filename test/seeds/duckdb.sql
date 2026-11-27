@@ -77,3 +77,51 @@ SELECT q.ts, q.price, t.qty
 FROM seed_duck_quotes AS q
 ASOF RIGHT JOIN seed_duck_trades AS t ON q.ts >= t.ts
 ORDER BY q.ts;
+
+-- Extended DDL, DML, utility, and grouping coverage (Phase 2b ledger)
+-- @case: duckdb_ddl_create_or_replace
+-- @dialects: duckdb
+-- @units: sql=;,sql=;
+CREATE OR REPLACE TABLE seed_duck_rep (id INT, name VARCHAR);
+-- @unit
+CREATE OR REPLACE MACRO seed_duck_add(x, y) AS x + y;
+
+-- @case: duckdb_utility_pragma_attach_prepare
+-- @dialects: duckdb
+-- @units: sql=;,sql=;,sql=;,sql=;,sql=;,sql=;
+PRAGMA version;
+-- @unit
+ATTACH IF NOT EXISTS ':memory:' AS seed_duck_aux;
+-- @unit
+DETACH seed_duck_aux;
+-- @unit
+PREPARE seed_duck_ps AS SELECT $1 + $2;
+-- @unit
+EXECUTE seed_duck_ps(1, 2);
+-- @unit
+DEALLOCATE PREPARE seed_duck_ps;
+
+-- @case: duckdb_dml_update_from_returning
+-- @dialects: postgresql,sqlite,duckdb
+-- @units: sql=;,sql=;,sql=;,sql=;,sql=;
+CREATE TABLE seed_duck_u1 (id INT PRIMARY KEY, v INT NOT NULL);
+-- @unit
+CREATE TABLE seed_duck_u2 (id INT PRIMARY KEY, v INT NOT NULL);
+-- @unit
+INSERT INTO seed_duck_u1 VALUES (1, 10);
+-- @unit
+INSERT INTO seed_duck_u2 VALUES (1, 20);
+-- @unit
+UPDATE seed_duck_u1
+SET v = seed_duck_u2.v
+FROM seed_duck_u2
+WHERE seed_duck_u1.id = seed_duck_u2.id
+RETURNING seed_duck_u1.id, seed_duck_u1.v;
+
+-- @case: duckdb_query_grouping_sets_shared
+-- @dialects: postgresql,duckdb,clickhouse
+-- @units: sql=;
+SELECT a, b, count(*) AS cnt
+FROM (VALUES (1, 10), (1, 20), (2, 30)) AS t(a, b)
+GROUP BY GROUPING SETS ((a), (b), ())
+ORDER BY a NULLS LAST, b NULLS LAST;

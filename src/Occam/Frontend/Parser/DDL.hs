@@ -37,6 +37,7 @@ import Occam.Parser.Types (SQLDialect (..))
 data CreateFlags = CreateFlags
     { cfOrReplace :: !(Maybe ByteSpan)
     , cfTemp :: !(Maybe ByteSpan)
+    , cfUnlogged :: !(Maybe ByteSpan)
     , cfUnique :: !(Maybe ByteSpan)
     , cfFulltext :: !(Maybe ByteSpan)
     , cfMaterialized :: !(Maybe ByteSpan)
@@ -45,7 +46,7 @@ data CreateFlags = CreateFlags
     }
 
 emptyCreateFlags :: CreateFlags
-emptyCreateFlags = CreateFlags Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+emptyCreateFlags = CreateFlags Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
 -- | Parse a CREATE statement and its dialect-specific object form.
 parseCreate :: P (Located CreateStmt)
@@ -153,13 +154,13 @@ parseCreateFlags flags = do
         else evalContT do
             onWords ["TEMP", "TEMPORARY"] \tok hit -> do
                 when (asciiEqCI "TEMP" hit) $ do
-                    mysqlLike <- (||) <$> isDialect MySQL <*> isDialect MariaDB
-                    when mysqlLike $
-                        throwParse
-                            ParseUnsupported
-                            (locSpan tok)
-                            "MySQL/MariaDB require the TEMPORARY spelling, not TEMP"
+                    requireDialectP
+                        [PostgreSQL, SQLite, DuckDB]
+                        (locSpan tok)
+                        "TEMP spelling (use TEMPORARY in MySQL/MariaDB/ClickHouse)"
                 parseCreateFlags flags {cfTemp = Just (locSpan tok)}
+            onWordTok "UNLOGGED" \tok ->
+                parseCreateFlags flags {cfUnlogged = Just (locSpan tok)}
             onWordTok "UNIQUE" \tok ->
                 parseCreateFlags flags {cfUnique = Just (locSpan tok)}
             onWordTok "FULLTEXT" \tok ->
@@ -192,6 +193,7 @@ validateCreateFlags :: CreateFlags -> ByteString -> P ()
 validateCreateFlags flags objRaw = do
     traverse_ checkOrReplace (cfOrReplace flags)
     traverse_ checkTemp (cfTemp flags)
+    traverse_ checkUnlogged (cfUnlogged flags)
     traverse_ checkMat (cfMaterialized flags)
     traverse_ checkUnique (cfUnique flags)
     traverse_ checkFulltext (cfFulltext flags)
@@ -210,6 +212,7 @@ validateCreateFlags flags objRaw = do
             "AGGREGATE" -> requireDialectP [PostgreSQL] sp "CREATE OR REPLACE AGGREGATE"
             "TRIGGER" -> requireDialectP [PostgreSQL, MariaDB] sp "CREATE OR REPLACE TRIGGER"
             "SEQUENCE" -> requireDialectP [MariaDB, DuckDB] sp "CREATE OR REPLACE SEQUENCE"
+            "SCHEMA" -> requireDialectP [DuckDB] sp "CREATE OR REPLACE SCHEMA"
             "MACRO" -> requireDialectP [DuckDB] sp "CREATE OR REPLACE MACRO"
             "RULE" -> requireDialectP [PostgreSQL] sp "CREATE OR REPLACE RULE"
             _ -> throwParse ParseUnsupported sp ("CREATE OR REPLACE " <> decodeBS objRaw <> " is not supported")
@@ -220,6 +223,10 @@ validateCreateFlags flags objRaw = do
             "MACRO" -> requireDialectP [DuckDB] sp "TEMP MACRO"
             "POLICY" -> throwParse ParseUnsupported sp "CREATE TEMP POLICY is not valid in PostgreSQL"
             _ -> throwParse ParseUnsupported sp ("CREATE TEMP " <> decodeBS objRaw <> " is not supported")
+        checkUnlogged sp = case objRaw of
+            "TABLE" -> requireDialectP [PostgreSQL] sp "CREATE UNLOGGED TABLE"
+            "SEQUENCE" -> requireDialectP [PostgreSQL] sp "CREATE UNLOGGED SEQUENCE"
+            _ -> throwParse ParseUnsupported sp ("CREATE UNLOGGED " <> decodeBS objRaw <> " is not supported")
         checkMat sp
             | objRaw == "VIEW" = requireFeatureP FeatureMaterializedViews sp "CREATE MATERIALIZED VIEW"
             | otherwise = throwParse ParseUnsupported sp "MATERIALIZED is only valid for CREATE VIEW"
@@ -295,6 +302,7 @@ parsePartitionOf :: ByteSpan -> P (Located TablePartition)
 parsePartitionOf startSp = do
     _ <- expectWordCI "OF"
     parent <- parseName
+    validatePgRelationName parent
     bound <- evalContT do
         onWord "DEFAULT" (pure PartitionBoundDefault)
         lift do
@@ -1521,10 +1529,30 @@ parseAlter = withLocated do
         AlterObjectTable -> isJust <$> matchWordCI "ONLY"
         AlterObjectView -> pure False
     table <- parseName
+    validatePgRelationName table
     actions <- case objectKind of
         AlterObjectTable -> parseCommaSeparated parseAlterAction
         AlterObjectView -> (: []) <$> parseAlterViewAction
+    pg <- isDialect PostgreSQL
+    case actions of
+        firstAct : _ : _
+            | pg && any isPgStandaloneRename actions ->
+                throwParse
+                    ParseUnsupported
+                    (locSpan firstAct)
+                    "PostgreSQL ALTER TABLE RENAME cannot be combined with other actions"
+        _ -> pure ()
     pure (AlterStmt objectKind ifExists only table actions)
+    where
+        isPgStandaloneRename (L _ (AlterRenameTable _)) = True
+        isPgStandaloneRename (L _ (AlterRenameColumn _ _)) = True
+        isPgStandaloneRename _ = False
+
+validatePgRelationName :: Located Name -> P ()
+validatePgRelationName (L sp (Name parts)) = do
+    pg <- isDialect PostgreSQL
+    when (pg && length parts > 3) $
+        throwParse ParseUnsupported sp "improper qualified name (too many dotted names)"
 
 parseAlterViewAction :: P (Located AlterAction)
 parseAlterViewAction = withLocated $ evalContT do
@@ -1599,7 +1627,9 @@ parseAlterAction = withLocated $ evalContT do
         pure (AlterDetachPartition part concurrently finalize)
     onWordTok "INHERIT" \tok -> do
         requireFeatureP FeatureAlterPartitionInherit (locSpan tok) "ALTER TABLE ... INHERIT"
-        AlterInherit <$> parseName
+        parent <- parseName
+        validatePgRelationName parent
+        pure (AlterInherit parent)
     onWordTok "OWNER" \tok -> do
         requireDialectP [PostgreSQL] (locSpan tok) "ALTER TABLE ... OWNER TO"
         expectWordCI "TO" *> (AlterOwnerTo <$> parseName)
@@ -1628,7 +1658,9 @@ parseAlterAction = withLocated $ evalContT do
     onWordTok "NO" \tok -> evalContT do
         onWord "INHERIT" do
             requireFeatureP FeatureAlterPartitionInherit (locSpan tok) "ALTER TABLE ... NO INHERIT"
-            AlterNoInherit <$> parseName
+            parent <- parseName
+            validatePgRelationName parent
+            pure (AlterNoInherit parent)
         lift (expectWordCI "FORCE" *> pgRls tok RlsNoForce)
     lift $
         currentWord >>= \case

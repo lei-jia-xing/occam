@@ -349,12 +349,12 @@ lexerTests =
                     let toks = map locValue (nonTriviaTokens (lexSQL (dialectProfile d) "SELECT `a`;"))
                     assertBool (show d <> " rejects backtick ident") $
                         TokUnknown "`" `elem` toks
-                -- Nested block comments (PG / ClickHouse only)
+                -- Nested block comments (PG / DuckDB / ClickHouse)
                 let nested = "/* outer /* inner */ still */ SELECT 1;"
-                for_ [PostgreSQL, ClickHouse] $ \d -> do
+                for_ [PostgreSQL, DuckDB, ClickHouse] $ \d -> do
                     let toks = map locValue (nonTriviaTokens (lexSQL (dialectProfile d) nested))
                     assertEqual (show d <> " skips entire nested comment") 3 (length toks)
-                for_ [MySQL, MariaDB, SQLite, DuckDB] $ \d -> do
+                for_ [MySQL, MariaDB, SQLite] $ \d -> do
                     let toks = map locValue (nonTriviaTokens (lexSQL (dialectProfile d) nested))
                     assertBool (show d <> " closes block comment at first */") (any (isWordRaw "still") toks)
                 -- Conditional comments (MySQL / MariaDB only)

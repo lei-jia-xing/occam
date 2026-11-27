@@ -34,9 +34,11 @@
               elan
               python3
               duckdb
+              libpg_query
               bashInteractive
             ];
             shellHook = ''
+              export OCCAM_PG_QUERY_LIB="${pkgs.libpg_query}/lib/libpg_query${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}"
               if [ -d .githooks ]; then
                 git config core.hooksPath .githooks
               fi

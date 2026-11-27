@@ -1711,7 +1711,7 @@ grammarGapTests =
                     other -> assertFailure ("expected outer WITH clause, got " <> show other)
                 other -> assertFailure ("expected InsertStmt, got " <> show other)
         , testCase "Ordered-set aggregates WITHIN GROUP (ORDER BY ...)" $ do
-            forM_ [postgresqlProfile, sqliteProfile, mysqlProfile] $ \prof -> do
+            forM_ [postgresqlProfile, duckdbProfile, mariadbProfile] $ \prof -> do
                 stmt <- parseSingleChecked prof "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) FROM t"
                 case locValue stmt of
                     StatementQuery (L _ q) -> case locValue (queryBody q) of
@@ -1721,6 +1721,8 @@ grammarGapTests =
                             other -> assertFailure ("expected ExprCall, got " <> show other)
                         other -> assertFailure ("expected SELECT, got " <> show other)
                     other -> assertFailure ("expected Query, got " <> show other)
+            forM_ [sqliteProfile, mysqlProfile] $ \prof ->
+                assertRejected prof "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a DESC) FROM t"
         , testCase "PostgreSQL FROM ONLY t and FROM t * markers" $ do
             onlyStmt <- parseSingleChecked postgresqlProfile "SELECT * FROM ONLY t"
             case firstTableRef onlyStmt of

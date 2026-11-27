@@ -26,15 +26,17 @@ import PoolMetricsChecks qualified
 import PropertyChecks qualified
 import ReductionChecks qualified
 import SqliteOracleChecks qualified
+import SyntaxAlignmentChecks qualified
 import Test.Tasty (TestTree, defaultMain, testGroup)
 
 main :: IO ()
 main = do
     frontendSeedTests <- FrontendSeedChecks.tests
-    defaultMain (tests frontendSeedTests)
+    syntaxAlignmentTests <- SyntaxAlignmentChecks.tests
+    defaultMain (tests frontendSeedTests syntaxAlignmentTests)
 
-tests :: TestTree -> TestTree
-tests frontendSeedTests =
+tests :: TestTree -> TestTree -> TestTree
+tests frontendSeedTests syntaxAlignmentTests =
     testGroup
         "Occam Test Suite"
         [ DialectAndControlChecks.phase3Tests
@@ -47,6 +49,7 @@ tests frontendSeedTests =
         , FrontendSemanticsChecks.tests
         , ParserChecks.tests
         , frontendSeedTests
+        , syntaxAlignmentTests
         , CliChecks.tests
         , CacheChecks.tests
         , DialectAndControlChecks.phase7Tests

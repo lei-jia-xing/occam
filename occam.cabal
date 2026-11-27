@@ -213,10 +213,12 @@ test-suite occam-test
     type:             exitcode-stdio-1.0
     c-sources:        eval-lib/cbits/duckdb_result.c
                       eval-lib/cbits/sqlite_authorizer.c
+                      test/cbits/pg_query_shim.c
     hs-source-dirs:   test eval-lib
     other-modules:    DialectFuzz
                     , Fuzz
                     , MutationalFuzz
+                    , PgQueryOracle
                     , TestSupport
                     , BenchmarkMetricsChecks
                     , CacheChecks
@@ -255,6 +257,7 @@ test-suite occam-test
                     , ReductionChecks.Support
                     , ReductionChecks.SyntaxAndColumnChecks
                     , SqliteOracleChecks
+                    , SyntaxAlignmentChecks
                     , Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite

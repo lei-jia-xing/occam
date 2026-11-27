@@ -130,7 +130,7 @@ import Occam.Parser.Dialect (
     DialectFeature,
     DialectProfile (..),
  )
-import Occam.Parser.Types (SQLDialect (DuckDB))
+import Occam.Parser.Types (SQLDialect (ClickHouse, DuckDB))
 
 -- ---------------------------------------------------------------------------
 -- Public error and result types
@@ -493,9 +493,21 @@ parseOptionalAlias allowColumns = evalContT do
     onWord "AS" (Just <$> parseAlias allowColumns)
     lift do
         mt <- peekTok
-        if tokenStartsBareAlias mt
+        isBare <- tokenStartsBareAliasP mt
+        if isBare
             then Just <$> parseAlias allowColumns
             else pure Nothing
+
+-- | Dialect-aware check for whether a token can start an implicit alias.
+tokenStartsBareAliasP :: Maybe SpannedToken -> P Bool
+tokenStartsBareAliasP mt = case mt of
+    Just (L _ (TokWord wt))
+        | Nothing <- wordQuote wt -> do
+            let upper = asciiUpperBS (wordRaw wt)
+            if upper == "ASOF"
+                then not <$> gets ((`elem` [DuckDB, ClickHouse]) . dialectId . psProfile)
+                else pure (tokenStartsBareAlias mt)
+    _ -> pure (tokenStartsBareAlias mt)
 
 -- | Parse one alias, optionally with a parenthesized column list.
 parseAlias :: Bool -> P (Located Alias)
@@ -536,7 +548,6 @@ reservedAliasWords =
         , "FULL"
         , "CROSS"
         , "NATURAL"
-        , "ASOF"
         , "ON"
         , "USING"
         , "AND"

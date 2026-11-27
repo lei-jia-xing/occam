@@ -96,3 +96,55 @@ FROM (SELECT 1 AS [id]);
 -- @unit
 SELECT "id" AS "naïve", 'It''s fine' AS quoted, x'00ff' AS blob_value
 FROM (SELECT 1 AS "id");
+
+-- Extended DDL, utility, transaction, and window/filter coverage (Phase 2b ledger)
+-- @case: sqlite_utility_pragma_attach_vacuum
+-- @dialects: sqlite
+-- @units: sql=;,sql=;,sql=;,sql=;
+PRAGMA foreign_keys = ON;
+-- @unit
+ATTACH DATABASE ':memory:' AS seed_sq_aux;
+-- @unit
+DETACH DATABASE seed_sq_aux;
+-- @unit
+VACUUM main;
+
+-- @case: sqlite_ddl_alter_add_drop_column
+-- @dialects: postgresql,mysql,mariadb,sqlite,duckdb
+-- @units: sql=;,sql=;,sql=;
+CREATE TABLE seed_sq_alt (id INTEGER PRIMARY KEY, a TEXT);
+-- @unit
+ALTER TABLE seed_sq_alt ADD COLUMN b INTEGER DEFAULT 0;
+-- @unit
+ALTER TABLE seed_sq_alt DROP COLUMN b;
+
+-- @case: sqlite_tx_immediate_savepoint
+-- @dialects: sqlite
+-- @units: sql=;,sql=;,sql=;,sql=;,sql=;,sql=;,sql=;
+BEGIN IMMEDIATE;
+-- @unit
+CREATE TABLE seed_sq_tx (id INTEGER PRIMARY KEY);
+-- @unit
+SAVEPOINT seed_sq_sp;
+-- @unit
+INSERT INTO seed_sq_tx VALUES (1);
+-- @unit
+ROLLBACK TO SAVEPOINT seed_sq_sp;
+-- @unit
+RELEASE SAVEPOINT seed_sq_sp;
+-- @unit
+COMMIT;
+
+-- @case: sqlite_query_window_filter_agg
+-- @dialects: postgresql,sqlite,duckdb
+-- @units: sql=;,sql=;,sql=;
+CREATE TABLE seed_sq_win (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+-- @unit
+INSERT INTO seed_sq_win VALUES (1, 'a', 10), (2, 'a', -5), (3, 'b', 20);
+-- @unit
+SELECT grp,
+       count(*) FILTER (WHERE val > 0) AS pos_cnt,
+       sum(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum
+FROM seed_sq_win
+GROUP BY grp, id, val
+ORDER BY id;
