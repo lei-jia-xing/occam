@@ -51,7 +51,7 @@ BEGIN FOOBAR;
 -- @units: sql=;
 SAVEPOINT seed_invalid_sp;
 
--- Join & locking & DDL tightening negatives (Phase 2b)
+-- Join, locking, and DDL negative cases
 -- @case: invalid_natural_join_on
 -- @dialects: postgresql,mysql,mariadb,sqlite,duckdb,clickhouse
 -- @units: sql=;

@@ -8,9 +8,6 @@ module Occam.Reducer.Statement (
     cutRemovedStatementInts,
     cutRemovedStatements,
     statementSQL,
-    StatementSnapshot (..),
-    buildStatementSnapshot,
-    renderSingletonDeletion,
     partitionChunks,
     partitionStatementsByBytes,
     partitionStatementsByWeights,
@@ -95,46 +92,6 @@ cutRemovedStatementInts baseSQL allStatements keptInts =
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
     cutRemovedStatementInts baseSQL allStatements (statementIdsInt keptStatements)
-
--- | Indexed singleton deletion boundaries for a statement snapshot.
-data StatementSnapshot = StatementSnapshot
-    { snapSQL :: !ByteString
-    , snapOffsets :: !(IntMap.IntMap (Int, Int))
-    }
-
-buildStatementSnapshot ::
-    ByteString -> [Statement] -> IntSet.IntSet -> ByteString -> StatementSnapshot
-buildStatementSnapshot baseSQL allStatements keptInts currentSQL =
-    let !sourceLength = BS.length baseSQL
-        !firstStart = case allStatements of
-            s : _ -> spanStartByte (stmtSpan s)
-            [] -> 0
-        computeSpans [] = []
-        computeSpans (s : rest) =
-            let Span start _ = stmtSpan s
-                nextStart = case rest of
-                    n : _ -> spanStartByte (stmtSpan n)
-                    [] -> sourceLength
-             in (s, nextStart - start) : computeSpans rest
-
-        spans = computeSpans allStatements
-
-        buildOffsets [] !m !_ = m
-        buildOffsets ((s, len) : rest) !m !off
-            | IntSet.member (unStatementId (stmtId s)) keptInts =
-                let !m' = IntMap.insert (unStatementId (stmtId s)) (off, len) m
-                 in buildOffsets rest m' (off + len)
-            | otherwise = buildOffsets rest m off
-
-        !offsets = buildOffsets spans IntMap.empty firstStart
-     in StatementSnapshot currentSQL offsets
-
-renderSingletonDeletion :: StatementSnapshot -> Statement -> Maybe ByteString
-renderSingletonDeletion StatementSnapshot {..} stmt =
-    case IntMap.lookup (unStatementId (stmtId stmt)) snapOffsets of
-        Nothing -> Nothing
-        Just (!off, !len) ->
-            Just (BS.take off snapSQL <> BS.drop (off + len) snapSQL)
 
 -- | Split a list into at most n approximately equal, contiguous chunks.
 partitionChunks :: Int -> [a] -> [[a]]

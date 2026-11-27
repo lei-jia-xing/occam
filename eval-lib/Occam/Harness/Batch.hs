@@ -121,22 +121,33 @@ data BatchSummary = BatchSummary
     }
     deriving (Eq, Show)
 
+data ManagedContainer = ManagedContainer
+    { mcName :: !Text
+    , mcHostLog :: !(Maybe FilePath)
+    }
+
+data WorkerBackend
+    = BackendLocalEmbedded !(Maybe FilePath)
+    | BackendExternal !ExternalContainer
+    | BackendManaged !(Maybe ManagedContainer)
+
+data WorkerEndpointSpec = WorkerEndpointSpec
+    { wesContainer :: !(Maybe Text)
+    , wesHostLog :: !(Maybe FilePath)
+    , wesHost :: !(Maybe Text)
+    , wesPort :: !(Maybe Int)
+    , wesDbName :: !(Maybe Text)
+    }
+
 data WorkerState = WorkerState
     { wsWorkerId :: !Int
     , wsRunTag :: !Text
     , wsOutDir :: !FilePath
-    , wsExternal :: !(Maybe ExternalContainer)
-    , wsLocalEmbedded :: !Bool
-    , wsEngineBin :: !(Maybe FilePath)
     , wsContainerWait :: !Int
     , wsCurrentDbms :: !(Maybe DbmsKind)
     , wsCurrentImage :: !(Maybe Text)
-    , wsContainerName :: !(Maybe Text)
-    , wsManagedContainer :: !(Maybe Text)
-    , wsHostLogFile :: !(Maybe FilePath)
-    , wsHost :: !Text
-    , wsPort :: !(Maybe Int)
-    , wsDbName :: !(Maybe Text)
+    , wsBackend :: !WorkerBackend
+    , wsEndpoint :: !(Maybe WorkerEndpointSpec)
     }
 
 data WorkerHandle = WorkerHandle
@@ -197,7 +208,7 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
     stopRef <- newIORef False
     sigNumRef <- newIORef Nothing
     spawnedRef <- newMVar Set.empty
-    workerExRef <- newIORef (0 :: Int)
+    workerErrsRef <- newIORef []
     withSignalHandlers stopRef sigNumRef $
         finally
             ( do
@@ -214,7 +225,7 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
                                 (pbpCases plan)
                         else pure Map.empty
                 let missingCases = filter (\bc -> Map.notMember (batchCaseId bc) priorQuals) (pbpCases plan)
-                runWorkerPool stopRef workers workerExRef missingCases \wh bc ->
+                runWorkerPool stopRef workers workerErrsRef missingCases \wh bc ->
                     qualifyCaseOnWorker wh opts plan bc
                 stopped1 <- readIORef stopRef
                 qualsMap <-
@@ -258,14 +269,15 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
                             then selectReusableJobs outDir (planRerunFailed pOpts) jobChecks
                             else pure Set.empty
                     let pendingJobs = filter (\(j, _, _) -> Set.notMember (jobId j) reusableIds) jobItems
-                    runWorkerPool stopRef workers workerExRef pendingJobs \wh (j, bc, cfgHash) ->
+                    runWorkerPool stopRef workers workerErrsRef pendingJobs \wh (j, bc, cfgHash) ->
                         runJobOnWorker wh opts plan occamBin harnessBin bc j cfgHash (qualLookup (batchCaseId bc))
             )
             (cleanupSpawnedContainers spawnedRef)
 
     interrupted <- readIORef stopRef
     mSig <- readIORef sigNumRef
-    workerExCount <- readIORef workerExRef
+    workerErrs <- reverse <$> readIORef workerErrsRef
+    let workerExCount = length workerErrs
     agg <- aggregateOutDir outDir
     let code
             | interrupted = 128 + fromMaybe 2 mSig
@@ -279,6 +291,7 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
                 , "interrupted" .= interrupted
                 , "signal" .= mSig
                 , "worker_exceptions" .= workerExCount
+                , "worker_errors" .= workerErrs
                 ]
     pure (BatchSummary code payload)
     where
@@ -330,23 +343,20 @@ initWorkers cfg opts plan runTag stopRef spawnedRef = do
         externals = pbpExternalContainers plan
     forM [0 .. nWorkers - 1] \wid -> do
         let mExt = if wid < length externals then Just (externals !! wid) else Nothing
+            backend
+                | planLocalEmbedded pOpts = BackendLocalEmbedded (boEngineBin opts)
+                | Just ext <- mExt = BackendExternal ext
+                | otherwise = BackendManaged Nothing
             st =
                 WorkerState
                     { wsWorkerId = wid
                     , wsRunTag = runTag
                     , wsOutDir = outDir
-                    , wsExternal = mExt
-                    , wsLocalEmbedded = planLocalEmbedded pOpts
-                    , wsEngineBin = boEngineBin opts
                     , wsContainerWait = workContainerWait settings
                     , wsCurrentDbms = Nothing
                     , wsCurrentImage = Nothing
-                    , wsContainerName = Nothing
-                    , wsManagedContainer = Nothing
-                    , wsHostLogFile = Nothing
-                    , wsHost = ""
-                    , wsPort = Nothing
-                    , wsDbName = Nothing
+                    , wsBackend = backend
+                    , wsEndpoint = Nothing
                     }
         mv <- newMVar st
         pure (WorkerHandle mv spawnedRef cfg stopRef)
@@ -354,12 +364,12 @@ initWorkers cfg opts plan runTag stopRef spawnedRef = do
 runWorkerPool ::
     IORef Bool ->
     [WorkerHandle] ->
-    IORef Int ->
+    IORef [Text] ->
     [a] ->
     (WorkerHandle -> a -> IO ()) ->
     IO ()
 runWorkerPool _ _ _ [] _ = pure ()
-runWorkerPool stopRef workers exRef items action = do
+runWorkerPool stopRef workers errsRef items action = do
     queue <- newMVar items
     dones <- forM workers \wh -> do
         done <- newEmptyMVar
@@ -381,7 +391,7 @@ runWorkerPool stopRef workers exRef items action = do
                             action wh item
                             loop wh queue
         onWorkerErr :: SomeException -> IO ()
-        onWorkerErr _ = atomicModifyIORef' exRef (\n -> (n + 1, ()))
+        onWorkerErr exc = atomicModifyIORef' errsRef (\es -> (T.pack (show exc) : es, ()))
 
 qualifyCaseOnWorker :: WorkerHandle -> BatchOptions -> PreparedBatchPlan -> BatchCase -> IO ()
 qualifyCaseOnWorker wh opts plan bc = do
@@ -751,58 +761,56 @@ runJobOnWorker wh opts plan occamBin harnessBin bc j@(Job _ prof repetition) cfg
 ensureWorkerTarget :: WorkerHandle -> Bool -> DbmsKind -> DbmsSpec -> Text -> IO ()
 ensureWorkerTarget wh forceRecreate dbmsKind dbmsSpec image =
     modifyMVar_ (whState wh) \st ->
-        if wsLocalEmbedded st
-            then do
-                let eBin = wsEngineBin st
+        case wsBackend st of
+            BackendLocalEmbedded _ ->
                 pure $
                     st
                         { wsCurrentDbms = Just dbmsKind
                         , wsCurrentImage = Just "local-embedded"
-                        , wsContainerName = Nothing
-                        , wsHostLogFile = Nothing
-                        , wsEngineBin = eBin
+                        , wsEndpoint = Nothing
                         }
-            else case wsExternal st of
-                Just (ExternalContainer cname host mPort) -> do
-                    effPort <-
-                        if dbmsServerBased dbmsSpec
-                            then case mPort of
-                                Just p -> pure (Just p)
-                                Nothing -> do
-                                    let defPort = defaultPortFor dbmsKind dbmsSpec
-                                    pResolved <- resolveDockerPort cname defPort
-                                    pure (Just (fromMaybe defPort pResolved))
-                            else pure Nothing
-                    let effHost = if dbmsServerBased dbmsSpec then host else ""
-                        needWait = forceRecreate || wsCurrentDbms st /= Just dbmsKind
-                        nextSt =
-                            st
-                                { wsCurrentDbms = Just dbmsKind
-                                , wsCurrentImage = Just "external"
-                                , wsContainerName = Just cname
-                                , wsHost = effHost
-                                , wsPort = effPort
-                                , wsDbName = if dbmsServerBased dbmsSpec then Just "occam_test" else Nothing
-                                , wsHostLogFile = Nothing
-                                }
-                    when needWait $ do
-                        eReady <- resetStateEndpoint (whHarnessConfig wh) dbmsKind nextSt (wsContainerWait st)
-                        case eReady of
-                            Left err -> fail err
-                            Right () -> pure ()
-                    pure nextSt
-                Nothing
-                    | not forceRecreate
-                        && isJust (wsManagedContainer st)
-                        && wsCurrentDbms st == Just dbmsKind
-                        && wsCurrentImage st == Just image ->
-                        pure st
-                    | otherwise -> spawnManagedContainer wh st dbmsKind dbmsSpec image
+            BackendExternal (ExternalContainer cname host mPort) -> do
+                effPort <-
+                    if dbmsServerBased dbmsSpec
+                        then case mPort of
+                            Just p -> pure (Just p)
+                            Nothing -> do
+                                let defPort = defaultPortFor dbmsKind dbmsSpec
+                                pResolved <- resolveDockerPort cname defPort
+                                pure (Just (fromMaybe defPort pResolved))
+                        else pure Nothing
+                let needWait = forceRecreate || wsCurrentDbms st /= Just dbmsKind
+                    ep =
+                        WorkerEndpointSpec
+                            { wesContainer = Just cname
+                            , wesHostLog = Nothing
+                            , wesHost = if dbmsServerBased dbmsSpec then Just host else Nothing
+                            , wesPort = effPort
+                            , wesDbName = if dbmsServerBased dbmsSpec then Just "occam_test" else Nothing
+                            }
+                    nextSt =
+                        st
+                            { wsCurrentDbms = Just dbmsKind
+                            , wsCurrentImage = Just "external"
+                            , wsEndpoint = Just ep
+                            }
+                when needWait $ do
+                    eReady <- resetStateEndpoint (whHarnessConfig wh) dbmsKind nextSt (wsContainerWait st)
+                    case eReady of
+                        Left err -> fail err
+                        Right () -> pure ()
+                pure nextSt
+            BackendManaged (Just _)
+                | not forceRecreate
+                    && wsCurrentDbms st == Just dbmsKind
+                    && wsCurrentImage st == Just image ->
+                    pure st
+            BackendManaged _ -> spawnManagedContainer wh st dbmsKind dbmsSpec image
 
 spawnManagedContainer ::
     WorkerHandle -> WorkerState -> DbmsKind -> DbmsSpec -> Text -> IO WorkerState
 spawnManagedContainer wh st0 dbmsKind dbmsSpec image = do
-    cleanupManaged st0 (whSpawned wh)
+    cleanupManaged (wsBackend st0) (whSpawned wh)
     let cname = "occam-eval-" <> wsRunTag st0 <> "-w" <> T.pack (show (wsWorkerId st0))
         (contLogDir, logFileName) = containerLogDirAndFile dbmsKind
         hostLogDir = wsOutDir st0 </> "workers" </> ("worker_" <> show (wsWorkerId st0)) </> "logs"
@@ -836,21 +844,26 @@ spawnManagedContainer wh st0 dbmsKind dbmsSpec image = do
         if dbmsServerBased dbmsSpec
             then Just <$> waitForPort cname defPort
             else pure Nothing
-    let nextSt =
+    let managed = ManagedContainer {mcName = cname, mcHostLog = hostLogPath}
+        ep =
+            WorkerEndpointSpec
+                { wesContainer = Just cname
+                , wesHostLog = hostLogPath
+                , wesHost = if dbmsServerBased dbmsSpec then Just "127.0.0.1" else Nothing
+                , wesPort = effPort
+                , wesDbName = if dbmsServerBased dbmsSpec then Just "occam_test" else Nothing
+                }
+        nextSt =
             st0
                 { wsCurrentDbms = Just dbmsKind
                 , wsCurrentImage = Just image
-                , wsContainerName = Just cname
-                , wsManagedContainer = Just cname
-                , wsHostLogFile = hostLogPath
-                , wsHost = if dbmsServerBased dbmsSpec then "127.0.0.1" else ""
-                , wsPort = effPort
-                , wsDbName = if dbmsServerBased dbmsSpec then Just "occam_test" else Nothing
+                , wsBackend = BackendManaged (Just managed)
+                , wsEndpoint = Just ep
                 }
     eReady <- resetStateEndpoint (whHarnessConfig wh) dbmsKind nextSt (wsContainerWait st0)
     case eReady of
         Left err -> do
-            cleanupManaged nextSt (whSpawned wh)
+            cleanupManaged (wsBackend nextSt) (whSpawned wh)
             fail err
         Right () -> pure nextSt
     where
@@ -867,11 +880,11 @@ spawnManagedContainer wh st0 dbmsKind dbmsSpec image = do
                                 threadDelay 200_000
                                 go (n + 1)
 
-        cleanupManaged st spawnedMv = case wsManagedContainer st of
-            Nothing -> pure ()
-            Just oldCname -> do
-                _ <- runProcessCapture Nothing Nothing (Just 20.0) "docker" ["rm", "-f", T.unpack oldCname] BS.empty
-                modifyMVar_ spawnedMv (pure . Set.delete oldCname)
+        cleanupManaged (BackendManaged (Just managed)) spawnedMv = do
+            let oldCname = mcName managed
+            _ <- runProcessCapture Nothing Nothing (Just 20.0) "docker" ["rm", "-f", T.unpack oldCname] BS.empty
+            modifyMVar_ spawnedMv (pure . Set.delete oldCname)
+        cleanupManaged _ _ = pure ()
 
 cleanupSpawnedContainers :: MVar (Set Text) -> IO ()
 cleanupSpawnedContainers spawnedMv = do
@@ -901,24 +914,25 @@ resolveDockerPort cname cport = do
                 (_, portTxt) = T.breakOnEnd ":" firstLine
             pure (readMaybe (T.unpack portTxt))
 
+connectionOverridesForState :: WorkerState -> ConnectionOverrides
+connectionOverridesForState st = case wsBackend st of
+    BackendLocalEmbedded mEngBin ->
+        emptyConnectionOverrides {coEngineBin = mEngBin}
+    _ ->
+        let mEp = wsEndpoint st
+         in emptyConnectionOverrides
+                { coHost = mEp >>= wesHost
+                , coPort = mEp >>= wesPort
+                , coDbName = mEp >>= wesDbName
+                , coContainer = mEp >>= wesContainer
+                }
+
 workerEndpoint :: WorkerHandle -> DbmsKind -> IO (Either String ReplayEndpoint)
 workerEndpoint wh _dbmsKind = withMVar (whState wh) \st -> do
-    mHostLog <- case wsHostLogFile st of
+    mHostLog <- case wsEndpoint st >>= wesHostLog of
         Just p -> doesFileExist p >>= \ok -> pure (if ok then Just p else Nothing)
         Nothing -> pure Nothing
-    let cov =
-            ConnectionOverrides
-                { coHost = if T.null (wsHost st) then Nothing else Just (wsHost st)
-                , coPort = wsPort st
-                , coUser = Nothing
-                , coPassword = Nothing
-                , coDbName = wsDbName st
-                , coTemplateDb = Nothing
-                , coSocket = Nothing
-                , coContainer = wsContainerName st
-                , coEngineBin = wsEngineBin st
-                }
-    pure (Right (ReplayEndpoint cov mHostLog Nothing))
+    pure (Right (ReplayEndpoint (connectionOverridesForState st) mHostLog Nothing))
 
 resetWorker :: WorkerHandle -> DbmsKind -> IO (Either String ())
 resetWorker wh dbmsKind = do
@@ -926,32 +940,29 @@ resetWorker wh dbmsKind = do
     eRes <- resetStateEndpoint (whHarnessConfig wh) dbmsKind st0 (wsContainerWait st0)
     case eRes of
         Right () -> pure (Right ())
-        Left err ->
-            if wsLocalEmbedded st0 || isJust (wsExternal st0)
-                then pure (Left err)
-                else case wsCurrentImage st0 of
-                    Nothing -> pure (Left err)
-                    Just img -> do
-                        let specFallback =
-                                fromMaybe
-                                    DbmsSpec
-                                        { dbmsId = dbmsKindName dbmsKind
-                                        , dbmsOccamDialect = dbmsKindName dbmsKind
-                                        , dbmsSqlancerSubcommand = Nothing
-                                        , dbmsSqlancerPort = Nothing
-                                        , dbmsSquirrelDb = Nothing
-                                        , dbmsContainerImage = img
-                                        , dbmsContainerLog = Nothing
-                                        , dbmsServerBased = isServerDbmsKind dbmsKind
-                                        , dbmsDefaultHost = Nothing
-                                        , dbmsDefaultPort = Nothing
-                                        , dbmsDefaultUser = Nothing
-                                        , dbmsDefaultDb = "occam_test"
-                                        }
-                                    (lookupDbmsSpec (whHarnessConfig wh) (dbmsKindName dbmsKind))
-                        ensureWorkerTarget wh True dbmsKind specFallback img
-                        st1 <- withMVar (whState wh) pure
-                        resetStateEndpoint (whHarnessConfig wh) dbmsKind st1 (wsContainerWait st1)
+        Left err -> case (wsBackend st0, wsCurrentImage st0) of
+            (BackendManaged _, Just img) -> do
+                let specFallback =
+                        fromMaybe
+                            DbmsSpec
+                                { dbmsId = dbmsKindName dbmsKind
+                                , dbmsOccamDialect = dbmsKindName dbmsKind
+                                , dbmsSqlancerSubcommand = Nothing
+                                , dbmsSqlancerPort = Nothing
+                                , dbmsSquirrelDb = Nothing
+                                , dbmsContainerImage = img
+                                , dbmsContainerLog = Nothing
+                                , dbmsServerBased = isServerDbmsKind dbmsKind
+                                , dbmsDefaultHost = Nothing
+                                , dbmsDefaultPort = Nothing
+                                , dbmsDefaultUser = Nothing
+                                , dbmsDefaultDb = "occam_test"
+                                }
+                            (lookupDbmsSpec (whHarnessConfig wh) (dbmsKindName dbmsKind))
+                ensureWorkerTarget wh True dbmsKind specFallback img
+                st1 <- withMVar (whState wh) pure
+                resetStateEndpoint (whHarnessConfig wh) dbmsKind st1 (wsContainerWait st1)
+            _ -> pure (Left err)
 
 defaultPortFor :: DbmsKind -> DbmsSpec -> Int
 defaultPortFor dbmsKind dbmsSpec = fromMaybe fallback (dbmsDefaultPort dbmsSpec)
@@ -964,20 +975,8 @@ defaultPortFor dbmsKind dbmsSpec = fromMaybe fallback (dbmsDefaultPort dbmsSpec)
             _ -> 0
 
 resetStateEndpoint :: HarnessConfig -> DbmsKind -> WorkerState -> Int -> IO (Either String ())
-resetStateEndpoint hc dbmsKind st maxWait = do
-    let cov =
-            ConnectionOverrides
-                { coHost = if T.null (wsHost st) then Nothing else Just (wsHost st)
-                , coPort = wsPort st
-                , coUser = Nothing
-                , coPassword = Nothing
-                , coDbName = wsDbName st
-                , coTemplateDb = Nothing
-                , coSocket = Nothing
-                , coContainer = wsContainerName st
-                , coEngineBin = wsEngineBin st
-                }
-    resetDb hc (ResetOptions dbmsKind cov maxWait)
+resetStateEndpoint hc dbmsKind st maxWait =
+    resetDb hc (ResetOptions dbmsKind (connectionOverridesForState st) maxWait)
 
 containerLogDirAndFile :: DbmsKind -> (FilePath, FilePath)
 containerLogDirAndFile dbms =

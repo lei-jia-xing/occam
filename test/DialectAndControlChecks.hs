@@ -1,7 +1,7 @@
 module DialectAndControlChecks (
-    phase3Tests,
-    phase7Tests,
-    phase8Tests,
+    hierarchicalReducerTests,
+    dialectProfileTests,
+    statementControlTests,
 ) where
 
 import Data.ByteString (ByteString)
@@ -47,10 +47,10 @@ withGraph dialect source action = do
         Left err -> assertFailure ("SQL parser transport error: " ++ show err)
         Right parsed -> action (analyzeStatements (parsedInitialSession parsed) (parsedUnits parsed))
 
-phase3Tests :: TestTree
-phase3Tests =
+hierarchicalReducerTests :: TestTree
+hierarchicalReducerTests =
     testGroup
-        "Phase 3: Hierarchical Reducer"
+        "Hierarchical Slicing & Closure Reduction"
         [ testCase "Closure validity checking" $ do
             let script =
                     BSC.unlines
@@ -100,8 +100,8 @@ phase3Tests =
             assertBool "Missing required WHERE a > 0" (BSC.isInfixOf "WHERE a > 0" reduced)
         ]
 
-phase7Tests :: TestTree
-phase7Tests =
+dialectProfileTests :: TestTree
+dialectProfileTests =
     testGroup
         "Selected frontend dialects"
         ( map (\dialect -> check dialect "SELECT 1" "SELECT 2") [minBound .. maxBound]
@@ -153,8 +153,8 @@ phase7Tests =
                         assertEqual "statement text and boundaries" [first, second] (map (stmtRaw . unitStatement) units)
                         assertEqual "parse errors" [] (mapMaybe unitParseError units)
 
-phase8Tests :: TestTree
-phase8Tests =
+statementControlTests :: TestTree
+statementControlTests =
     testGroup
         "Internal statement controls"
         [ testCase "statement deletion removes dead statements and satisfies oracle" $

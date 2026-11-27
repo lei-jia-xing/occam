@@ -24,8 +24,8 @@ import System.Directory (
     removeDirectoryRecursive,
  )
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
+import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath (joinPath, splitDirectories, takeDirectory, (</>))
-import System.Posix.Files (setFileMode)
 import System.Posix.Temp (mkdtemp)
 import System.Process (
     CreateProcess (..),
@@ -714,8 +714,15 @@ cleanEnv mockDir extras = do
 writeMock :: FilePath -> String -> String -> IO FilePath
 writeMock dir name body = do
     let path = dir </> name
-    writeFile path ("#!/bin/sh\nset -e\n" <> body)
-    setFileMode path 0o755
+        script = "#!/bin/sh\nset -e\n" <> body
+    -- Write in a single-threaded child process so concurrent Haskell fork()
+    -- calls never inherit an O_WRONLY descriptor to this script (Linux ETXTBSY).
+    (ec, _out, err) <-
+        readCreateProcessWithExitCode
+            (proc "/bin/sh" ["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "write-mock", path])
+            script
+    when (ec /= ExitSuccess) $
+        assertFailure ("Failed to write mock executable " <> path <> ": " <> err)
     pure path
 
 runHarness :: FilePath -> [String] -> BS.ByteString -> [(String, String)] -> IO (Int, Text, Text)

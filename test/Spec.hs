@@ -47,7 +47,7 @@ tests :: TestTree -> TestTree -> TestTree -> TestTree
 tests frontendSeedTests syntaxAlignmentTests semanticAlignmentTests =
     testGroup
         "Occam Test Suite"
-        [ DialectAndControlChecks.phase3Tests
+        [ DialectAndControlChecks.hierarchicalReducerTests
         , FrontendChecks.tests
         , FrontendColumnsChecks.tests
         , FrontendCorpusChecks.tests
@@ -61,8 +61,8 @@ tests frontendSeedTests syntaxAlignmentTests semanticAlignmentTests =
         , semanticAlignmentTests
         , CliChecks.tests
         , CacheChecks.tests
-        , DialectAndControlChecks.phase7Tests
-        , DialectAndControlChecks.phase8Tests
+        , DialectAndControlChecks.dialectProfileTests
+        , DialectAndControlChecks.statementControlTests
         , DependencyChecks.tests
         , EvaluationChecks.tests
         , OracleChecks.tests

@@ -14,19 +14,20 @@ import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
-import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.Maybe (fromMaybe)
+import Data.Maybe (listToMaybe)
 import Occam.Certificate (
     EarlyRejectCertifier,
     EarlyRejectTracker,
     checkEarlyRejectionBytesTracked,
-    checkEarlyRejectionIdsTracked,
     newEarlyRejectTracker,
+    prepareDeletionCertificateCheck,
  )
 import Occam.Core (
+    EarlyRejectReason,
     OracleOutcome (..),
     ResultTrace,
+    Span (spanStartByte),
     Statement (..),
     StatementId (..),
     oracleAccepts,
@@ -42,13 +43,7 @@ import Occam.Pool (
     reportCandidateCount,
     testOrderedGenerated,
  )
-import Occam.Reducer.Statement (
-    StatementSnapshot (..),
-    buildStatementSnapshot,
-    cutRemovedStatementInts,
-    renderSingletonDeletion,
-    statementIdsInt,
- )
+import Occam.Reducer.Statement (statementIdsInt)
 import Occam.Reducer.Support (
     StatementParser,
     buildCertifierTracked,
@@ -83,10 +78,14 @@ statementAuditWithParser logger parse pool initialSQL = do
 data AuditEnv = AuditEnv
     { auditTracker :: !EarlyRejectTracker
     , auditCert :: !EarlyRejectCertifier
+    , auditCheckDeletion :: !(Int -> IntSet.IntSet -> IO (Maybe EarlyRejectReason))
     , auditPool :: !OraclePool
-    , auditBaseSQL :: !ByteString
-    , auditAllStatements :: ![Statement]
+    , auditFirstOffset :: !Int
+    , auditExtents :: ![StatementExtent]
     }
+
+-- | Statement ID and byte length through the next statement start or EOF.
+data StatementExtent = StatementExtent !Int !Int
 
 type PrevDeletion = Maybe (Int, Int, ByteString)
 
@@ -111,87 +110,106 @@ statementAuditWithCert earlyReject tracker mTrace logger parse pool initialSQL =
         runConfirmedAudit = do
             (_, units) <- parse initialSQL
             let statements = map unitStatement units
+                start = spanStartByte . stmtSpan
+                firstOffset = maybe 0 start (listToMaybe statements)
+                ends = map start (drop 1 statements) ++ [BS.length initialSQL]
+                extents =
+                    zipWith
+                        (\stmt end -> StatementExtent (unStatementId (stmtId stmt)) (end - start stmt))
+                        statements
+                        ends
                 !initialKept = statementIdsInt statements
                 !initialCount = length statements
             cert <- buildCertifierTracked earlyReject tracker initialSQL units mTrace
-            let env = AuditEnv tracker cert pool initialSQL statements
-            auditLoop env initialKept initialCount 0 0 0
+            checkDeletion <- prepareDeletionCertificateCheck tracker cert initialKept
+            let env = AuditEnv tracker cert checkDeletion pool firstOffset extents
+            auditLoop env initialSQL initialKept initialCount 0 0 0
 
--- The audit only removes whole statements, and those statements keep
--- their original byte spans. Parse once, then track the retained set.
+-- The audit preserves the extent lengths of retained statements. Each pass
+-- walks those extents in source order, starting after the original preamble.
 auditLoop ::
-    AuditEnv -> IntSet.IntSet -> Int -> Int -> Int -> Int -> IO (ByteString, AuditStats)
-auditLoop env kept !keptCount passCount attemptCount removalCount
+    AuditEnv -> ByteString -> IntSet.IntSet -> Int -> Int -> Int -> Int -> IO (ByteString, AuditStats)
+auditLoop env sql kept !keptCount passCount attemptCount removalCount
     | keptCount <= 0 || IntSet.null kept =
-        pure (renderAuditKept env kept, AuditStats passCount attemptCount removalCount True)
+        pure (sql, AuditStats passCount attemptCount removalCount True)
     | otherwise = do
-        (nextKept, nextKeptCount, attempts, removals) <- runAuditPass env kept keptCount
+        (nextSQL, nextKept, nextKeptCount, attempts, removals) <- runAuditPass env sql kept keptCount
         let nextPassCount = passCount + 1
             totalAttempts = attemptCount + attempts
         if removals > 0
-            then auditLoop env nextKept nextKeptCount nextPassCount totalAttempts (removalCount + removals)
-            else pure (renderAuditKept env nextKept, AuditStats nextPassCount totalAttempts removalCount True)
+            then
+                auditLoop env nextSQL nextKept nextKeptCount nextPassCount totalAttempts (removalCount + removals)
+            else pure (nextSQL, AuditStats nextPassCount totalAttempts removalCount True)
 
-runAuditPass :: AuditEnv -> IntSet.IntSet -> Int -> IO (IntSet.IntSet, Int, Int, Int)
-runAuditPass env kept keptCount =
-    go initSnap kept keptCount (auditAllStatements env) 0 0
+runAuditPass ::
+    AuditEnv -> ByteString -> IntSet.IntSet -> Int -> IO (ByteString, IntSet.IntSet, Int, Int, Int)
+runAuditPass env sql kept keptCount =
+    go sql kept keptCount (auditFirstOffset env) (auditExtents env) 0 0
     where
-        !initSnap =
-            buildStatementSnapshot (auditBaseSQL env) (auditAllStatements env) kept (renderAuditKept env kept)
-        retire (!tested, _) (sid, rest) bytes (outcome, _) =
-            pure (tested + 1, if outcome == OracleAccepted then Just (sid, rest, bytes) else Nothing)
-        go snap currentKept !currentCount statements !attempts !removals = do
+        retire (!tested, _) (sid, offset, rest) bytes (outcome, _) =
+            pure (tested + 1, if outcome == OracleAccepted then Just (sid, offset, rest, bytes) else Nothing)
+        go currentSQL currentKept !currentCount !offset extents !attempts !removals = do
             (tested, accepted) <-
                 testOrderedGenerated
                     (auditPool env)
-                    (nextAuditCandidate env snap currentKept (currentCount - 1))
+                    (nextAuditCandidate env currentSQL currentKept (currentCount - 1))
                     retire
                     (0, Nothing)
-                    (Nothing, statements)
+                    (Nothing, offset, extents)
             case accepted of
-                Nothing -> pure (currentKept, currentCount, attempts + tested, removals)
-                Just (sid, rest, bytes) -> do
-                    let nextKept = IntSet.delete sid currentKept
-                        nextSnap = buildStatementSnapshot (auditBaseSQL env) (auditAllStatements env) nextKept bytes
-                    go nextSnap nextKept (currentCount - 1) rest (attempts + tested) (removals + 1)
+                Nothing -> pure (currentSQL, currentKept, currentCount, attempts + tested, removals)
+                Just (sid, deletedOffset, rest, bytes) ->
+                    -- The next extent moves to the start of the removed bytes.
+                    go
+                        bytes
+                        (IntSet.delete sid currentKept)
+                        (currentCount - 1)
+                        deletedOffset
+                        rest
+                        (attempts + tested)
+                        (removals + 1)
 
 nextAuditCandidate ::
     AuditEnv ->
-    StatementSnapshot ->
+    ByteString ->
     IntSet.IntSet ->
     Int ->
-    (PrevDeletion, [Statement]) ->
-    IO (Maybe ((FamilyTag, ByteString, (Int, [Statement])), (PrevDeletion, [Statement])))
-nextAuditCandidate _ _ _ _ (_, []) = pure Nothing
-nextAuditCandidate env snap currentKept count (previous, statement : rest)
-    | IntSet.notMember sid currentKept = nextAuditCandidate env snap currentKept count (previous, rest)
+    (PrevDeletion, Int, [StatementExtent]) ->
+    IO
+        ( Maybe
+            ((FamilyTag, ByteString, (Int, Int, [StatementExtent])), (PrevDeletion, Int, [StatementExtent]))
+        )
+nextAuditCandidate _ _ _ _ (_, _, []) = pure Nothing
+nextAuditCandidate env sql currentKept count (previous, !offset, StatementExtent sid len : rest)
+    | IntSet.notMember sid currentKept =
+        nextAuditCandidate env sql currentKept count (previous, offset, rest)
     | otherwise = do
-        (nextLast, candidate) <- evaluateAuditCandidate env snap currentKept statement sid previous
+        (nextLast, candidate) <- evaluateAuditCandidate env sql currentKept sid offset len previous
+        let next = (nextLast, offset + len, rest)
         case candidate of
-            Nothing -> nextAuditCandidate env snap currentKept count (nextLast, rest)
+            Nothing -> nextAuditCandidate env sql currentKept count next
             Just bytes -> do
                 reportCandidateCount (auditPool env) bytes count
-                pure (Just ((TagStatement, bytes, (sid, rest)), (nextLast, rest)))
-    where
-        sid = unStatementId (stmtId statement)
+                pure (Just ((TagStatement, bytes, (sid, offset, rest)), next))
 
 evaluateAuditCandidate ::
     AuditEnv ->
-    StatementSnapshot ->
+    ByteString ->
     IntSet.IntSet ->
-    Statement ->
+    Int ->
+    Int ->
     Int ->
     PrevDeletion ->
     IO (PrevDeletion, Maybe ByteString)
-evaluateAuditCandidate env snap currentKept statement sid previous = evalContT do
+evaluateAuditCandidate env sql currentKept sid offset len previous = evalContT do
     let store = poolMetricsStore (auditPool env)
         keptAfter = IntSet.delete sid currentKept
-    earlyId <- liftIO $ checkEarlyRejectionIdsTracked (auditTracker env) (auditCert env) keptAfter
+    earlyId <- liftIO $ auditCheckDeletion env sid keptAfter
     for_ earlyId \reason -> do
         liftIO $ recordEarlyRejectSkip store reason
         earlyExit (previous, Nothing)
-    (bytes, nextLast) <- liftIO $ renderAuditCandidate env snap statement sid keptAfter previous
-    when (BS.length bytes >= BS.length (snapSQL snap)) do
+    (bytes, nextLast) <- liftIO $ renderAuditCandidate env sql offset len previous
+    when (BS.length bytes >= BS.length sql) do
         liftIO $ recordGeneratedSkipped store "nonshrinking"
         earlyExit (nextLast, Nothing)
     earlyBytes <-
@@ -203,29 +221,24 @@ evaluateAuditCandidate env snap currentKept statement sid previous = evalContT d
 
 renderAuditCandidate ::
     AuditEnv ->
-    StatementSnapshot ->
-    Statement ->
+    ByteString ->
     Int ->
-    IntSet.IntSet ->
+    Int ->
     PrevDeletion ->
     IO (ByteString, PrevDeletion)
-renderAuditCandidate env snap statement sid keptAfter previous =
-    case (previous, IntMap.lookup sid (snapOffsets snap)) of
-        (Just (prevOff, prevLen, bytes), Just (off, len))
+renderAuditCandidate env sql off len previous =
+    case previous of
+        Just (prevOff, prevLen, bytes)
             | off == prevOff + prevLen
             , len == prevLen
             , deletedBytes off len == deletedBytes prevOff prevLen ->
                 pure (bytes, Just (off, len, bytes))
-        (_, extent) -> do
-            let fallback = renderAuditKept env keptAfter
-                raw = fromMaybe fallback (renderSingletonDeletion snap statement)
+        _ -> do
+            let raw = BS.take off sql <> BS.drop (off + len) sql
             bytes <- timeStatementBuild (poolMetricsStore (auditPool env)) raw
-            pure (bytes, fmap (\(off, len) -> (off, len, bytes)) extent)
+            pure (bytes, Just (off, len, bytes))
     where
-        deletedBytes off len = BS.take len (BS.drop off (snapSQL snap))
-
-renderAuditKept :: AuditEnv -> IntSet.IntSet -> ByteString
-renderAuditKept env = cutRemovedStatementInts (auditBaseSQL env) (auditAllStatements env)
+        deletedBytes start size = BS.take size (BS.drop start sql)
 
 logAuditStats :: Logger -> AuditStats -> IO ()
 logAuditStats logger stats =

@@ -113,7 +113,7 @@ ORDER BY 1 NULLS LAST;
 SELECT 1 AS one, 'héllo' AS label
 ORDER BY one;
 
--- Extended DDL & analytics coverage (Phase 2b ledger)
+-- Extended DDL & analytics coverage
 -- @case: pg_ddl_statistics
 -- @dialects: postgresql
 -- @units: sql=;,sql=;

@@ -19,6 +19,7 @@ module Occam.Certificate (
     readEarlyRejectStats,
     recordEarlyRejectBuildNanos,
     checkEarlyRejectionIdsTracked,
+    prepareDeletionCertificateCheck,
     checkEarlyRejectionBytesTracked,
     checkEarlyRejectionSyntaxEditTracked,
 ) where
@@ -180,9 +181,7 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
         uniqueDefiners = IntMap.foldlWithKey' addUniqueDefiners IntMap.empty missingDefReqs
         addUniqueDefiners acc sid = Foldable.foldl' (addUniqueDefiner sid) acc
         addUniqueDefiner sid m req
-            | Just (defSid, rest) <- IntSet.minView req
-            , IntSet.null rest
-            , defSid /= sid =
+            | Just defSid <- uniqueDefiner sid req =
                 IntMap.insertWith IntSet.union defSid (IntSet.singleton sid) m
             | otherwise = m
 
@@ -254,39 +253,59 @@ isAsciiWhitespace = BS.all isWsByte
         isWsByte :: Word8 -> Bool
         isWsByte b = b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d
 
+uniqueDefiner :: Int -> IntSet -> Maybe Int
+uniqueDefiner sid req
+    | not (IntSet.null req)
+    , let !definer = IntSet.findMin req
+    , definer /= sid
+    , IntSet.findMax req == definer =
+        Just definer
+    | otherwise = Nothing
+
 -- | Fast certificate check over retained statement IDs before rendering SQL bytes.
 checkEarlyRejectionIds :: EarlyRejectCertifier -> IntSet -> Maybe EarlyRejectReason
-checkEarlyRejectionIds cert keptInts
+checkEarlyRejectionIds cert kept =
+    checkEarlyRejectionIdsWith
+        cert
+        kept
+        (kept `IntSet.isSubsetOf` certGuaranteedNonResult cert)
+        (hasMissingDefinition cert kept)
+
+checkEarlyRejectionIdsWith ::
+    EarlyRejectCertifier -> IntSet -> Bool -> Bool -> Maybe EarlyRejectReason
+checkEarlyRejectionIdsWith cert kept noResult missingDefinition
     | not (certEnabled cert) = Nothing
     | certContiguousIds cert
-    , not (IntSet.null keptInts)
-    , IntSet.findMin keptInts == 1
-    , let !prefixLen = IntSet.size keptInts
-    , IntSet.findMax keptInts == prefixLen
-    , IntSet.member prefixLen (certExactPrefixLengths cert) =
+    , not (IntSet.null (certExactPrefixLengths cert))
+    , not (IntSet.null kept)
+    , let !prefixLen = IntSet.findMax kept
+    , IntSet.member prefixLen (certExactPrefixLengths cert)
+    , IntSet.findMin kept == 1
+    , IntSet.size kept == prefixLen =
         Just EarlyRejectExactPrefix
-    | certNonResultReady cert
-    , keptInts `IntSet.isSubsetOf` certGuaranteedNonResult cert =
+    | certNonResultReady cert && noResult =
         Just EarlyRejectNoResultStatement
-    | not (IntMap.null (certMissingDefReqs cert))
-    , hasMissingDefinition cert keptInts =
+    | missingDefinition =
         Just EarlyRejectMissingDefinition
     | otherwise = Nothing
+
+hasMissingDefinition :: EarlyRejectCertifier -> IntSet -> Bool
+hasMissingDefinition cert kept
+    | IntMap.null requirements = False
+    | otherwise = anyMissingUniqueDef || IntSet.foldr checkSid False kept
     where
-        hasMissingDefinition c kept =
-            anyMissingUniqueDef || IntSet.foldr checkSid False kept
-            where
-                anyMissingUniqueDef =
-                    IntMap.foldrWithKey'
-                        ( \defSid dependents acc ->
-                            acc || (IntSet.notMember defSid kept && not (IntSet.disjoint kept dependents))
-                        )
-                        False
-                        (certUniqueDefiners c)
-                checkSid sid rest =
-                    case IntMap.lookup sid (certMissingDefReqs c) of
-                        Nothing -> rest
-                        Just reqs -> any (IntSet.disjoint kept) reqs || rest
+        requirements = certMissingDefReqs cert
+        anyMissingUniqueDef =
+            IntMap.foldrWithKey
+                ( \defSid dependents rest ->
+                    (IntSet.notMember defSid kept && not (IntSet.disjoint kept dependents)) || rest
+                )
+                False
+                (certUniqueDefiners cert)
+        checkSid sid rest =
+            case IntMap.lookup sid requirements of
+                Nothing -> rest
+                Just reqs -> any (IntSet.disjoint kept) reqs || rest
 
 -- | Byte-exact prefix certificate check against engine-verified prefix slices.
 checkEarlyRejectionBytes :: EarlyRejectCertifier -> ByteString -> Maybe EarlyRejectReason
@@ -325,11 +344,73 @@ checkEarlyRejection cert keptInts candidateSQL =
 
 checkEarlyRejectionIdsTracked ::
     EarlyRejectTracker -> EarlyRejectCertifier -> IntSet -> IO (Maybe EarlyRejectReason)
-checkEarlyRejectionIdsTracked tracker cert keptInts
+checkEarlyRejectionIdsTracked tracker cert kept =
+    trackIdCheck tracker cert (checkEarlyRejectionIds cert kept)
+
+{- | Prepare the ID check for an audit that starts from the supplied set and
+only commits single deletions that pass the check. The arguments to the
+returned check are the removed ID and the retained set after the removal.
+-}
+prepareDeletionCertificateCheck ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
+    IntSet ->
+    IO (Int -> IntSet -> IO (Maybe EarlyRejectReason))
+prepareDeletionCertificateCheck tracker cert initialKept
+    | not (certEnabled cert) = pure (\_ _ -> pure Nothing)
+    | otherwise = do
+        t0 <- getMonotonicTimeNSec
+        let !check = preparedCheck
+        t1 <- getMonotonicTimeNSec
+        recordEarlyRejectBuildNanos tracker (t1 - t0)
+        pure check
+    where
+        preparedCheck
+            | hasMissingDefinition cert initialKept = \_ -> checkEarlyRejectionIdsTracked tracker cert
+            | otherwise =
+                let !possibleResults = initialKept `IntSet.difference` certGuaranteedNonResult cert
+                    !alternatives = IntMap.foldlWithKey' addAlternatives IntMap.empty (certMissingDefReqs cert)
+                 in \removed kept ->
+                        trackIdCheck tracker cert $
+                            checkEarlyRejectionIdsWith
+                                cert
+                                kept
+                                (IntSet.disjoint kept possibleResults)
+                                (missingUniqueDef removed kept || missingAlternatives alternatives kept)
+
+        -- A satisfied singleton requirement can only become invalid when its
+        -- sole definer is removed and at least one dependent survives.
+        missingUniqueDef removed kept =
+            case IntMap.lookup removed (certUniqueDefiners cert) of
+                Nothing -> False
+                Just dependents -> not (IntSet.disjoint kept dependents)
+
+        addAlternatives byWitness sid = Foldable.foldl' addRequirement byWitness
+            where
+                addRequirement index req
+                    | IntSet.null req || isJust (uniqueDefiner sid req) = index
+                    | otherwise = IntMap.insertWith (++) (IntSet.findMax req) [(sid, req)] index
+
+        -- A retained witness satisfies every requirement in its group.
+        -- When it is absent, check the full set of alternative definers.
+        missingAlternatives alternatives kept =
+            IntMap.foldr
+                (\reqs rest -> any missingRequirement reqs || rest)
+                False
+                (IntMap.withoutKeys alternatives kept)
+            where
+                missingRequirement (sid, req) = IntSet.member sid kept && IntSet.disjoint kept req
+
+trackIdCheck ::
+    EarlyRejectTracker ->
+    EarlyRejectCertifier ->
+    Maybe EarlyRejectReason ->
+    IO (Maybe EarlyRejectReason)
+trackIdCheck tracker cert result
     | not (certEnabled cert) = pure Nothing
     | otherwise = do
         t0 <- getMonotonicTimeNSec
-        let !res = checkEarlyRejectionIds cert keptInts
+        let !res = result
         t1 <- getMonotonicTimeNSec
         recordCheck (trackerStatsRef tracker) True res (t1 - t0)
         pure res

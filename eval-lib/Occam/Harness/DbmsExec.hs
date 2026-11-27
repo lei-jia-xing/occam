@@ -19,7 +19,7 @@ module Occam.Harness.DbmsExec (
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay, tryTakeMVar)
-import Control.Exception.Safe (IOException, bracketOnError, catch, finally, try)
+import Control.Exception.Safe (IOException, bracketOnError, catch, finally, throwIO, try)
 import Data.ByteString qualified as BS
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit, isSpace)
 import Data.Foldable qualified as Foldable
@@ -32,6 +32,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
 import Data.Time (addUTCTime, getCurrentTime)
+import GHC.IO.Exception (IOErrorType (ResourceBusy))
 import Occam.Harness.Config (DbmsSpec (..), HarnessConfig, lookupDbmsSpec)
 import Occam.Harness.Signature (DbmsKind (..), dbmsKindName)
 import System.Directory (
@@ -44,7 +45,8 @@ import System.Directory qualified as Dir
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (isPathSeparator, joinPath, splitDirectories, takeDirectory, (</>))
-import System.IO (hClose)
+import System.IO (Handle, hClose)
+import System.IO.Error (ioeGetErrorType)
 import System.Posix.Signals (sigKILL, sigTERM, signalProcess, signalProcessGroup)
 import System.Process (
     CreateProcess (..),
@@ -582,7 +584,7 @@ runProcessCaptureCancellable ::
     IO (Bool, Bool, Int, BS.ByteString, BS.ByteString)
 runProcessCaptureCancellable createNewGroup mStopRef mCwd mEnv mTimeout cmd args inputBytes =
     bracketOnError
-        ( createProcess
+        ( createProcessRetryBusy
             (proc cmd args)
                 { std_in = CreatePipe
                 , std_out = CreatePipe
@@ -596,6 +598,20 @@ runProcessCaptureCancellable createNewGroup mStopRef mCwd mEnv mTimeout cmd args
         cleanupHandles
         runWithHandles
     where
+        createProcessRetryBusy ::
+            CreateProcess -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+        createProcessRetryBusy cp = go (5 :: Int)
+            where
+                go remaining = do
+                    res <- try (createProcess cp)
+                    case res of
+                        Right handles -> pure handles
+                        Left (exc :: IOException)
+                            | remaining > 0 && ioeGetErrorType exc == ResourceBusy -> do
+                                threadDelay 5000
+                                go (remaining - 1)
+                            | otherwise -> throwIO exc
+
         cleanupHandles (mIn, mOut, mErr, ph) = do
             mapM_ closeQuiet [mIn, mOut, mErr]
             reapProcess ph `catch` ignoreIo

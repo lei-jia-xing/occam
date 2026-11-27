@@ -919,34 +919,62 @@ waitForReadableFile path waitSecs = do
                             threadDelay logPollIntervalMicros
                             go start
 
+data LogCursor = LogCursor
+    { lcStat :: !(IO (Maybe (Integer, Integer)))
+    , lcReadSlice :: !(Integer -> Integer -> IO (Maybe Text))
+    , lcReadExtra :: !(IO Text)
+    }
+
+pollLogCursor ::
+    LogCursor -> Integer -> Maybe Integer -> Text -> IO (Bool, Integer, Maybe Integer, Text, Text)
+pollLogCursor cursor curOff curInode accFile = do
+    mState <- lcStat cursor
+    case mState of
+        Nothing -> combine False curOff curInode accFile
+        Just (curSize, inodeNow) -> do
+            let offset0 = if maybe False (/= inodeNow) curInode || curSize < curOff then 0 else curOff
+            (okFile, nextOff, nextFile) <-
+                if curSize <= offset0
+                    then pure (True, offset0, accFile)
+                    else do
+                        let start = max offset0 (curSize - maxLogReadBytes)
+                        mChunk <- lcReadSlice cursor start (curSize - start)
+                        pure $ case mChunk of
+                            Nothing -> (False, offset0, accFile)
+                            Just chunk -> (True, curSize, tailText maxTotalLogChars (accFile <> chunk))
+            combine okFile nextOff (Just inodeNow) nextFile
+    where
+        combine ok off mInode nextFile = do
+            extra <- lcReadExtra cursor
+            let combined =
+                    tailText maxTotalLogChars $
+                        if T.null extra
+                            then nextFile
+                            else if T.null nextFile then extra else nextFile <> "\n" <> extra
+            pure (ok, off, mInode, combined, nextFile)
+
 pollFileReader ::
     FilePath -> Integer -> Maybe Integer -> Text -> IO (Bool, Integer, Maybe Integer, Text, Text)
-pollFileReader path curOff curInode accFile = do
-    res <- try (getFileStatus path) :: IO (Either IOException FileStatus)
-    case res of
-        Left _ -> pure (False, curOff, curInode, accFile, accFile)
-        Right st -> do
-            let curSize = fromIntegral (fileSize st)
-                inodeNow = fromIntegral (fileID st)
-                offset0 = if maybe False (/= inodeNow) curInode || curSize < curOff then 0 else curOff
-            if curSize <= offset0
-                then pure (True, offset0, Just inodeNow, accFile, accFile)
-                else do
-                    let start = max offset0 (curSize - maxLogReadBytes)
-                        toRead = fromIntegral (curSize - start)
-                    readRes <-
-                        try
-                            ( withBinaryFile path ReadMode \h -> do
-                                hSeek h AbsoluteSeek start
-                                bytes <- BS.hGet h toRead
-                                pure (TE.decodeUtf8With TEE.lenientDecode bytes)
-                            ) ::
-                            IO (Either IOException Text)
-                    case readRes of
-                        Left _ -> pure (False, offset0, Just inodeNow, accFile, accFile)
-                        Right chunk ->
-                            let acc' = tailText maxTotalLogChars (accFile <> chunk)
-                             in pure (True, curSize, Just inodeNow, acc', acc')
+pollFileReader path =
+    pollLogCursor
+        LogCursor
+            { lcStat = do
+                res <- try (getFileStatus path) :: IO (Either IOException FileStatus)
+                pure $ case res of
+                    Left _ -> Nothing
+                    Right st -> Just (fromIntegral (fileSize st), fromIntegral (fileID st))
+            , lcReadSlice = \start count -> do
+                res <-
+                    try
+                        ( withBinaryFile path ReadMode \h -> do
+                            hSeek h AbsoluteSeek start
+                            bytes <- BS.hGet h (fromIntegral count)
+                            pure (TE.decodeUtf8With TEE.lenientDecode bytes)
+                        ) ::
+                        IO (Either IOException Text)
+                pure (either (const Nothing) Just res)
+            , lcReadExtra = pure ""
+            }
 
 getContainerLogState :: Text -> FilePath -> IO (Maybe (Integer, Integer))
 getContainerLogState cname internalLog = do
@@ -976,39 +1004,27 @@ pollContainerReader ::
     Maybe Integer ->
     Text ->
     IO (Bool, Integer, Maybe Integer, Text, Text)
-pollContainerReader cname internalLog sinceIso curOff curInode accFile = do
-    mState <- getContainerLogState cname internalLog
-    case mState of
-        Nothing -> pure (False, curOff, curInode, accFile, accFile)
-        Just (curSize, inodeNow) -> do
-            let offset0 = if maybe False (/= inodeNow) curInode || curSize < curOff then 0 else curOff
-            (okFile, nextFile) <-
-                if curSize <= offset0
-                    then pure (True, accFile)
-                    else do
-                        let start = max offset0 (curSize - maxLogReadBytes)
-                        res <-
-                            try
-                                ( runProcessCapture
-                                    Nothing
-                                    Nothing
-                                    (Just 5.0)
-                                    "docker"
-                                    ["exec", T.unpack cname, "tail", "-c", "+" <> show (start + 1), internalLog]
-                                    BS.empty
-                                ) ::
-                                IO (Either IOException (Bool, Int, BS.ByteString, BS.ByteString))
-                        pure $ case res of
-                            Right (False, 0, outBs, _) ->
-                                (True, tailText maxTotalLogChars (accFile <> TE.decodeUtf8With TEE.lenientDecode outBs))
-                            _ -> (False, accFile)
-            stdoutLog <- readContainerStdoutLogs cname sinceIso
-            let combined =
-                    tailText maxTotalLogChars $
-                        if T.null stdoutLog
-                            then nextFile
-                            else if T.null nextFile then stdoutLog else nextFile <> "\n" <> stdoutLog
-            pure (okFile, curSize, Just inodeNow, combined, nextFile)
+pollContainerReader cname internalLog sinceIso =
+    pollLogCursor
+        LogCursor
+            { lcStat = getContainerLogState cname internalLog
+            , lcReadSlice = \start _ -> do
+                res <-
+                    try
+                        ( runProcessCapture
+                            Nothing
+                            Nothing
+                            (Just 5.0)
+                            "docker"
+                            ["exec", T.unpack cname, "tail", "-c", "+" <> show (start + 1), internalLog]
+                            BS.empty
+                        ) ::
+                        IO (Either IOException (Bool, Int, BS.ByteString, BS.ByteString))
+                pure $ case res of
+                    Right (False, 0, outBs, _) -> Just (TE.decodeUtf8With TEE.lenientDecode outBs)
+                    _ -> Nothing
+            , lcReadExtra = readContainerStdoutLogs cname sinceIso
+            }
 
 readContainerStdoutLogs :: Text -> Text -> IO Text
 readContainerStdoutLogs cname sinceIso = do

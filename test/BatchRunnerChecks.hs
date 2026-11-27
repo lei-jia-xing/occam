@@ -39,7 +39,6 @@ import System.Directory (
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Posix.Files (setFileMode)
 import System.Posix.Signals (sigINT, signalProcess)
 import System.Posix.Temp (mkdtemp)
 import System.Process (
@@ -100,8 +99,14 @@ writeExec :: FilePath -> FilePath -> String -> IO FilePath
 writeExec dir name body = do
     createDirectoryIfMissing True dir
     let path = dir </> name
-    writeFile path body
-    setFileMode path 0o755
+    -- Write in a single-threaded child process so concurrent Haskell fork()
+    -- calls never inherit an O_WRONLY descriptor to this script (Linux ETXTBSY).
+    (ec, _out, err) <-
+        readCreateProcessWithExitCode
+            (proc "/bin/sh" ["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "write-exec", path])
+            body
+    when (ec /= ExitSuccess) $
+        assertFailure ("Failed to write mock executable " <> path <> ": " <> err)
     pure path
 
 isolatedEnvWithBin :: FilePath -> IO [(String, String)]
@@ -163,7 +168,8 @@ overviewOf ctx val =
 
 readAggregatedStats :: FilePath -> IO (Object, Int, Int, Int)
 readAggregatedStats outDir = do
-    agg <- asObject "aggregated_stats.json" =<< readJsonFile (outDir </> "aggregated_stats.json")
+    let aggPath = outDir </> "aggregated_stats.json"
+    agg <- asObject "aggregated_stats.json" =<< readJsonFile aggPath
     ov <-
         maybe (assertFailure "missing overview in aggregated_stats.json") pure (getObjField "overview" agg)
     byProf <-
@@ -498,8 +504,8 @@ testReplayApiAndCancel = withTempDir "occam-replay-api" \td -> do
     writeFile modeFile "consistent"
     removeIfExists callCount
     rvCons <- runReplayVerification cfg Nothing (mkCfg engDrift Nothing) 3 "SELECT 1;"
-    assertEqual "allPassed" True (rvAllPassed rvCons)
-    assertEqual "consistentSignature" True (rvConsistentSignature rvCons)
+    assertEqual ("allPassed: " <> show rvCons) True (rvAllPassed rvCons)
+    assertEqual ("consistentSignature: " <> show rvCons) True (rvConsistentSignature rvCons)
     assertEqual "no baseline -> matchesBaseline Nothing" Nothing (rvMatchesBaseline rvCons)
     baseSigId <- case rvBaselineSignature rvCons of
         Just s -> pure (csId s)
@@ -509,7 +515,7 @@ testReplayApiAndCancel = withTempDir "occam-replay-api" \td -> do
     writeFile modeFile "drift"
     removeIfExists callCount
     rvDrift <- runReplayVerification cfg Nothing (mkCfg engDrift (Just baseSigId)) 2 "SELECT 1;"
-    assertEqual "drift still passes crashes" True (rvAllPassed rvDrift)
+    assertEqual ("drift still passes crashes: " <> show rvDrift) True (rvAllPassed rvDrift)
     assertEqual "drift consistentSignature False" False (rvConsistentSignature rvDrift)
     assertEqual "drift matchesBaseline Just False" (Just False) (rvMatchesBaseline rvDrift)
     assertEqual "drift slippage count 1" 1 (rvSlippageCount rvDrift)
@@ -828,7 +834,7 @@ testBatchExternalContainers = withTempDir "occam-batch-ext" \td -> do
     assertEqual ("external batch failed: " <> outStr <> errStr) ExitSuccess ec
     assertRunCounts "external" outDir summary 2 2 0 0
 
-    dockerCalls <- lines <$> readFile dockerLog
+    dockerCalls <- lines <$> readStrictText dockerLog
     assertBool ("unexpected docker run in external mode: " <> unlines dockerCalls) $
         not (any (\l -> "run " `isInfixOf` (" " <> l) && take 4 l == "run ") dockerCalls)
     assertBool ("unexpected docker rm in external mode: " <> unlines dockerCalls) $

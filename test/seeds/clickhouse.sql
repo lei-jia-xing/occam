@@ -98,7 +98,7 @@ SELECT 'héllo' AS label,
 FROM numbers(1)
 ORDER BY n;
 
--- Extended ClickHouse coverage (Phase 2b ledger)
+-- Extended ClickHouse coverage
 -- @case: clickhouse_typed_path_cast
 -- @dialects: clickhouse
 -- @units: sql=;,sql=;

@@ -5,12 +5,17 @@ import Data.Aeson (Value (..))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
-import Data.Maybe (isJust)
+import Data.List (subsequences)
+import Data.Maybe (isJust, isNothing)
 import Occam.Certificate (
     EarlyRejectCertifier (..),
     buildEarlyRejectCertifier,
     checkEarlyRejection,
+    checkEarlyRejectionIds,
+    newEarlyRejectTracker,
+    prepareDeletionCertificateCheck,
  )
 import Occam.Core (
     EarlyRejectReason (..),
@@ -327,6 +332,36 @@ checks =
             assertBool
                 ("expected >= 30 DuckDB certified subsets validated, got " ++ show duckChecked)
                 (duckChecked >= 30)
+    , testCase "Indexed audit checks agree with full certificates after single deletions" $ do
+        let sql =
+                BSC.unlines
+                    [ "CREATE TABLE t(x INT);"
+                    , "CREATE TABLE IF NOT EXISTS t(x INT);"
+                    , "CREATE TABLE u(x INT);"
+                    , "INSERT INTO t VALUES (1);"
+                    , "INSERT INTO u VALUES (2);"
+                    , "SELECT t.x + u.x AS answer FROM t CROSS JOIN u;"
+                    ]
+        (_, trace) <- generateSqliteContractWithTrace 500000 sql >>= either (assertFailure . show) pure
+        parsed <- parseSQL (defaultParseOptions SQLite) sql >>= either (assertFailure . show) pure
+        tracker <- newEarlyRejectTracker
+        let cert = buildEarlyRejectCertifier sql (parsedUnits parsed) (Just trace)
+            ids = [1 .. 6]
+        check <- prepareDeletionCertificateCheck tracker cert (IntSet.fromList ids)
+        assertEqual
+            "two possible definitions of t"
+            (Just [IntSet.fromList [1, 2]])
+            (IntMap.lookup 4 (certMissingDefReqs cert))
+        assertBool "single definition of u is indexed" (IntMap.member 3 (certUniqueDefiners cert))
+        forM_ (map IntSet.fromList (subsequences ids)) $ \current ->
+            when (isNothing (checkEarlyRejectionIds cert current)) $
+                forM_ (IntSet.toList current) $ \removed -> do
+                    let kept = IntSet.delete removed current
+                    indexed <- check removed kept
+                    assertEqual
+                        ("after removing " <> show removed <> " from " <> show current)
+                        (checkEarlyRejectionIds cert kept)
+                        indexed
     , testCase "Early rejection preserves exact reduced SQL and cuts physical oracle calls on SQLite" $ do
         let inputRow i =
                 "INSERT INTO t VALUES ("

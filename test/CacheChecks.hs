@@ -33,7 +33,7 @@ import TestSupport (boolObservation, testCountingPool)
 tests :: TestTree
 tests =
     testGroup
-        "Phase 6: Candidate Memoization"
+        "Candidate Memoization & Epoch Invalidation"
         [ testCase "ordered pool caches repeated queries and tracks hits/misses" $ do
             callCountRef <- newIORef (0 :: Int)
             let mockOracle sql = do

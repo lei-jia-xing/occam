@@ -33,6 +33,7 @@ import Occam.Parser (
     parseSQL,
  )
 import Occam.Reducer (
+    AuditStats (..),
     ColumnMode (..),
     ReductionConfig (..),
     applyParserEdits,
@@ -42,6 +43,7 @@ import Occam.Reducer (
     reduceSQLWithConfig,
     selectIndependentEdits,
     statementAudit,
+    statementAuditWithLogger,
     statementDdmin,
  )
 import ReductionChecks.Support (countOrFail, jobsPool, outcomePool, predicatePool, syntaxOnly)
@@ -313,6 +315,47 @@ checks =
             firstStatement = BSC.pack "SELECT 11;\r\n"
         byteResult <- statementDdmin SQLite keepPool bytes
         assertEqual "retained source bytes, including CRLF, are unchanged" firstStatement byteResult
+    , testCase "Statement audit preserves probe bytes and order across accepted deletions" $ do
+        let preamble = TE.encodeUtf8 "-- café\r\n"
+            a = "SELECT 1; -- keep this separator with the first statement\r\n"
+            b = "SELECT 22;\n"
+            c = TE.encodeUtf8 "SELECT '雪';\r\n"
+            d = "SELECT 4444;\n\n"
+            e = "SELECT 5; -- end"
+            script = (preamble <>) . BS.concat
+            initial = script [a, b, c, d, e]
+            afterB = script [a, c, d, e]
+            afterD = script [a, c, e]
+            final = script [c, e]
+            onlyC = script [c]
+            onlyE = script [e]
+        probes <- newIORef []
+        pool <- outcomePool $ \candidate -> do
+            modifyIORef' probes (candidate :)
+            pure (if candidate `elem` [initial, afterB, afterD, final] then OracleAccepted else OracleRejected)
+        (reduced, stats) <- statementAuditWithLogger nullLogger SQLite pool initial
+        assertEqual "reduced SQL" final reduced
+        assertEqual
+            "passes, attempts, and removals"
+            (3, 10, 3)
+            (auditPasses stats, auditAttempts stats, auditRemovals stats)
+        assertBool "minimality confirmed" (auditMinimalityConfirmed stats)
+        attempted <- reverse <$> readIORef probes
+        assertEqual
+            "oracle probes in retirement order"
+            [ initial
+            , script [b, c, d, e]
+            , afterB
+            , script [a, d, e]
+            , afterD
+            , script [a, c]
+            , final
+            , onlyE
+            , onlyC
+            , onlyE
+            , onlyC
+            ]
+            attempted
     , testCase "statement audit distinguishes identical statements with different trailing comments" $ do
         let kept = "SELECT 1; -- A\n"
             input = kept <> "SELECT 1; -- B\n"

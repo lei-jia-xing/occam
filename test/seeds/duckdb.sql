@@ -78,7 +78,7 @@ FROM seed_duck_quotes AS q
 ASOF RIGHT JOIN seed_duck_trades AS t ON q.ts >= t.ts
 ORDER BY q.ts;
 
--- Extended DDL, DML, utility, and grouping coverage (Phase 2b ledger)
+-- Extended DDL, DML, utility, and grouping coverage
 -- @case: duckdb_ddl_create_or_replace
 -- @dialects: duckdb
 -- @units: sql=;,sql=;

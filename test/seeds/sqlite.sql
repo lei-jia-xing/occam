@@ -97,7 +97,7 @@ FROM (SELECT 1 AS [id]);
 SELECT "id" AS "naïve", 'It''s fine' AS quoted, x'00ff' AS blob_value
 FROM (SELECT 1 AS "id");
 
--- Extended DDL, utility, transaction, and window/filter coverage (Phase 2b ledger)
+-- Extended DDL, utility, transaction, and window/filter coverage
 -- @case: sqlite_utility_pragma_attach_vacuum
 -- @dialects: sqlite
 -- @units: sql=;,sql=;,sql=;,sql=;
