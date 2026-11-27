@@ -75,17 +75,13 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for process-group reaping, budg
 
 ## Building & Testing
 
-`nix develop` provides GHC, Cabal, Rust/Cargo, Fourmolu, HLint, HLS, Clippy, and Python 3. Run `make hooks` once per checkout to install the pre-commit hook.
+`nix develop` provides GHC, Cabal, Fourmolu, HLint, HLS, Lean (`elan`), DuckDB, and Python 3. Occam has a 100% pure-Haskell SQL frontend with zero FFI/Cargo/C-toolchain dependencies for SQL parsing. Run `make hooks` once per checkout to install the pre-commit hook.
 
 ```bash
-make build        # Build Rust FFI + Haskell binary
-make test         # Run Haskell + Rust test suites (-Werror)
-make check        # Full gate: fmt, hlint, build, tests, clippy, harness tests, Lean 4 proofs
+make build        # Build Haskell library and occam binary
+make test         # Run Haskell test & fuzz suites (-Werror)
+make check        # Full gate: fmt, hlint, build, tests, harness tests, Lean 4 proofs
 ```
-
-- **Dev builds** (`cabal build` / `make build`) dynamically link the Rust `sqlparser-ffi` cdylib via an rpath configured by `Setup.hs`. After editing Rust, run `make build` (bare `cabal build` skips Cargo when Haskell sources are unchanged).
-- **Release builds** use `-f static-rust` for a single self-contained binary (Windows is static-only).
-- Source distributions bundle the Rust crate and `Cargo.lock` for standalone builds.
 
 ---
 
@@ -95,7 +91,7 @@ make check        # Full gate: fmt, hlint, build, tests, clippy, harness tests, 
 | :--- | :--- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline, dependency fences, ordered scheduler, oracle/process contract, `stats.json`, verification boundaries |
 | [docs/DIALECTS.md](docs/DIALECTS.md) | 6 supported SQL dialects, modeled dependency effects, and explicit opaque boundaries |
-| [docs/UPSTREAM_TRACKER.md](docs/UPSTREAM_TRACKER.md) | Upstream `sqlparser-rs` gaps, workarounds, and local patching workflow |
+| [docs/FRONTEND_GRAMMAR.md](docs/FRONTEND_GRAMMAR.md) | Pure-Haskell strict SQL frontend module map, dialect dispatch, grammar coverage, and seed corpus |
 | [benchmarks/README.md](benchmarks/README.md) | 4-tier benchmark suite, flame graphs, and search/result baseline scripts |
 | [benchmarks/real_fuzz_corpus/README.md](benchmarks/real_fuzz_corpus/README.md) | 71 multi-statement real DBMS crash cases across 6 DBMS targets |
 | [harness/README.md](harness/README.md) | Crash oracle, target DBMS containers, fuzzer drivers, and batch evaluation |

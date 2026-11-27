@@ -10,7 +10,7 @@ This document describes Occam's reduction pipeline, execution scheduler, externa
 SQL input
   │
   ▼
-Rust sqlparser-rs FFI (statement boundaries, dependency facts, optional exact-span edit IR)
+Pure-Haskell Strict Frontend (lexer, statement splitter, dialect LL(k)/Pratt parser, semantic facts, exact-span edits & column IR)
   │
   ▼
 Haskell Dependency Analysis (schema generations, scopes, transaction snapshots, fences)
@@ -25,12 +25,13 @@ Ordered Bounded-Window Scheduler (cache + single-flight + process-group hygiene)
 External Predicate (--oracle / --reset)  OR  In-Process Result Oracle (SQLite / DuckDB)
 ```
 
-### Rust Frontend (`rust/sqlparser-ffi`)
+### Pure-Haskell Strict Frontend (`src/Occam/Frontend`, `src/Occam/Parser.hs`)
 
-- Pins `sqlparser-rs` `0.64.0` with an explicit target dialect (`--dialect`).
-- Emits statement byte boundaries and dialect-normalized dependency facts.
-- **Exact-span edits only**: byte edits are emitted only when an AST node has a complete, exact source range. Partial `Spanned` ranges are never treated as whole-node spans, and AST display text is never used to regenerate SQL. When a compound node lacks a complete range (e.g., certain unknown, window, NULL-treatment, or ODBC forms), Occam falls back to recursively verified child edits and statement-level deletion.
-- **Facts-only statement parses**: statement-level parses omit per-edit syntax IR entirely (no allocation, JSON serialization, or decoding) while returning identical statements, boundaries, and dependency facts. Syntax, column, clause-pruning, and expression-simplification passes opt into edit IR explicitly per call.
+- 100% native Haskell with zero FFI/Cargo/C-toolchain dependencies for SQL parsing, lexing, statement splitting, semantic fact extraction, exact-span edit generation, column IR assembly, and oracle-source proofs.
+- Dispatches explicitly on `--dialect` (`postgresql`, `mysql`, `mariadb`, `sqlite`, `duckdb`, `clickhouse`) via `DialectProfile` with zero generic fallback and zero cross-dialect grammar bleed. Client `DELIMITER` directives adjust splitting and are excluded from the SQL statement count.
+- **Decoupled statement boundaries & exact-span edits only**: statement splitting runs on the token stream before statement-level grammar parsing, so syntax errors in one unit never corrupt surrounding statement spans. Intra-statement edits carry typed priority tiers (`ClauseTier` / `ExprTier` via `EditTier`) and exact UTF-8 byte spans only—AST pretty-printing is never used to regenerate SQL.
+- **Selective pass execution**: statement-level parses omit intra-statement edit IR and column bundles while returning identical statement spans and dependency facts. Syntax, column, clause-pruning, and expression-simplification passes opt into edit/column IR explicitly per call.
+- The grammar target is each engine's latest stable release, with no version dimension; see [Frontend Grammar](FRONTEND_GRAMMAR.md) for the module map, span/trivia contract, per-dialect coverage, and seed corpus.
 
 ### Dependency Analysis (`src/Occam/Dependency.hs`)
 
@@ -64,7 +65,7 @@ All stages provide **local minimality guarantees**, not a global minimum.
 - When a launched candidate has already published a decisive result, the scheduler leaves later slots empty while it retires the earlier candidates in order.
 - Progress, curve, and checkpoint updates occur only at ordered retirement, and every window drains fully before reparse, phase transition, or serial final validation.
 - With caching enabled (default), duplicate candidate bytes single-flight onto one in-flight execution (`cache_joins`). Timeouts, errors, and cancellations are never cached and never converted into rejections.
-- Native SQLite and DuckDB result oracles can also share a key for ordinary whitespace variations of explicitly aliased literal SELECTs. The Rust lexer preserves the original token bytes, and the oracle receives the original candidate.
+- Native SQLite and DuckDB result oracles can also share a key for ordinary whitespace variations of explicitly aliased literal SELECTs. The Haskell lexer preserves the original token bytes, and the oracle receives the original candidate.
 
 ---
 

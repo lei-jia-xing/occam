@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-make fmt-check lint build-check rust-check
+make fmt-check lint build-check
 
 echo "==> [pre-commit] All checks passed!"

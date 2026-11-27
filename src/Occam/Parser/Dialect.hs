@@ -1,6 +1,4 @@
-{- | Extensible dialect capability model separating lexical rules, keyword tables,
-identifier folding, grammar capabilities, and session/catalog semantics.
--}
+-- | Dialect profiles: lexical rules, keywords, folding, features, and semantics.
 module Occam.Parser.Dialect (
     CaseFolding (..),
     applyCaseFolding,
@@ -41,6 +39,7 @@ data CaseFolding
     | FoldPreserve
     deriving (Eq, Ord, Show)
 
+-- | Apply a dialect's identifier folding.
 applyCaseFolding :: CaseFolding -> Text -> Text
 applyCaseFolding FoldLower = T.toLower
 applyCaseFolding FoldAsciiLower = T.map toAsciiLower
@@ -61,6 +60,9 @@ data LexicalProfile = LexicalProfile
     , lexEscapeStrings :: !Bool
     , lexBackslashEscapesInSingleQuote :: !Bool
     , lexDollarParameters :: !Bool
+    , lexNamedParameters :: !Bool
+    , lexNumberedQuestionParameters :: !Bool
+    , lexQuestionOperators :: !Bool
     , lexUserVariables :: !Bool
     , lexCompoundBlocks :: !Bool
     }
@@ -80,7 +82,6 @@ data DialectFeature
     | FeatureSelectIntoUserVar
     | FeatureReturningClause
     | FeatureIndexLengthPrefix
-    | FeatureQualifiedSequenceCalls
     | FeaturePragmas
     | FeatureCreateMacro
     | FeaturePivotUnpivot
@@ -98,6 +99,7 @@ data DialectFeature
     | FeatureVirtualTables
     | FeatureSequenceDDL
     | FeatureMaterializedViews
+    | FeatureDropMaterializedViews
     | FeaturePreparedStatements
     | FeatureColonCast
     deriving (Eq, Ord, Show, Enum, Bounded)
@@ -148,6 +150,7 @@ data DialectProfile = DialectProfile
     , dialectSemantics :: !SemanticsProfile
     }
 
+-- | Profiles in `--list-dialects` order.
 allDialectProfiles :: [DialectProfile]
 allDialectProfiles =
     [ postgresqlProfile
@@ -158,6 +161,7 @@ allDialectProfiles =
     , clickhouseProfile
     ]
 
+-- | Total lookup for the six supported dialects.
 dialectProfile :: SQLDialect -> DialectProfile
 dialectProfile PostgreSQL = postgresqlProfile
 dialectProfile MySQL = mysqlProfile
@@ -174,9 +178,11 @@ dialectAliasMap =
         , alias <- dialectCanonicalName p : dialectCliAliases p
         ]
 
+-- | Resolve a canonical name or CLI alias (case-insensitive).
 lookupDialectByName :: Text -> Maybe SQLDialect
 lookupDialectByName raw = Map.lookup (T.toLower raw) dialectAliasMap
 
+-- | Whether a dialect declares a grammar feature.
 dialectHasFeature :: SQLDialect -> DialectFeature -> Bool
 dialectHasFeature dialect feature =
     Set.member feature (dialectFeatures (dialectProfile dialect))
@@ -198,6 +204,9 @@ postgresqlProfile =
                 , lexEscapeStrings = True
                 , lexBackslashEscapesInSingleQuote = False
                 , lexDollarParameters = True
+                , lexNamedParameters = False
+                , lexNumberedQuestionParameters = False
+                , lexQuestionOperators = True
                 , lexUserVariables = False
                 , lexCompoundBlocks = True
                 }
@@ -227,7 +236,6 @@ postgresqlProfile =
             Set.fromList
                 [ FeatureSelectIntoCreatesTable
                 , FeatureReturningClause
-                , FeatureQualifiedSequenceCalls
                 , FeatureOnConflict
                 , FeatureMergeStatement
                 , FeatureCopyStatement
@@ -235,6 +243,7 @@ postgresqlProfile =
                 , FeatureAlterPartitionInherit
                 , FeatureSequenceDDL
                 , FeatureMaterializedViews
+                , FeatureDropMaterializedViews
                 , FeaturePreparedStatements
                 , FeatureColonCast
                 ]
@@ -265,6 +274,9 @@ mysqlSharedLexical =
         , lexEscapeStrings = False
         , lexBackslashEscapesInSingleQuote = True
         , lexDollarParameters = False
+        , lexNamedParameters = False
+        , lexNumberedQuestionParameters = False
+        , lexQuestionOperators = False
         , lexUserVariables = True
         , lexCompoundBlocks = True
         }
@@ -365,6 +377,9 @@ sqliteProfile =
                 , lexEscapeStrings = False
                 , lexBackslashEscapesInSingleQuote = False
                 , lexDollarParameters = True
+                , lexNamedParameters = True
+                , lexNumberedQuestionParameters = True
+                , lexQuestionOperators = False
                 , lexUserVariables = False
                 , lexCompoundBlocks = True
                 }
@@ -428,6 +443,9 @@ duckdbProfile =
                 , lexEscapeStrings = True
                 , lexBackslashEscapesInSingleQuote = False
                 , lexDollarParameters = True
+                , lexNamedParameters = False
+                , lexNumberedQuestionParameters = False
+                , lexQuestionOperators = False
                 , lexUserVariables = False
                 , lexCompoundBlocks = False
                 }
@@ -464,6 +482,7 @@ duckdbProfile =
                 , FeatureMergeStatement
                 , FeatureCopyStatement
                 , FeatureSequenceDDL
+                , FeaturePreparedStatements
                 , FeatureColonCast
                 ]
         , dialectSemantics =
@@ -498,6 +517,9 @@ clickhouseProfile =
                 , lexEscapeStrings = False
                 , lexBackslashEscapesInSingleQuote = True
                 , lexDollarParameters = False
+                , lexNamedParameters = False
+                , lexNumberedQuestionParameters = False
+                , lexQuestionOperators = False
                 , lexUserVariables = False
                 , lexCompoundBlocks = False
                 }
@@ -526,6 +548,7 @@ clickhouseProfile =
                 , FeatureEngineClause
                 , FeatureAttachDetach
                 , FeatureMaterializedViews
+                , FeatureQualifyClause
                 , FeatureColonCast
                 ]
         , dialectSemantics =

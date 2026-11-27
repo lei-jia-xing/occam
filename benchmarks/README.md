@@ -43,7 +43,7 @@ another SQLite input.
 
 **NOTE** GHC cost-centre instrumentation changes optimization and excludes time
 in safe foreign calls. Use the profile to locate Haskell work, the regular
-benchmark for timings, and native CPU sampling for SQLite and Rust.
+benchmark for timings, and native CPU sampling for SQLite/DuckDB C calls.
 [GHC profiling guide](https://ghc.gitlab.haskell.org/ghc/doc/users_guide/profiling.html)
 
 ### In-Process SQLite Evaluation (`Occam.Oracle.Sqlite`)

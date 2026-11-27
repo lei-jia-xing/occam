@@ -6,11 +6,21 @@ import CliChecks qualified
 import ColumnChecks qualified
 import DependencyChecks qualified
 import DialectAndControlChecks qualified
+import DialectFuzz qualified
 import DuckDBOracleChecks qualified
 import EvaluationChecks qualified
+import FrontendChecks qualified
+import FrontendColumnsChecks qualified
+import FrontendCorpusChecks qualified
+import FrontendEditsChecks qualified
+import FrontendFacadeChecks qualified
+import FrontendPipelineChecks qualified
+import FrontendSeedChecks qualified
+import FrontendSemanticsChecks qualified
 import Fuzz (generativeFuzzTests)
 import MutationalFuzz (mutationalFuzzTests)
 import OracleChecks qualified
+import ParserChecks qualified
 import PoolChecks qualified
 import PoolMetricsChecks qualified
 import PropertyChecks qualified
@@ -19,13 +29,24 @@ import SqliteOracleChecks qualified
 import Test.Tasty (TestTree, defaultMain, testGroup)
 
 main :: IO ()
-main = defaultMain tests
+main = do
+    frontendSeedTests <- FrontendSeedChecks.tests
+    defaultMain (tests frontendSeedTests)
 
-tests :: TestTree
-tests =
+tests :: TestTree -> TestTree
+tests frontendSeedTests =
     testGroup
         "Occam Test Suite"
         [ DialectAndControlChecks.phase3Tests
+        , FrontendChecks.tests
+        , FrontendColumnsChecks.tests
+        , FrontendCorpusChecks.tests
+        , FrontendEditsChecks.tests
+        , FrontendFacadeChecks.tests
+        , FrontendPipelineChecks.tests
+        , FrontendSemanticsChecks.tests
+        , ParserChecks.tests
+        , frontendSeedTests
         , CliChecks.tests
         , CacheChecks.tests
         , DialectAndControlChecks.phase7Tests
@@ -43,4 +64,5 @@ tests =
         , PropertyChecks.tests
         , generativeFuzzTests
         , mutationalFuzzTests
+        , DialectFuzz.tests
         ]

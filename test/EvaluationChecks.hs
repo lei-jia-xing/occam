@@ -40,7 +40,13 @@ import Occam.Oracle (
     prepareOracle,
     shellOracleConfig,
  )
-import Occam.Parser (SQLDialect (..), countStatements, dialectCode, dialectName)
+import Occam.Parser (
+    DialectProfile (..),
+    SQLDialect (..),
+    allDialectProfiles,
+    countStatements,
+    dialectName,
+ )
 import Occam.Pool (observationDetails, poolLiveWorkers, poolOracle, testOrdered, withPredicatePool)
 import Occam.Reducer (
     ReductionConfig (..),
@@ -447,7 +453,7 @@ tests =
             assertEqual "SQLite serialized using CLI spelling" "sqlite" (sqlDialectName SQLite)
             assertEqual "DuckDB serialized using CLI spelling" "duckdb" (sqlDialectName DuckDB)
             assertEqual "ClickHouse serialized using CLI spelling" "clickhouse" (sqlDialectName ClickHouse)
-        , testCase "all selected dialects round-trip name, parse, and code" $ do
+        , testCase "all selected dialects round-trip name, parse, and profile" $ do
             let dialects = [minBound .. maxBound] :: [SQLDialect]
             assertEqual "six active dialects" 6 (length dialects)
             mapM_
@@ -457,9 +463,12 @@ tests =
                     assertEqual ("parse round-trip " ++ show dialect) (Right dialect) (parseSQLDialect (T.unpack name))
                 )
                 dialects
-            assertEqual "distinct FFI codes 0..5" [0 .. 5] (sort (map dialectCode dialects))
+            assertEqual
+                "all dialect profiles registered uniquely"
+                dialects
+                (sort (map dialectId allDialectProfiles))
             counts <- mapM (`countStatements` "SELECT 1; SELECT 2;") dialects
-            assertEqual "every dialect counts two statements over FFI" (replicate 6 (Right 2)) counts
+            assertEqual "every dialect counts two statements" (replicate 6 (Right 2)) counts
         , testCase "speculative losers are cancelled without timeout or error inflation" $
             withSentinelPath $ \sentinel -> do
                 let acceptSQL = "SELECT 1;\n"

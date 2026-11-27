@@ -3,6 +3,9 @@ module Occam.Facts (
     StatementFacts (..),
     ParserEdit (..),
     ParserEditCategory (..),
+    ClauseTier (..),
+    ExprTier (..),
+    EditTier (..),
     ColumnSite (..),
     ColumnSiteKind (..),
     ColumnTarget (..),
@@ -10,11 +13,10 @@ module Occam.Facts (
     parseEditCategoryName,
 ) where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), withObject, withText, (.!=), (.:), (.:?))
+import Data.Aeson (FromJSON (..), ToJSON (..), withText)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import GHC.Generics (Generic)
 import Occam.Core (Ident (..), Name (..), SemanticFacts (..), Statement (..))
 
@@ -69,11 +71,32 @@ parseEditCategoryName "type" = Just EditType
 parseEditCategoryName "literal" = Just EditLiteral
 parseEditCategoryName _ = Nothing
 
+-- | Priority tier for clause-removal edits (lower constructors run first).
+data ClauseTier
+    = SafeClause
+    | StructuralClause
+    | FragileClause
+    deriving (Eq, Ord, Show, Generic)
+
+-- | Priority tier for expression-simplification edits (lower constructors run first).
+data ExprTier
+    = UnwrapExpr
+    | AggressiveExpr
+    deriving (Eq, Ord, Show, Generic)
+
+-- | Typed priority tier carried by 'ParserEdit' for bucket ordering without label matching.
+data EditTier
+    = TierDefault
+    | TierClause !ClauseTier
+    | TierExpr !ExprTier
+    deriving (Eq, Ord, Show, Generic)
+
 data ParserEdit = ParserEdit
     { parserEditStart :: !Int
     , parserEditEnd :: !Int
     , parserEditReplacement :: !ByteString
     , parserEditCategory :: !ParserEditCategory
+    , parserEditTier :: !EditTier
     , parserEditLabel :: !Text
     , parserEditTopProjection :: !Bool
     , parserEditStringLiteral :: !Bool
@@ -82,32 +105,11 @@ data ParserEdit = ParserEdit
     }
     deriving (Eq, Show)
 
-instance FromJSON ParserEdit where
-    parseJSON = withObject "ParserEdit" \objectValue ->
-        ParserEdit
-            <$> objectValue .: "start"
-            <*> objectValue .: "end"
-            <*> (TE.encodeUtf8 <$> objectValue .: "replacement")
-            <*> objectValue .: "category"
-            <*> objectValue .: "label"
-            <*> objectValue .:? "top_level_projection" .!= False
-            <*> objectValue .:? "string_literal" .!= False
-            <*> objectValue .:? "recursive_predicate" .!= False
-            <*> objectValue .:? "low_yield" .!= False
-
 data ColumnSiteKind
     = CreateDefSite
     | InsertListSite
     | ValuesItemSite
     deriving (Eq, Ord, Show, Generic)
-
-instance FromJSON ColumnSiteKind where
-    parseJSON = withText "ColumnSiteKind" \name ->
-        case name of
-            "create_def" -> pure CreateDefSite
-            "insert_list_item" -> pure InsertListSite
-            "values_item" -> pure ValuesItemSite
-            _ -> fail ("unknown column site kind: " <> T.unpack name)
 
 data ColumnSite = ColumnSite
     { siteStmt :: !Int
@@ -116,14 +118,6 @@ data ColumnSite = ColumnSite
     , siteKind :: !ColumnSiteKind
     }
     deriving (Eq, Show, Generic)
-
-instance FromJSON ColumnSite where
-    parseJSON = withObject "ColumnSite" \objectValue ->
-        ColumnSite
-            <$> objectValue .: "stmt"
-            <*> objectValue .: "start"
-            <*> objectValue .: "end"
-            <*> objectValue .: "kind"
 
 -- | Column co-reduction target with sites and optional blocking reason.
 data ColumnTarget = ColumnTarget
@@ -134,12 +128,3 @@ data ColumnTarget = ColumnTarget
     , targetBlocked :: !(Maybe Text)
     }
     deriving (Eq, Show, Generic)
-
-instance FromJSON ColumnTarget where
-    parseJSON = withObject "ColumnTarget" \objectValue ->
-        ColumnTarget
-            <$> objectValue .: "table"
-            <*> objectValue .: "column"
-            <*> objectValue .: "ordinal"
-            <*> objectValue .: "sites"
-            <*> objectValue .: "blocked"

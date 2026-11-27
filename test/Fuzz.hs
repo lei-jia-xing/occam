@@ -6,6 +6,7 @@ import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import DialectFuzz qualified
 import MutationalFuzz (mutationalFuzzTests)
 import Occam.Core (oracleAccepts)
 import Occam.Parser (SQLDialect (..))
@@ -569,6 +570,7 @@ fuzzTests =
         "Occam Fuzz Testing"
         [ generativeFuzzTests
         , mutationalFuzzTests
+        , DialectFuzz.tests
         ]
 main :: IO ()
 main = defaultMain fuzzTests

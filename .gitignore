@@ -4,7 +4,6 @@ dist-*
 cabal.project.local
 cabal.project.local~
 .ghc.environment.*
-rust/sqlparser-ffi/target/
 
 # GHC outputs
 *.o

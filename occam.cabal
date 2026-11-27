@@ -8,29 +8,15 @@ license-file:       LICENSE
 author:             Hunter
 maintainer:         leij49456@gmail.com
 category:           Development, Database, Testing
-build-type:         Custom
+build-type:         Simple
 extra-doc-files:    README.md
 data-files:         benchmarks/corpus/*.sql
 extra-source-files:
-    Setup.hs
-    rust/sqlparser-ffi/Cargo.toml
-    rust/sqlparser-ffi/Cargo.lock
-    rust/sqlparser-ffi/src/*.rs
+    test/seeds/*.sql
 source-repository head
     type:     git
     location: https://github.com/Hunter/occam
 
-custom-setup
-    setup-depends: base >= 4.18 && < 5
-                 , Cabal >= 3.12 && < 4
-                 , process >= 1.6 && < 1.7
-                 , directory >= 1.3 && < 1.4
-                 , filepath >= 1.4 && < 1.6
-
-flag static-rust
-    description: Link the Rust sqlparser frontend statically for a single self-contained binary (release mode). Default off: link dynamically against the cargo-built cdylib (dev mode).
-    manual: True
-    default: False
 common warnings
     ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
                  -Wincomplete-uni-patterns -Wmissing-export-lists
@@ -83,6 +69,17 @@ library
                     , Occam.Proposals
                     , Occam.Reducer
                     , Occam.Slicer
+                    , Occam.Frontend.AST
+                    , Occam.Frontend.Columns
+                    , Occam.Frontend.Context
+                    , Occam.Frontend.Edits
+                    , Occam.Frontend.Lexer
+                    , Occam.Frontend.OracleProof
+                    , Occam.Frontend.Parser
+                    , Occam.Frontend.Pipeline
+                    , Occam.Frontend.Semantics
+                    , Occam.Frontend.Span
+                    , Occam.Frontend.Splitter
                     , Occam.Parser
                     , Occam.Parser.Dialect
                     , Occam.Pool
@@ -91,14 +88,31 @@ library
     other-modules:    Paths_occam
                     , Occam.Core.Schema
                     , Occam.Core.Semantics
+                    , Occam.Frontend.Columns.Analysis
+                    , Occam.Frontend.Columns.Assemble
+                    , Occam.Frontend.Columns.Edits
+                    , Occam.Frontend.Edits.Core
+                    , Occam.Frontend.Edits.DDL
+                    , Occam.Frontend.Edits.Expr
+                    , Occam.Frontend.Edits.Query
+                    , Occam.Frontend.Edits.Stmt
+                    , Occam.Frontend.Edits.Tokens
+                    , Occam.Frontend.Parser.Core
+                    , Occam.Frontend.Parser.DDL
+                    , Occam.Frontend.Parser.Expr
+                    , Occam.Frontend.Parser.Query
+                    , Occam.Frontend.Parser.Stmt
+                    , Occam.Frontend.Semantics.DDL
+                    , Occam.Frontend.Semantics.DML
+                    , Occam.Frontend.Semantics.Expr
+                    , Occam.Frontend.Semantics.Pure
+                    , Occam.Frontend.Semantics.Query
+                    , Occam.Frontend.Semantics.Sequence
+                    , Occam.Frontend.Semantics.Session
                     , Occam.Certificate.MissingDef
                     , Occam.Certificate.PrefixCache
                     , Occam.Json
-                    , Occam.Parser.Binary
-                    , Occam.Parser.Binary.Primitives
-                    , Occam.Parser.Binary.Semantics
                     , Occam.Parser.Facts
-                    , Occam.Parser.Native
                     , Occam.Parser.Types
                     , Occam.Parser.Validate
                     , Occam.Oracle.Process
@@ -149,15 +163,6 @@ library
                     , temporary >= 1.3 && < 1.4
                     , vector >= 0.13 && < 0.14
     hs-source-dirs:   src
-    -- Windows is static-only in v1: dynamic cdylib linking is not supported there.
-    -- In dynamic mode Setup.hs adds the absolute cargo target dir + rpath at configure time.
-    if flag(static-rust) || os(windows)
-        extra-bundled-libraries: Coccam_sqlparser
-    else
-        extra-libraries: occam_sqlparser
-
-    if os(windows)
-        extra-libraries: advapi32, ws2_32, userenv, bcrypt, ntdll
 
 executable occam
     import:           warnings, language, core-deps, io-deps
@@ -192,7 +197,8 @@ test-suite occam-fuzz
     import:           warnings, language, core-deps, rts-threaded
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
-    other-modules:    Fuzz
+    other-modules:    DialectFuzz
+                    , Fuzz
                     , MutationalFuzz
                     , TestSupport
     main-is:          FuzzMain.hs
@@ -208,7 +214,8 @@ test-suite occam-test
     c-sources:        eval-lib/cbits/duckdb_result.c
                       eval-lib/cbits/sqlite_authorizer.c
     hs-source-dirs:   test eval-lib
-    other-modules:    Fuzz
+    other-modules:    DialectFuzz
+                    , Fuzz
                     , MutationalFuzz
                     , TestSupport
                     , BenchmarkMetricsChecks
@@ -226,7 +233,18 @@ test-suite occam-test
                     , DialectAndControlChecks
                     , DuckDBOracleChecks
                     , EvaluationChecks
+                    , FrontendAstInvariants
+                    , FrontendChecks
+                    , FrontendColumnsChecks
+                    , FrontendCorpusChecks
+                    , FrontendEditsChecks
+                    , FrontendFacadeChecks
+                    , FrontendPipelineChecks
+                    , FrontendSeedChecks
+                    , FrontendSeedLoader
+                    , FrontendSemanticsChecks
                     , OracleChecks
+                    , ParserChecks
                     , PoolChecks
                     , PoolMetricsChecks
                     , PropertyChecks
@@ -258,6 +276,7 @@ test-suite occam-test
                     , tasty-quickcheck
                     , QuickCheck
                     , time
+                    , vector
                     , direct-sqlite >= 2.3 && < 2.4
                     , safe-exceptions >= 0.1 && < 0.2
 

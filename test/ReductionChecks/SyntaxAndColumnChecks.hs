@@ -15,6 +15,9 @@ import Occam.Core (
     OracleOutcome (..),
  )
 import Occam.Facts (
+    ClauseTier (..),
+    EditTier (..),
+    ExprTier (..),
     ParserEdit (..),
     ParserEditCategory (..),
     StatementUnit (..),
@@ -113,13 +116,13 @@ checks =
         let sql = "CREATE TABLE t (a VARCHAR(20) NOT NULL, b BIGINT DEFAULT 1);"
             -- a: VARCHAR(20) [18..29) -> "INT", NOT NULL [29..38) -> ""
             -- b: BIGINT [42..48) -> "INT", DEFAULT 1 [48..58) -> ""
-            eTypeA = ParserEdit 18 29 "INT" EditType "simplify-data_type" False False False False
-            eTypeAText = ParserEdit 18 29 "TEXT" EditType "simplify-data_type" False False False False
-            eConsA = ParserEdit 29 38 "" EditConstraint "remove-column_constraint" False False False False
-            eTypeB = ParserEdit 42 48 "INT" EditType "simplify-data_type" False False False False
-            eConsB = ParserEdit 48 58 "" EditConstraint "remove-column_constraint" False False False False
-            gluedA = ParserEdit 18 23 "AA" EditExpression "test" False False False False
-            gluedB = ParserEdit 23 29 "BB" EditExpression "test" False False False False
+            eTypeA = ParserEdit 18 29 "INT" EditType TierDefault "simplify-data_type" False False False False
+            eTypeAText = ParserEdit 18 29 "TEXT" EditType TierDefault "simplify-data_type" False False False False
+            eConsA = ParserEdit 29 38 "" EditConstraint TierDefault "remove-column_constraint" False False False False
+            eTypeB = ParserEdit 42 48 "INT" EditType TierDefault "simplify-data_type" False False False False
+            eConsB = ParserEdit 48 58 "" EditConstraint TierDefault "remove-column_constraint" False False False False
+            gluedA = ParserEdit 18 23 "AA" EditExpression (TierExpr AggressiveExpr) "test" False False False False
+            gluedB = ParserEdit 23 29 "BB" EditExpression (TierExpr AggressiveExpr) "test" False False False False
         assertEqual
             "applyParserEdits applies adjacent replacement + deletion cleanly"
             (Just "CREATE TABLE t (a INT, b INT);")
@@ -135,7 +138,10 @@ checks =
         assertEqual
             "applyParserEdits rejects out-of-bounds spans"
             Nothing
-            (applyParserEdits sql [ParserEdit 0 999 "" EditClause "oob" False False False False])
+            ( applyParserEdits
+                sql
+                [ParserEdit 0 999 "" EditClause (TierClause SafeClause) "oob" False False False False]
+            )
         let selected = selectIndependentEdits [eTypeAText, eTypeA, gluedA, gluedB, eTypeB]
         assertEqual
             "selectIndependentEdits picks highest-savings non-overlapping non-gluing set"

@@ -213,8 +213,8 @@ updateSyntaxSnapshot context category currentUnits index currentBundles edit =
     updateSyntaxBatchSnapshot context category currentUnits index currentBundles [edit]
 
 {- | Incrementally refresh an accepted single- or multi-edit syntax batch by
-reparsing only the touched statements through the Rust parser and shifting
-untouched statement spans by the cumulative byte delta, with full reparse fallback.
+reparsing only the touched statements and shifting untouched statement spans
+by the cumulative byte delta, with full reparse fallback.
 -}
 updateSyntaxBatchSnapshot ::
     SyntaxContext ->

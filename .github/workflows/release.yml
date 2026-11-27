@@ -38,14 +38,6 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Using release tag: ${TAG}"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "rust/sqlparser-ffi -> rust/sqlparser-ffi/target"
-
       - name: Set up GHC and Cabal
         uses: haskell-actions/setup@v2
         with:
@@ -68,12 +60,12 @@ jobs:
         run: cabal update
 
       - name: Build occam executable
-        run: cabal build -f static-rust exe:occam
+        run: cabal build exe:occam
 
       - name: Package Binary & Generate Checksum
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
-          BIN_PATH="$(cabal list-bin -f static-rust occam)"
+          BIN_PATH="$(cabal list-bin occam)"
           echo "Found binary at: ${BIN_PATH}"
 
           mkdir -p dist

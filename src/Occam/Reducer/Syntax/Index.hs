@@ -38,7 +38,7 @@ import Data.Text qualified as T
 import Data.Word (Word64)
 import Occam.Certificate (EarlyRejectCertifier, EarlyRejectTracker)
 import Occam.Core (ResultTrace, Span (..), Statement (..))
-import Occam.Facts (editCategoryName)
+import Occam.Facts (ClauseTier (..), EditTier (..), ExprTier (..), editCategoryName)
 import Occam.Logger (Logger)
 import Occam.Metrics (MetricsStore)
 import Occam.Parser (
@@ -90,80 +90,16 @@ data SyntaxCandidate
     | BundleCandidate !ColumnTarget
     | BatchCandidate !ParserEditCategory !T.Text ![ParserEdit]
 
--- | Clause edit classification in priority order.
-data ClauseEditClass = SafeClauseEdit | StructuralClauseEdit | FragileClauseEdit
-    deriving (Eq, Ord, Show)
+classifyClauseEdit :: ParserEdit -> ClauseTier
+classifyClauseEdit edit = case parserEditTier edit of
+    TierClause tier -> tier
+    _ -> StructuralClause
 
--- | Expression edit classification in priority order.
-data ExpressionEditClass = UnwrapExpressionEdit | AggressiveExpressionEdit
-    deriving (Eq, Ord, Show)
-
--- | Clause labels whose removal cannot change predicate truth.
-safeClauseLabels :: Set T.Text
-safeClauseLabels =
-    Set.fromList
-        [ "remove-order_by"
-        , "remove-limit"
-        , "remove-offset"
-        , "remove-fetch"
-        , "remove-distinct"
-        , "simplify-window_spec_empty"
-        , "remove-window_partition_by"
-        , "remove-window_order_by"
-        , "remove-window_frame"
-        ]
-
--- | Predicate-bearing clause labels, attempted after structural clauses.
-fragileClauseLabels :: Set T.Text
-fragileClauseLabels = Set.singleton "remove-where"
-
--- | Expression labels that only collapse redundant structure.
-unwrappedExpressionLabels :: Set T.Text
-unwrappedExpressionLabels =
-    Set.fromList
-        [ "simplify-parenthesized_expression"
-        , "simplify-scalar-subquery"
-        , "simplify-cast"
-        , "simplify-function_to_argument"
-        , "simplify-case_result"
-        , "simplify-case_else"
-        ]
-
--- | Operand simplifications that unwrap unless they discard the operand value.
-operandSimplifyLabels :: Set T.Text
-operandSimplifyLabels =
-    Set.fromList
-        [ "simplify-unary_expression"
-        , "simplify-binary_expression"
-        , "simplify-in_list"
-        , "simplify-in_subquery"
-        , "simplify-between"
-        , "simplify-like"
-        , "simplify-is_null"
-        ]
-
--- | Prefix used by the frontend for operand-unwrapping edits.
-unwrapExpressionPrefix :: T.Text
-unwrapExpressionPrefix = "unwrap-"
-
-classifyClauseEdit :: ParserEdit -> ClauseEditClass
-classifyClauseEdit edit
-    | label `Set.member` safeClauseLabels = SafeClauseEdit
-    | label `Set.member` fragileClauseLabels = FragileClauseEdit
-    | otherwise = StructuralClauseEdit
-    where
-        label = parserEditLabel edit
-
-classifyExpressionEdit :: ParserEdit -> ExpressionEditClass
+classifyExpressionEdit :: ParserEdit -> ExprTier
 classifyExpressionEdit edit
-    | parserEditLowYield edit = AggressiveExpressionEdit
-    | label `Set.member` unwrappedExpressionLabels
-        || label `Set.member` operandSimplifyLabels
-        || unwrapExpressionPrefix `T.isPrefixOf` label =
-        UnwrapExpressionEdit
-    | otherwise = AggressiveExpressionEdit
-    where
-        label = parserEditLabel edit
+    | parserEditLowYield edit = AggressiveExpr
+    | TierExpr tier <- parserEditTier edit = tier
+    | otherwise = AggressiveExpr
 
 -- | Named rank constants: lower ranks are tested first.
 safeClauseRank, structuralClauseRank, fragileClauseRank :: Int
@@ -177,14 +113,14 @@ aggressiveExpressionRank = 1
 
 clauseEditRank :: ParserEdit -> Int
 clauseEditRank edit = case classifyClauseEdit edit of
-    SafeClauseEdit -> safeClauseRank
-    StructuralClauseEdit -> structuralClauseRank
-    FragileClauseEdit -> fragileClauseRank
+    SafeClause -> safeClauseRank
+    StructuralClause -> structuralClauseRank
+    FragileClause -> fragileClauseRank
 
 expressionEditRank :: ParserEdit -> Int
 expressionEditRank edit = case classifyExpressionEdit edit of
-    UnwrapExpressionEdit -> unwrappedExpressionRank
-    AggressiveExpressionEdit -> aggressiveExpressionRank
+    UnwrapExpr -> unwrappedExpressionRank
+    AggressiveExpr -> aggressiveExpressionRank
 
 -- | Column edits only participate when the column mode is enabled.
 syntaxCategoryOrder :: ColumnMode -> [ParserEditCategory]
@@ -247,16 +183,16 @@ indexUnitEdits context unit =
                 (IntMap.insertWith (++) (fromEnum (baseEditBucket edit)) [edit] buckets, seenLitSpans)
         baseEditBucket edit = case parserEditCategory edit of
             EditClause -> case classifyClauseEdit edit of
-                SafeClauseEdit -> SafeClauses
-                StructuralClauseEdit -> StructuralClauses
-                FragileClauseEdit -> FragileClauses
+                SafeClause -> SafeClauses
+                StructuralClause -> StructuralClauses
+                FragileClause -> FragileClauses
             EditList -> Lists
             EditColumn -> Columns
             EditConstraint -> Constraints
             EditType -> Types
             EditExpression -> case classifyExpressionEdit edit of
-                UnwrapExpressionEdit -> UnwrapExpressions
-                AggressiveExpressionEdit -> AggressiveExpressions
+                UnwrapExpr -> UnwrapExpressions
+                AggressiveExpr -> AggressiveExpressions
             EditLiteral -> PrimaryLiterals
 
 buildSyntaxIndex :: SyntaxContext -> [StatementUnit] -> SyntaxIndex

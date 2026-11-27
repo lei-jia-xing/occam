@@ -10,8 +10,8 @@
 - [Unix-Native Ergonomics] Pure reduced SQL on `stdout` when piped, diagnostics and dynamic progress on `stderr`, and native shell auto-completions.
 
 * Active Tasks
-** TODO [#A] Pure-Haskell Strict Frontend Migration & Semantic Facts Refactoring
-Replace `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary protocol) with a clean, extensible pure-Haskell frontend built around Occam's own domain model rather than `sqlparser-rs` AST concepts.
+** DONE [#A] Pure-Haskell Strict Frontend Migration & Semantic Facts Refactoring
+Replaced `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary protocol) with a 100% pure-Haskell, FFI-free strict frontend built directly around Occam's domain model.
 
 *** Phase 0: Dialect Pruning, Extensibility Model & `GenericSQL` Removal
 - [X] Drop `GenericSQL` from `SQLDialect`, CLI options (`--dialect`), `pure.rs` special-casing, and docs; make `--dialect` a required explicit CLI option with zero implicit default, and migrate `GenericSQL` references in `test/` to concrete dialects.
@@ -19,32 +19,41 @@ Replace `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary 
 - [X] Design an extensible `DialectProfile` / dialect-capability architecture separating lexical rules, keyword tables, statement/clause hooks, identifier folding rules, and session/catalog semantics so new dialects plug in without touching shared code.
 
 *** Phase 1: Dialect-Aware Lexer, Statement Splitter & Oracle Source Proofs
-- [ ] Implement a fast `ByteString`-backed UTF-8 lexer producing `Vector (Token, ByteSpan)` with exact byte offsets and preserved trivia/comment boundaries.
-- [ ] Support dialect-specific lexical rules cleanly: PG dollar-quoting (`$$tag$$`) and nested `/* */` comments; MySQL/MariaDB backticks, `#` comments, and `/*!...*/` conditional comments; DuckDB `E'...'` escapes; ClickHouse literals.
-- [ ] Decouple top-level statement splitting (tracking paren depth and `BEGIN ... END` compound blocks, plus script-level `DELIMITER` / `GO` boundaries if needed) from full grammar parsing so unparsed/error statements never corrupt surrounding unit boundaries.
-- [ ] Port `oracle.rs` (`nativeOracleCacheKey` and `nativeDuckDBReplayUnits`) directly onto the Haskell token stream.
+- [X] Implement a fast `ByteString`-backed UTF-8 lexer producing `Vector (Token, ByteSpan)` with exact byte offsets and preserved trivia/comment boundaries.
+- [X] Support dialect-specific lexical rules cleanly: PG dollar-quoting (`$$tag$$`) and nested `/* */` comments; MySQL/MariaDB backticks, `#` comments, and `/*!...*/` conditional comments; DuckDB `E'...'` escapes; ClickHouse literals.
+- [X] Decouple top-level statement splitting (tracking paren depth and `BEGIN ... END` compound blocks, plus script-level `DELIMITER` / `GO` boundaries if needed) from full grammar parsing so unparsed/error statements never corrupt surrounding unit boundaries.
+- [X] Port `oracle.rs` (`nativeOracleCacheKey` and `nativeDuckDBReplayUnits`) directly onto the Haskell token stream.
 
 *** Phase 2: Deterministic LL(k) + Pratt Per-Dialect Parser & Differential Alignment
-- [ ] Build a deterministic `LL(k)` recursive-descent + Pratt expression parser over the `Vector Token` stream with span-annotated AST nodes (`Located Span a`).
-- [ ] Enforce strict dialect grammar alignment (e.g., `CREATE [TEMP]` validated per target object type and dialect, rejecting `CREATE TEMP POLICY` cleanly instead of dropping modifiers).
-- [ ] Cover real-corpus syntax omitted by `sqlparser-rs`:
+- [X] Build a deterministic `LL(k)` recursive-descent + Pratt expression parser over the `Vector Token` stream with span-annotated AST nodes (`Located Span a`).
+- [X] Enforce strict dialect grammar alignment (e.g., `CREATE [TEMP]` validated per target object type and dialect, rejecting `CREATE TEMP POLICY` cleanly instead of dropping modifiers).
+- [X] Cover real-corpus syntax omitted by `sqlparser-rs`:
   - PostgreSQL: `CREATE STATISTICS`, `DROP CONVERSION`, standalone `TABLE t`, strict policy/rule/RLS forms.
   - SQLite: `PRAGMA` bare boolean/word values (`ON`/`OFF`/`YES`/`NO`/`TRUE`/`FALSE`/`MEMORY`), schema-qualified `PRAGMA` / `VACUUM`.
   - MySQL / MariaDB: column `BINARY` attribute, index key-part length prefix `col(N)` (first-class AST instead of `Expr::Function`), multi-table `ANALYZE TABLE`, `CREATE FULLTEXT INDEX`, `ALTER TABLE ... ADD COLUMN (...)`, `PREPARE ... FROM '...'`.
   - DuckDB: `PIVOT`, `ASOF RIGHT JOIN`, `E'...'` escape strings, parenthesized `FROM (VALUES ...) WHERE ...`, and reject unsupported forms (`SAVEPOINT`, `FOREIGN KEY ... ON DELETE CASCADE` where native DuckDB rejects them).
   - ClickHouse: `CREATE MATERIALIZED VIEW ... ENGINE = ... [TO ...]`, `ALTER ... MATERIALIZE TTL`, `DETACH`/`ATTACH`, query/DDL `SETTINGS`, `Array(JSON(...))`, `data.:Int64`, `ARRAY JOIN []`.
-- [ ] Build a differential syntax-alignment harness comparing Occam's frontend acceptance/rejection against native engines (`sqlite`, `duckdb`, `postgresql`, `mysql`/`mariadb`, `clickhouse`) over harmless valid and invalid SQL fixtures.
+- [X] Differential syntax alignment: focused latest-grammar regressions in `test/ParserChecks.hs` plus the 71/71 `benchmarks/real_fuzz_corpus` regression. The temporary grammar-exact seed matrix used during parser bring-up was removed; no version dimension.
+
+*** Phase 2b: Six-dialect seed conformance
+- [X] Shared `test/seeds/` block protocol (`@case`/`@dialects`/`@units` + literal `-- @unit` boundaries), seven required files, 62 focused cases / 109 units.
+- [ ] Expand seed coverage against the ledger in `docs/FRONTEND_GRAMMAR.md`.
+- [ ] Choose a lightweight way to check SQL grammar independently against each engine.
+- [ ] Mark corpus FULL after independent six-engine conformance, Phase 4 product facade cutover, and semantic-facade tests pass.
 
 *** Phase 3: Refactor `SemanticFacts`, Exact-Span Edits & Column IR
-- [ ] Refactor `Occam.Core.Semantics` and `Occam.Facts` without `sqlparser-rs` AST or `OCCM` wire-protocol compromises (clean Haskell types for `StatementFacts`, `CatalogOp`, `SessionEffect`, `TxEffect`, `ScopedBarrier`, `ParserEdit`, and `ColumnTarget`).
-- [ ] Implement pure-Haskell AST semantic fact extraction, preserving sound barrier scoping and fixing known modeling gaps:
-  - SQLite `CREATE VIRTUAL TABLE` shadow table edges (`_segdir`, `_content`) and unmodeled dialect DDL/session variables (`OPTIMIZE TABLE ... FINAL`, `CREATE OR REPLACE RULE`, `ALTER TABLE ... ALGORITHM=INPLACE`).
-  - Conservative vs opt-in trusted-builtin mode (replacing `Generic`-only `pure.rs` `coalesce`/`nullif` special case).
+- [X] Lower selected transaction, SQLite PRAGMA, PostgreSQL TABLE, and ClickHouse OPTIMIZE statements from the Haskell AST through the product parser.
+- [X] Generate exact clause deletions for PREWHERE, query SETTINGS, and QUALIFY through the product parser.
+- [X] Refactor `Occam.Core.Semantics` and `Occam.Facts` without `sqlparser-rs` AST or `OCCM` wire-protocol compromises (stripped Rust wire `FromJSON` codecs; replaced string-matched edit-label heuristics with typed `ClauseTier`/`ExprTier`/`EditTier` on `ParserEdit`).
+- [X] Implement pure-Haskell AST semantic fact extraction, preserving sound barrier scoping and fixing known modeling gaps:
+  - SQLite `CREATE VIRTUAL TABLE` shadow table edges (`_segdir`, `_content`) and dialect DDL/session semantics (`OPTIMIZE TABLE ... FINAL`, `CREATE OR REPLACE RULE`, `ALTER TABLE ... ALGORITHM=INPLACE`).
+  - Conservative pure-builtin mode without `Generic`-only special cases.
   - Exact-span intra-statement edit generation (including ClickHouse `PREWHERE`/`SETTINGS` and DuckDB `QUALIFY` clause deletions) and atomic column co-reduction site extraction.
 
 *** Phase 4: Cutover, Verification & Rust/FFI Removal
-- [ ] Switch `Occam.Parser` to the new Haskell frontend; verify full unit/property/integration test parity, `occam-bench` `parse` microbenchmark throughput, and 71-case `benchmarks/real_fuzz_corpus/` barrier census.
-- [ ] Remove `rust/`, `Setup.hs` Cargo build hooks, `static-rust` Cabal flag, `Occam.Parser.Native`, `Occam.Parser.Binary*`, and obsolete `sqlparser-rs` entries from `docs/`.
+- [X] Use the Haskell splitter for the public statement count and cover it with the seed corpus and all six dialect fuzz properties.
+- [X] Switch `Occam.Parser` to the pure-Haskell frontend (`Occam.Frontend.Pipeline.parseFrontend`); verified full unit/property/integration/corpus regression parity, `occam-bench` `parse` microbenchmark throughput, and 71-case `benchmarks/real_fuzz_corpus/` barrier census.
+- [X] Remove `rust/`, `Setup.hs` Cargo build hooks, `static-rust` Cabal flag, `Occam.Parser.Native`, `Occam.Parser.Binary*`, `Occam.Frontend.Facts`, `occam-frontend-diff`, and obsolete `sqlparser-rs` entries from CI/Nix/Makefile/docs.
 
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (DONE)

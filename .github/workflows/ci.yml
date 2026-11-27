@@ -24,16 +24,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "rust/sqlparser-ffi -> rust/sqlparser-ffi/target"
-
       - name: Set up GHC and Cabal
         uses: haskell-actions/setup@v2
         with:
@@ -47,7 +37,7 @@ jobs:
             ~/.cabal/packages
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project', 'rust/sqlparser-ffi/src/*.rs', 'rust/sqlparser-ffi/Cargo.toml', 'rust/sqlparser-ffi/Cargo.lock') }}
+          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project') }}
           restore-keys: |
             ${{ runner.os }}-cabal-
 
@@ -64,7 +54,6 @@ jobs:
             test/**/*.hs
             bench/**/*.hs
             eval-lib/**/*.hs
-            Setup.hs
 
       # Manual install: haskell-actions/hlint-setup@v2 is node20-based (removed from
       # runners in fall 2026) with no newer release; 3.10 is the latest HLint.
@@ -75,28 +64,13 @@ jobs:
           echo "$(dirname "$(find /tmp/hlint-bin -name hlint -type f | head -n 1)")" >> "$GITHUB_PATH"
 
       - name: Run HLint
-        run: hlint src app test bench eval-lib Setup.hs
-
-      - name: Check Rust formatting
-        run: cargo fmt --manifest-path rust/sqlparser-ffi/Cargo.toml --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --manifest-path rust/sqlparser-ffi/Cargo.toml --all-targets -- -D warnings
+        run: hlint src app test bench eval-lib
 
       - name: Build all targets
-        run: cabal build all --enable-tests --ghc-options=-Werror
+        run: cabal build all --enable-tests --enable-benchmarks --ghc-options=-Werror
 
       - name: Run Haskell tests
         run: cabal test all --test-show-details=direct --ghc-options=-Werror
-
-      - name: Build all targets (static-rust)
-        run: cabal build all --enable-tests --ghc-options=-Werror -f static-rust
-
-      - name: Run Haskell tests (static-rust)
-        run: cabal test all --test-show-details=direct --ghc-options=-Werror -f static-rust
-
-      - name: Run Rust tests
-        run: cargo test --locked --manifest-path rust/sqlparser-ffi/Cargo.toml
 
       - name: Run harness contract tests
         run: make harness-check

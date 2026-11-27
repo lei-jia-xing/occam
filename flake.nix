@@ -31,19 +31,12 @@
               haskell-language-server
               fourmolu
               hlint
-              rustc
-              cargo
-              rust-analyzer
-              rustfmt
-              clippy
               elan
               python3
               duckdb
               bashInteractive
             ];
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             shellHook = ''
-              export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
               if [ -d .githooks ]; then
                 git config core.hooksPath .githooks
               fi

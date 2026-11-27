@@ -10,7 +10,6 @@ module Occam.Parser.Types (
     ParsedSQL (..),
 ) where
 
-import Data.Aeson (ToJSON (..), Value, object, (.=))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -86,47 +85,12 @@ defaultParseOptions dialect =
         , parseSpanOnly = False
         }
 
-instance ToJSON ServerConfig where
-    toJSON :: ServerConfig -> Value
-    toJSON config =
-        object
-            [ "namespace_prefix" .= serverNamespacePrefix config
-            , "search_path" .= serverSearchPath config
-            , "current_user" .= serverCurrentUser config
-            , "autocommit" .= serverAutocommit config
-            , "foreign_key_checks" .= serverForeignKeyChecks config
-            , "variables" .= serverVariables config
-            , "lower_case_table_names" .= serverLowerCaseTableNames config
-            , "table_names_case_sensitive" .= serverTableNamesCaseSensitive config
-            , "column_names_case_sensitive" .= serverColumnNamesCaseSensitive config
-            , "quoted_identifiers_case_sensitive" .= serverQuotedIdentifiersCaseSensitive config
-            ]
-
-instance ToJSON ParseOptions where
-    toJSON :: ParseOptions -> Value
-    toJSON options =
-        object
-            [ "dialect" .= dialectName (parseDialect options)
-            , "server" .= parseServerConfig options
-            , "chunk_edits" .= parseChunkEdits options
-            , "column_ir" .= parseColumnIR options
-            , "column_bundles" .= parseColumnBundles options
-            , "syntax_edits" .= parseSyntaxEdits options
-            , "syntax_only" .= parseSyntaxOnly options
-            , "span_only" .= parseSpanOnly options
-            ]
-
 data ParserErrorKind
     = ParserInvalidArguments
     | ParserInvalidConfig
     | ParserInvalidUtf8
-    | ParserNativeFailure
-    | ParserNativePanic
-    | ParserNullResult
-    | ParserDecodeFailure
     | ParserInvalidSourceRange
     | ParserInvalidEditRange
-    | ParserUnknownFailure !Int
     deriving (Eq, Show)
 
 data ParserError = ParserError
