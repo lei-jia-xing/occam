@@ -1,0 +1,19 @@
+{
+  "adaptive_values": false,
+  "ast_batching": false,
+  "cache": true,
+  "closure": true,
+  "color": "auto",
+  "column_mode": "off",
+  "intra_statement": false,
+  "jobs": 1,
+  "literal_batches": false,
+  "log_format": "text",
+  "log_level": "warn",
+  "log_level_json": "info",
+  "slicing": true,
+  "statement_order": "ranked-fallback",
+  "strategy": "full",
+  "timeout": 10,
+  "unrestricted": true
+}

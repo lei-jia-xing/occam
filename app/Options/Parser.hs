@@ -6,18 +6,11 @@ module Options.Parser (
 
 import Completion (parseShellType, supportedShells)
 import Control.Applicative ((<|>))
-import Data.Char (toLower)
 import Data.Text qualified as T
 import Occam qualified
 import Occam.Evaluation (parseSQLDialect)
-import Occam.Logger (LogFormat (..), LogLevel (..))
 import Occam.Parser (dialectName)
-import Occam.Reducer (
-    ColumnMode (..),
-    StatementSearchPolicy (..),
-    convergedRankedScheduleConfig,
-    statementRankedFallback,
- )
+import Occam.Reducer (ColumnMode, StatementSearchPolicy)
 import Options (
     Action (..),
     RawOptions (..),
@@ -26,10 +19,18 @@ import Options (
     defaultRawOptions,
     getSpecified,
     parseColorMode,
+    parseColumnMode,
+    parseLogFormat,
+    parseLogLevel,
+    parseStatementOrder,
+    parseStrategy,
  )
 import Options.Applicative (
+    Mod,
+    OptionFields,
     Parser,
     ParserInfo,
+    ReadM,
     action,
     auto,
     completeWith,
@@ -49,7 +50,6 @@ import Options.Applicative (
     strArgument,
     strOption,
     switch,
-    value,
     (<**>),
  )
 
@@ -111,15 +111,16 @@ rawOptionsParser =
                     <> action "file"
                 )
             )
-        <*> switch
-            ( long "result-oracle"
-                <> help "Preserve query results with SQLite or DuckDB"
-            )
-        <*> switch
-            ( long "in-place"
-                <> short 'i'
-                <> help "Replace input after validation. Keep a .bak backup."
-            )
+        <*> switchSpecified
+            "result-oracle"
+            Nothing
+            "Preserve query results with SQLite or DuckDB"
+            (getSpecified (rawResultOracle defaultRawOptions))
+        <*> switchSpecified
+            "in-place"
+            (Just 'i')
+            "Replace input after validation. Keep a .bak backup."
+            (getSpecified (rawInPlace defaultRawOptions))
         <*> optional
             ( strOption
                 ( long "stats"
@@ -135,49 +136,55 @@ rawOptionsParser =
                     <> help "Run before each oracle execution"
                 )
             )
-        <*> option
+        <*> optional
+            ( strOption
+                ( long "config"
+                    <> metavar "FILE"
+                    <> help "Load JSON configuration (CLI flags override)"
+                    <> action "file"
+                )
+            )
+        <*> optionSpecified
             auto
             ( long "timeout"
                 <> metavar "SECONDS"
-                <> value (rawTimeoutSecs defaultRawOptions)
                 <> help "Timeout per execution (default: 10 seconds)"
             )
-        <*> ( ( Explicit
-                    <$> option
-                        (eitherReader parseLogLevel)
-                        ( long "log-level"
-                            <> metavar "LEVEL"
-                            <> help "debug, info, warn (default), or error"
-                            <> completeWith ["debug", "info", "warn", "error"]
-                        )
-              )
-                <|> pure (rawLogLevel defaultRawOptions)
+            (rawTimeoutSecs defaultRawOptions)
+        <*> optionSpecified
+            (eitherReader parseLogLevel)
+            ( long "log-level"
+                <> metavar "LEVEL"
+                <> help "debug, info, warn (default), or error"
+                <> completeWith ["debug", "info", "warn", "error"]
             )
-        <*> option
+            (rawLogLevel defaultRawOptions)
+        <*> optionSpecified
             (eitherReader parseLogFormat)
             ( long "log-format"
                 <> metavar "FORMAT"
-                <> value (rawLogFormat defaultRawOptions)
                 <> help "text (default) or json"
                 <> completeWith ["text", "json"]
             )
-        <*> switch
-            ( long "verbose"
-                <> help "Show debug logs and progress"
-            )
-        <*> switch
-            ( long "quiet"
-                <> short 'q'
-                <> help "Show errors only"
-            )
-        <*> option
+            (rawLogFormat defaultRawOptions)
+        <*> switchSpecified
+            "verbose"
+            Nothing
+            "Show debug logs and progress"
+            (getSpecified (rawVerbose defaultRawOptions))
+        <*> switchSpecified
+            "quiet"
+            (Just 'q')
+            "Show errors only"
+            (getSpecified (rawQuiet defaultRawOptions))
+        <*> optionSpecified
             (eitherReader parseColorMode)
             ( long "color"
                 <> metavar "WHEN"
-                <> value (rawColor defaultRawOptions)
                 <> help "auto (default), always, or never. Honors NO_COLOR."
                 <> completeWith ["auto", "always", "never"]
             )
+            (rawColor defaultRawOptions)
         <*> optional
             ( option
                 auto
@@ -196,14 +203,14 @@ rawOptionsParser =
                     <> help "Maximum uncached oracle attempts"
                 )
             )
-        <*> option
+        <*> optionSpecified
             (eitherReader parseJobs)
             ( short 'j'
                 <> long "jobs"
                 <> metavar "N"
-                <> value (rawJobs defaultRawOptions)
                 <> help "Concurrent oracle runs (default: 1)"
             )
+            (rawJobs defaultRawOptions)
         <*> toggleSpecified
             "slicing"
             "no-slicing"
@@ -263,6 +270,14 @@ rawOptionsParser =
                 <> internal
             )
 
+optionSpecified :: ReadM a -> Mod OptionFields (Specified a) -> Specified a -> Parser (Specified a)
+optionSpecified reader mods def = option (Explicit <$> reader) mods <|> pure def
+
+switchSpecified :: String -> Maybe Char -> String -> Bool -> Parser (Specified Bool)
+switchSpecified flagName mShort desc def =
+    flag' (Explicit True) (long flagName <> maybe mempty short mShort <> help desc)
+        <|> pure (Default def)
+
 toggleSpecified :: String -> String -> String -> Bool -> Parser (Specified Bool)
 toggleSpecified enableName disableName description def =
     flag' (Explicit True) (long enableName <> help ("Enable " ++ description))
@@ -303,21 +318,6 @@ columnModeParser =
         )
         <|> pure (rawColumnMode defaultRawOptions)
 
-parseLogLevel :: String -> Either String LogLevel
-parseLogLevel s = case map toLower s of
-    "debug" -> Right LevelDebug
-    "info" -> Right LevelInfo
-    "warn" -> Right LevelWarn
-    "warning" -> Right LevelWarn
-    "error" -> Right LevelError
-    _ -> Left "Expected debug, info, warn, or error"
-
-parseLogFormat :: String -> Either String LogFormat
-parseLogFormat s = case map toLower s of
-    "text" -> Right FormatText
-    "json" -> Right FormatJSON
-    _ -> Left "Expected text or json"
-
 parseJobs :: String -> Either String Int
 parseJobs s = case reads s of
     [(n, "")]
@@ -325,29 +325,6 @@ parseJobs s = case reads s of
         , n <= toInteger (maxBound :: Int) ->
             Right (fromInteger n)
     _ -> Left "Expected a positive --jobs value"
-
-parseStatementOrder :: String -> Either String StatementSearchPolicy
-parseStatementOrder s = case map toLower s of
-    "ranked-fallback" -> Right statementRankedFallback
-    "ranked" -> Right (StatementRankedWith convergedRankedScheduleConfig)
-    "subset-first" -> Right StatementSubsetFirst
-    "complement-first" -> Right StatementComplementFirst
-    "byte-weighted" -> Right StatementByteWeighted
-    _ -> Left "Expected ranked-fallback, ranked, byte-weighted, complement-first, or subset-first"
-
-parseColumnMode :: String -> Either String ColumnMode
-parseColumnMode s = case map toLower s of
-    "off" -> Right ColumnOff
-    "single" -> Right ColumnSingle
-    "atomic" -> Right ColumnAtomic
-    _ -> Left "Expected off, single, or atomic"
-
-parseStrategy :: String -> Either String ReductionStrategy
-parseStrategy s = case map toLower s of
-    "full" -> Right StrategyFull
-    "ddmin-only" -> Right StrategyDdminOnly
-    "audit-only" -> Right StrategyAuditOnly
-    _ -> Left "Expected full, ddmin-only, or audit-only"
 
 versionOption :: Parser (a -> a)
 versionOption =

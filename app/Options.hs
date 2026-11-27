@@ -1,10 +1,12 @@
 module Options (
     Action (..),
     ColorMode (..),
+    ConfigPatch (..),
     RawOptions (..),
     ReductionStrategy (..),
     Specified (..),
     ValidatedOptions (..),
+    applyConfigPatch,
     colorModeName,
     defaultLogLevelForFormat,
     defaultRawOptions,
@@ -12,22 +14,44 @@ module Options (
     isExplicit,
     logFormatName,
     parseColorMode,
+    parseColumnMode,
+    parseConfigPatch,
+    parseLogFormat,
+    parseLogLevel,
+    parseStatementOrder,
+    parseStrategy,
     resolveColor,
     strategyName,
     validateCliOptions,
 ) where
 
 import Completion (ShellType)
-import Control.Monad (when)
+import Control.Applicative ((<|>))
+import Control.Monad (forM_, when)
+import Data.Aeson (
+    FromJSON (..),
+    Value,
+    eitherDecodeStrict',
+    withObject,
+    withText,
+    (.:?),
+ )
+import Data.Aeson.Key qualified as AesonKey
+import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Aeson.Types (Parser)
+import Data.ByteString (ByteString)
 import Data.Char (toLower)
 import Data.Maybe (isJust)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Occam.Evaluation (parseSQLDialect)
 import Occam.Logger (LogFormat (..), LogLevel (..))
 import Occam.Parser (SQLDialect (..))
 import Occam.Reducer (
     ColumnMode (..),
-    StatementSearchPolicy,
+    StatementSearchPolicy (..),
+    convergedRankedScheduleConfig,
     statementRankedFallback,
  )
 import System.Environment (lookupEnv)
@@ -96,23 +120,62 @@ strategyName StrategyFull = "full"
 strategyName StrategyDdminOnly = "ddmin-only"
 strategyName StrategyAuditOnly = "audit-only"
 
+parseLogLevel :: String -> Either String LogLevel
+parseLogLevel s = case map toLower s of
+    "debug" -> Right LevelDebug
+    "info" -> Right LevelInfo
+    "warn" -> Right LevelWarn
+    "warning" -> Right LevelWarn
+    "error" -> Right LevelError
+    _ -> Left "Expected debug, info, warn, or error"
+
+parseLogFormat :: String -> Either String LogFormat
+parseLogFormat s = case map toLower s of
+    "text" -> Right FormatText
+    "json" -> Right FormatJSON
+    _ -> Left "Expected text or json"
+
+parseStatementOrder :: String -> Either String StatementSearchPolicy
+parseStatementOrder s = case map toLower s of
+    "ranked-fallback" -> Right statementRankedFallback
+    "ranked" -> Right (StatementRankedWith convergedRankedScheduleConfig)
+    "subset-first" -> Right StatementSubsetFirst
+    "complement-first" -> Right StatementComplementFirst
+    "byte-weighted" -> Right StatementByteWeighted
+    _ -> Left "Expected ranked-fallback, ranked, byte-weighted, complement-first, or subset-first"
+
+parseColumnMode :: String -> Either String ColumnMode
+parseColumnMode s = case map toLower s of
+    "off" -> Right ColumnOff
+    "single" -> Right ColumnSingle
+    "atomic" -> Right ColumnAtomic
+    _ -> Left "Expected off, single, or atomic"
+
+parseStrategy :: String -> Either String ReductionStrategy
+parseStrategy s = case map toLower s of
+    "full" -> Right StrategyFull
+    "ddmin-only" -> Right StrategyDdminOnly
+    "audit-only" -> Right StrategyAuditOnly
+    _ -> Left "Expected full, ddmin-only, or audit-only"
+
 data RawOptions = RawOptions
     { rawInputFile :: !FilePath
     , rawOracleCmd :: !(Maybe String)
     , rawOut :: !(Maybe FilePath)
-    , rawResultOracle :: !Bool
-    , rawInPlace :: !Bool
+    , rawResultOracle :: !(Specified Bool)
+    , rawInPlace :: !(Specified Bool)
     , rawStatsFile :: !(Maybe FilePath)
     , rawResetCmd :: !(Maybe String)
-    , rawTimeoutSecs :: !Double
+    , rawConfigFile :: !(Maybe FilePath)
+    , rawTimeoutSecs :: !(Specified Double)
     , rawLogLevel :: !(Specified LogLevel)
-    , rawLogFormat :: !LogFormat
-    , rawVerbose :: !Bool
-    , rawQuiet :: !Bool
-    , rawColor :: !ColorMode
+    , rawLogFormat :: !(Specified LogFormat)
+    , rawVerbose :: !(Specified Bool)
+    , rawQuiet :: !(Specified Bool)
+    , rawColor :: !(Specified ColorMode)
     , rawBudgetSecs :: !(Maybe Double)
     , rawMaxOracleExecutions :: !(Maybe Int)
-    , rawJobs :: !Int
+    , rawJobs :: !(Specified Int)
     , rawSlicing :: !(Specified Bool)
     , rawClosure :: !(Specified Bool)
     , rawIntraStatement :: !(Specified Bool)
@@ -134,22 +197,23 @@ data RawOptions = RawOptions
 defaultRawOptions :: RawOptions
 defaultRawOptions =
     RawOptions
-        { rawInputFile = "INPUT.sql"
+        { rawConfigFile = Nothing
+        , rawInputFile = "INPUT.sql"
         , rawOracleCmd = Nothing
-        , rawResultOracle = False
+        , rawResultOracle = Default False
         , rawOut = Nothing
-        , rawInPlace = False
+        , rawInPlace = Default False
         , rawStatsFile = Nothing
         , rawResetCmd = Nothing
-        , rawTimeoutSecs = 10.0
+        , rawTimeoutSecs = Default 10.0
         , rawLogLevel = Default LevelWarn
-        , rawLogFormat = FormatText
-        , rawVerbose = False
-        , rawQuiet = False
-        , rawColor = ColorAuto
+        , rawLogFormat = Default FormatText
+        , rawVerbose = Default False
+        , rawQuiet = Default False
+        , rawColor = Default ColorAuto
         , rawBudgetSecs = Nothing
         , rawMaxOracleExecutions = Nothing
-        , rawJobs = 1
+        , rawJobs = Default 1
         , rawSlicing = Default True
         , rawClosure = Default True
         , rawIntraStatement = Default False
@@ -165,6 +229,171 @@ defaultRawOptions =
         , rawDumpFacts = False
         , rawDumpFactsFkOn = False
         }
+
+-- | Partial JSON configuration decoded from @--config@ (e.g. compiled from Dhall).
+data ConfigPatch = ConfigPatch
+    { cfgDialect :: !(Maybe SQLDialect)
+    , cfgStrategy :: !(Maybe ReductionStrategy)
+    , cfgSlicing :: !(Maybe Bool)
+    , cfgClosure :: !(Maybe Bool)
+    , cfgIntraStatement :: !(Maybe Bool)
+    , cfgStatementOrder :: !(Maybe StatementSearchPolicy)
+    , cfgLiteralBatches :: !(Maybe Bool)
+    , cfgAstBatching :: !(Maybe Bool)
+    , cfgAdaptiveValues :: !(Maybe Bool)
+    , cfgColumnMode :: !(Maybe ColumnMode)
+    , cfgUnrestricted :: !(Maybe Bool)
+    , cfgCache :: !(Maybe Bool)
+    , cfgTimeout :: !(Maybe Double)
+    , cfgJobs :: !(Maybe Int)
+    , cfgBudget :: !(Maybe Double)
+    , cfgMaxOracleExecutions :: !(Maybe Int)
+    , cfgResultOracle :: !(Maybe Bool)
+    , cfgOracle :: !(Maybe String)
+    , cfgReset :: !(Maybe String)
+    , cfgOut :: !(Maybe FilePath)
+    , cfgInPlace :: !(Maybe Bool)
+    , cfgStats :: !(Maybe FilePath)
+    , cfgLogLevel :: !(Maybe LogLevel)
+    , cfgLogLevelJson :: !(Maybe LogLevel)
+    , cfgLogFormat :: !(Maybe LogFormat)
+    , cfgVerbose :: !(Maybe Bool)
+    , cfgQuiet :: !(Maybe Bool)
+    , cfgColor :: !(Maybe ColorMode)
+    }
+    deriving (Eq, Show)
+
+knownConfigKeys :: Set.Set Text
+knownConfigKeys =
+    Set.fromList
+        [ "dialect"
+        , "strategy"
+        , "slicing"
+        , "closure"
+        , "intra_statement"
+        , "statement_order"
+        , "literal_batches"
+        , "ast_batching"
+        , "adaptive_values"
+        , "column_mode"
+        , "unrestricted"
+        , "cache"
+        , "timeout"
+        , "jobs"
+        , "budget"
+        , "max_oracle_executions"
+        , "result_oracle"
+        , "oracle"
+        , "reset"
+        , "out"
+        , "in_place"
+        , "stats"
+        , "log_level"
+        , "log_level_json"
+        , "log_format"
+        , "verbose"
+        , "quiet"
+        , "color"
+        ]
+
+parseEnumField :: (String -> Either String a) -> String -> Value -> Parser a
+parseEnumField reader label =
+    withText label $ either fail pure . reader . T.unpack
+
+optEnum ::
+    (String -> Either String a) -> String -> KeyMap.KeyMap Value -> AesonKey.Key -> Parser (Maybe a)
+optEnum reader label obj key = do
+    mVal <- obj .:? key
+    traverse (parseEnumField reader label) mVal
+
+instance FromJSON ConfigPatch where
+    parseJSON = withObject "OccamConfig" $ \obj -> do
+        forM_ (KeyMap.keys obj) $ \k ->
+            let txt = AesonKey.toText k
+             in when (Set.notMember txt knownConfigKeys) $
+                    fail ("Unknown --config key: " ++ T.unpack txt)
+        ConfigPatch
+            <$> optEnum parseSQLDialect "dialect" obj "dialect"
+            <*> optEnum parseStrategy "strategy" obj "strategy"
+            <*> obj .:? "slicing"
+            <*> obj .:? "closure"
+            <*> obj .:? "intra_statement"
+            <*> optEnum parseStatementOrder "statement_order" obj "statement_order"
+            <*> obj .:? "literal_batches"
+            <*> obj .:? "ast_batching"
+            <*> obj .:? "adaptive_values"
+            <*> optEnum parseColumnMode "column_mode" obj "column_mode"
+            <*> obj .:? "unrestricted"
+            <*> obj .:? "cache"
+            <*> obj .:? "timeout"
+            <*> obj .:? "jobs"
+            <*> obj .:? "budget"
+            <*> obj .:? "max_oracle_executions"
+            <*> obj .:? "result_oracle"
+            <*> obj .:? "oracle"
+            <*> obj .:? "reset"
+            <*> obj .:? "out"
+            <*> obj .:? "in_place"
+            <*> obj .:? "stats"
+            <*> optEnum parseLogLevel "log_level" obj "log_level"
+            <*> optEnum parseLogLevel "log_level_json" obj "log_level_json"
+            <*> optEnum parseLogFormat "log_format" obj "log_format"
+            <*> obj .:? "verbose"
+            <*> obj .:? "quiet"
+            <*> optEnum parseColorMode "color" obj "color"
+
+parseConfigPatch :: ByteString -> Either String ConfigPatch
+parseConfigPatch = eitherDecodeStrict'
+
+applyConfigPatch :: ConfigPatch -> RawOptions -> Either String RawOptions
+applyConfigPatch patch cliOpts = do
+    -- Validate internal consistency of options originating solely from the config file.
+    let cfgAlone = mergeWith True patch defaultRawOptions
+    validateStrategyConflicts cfgAlone
+    pure (mergeWith (not (isExplicit (rawStrategy cliOpts))) patch cliOpts)
+    where
+        mergeWith markExplicit p opts =
+            let pickSpec :: Maybe a -> Specified a -> Specified a
+                pickSpec Nothing cur = cur
+                pickSpec (Just cfgVal) (Default _)
+                    | markExplicit = Explicit cfgVal
+                    | otherwise = Default cfgVal
+                pickSpec _ cur@(Explicit _) = cur
+                pickSimple :: Maybe a -> Specified a -> Specified a
+                pickSimple Nothing cur = cur
+                pickSimple (Just cfgVal) (Default _) = Explicit cfgVal
+                pickSimple _ cur@(Explicit _) = cur
+                pickMaybe :: Maybe a -> Maybe a -> Maybe a
+                pickMaybe mCfg mCli = mCli <|> mCfg
+             in opts
+                    { rawDialect = pickMaybe (cfgDialect p) (rawDialect opts)
+                    , rawStrategy = pickSimple (cfgStrategy p) (rawStrategy opts)
+                    , rawSlicing = pickSpec (cfgSlicing p) (rawSlicing opts)
+                    , rawClosure = pickSpec (cfgClosure p) (rawClosure opts)
+                    , rawIntraStatement = pickSpec (cfgIntraStatement p) (rawIntraStatement opts)
+                    , rawStatementOrder = pickSpec (cfgStatementOrder p) (rawStatementOrder opts)
+                    , rawLiteralBatches = pickSpec (cfgLiteralBatches p) (rawLiteralBatches opts)
+                    , rawAstBatching = pickSpec (cfgAstBatching p) (rawAstBatching opts)
+                    , rawAdaptiveValues = pickSpec (cfgAdaptiveValues p) (rawAdaptiveValues opts)
+                    , rawColumnMode = pickSpec (cfgColumnMode p) (rawColumnMode opts)
+                    , rawUnrestricted = pickSpec (cfgUnrestricted p) (rawUnrestricted opts)
+                    , rawCache = pickSpec (cfgCache p) (rawCache opts)
+                    , rawTimeoutSecs = pickSimple (cfgTimeout p) (rawTimeoutSecs opts)
+                    , rawJobs = pickSimple (cfgJobs p) (rawJobs opts)
+                    , rawBudgetSecs = pickMaybe (cfgBudget p) (rawBudgetSecs opts)
+                    , rawMaxOracleExecutions = pickMaybe (cfgMaxOracleExecutions p) (rawMaxOracleExecutions opts)
+                    , rawResultOracle = pickSimple (cfgResultOracle p) (rawResultOracle opts)
+                    , rawOracleCmd = pickMaybe (cfgOracle p) (rawOracleCmd opts)
+                    , rawResetCmd = pickMaybe (cfgReset p) (rawResetCmd opts)
+                    , rawOut = pickMaybe (cfgOut p) (rawOut opts)
+                    , rawInPlace = pickSimple (cfgInPlace p) (rawInPlace opts)
+                    , rawStatsFile = pickMaybe (cfgStats p) (rawStatsFile opts)
+                    , rawLogLevel = pickSimple (cfgLogLevel p) (rawLogLevel opts)
+                    , rawLogFormat = pickSimple (cfgLogFormat p) (rawLogFormat opts)
+                    , rawVerbose = pickSimple (cfgVerbose p) (rawVerbose opts)
+                    , rawQuiet = pickSimple (cfgQuiet p) (rawQuiet opts)
+                    , rawColor = pickSimple (cfgColor p) (rawColor opts)
+                    }
 
 -- | Log level used when the format is not explicitly configured as JSON.
 defaultLogLevelForFormat :: LogFormat -> LogLevel
@@ -213,15 +442,23 @@ data ValidatedOptions = ValidatedOptions
 validateCliOptions :: RawOptions -> Either String ValidatedOptions
 validateCliOptions opts@RawOptions {..} = do
     dialect <- maybe (Left "Missing required --dialect (see --list-dialects)") Right rawDialect
+    let verbose = getSpecified rawVerbose
+        quiet = getSpecified rawQuiet
+        inPlace = getSpecified rawInPlace
+        resultOracle = getSpecified rawResultOracle
+        timeoutSecs = getSpecified rawTimeoutSecs
+        jobs = getSpecified rawJobs
+        logFormat = getSpecified rawLogFormat
+        color = getSpecified rawColor
 
     -- 1. Mutually exclusive flags
-    when (rawVerbose && rawQuiet) $
+    when (verbose && quiet) $
         Left "Cannot specify both --verbose and --quiet"
-    when (rawInPlace && isJust rawOut) $
+    when (inPlace && isJust rawOut) $
         Left "Cannot specify both --in-place and --out"
-    when (rawInPlace && rawInputFile == "-") $
+    when (inPlace && rawInputFile == "-") $
         Left "Cannot modify stdin in place (--in-place with '-' input)"
-    when rawResultOracle $ do
+    when resultOracle $ do
         when (isJust rawOracleCmd || isJust rawResetCmd) $
             Left "--result-oracle cannot be combined with --oracle or --reset"
         when (dialect /= SQLite && dialect /= DuckDB) $
@@ -236,7 +473,7 @@ validateCliOptions opts@RawOptions {..} = do
         litBatches = getSpecified rawLiteralBatches
         astBatches = getSpecified rawAstBatching
         adaptValues = case rawAdaptiveValues of
-            Default _ -> rawResultOracle
+            Default _ -> resultOracle
             Explicit enabled -> enabled
     when (colMode /= ColumnOff && not intra) $
         Left
@@ -249,7 +486,7 @@ validateCliOptions opts@RawOptions {..} = do
         ]
 
     -- 4. Numeric bounds
-    validateNumericBounds rawTimeoutSecs rawJobs rawBudgetSecs rawMaxOracleExecutions
+    validateNumericBounds timeoutSecs jobs rawBudgetSecs rawMaxOracleExecutions
 
     -- 5. Effective flags according to strategy
     let strategy = getSpecified rawStrategy
@@ -262,20 +499,20 @@ validateCliOptions opts@RawOptions {..} = do
         ValidatedOptions
             { valInputFile = rawInputFile
             , valOracleCmd = rawOracleCmd
-            , valResultOracle = rawResultOracle
+            , valResultOracle = resultOracle
             , valOut = rawOut
-            , valInPlace = rawInPlace
+            , valInPlace = inPlace
             , valStatsFile = rawStatsFile
             , valResetCmd = rawResetCmd
-            , valTimeoutSecs = rawTimeoutSecs
+            , valTimeoutSecs = timeoutSecs
             , valLogLevel = rawLogLevel
-            , valLogFormat = rawLogFormat
-            , valVerbose = rawVerbose
-            , valQuiet = rawQuiet
-            , valColor = rawColor
+            , valLogFormat = logFormat
+            , valVerbose = verbose
+            , valQuiet = quiet
+            , valColor = color
             , valBudgetSecs = rawBudgetSecs
             , valMaxOracleExecutions = rawMaxOracleExecutions
-            , valJobs = rawJobs
+            , valJobs = jobs
             , valSlicing = effSlicing
             , valClosure = effClosure
             , valIntraStatement = effIntra

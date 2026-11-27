@@ -63,6 +63,17 @@ Replaced `rust/sqlparser-ffi` (`sqlparser-rs 0.64.0` + C ABI + `OCCM\x02` binary
 - [X] Switch `Occam.Parser` to the pure-Haskell frontend (`Occam.Frontend.Pipeline.parseFrontend`); verified full unit/property/integration/corpus regression parity, `occam-bench` `parse` microbenchmark throughput, and 71-case `benchmarks/real_fuzz_corpus/` barrier census.
 - [X] Remove `rust/`, `Setup.hs` Cargo build hooks, `static-rust` Cabal flag, `Occam.Parser.Native`, `Occam.Parser.Binary*`, `Occam.Frontend.Facts`, `occam-frontend-diff`, and obsolete `sqlparser-rs` entries from CI/Nix/Makefile/docs.
 
+** IN_PROGRESS [#A] Dhall Typed Config & Harness De-Pythonification
+Eliminate ad-hoc hardcoded config dicts, env parsing, and bash YAML heredocs across `harness/` via strongly-typed Dhall (`config/dhall/`), keeping `lib:occam` / `exe:occam` free of Hackage `dhall` runtime bloat by compiling Dhall to deterministic JSON under `config/generated/` via `dhall-to-json` in dev/CI.
+*** Phase A: Dhall Toolchain & Typed Single-Source Schemas (`config/dhall/`) [DONE]
+- [X] Add `pkgs.dhall`, `pkgs.dhall-json`, and `pkgs.dhall-yaml` to `flake.nix` devShells and add `dhall-gen` / `dhall-check` targets to `Makefile` (`make check`) for static type-checking and zero-drift JSON verification.
+- [X] Define `DbmsSpecs.dhall` (`postgres | mysql | mariadb | clickhouse | sqlite | duckdb`) covering `occam_dialect`, `container_image`, `default_port`, `default_db`, and `server_based`; fix `"mariadb": "mysql"` dialect drift in `harness/collect_fuzzer_crashes.py` (`DBMS_TO_OCCAM_DIALECT`).
+- [X] Define `Experiment.dhall` and `Profiles.dhall` unifying `harness/batch_eval.py` (`DEFAULT_IMAGES`, `DEFAULT_CONTAINER_PORTS`, `BUILTIN_PROFILES`: `audit-only`, `ddmin-only`, `Ours-S`, `Ours-SI`, `Ours-Full`, `Ours-NoDep`, plus `--plan`), `harness/crash_oracle.py` oracle knobs (`ORACLE_TIMEOUT`, `ORACLE_STACK_FRAMES`, `ORACLE_REJECT_ON_SLIPPAGE`), and Stage 2 repeats/budget settings.
+- [X] Replace `harness/squirrel_driver.sh` `cat <<EOF` YAML heredocs with `harness/dhall_config.py render-squirrel-yaml` driven by typed `config/dhall/Squirrel.dhall` specs (copied into `harness/Dockerfile.fuzzer-squirrel` cleanly).
+*** Phase B: Occam CLI `--config` & Python Script Consolidation
+- [X] Add `--config <json>` to `app/Options.hs` / `app/Options/Parser.hs` (`RawOptions` decoded via existing `aeson`, with explicit CLI flags overriding config defaults) plus Dhall presets (`config/dhall/profiles/*.dhall` -> `config/generated/profiles/*.json`) and `CliChecks` syncing `--print-defaults` against `config/generated/occam_defaults.json`.
+- [ ] Slim down or replace remaining Python harness orchestration (`harness/batch_eval.py` 2.3k LoC, `harness/collect_fuzzer_crashes.py`, `harness/crash_oracle.py`): migrate container/execution/reporting pipelines from Python into typed Haskell or minimal thin wrappers now that configuration is cleanly factored into Dhall.
+
 ** TODO [#A] Multi-DBMS crash validation & thesis evaluation roadmap
 *** Stage 1: Local harness & orchestration (DONE)
 - [X] Target DBMS Dockerfiles (`pg`, `mysql`, `mariadb`, `sqlite`, `duckdb`, `clickhouse`), `harness/crash_oracle.py`, `harness/reset_db.sh`, structured crash signatures / RQ3 slippage tracking, fuzzer drivers (`sqlancer`, `squirrel`), `harness/batch_eval.py`, and 71-case `benchmarks/real_fuzz_corpus/` (verified via `make harness-check` 98/98).

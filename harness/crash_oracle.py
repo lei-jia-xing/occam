@@ -58,14 +58,34 @@ import subprocess
 import sys
 import time
 
+_HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HARNESS_DIR not in sys.path:
+    sys.path.insert(0, _HARNESS_DIR)
+
+try:
+    from dhall_config import (  # noqa: E402
+        EMBEDDED_DBMS,
+        ORACLE_DEFAULTS,
+        SERVER_DBMS,
+        SUPPORTED_DBMS,
+    )
+except (ImportError, FileNotFoundError):
+    EMBEDDED_DBMS = {"sqlite", "duckdb"}
+    SERVER_DBMS = {"postgres", "mysql", "mariadb", "clickhouse"}
+    SUPPORTED_DBMS = ("postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb")
+    ORACLE_DEFAULTS = {
+        "timeout_secs": 0.0,
+        "stack_frames": 5,
+        "reject_on_slippage": False,
+        "allow_stderr_only": False,
+        "allow_psql_meta": False,
+        "verbose": False,
+    }
+
 MAX_LOG_READ_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_LOG_BYTES = 32 * 1024 * 1024
 LOG_WAIT_SECONDS = 2.0
 LOG_POLL_INTERVAL = 0.05
-
-EMBEDDED_DBMS = {"sqlite", "duckdb"}
-SERVER_DBMS = {"postgres", "mysql", "mariadb", "clickhouse"}
-SUPPORTED_DBMS = ("postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb")
 
 SIGNAL_NAMES = {
     4: "SIGILL",
@@ -2243,13 +2263,13 @@ def main():
     parser.add_argument(
         "--reject-on-slippage",
         action="store_true",
-        default=env_flag("ORACLE_REJECT_ON_SLIPPAGE"),
+        default=env_flag("ORACLE_REJECT_ON_SLIPPAGE") or bool(ORACLE_DEFAULTS.get("reject_on_slippage", False)),
         help="Reject faults whose normalized crash_signature differs from --baseline-signature",
     )
     parser.add_argument(
         "--stack-frames",
         type=int,
-        default=_env_int("ORACLE_STACK_FRAMES", 5),
+        default=_env_int("ORACLE_STACK_FRAMES", int(ORACLE_DEFAULTS.get("stack_frames", 5))),
         help="Maximum non-wrapper stack frames retained in crash_signature (default: 5)",
     )
     parser.add_argument(
@@ -2281,7 +2301,7 @@ def main():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=_env_float("ORACLE_TIMEOUT", 0.0),
+        default=_env_float("ORACLE_TIMEOUT", float(ORACLE_DEFAULTS.get("timeout_secs", 0.0))),
         help=(
             "Optional client-side timeout in seconds (default: 0 = disabled). "
             "Under Occam leave this disabled and use Occam's --timeout instead."
@@ -2290,19 +2310,19 @@ def main():
     parser.add_argument(
         "--allow-stderr-only",
         action="store_true",
-        default=env_flag("ORACLE_ALLOW_STDERR_ONLY"),
+        default=env_flag("ORACLE_ALLOW_STDERR_ONLY") or bool(ORACLE_DEFAULTS.get("allow_stderr_only", False)),
         help="UNSAFE: accept connection loss from stderr when no server log is configured",
     )
     parser.add_argument(
         "--allow-psql-meta",
         action="store_true",
-        default=env_flag("ORACLE_ALLOW_PSQL_META"),
+        default=env_flag("ORACLE_ALLOW_PSQL_META") or bool(ORACLE_DEFAULTS.get("allow_psql_meta", False)),
         help="UNSAFE: allow psql backslash meta-commands in candidate SQL",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        default=env_flag("ORACLE_VERBOSE"),
+        default=env_flag("ORACLE_VERBOSE") or bool(ORACLE_DEFAULTS.get("verbose", False)),
         help="Print verbose diagnostics to stderr",
     )
 

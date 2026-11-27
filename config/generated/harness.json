@@ -1,0 +1,355 @@
+{
+  "dbms": [
+    {
+      "container_image": "occam-target-pg",
+      "container_log": "/var/log/postgresql/postgresql.log",
+      "default_db": "occam_test",
+      "default_host": "127.0.0.1",
+      "default_port": 5432,
+      "default_user": "postgres",
+      "id": "postgres",
+      "occam_dialect": "postgresql",
+      "server_based": true,
+      "sqlancer_port": 5432,
+      "sqlancer_subcommand": "postgres",
+      "squirrel_db": "postgresql"
+    },
+    {
+      "container_image": "occam-target-mysql",
+      "container_log": "/var/log/mysql/error.log",
+      "default_db": "occam_test",
+      "default_host": "127.0.0.1",
+      "default_port": 3306,
+      "default_user": "root",
+      "id": "mysql",
+      "occam_dialect": "mysql",
+      "server_based": true,
+      "sqlancer_port": 3306,
+      "sqlancer_subcommand": "mysql",
+      "squirrel_db": "mysql"
+    },
+    {
+      "container_image": "occam-target-mariadb",
+      "container_log": "/var/log/mysql/error.log",
+      "default_db": "occam_test",
+      "default_host": "127.0.0.1",
+      "default_port": 3306,
+      "default_user": "root",
+      "id": "mariadb",
+      "occam_dialect": "mariadb",
+      "server_based": true,
+      "sqlancer_port": 3306,
+      "sqlancer_subcommand": "mariadb",
+      "squirrel_db": "mysql"
+    },
+    {
+      "container_image": "occam-target-clickhouse",
+      "container_log": "/var/log/clickhouse-server/clickhouse-server.err.log",
+      "default_db": "occam_test",
+      "default_host": "127.0.0.1",
+      "default_port": 9000,
+      "default_user": "default",
+      "id": "clickhouse",
+      "occam_dialect": "clickhouse",
+      "server_based": true,
+      "sqlancer_port": 8123,
+      "sqlancer_subcommand": "clickhouse"
+    },
+    {
+      "container_image": "occam-target-sqlite",
+      "default_db": ":memory:",
+      "id": "sqlite",
+      "occam_dialect": "sqlite",
+      "server_based": false,
+      "sqlancer_subcommand": "sqlite3",
+      "squirrel_db": "sqlite"
+    },
+    {
+      "container_image": "occam-target-duckdb",
+      "default_db": ":memory:",
+      "id": "duckdb",
+      "occam_dialect": "duckdb",
+      "server_based": false,
+      "sqlancer_subcommand": "duckdb"
+    }
+  ],
+  "occam_defaults": {
+    "adaptive_values": false,
+    "ast_batching": false,
+    "cache": true,
+    "closure": true,
+    "color": "auto",
+    "column_mode": "off",
+    "intra_statement": false,
+    "jobs": 1,
+    "literal_batches": false,
+    "log_format": "text",
+    "log_level": "warn",
+    "log_level_json": "info",
+    "slicing": true,
+    "statement_order": "ranked-fallback",
+    "strategy": "full",
+    "timeout": 10,
+    "unrestricted": true
+  },
+  "oracle": {
+    "allow_psql_meta": false,
+    "allow_stderr_only": false,
+    "reject_on_slippage": false,
+    "stack_frames": 5,
+    "timeout_secs": 0,
+    "verbose": false
+  },
+  "plans": {
+    "smoke": {
+      "container_wait_secs": 30,
+      "dbms": [
+        "postgres",
+        "mysql",
+        "mariadb",
+        "clickhouse",
+        "sqlite",
+        "duckdb"
+      ],
+      "name": "smoke",
+      "no_cache": false,
+      "occam_jobs": 1,
+      "oracle": {
+        "allow_psql_meta": false,
+        "allow_stderr_only": false,
+        "reject_on_slippage": false,
+        "stack_frames": 5,
+        "timeout_secs": 0,
+        "verbose": false
+      },
+      "profiles": [
+        "Ours-S"
+      ],
+      "repeats": 1,
+      "timeout_secs": 10,
+      "worker_jobs": 1
+    },
+    "stage2_thesis": {
+      "budget_secs": 600,
+      "container_wait_secs": 30,
+      "dbms": [
+        "postgres",
+        "mysql",
+        "mariadb",
+        "clickhouse",
+        "sqlite",
+        "duckdb"
+      ],
+      "name": "stage2-thesis",
+      "no_cache": false,
+      "occam_jobs": 1,
+      "oracle": {
+        "allow_psql_meta": false,
+        "allow_stderr_only": false,
+        "reject_on_slippage": true,
+        "stack_frames": 5,
+        "timeout_secs": 0,
+        "verbose": false
+      },
+      "profiles": [
+        "audit-only",
+        "ddmin-only",
+        "Ours-S",
+        "Ours-SI",
+        "Ours-Full",
+        "Ours-NoDep"
+      ],
+      "repeats": 3,
+      "timeout_secs": 10,
+      "worker_jobs": 4
+    }
+  },
+  "profiles": [
+    {
+      "cli_flags": [
+        "--strategy",
+        "audit-only"
+      ],
+      "config": {
+        "strategy": "audit-only"
+      },
+      "key": "audit-only",
+      "name": "audit-only"
+    },
+    {
+      "cli_flags": [
+        "--strategy",
+        "ddmin-only"
+      ],
+      "config": {
+        "strategy": "ddmin-only"
+      },
+      "key": "ddmin-only",
+      "name": "ddmin-only"
+    },
+    {
+      "cli_flags": [
+        "--strategy",
+        "full",
+        "--no-intra-statement"
+      ],
+      "config": {
+        "intra_statement": false,
+        "strategy": "full"
+      },
+      "key": "ours-s",
+      "name": "Ours-S"
+    },
+    {
+      "cli_flags": [
+        "--strategy",
+        "full",
+        "--intra-statement",
+        "--column-mode",
+        "off"
+      ],
+      "config": {
+        "column_mode": "off",
+        "intra_statement": true,
+        "strategy": "full"
+      },
+      "key": "ours-si",
+      "name": "Ours-SI"
+    },
+    {
+      "cli_flags": [
+        "--strategy",
+        "full",
+        "--intra-statement",
+        "--column-mode",
+        "atomic"
+      ],
+      "config": {
+        "column_mode": "atomic",
+        "intra_statement": true,
+        "strategy": "full"
+      },
+      "key": "ours-full",
+      "name": "Ours-Full"
+    },
+    {
+      "cli_flags": [
+        "--strategy",
+        "full",
+        "--no-slicing",
+        "--no-closure"
+      ],
+      "config": {
+        "closure": false,
+        "slicing": false,
+        "strategy": "full"
+      },
+      "key": "ours-nodep",
+      "name": "Ours-NoDep"
+    }
+  ],
+  "squirrel": [
+    {
+      "db": "sqlite",
+      "dbms": "sqlite",
+      "default_input_subdir": "sqlite_input",
+      "init_lib_rel": "data/fuzz_root/init_lib",
+      "mutator_dbms": "sqlite",
+      "pragma_rel": "data/fuzz_root/pragma",
+      "required": [
+        "init_lib",
+        "pragma"
+      ],
+      "should_exist": [
+        "init_lib",
+        "pragma"
+      ],
+      "target_bin_rel": "bin/sqlite_ossfuzz"
+    },
+    {
+      "data_lib_rel": "data/fuzz_root/global_data_lib_pqsql",
+      "db": "postgresql",
+      "dbms": "postgresql",
+      "default_db": "postgres",
+      "default_host": "127.0.0.1",
+      "default_input_subdir": "pqsql_input",
+      "default_port": 5432,
+      "default_user": "postgres",
+      "init_lib_rel": "data/fuzz_root/pqsql_init_lib",
+      "mutator_dbms": "postgresql",
+      "required": [
+        "init_lib",
+        "data_lib",
+        "db",
+        "passwd",
+        "user_name",
+        "host",
+        "db_name",
+        "startup_cmd"
+      ],
+      "should_exist": [
+        "init_lib",
+        "data_lib"
+      ],
+      "target_bin_rel": "build/db_driver"
+    },
+    {
+      "data_lib_rel": "data/fuzz_root/global_data_lib_mysql",
+      "db": "mysql",
+      "dbms": "mysql",
+      "default_db": "test",
+      "default_host": "127.0.0.1",
+      "default_input_subdir": "mysql_input",
+      "default_port": 3306,
+      "default_socket": "/tmp/mysql.sock",
+      "default_user": "root",
+      "init_lib_rel": "data/fuzz_root/mysql_init_lib",
+      "mutator_dbms": "mysql",
+      "required": [
+        "init_lib",
+        "data_lib",
+        "db",
+        "passwd",
+        "user_name",
+        "host",
+        "sock_path",
+        "db_prefix",
+        "startup_cmd"
+      ],
+      "should_exist": [
+        "init_lib",
+        "data_lib"
+      ],
+      "target_bin_rel": "build/db_driver"
+    },
+    {
+      "data_lib_rel": "data/fuzz_root/global_data_lib_mysql",
+      "db": "mysql",
+      "dbms": "mariadb",
+      "default_db": "test",
+      "default_host": "127.0.0.1",
+      "default_input_subdir": "mysql_input",
+      "default_port": 3306,
+      "default_socket": "/tmp/mysql.sock",
+      "default_user": "root",
+      "init_lib_rel": "data/fuzz_root/mysql_init_lib",
+      "mutator_dbms": "mysql",
+      "required": [
+        "init_lib",
+        "data_lib",
+        "db",
+        "passwd",
+        "user_name",
+        "host",
+        "sock_path",
+        "db_prefix",
+        "startup_cmd"
+      ],
+      "should_exist": [
+        "init_lib",
+        "data_lib"
+      ],
+      "target_bin_rel": "build/db_driver"
+    }
+  ]
+}

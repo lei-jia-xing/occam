@@ -277,12 +277,14 @@ python3 harness/collect_fuzzer_crashes.py \
 - **Aggregation**: Produces `aggregated_stats.json` and `summary.md`, keeping `completed` separate from `timeout`/`execution-budget` censoring, computing Attempt-AUC and engine overhead, and stratifying results by unique crash signature (`by_signature`, `signature_stratified_by_profile`).
 
 ```bash
-# Dry-run plan across benchmarks/real_fuzz_corpus (71 cases x 6 profiles x 3 repeats)
+# Dry-run Stage 2 thesis plan from config/dhall/Experiment.dhall (71 cases x 6 profiles x 3 repeats)
 python3 harness/batch_eval.py \
+  --plan stage2-thesis \
   --corpus-dir benchmarks/real_fuzz_corpus \
-  --profiles audit-only,ddmin-only,Ours-S,Ours-SI,Ours-Full,Ours-NoDep \
-  --repeats 3 --jobs 4 --out-dir occam-out/thesis_eval --dry-run
+  --out-dir occam-out/thesis_eval --dry-run
 ```
+
+Shared DBMS specs, ablation profiles, SQUIRREL YAML schemas, and experiment plans live in [`config/dhall/`](../config/dhall/) and compile deterministically to JSON under `config/generated/` (`make dhall-gen` / `make dhall-check`).
 
 ---
 

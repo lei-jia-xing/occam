@@ -418,6 +418,7 @@ tests =
                     ["--bash-completion-index", "1", "--bash-completion-word", "occam", "--bash-completion-word", "--"]
             assertEqual "completion options exit code" ExitSuccess cCode
             assertBool "completion includes --print-defaults" ("--print-defaults" `isInfixOf` cOut)
+            assertBool "completion includes --config" ("--config" `isInfixOf` cOut)
             assertBool "completion includes --dialect" ("--dialect" `isInfixOf` cOut)
             assertBool "completion includes --strategy" ("--strategy" `isInfixOf` cOut)
             assertBool "completion includes --completion" ("--completion" `isInfixOf` cOut)
@@ -804,4 +805,81 @@ tests =
                             "wrong error for --stats - with stdout"
                             ("--stats - cannot be combined" `isInfixOf` errText)
                 forM_ mIn hClose
+        , testCase "--print-defaults matches Dhall-compiled config/generated/occam_defaults.json" $ do
+            (pCode, pOut, pErr) <- runOccamCLI ["--print-defaults"]
+            assertEqual ("--print-defaults failed: " ++ pErr) ExitSuccess pCode
+            dhallBytes <- BS.readFile "config/generated/occam_defaults.json"
+            case ( eitherDecodeStrict' (BSC.pack pOut) :: Either String Value
+                 , eitherDecodeStrict' dhallBytes :: Either String Value
+                 ) of
+                (Right cliVal, Right dhallVal) ->
+                    assertEqual "CLI --print-defaults drifted from config/generated/occam_defaults.json" dhallVal cliVal
+                (Left e, _) -> assertFailure ("--print-defaults JSON decode failed: " ++ e)
+                (_, Left e) -> assertFailure ("config/generated/occam_defaults.json decode failed: " ++ e)
+        , testCase "--config applies Dhall profile JSON and CLI flags override it" $ do
+            let sql = "CREATE TABLE t (a INT, b INT);\nINSERT INTO t VALUES (1, 999);\nSELECT a FROM t;\n"
+            withCLIInput sql $ \input outRoot -> do
+                let outFull = outRoot ++ "-full.sql"
+                    statsFull = outRoot ++ "-full.json"
+                (c1, _, e1) <-
+                    runOccamCLI
+                        [ input
+                        , "--dialect"
+                        , "sqlite"
+                        , "--result-oracle"
+                        , "--config"
+                        , "config/generated/profiles/ours-full.json"
+                        , "--out"
+                        , outFull
+                        , "--stats"
+                        , statsFull
+                        , "--quiet"
+                        ]
+                assertEqual ("--config ours-full failed: " ++ e1) ExitSuccess c1
+                reduced <- BSC.readFile outFull
+                assertBool
+                    "ours-full atomic column mode should strip unused column b or simplify"
+                    (BS.length reduced < BS.length sql)
+
+                let outOverride = outRoot ++ "-override.sql"
+                    statsOverride = outRoot ++ "-override.json"
+                (c2, _, e2) <-
+                    runOccamCLI
+                        [ input
+                        , "--dialect"
+                        , "sqlite"
+                        , "--result-oracle"
+                        , "--config"
+                        , "config/generated/occam_defaults.json"
+                        , "--strategy"
+                        , "ddmin-only"
+                        , "--out"
+                        , outOverride
+                        , "--stats"
+                        , statsOverride
+                        , "--quiet"
+                        ]
+                assertEqual ("--config override failed: " ++ e2) ExitSuccess c2
+                encoded <- BS.readFile statsOverride
+                case eitherDecodeStrict' encoded :: Either String CliStats of
+                    Left err -> assertFailure ("stats decode failed: " ++ err)
+                    Right stats -> assertEqual "CLI --strategy must override config" "ddmin-only" (cliStrategy stats)
+        , testCase "--config rejects unknown keys, internal conflicts, and missing files" $
+            withCLIInput "SELECT 1;" $ \input outFile -> do
+                (badFileCode, _, badFileErr) <-
+                    runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--config", "nonexistent-occam-config.json"]
+                assertEqual "missing --config must exit 2" (ExitFailure 2) badFileCode
+                assertBool "missing --config error mentions --config" ("--config" `isInfixOf` badFileErr)
+
+                withCLIInput "{\"unknown_field\": 1}" $ \badKeyCfg _ -> do
+                    (badKeyCode, _, badKeyErr) <-
+                        runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--config", badKeyCfg, "--out", outFile]
+                    assertEqual "unknown --config key must exit 2" (ExitFailure 2) badKeyCode
+                    assertBool "unknown key message should mention key name" ("unknown_field" `isInfixOf` badKeyErr)
+
+                withCLIInput "{\"strategy\": \"ddmin-only\", \"slicing\": true}" $ \conflictCfg _ -> do
+                    (confCode, _, confErr) <-
+                        runOccamCLI [input, "-d", "sqlite", "-c", "exit 0", "--config", conflictCfg, "--out", outFile]
+                    assertEqual "conflicting --config options must exit 2" (ExitFailure 2) confCode
+                    assertBool "conflict error should mention ddmin-only" ("ddmin-only" `isInfixOf` confErr)
         ]

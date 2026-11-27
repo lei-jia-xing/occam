@@ -55,40 +55,12 @@ from collect_fuzzer_crashes import (
     resolve_engine_bin,
     run_replay_verification,
 )
-
-DEFAULT_CONTAINER_PORTS = {
-    "postgres": 5432,
-    "mysql": 3306,
-    "mariadb": 3306,
-    "clickhouse": 9000,
-}
-
-DEFAULT_IMAGES = {
-    "postgres": "occam-target-pg",
-    "mysql": "occam-target-mysql",
-    "mariadb": "occam-target-mariadb",
-    "clickhouse": "occam-target-clickhouse",
-    "sqlite": "occam-target-sqlite",
-    "duckdb": "occam-target-duckdb",
-}
-
-BUILTIN_PROFILES = {
-    "audit-only": ("audit-only", ["--strategy", "audit-only"]),
-    "ddmin-only": ("ddmin-only", ["--strategy", "ddmin-only"]),
-    "ours-s": ("Ours-S", ["--strategy", "full", "--no-intra-statement"]),
-    "ours-si": (
-        "Ours-SI",
-        ["--strategy", "full", "--intra-statement", "--column-mode", "off"],
-    ),
-    "ours-full": (
-        "Ours-Full",
-        ["--strategy", "full", "--intra-statement", "--column-mode", "atomic"],
-    ),
-    "ours-nodep": (
-        "Ours-NoDep",
-        ["--strategy", "full", "--no-slicing", "--no-closure"],
-    ),
-}
+from dhall_config import (
+    BUILTIN_PROFILES,
+    DEFAULT_CONTAINER_PORTS,
+    DEFAULT_IMAGES,
+    load_experiment_plan,
+)
 
 
 def resolve_occam_binary(explicit_path=""):
@@ -1763,8 +1735,16 @@ def main():
         help="Default expected crash signature regex for cases without metadata",
     )
     parser.add_argument(
+        "--plan",
+        default="",
+        help=(
+            "Experiment plan name ('smoke', 'stage2-thesis') or path to a .json/.dhall "
+            "ExperimentPlan file (CLI flags override plan defaults)"
+        ),
+    )
+    parser.add_argument(
         "--profiles",
-        default="Ours-S",
+        default=None,
         help=(
             "Comma-separated reduction profiles: audit-only,ddmin-only,Ours-S,Ours-SI,Ours-Full,Ours-NoDep "
             "(default: Ours-S)"
@@ -1779,20 +1759,20 @@ def main():
     parser.add_argument(
         "--repeats",
         type=int,
-        default=1,
+        default=None,
         help="Repetitions per (case, profile) pair (default: 1)",
     )
     parser.add_argument(
         "-j",
         "--jobs",
         type=int,
-        default=1,
+        default=None,
         help="Horizontal worker count (1 isolated container per worker, default: 1)",
     )
     parser.add_argument(
         "--occam-jobs",
         type=int,
-        default=1,
+        default=None,
         help="--jobs passed to each occam invocation (default: 1; server DBMSes require 1 unless --allow-unsafe-occam-jobs)",
     )
     parser.add_argument(
@@ -1852,14 +1832,14 @@ def main():
     parser.add_argument(
         "--container-wait",
         type=int,
-        default=30,
+        default=None,
         help="Max seconds waiting for container readiness/reset (default: 30)",
     )
 
     parser.add_argument(
         "--timeout",
         type=float,
-        default=10.0,
+        default=None,
         help="Per-probe --timeout in seconds passed to occam (default: 10.0)",
     )
     parser.add_argument(
@@ -1877,6 +1857,7 @@ def main():
     parser.add_argument(
         "--no-cache",
         action="store_true",
+        default=None,
         help="Pass --no-cache to occam",
     )
     parser.add_argument(
@@ -1898,12 +1879,13 @@ def main():
     parser.add_argument(
         "--reject-on-slippage",
         action="store_true",
+        default=None,
         help="Pass --reject-on-slippage to crash_oracle.py during reduction",
     )
     parser.add_argument(
         "--stack-frames",
         type=int,
-        default=5,
+        default=None,
         help="Stack frames retained in normalized RQ3 crash signatures (default: 5)",
     )
     parser.add_argument(
@@ -1941,6 +1923,45 @@ def main():
     )
 
     args = parser.parse_args()
+
+    plan_cfg = {}
+    if args.plan:
+        try:
+            plan_cfg = load_experiment_plan(args.plan)
+        except (ValueError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+            parser.error(f"failed to load --plan '{args.plan}': {exc}")
+    plan_oracle = plan_cfg.get("oracle") if isinstance(plan_cfg.get("oracle"), dict) else {}
+
+    if args.profiles is None:
+        raw_plan_profiles = plan_cfg.get("profiles")
+        args.profiles = (
+            ",".join(raw_plan_profiles)
+            if isinstance(raw_plan_profiles, list) and raw_plan_profiles
+            else "Ours-S"
+        )
+    if args.repeats is None:
+        args.repeats = int(plan_cfg.get("repeats", 1))
+    if args.jobs is None:
+        args.jobs = int(plan_cfg.get("worker_jobs", 1))
+    if args.occam_jobs is None:
+        args.occam_jobs = int(plan_cfg.get("occam_jobs", 1))
+    if args.container_wait is None:
+        args.container_wait = int(plan_cfg.get("container_wait_secs", 30))
+    if args.timeout is None:
+        args.timeout = float(plan_cfg.get("timeout_secs", 10.0))
+    if args.budget is None and plan_cfg.get("budget_secs") is not None:
+        args.budget = float(plan_cfg["budget_secs"])
+    if (
+        args.max_oracle_executions is None
+        and plan_cfg.get("max_oracle_executions") is not None
+    ):
+        args.max_oracle_executions = int(plan_cfg["max_oracle_executions"])
+    if args.no_cache is None:
+        args.no_cache = bool(plan_cfg.get("no_cache", False))
+    if args.reject_on_slippage is None:
+        args.reject_on_slippage = bool(plan_oracle.get("reject_on_slippage", False))
+    if args.stack_frames is None:
+        args.stack_frames = int(plan_oracle.get("stack_frames", 5))
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)

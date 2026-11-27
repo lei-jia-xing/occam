@@ -21,21 +21,19 @@ import tempfile
 import threading
 
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
+if HARNESS_DIR not in sys.path:
+    sys.path.insert(0, HARNESS_DIR)
+
+from dhall_config import (  # noqa: E402
+    DBMS_TO_OCCAM_DIALECT,
+    SERVER_DBMS,
+    SUPPORTED_DBMS,
+)
+
 CRASH_ORACLE_PATH = os.path.join(HARNESS_DIR, "crash_oracle.py")
 RESET_DB_PATH = os.path.join(HARNESS_DIR, "reset_db.sh")
 
-SUPPORTED_DBMS = ("postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb")
 SUPPORTED_SOURCES = ("squirrel", "sqlancer", "sqlsmith", "raw")
-SERVER_DBMS = {"postgres", "mysql", "mariadb", "clickhouse"}
-
-DBMS_TO_OCCAM_DIALECT = {
-    "postgres": "postgres",
-    "mysql": "mysql",
-    "mariadb": "mysql",
-    "clickhouse": "clickhouse",
-    "sqlite": "sqlite",
-    "duckdb": "duckdb",
-}
 
 JAVA_STACK_LINE_RE = re.compile(
     r"^(?:--\s*)?(?:"

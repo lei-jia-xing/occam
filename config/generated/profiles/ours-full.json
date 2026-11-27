@@ -1,0 +1,5 @@
+{
+  "column_mode": "atomic",
+  "intra_statement": true,
+  "strategy": "full"
+}

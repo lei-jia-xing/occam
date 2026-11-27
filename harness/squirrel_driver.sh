@@ -371,55 +371,33 @@ elif [[ "$SQUIRREL_DBMS" == "mysql" || "$SQUIRREL_DBMS" == "mariadb" ]]; then
     DB_NAME="${DB_NAME:-test}"
 fi
 
-yaml_quote() {
-    local val="$1"
-    val="${val//\'/\'\'}"
-    printf "'%s'" "$val"
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DHALL_CFG_HELPER=""
+for _cand in \
+    "${SCRIPT_DIR}/dhall_config.py" \
+    "/usr/local/share/occam/harness/dhall_config.py"; do
+    if [[ -f "$_cand" ]]; then
+        DHALL_CFG_HELPER="$_cand"
+        break
+    fi
+done
 
 if [[ -z "$CONFIG_FILE" ]]; then
     CONFIG_FILE="${OUTPUT_DIR}/squirrel_config_${SQUIRREL_DBMS}.yml"
-    if [[ "$SQUIRREL_DBMS" == "sqlite" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
----
-required: ["init_lib", "pragma"]
-should_exist: ["init_lib", "pragma"]
-init_lib: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/init_lib")
-pragma: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/pragma")
-db: sqlite
-EOF
-    elif [[ "$SQUIRREL_DBMS" == "postgresql" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
----
-required: ["init_lib", "data_lib", "db", "passwd", "user_name", "host", "db_name", "startup_cmd"]
-should_exist: ["init_lib", "data_lib"]
-init_lib: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/pqsql_init_lib")
-data_lib: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/global_data_lib_pqsql")
-db: postgresql
-passwd: $(yaml_quote "$PASSWORD")
-user_name: $(yaml_quote "$DB_USER")
-db_name: $(yaml_quote "$DB_NAME")
-host: $(yaml_quote "$HOST")
-port: ${PORT}
-startup_cmd: $(yaml_quote "$SERVER_CMD")
-EOF
-    else
-        cat > "$CONFIG_FILE" <<EOF
----
-required: ["init_lib", "data_lib", "db", "passwd", "user_name", "host", "sock_path", "db_prefix", "startup_cmd"]
-should_exist: ["init_lib", "data_lib"]
-init_lib: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/mysql_init_lib")
-data_lib: $(yaml_quote "${SQUIRREL_HOME}/data/fuzz_root/global_data_lib_mysql")
-db: mysql
-passwd: $(yaml_quote "$PASSWORD")
-user_name: $(yaml_quote "$DB_USER")
-host: $(yaml_quote "$HOST")
-port: ${PORT}
-sock_path: $(yaml_quote "$SOCKET")
-db_prefix: $(yaml_quote "$DB_NAME")
-startup_cmd: $(yaml_quote "$SERVER_CMD")
-EOF
+    if [[ -z "$DHALL_CFG_HELPER" ]]; then
+        echo "Error: could not locate dhall_config.py for SQUIRREL YAML rendering." >&2
+        exit 1
     fi
+    python3 "$DHALL_CFG_HELPER" render-squirrel-yaml \
+        --dbms "$SQUIRREL_DBMS" \
+        --squirrel-home "$SQUIRREL_HOME" \
+        --host "$HOST" \
+        --port "${PORT:-0}" \
+        --user "$DB_USER" \
+        --password "$PASSWORD" \
+        --socket "$SOCKET" \
+        --db-name "$DB_NAME" \
+        --server-cmd "$SERVER_CMD" > "$CONFIG_FILE"
 fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then

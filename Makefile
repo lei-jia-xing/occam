@@ -1,4 +1,4 @@
-.PHONY: all build build-check test syntax-check bench microbench bench-product flamegraph fmt fmt-check lint harness-check proof-check check hooks dev clean completions install-completions
+.PHONY: all build build-check test syntax-check bench microbench bench-product flamegraph fmt fmt-check lint dhall-gen dhall-check harness-check proof-check check hooks dev clean completions install-completions
 
 all: build
 
@@ -74,7 +74,58 @@ proof-check:
 		nix develop --command bash -c "cd proofs && lake build"; \
 	fi
 
-check: fmt-check lint build-check test harness-check proof-check
+dhall-gen:
+	@gen_cmd=' \
+		set -e; \
+		mkdir -p config/generated/profiles config/generated/plans; \
+		dhall-to-json --file config/dhall/Harness.dhall > config/generated/harness.json; \
+		dhall-to-json --file config/dhall/OccamDefaultsJson.dhall > config/generated/occam_defaults.json; \
+		for f in config/dhall/profiles/*.dhall; do \
+			name=$$(basename "$$f" .dhall); \
+			dhall-to-json --file "$$f" > "config/generated/profiles/$${name}.json"; \
+		done; \
+		for f in config/dhall/plans/*.dhall; do \
+			name=$$(basename "$$f" .dhall); \
+			dhall-to-json --file "$$f" > "config/generated/plans/$${name}.json"; \
+		done; \
+	'; \
+	if command -v dhall-to-json >/dev/null 2>&1; then \
+		bash -c "$$gen_cmd"; \
+	else \
+		nix develop --command bash -c "$$gen_cmd"; \
+	fi
+
+dhall-check:
+	@chk_cmd=' \
+		set -eo pipefail; \
+		for f in config/dhall/*.dhall config/dhall/profiles/*.dhall config/dhall/plans/*.dhall; do \
+			dhall type --quiet --file "$$f"; \
+		done; \
+		tmp=$$(mktemp -d); \
+		trap "rm -rf \"$$tmp\"" EXIT; \
+		mkdir -p "$$tmp/profiles" "$$tmp/plans"; \
+		dhall-to-json --file config/dhall/Harness.dhall > "$$tmp/harness.json"; \
+		dhall-to-json --file config/dhall/OccamDefaultsJson.dhall > "$$tmp/occam_defaults.json"; \
+		diff -u config/generated/harness.json "$$tmp/harness.json"; \
+		diff -u config/generated/occam_defaults.json "$$tmp/occam_defaults.json"; \
+		for f in config/dhall/profiles/*.dhall; do \
+			name=$$(basename "$$f" .dhall); \
+			dhall-to-json --file "$$f" > "$$tmp/profiles/$${name}.json"; \
+			diff -u "config/generated/profiles/$${name}.json" "$$tmp/profiles/$${name}.json"; \
+		done; \
+		for f in config/dhall/plans/*.dhall; do \
+			name=$$(basename "$$f" .dhall); \
+			dhall-to-json --file "$$f" > "$$tmp/plans/$${name}.json"; \
+			diff -u "config/generated/plans/$${name}.json" "$$tmp/plans/$${name}.json"; \
+		done; \
+	'; \
+	if command -v dhall >/dev/null 2>&1 && command -v dhall-to-json >/dev/null 2>&1; then \
+		bash -c "$$chk_cmd"; \
+	else \
+		nix develop --command bash -c "$$chk_cmd"; \
+	fi
+
+check: fmt-check lint build-check dhall-check test harness-check proof-check
 
 
 hooks:

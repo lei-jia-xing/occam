@@ -3,6 +3,7 @@ module Main (main) where
 import Completion (generateCompletion)
 import Control.Monad (forM_)
 import Data.Aeson (encode, object, (.=))
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Text qualified as T
 import Occam.Logger (LogFormat (..))
@@ -11,11 +12,13 @@ import Occam.Reducer (columnModeName, statementSearchPolicyName)
 import Options (
     Action (..),
     RawOptions (..),
+    applyConfigPatch,
     colorModeName,
     defaultLogLevelForFormat,
     defaultRawOptions,
     getSpecified,
     logFormatName,
+    parseConfigPatch,
     strategyName,
     validateCliOptions,
  )
@@ -31,6 +34,7 @@ import Runner (runOccam)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import System.IO (hPutStrLn, stderr)
+import System.IO.Error (tryIOError)
 
 main :: IO ()
 main = do
@@ -72,8 +76,8 @@ runAction ActionPrintDefaults = do
     let opts = defaultRawOptions
         defaults =
             object
-                [ "timeout" .= rawTimeoutSecs opts
-                , "jobs" .= rawJobs opts
+                [ "timeout" .= getSpecified (rawTimeoutSecs opts)
+                , "jobs" .= getSpecified (rawJobs opts)
                 , "strategy" .= strategyName (getSpecified (rawStrategy opts))
                 , "statement_order" .= statementSearchPolicyName (getSpecified (rawStatementOrder opts))
                 , "column_mode" .= columnModeName (getSpecified (rawColumnMode opts))
@@ -87,14 +91,25 @@ runAction ActionPrintDefaults = do
                 , "cache" .= getSpecified (rawCache opts)
                 , "log_level" .= getSpecified (rawLogLevel opts)
                 , "log_level_json" .= defaultLogLevelForFormat FormatJSON
-                , "log_format" .= logFormatName (rawLogFormat opts)
-                , "color" .= colorModeName (rawColor opts)
+                , "log_format" .= logFormatName (getSpecified (rawLogFormat opts))
+                , "color" .= colorModeName (getSpecified (rawColor opts))
                 ]
     BSL.putStr (encode defaults <> "\n")
     exitSuccess
-runAction (ActionNormal rawOpts) =
-    case validateCliOptions rawOpts of
-        Left err -> do
-            hPutStrLn stderr ("error: " ++ err)
-            exitWith (ExitFailure 2)
+runAction (ActionNormal rawOpts) = do
+    resolvedOpts <- case rawConfigFile rawOpts of
+        Nothing -> pure rawOpts
+        Just cfgPath -> do
+            eBytes <- tryIOError (BS.readFile cfgPath)
+            case eBytes of
+                Left ioErr -> dieOpt ("failed to read --config " ++ cfgPath ++ ": " ++ show ioErr)
+                Right bytes -> case parseConfigPatch bytes >>= (`applyConfigPatch` rawOpts) of
+                    Left err -> dieOpt err
+                    Right patched -> pure patched
+    case validateCliOptions resolvedOpts of
+        Left err -> dieOpt err
         Right validatedOpts -> runOccam validatedOpts
+    where
+        dieOpt msg = do
+            hPutStrLn stderr ("error: " ++ msg)
+            exitWith (ExitFailure 2)

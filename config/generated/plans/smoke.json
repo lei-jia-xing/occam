@@ -1,0 +1,28 @@
+{
+  "container_wait_secs": 30,
+  "dbms": [
+    "postgres",
+    "mysql",
+    "mariadb",
+    "clickhouse",
+    "sqlite",
+    "duckdb"
+  ],
+  "name": "smoke",
+  "no_cache": false,
+  "occam_jobs": 1,
+  "oracle": {
+    "allow_psql_meta": false,
+    "allow_stderr_only": false,
+    "reject_on_slippage": false,
+    "stack_frames": 5,
+    "timeout_secs": 0,
+    "verbose": false
+  },
+  "profiles": [
+    "Ours-S"
+  ],
+  "repeats": 1,
+  "timeout_secs": 10,
+  "worker_jobs": 1
+}
