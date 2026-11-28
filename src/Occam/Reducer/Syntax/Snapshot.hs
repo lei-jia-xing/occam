@@ -239,8 +239,6 @@ updateSyntaxBatchSnapshot ::
     [ParserEdit] ->
     ByteString ->
     IO ([StatementUnit], SyntaxIndex, [ColumnTarget])
-updateSyntaxBatchSnapshot context _ _ _ _ _ acceptedBytes
-    | syntaxFullReparse context = parseSyntaxSnapshot context acceptedBytes
 updateSyntaxBatchSnapshot context category currentUnits index currentBundles batch acceptedBytes = do
     incremental <- runMaybeT do
         guard (category /= EditColumn)

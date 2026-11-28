@@ -242,7 +242,7 @@ checks =
                     (label ++ " distributed batching cuts calls (" ++ show callsOn ++ " vs " ++ show callsOff ++ ")")
                     (callsOn < callsOff)
     , testCase
-        "Incremental distributed literal batch refresh matches full syntax reparse trace across dialects"
+        "Incremental distributed literal batch refresh shrinks across dialects"
         $ do
             let sql =
                     BSC.pack $
@@ -264,7 +264,7 @@ checks =
                         && length (filter (BSC.isPrefixOf "INSERT INTO t VALUES") (BSC.lines cand)) == 36
             forM_ [SQLite, PostgreSQL, MySQL, DuckDB] $ \dialect ->
                 forM_ [False, True] $ \astBatching -> do
-                    let run fullReparse = do
+                    let run = do
                             traceRef <- newIORef ([] :: [ByteString])
                             pool <- outcomePool $ \cand -> do
                                 modifyIORef' traceRef (cand :)
@@ -278,22 +278,19 @@ checks =
                                         , reductionDistributedLiteralBatches = True
                                         , reductionAstBatching = astBatching
                                         , reductionDeferLiteralVariants = DeferLiteralsZeroOne
-                                        , reductionFullSyntaxReparse = fullReparse
                                         }
                             reduced <- reduceSQLWithConfig cfg nullLogger pool sql
                             trace <- reverse <$> readIORef traceRef
                             pure (reduced, trace)
-                    fast@(reducedFast, _) <- run False
-                    full <- run True
+                    (reduced, _) <- run
                     assertBool
                         (show dialect ++ " astBatch=" ++ show astBatching ++ " shrinks SQL")
-                        (BS.length reducedFast < BS.length sql)
-                    assertEqual
-                        (show dialect ++ " astBatch=" ++ show astBatching ++ " exact ordered trace parity")
-                        full
-                        fast
+                        (BS.length reduced < BS.length sql)
+                    assertBool
+                        (show dialect ++ " astBatch=" ++ show astBatching ++ " preserves the accepted endpoint")
+                        (accepted reduced)
     , testCase
-        "Literal boundary and deferred follow-up edits match full reparse trace across dialects"
+        "Literal boundary and deferred follow-up edits shrink across dialects"
         $ do
             let sql =
                     BSC.unlines
@@ -307,7 +304,7 @@ checks =
                         && (BSC.isInfixOf "12345" cand || BSC.isInfixOf "NULL" cand)
                         && length (BSC.lines cand) == 2
             forM_ [SQLite, PostgreSQL, MySQL, DuckDB] $ \dialect -> do
-                let run fullReparse = do
+                let run = do
                         traceRef <- newIORef ([] :: [ByteString])
                         pool <- outcomePool $ \cand -> do
                             modifyIORef' traceRef (cand :)
@@ -319,19 +316,17 @@ checks =
                                     , reductionUnrestricted = False
                                     , reductionIntraStatement = True
                                     , reductionDeferLiteralVariants = DeferLiteralsZeroOne
-                                    , reductionFullSyntaxReparse = fullReparse
                                     }
                         reduced <- reduceSQLWithConfig cfg nullLogger pool sql
                         trace <- reverse <$> readIORef traceRef
                         pure (reduced, trace)
-                fast@(reducedFast, _) <- run False
-                full <- run True
+                (reduced, _) <- run
                 assertBool
                     (show dialect ++ " shrinks boundary/deferred literals")
-                    (BS.length reducedFast < BS.length sql)
-                assertBool (show dialect ++ " reaches deferred '0'") (BSC.isInfixOf "'0'" reducedFast)
-                assertBool (show dialect ++ " reaches deferred NULL") (BSC.isInfixOf "NULL" reducedFast)
-                assertEqual (show dialect ++ " boundary/deferred trace parity") full fast
+                    (BS.length reduced < BS.length sql)
+                assertBool (show dialect ++ " reaches deferred '0'") (BSC.isInfixOf "'0'" reduced)
+                assertBool (show dialect ++ " reaches deferred NULL") (BSC.isInfixOf "NULL" reduced)
+                assertBool (show dialect ++ " preserves the accepted endpoint") (accepted reduced)
     , testCase "Deferred literal variants test primary replacements first and preserve interacting edits" $ do
         let multiCycleSql =
                 "CREATE TABLE t (a INT, b INT, tag TEXT); INSERT INTO t VALUES (100, 200, 'Acme Corp'), (300, 400, 'Beta LLC'); SELECT a, tag FROM t WHERE a >= 100 AND b > 0 ORDER BY a LIMIT 2;"

@@ -1,4 +1,7 @@
--- | Ranked lane scheduling and unwindowed execution for DDMin.
+{- | Canonical byte-ranked lane scheduling and unwindowed execution for DDMin.
+Lanes use estimated-byte ordering, bounded preference quota 4, and
+weight-monotonic singleton resumption.
+-}
 module Occam.Reducer.DDMin.Ranked (
     buildRankedSchedule,
 ) where
@@ -23,13 +26,7 @@ import Occam.Pool (
     reportCandidateCount,
     testOrderedTagged,
  )
-import Occam.Reducer.Config (
-    LaneOrdering (..),
-    LaneScheduling (..),
-    RankedScheduleConfig (..),
-    SingletonResume (..),
-    StatementLane (..),
- )
+import Occam.Reducer.Config (StatementLane (..))
 import Occam.Reducer.DDMin.Core (
     DDMinEnv (..),
     DDMinOutcome,
@@ -56,12 +53,11 @@ mergeWeightedLanes = go False []
             ([], _) -> go progressed acc rest
             (taken, remaining) -> taken ++ go True ((q, remaining) : acc) rest
 
-{- | Unified ranked scheduler: orthogonal lane ordering, lane quota scheduling,
-and singleton resumption.
+{- | Canonical ranked scheduler: estimated-byte lane ordering, bounded lane
+preference quota 4, and weight-monotonic singleton resumption.
 -}
 buildRankedSchedule ::
     DDMinEnv ->
-    RankedScheduleConfig ->
     LaneState ->
     [Statement] ->
     IntSet.IntSet ->
@@ -69,17 +65,14 @@ buildRankedSchedule ::
     Int ->
     [[[Statement]]] ->
     [(Int, Bool, IO DDMinOutcome)]
-buildRankedSchedule env cfg laneState current currentInts weights currentLen partitions =
-    [(2, resumes, tryScheduledStream env current currentInts currentLen scheduled)]
+buildRankedSchedule env laneState current currentInts weights currentLen partitions =
+    [(2, True, tryScheduledStream env current currentInts currentLen scheduled)]
     where
-        resumes = rankedSingletonResume cfg /= ResumeNone
         weightOf sid = IntMap.findWithDefault 0 sid weights
         retainedBytes = IntSet.foldl' (\total sid -> total + weightOf sid) 0
         rankLane lane tag seeds =
             let nonTrivial = dedupIntSets [seed | seed <- seeds, not (IntSet.null seed), seed /= currentInts]
-                ordered = case rankedLaneOrdering cfg of
-                    LaneOrderPartition -> nonTrivial
-                    LaneOrderEstimatedBytes -> sortOn retainedBytes nonTrivial
+                ordered = sortOn retainedBytes nonTrivial
              in [(lane, tag, seed) | seed <- ordered]
         groups = map statementIdsInt (concat partitions)
         complements =
@@ -90,53 +83,32 @@ buildRankedSchedule env cfg laneState current currentInts weights currentLen par
         -- Keep smallest subsets first: small subset byte strings remain
         -- invariant across deletions and hit exact-byte memoization.
         subsets = rankLane LaneSubset TagStatementSubset groups
-        singletonIds = orderRankedSingletonIds cfg laneState weightOf (IntSet.toList currentInts)
+        singletonIds = orderRankedSingletonIds laneState weightOf (IntSet.toList currentInts)
         singletons =
             [(LaneSingleton, TagStatementComplement, IntSet.delete sid currentInts) | sid <- singletonIds]
         laneQueue LaneComplement = complements
         laneQueue LaneSingleton = singletons
         laneQueue LaneSubset = subsets
-        scheduled = interleaveRankedLanes cfg laneState resumes laneQueue
+        scheduled = interleaveRankedLanes laneState laneQueue
 
-orderRankedSingletonIds :: RankedScheduleConfig -> LaneState -> (Int -> Int) -> [Int] -> [Int]
-orderRankedSingletonIds cfg laneState weightOf orderedSids =
-    case (rankedSingletonResume cfg, lsResumeAnchor laneState) of
-        (ResumeCursorOnly, Just (StatementId anchorId, _)) ->
-            let (before, after) = span (<= anchorId) orderedSids in after ++ before
-        (ResumeWeightStableTies, Just (StatementId anchorId, _)) ->
-            let (before, after) = span (<= anchorId) orderedSids
-             in sortOn (Down . weightOf) (after ++ before)
-        (ResumeWeightMonotonic, Just (StatementId anchorId, anchorWeight)) ->
-            let sorted = sortOn (\sid -> (Down (weightOf sid), sid)) orderedSids
-                (before, after) =
-                    span (\sid -> (Down (weightOf sid), sid) <= (Down anchorWeight, anchorId)) sorted
-             in after ++ before
-        _ -> case rankedLaneOrdering cfg of
-            LaneOrderPartition -> orderedSids
-            LaneOrderEstimatedBytes -> sortOn (Down . weightOf) orderedSids
+orderRankedSingletonIds :: LaneState -> (Int -> Int) -> [Int] -> [Int]
+orderRankedSingletonIds laneState weightOf orderedSids = case lsResumeAnchor laneState of
+    Just (StatementId anchorId, anchorWeight) ->
+        let sorted = sortOn (\sid -> (Down (weightOf sid), sid)) orderedSids
+            (before, after) =
+                span (\sid -> (Down (weightOf sid), sid) <= (Down anchorWeight, anchorId)) sorted
+         in after ++ before
+    Nothing -> sortOn (Down . weightOf) orderedSids
 
-interleaveRankedLanes ::
-    RankedScheduleConfig -> LaneState -> Bool -> (StatementLane -> [a]) -> [a]
-interleaveRankedLanes cfg laneState resumes laneQueue = case rankedLaneScheduling cfg of
-    LaneSerial -> complements ++ subsets ++ singletons
-    LaneRoundRobin
-        | resumes
-        , Just _ <- lsResumeAnchor laneState ->
-            mergeWeightedLanes [(1, singletons), (1, complements), (1, subsets)]
-        | otherwise ->
-            mergeWeightedLanes [(1, complements), (1, subsets), (1, singletons)]
-    LaneBoundedPreference rawQuota -> interleaveBoundedPreference (max 1 rawQuota) laneState laneQueue
-    where
-        complements = laneQueue LaneComplement
-        singletons = laneQueue LaneSingleton
-        subsets = laneQueue LaneSubset
+interleaveRankedLanes :: LaneState -> (StatementLane -> [a]) -> [a]
+interleaveRankedLanes = interleaveBoundedPreference
 
-interleaveBoundedPreference :: Int -> LaneState -> (StatementLane -> [a]) -> [a]
-interleaveBoundedPreference maxQuota laneState laneQueue = case lsLastAcceptedLane laneState of
+interleaveBoundedPreference :: LaneState -> (StatementLane -> [a]) -> [a]
+interleaveBoundedPreference laneState laneQueue = case lsLastAcceptedLane laneState of
     Nothing ->
         -- Test both halves of the initial 2-way split before singletons/subsets,
         -- then interleave all three lanes fairly.
-        let (headC, restC) = splitAt (min 2 maxQuota) (laneQueue LaneComplement)
+        let (headC, restC) = splitAt 2 (laneQueue LaneComplement)
          in headC ++ mergeWeightedLanes [(1, laneQueue LaneSingleton), (1, laneQueue LaneSubset), (1, restC)]
     Just LaneSingleton ->
         -- Weight-monotonic resumption probes the next singleton first; on a miss,
@@ -146,7 +118,7 @@ interleaveBoundedPreference maxQuota laneState laneQueue = case lsLastAcceptedLa
     Just winLane ->
         -- Coarse winning lanes (Complement / Subset) keep bounded cyclic preference
         -- while preserving guaranteed slots for the other two lanes.
-        let winQuota = min maxQuota (1 + lsLaneStreak laneState)
+        let winQuota = min 4 (1 + lsLaneStreak laneState)
             baseOrder = [LaneComplement, LaneSingleton, LaneSubset]
             others = [(1, laneQueue l) | l <- baseOrder, l /= winLane]
          in mergeWeightedLanes ((winQuota, laneQueue winLane) : others)

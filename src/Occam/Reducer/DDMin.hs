@@ -73,7 +73,6 @@ import Occam.Reducer.Support (
 searchStatementsWithCert ::
     EarlyRejectTracker ->
     EarlyRejectCertifier ->
-    Bool ->
     StatementSearchPolicy ->
     CandidateBuilder ->
     OraclePool ->
@@ -81,12 +80,11 @@ searchStatementsWithCert ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchStatementsWithCert tracker cert closureAware policy buildCandidate pool baseSQL allStatements initialStatements = do
+searchStatementsWithCert tracker cert policy buildCandidate pool baseSQL allStatements initialStatements = do
     feedback <- newFeedback
     searchDDMinWithCert
         tracker
         cert
-        closureAware
         policy
         feedback
         buildCandidate
@@ -98,7 +96,6 @@ searchStatementsWithCert tracker cert closureAware policy buildCandidate pool ba
 searchDDMinWithCert ::
     EarlyRejectTracker ->
     EarlyRejectCertifier ->
-    Bool ->
     StatementSearchPolicy ->
     Feedback ->
     CandidateBuilder ->
@@ -107,17 +104,16 @@ searchDDMinWithCert ::
     [Statement] ->
     [Statement] ->
     IO [Statement]
-searchDDMinWithCert tracker cert closureAware policy feedback buildCandidate pool baseSQL allStatements initial =
+searchDDMinWithCert tracker cert policy feedback buildCandidate pool baseSQL allStatements initial =
     ddminLoop env 2 emptyLaneState initialLen initial
     where
         effectivePolicy = case policy of
-            StatementRankedFallback _ -> StatementByteWeighted
+            StatementRankedFallback -> StatementByteWeighted
             other -> other
         env =
             DDMinEnv
                 { ddTracker = tracker
                 , ddCert = cert
-                , ddClosureAware = closureAware
                 , ddPolicy = effectivePolicy
                 , ddFeedback = feedback
                 , ddBuildCandidate = buildCandidate
@@ -139,7 +135,7 @@ ddminLoop env granularity laneState currentLen current =
         totalSpanBytes = sum (map snd stmtWithWeights)
         chunks count = case ddPolicy env of
             StatementByteWeighted -> partitionStatementsByWeights count stmtWithWeights totalSpanBytes
-            StatementRankedWith _ -> partitionStatementsByWeights count stmtWithWeights totalSpanBytes
+            StatementRanked -> partitionStatementsByWeights count stmtWithWeights totalSpanBytes
             _ -> partitionChunks count current
         lanes count =
             let groups = chunks count
@@ -156,10 +152,9 @@ ddminLoop env granularity laneState currentLen current =
                 )
         counts = ddminGranularities (length current) n
         schedule = case ddPolicy env of
-            StatementRankedWith cfg ->
+            StatementRanked ->
                 buildRankedSchedule
                     env
-                    cfg
                     laneState
                     current
                     currentInts
@@ -306,7 +301,6 @@ statementDdminWithCert earlyReject tracker mTrace policy parse pool initialSQL =
                 searchStatementsWithCert
                     tracker
                     cert
-                    False
                     policy
                     plainCandidate
                     pool

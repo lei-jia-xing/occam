@@ -78,7 +78,6 @@ data SyntaxContext = SyntaxContext
     , syntaxDeferRecursivePredicates :: !Bool
     , syntaxAstBatching :: !Bool
     , syntaxAdaptiveValues :: !Bool
-    , syntaxFullReparse :: !Bool
     , syntaxOptions :: !ParseOptions
     , syntaxEarlyReject :: !Bool
     , syntaxTracker :: !EarlyRejectTracker

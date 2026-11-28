@@ -4,13 +4,6 @@ module Occam.Reducer.Config (
     columnModeName,
     syntaxPolicyName,
     StatementLane (..),
-    LaneOrdering (..),
-    SingletonResume (..),
-    LaneScheduling (..),
-    RankedScheduleConfig (..),
-    defaultRankedScheduleConfig,
-    convergedRankedScheduleConfig,
-    rankedSchedulePolicyTag,
     shouldActivateRankedFallback,
     StatementSearchPolicy (..),
     statementRanked,
@@ -28,7 +21,6 @@ module Occam.Reducer.Config (
     deferRecursivePredicatesPolicy,
     astBatchPolicy,
     valuesChunkPolicy,
-    fullReparsePolicy,
     ReductionStage (..),
     reductionStageName,
     stageLogName,
@@ -73,19 +65,12 @@ reductionSearchPolicy config =
                     <> deferRecursivePredicatesPolicy (reductionDeferRecursivePredicates config)
                     <> astBatchPolicy (reductionAstBatching config)
                     <> valuesChunkPolicy (reductionAdaptiveValues config)
-                    <> fullReparsePolicy (reductionFullSyntaxReparse config)
         statement = case reductionStatementSearch config of
             StatementSubsetFirst -> ""
             StatementComplementFirst -> "+complement-first"
             StatementByteWeighted -> "+complement-first-byte-weighted"
-            StatementRankedWith cfg -> "+" <> rankedSchedulePolicyTag cfg
-            StatementRankedFallback cfg ->
-                "+fallback-"
-                    <> rankedSchedulePolicyTag cfg
-                    <> "-m"
-                    <> T.pack (show (rankedFallbackMinStatements cfg))
-                    <> "-s"
-                    <> T.pack (show (rankedFallbackMaxShrinkPct cfg))
+            StatementRanked -> "+ranked-pref-4-resume-mono"
+            StatementRankedFallback -> "+fallback-ranked-pref-4-resume-mono-m8-s10"
 
 groupProposalsPolicy :: Bool -> T.Text
 groupProposalsPolicy False = ""
@@ -119,10 +104,6 @@ valuesChunkPolicy :: Bool -> T.Text
 valuesChunkPolicy False = ""
 valuesChunkPolicy True = "+defer-fine-values-chunks"
 
-fullReparsePolicy :: Bool -> T.Text
-fullReparsePolicy False = ""
-fullReparsePolicy True = "+full-reparse"
-
 -- | Candidate family lane inside ranked statement scheduling.
 data StatementLane
     = LaneComplement
@@ -130,69 +111,15 @@ data StatementLane
     | LaneSubset
     deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | How candidates are ordered inside each lane before cross-lane merging.
-data LaneOrdering
-    = LaneOrderPartition
-    | LaneOrderEstimatedBytes
-    deriving (Eq, Show)
-
--- | How single-statement deletion resumes after an accepted singleton shrink.
-data SingletonResume
-    = ResumeNone
-    | ResumeCursorOnly
-    | ResumeWeightStableTies
-    | ResumeWeightMonotonic
-    deriving (Eq, Show)
-
--- | How the three candidate lanes share probe slots across each pass.
-data LaneScheduling
-    = LaneSerial
-    | LaneRoundRobin
-    | LaneBoundedPreference !Int
-    deriving (Eq, Show)
-
--- | Orthogonal configuration for generalized ranked statement scheduling.
-data RankedScheduleConfig = RankedScheduleConfig
-    { rankedLaneOrdering :: !LaneOrdering
-    , rankedLaneScheduling :: !LaneScheduling
-    , rankedSingletonResume :: !SingletonResume
-    , rankedFallbackMinStatements :: !Int
-    , rankedFallbackMaxShrinkPct :: !Int
-    }
-    deriving (Eq, Show)
-
-defaultRankedScheduleConfig :: RankedScheduleConfig
-defaultRankedScheduleConfig =
-    RankedScheduleConfig
-        { rankedLaneOrdering = LaneOrderEstimatedBytes
-        , rankedLaneScheduling = LaneRoundRobin
-        , rankedSingletonResume = ResumeNone
-        , rankedFallbackMinStatements = 8
-        , rankedFallbackMaxShrinkPct = 0
-        }
-
-rankedSchedulePolicyTag :: RankedScheduleConfig -> T.Text
-rankedSchedulePolicyTag cfg = base <> resumeTag
-    where
-        base = case (rankedLaneOrdering cfg, rankedLaneScheduling cfg) of
-            (LaneOrderPartition, _) -> "interleaved-statements"
-            (LaneOrderEstimatedBytes, LaneSerial) -> "ranked-lanes"
-            (LaneOrderEstimatedBytes, LaneRoundRobin) -> "ranked-statements"
-            (LaneOrderEstimatedBytes, LaneBoundedPreference q) ->
-                "ranked-pref-" <> T.pack (show q)
-        resumeTag = case rankedSingletonResume cfg of
-            ResumeNone -> ""
-            ResumeCursorOnly -> "-resume"
-            ResumeWeightStableTies -> "-resume-ties"
-            ResumeWeightMonotonic -> "-resume-mono"
-
--- | Decide whether post-slicing fallback should switch from byte-weighted ddmin to ranked search.
-shouldActivateRankedFallback :: RankedScheduleConfig -> Bool -> Int -> Int -> Int -> Bool
-shouldActivateRankedFallback cfg slicingEnabled initialBytes slicedBytes remainingStmts =
+{- | Decide whether post-slicing fallback should switch from byte-weighted ddmin
+to ranked search after removing at most 10% of the bytes with >= 8 statements left.
+-}
+shouldActivateRankedFallback :: Bool -> Int -> Int -> Int -> Bool
+shouldActivateRankedFallback slicingEnabled initialBytes slicedBytes remainingStmts =
     slicingEnabled
-        && remainingStmts >= max 1 (rankedFallbackMinStatements cfg)
+        && remainingStmts >= 8
         && initialBytes > 0
-        && removedBytes * 100 <= initialBytes * max 0 (rankedFallbackMaxShrinkPct cfg)
+        && removedBytes * 100 <= initialBytes * 10
     where
         removedBytes = max 0 (initialBytes - slicedBytes)
 
@@ -200,41 +127,22 @@ data StatementSearchPolicy
     = StatementSubsetFirst
     | StatementComplementFirst
     | StatementByteWeighted
-    | StatementRankedWith !RankedScheduleConfig
-    | StatementRankedFallback !RankedScheduleConfig
+    | StatementRanked
+    | StatementRankedFallback
     deriving (Eq, Show)
 
-convergedRankedScheduleConfig :: RankedScheduleConfig
-convergedRankedScheduleConfig =
-    defaultRankedScheduleConfig
-        { rankedLaneScheduling = LaneBoundedPreference 4
-        , rankedSingletonResume = ResumeWeightMonotonic
-        , rankedFallbackMinStatements = 8
-        , rankedFallbackMaxShrinkPct = 10
-        }
-
 statementRanked :: StatementSearchPolicy
-statementRanked = StatementRankedWith defaultRankedScheduleConfig
+statementRanked = StatementRanked
 
 statementRankedFallback :: StatementSearchPolicy
-statementRankedFallback = StatementRankedFallback convergedRankedScheduleConfig
+statementRankedFallback = StatementRankedFallback
 
 statementSearchPolicyName :: StatementSearchPolicy -> T.Text
 statementSearchPolicyName StatementSubsetFirst = "subset-first"
 statementSearchPolicyName StatementComplementFirst = "complement-first"
 statementSearchPolicyName StatementByteWeighted = "byte-weighted"
-statementSearchPolicyName (StatementRankedWith cfg)
-    | cfg == convergedRankedScheduleConfig = "ranked"
-    | otherwise = rankedSchedulePolicyTag cfg
-statementSearchPolicyName (StatementRankedFallback cfg)
-    | cfg == convergedRankedScheduleConfig = "ranked-fallback"
-    | otherwise =
-        "fallback-"
-            <> rankedSchedulePolicyTag cfg
-            <> "-m"
-            <> T.pack (show (rankedFallbackMinStatements cfg))
-            <> "-s"
-            <> T.pack (show (rankedFallbackMaxShrinkPct cfg))
+statementSearchPolicyName StatementRanked = "ranked"
+statementSearchPolicyName StatementRankedFallback = "ranked-fallback"
 
 -- | Which literal replacement variants run in the regular sweep before stalling.
 data LiteralDeferralMode
@@ -273,7 +181,6 @@ data ReductionConfig = ReductionConfig
     , reductionDeferRecursivePredicates :: !Bool
     , reductionAstBatching :: !Bool
     , reductionAdaptiveValues :: !Bool
-    , reductionFullSyntaxReparse :: !Bool
     , reductionUnrestricted :: !Bool
     , reductionDialect :: !SQLDialect
     , reductionColumnMode :: !ColumnMode
@@ -297,7 +204,6 @@ defaultReductionConfigFor dialect =
         , reductionDeferRecursivePredicates = True
         , reductionAstBatching = False
         , reductionAdaptiveValues = False
-        , reductionFullSyntaxReparse = False
         , reductionUnrestricted = True
         , reductionDialect = dialect
         , reductionColumnMode = ColumnOff

@@ -8,7 +8,6 @@ module ResultBaseline.Fixtures (
     statementFixtures,
     statementFixture,
     closureRankedCohort,
-    lanePreferenceCohort,
     fallbackQualificationCohort,
     fallbackNoLocCohort,
     groupProposalCohort,
@@ -480,19 +479,6 @@ closureRankedCohort :: [Fixture]
 closureRankedCohort =
     statementFixtures
         ++ [statementFixture False False 128, statementFixture True False 32, statementFixture True True 32]
-        ++ fixtures
-
-lanePreferenceCohort :: [Fixture]
-lanePreferenceCohort =
-    statementFixtures
-        ++ [ statementFixture False True 128
-           , statementFixture True True 32
-           , shortNoiseFixture True 32
-           , shortNoiseFixture True 64
-           , txNoopBlocksFixture False 16
-           , txSavepointMixFixture False 12
-           , subsetOnlyReturningFixture
-           ]
         ++ fixtures
 
 fallbackQualificationCohort :: [Fixture]

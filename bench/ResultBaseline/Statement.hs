@@ -5,15 +5,7 @@ module ResultBaseline.Statement (
     runStatementWeightBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
-    runStatementRankBaseline,
-    runStatementInterleaveBaseline,
-    runStatementRankedResumeBaseline,
-    runStatementRankedResumeTiesBaseline,
     runStatementBoundedPrefClosureBaseline,
-    runStatementResumeMonoBaseline,
-    runStatementLanePrefBaseline,
-    runStatementLanePrefQuota2Baseline,
-    runStatementLanePrefQuota8Baseline,
     runStatementFallbackBaseline,
     runStatementFallbackNoLocBaseline,
     runGroupProposalsBaseline,
@@ -22,13 +14,8 @@ module ResultBaseline.Statement (
 ) where
 
 import Occam.Reducer (
-    LaneOrdering (..),
-    LaneScheduling (..),
-    RankedScheduleConfig (..),
     ReductionConfig (..),
-    SingletonResume (..),
     StatementSearchPolicy (..),
-    defaultRankedScheduleConfig,
     statementRanked,
  )
 import ResultBaseline.Fixtures
@@ -130,76 +117,13 @@ runRankedComparison configure cases pairs wallLimit callLimit out =
         )
         cases
 
-rankedPolicy :: (RankedScheduleConfig -> RankedScheduleConfig) -> StatementSearchPolicy
-rankedPolicy f = StatementRankedWith (f defaultRankedScheduleConfig)
-
-boundedPrefConfig :: Int -> RankedScheduleConfig
-boundedPrefConfig quota =
-    defaultRankedScheduleConfig
-        { rankedLaneScheduling = LaneBoundedPreference quota
-        , rankedSingletonResume = ResumeWeightMonotonic
-        , rankedFallbackMinStatements = 8
-        , rankedFallbackMaxShrinkPct = 10
-        }
-runStatementRankBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementRankBaseline =
-    runRankedAblation (rankedPolicy (\c -> c {rankedLaneOrdering = LaneOrderPartition}))
-
-runStatementInterleaveBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementInterleaveBaseline =
-    runRankedAblation (rankedPolicy (\c -> c {rankedLaneScheduling = LaneSerial}))
-
-runStatementRankedResumeBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementRankedResumeBaseline =
-    runRankedAblation (rankedPolicy (\c -> c {rankedSingletonResume = ResumeCursorOnly}))
-
-runStatementRankedResumeTiesBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementRankedResumeTiesBaseline =
-    runRankedAblation (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
-
 runStatementBoundedPrefClosureBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
 runStatementBoundedPrefClosureBaseline =
     runClosurePair
-        "ranked-unwindowed"
+        "statement-byte-weighted"
+        StatementByteWeighted
+        "statement-ranked"
         statementRanked
-        "bounded-lane-pref-4"
-        (StatementRankedWith (boundedPrefConfig 4))
-
-runStatementResumeMonoBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementResumeMonoBaseline =
-    runGraphFreePair
-        "resume-stable-ties"
-        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
-        "resume-weight-monotonic"
-        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightMonotonic}))
-        lanePreferenceCohort
-
-runStatementLanePrefBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementLanePrefBaseline =
-    runGraphFreePair
-        "fixed-resume-ties"
-        (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
-        "bounded-lane-pref-4"
-        (StatementRankedWith (boundedPrefConfig 4))
-        lanePreferenceCohort
-
-runStatementLanePrefQuota2Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementLanePrefQuota2Baseline =
-    runGraphFreePair
-        "bounded-lane-pref-2"
-        (StatementRankedWith (boundedPrefConfig 2))
-        "bounded-lane-pref-4"
-        (StatementRankedWith (boundedPrefConfig 4))
-        lanePreferenceCohort
-
-runStatementLanePrefQuota8Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementLanePrefQuota8Baseline =
-    runGraphFreePair
-        "bounded-lane-pref-8"
-        (StatementRankedWith (boundedPrefConfig 8))
-        "bounded-lane-pref-4"
-        (StatementRankedWith (boundedPrefConfig 4))
-        lanePreferenceCohort
 
 runStatementFallbackBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
 runStatementFallbackBaseline pairs wallLimit callLimit out =
@@ -219,7 +143,7 @@ runStatementFallbackBaseline pairs wallLimit callLimit out =
             ( \config ->
                 config
                     { reductionGroupProposals = False
-                    , reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)
+                    , reductionStatementSearch = StatementRankedFallback
                     }
             )
             True
@@ -244,7 +168,7 @@ runStatementFallbackNoLocBaseline pairs wallLimit callLimit out =
             ( \config ->
                 config
                     { reductionGroupProposals = False
-                    , reductionStatementSearch = StatementRankedFallback (boundedPrefConfig 4)
+                    , reductionStatementSearch = StatementRankedFallback
                     }
             )
             False
@@ -332,45 +256,3 @@ runClosurePair controlName control treatmentName treatment pairs wallLimit callL
                 name
                 (\config -> config {reductionSlicing = False, reductionStatementSearch = policy})
                 True
-
-runGraphFreePair ::
-    String ->
-    StatementSearchPolicy ->
-    String ->
-    StatementSearchPolicy ->
-    [Fixture] ->
-    Int ->
-    Maybe Int ->
-    Maybe Int ->
-    FilePath ->
-    IO ()
-runGraphFreePair controlName control treatmentName treatment cases pairs wallLimit callLimit out =
-    runComparison
-        pairs
-        out
-        wallLimit
-        callLimit
-        (searchCensoredStatuses wallLimit callLimit)
-        (arm controlName control, arm treatmentName treatment)
-        cases
-    where
-        arm name policy =
-            serialArm
-                name
-                ( \config ->
-                    config
-                        { reductionSlicing = False
-                        , reductionClosure = False
-                        , reductionStatementSearch = policy
-                        }
-                )
-                True
-
-runRankedAblation :: StatementSearchPolicy -> Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runRankedAblation control =
-    runGraphFreePair
-        "control"
-        control
-        "ranked-interleaved"
-        statementRanked
-        (statementFixtures ++ [statementFixture False True 128, statementFixture True True 32] ++ fixtures)

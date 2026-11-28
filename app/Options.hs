@@ -52,7 +52,7 @@ import Occam.Parser (SQLDialect (..))
 import Occam.Reducer (
     ColumnMode (..),
     StatementSearchPolicy (..),
-    convergedRankedScheduleConfig,
+    statementRanked,
     statementRankedFallback,
  )
 import System.Environment (lookupEnv)
@@ -152,7 +152,7 @@ parseLogFormat s = case map toLower s of
 parseStatementOrder :: String -> Either String StatementSearchPolicy
 parseStatementOrder s = case map toLower s of
     "ranked-fallback" -> Right statementRankedFallback
-    "ranked" -> Right (StatementRankedWith convergedRankedScheduleConfig)
+    "ranked" -> Right statementRanked
     "subset-first" -> Right StatementSubsetFirst
     "complement-first" -> Right StatementComplementFirst
     "byte-weighted" -> Right StatementByteWeighted

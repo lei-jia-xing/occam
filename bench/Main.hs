@@ -101,28 +101,18 @@ import ResultBaseline (
     runDistributedMin16Vs32Baseline,
     runDistributedMisses1Vs2Baseline,
     runDistributedMisses2Vs3Baseline,
-    runDistributedRefreshBaseline,
     runEarlyRejectBaseline,
     runGroupProposalsBaseline,
     runGroupProposalsNoLocBaseline,
     runLiteralBatchBaseline,
-    runReparseBaseline,
     runResultBaseline,
     runSearchBaseline,
     runStatementBoundedPrefClosureBaseline,
     runStatementFallbackBaseline,
     runStatementFallbackNoLocBaseline,
-    runStatementInterleaveBaseline,
-    runStatementLanePrefBaseline,
-    runStatementLanePrefQuota2Baseline,
-    runStatementLanePrefQuota8Baseline,
     runStatementOrderBaseline,
-    runStatementRankBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
-    runStatementRankedResumeBaseline,
-    runStatementRankedResumeTiesBaseline,
-    runStatementResumeMonoBaseline,
     runStatementWeightBaseline,
     runStatementYieldBaseline,
     runValuesScheduleBaseline,
@@ -448,24 +438,14 @@ searchModes =
     , ("--statement-weight-baseline", runStatementWeightBaseline)
     , ("--statement-ranked-baseline", runStatementRankedBaseline)
     , ("--statement-ranked-graph-free-baseline", runStatementRankedGraphFreeBaseline)
-    , ("--statement-rank-ablation", runStatementRankBaseline)
-    , ("--statement-interleave-ablation", runStatementInterleaveBaseline)
-    , ("--statement-ranked-resume-ablation", runStatementRankedResumeBaseline)
-    , ("--statement-ranked-resume-ties-ablation", runStatementRankedResumeTiesBaseline)
     , ("--statement-bounded-pref-closure-baseline", runStatementBoundedPrefClosureBaseline)
-    , ("--statement-resume-mono-baseline", runStatementResumeMonoBaseline)
-    , ("--statement-lane-pref-baseline", runStatementLanePrefBaseline)
-    , ("--statement-lane-pref-quota-2-baseline", runStatementLanePrefQuota2Baseline)
-    , ("--statement-lane-pref-quota-8-baseline", runStatementLanePrefQuota8Baseline)
     , ("--statement-fallback-baseline", runStatementFallbackBaseline)
     , ("--statement-fallback-noloc-baseline", runStatementFallbackNoLocBaseline)
     , ("--group-proposals-baseline", runGroupProposalsBaseline)
     , ("--group-proposals-noloc-baseline", runGroupProposalsNoLocBaseline)
     , ("--early-reject-baseline", runEarlyRejectBaseline)
-    , ("--reparse-baseline", runReparseBaseline)
     , ("--worker-baseline", runWorkerBaseline)
     , ("--distributed-literal-batch-baseline", runDistributedLiteralBatchBaseline)
-    , ("--distributed-refresh-baseline", runDistributedRefreshBaseline)
     , ("--distributed-misses-1-vs-2-baseline", runDistributedMisses1Vs2Baseline)
     , ("--distributed-misses-2-vs-3-baseline", runDistributedMisses2Vs3Baseline)
     , ("--distributed-min16-vs-32-baseline", runDistributedMin16Vs32Baseline)

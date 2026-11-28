@@ -119,7 +119,6 @@ closureDdminWithCert tracker cert policy logger pool baseSQL initialStatements g
         searchStatementsWithCert
             tracker
             cert
-            True
             policy
             (buildClosureCandidate env)
             pool

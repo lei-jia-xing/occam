@@ -576,30 +576,30 @@ checks =
             assertBool
                 ("expected strictly fewer oracle calls: on=" ++ show callsOn ++ " off=" ++ show callsOff)
                 (callsOn < callsOff)
-    , testCase "Deferred literal leaf span-shift matches full syntax reparse exactly on multi-row VALUES" $ do
-        let rows =
-                [ "(" <> BSC.pack (show i) <> ", 'payload_string_value_" <> BSC.pack (show i) <> "')"
-                | i <- [1 .. 24 :: Int]
-                ]
-            sql =
-                BSC.unlines
-                    [ "CREATE TABLE t(id INT, label TEXT);"
-                    , "INSERT INTO t VALUES " <> BS.intercalate ", " rows <> ";"
-                    , "SELECT sum(id), count(*) FROM t;"
+    , testCase
+        "Incremental deferred literal leaf span-shift shrinks multi-row VALUES under the SQLite contract"
+        $ do
+            let rows =
+                    [ "(" <> BSC.pack (show i) <> ", 'payload_string_value_" <> BSC.pack (show i) <> "')"
+                    | i <- [1 .. 24 :: Int]
                     ]
-        contractRes <- generateSqliteContract sql
-        contract <- either (assertFailure . show) pure contractRes
-        let runWith fullReparse = do
-                pool <- outcomePool (sqliteContractOracle contract)
-                let cfg =
-                        (defaultReductionConfigFor SQLite)
-                            { reductionIntraStatement = True
-                            , reductionFullSyntaxReparse = fullReparse
-                            }
-                reduceSQLWithConfig cfg nullLogger pool sql
-        fullOut <- runWith True
-        fastOut <- runWith False
-        assertEqual "deferred literal leaf shift matches full reparse byte-for-byte" fullOut fastOut
-        verdict <- sqliteContractOracle contract fastOut
-        assertEqual "deferred literal output preserves SQLite contract" OracleAccepted verdict
+                sql =
+                    BSC.unlines
+                        [ "CREATE TABLE t(id INT, label TEXT);"
+                        , "INSERT INTO t VALUES " <> BS.intercalate ", " rows <> ";"
+                        , "SELECT sum(id), count(*) FROM t;"
+                        ]
+            contractRes <- generateSqliteContract sql
+            contract <- either (assertFailure . show) pure contractRes
+            let cfg =
+                    (defaultReductionConfigFor SQLite)
+                        { reductionIntraStatement = True
+                        }
+            pool <- outcomePool (sqliteContractOracle contract)
+            reduced <- reduceSQLWithConfig cfg nullLogger pool sql
+            assertBool
+                "deferred literal leaf shifts shrink the multi-row VALUES script"
+                (BS.length reduced < BS.length sql)
+            verdict <- sqliteContractOracle contract reduced
+            assertEqual "deferred literal output preserves SQLite contract" OracleAccepted verdict
     ]

@@ -18,9 +18,7 @@ module Occam.Frontend.Edits.Core (
     addLowYieldExprEdit,
     addEditBytesWithFlags,
     markEditsTopProjection,
-    withRecursivePredicates,
     addRecursivePredicateSpans,
-    getRecursivePredicateSpans,
     markLastEditRecursiveIf,
 
     -- * List, chunk, clause, and type helpers
@@ -220,15 +218,6 @@ addRecursivePredicateSpans spans =
     where
         unlessNull [] _ = pure ()
         unlessNull _ m = m
-
--- | Run @action@ with additional recursive predicate spans (which persist in visitor state, matching Rust).
-withRecursivePredicates :: [(Int, Int)] -> EditM () -> EditM ()
-withRecursivePredicates spans action = do
-    addRecursivePredicateSpans spans
-    action
-
-getRecursivePredicateSpans :: EditM [(Int, Int)]
-getRecursivePredicateSpans = gets editRecursivePreds
 
 {- | If @action@ emitted an edit and @cond@ holds on the recursive predicate set,
 force 'parserEditRecursivePredicate' on the edit emitted by @action@ (mirrors Rust

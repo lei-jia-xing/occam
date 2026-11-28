@@ -2,7 +2,6 @@
 module ResultBaseline.Syntax (
     runSyntaxPolicyBaseline,
     runDistributedLiteralBatchBaseline,
-    runDistributedRefreshBaseline,
     runDistributedMisses1Vs2Baseline,
     runDistributedMisses2Vs3Baseline,
     runDistributedMin16Vs32Baseline,
@@ -74,32 +73,6 @@ runDistributedLiteralBatchBaseline pairs wallLimit callLimit out =
             True
         )
         distributedBatchFixtures
-
-runDistributedRefreshBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runDistributedRefreshBaseline pairs wallLimit callLimit out =
-    runComparison
-        pairs
-        out
-        wallLimit
-        callLimit
-        (searchCensoredStatuses wallLimit callLimit)
-        ( serialArm
-            "distributed-full-reparse"
-            (\c -> (plainSyntax c) {reductionDistributedLiteralBatches = True, reductionFullSyntaxReparse = True})
-            True
-        , serialArm
-            "distributed-incremental-refresh"
-            ( \c -> (plainSyntax c) {reductionDistributedLiteralBatches = True, reductionFullSyntaxReparse = False}
-            )
-            True
-        )
-        [ wideInsertsFixture 512
-        , insertRowsFixture SQLite "all" 512 ""
-        , insertRowsFixture SQLite "all" 64 " WHERE typeof(x) = 'text'"
-        , insertRowsFixture SQLite "multi-col" 64 ""
-        , insertRowsFixture DuckDB "all" 32 ""
-        , insertRowsFixture DuckDB "all" 32 " WHERE x <> '0'"
-        ]
 
 runDistributedConfigComparison ::
     String ->

@@ -52,7 +52,7 @@ import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
 checks :: [TestTree]
 checks =
-    [ testCase "Refreshed syntax edits agree with full reparse across statement boundaries" $ do
+    [ testCase "Incremental refreshed syntax edits shrink across statement boundaries" $ do
         let cases =
                 [ (SQLite, "CREATE TABLE t(a INT NOT NULL);\r\n-- retained\r\nSELECT a, 123456 FROM t WHERE a > 0;")
                 ,
@@ -64,31 +64,29 @@ checks =
                     , "CREATE MACRO identity_value(x) AS x; CREATE TABLE t(a INT NOT NULL); SELECT a, 123456 FROM t WHERE a > 0;"
                     )
                 ]
-            run fullReparse dialect original = do
+            accepted candidate = all (`BSC.isInfixOf` candidate) ["CREATE TABLE t(", "SELECT a", "FROM t"]
+            run dialect original = do
                 candidates <- newIORef []
                 pool <- outcomePool $ \candidate -> do
                     modifyIORef' candidates (candidate :)
-                    let accepted = all (`BSC.isInfixOf` candidate) ["CREATE TABLE t(", "SELECT a", "FROM t"]
-                    pure (if accepted then OracleAccepted else OracleRejected)
+                    pure (if accepted candidate then OracleAccepted else OracleRejected)
                 let config =
                         (defaultReductionConfigFor dialect)
                             { reductionIntraStatement = True
                             , reductionLiteralBatches = True
                             , reductionAdaptiveValues = True
-                            , reductionFullSyntaxReparse = fullReparse
                             }
                 reduced <- reduceSQLWithConfig config nullLogger pool original
                 trace <- reverse <$> readIORef candidates
                 pure (reduced, trace)
         mapM_
             ( \(dialect, original) -> do
-                incremental@(reduced, _) <- run False dialect original
-                full <- run True dialect original
+                (reduced, _) <- run dialect original
                 assertBool (show dialect <> " applies an edit") (BS.length reduced < BS.length original)
-                assertEqual (show dialect <> " candidate bytes and endpoint") full incremental
+                assertBool (show dialect <> " keeps the required statements") (accepted reduced)
             )
             cases
-    , testCase "Trailing SELECT clause shifts preserve the full syntax-reparse candidate order" $ do
+    , testCase "Trailing SELECT clause shifts preserve incremental candidate order" $ do
         let original =
                 "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12 ORDER BY a, b LIMIT 10; SELECT 12345 AS c;"
             withoutLimit =
@@ -98,7 +96,7 @@ checks =
             afterLiteralChange =
                 "SELECT 123456 AS a, 6583 AS b WHERE 25 > 12; SELECT 0 AS c;"
             accepted = [original, withoutLimit, withoutOrder, afterLiteralChange]
-            run fullReparse = do
+            run = do
                 candidates <- newIORef []
                 pool <- outcomePool $ \candidate -> do
                     modifyIORef' candidates (candidate :)
@@ -106,14 +104,18 @@ checks =
                 let cfg =
                         (defaultReductionConfigFor SQLite)
                             { reductionIntraStatement = True
-                            , reductionFullSyntaxReparse = fullReparse
                             }
                 reduced <- reduceSQLWithConfig cfg nullLogger pool original
                 trace <- reverse <$> readIORef candidates
                 pure (reduced, trace)
-        fast@(endpoint, _) <- run False
+        (endpoint, trace) <- run
         assertEqual "both trailing clauses and the later literal are removed" afterLiteralChange endpoint
-        assertEqual "same ordered candidate bytes" fast =<< run True
+        case map (`elemIndex` trace) [withoutLimit, withoutOrder, afterLiteralChange] of
+            [Just limitIdx, Just orderIdx, Just literalIdx] ->
+                assertBool
+                    "trailing clause shifts and the later literal retain candidate order"
+                    (limitIdx < orderIdx && orderIdx < literalIdx)
+            _ -> assertFailure "the oracle did not observe the ordered trailing-clause states"
     , testCase "applyParserEdits and selectIndependentEdits enforce disjoint non-gluing boundaries" $ do
         let sql = "CREATE TABLE t (a VARCHAR(20) NOT NULL, b BIGINT DEFAULT 1);"
             -- a: VARCHAR(20) [18..29) -> "INT", NOT NULL [29..38) -> ""

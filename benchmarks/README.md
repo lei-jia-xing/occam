@@ -69,7 +69,10 @@ intra-statement rewrites enabled in both arms. Both use the shared evaluation en
 and one worker. The cohort includes removable and required VALUES rows,
 independent and interacting literals, and both precise and globally fenced
 graphs. The JSON records AB/BA order, warmups, phase metrics, physical calls
-including preflight and validation, and the improving checkpoint curve.
+including preflight and validation, and the improving checkpoint curve. A local
+four-pair run with distributed batching held on reduced calls from 4344 to 3532
+(-18.7%) at unlimited budget, 1152 to 1024 (-11.1%) at cap 64, and 1448 to 1280
+(-11.6%) at cap 128, with byte-identical endpoints.
 
 Use `--values-schedule-baseline` to compare the coarse-to-fine VALUES
 schedule with deferred fine chunks. Use `--combined-syntax-baseline`
@@ -96,12 +99,21 @@ Use `--statement-order-baseline` to isolate complement-first ordering while
 retaining both search lanes and the normal audit.
 Use `--statement-weight-baseline` to compare equal-count and byte-weighted
 partitions with complement-first ordering in both arms. This comparison
-includes scripts with unusually large noise statements.
+includes scripts with unusually large noise statements. Ranked scheduling is now
+fixed to the canonical estimated-byte, bounded-preference-4, monotonic-resume
+policy; retired partition/serial/cursor/stable-tie ablation modes regressed calls
+by 25–97%, while quota 2/8 differed from quota 4 by at most 2%.
 
-Use `--reparse-baseline` to compare single-unit refresh with full script
-reparse after an accepted syntax edit, with both experimental syntax
-schedules enabled. Use `--worker-baseline` with `+RTS -N4 -RTS` and the
-same CPU affinity for both arms to compare one and four ordered workers on
+`--group-proposals-baseline` and `--group-proposals-noloc-baseline` exercise
+noncontiguous dependency and transaction proposals. A local projection-on/off
+comparison reduced tx-noop-block calls from 160 to 24 (precise) and 156 to 24
+(fenced), and savepoint-mix calls from 132 to 28, with identical endpoints. In
+no-location mode at cap 64, projection improved the tx-noop checkpoint from
+461 to 77 B. One FK-wrapper fixture regressed by eight calls, so the projection
+is retained for its substantial transaction-heavy benefit.
+
+Use `--worker-baseline` with `+RTS -N4 -RTS` and the same CPU affinity for
+both arms to compare one and four ordered workers on
 SQLite. Each worker gets a fresh in-memory database. Include speculative
 starts and cancellations when comparing physical calls.
 

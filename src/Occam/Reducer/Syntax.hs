@@ -25,7 +25,6 @@ import Occam.Reducer.Config (
     deferLiteralVariantsPolicy,
     deferRecursivePredicatesPolicy,
     distributedLiteralBatchPolicy,
-    fullReparsePolicy,
     literalBatchPolicy,
     syntaxPolicyName,
     valuesChunkPolicy,
@@ -77,7 +76,6 @@ reduceSyntaxWithDialect config tracker lookupTrace logger options pool shouldRun
                 , syntaxDeferRecursivePredicates = reductionDeferRecursivePredicates config
                 , syntaxAstBatching = reductionAstBatching config
                 , syntaxAdaptiveValues = reductionAdaptiveValues config
-                , syntaxFullReparse = reductionFullSyntaxReparse config
                 , syntaxOptions = options
                 , syntaxEarlyReject = reductionEarlyReject config
                 , syntaxTracker = tracker
@@ -98,7 +96,6 @@ reduceSyntaxWithDialect config tracker lookupTrace logger options pool shouldRun
                     <> deferRecursivePredicatesPolicy (reductionDeferRecursivePredicates config)
                     <> astBatchPolicy (reductionAstBatching config)
                     <> valuesChunkPolicy (reductionAdaptiveValues config)
-                    <> fullReparsePolicy (reductionFullSyntaxReparse config)
                 )
             )
         , ("category_order", toJSON (syntaxCategoryOrderName mode))

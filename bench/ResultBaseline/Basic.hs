@@ -1,4 +1,4 @@
--- | Baseline runners for result selection, syntax policy, reparsing, and worker count.
+-- | Baseline runners for result selection, syntax policy, and worker count.
 module ResultBaseline.Basic (
     runResultBaseline,
     runSearchBaseline,
@@ -7,7 +7,6 @@ module ResultBaseline.Basic (
     runCombinedSyntaxBaseline,
     runAstBatchingBaseline,
     runColumnModeBaseline,
-    runReparseBaseline,
     runWorkerBaseline,
 ) where
 
@@ -135,22 +134,6 @@ optimizedSyntax config =
         , reductionAdaptiveValues = True
         , reductionLiteralBatches = True
         }
-
-runReparseBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runReparseBaseline pairs wallLimit callLimit out =
-    runComparison
-        pairs
-        out
-        wallLimit
-        callLimit
-        (searchCensoredStatuses wallLimit callLimit)
-        ( serialArm "incremental-syntax-reparse" optimizedSyntax True
-        , serialArm
-            "full-syntax-reparse"
-            (\config -> (optimizedSyntax config) {reductionFullSyntaxReparse = True})
-            True
-        )
-        (searchFixtures ++ fixtures)
 
 runWorkerBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
 runWorkerBaseline pairs wallLimit callLimit out =

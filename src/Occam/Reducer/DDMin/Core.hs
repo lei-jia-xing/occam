@@ -92,7 +92,6 @@ emptyLaneState = LaneState Nothing 0 Nothing
 data DDMinEnv = DDMinEnv
     { ddTracker :: !EarlyRejectTracker
     , ddCert :: !EarlyRejectCertifier
-    , ddClosureAware :: !Bool
     , ddPolicy :: !StatementSearchPolicy
     , ddFeedback :: !Feedback
     , ddBuildCandidate :: !CandidateBuilder

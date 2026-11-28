@@ -305,7 +305,7 @@ resolveEffectiveStatementPolicy ::
     IO StatementSearchPolicy
 resolveEffectiveStatementPolicy env initialSQL sliced searchAnalysis priorEvidence =
     case reductionStatementSearch config of
-        StatementRankedFallback rankedCfg -> do
+        StatementRankedFallback -> do
             remainingStmts <-
                 maybe
                     (length . snd <$> iterParse env sliced)
@@ -315,7 +315,6 @@ resolveEffectiveStatementPolicy env initialSQL sliced searchAnalysis priorEviden
                 activated =
                     not alreadyConfirmed
                         && shouldActivateRankedFallback
-                            rankedCfg
                             (reductionSlicing config)
                             (BS.length initialSQL)
                             (BS.length sliced)
@@ -333,7 +332,7 @@ resolveEffectiveStatementPolicy env initialSQL sliced searchAnalysis priorEviden
                 , ("bytes_after", toJSON (BS.length sliced))
                 , ("statements_after", toJSON remainingStmts)
                 ]
-            pure (if activated then StatementRankedWith rankedCfg else StatementByteWeighted)
+            pure (if activated then StatementRanked else StatementByteWeighted)
         other -> pure other
     where
         config = iterConfig env
