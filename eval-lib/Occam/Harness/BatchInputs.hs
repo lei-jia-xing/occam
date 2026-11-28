@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Resolve input files and metadata for a batch without executing the SQL.
 module Occam.Harness.BatchInputs (
     Attributes (..),
@@ -112,7 +114,7 @@ instance ToJSON BatchCase where
                 , "file" .= batchFile item
                 , "byte_count" .= batchByteCount item
                 , "sql_sha256" .= batchSqlSha256 item
-                , "dbms" .= dbmsId (batchDbms item)
+                , "dbms" .= (batchDbms item).identifier
                 , "dialect" .= batchDialect item
                 , "image" .= batchImage item
                 , "version" .= attrVersion attrs
@@ -127,7 +129,7 @@ batchCaseOverview :: BatchCase -> Value
 batchCaseOverview item =
     object
         [ "id" .= batchCaseId item
-        , "dbms" .= dbmsId (batchDbms item)
+        , "dbms" .= (batchDbms item).identifier
         , "dialect" .= batchDialect item
         , "image" .= batchImage item
         , "file" .= batchFile item
@@ -170,13 +172,13 @@ loadBatchInputs cfg options = do
                         (throwE ("Cannot infer DBMS for '" <> path <> "'; pass --dbms or add dialect metadata"))
                         pure
                         (attrDbms attrs <|> dbmsFilter)
-            if maybe True (== dbmsId dbms) dbmsFilter
+            if maybe True (== dbms.identifier) dbmsFilter
                 then do
                     exists <- lift (doesFileExist path)
                     unless exists (throwE ("SQL file not found: " <> path))
                     sql <- lift (BS.readFile path)
                     let image = resolveImage (inputImage options) overrides cid attrs dbms
-                        dialect = fromMaybe (dbmsOccamDialect dbms) (attrDialect attrs)
+                        dialect = fromMaybe dbms.occamDialect (attrDialect attrs)
                         signature = fromMaybe (inputExpectedSignature options) (attrSignature attrs)
                     pure
                         ( Just
@@ -184,7 +186,7 @@ loadBatchInputs cfg options = do
                         )
                 else pure Nothing
 
-        sortKey item = (dbmsId (batchDbms item), batchImage item, batchCaseId item)
+        sortKey item = ((batchDbms item).identifier, batchImage item, batchCaseId item)
 
 explicitFiles :: BatchInputSource -> Bool
 explicitFiles (SqlFiles _) = True
@@ -332,9 +334,9 @@ parseImageOverride raw =
 
 resolveImage :: Text -> Map Text Text -> Text -> Attributes -> DbmsSpec -> Text
 resolveImage explicit overrides cid attrs dbms =
-    let name = dbmsId dbms
+    let name = dbms.identifier
         versionKey = (\version -> name <> "@" <> version) <$> nonEmpty (attrVersion attrs)
         keys = [Just ("case:" <> cid), versionKey, Just name]
         candidates =
             nonEmpty explicit : [key >>= (`Map.lookup` overrides) | key <- keys] <> [nonEmpty (attrImage attrs)]
-     in fromMaybe (dbmsContainerImage dbms) (listToMaybe (catMaybes candidates))
+     in fromMaybe dbms.containerImage (listToMaybe (catMaybes candidates))

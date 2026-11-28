@@ -36,6 +36,7 @@ import Occam.Frontend.Span (ByteSpan (..), Located (..), spanEnd, spanStart)
 import Occam.Parser.Dialect (DialectFeature (..))
 import Occam.Parser.Types (SQLDialect (..))
 
+-- | Parse PostgreSQL @REFRESH MATERIALIZED VIEW@ and its concurrency/data flags.
 parseRefreshMaterializedView :: P (Located RefreshMaterializedViewStmt)
 parseRefreshMaterializedView = withLocated do
     tok <- expectWordCI "REFRESH"
@@ -50,6 +51,7 @@ parseRefreshMaterializedView = withLocated do
             pure (not noData)
     pure (RefreshMaterializedViewStmt concurrently name withData)
 
+-- | Parse @EXPLAIN@ options followed by the statement being explained.
 parseExplain :: P (Located ExplainStmt)
 parseExplain = withLocated do
     _ <- expectWordCI "EXPLAIN"
@@ -110,6 +112,7 @@ optionValueRaw tok = case locValue tok of
     TokWord WordToken {wordQuote = Nothing, wordRaw} -> asciiUpperBS wordRaw
     _ -> tokenRaw tok
 
+-- | Parse @COPY@ source, direction, endpoint, and supported option spellings.
 parseCopy :: P (Located CopyStmt)
 parseCopy = withLocated do
     tok <- expectWordCI "COPY"
@@ -210,6 +213,7 @@ isKnownCopyOption =
     wordIn
         ["HEADER", "CSV", "BINARY", "FREEZE", "OIDS", "DELIMITER", "NULL", "QUOTE", "ESCAPE", "FORMAT"]
 
+-- | Parse @ANALYZE@ with an optional table and column list.
 parseAnalyze :: P (Located AnalyzeStmt)
 parseAnalyze = withLocated do
     tok <- expectWordCI "ANALYZE"
@@ -227,6 +231,7 @@ parseAnalyzeTables =
 parseAnalyzeTable :: P (Located AnalyzeTable)
 parseAnalyzeTable = withLocated (AnalyzeTable <$> parseName <*> parseOptionalColumnNames)
 
+-- | Parse SQLite @VACUUM INTO@ or PostgreSQL/DuckDB vacuum options and target.
 parseVacuum :: P (Located VacuumStmt)
 parseVacuum = withLocated do
     tok <- expectWordCI "VACUUM"
@@ -304,6 +309,7 @@ parseAttachObjectKind =
                 advanceTok $> L (locSpan tok) (asciiUpperBS raw)
         _ -> unexpectedHere "expected TABLE, DICTIONARY, DATABASE, or VIEW"
 
+-- | Parse database detachment or ClickHouse object detachment.
 parseDetach :: P (Located DetachStmt)
 parseDetach = withLocated do
     tok <- expectWordCI "DETACH"
@@ -326,6 +332,7 @@ parseDetach = withLocated do
 -- PREPARE / EXECUTE / DEALLOCATE / TRUNCATE / PIVOT
 -- ---------------------------------------------------------------------------
 
+-- | Parse a prepared statement using the dialect-specific source form.
 parsePrepare :: P (Located PrepareStmt)
 parsePrepare = withLocated do
     tok <- expectWordCI "PREPARE"
@@ -356,12 +363,14 @@ parsePrepare = withLocated do
             ExprParam ParamUser _ -> True
             _ -> False
 
+-- | Parse execution of a prepared statement with optional expression arguments.
 parseExecute :: P (Located ExecuteStmt)
 parseExecute = withLocated do
     tok <- expectWordCI "EXECUTE"
     requireFeatureP FeaturePreparedStatements (locSpan tok) "EXECUTE"
     ExecuteStmt <$> parseName <*> parseOptParenList parseExpr
 
+-- | Parse @DEALLOCATE ALL@ or deallocation of one prepared name.
 parseDeallocate :: P (Located DeallocateStmt)
 parseDeallocate = withLocated do
     tok <- expectWordCI "DEALLOCATE"
@@ -371,6 +380,7 @@ parseDeallocate = withLocated do
         onWord "ALL" (pure (DeallocateStmt True Nothing))
         lift (DeallocateStmt False . Just <$> parseName)
 
+-- | Parse @TRUNCATE@ targets and supported identity/cascade modifiers.
 parseTruncate :: P (Located TruncateStmt)
 parseTruncate = withLocated do
     tok <- expectWordCI "TRUNCATE"
@@ -395,6 +405,7 @@ parseTruncate = withLocated do
         requireDialectP [PostgreSQL] (locSpan tok) "TRUNCATE ... CASCADE/RESTRICT"
     pure (TruncateStmt (isJust onlyTok) tables identity behavior)
 
+-- | Parse DuckDB @PIVOT@ or @UNPIVOT@ into its structural clause fields.
 parsePivot :: P (Located PivotStmt)
 parsePivot = withLocated do
     (headSpan, isUnpivot) <-
@@ -418,6 +429,7 @@ parsePivot = withLocated do
             groupBy <- fromMaybe [] <$> whenWord "GROUP" (expectWordCI "BY" *> parseCommaSeparated parseExpr)
             pure (PivotStmt False source onExprs inValues using groupBy Nothing Nothing)
 
+-- | Parse PostgreSQL @NOTIFY@ channel and optional payload.
 parseNotify :: P (Located NotifyStmt)
 parseNotify = withLocated do
     tok <- expectWordCI "NOTIFY"
@@ -426,6 +438,7 @@ parseNotify = withLocated do
     payload <- whenTok TokComma parseExpr
     pure (NotifyStmt channel payload)
 
+-- | Parse the MySQL/MariaDB/ClickHouse pairwise @RENAME TABLE@ form.
 parseRenameTable :: P (Located [(Located Name, Located Name)])
 parseRenameTable = withLocated do
     tok <- expectWordCI "RENAME"
@@ -433,6 +446,7 @@ parseRenameTable = withLocated do
     requireDialectP [MySQL, MariaDB, ClickHouse] (locSpan tok) "RENAME TABLE"
     parseCommaSeparated ((,) <$> parseName <*> (expectWordCI "TO" *> parseName))
 
+-- | Parse ClickHouse/MySQL @OPTIMIZE TABLE@ modifiers.
 parseOptimize :: P (Located OptimizeStmt)
 parseOptimize = withLocated do
     tok <- expectWordCI "OPTIMIZE"
@@ -444,6 +458,7 @@ parseOptimize = withLocated do
     dedup <- isJust <$> matchWordCI "DEDUPLICATE"
     pure (OptimizeStmt table part finalFlag dedup)
 
+-- | Parse a dialect-specific @SHOW@ subject, target, and filters.
 parseShow :: P (Located ShowStmt)
 parseShow = withLocated do
     tok <- expectWordCI "SHOW"

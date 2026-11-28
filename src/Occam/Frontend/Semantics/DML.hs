@@ -144,6 +144,7 @@ mergeTargetReads reads0 target extra
                  in r {Core.readColumns = existing ++ added}
             | otherwise = r
 
+-- | Extract INSERT write/read facts, conservative barriers, and nested DML facts.
 insertFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -197,6 +198,7 @@ insertFacts analyzeStmt ctx visitor stmtSpan ins baseFacts =
                             }
                  in mergeNested facts1 nested
 
+-- | Extract UPDATE writes per resolved target and attach source/read dependencies.
 updateFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -304,6 +306,7 @@ sourceMatchesQualifier src qual = case tsAlias src of
         qual == tsParts src
             || (length qual == 1 && listToMaybe (reverse (tsParts src)) == listToMaybe qual)
 
+-- | Extract DELETE target writes, reads, barriers, and nested DML facts.
 deleteFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -371,6 +374,7 @@ deleteFacts analyzeStmt ctx visitor stmtSpan del baseFacts =
                                 (factsWithBarriers {Core.factOps = Core.factOps factsWithBarriers ++ writes})
                                 nested
 
+-- | Extract MERGE target writes and source reads, retaining nested DML effects.
 mergeFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -426,6 +430,7 @@ mergeColumns ctx m = dedupPreserve (concatMap clauseCols (AST.mergeClauses m))
                 map (canonicalIdent ctx IdentColumn . locValue) cols
             _ -> []
 
+-- | Convert each resolved TRUNCATE target into a write fact with its modifiers.
 truncateFacts :: AnalysisContext -> AST.TruncateStmt -> Core.SemanticFacts -> Core.SemanticFacts
 truncateFacts ctx tr baseFacts
     | null (AST.truncateTables tr) =
@@ -471,6 +476,7 @@ truncateFacts ctx tr baseFacts
                                ]
                     }
 
+-- | Extract COPY table/query reads or writes and fence unmodeled external effects.
 copyFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->

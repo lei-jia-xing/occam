@@ -25,6 +25,7 @@ import Occam.Frontend.Span (ByteSpan, Located (..))
 import Occam.Parser.Dialect (DialectFeature (..), DialectProfile (..))
 import Occam.Parser.Types (SQLDialect (..))
 
+-- | Parse INSERT or REPLACE after the optional WITH clause, using @start@ for its full span.
 parseInsertFrom :: Bool -> ByteSpan -> Maybe (Located WithClause) -> P (Located InsertStmt)
 parseInsertFrom isReplace start mWith = do
     orAction <-
@@ -292,6 +293,7 @@ parseDeleteFrom start mWith = do
 isMySQLFamily :: P Bool
 isMySQLFamily = gets ((`elem` [MySQL, MariaDB]) . dialectId . psProfile)
 
+-- | Parse a feature-gated @MERGE INTO@ statement with its WHEN clauses.
 parseMergeFrom :: ByteSpan -> Maybe (Located WithClause) -> P (Located MergeStmt)
 parseMergeFrom start mWith = do
     mergeTok <- expectWordCI "MERGE"
@@ -342,6 +344,7 @@ parseMergeClause = withLocated do
         lift (expectWordsCI ["DO", "NOTHING"] $> MergeDoNothing)
     pure (MergeClause matched bySource condition action)
 
+-- | Parse a dialect-supported @USE@ namespace name.
 parseUse :: P (Located Name)
 parseUse = do
     tok <- expectWordCI "USE"

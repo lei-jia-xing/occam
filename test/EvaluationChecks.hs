@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module EvaluationChecks (tests) where
 
 import Control.Concurrent (threadDelay)
@@ -86,23 +88,23 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "accepted checkpoint survives execution cap" candidate (evaluatedSQL result)
-            assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
-            assertEqual "two validation calls reserved" 2 (evaluationValidationObservations metrics)
-            assertBool "last repeated target validation passes" (evaluationValidationPassed metrics)
-            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget (evaluationStatus metrics)
-            assertEqual "uncached profile records no hits" 0 (evaluationCacheHits metrics)
+            let metrics = result.metrics
+            assertEqual "accepted checkpoint survives execution cap" candidate result.sql
+            assertEqual "one reduction oracle call allowed" 1 metrics.oracleAttempts
+            assertEqual "two validation calls reserved" 2 metrics.validationObservations
+            assertBool "last repeated target validation passes" metrics.validationPassed
+            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget metrics.runStatus
+            assertEqual "uncached profile records no hits" 0 metrics.cacheHits
             assertEqual
                 "outcome category counts every real reduction attempt"
                 1
-                (sum (Map.elems (evaluationOracleOutcomes metrics)))
+                (sum (Map.elems metrics.oracleOutcomes))
             assertEqual
                 "validation outcomes remain separate"
                 2
-                (sum (Map.elems (evaluationValidationOutcomes metrics)))
-            assertBool "reset process time is reported separately" (evaluationResetSeconds metrics > 0)
-            assertBool "validation reset time is separate" (evaluationValidationResetSeconds metrics > 0)
+                (sum (Map.elems metrics.validationOutcomes))
+            assertBool "reset process time is reported separately" (metrics.resetSeconds > 0)
+            assertBool "validation reset time is separate" (metrics.validationResetSeconds > 0)
         , testCase "native validation uses the independent observer for both final probes" $ do
             let initial = "SELECT 1; SELECT 2;"
                 candidate = "SELECT 2;"
@@ -111,34 +113,34 @@ tests =
             result <-
                 runEvaluationRequestWithNativeValidation 500000 observe validate $
                     EvaluationRequest
-                        { requestOnProgress = const (pure ())
-                        , requestMetricsPolicy = Nothing
-                        , requestConfig = evaluationConfig True Nothing (Just 3)
-                        , requestDialect = SQLite
-                        , requestOracleConfig = ()
-                        , requestPreflightObservation = Just (OracleFinished ExitSuccess)
-                        , requestLogger = nullLogger
-                        , requestInitialSQL = initial
-                        , requestCheckpoint = ""
-                        , requestCollectCurve = False
-                        , requestAction = \_ _ pool -> do
+                        { onProgress = const (pure ())
+                        , metricsPolicy = Nothing
+                        , config = evaluationConfig True Nothing (Just 3)
+                        , dialect = SQLite
+                        , oracleConfig = ()
+                        , preflightObservation = Just (OracleFinished ExitSuccess)
+                        , logger = nullLogger
+                        , initialSQL = initial
+                        , checkpoint = ""
+                        , collectCurve = False
+                        , action = \_ _ pool -> do
                             outcome <- poolOracle pool candidate
                             assertEqual "reduction accepts its candidate" OracleAccepted outcome
                             pure (ReductionActionResult candidate (Just (ReductionEvidence candidate True)))
                         }
-            let metrics = evaluationMetrics result
+            let metrics = result.metrics
             assertEqual
                 "validation bypasses the cached acceptance"
                 EvaluationValidationFailed
-                (evaluationStatus metrics)
+                metrics.runStatus
             assertEqual
                 "both validations executed independently"
                 2
-                (evaluationValidationDatabaseObservations metrics)
+                metrics.validationDatabaseObservations
             assertEqual
                 "rejected validation suppresses minimality"
                 MinimalityNotEstablished
-                (evaluationMinimalityClaim metrics)
+                metrics.minimalityClaim
         , testCase "coarse-to-fine search checkpoints a structural edit within finite budget" $ do
             let initial = "INSERT INTO t VALUES (123456);\nSELECT x FROM t WHERE x = 42;\n"
                 candidate = "INSERT INTO t VALUES (123456);\nSELECT x FROM t;\n"
@@ -164,13 +166,13 @@ tests =
                 saved <- BS.readFile checkpoint
                 assertEqual "the structural candidate is persisted" candidate saved
                 pure value
-            let metrics = evaluationMetrics result
-            assertEqual "the accepted structural SQL is returned" candidate (evaluatedSQL result)
+            let metrics = result.metrics
+            assertEqual "the accepted structural SQL is returned" candidate result.sql
             assertEqual
                 "further search stops only at the explicit budget"
                 EvaluationExecutionBudget
-                (evaluationStatus metrics)
-            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+                metrics.runStatus
+            assertBool "the accepted checkpoint passes final validation" metrics.validationPassed
         , testCase "syntax reduction checkpoints both fine edits before budget exhaustion" $ do
             let initial = "INSERT INTO t VALUES (123456, 654321);\nSELECT x FROM t WHERE flag;\n"
                 candidate = "INSERT INTO t VALUES (0, 0);\nSELECT x FROM t WHERE flag;\n"
@@ -198,13 +200,13 @@ tests =
                 saved <- BS.readFile checkpoint
                 assertEqual "both fine edits are checkpointed before coarse replay" candidate saved
                 pure value
-            let metrics = evaluationMetrics result
-            assertEqual "both fine edits are returned" candidate (evaluatedSQL result)
+            let metrics = result.metrics
+            assertEqual "both fine edits are returned" candidate result.sql
             assertEqual
                 "the next search attempt exhausts the explicit budget"
                 EvaluationExecutionBudget
-                (evaluationStatus metrics)
-            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+                metrics.runStatus
+            assertBool "the accepted checkpoint passes final validation" metrics.validationPassed
         , testCase "finite oracle budget reaches both later same-category literal reductions" $ do
             let initial = "INSERT INTO t VALUES (42, 123456, 654321);\nSELECT x FROM t WHERE flag;"
                 afterFirst = "INSERT INTO t VALUES (42, 0, 654321);\nSELECT x FROM t WHERE flag;"
@@ -242,13 +244,13 @@ tests =
                 saved <- BS.readFile checkpoint
                 assertEqual "both later literal reductions are checkpointed" afterBoth saved
                 pure value
-            let metrics = evaluationMetrics result
-            assertEqual "both later values are zeroed before the cap" afterBoth (evaluatedSQL result)
+            let metrics = result.metrics
+            assertEqual "both later values are zeroed before the cap" afterBoth result.sql
             assertEqual
                 "the explicit oracle cap interrupts only further search"
                 EvaluationExecutionBudget
-                (evaluationStatus metrics)
-            assertBool "the accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
+                metrics.runStatus
+            assertBool "the accepted checkpoint passes final validation" metrics.validationPassed
         , testCase "preflight exhaustion reports execution budget and keeps the accepted checkpoint" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -260,10 +262,10 @@ tests =
                 Right details -> do
                     let config =
                             (evaluationConfig False (Just 30000000) (Just 1))
-                                { evaluationPreflightMicros = totalElapsedMicros details
-                                , evaluationPreflightAttempts = 1
-                                , evaluationPreflightResetMicros = Just (resetElapsedMicros details)
-                                , evaluationPreflightOracleMicros = oracleElapsedMicros details
+                                { preflightMicros = totalElapsedMicros details
+                                , preflightAttempts = 1
+                                , preflightResetMicros = Just (resetElapsedMicros details)
+                                , preflightOracleMicros = oracleElapsedMicros details
                                 }
                         action _ _ _ = fail "reduction must not start after preflight exhausts the execution cap"
                     result <- withCheckpoint $ \checkpoint -> do
@@ -281,19 +283,19 @@ tests =
                         saved <- BS.readFile checkpoint
                         assertEqual "exhausted budget cannot replace accepted SQL" initial saved
                         pure value
-                    let metrics = evaluationMetrics result
+                    let metrics = result.metrics
                     assertEqual
                         "an exhausted execution cap is not a wall timeout"
                         EvaluationExecutionBudget
-                        (evaluationStatus metrics)
-                    assertEqual "preflight consumed the only allowed execution" 0 (evaluationOracleAttempts metrics)
-                    assertEqual "no reducer subprocess started" 0 (evaluationDatabaseObservations metrics)
-                    assertEqual "no final validations were scheduled" 0 (evaluationValidationObservations metrics)
+                        metrics.runStatus
+                    assertEqual "preflight consumed the only allowed execution" 0 metrics.oracleAttempts
+                    assertEqual "no reducer subprocess started" 0 metrics.databaseObservations
+                    assertEqual "no final validations were scheduled" 0 metrics.validationObservations
                     assertEqual
                         "no final validation subprocess started"
                         0
-                        (evaluationValidationDatabaseObservations metrics)
-                    assertEqual "last accepted SQL remains the initial input" initial (evaluatedSQL result)
+                        metrics.validationDatabaseObservations
+                    assertEqual "last accepted SQL remains the initial input" initial result.sql
         , testCase "timeouts keep the last accepted checkpoint and make no 1-minimal claim" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -314,15 +316,15 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "checkpoint remains the last accepted SQL" candidate (evaluatedSQL result)
-            assertEqual "timeout is not reported as completion" EvaluationTimeout (evaluationStatus metrics)
-            assertBool "final candidate still receives repeated validation" (evaluationValidationPassed metrics)
-            assertEqual "audit did not finish" False (evaluationAuditCompleted metrics)
+            let metrics = result.metrics
+            assertEqual "checkpoint remains the last accepted SQL" candidate result.sql
+            assertEqual "timeout is not reported as completion" EvaluationTimeout metrics.runStatus
+            assertBool "final candidate still receives repeated validation" metrics.validationPassed
+            assertEqual "audit did not finish" False metrics.auditCompleted
             assertEqual
                 "truncated reductions are not called minimal"
                 MinimalityNotEstablished
-                (evaluationMinimalityClaim metrics)
+                metrics.minimalityClaim
         , testCase "wall-budget cancellation counts an oracle process already started" $ do
             let initial = "SELECT 1;\n"
                 oracleCfg = predicateOracle 2000000 "sleep 2"
@@ -341,13 +343,13 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "in-flight oracle attempt is counted" 1 (evaluationOracleAttempts metrics)
-            assertEqual "oracle process start survives cancellation" 1 (evaluationDatabaseObservations metrics)
+            let metrics = result.metrics
+            assertEqual "in-flight oracle attempt is counted" 1 metrics.oracleAttempts
+            assertEqual "oracle process start survives cancellation" 1 metrics.databaseObservations
             assertEqual
                 "timeout prevents a minimality claim"
                 MinimalityNotEstablished
-                (evaluationMinimalityClaim metrics)
+                metrics.minimalityClaim
         , testCase "audit removals replace the selected reduction result" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -371,14 +373,14 @@ tests =
                 saved <- BS.readFile checkpoint
                 assertEqual "audit result is checkpointed" "" saved
                 pure value
-            let metrics = evaluationMetrics result
-            assertEqual "audit result becomes the selected reduction" "" (evaluatedSQL result)
-            assertBool "audit completed" (evaluationAuditCompleted metrics)
+            let metrics = result.metrics
+            assertEqual "audit result becomes the selected reduction" "" result.sql
+            assertBool "audit completed" metrics.auditCompleted
             assertEqual
                 "audit fixed point is claimed minimal"
                 StatementDeletionOneMinimal
-                (evaluationMinimalityClaim metrics)
-            assertBool "audit result passed independent final validation" (evaluationValidationPassed metrics)
+                metrics.minimalityClaim
+            assertBool "audit result passed independent final validation" metrics.validationPassed
         , testCase "shared audit evidence marks the audit as skipped, not zero-duration" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -398,15 +400,15 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertBool "shared evidence audit is skipped" (evaluationAuditSkipped metrics)
-            assertBool "skipped audit still counts as completed" (evaluationAuditCompleted metrics)
-            assertEqual "skipped audit performs no checks" 0 (evaluationAuditChecks metrics)
-            assertEqual "skipped audit reports zero duration" 0.0 (evaluationAuditSeconds metrics)
+            let metrics = result.metrics
+            assertBool "shared evidence audit is skipped" metrics.auditSkipped
+            assertBool "skipped audit still counts as completed" metrics.auditCompleted
+            assertEqual "skipped audit performs no checks" 0 metrics.auditChecks
+            assertEqual "skipped audit reports zero duration" 0.0 metrics.auditSeconds
             assertEqual
                 "shared evidence preserves the 1-minimal claim"
                 StatementDeletionOneMinimal
-                (evaluationMinimalityClaim metrics)
+                metrics.minimalityClaim
         , testCase "parser transport failures preserve the last accepted checkpoint" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -424,9 +426,9 @@ tests =
                 saved <- BS.readFile checkpoint
                 assertEqual "failed parser input cannot overwrite the accepted checkpoint" candidate saved
                 pure value
-            let metrics = evaluationMetrics result
-            assertEqual "parser failure is reported" EvaluationError (evaluationStatus metrics)
-            assertEqual "evaluation returns the last accepted SQL" candidate (evaluatedSQL result)
+            let metrics = result.metrics
+            assertEqual "parser failure is reported" EvaluationError metrics.runStatus
+            assertEqual "evaluation returns the last accepted SQL" candidate result.sql
         , testCase "dialect flags parse to their dependency dialect" $ do
             assertEqual "PostgreSQL dialect" (Right PostgreSQL) (parseSQLDialect "POSTGRESQL")
             assertEqual "postgres alias" (Right PostgreSQL) (parseSQLDialect "postgres")
@@ -480,7 +482,7 @@ tests =
                                 ++ shellQuotePath sentinel
                                 ++ ") & wait;; *) exit 0;; esac"
                             )
-                    config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+                    config = (evaluationConfig True Nothing Nothing) {jobs = 4}
                     action _ _ pool = do
                         outcomes <- testOrdered pool [acceptSQL, sleepSQL]
                         case outcomes of
@@ -497,10 +499,10 @@ tests =
                         acceptSQL
                         checkpoint
                         action
-                let metrics = evaluationMetrics result
-                assertEqual "slow loser must not time out" 0 (evaluationTimedOutObservations metrics)
-                assertEqual "cancelled work is not an error" 0 (evaluationOracleErrors metrics)
-                assertBool "loser cancellation was not accounted" (evaluationCancelledObservations metrics >= 1)
+                let metrics = result.metrics
+                assertEqual "slow loser must not time out" 0 metrics.timedOutObservations
+                assertEqual "cancelled work is not an error" 0 metrics.oracleErrors
+                assertBool "loser cancellation was not accounted" (metrics.cancelledObservations >= 1)
                 threadDelay 2500000
                 leaked <- doesFileExist sentinel
                 assertBool "a cancelled loser descendant survived the process-group cleanup" (not leaked)
@@ -508,7 +510,7 @@ tests =
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
-                config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+                config = (evaluationConfig True Nothing Nothing) {jobs = 4}
             liveAtEndRef <- newIORef (1 :: Int)
             let action _ _ pool = do
                     _ <- testOrdered pool [candidate, initial]
@@ -526,16 +528,16 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
+            let metrics = result.metrics
             liveAtEnd <- readIORef liveAtEndRef
             assertEqual "workers outlived the reduction action" 0 liveAtEnd
-            assertEqual "drained run did not complete" EvaluationCompleted (evaluationStatus metrics)
-            assertEqual "final validation did not run twice" 2 (evaluationValidationObservations metrics)
-            assertBool "final validation failed" (evaluationValidationPassed metrics)
+            assertEqual "drained run did not complete" EvaluationCompleted metrics.runStatus
+            assertEqual "final validation did not run twice" 2 metrics.validationObservations
+            assertBool "final validation failed" metrics.validationPassed
         , testCase "parallel jobs complete a small end-to-end reduction" $ do
             let initial = "SELECT 1;\nSELECT 2;\nSELECT 3;\n"
                 oracleCfg = predicateOracle 500000 "exit 0"
-                config = (evaluationConfig True Nothing Nothing) {evaluationJobs = 4}
+                config = (evaluationConfig True Nothing Nothing) {jobs = 4}
                 reducerConfig = defaultReductionConfigFor SQLite
                 action _ _ pool =
                     ReductionActionResult <$> reduceSQLWithConfig reducerConfig nullLogger pool initial <*> pure Nothing
@@ -550,10 +552,10 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "parallel reduction lost the empty fixed point" "" (evaluatedSQL result)
-            assertEqual "parallel run did not complete" EvaluationCompleted (evaluationStatus metrics)
-            assertBool "parallel result failed final validation" (evaluationValidationPassed metrics)
+            let metrics = result.metrics
+            assertEqual "parallel reduction lost the empty fixed point" "" result.sql
+            assertEqual "parallel run did not complete" EvaluationCompleted metrics.runStatus
+            assertBool "parallel result failed final validation" metrics.validationPassed
         , testCase "evaluation request record runs the same evaluation" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -565,23 +567,23 @@ tests =
             result <- withCheckpoint $ \checkpoint ->
                 runEvaluationRequest
                     EvaluationRequest
-                        { requestOnProgress = \_ -> pure ()
-                        , requestMetricsPolicy = Nothing
-                        , requestConfig = config
-                        , requestDialect = SQLite
-                        , requestOracleConfig = oracleCfg
-                        , requestPreflightObservation = Nothing
-                        , requestLogger = nullLogger
-                        , requestInitialSQL = initial
-                        , requestCheckpoint = checkpoint
-                        , requestAction = action
-                        , requestCollectCurve = True
+                        { onProgress = \_ -> pure ()
+                        , metricsPolicy = Nothing
+                        , config = config
+                        , dialect = SQLite
+                        , oracleConfig = oracleCfg
+                        , preflightObservation = Nothing
+                        , logger = nullLogger
+                        , initialSQL = initial
+                        , checkpoint = checkpoint
+                        , action = action
+                        , collectCurve = True
                         }
-            let metrics = evaluationMetrics result
-            assertEqual "request run returns the accepted candidate" candidate (evaluatedSQL result)
-            assertEqual "request run completes" EvaluationCompleted (evaluationStatus metrics)
-            assertEqual "request run performs two final checks" 2 (evaluationValidationObservations metrics)
-            assertBool "request run validates the final candidate" (evaluationValidationPassed metrics)
+            let metrics = result.metrics
+            assertEqual "request run returns the accepted candidate" candidate result.sql
+            assertEqual "request run completes" EvaluationCompleted metrics.runStatus
+            assertEqual "request run performs two final checks" 2 metrics.validationObservations
+            assertBool "request run validates the final candidate" metrics.validationPassed
         , testCase "cost attribution is captured on budget exhaustion" $ do
             let initial = "SELECT 1;\nSELECT 2;\n"
                 candidate = "SELECT 2;\n"
@@ -606,10 +608,10 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget (evaluationStatus metrics)
-            assertEqual "one reduction oracle call allowed" 1 (evaluationOracleAttempts metrics)
-            case evaluationCostAttribution metrics of
+            let metrics = result.metrics
+            assertEqual "budget exhaustion is reported" EvaluationExecutionBudget metrics.runStatus
+            assertEqual "one reduction oracle call allowed" 1 metrics.oracleAttempts
+            case metrics.costAttribution of
                 Nothing -> assertFailure "cost section missing on budget end"
                 Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
                     Nothing -> assertFailure "untagged pool work missing a family"
@@ -641,10 +643,10 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "timeout is not reported as completion" EvaluationTimeout (evaluationStatus metrics)
-            assertEqual "one reduction call ran before the stall" 1 (evaluationOracleAttempts metrics)
-            case evaluationCostAttribution metrics of
+            let metrics = result.metrics
+            assertEqual "timeout is not reported as completion" EvaluationTimeout metrics.runStatus
+            assertEqual "one reduction call ran before the stall" 1 metrics.oracleAttempts
+            case metrics.costAttribution of
                 Nothing -> assertFailure "cost section missing after drained timeout"
                 Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
                     Nothing -> assertFailure "untagged pool work missing from drained snapshot"
@@ -679,11 +681,11 @@ tests =
                     initial
                     checkpoint
                     action
-            let metrics = evaluationMetrics result
-            assertEqual "inconclusive oracle is reported as an error" EvaluationError (evaluationStatus metrics)
-            assertEqual "last accepted checkpoint survives the error" candidate (evaluatedSQL result)
-            assertBool "accepted checkpoint passes final validation" (evaluationValidationPassed metrics)
-            case evaluationCostAttribution metrics of
+            let metrics = result.metrics
+            assertEqual "inconclusive oracle is reported as an error" EvaluationError metrics.runStatus
+            assertEqual "last accepted checkpoint survives the error" candidate result.sql
+            assertBool "accepted checkpoint passes final validation" metrics.validationPassed
+            case metrics.costAttribution of
                 Nothing -> assertFailure "cost section missing on inconclusive error"
                 Just snapshot -> case Map.lookup TagUnknown (snapshotFamilies snapshot) of
                     Nothing -> assertFailure "untagged pool work missing a family"
@@ -707,15 +709,15 @@ tests =
 evaluationConfig :: Bool -> Maybe Int -> Maybe Int -> EvaluationConfig
 evaluationConfig cacheEnabled wallBudget callBudget =
     EvaluationConfig
-        { evaluationCacheEnabled = cacheEnabled
-        , evaluationJobs = 1
-        , evaluationTotalTimeoutMicros = wallBudget
-        , evaluationMaxOracleExecutions = callBudget
-        , evaluationPreflightMicros = 0
-        , evaluationPreflightAttempts = 0
-        , evaluationPreflightResetMicros = Nothing
-        , evaluationPreflightOracleMicros = Nothing
-        , evaluationInitialStatements = Nothing
+        { cacheEnabled = cacheEnabled
+        , jobs = 1
+        , totalTimeoutMicros = wallBudget
+        , maxOracleExecutions = callBudget
+        , preflightMicros = 0
+        , preflightAttempts = 0
+        , preflightResetMicros = Nothing
+        , preflightOracleMicros = Nothing
+        , initialStatements = Nothing
         }
 
 predicateOracle :: Int -> String -> OracleConfig

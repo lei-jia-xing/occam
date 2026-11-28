@@ -38,12 +38,16 @@ import Occam.Frontend.Context (
 import Occam.Frontend.Lexer (SpannedToken, Token (..), isTriviaToken)
 import Occam.Frontend.Span (ByteSpan (..), Located (..))
 
--- | Precomputed token entry with matching right-parenthesis end offset (@-1@ if unmatched).
+-- | Token and delimiter-navigation metadata for one lexer token.
 data TokenEntry = TokenEntry
     { teSpan :: !ByteSpan
+    -- ^ Byte span of this token, as supplied by the lexer.
     , teToken :: !Token
+    -- ^ Lexed token at this entry.
     , teParenEnd :: !Int
+    -- ^ End byte offset of its matching right parenthesis, or @-1@ if unmatched.
     , teParent :: !Int
+    -- ^ Index of the innermost opening parenthesis containing this token, or @-1@ outside parentheses.
     }
     deriving (Eq, Show)
 

@@ -15,12 +15,12 @@ module Occam.Dependency.Alter (
     indexKeyName,
 ) where
 
+import Control.Monad.Trans.State.Strict (State, get, modify')
 import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Lens.Micro ((%~), (&), (.~))
 import Occam.Core.Schema (
     AlterChange (..),
     AlterTable (..),
@@ -63,24 +63,20 @@ import Occam.Dependency.State (
     SessionState,
     addDeps,
     addTouches,
+    ambiguousMutation,
     deleteConstraint,
     deleteIndex,
-    evalCatalogL,
     insertRelation,
     lookupRelation,
-    mutateResolved,
     nameLast,
     newRelation,
-    relColumnWritesL,
-    relColumnsL,
-    relConstraintsL,
-    relIndexesL,
-    relSchemaWritesL,
  )
 
 -- Constraint columns
 
 -- ALTER TABLE
+
+-- | Find foreign keys introduced by ADD CONSTRAINT or ADD COLUMN changes.
 introducedForeignKeysOf :: AlterChange -> [ForeignKey]
 introducedForeignKeysOf change =
     case change of
@@ -99,6 +95,7 @@ dropColumnDependentViews session catalog tableKey column =
     , viewDependsOnColumn session catalog Set.empty tableKey column viewKey
     ]
 
+-- | Test transitive view lineage for dependence on one source column.
 viewDependsOnColumn ::
     SessionState ->
     Catalog ->
@@ -143,11 +140,11 @@ viewTransitiveDependsOn session catalog visited tableKey column currentKey reque
             | otherwise =
                 viewTransitiveDependsOn session catalog visited' tableKey column sourceKey neededCols
 
-processAlterTable :: StatementId -> Eval -> AlterTable -> Eval
-processAlterTable sid eval alter =
-    mutateResolved (alterRelationKey session sid changes foreignKeyDeps) eval keys
-    where
-        session = evalSession eval
+-- | Apply ALTER TABLE changes to each unambiguous target and record dependencies.
+processAlterTable :: StatementId -> AlterTable -> State Eval ()
+processAlterTable sid alter = do
+    eval <- get
+    let session = evalSession eval
         catalog = evalCatalog eval
         keys = resolveRelationKeys session catalog (alterTableTarget alter)
         changes = alterTableChanges alter
@@ -164,62 +161,67 @@ processAlterTable sid eval alter =
                 | foreignKey <- introducedForeignKeys
                 , parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
                 ]
+    case keys of
+        _ : _ : _ -> modify' ambiguousMutation
+        [] -> pure ()
+        [key] -> alterRelationKey session sid changes foreignKeyDeps key
 
 alterRelationKey ::
-    SessionState -> StatementId -> [AlterChange] -> Set StatementId -> Eval -> RelationKey -> Eval
-alterRelationKey session sid changes foreignKeyDeps current key =
-    current1 & evalCatalogL .~ insertRelation key relation2 catalog1
-    where
-        currentCatalog = evalCatalog current
-        relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
-        validationDeps =
-            Set.unions
-                [ relationReadDeps session currentCatalog parentKey ReadData [] False
-                | ValidateConstraint name <- changes
-                , constraintKey <- Set.toList (relConstraints relation)
-                , constraintKeyIdentity constraintKey == NamedConstraint name
-                , Just state <- [Map.lookup constraintKey (catalogConstraints currentCatalog)]
-                , ForeignKeyConstraint foreignKey <- [constraintValue state]
-                , parentKey <- resolveRelationKeys session currentCatalog (foreignKeyParent foreignKey)
-                ]
-        dropColumnViewDeps =
-            Set.unions
-                [ relationAllDeps session currentCatalog viewKey
-                    `Set.union` relationConstraintDeps currentCatalog viewRelation
-                | DropColumn column _ <- changes
-                , viewKey <- dropColumnDependentViews session currentCatalog key column
-                , Just viewRelation <- [lookupRelation currentCatalog viewKey]
-                ]
-        deps =
-            relationAllDeps session currentCatalog key
-                `Set.union` relationConstraintDeps currentCatalog relation
-                `Set.union` foreignKeyDeps
-                `Set.union` validationDeps
-                `Set.union` dropColumnViewDeps
-        current1 = addTouches (relationTouchKeys key) (addDeps deps current)
-        (catalog1, relation1) = Foldable.foldl' (applyAlterChange session sid key) (currentCatalog, relation) changes
-        relation2 = relation1 & relSchemaWritesL %~ Set.insert sid
+    SessionState -> StatementId -> [AlterChange] -> Set StatementId -> RelationKey -> State Eval ()
+alterRelationKey session sid changes foreignKeyDeps key =
+    modify' $ \current ->
+        let currentCatalog = evalCatalog current
+            relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
+            validationDeps =
+                Set.unions
+                    [ relationReadDeps session currentCatalog parentKey ReadData [] False
+                    | ValidateConstraint name <- changes
+                    , constraintKey <- Set.toList (relConstraints relation)
+                    , constraintKeyIdentity constraintKey == NamedConstraint name
+                    , Just state <- [Map.lookup constraintKey (catalogConstraints currentCatalog)]
+                    , ForeignKeyConstraint foreignKey <- [constraintValue state]
+                    , parentKey <- resolveRelationKeys session currentCatalog (foreignKeyParent foreignKey)
+                    ]
+            dropColumnViewDeps =
+                Set.unions
+                    [ relationAllDeps session currentCatalog viewKey
+                        `Set.union` relationConstraintDeps currentCatalog viewRelation
+                    | DropColumn column _ <- changes
+                    , viewKey <- dropColumnDependentViews session currentCatalog key column
+                    , Just viewRelation <- [lookupRelation currentCatalog viewKey]
+                    ]
+            deps =
+                relationAllDeps session currentCatalog key
+                    `Set.union` relationConstraintDeps currentCatalog relation
+                    `Set.union` foreignKeyDeps
+                    `Set.union` validationDeps
+                    `Set.union` dropColumnViewDeps
+            current1 = addTouches (relationTouchKeys key) (addDeps deps current)
+            (catalog1, relation1) = Foldable.foldl' (applyAlterChange session sid key) (currentCatalog, relation) changes
+            relation2 = relation1 {relSchemaWrites = Set.insert sid (relSchemaWrites relation1)}
+         in current1 {evalCatalog = insertRelation key relation2 catalog1}
 
 -- | Process @ALTER TABLE ... ATTACH PARTITION@.
-processAttachPartition :: StatementId -> Eval -> PartitionLink -> Eval
-processAttachPartition sid eval link = attachDetachPartition sid eval link True
+processAttachPartition :: StatementId -> PartitionLink -> State Eval ()
+processAttachPartition sid link = attachDetachPartition sid link True
 
 -- | Process @ALTER TABLE ... DETACH PARTITION@.
-processDetachPartition :: StatementId -> Eval -> PartitionLink -> Eval
-processDetachPartition sid eval link = attachDetachPartition sid eval link False
+processDetachPartition :: StatementId -> PartitionLink -> State Eval ()
+processDetachPartition sid link = attachDetachPartition sid link False
 
-attachDetachPartition :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
+attachDetachPartition :: StatementId -> PartitionLink -> Bool -> State Eval ()
 attachDetachPartition =
     attachDetachLink relPartitionParents (\relation links -> relation {relPartitionParents = links})
 
 -- | Process @ALTER TABLE ... INHERIT@.
-processAttachInherit :: StatementId -> Eval -> PartitionLink -> Eval
-processAttachInherit sid eval link = attachDetachInherit sid eval link True
+processAttachInherit :: StatementId -> PartitionLink -> State Eval ()
+processAttachInherit sid link = attachDetachInherit sid link True
 
-processDetachInherit :: StatementId -> Eval -> PartitionLink -> Eval
-processDetachInherit sid eval link = attachDetachInherit sid eval link False
+-- | Process @ALTER TABLE ... NO INHERIT@.
+processDetachInherit :: StatementId -> PartitionLink -> State Eval ()
+processDetachInherit sid link = attachDetachInherit sid link False
 
-attachDetachInherit :: StatementId -> Eval -> PartitionLink -> Bool -> Eval
+attachDetachInherit :: StatementId -> PartitionLink -> Bool -> State Eval ()
 attachDetachInherit =
     attachDetachLink relInheritParents (\relation links -> relation {relInheritParents = links})
 
@@ -228,14 +230,12 @@ attachDetachLink ::
     (RelationState -> Set NameRef) ->
     (RelationState -> Set NameRef -> RelationState) ->
     StatementId ->
-    Eval ->
     PartitionLink ->
     Bool ->
-    Eval
-attachDetachLink getLinks setLinks sid eval link isAttach =
-    mutateResolved step eval pairs
-    where
-        session = evalSession eval
+    State Eval ()
+attachDetachLink getLinks setLinks sid link isAttach = do
+    eval <- get
+    let session = evalSession eval
         catalog = evalCatalog eval
         existing reference =
             filter (`Map.member` catalogRelations catalog) (resolveRelationKeys session catalog reference)
@@ -244,30 +244,36 @@ attachDetachLink getLinks setLinks sid eval link isAttach =
             | parentKey <- existing (linkParent link)
             , childKey <- existing (linkChild link)
             ]
-        step current (parentKey, childKey) =
-            current1 & evalCatalogL .~ catalog1
-            where
-                currentCatalog = evalCatalog current
-                child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
-                parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
-                deps =
-                    relationDefinitionDeps currentCatalog parentKey
-                        `Set.union` relationDefinitionDeps currentCatalog childKey
-                current1 =
-                    addTouches (relationTouchKeys parentKey ++ relationTouchKeys childKey) (addDeps deps current)
-                updatedLinks
-                    | isAttach = Set.insert (linkParent link) (getLinks child)
-                    | otherwise =
-                        Set.filter
-                            (\reference -> parentKey `notElem` resolveRelationKeys session currentCatalog reference)
-                            (getLinks child)
-                parent1 = parent & relSchemaWritesL %~ Set.insert sid
-                catalog1 =
-                    insertRelation
-                        childKey
-                        (setLinks child updatedLinks)
-                        (insertRelation parentKey parent1 currentCatalog)
+        step (parentKey, childKey) =
+            modify' $ \current ->
+                let currentCatalog = evalCatalog current
+                    child = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog childKey)
+                    parent = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog parentKey)
+                    deps =
+                        relationDefinitionDeps currentCatalog parentKey
+                            `Set.union` relationDefinitionDeps currentCatalog childKey
+                    current1 =
+                        addTouches
+                            (relationTouchKeys parentKey ++ relationTouchKeys childKey)
+                            (addDeps deps current)
+                    updatedLinks
+                        | isAttach = Set.insert (linkParent link) (getLinks child)
+                        | otherwise =
+                            Set.filter
+                                (\reference -> parentKey `notElem` resolveRelationKeys session currentCatalog reference)
+                                (getLinks child)
+                    parent1 = parent {relSchemaWrites = Set.insert sid (relSchemaWrites parent)}
+                    catalog1 =
+                        insertRelation
+                            childKey
+                            (setLinks child updatedLinks)
+                            (insertRelation parentKey parent1 currentCatalog)
+                 in current1 {evalCatalog = catalog1}
+    case pairs of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> Foldable.foldlM (\() pair -> step pair) () pairs
 
+-- | Apply one normalized alteration to a relation and its catalog objects.
 applyAlterChange ::
     SessionState ->
     StatementId ->
@@ -310,8 +316,9 @@ applyAddColumn session sid key (catalog, relation) column constraints =
         (catalog1, keys) = installConstraints session sid key allConstraints catalog
      in ( catalog1
         , relation
-            & relColumnsL %~ Set.insert (columnName column)
-            & relConstraintsL %~ Set.union keys
+            { relColumns = Set.insert (columnName column) (relColumns relation)
+            , relConstraints = Set.union keys (relConstraints relation)
+            }
         )
 
 applyDropColumn ::
@@ -388,10 +395,11 @@ applyDropColumn session key (catalog, relation) column cascade =
                     (Foldable.foldl' (flip deleteConstraint) catalog1 removedKeys)
                     sameTableIndexes
                 , relation
-                    & relColumnsL %~ Set.delete column
-                    & relColumnWritesL %~ Map.delete column
-                    & relConstraintsL %~ (`Set.difference` Set.fromList removedKeys)
-                    & relIndexesL %~ (`Set.difference` Set.fromList sameTableIndexes)
+                    { relColumns = Set.delete column (relColumns relation)
+                    , relColumnWrites = Map.delete column (relColumnWrites relation)
+                    , relConstraints = relConstraints relation `Set.difference` Set.fromList removedKeys
+                    , relIndexes = relIndexes relation `Set.difference` Set.fromList sameTableIndexes
+                    }
                 )
 
 applyAddConstraint ::
@@ -403,9 +411,7 @@ applyAddConstraint ::
     (Catalog, RelationState)
 applyAddConstraint session sid key (catalog, relation) constraint =
     let (catalog1, keys) = installConstraints session sid key [constraint] catalog
-     in ( catalog1
-        , relation & relConstraintsL %~ Set.union keys
-        )
+     in (catalog1, relation {relConstraints = Set.union keys (relConstraints relation)})
 
 applyDropConstraint ::
     SessionState ->
@@ -543,6 +549,7 @@ applyAlterColumn :: (Catalog, RelationState) -> Ident -> (Catalog, RelationState
 applyAlterColumn (catalog, relation) column =
     (catalog, relation {relColumns = Set.insert column (relColumns relation)})
 
+-- | Replace a constraint's name while preserving its normalized definition.
 renameConstraintName :: Ident -> Constraint -> Constraint
 renameConstraintName name constraint =
     case constraint of
@@ -568,6 +575,7 @@ validateConstraintValue constraint =
             CheckConstraint name columns ConstraintValid
         other -> other
 
+-- | Return the explicit name carried by either index-key representation.
 indexKeyName :: IndexKey -> Maybe Ident
 indexKeyName indexKey =
     case indexKey of

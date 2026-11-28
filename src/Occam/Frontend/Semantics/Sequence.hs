@@ -39,7 +39,7 @@ import Occam.Frontend.Semantics.Pure (
 import Occam.Frontend.Span (ByteSpan (..), Located (..))
 import Occam.Parser.Types (SQLDialect (..))
 
--- | Effect of a PostgreSQL sequence function call.
+-- | Effect of a PostgreSQL or DuckDB sequence-function call.
 data SequenceEffect
     = SeqWrite !Core.NameRef
     | SeqRead !Core.NameRef

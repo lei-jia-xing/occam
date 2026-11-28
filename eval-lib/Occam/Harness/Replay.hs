@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | In-process multi-run crash replay verification for Collect, Qualification, and Reduced SQL checks.
 module Occam.Harness.Replay (
     QualificationResult (..),
@@ -290,19 +292,19 @@ runReplayVerification hc mStopRef rcfg replays sqlBytes
 
         oracleOptsFor ep =
             (defaultOracleOptions dbms)
-                { ooConnection = reConnection ep
-                , ooExpectedSignature = rcExpectedSignature rcfg
-                , ooBaselineSignature = fromMaybe "" (rcBaselineSignature rcfg)
-                , ooRejectOnSlippage = rcRejectOnSlippage rcfg
-                , ooStackFrames = rcStackFrames rcfg
-                , ooLogFile = reLogFile ep
-                , ooContainerLog = reContainerLog ep
-                , ooDecisionLog = rcDecisionLog rcfg
-                , ooTimeoutSeconds = rcProbeTimeout rcfg
-                , ooAllowStderrOnly = rcAllowStderrOnly rcfg
-                , ooAllowPsqlMeta = rcAllowPsqlMeta rcfg
-                , ooVerbose = False
-                , ooWorkdir = Nothing
+                { connection = reConnection ep
+                , expectedSignature = rcExpectedSignature rcfg
+                , baselineSignature = fromMaybe "" (rcBaselineSignature rcfg)
+                , rejectOnSlippage = rcRejectOnSlippage rcfg
+                , stackFrames = rcStackFrames rcfg
+                , logFile = reLogFile ep
+                , containerLog = reContainerLog ep
+                , decisionLog = rcDecisionLog rcfg
+                , timeoutSeconds = rcProbeTimeout rcfg
+                , allowStderrOnly = rcAllowStderrOnly rcfg
+                , allowPsqlMeta = rcAllowPsqlMeta rcfg
+                , verbose = False
+                , workdir = Nothing
                 }
 
         failedRecord idx prefix err =
@@ -320,9 +322,9 @@ runReplayVerification hc mStopRef rcfg replays sqlBytes
 
         applyProbeResult st idx oRes =
             let dec = orDecision oRes
-                accepted = orExitCode oRes == 0 && odVerdict dec == VerdictAccepted
-                mSig = odCrashSignature dec
-                mSlipped = svSlipped <$> odSlippage dec
+                accepted = orExitCode oRes == 0 && dec.verdict == VerdictAccepted
+                mSig = dec.crashSignature
+                mSlipped = svSlipped <$> dec.slippage
                 slippedThis = fromMaybe False mSlipped
                 (seenIds', revSigs') = case mSig of
                     Just sig
@@ -333,8 +335,8 @@ runReplayVerification hc mStopRef rcfg replays sqlBytes
                     ReplayRunRecord
                         { rrRun = idx
                         , rrAccepted = accepted
-                        , rrClassification = odClassification dec
-                        , rrReason = odReason dec
+                        , rrClassification = dec.classification
+                        , rrReason = dec.reason
                         , rrSignatureId = csId <$> mSig
                         , rrSignatureHash = csHash <$> mSig
                         , rrSlipped = if hasBaseline then mSlipped else Nothing

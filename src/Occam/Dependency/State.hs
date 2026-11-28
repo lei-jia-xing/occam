@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveGeneric #-}
+
 -- | Catalog, session, transaction, scan, and evaluation state.
 module Occam.Dependency.State (
     -- Canonical catalog keys
@@ -11,13 +13,21 @@ module Occam.Dependency.State (
     BarrierKey (..),
     -- Catalog state
     RelationState (..),
+    -- | State for one index definition, its owning relation, and key columns.
     IndexState (..),
+    -- | State for a trigger definition, timing, events, and body.
     TriggerState (..),
+    -- | State for sequence definition and write history, including non-transactional writes.
     SequenceState (..),
+    -- | State for a relation-owned constraint and its normalized definition.
     ConstraintState (..),
+    -- | Definition and last-rollback markers for a type or schema.
     DefinitionState (..),
+    -- | Catalog maps and derived indexes used during dependency scanning.
     Catalog (..),
+    -- | Catalog with all object maps empty and derived indexes initialized.
     emptyCatalog,
+    -- | Create an empty relation-state record for the supplied relation kind.
     newRelation,
     -- Session and transaction state
     SessionState (..),
@@ -44,60 +54,44 @@ module Occam.Dependency.State (
     mutateResolved,
     evalToState,
     -- Pure catalog operations
+
+    -- | Look up a relation by its canonical key.
     lookupRelation,
+    -- | Insert or replace a relation while maintaining derived catalog indexes.
     insertRelation,
+    -- | Delete a relation entry and update its derived name/child indexes.
     deleteRelation,
+    -- | Delete an index from the catalog map.
     deleteIndex,
+    -- | Delete a trigger from the catalog map.
     deleteTrigger,
+    -- | Delete a sequence from the catalog map.
     deleteSequence,
+    -- | Delete a constraint and remove its relation/FK references.
     deleteConstraint,
+    -- | Delete a relation and all indexes, triggers, and constraints it owns.
     clearRelationObjects,
-    -- Lenses and state modification combinators
-    evalCatalogL,
-    evalSessionL,
-    evalDepsL,
-    evalTouchesL,
-    evalBarriersL,
-    catalogRelationsL,
-    catalogIndexesL,
-    catalogTriggersL,
-    catalogSequencesL,
-    catalogConstraintsL,
-    catalogTypesL,
-    catalogSchemasL,
-    catalogNextUnnamedConstraintL,
-    relColumnsL,
-    relDefinitionL,
-    relTransactionalL,
-    relOnCommitL,
-    relOnCommitFrameIdL,
-    relDataWritesL,
-    relCardinalityWritesL,
-    relColumnWritesL,
-    relSchemaWritesL,
-    relConstraintsL,
-    relIndexesL,
-    relTriggersL,
-    relSourcesL,
-    relUnresolvedSourcesL,
-    relSourceReadsL,
-    relPartitionParentsL,
-    relInheritParentsL,
-    relColumnLineageL,
-    relConditionColumnsL,
-    sequenceWritesL,
-    sequenceNonTxWritesL,
+    -- State modification helpers
+
     modifyCatalog,
     modifySession,
     modifyRelation,
     modifyEvalRelation,
     -- Write signatures and name utilities
+
+    -- | Signature used to coalesce equivalent writes to one relation.
     WriteSignature (..),
+    -- | Normalize a write kind and its target columns into a write signature.
     writeSignature,
+    -- | Test whether one qualified name is a suffix of another.
     nameSuffix,
+    -- | Return the final identifier component, if present.
     nameLast,
+    -- | Rebuild the foreign-key lookup map from stored constraint states.
     rebuildForeignKeys,
+    -- | Rebuild the set of relations that have partition or inheritance parents.
     rebuildChildRelations,
+    -- | Rebuild the non-temporary relation index keyed by final identifier.
     rebuildRelationsByLast,
 ) where
 
@@ -108,7 +102,7 @@ import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Lens.Micro (Lens', lens, (%~), (&))
+import GHC.Generics (Generic)
 import Occam.Core.Schema (Ident, Name (..))
 import Occam.Core.Semantics (
     BarrierReason (..),
@@ -120,34 +114,40 @@ import Occam.Core.Semantics (
  )
 import Occam.Core.Types (StatementId)
 import Occam.Dependency.State.Catalog
-import Occam.Dependency.State.Lenses
 
 -- Session and transaction state
+
+-- | Session configuration with transaction-local overrides and runtime switches.
 data SessionState = SessionState
     { sessNamespacePrefix :: ![Ident]
     , sessSearchPath :: ![SearchPathEntry]
     , sessCurrentUser :: !(Maybe Ident)
-    , -- The user that authenticated the connection. `RESET SESSION
-      -- AUTHORIZATION` restores both users from it.
-      sessAuthenticatedUser :: !(Maybe Ident)
-    , -- The current session_user, changed by `SET SESSION AUTHORIZATION`.
-      sessSessionUser :: !(Maybe Ident)
+    , sessAuthenticatedUser :: !(Maybe Ident)
+    -- ^ User that originally authenticated the connection.
+    , sessSessionUser :: !(Maybe Ident)
+    -- ^ SQL session_user, changed by SET SESSION AUTHORIZATION.
     , sessAutocommit :: !Bool
     , sessVariables :: !(Map Text SessionValue)
     , sessForeignKeyChecks :: !Bool
-    , -- The configured start value, restored by RESET foreign_keys and RESET ALL.
-      sessInitialForeignKeyChecks :: !Bool
+    , sessInitialForeignKeyChecks :: !Bool
+    -- ^ Configured value restored by RESET foreign_keys and RESET ALL.
     , sessTxNamespacePrefix :: !(Maybe [Ident])
+    -- ^ Transaction-local override of the namespace prefix.
     , sessTxSearchPath :: !(Maybe [SearchPathEntry])
+    -- ^ Transaction-local override of the search path.
     , sessTxSessionUser :: !(Maybe (Maybe Ident))
+    -- ^ Outer Nothing inherits; Just Nothing explicitly clears.
     , sessTxCurrentUser :: !(Maybe (Maybe Ident))
+    -- ^ Outer Nothing inherits; Just Nothing explicitly clears.
     , sessTxVariables :: !(Map Text SessionValue)
+    -- ^ Transaction-local setting overrides.
     , sessTempInNamespace :: !Bool
     , sessPermViewIgnoresTemp :: !Bool
     , sessViewsBoundToRelations :: !Bool
     }
     deriving (Eq, Show)
 
+-- | Initialize session state and its authenticated/session user from initialization options.
 sessionFromInit :: SessionInit -> SessionState
 sessionFromInit SessionInit {..} =
     SessionState
@@ -170,14 +170,17 @@ sessionFromInit SessionInit {..} =
         , sessViewsBoundToRelations = sessionViewsBoundToRelations
         }
 
+-- | Current namespace prefix, preferring a transaction-local override.
 effectiveNamespacePrefix :: SessionState -> [Ident]
 effectiveNamespacePrefix state =
     fromMaybe (sessNamespacePrefix state) (sessTxNamespacePrefix state)
 
+-- | Current user after applying any transaction-local override.
 effectiveCurrentUser :: SessionState -> Maybe Ident
 effectiveCurrentUser state =
     fromMaybe (sessCurrentUser state) (sessTxCurrentUser state)
 
+-- | Session user after applying any transaction-local override.
 effectiveSessionUser :: SessionState -> Maybe Ident
 effectiveSessionUser state =
     fromMaybe (sessSessionUser state) (sessTxSessionUser state)
@@ -193,6 +196,7 @@ effectiveSearchPath state =
         resolveEntry SearchPathCurrentUser =
             Name . pure <$> effectiveCurrentUser state
 
+-- | Clear all transaction-local session overrides while preserving session values.
 clearTransactionSession :: SessionState -> SessionState
 clearTransactionSession state =
     state
@@ -203,6 +207,7 @@ clearTransactionSession state =
         , sessTxVariables = Map.empty
         }
 
+-- | Catalog and session snapshots made when a savepoint is created.
 data Savepoint = Savepoint
     { savepointName :: !Ident
     , savepointCatalog :: !Catalog
@@ -211,12 +216,12 @@ data Savepoint = Savepoint
     }
     deriving (Eq, Show)
 
+-- | Transaction snapshot plus explicit/nested state and its savepoint stack.
 data TxFrame = TxFrame
     { frameId :: !Int
     , frameExplicit :: !Bool
-    , -- Nested transactions increment this counter; a commit only closes the
-      -- outermost frame when the counter reaches zero.
-      frameNesting :: !Int
+    , frameNesting :: !Int
+    -- ^ Nested begin count; commit closes only when it reaches zero.
     , frameBegin :: !(Maybe StatementId)
     , frameCatalog :: !Catalog
     , frameSession :: !SessionState
@@ -224,6 +229,7 @@ data TxFrame = TxFrame
     }
     deriving (Eq, Show)
 
+-- | Mutable scan-wide catalog/session state and dependency-barrier ordering indexes.
 data ScanState = ScanState
     { scanCatalog :: !Catalog
     , scanSession :: !SessionState
@@ -237,6 +243,7 @@ data ScanState = ScanState
     , scanPriorStatements :: !(Set StatementId)
     }
 
+-- | Start a scan with an empty catalog and session settings from initialization.
 initialScanState :: SessionInit -> ScanState
 initialScanState initSession =
     let session = sessionFromInit initSession
@@ -271,21 +278,25 @@ initialScanState initSession =
                     }
 
 -- Evaluation accumulator
+
+-- | Per-statement dependency result and working copies of catalog/session state.
 data Eval = Eval
     { evalDeps :: !(Set StatementId)
     , evalTouches :: !(Set BarrierKey)
     , evalBarriers :: ![ScopedBarrier]
     , evalCatalog :: !Catalog
     , evalSession :: !SessionState
+    , evalSessionTouched :: !Bool
     , evalVisitedTriggers :: !(Set TriggerKey)
     , evalVisitedWrites :: !(Set (RelationKey, WriteSignature))
     , evalFrameId :: !(Maybe Int)
     , evalTransactionActive :: !Bool
-    , -- Used only for SQLite foreign-key PRAGMAs.
-      evalTransactionBoundary :: Maybe StatementId
-    , evalSessionTouched :: !Bool
+    , evalTransactionBoundary :: Maybe StatementId
+    -- ^ Transaction boundary used for SQLite foreign-key PRAGMA semantics.
     }
+    deriving (Generic)
 
+-- | Initialize an empty evaluation accumulator from the current scan snapshot.
 initialEval :: StatementId -> ScanState -> Eval
 initialEval _ state =
     Eval
@@ -304,6 +315,7 @@ initialEval _ state =
     where
         active = transactionActive state
 
+-- | Return the statement that opened the active transaction or latest savepoint.
 transactionOpener :: ScanState -> Maybe StatementId
 transactionOpener state = do
     frame <- listToMaybe (scanTransactions state)
@@ -311,72 +323,68 @@ transactionOpener state = do
         Just begin -> Just begin
         Nothing -> savepointStatement <$> listToMaybe (reverse (frameSavepoints frame))
 
+-- | True when an explicit/savepoint frame exists or autocommit is disabled.
 transactionActive :: ScanState -> Bool
 transactionActive state =
     any (\frame -> frameExplicit frame || not (null (frameSavepoints frame))) (scanTransactions state)
         || not (sessAutocommit (scanSession state))
 
+-- | Union statement dependencies into the evaluation accumulator.
 addDeps :: Set StatementId -> Eval -> Eval
 addDeps deps eval
     | Set.null deps = eval
     | Set.null (evalDeps eval) = eval {evalDeps = deps}
     | otherwise = eval {evalDeps = Set.union deps (evalDeps eval)}
 
+-- | Record one barrier key touched by the current statement.
 addTouch :: BarrierKey -> Eval -> Eval
 addTouch key eval = eval {evalTouches = Set.insert key (evalTouches eval)}
 
+-- | Record several barrier keys touched by the current statement.
 addTouches :: [BarrierKey] -> Eval -> Eval
 addTouches keys eval =
     eval {evalTouches = Foldable.foldl' (flip Set.insert) (evalTouches eval) keys}
 
+-- | Add one scoped barrier to the evaluation result.
 addBarrier :: ScopedBarrier -> Eval -> Eval
 addBarrier scoped eval = eval {evalBarriers = scoped : evalBarriers eval}
 
--- | Lens for the catalog component of an evaluation accumulator.
-evalCatalogL :: Lens' Eval Catalog
-evalCatalogL = lens evalCatalog (\e c -> e {evalCatalog = c})
-
--- | Lens for session state inside an evaluation state.
-evalSessionL :: Lens' Eval SessionState
-evalSessionL = lens evalSession (\e s -> e {evalSession = s})
-
--- | Lens for dependencies inside an evaluation state.
-evalDepsL :: Lens' Eval (Set StatementId)
-evalDepsL = lens evalDeps (\e d -> e {evalDeps = d})
-
--- | Lens for barrier touches inside an evaluation state.
-evalTouchesL :: Lens' Eval (Set BarrierKey)
-evalTouchesL = lens evalTouches (\e t -> e {evalTouches = t})
-
--- | Lens for scoped barriers inside an evaluation state.
-evalBarriersL :: Lens' Eval [ScopedBarrier]
-evalBarriersL = lens evalBarriers (\e b -> e {evalBarriers = b})
+modifyRelation :: RelationKey -> (RelationState -> RelationState) -> Catalog -> Catalog
+modifyRelation key f catalog =
+    catalog
+        { catalogRelations =
+            Map.adjust f key (catalogRelations catalog)
+        }
 
 -- | Modify the catalog component of an evaluation accumulator.
 modifyCatalog :: (Catalog -> Catalog) -> Eval -> Eval
-modifyCatalog f eval = eval & evalCatalogL %~ f
+modifyCatalog f eval = eval {evalCatalog = f (evalCatalog eval)}
 
 -- | Modify the session component of an evaluation accumulator.
 modifySession :: (SessionState -> SessionState) -> Eval -> Eval
-modifySession f eval = eval & evalSessionL %~ f
+modifySession f eval = eval {evalSession = f (evalSession eval)}
 
 -- | Modify a relation state within an evaluation state if present.
 modifyEvalRelation :: RelationKey -> (RelationState -> RelationState) -> Eval -> Eval
 modifyEvalRelation key f = modifyCatalog (modifyRelation key f)
 
+-- | Add a global unknown-mutation barrier for an ambiguous catalog target.
 ambiguousMutation :: Eval -> Eval
 ambiguousMutation =
     addBarrier
         (ScopedBarrier GlobalScope UnknownStatementBarrier (Just "ambiguous catalog mutation target"))
 
--- Resolution may union possible read sources, but a mutation cannot apply to
--- every possible target. Explicit multi-target SQL emits one operation each.
+{- | Apply an update only when resolution yields at most one possible target.
+Multiple candidates create a conservative barrier; callers model explicit
+multi-target statements separately.
+-}
 mutateResolved :: (Eval -> key -> Eval) -> Eval -> [key] -> Eval
 mutateResolved apply eval keys =
     case keys of
         _ : _ : _ -> ambiguousMutation eval
         _ -> Foldable.foldl' apply eval keys
 
+-- | Commit the evaluation's catalog and session values back into scan state.
 evalToState :: Eval -> ScanState -> ScanState
 evalToState eval state =
     state

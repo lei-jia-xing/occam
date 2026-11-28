@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Terminal progress rendering and summary formatting for CLI reduction runs.
 module Occam.UI (
     UIConfig (..),
@@ -354,19 +356,19 @@ printSummary useColor summary = do
             if initBytes > 0
                 then (1.0 - (fromIntegral redBytes / fromIntegral initBytes :: Double)) * 100.0
                 else 0.0
-        totHits = evaluationCacheHits metrics
-        totMisses = evaluationCacheMisses metrics
+        totHits = metrics.cacheHits
+        totMisses = metrics.cacheMisses
         totLookups = totHits + totMisses
         hitRate =
             if totLookups > 0
                 then (fromIntegral totHits / fromIntegral totLookups :: Double) * 100.0
                 else 0.0
-        totalRuns = evaluationOracleAttempts metrics
-        elapsed = evaluationTotalSeconds metrics
-        isSuccess = evaluationStatus metrics == EvaluationCompleted && evaluationValidationPassed metrics
-        statusTag = case evaluationStatus metrics of
+        totalRuns = metrics.oracleAttempts
+        elapsed = metrics.totalSeconds
+        isSuccess = metrics.runStatus == EvaluationCompleted && metrics.validationPassed
+        statusTag = case metrics.runStatus of
             EvaluationCompleted
-                | evaluationValidationPassed metrics -> ""
+                | metrics.validationPassed -> ""
                 | otherwise -> " (validation failed)"
             EvaluationTimeout -> " (timeout)"
             EvaluationExecutionBudget -> " (budget exceeded)"

@@ -46,6 +46,7 @@ data CreateTableTail = CreateTableTail
     , cttWithData :: !(Maybe Bool)
     }
 
+-- | Parse a CREATE TABLE body, including partition, option, and CTAS tails.
 parseCreateTable :: P CreateTable
 parseCreateTable = do
     ifNotExists <- parseIfNotExists
@@ -95,6 +96,7 @@ parsePartitionOf startSp = do
             parsePartitionBoundSpec
     locatedSpanning startSp (TablePartition parent bound)
 
+-- | Parse PostgreSQL list, range, hash, or DEFAULT partition-bound syntax.
 parsePartitionBoundSpec :: P PartitionBound
 parsePartitionBoundSpec = evalContT do
     onWord "IN" (PartitionBoundIn <$> parseParenList parseExpr)
@@ -280,17 +282,20 @@ parseTableLikeOptions = go []
 parseParenNamePartList :: P [Located NamePart]
 parseParenNamePartList = parseParenList parseNamePart
 
-{- | Parse @name [type] [constraints]@, optionally with ClickHouse SETTINGS.
-| Options controlling context-specific column clauses (placement and inline FK).
+{- | Context controls for optional clauses in a column definition.
+'cdoAllowPosition' permits column placement syntax; 'cdoAllowReferences'
+permits inline @REFERENCES@ clauses.
 -}
 data ColumnDefOpts = ColumnDefOpts
     { cdoAllowPosition :: !Bool
     , cdoAllowReferences :: !Bool
     }
 
+-- | Parse one column definition in the default CREATE TABLE context.
 parseColumnDef :: P (Located ColumnDef)
 parseColumnDef = parseColumnDefWith (ColumnDefOpts False True)
 
+-- | Parse a column definition with caller-selected clause permissions.
 parseColumnDefWith :: ColumnDefOpts -> P (Located ColumnDef)
 parseColumnDefWith opts = withLocated do
     namePart <- parseNamePart
@@ -566,6 +571,7 @@ parseForeignKeyAction = withLocated $ evalContT do
                 duck
                 (unexpectedUnsupported tok ("FOREIGN KEY ... " <> action <> " is not supported by DuckDB"))
 
+-- | Parse PostgreSQL @WITH [NO] DATA@, returning 'Nothing' when absent.
 parseOptionalWithData :: P (Maybe Bool)
 parseOptionalWithData =
     whenWordTok "WITH" \tok -> do
@@ -574,6 +580,7 @@ parseOptionalWithData =
         _ <- expectWordCI "DATA"
         pure (not noData)
 
+-- | Parse further table options, extending the reverse-order accumulator.
 parseTableOptionList :: [Located TableOption] -> P [Located TableOption]
 parseTableOptionList acc =
     peekTok >>= \case
@@ -690,6 +697,7 @@ parseTableOptionName = do
             , ("OWNED", "BY")
             ]
 
+-- | Reject PostgreSQL relation names with more than three identifier parts.
 validatePgRelationName :: Located Name -> P ()
 validatePgRelationName (L sp (Name parts)) = do
     pg <- isDialect PostgreSQL

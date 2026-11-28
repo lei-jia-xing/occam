@@ -7,6 +7,7 @@ module Occam.Dependency (
     cascadeWrites,
 ) where
 
+import Control.Monad.Trans.State.Strict (State, execState, modify', state)
 import Data.Foldable qualified as Foldable
 import Data.IntMap.Lazy (IntMap)
 import Data.IntMap.Lazy qualified as IntMap
@@ -158,7 +159,7 @@ step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount)
         (state2, preTxDeps) = applyTxEffects sid (factPreTx facts) state1
         state3 = ensureFrameForOps state2
         eval0 = initialEval sid state3
-        eval1 = Foldable.foldl' (processOp sid) eval0 (factOps facts)
+        eval1 = execState (processOps sid (factOps facts)) eval0
         eval1' = Foldable.foldl' (flip addBarrier) eval1 (factBarriers facts)
         (eval2, sessionTouched) = applySessionEffects sid (factSession facts) eval1'
         state4 = evalToState eval2 state3
@@ -186,27 +187,37 @@ step (priorState, edges, barrierEdgeCount, barrierStmtCount, barrierActionCount)
 -- Catalog operation dispatch
 -- ----------------------------------------------------------------------------
 
-processOp :: StatementId -> Eval -> CatalogOp -> Eval
-processOp sid eval op =
+processOps :: StatementId -> [CatalogOp] -> State Eval ()
+processOps sid ops =
+    state $ \eval ->
+        let !eval' =
+                Foldable.foldl'
+                    (\current op -> execState (processOp sid op) current)
+                    eval
+                    ops
+         in ((), eval')
+
+processOp :: StatementId -> CatalogOp -> State Eval ()
+processOp sid op =
     case op of
-        DefineTableOp definition -> processDefineTable sid eval definition
-        DefineViewOp definition -> processDefineView sid eval definition
-        DefineIndexOp definition -> processDefineIndex sid eval definition
-        DefineTriggerOp definition -> processDefineTrigger sid eval definition
-        DefineSequenceOp definition -> processDefineSequence sid eval definition
-        DefineTypeOp definition -> processDefineType sid eval definition
-        DefineSchemaOp definition -> processDefineSchema sid eval definition
-        ReadOp readFact -> processRead eval readFact
-        WriteDataOp write -> processDataWrite sid eval write
-        WriteSequenceOp write -> processSequenceWrite sid eval write
-        AlterTableOp alter -> processAlterTable sid eval alter
-        AttachPartitionOp link -> processAttachPartition sid eval link
-        DetachPartitionOp link -> processDetachPartition sid eval link
-        AttachInheritOp link -> processAttachInherit sid eval link
-        DetachInheritOp link -> processDetachInherit sid eval link
-        DropCatalogOp dropOp -> processDrop sid eval dropOp
-        RenameOp renameOp -> processRename sid eval renameOp
-        RefreshCatalogOp refresh -> processRefresh sid eval refresh
+        DefineTableOp definition -> processDefineTable sid definition
+        DefineViewOp definition -> processDefineView sid definition
+        DefineIndexOp definition -> processDefineIndex sid definition
+        DefineTriggerOp definition -> processDefineTrigger sid definition
+        DefineSequenceOp definition -> processDefineSequence sid definition
+        DefineTypeOp definition -> processDefineType sid definition
+        DefineSchemaOp definition -> processDefineSchema sid definition
+        ReadOp readFact -> modify' (`processRead` readFact)
+        WriteDataOp write -> processDataWrite sid write
+        WriteSequenceOp write -> processSequenceWrite sid write
+        AlterTableOp alter -> processAlterTable sid alter
+        AttachPartitionOp link -> processAttachPartition sid link
+        DetachPartitionOp link -> processDetachPartition sid link
+        AttachInheritOp link -> processAttachInherit sid link
+        DetachInheritOp link -> processDetachInherit sid link
+        DropCatalogOp dropOp -> processDrop sid dropOp
+        RenameOp renameOp -> modify' (\eval -> processRename sid eval renameOp)
+        RefreshCatalogOp refresh -> processRefresh sid refresh
 
 -- ----------------------------------------------------------------------------
 -- Statement barrier finalization

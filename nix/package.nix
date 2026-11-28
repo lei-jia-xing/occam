@@ -16,7 +16,7 @@
 , lib
 , libpg_query
 , makeBinaryWrapper
-, microlens
+, optics-core
 , optparse-applicative
 , process
 , python3
@@ -81,7 +81,7 @@ mkDerivation {
     fast-logger
     filepath
     hashable
-    microlens
+    optics-core
     optparse-applicative
     process
     safe-exceptions

@@ -247,7 +247,7 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             ssParenDepth st == 0 && ssBracketDepth st == 0 && ssBraceDepth st == 0
 
         go !i !st
-            | i >= n = finalize st
+            | i >= n = finalizeSplit sqlLen vec tokAt nextNonTriviaFrom mErr emitStatement st
             | isTriviaToken tok = go (i + 1) st
             | ssStmtStartTok st < 0 = handleBetweenStatements i tok st
             | otherwise = handleInStatement False i tok (ssStmtStartTok st) st
@@ -449,39 +449,48 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             where
                 startsClosure = isCompoundStmtStart (ssPrevNonTrivia st)
 
-        finalize !st = case mErr of
-            Just err ->
-                let !tailIdx = ssLastTopLevelEndIdx st
-                    !mFirstSubstantive = nextNonTriviaFrom tailIdx
-                    !errStart = case mFirstSubstantive of
-                        Just firstIdx -> spanStart (locSpan (tokAt firstIdx))
-                        Nothing -> lexErrorOffset err
-                    !errToks = case mFirstSubstantive of
-                        Just firstIdx -> V.drop firstIdx vec
-                        Nothing -> V.empty
-                    errUnit =
-                        SplitUnit
-                            { splitUnitSpan = ByteSpan errStart sqlLen
-                            , splitUnitDelimiterSpan = Nothing
-                            , splitUnitTokens = errToks
-                            , splitUnitLexError = Just err
-                            , splitUnitDelimiterDirective = Nothing
-                            }
-                 in emitStatement (ssAcc st) errUnit
-            Nothing
-                | let sIdx = ssStmtStartTok st
-                      eIdx = ssLastNonTriviaTok st
-                , sIdx >= 0
-                , eIdx >= 0 ->
-                    let !startByte = spanStart (locSpan (tokAt sIdx))
-                        !endByte = spanEnd (locSpan (tokAt eIdx))
-                        unit =
-                            SplitUnit
-                                { splitUnitSpan = ByteSpan startByte endByte
-                                , splitUnitDelimiterSpan = Nothing
-                                , splitUnitTokens = V.slice sIdx (eIdx - sIdx + 1) vec
-                                , splitUnitLexError = Nothing
-                                , splitUnitDelimiterDirective = Nothing
-                                }
-                     in emitStatement (ssAcc st) unit
-                | otherwise -> ssAcc st
+finalizeSplit ::
+    Int ->
+    Vector SpannedToken ->
+    (Int -> SpannedToken) ->
+    (Int -> Maybe Int) ->
+    Maybe LexError ->
+    (a -> SplitUnit -> a) ->
+    SplitState a ->
+    a
+finalizeSplit sqlLen vec tokAt nextNonTriviaFrom mErr emitStatement st = case mErr of
+    Just err ->
+        let !tailIdx = ssLastTopLevelEndIdx st
+            !mFirstSubstantive = nextNonTriviaFrom tailIdx
+            !errStart = case mFirstSubstantive of
+                Just firstIdx -> spanStart (locSpan (tokAt firstIdx))
+                Nothing -> lexErrorOffset err
+            !errToks = case mFirstSubstantive of
+                Just firstIdx -> V.drop firstIdx vec
+                Nothing -> V.empty
+            errUnit =
+                SplitUnit
+                    { splitUnitSpan = ByteSpan errStart sqlLen
+                    , splitUnitDelimiterSpan = Nothing
+                    , splitUnitTokens = errToks
+                    , splitUnitLexError = Just err
+                    , splitUnitDelimiterDirective = Nothing
+                    }
+         in emitStatement (ssAcc st) errUnit
+    Nothing
+        | let sIdx = ssStmtStartTok st
+              eIdx = ssLastNonTriviaTok st
+        , sIdx >= 0
+        , eIdx >= 0 ->
+            let !startByte = spanStart (locSpan (tokAt sIdx))
+                !endByte = spanEnd (locSpan (tokAt eIdx))
+                unit =
+                    SplitUnit
+                        { splitUnitSpan = ByteSpan startByte endByte
+                        , splitUnitDelimiterSpan = Nothing
+                        , splitUnitTokens = V.slice sIdx (eIdx - sIdx + 1) vec
+                        , splitUnitLexError = Nothing
+                        , splitUnitDelimiterDirective = Nothing
+                        }
+             in emitStatement (ssAcc st) unit
+        | otherwise -> ssAcc st

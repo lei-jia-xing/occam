@@ -70,11 +70,13 @@ data Cte = Cte
     }
     deriving (Eq, Show)
 
+-- | CTE body that may be a query or a data-modifying statement.
 data CteBody
     = CteQuery !(Located Query)
     | CteStatement !(Located Statement)
     deriving (Eq, Show)
 
+-- | Optional request to materialize or avoid materializing a CTE.
 data MaterializedHint
     = Materialized
     | NotMaterialized
@@ -94,12 +96,14 @@ data QueryBody
     | QueryBodyParen !(Located Query)
     deriving (Eq, Show)
 
+-- | Set-combination operator joining two query bodies.
 data SetOperator
     = SetUnion
     | SetIntersect
     | SetExcept
     deriving (Eq, Ord, Show)
 
+-- | Set-operation duplicate policy, preserving whether it was omitted.
 data SetQuantifier
     = SetAll
     | SetDistinct
@@ -121,17 +125,20 @@ data SelectCore = SelectCore
     }
     deriving (Eq, Show)
 
+-- | SELECT INTO destination: a relation with scope metadata or user variables.
 data SelectInto
     = SelectInto !(Located Name) !SelectIntoScope !Bool
     | SelectIntoUserVars ![Located ByteString]
     deriving (Eq, Ord, Show)
 
+-- | Persistence scope for a SELECT INTO relation target.
 data SelectIntoScope
     = SelectIntoTemporary
     | SelectIntoUnlogged
     | SelectIntoPersistent
     deriving (Eq, Ord, Show)
 
+-- | SELECT duplicate policy, including PostgreSQL DISTINCT ON expressions.
 data SelectQuantifier
     = SelectAll
     | SelectDistinct
@@ -160,6 +167,7 @@ data GroupByItem
     | GroupByCube ![Located GroupByItem]
     deriving (Eq, Show)
 
+-- | Comma-separated top-level FROM references.
 newtype FromClause = FromClause
     { fromItems :: [Located TableRef]
     }
@@ -211,6 +219,7 @@ data JoinClause = JoinClause
     }
     deriving (Eq, Show)
 
+-- | Join family; parameterized ASOF/ARRAY forms retain their directional modifier.
 data JoinKind
     = JoinInner
     | JoinLeft
@@ -221,17 +230,20 @@ data JoinKind
     | JoinArray !Bool
     deriving (Eq, Ord, Show)
 
+-- | Table-reference join target or ClickHouse ARRAY JOIN item list.
 data JoinTarget
     = JoinTargetTable !(Located TableRef)
     | JoinTargetArray ![Located ArrayJoinItem]
     deriving (Eq, Show)
 
+-- | ARRAY JOIN expression and optional output name.
 data ArrayJoinItem = ArrayJoinItem
     { arrayJoinExpr :: !(Located Expr)
     , arrayJoinAlias :: !(Maybe (Located NamePart))
     }
     deriving (Eq, Show)
 
+-- | Join predicate expressed as @ON@ or a @USING@ column list.
 data JoinConstraint
     = JoinOn !(Located Expr)
     | JoinUsing ![Located NamePart]
@@ -261,6 +273,7 @@ data ForClause = ForClause
     }
     deriving (Eq, Show)
 
+-- | Row-locking strength requested by a query's @FOR@ clause.
 data ForStrength
     = ForUpdate
     | ForShare
@@ -268,12 +281,14 @@ data ForStrength
     | ForKeyShare
     deriving (Eq, Ord, Show)
 
+-- | Named window and its inline window specification.
 data WindowDef = WindowDef
     { windowDefName :: !(Located NamePart)
     , windowDefSpec :: !WindowSpec
     }
     deriving (Eq, Show)
 
+-- | Query setting assignment retained as a name and expression pair.
 data SettingItem = SettingItem
     { settingName :: !(Located Name)
     , settingValue :: !(Located Expr)

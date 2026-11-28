@@ -49,7 +49,7 @@ import Occam.Frontend.Span (Located)
 -- Statements
 -- ---------------------------------------------------------------------------
 
--- | Any parsed top-level statement.
+-- | Parsed top-level statement, including client delimiter directives.
 data Statement
     = StatementDelimiter !(Located ByteString)
     | StatementQuery !(Located Query)
@@ -86,6 +86,7 @@ data Statement
     | StatementRefreshMaterializedView !(Located RefreshMaterializedViewStmt)
     deriving (Eq, Show)
 
+-- | PostgreSQL notification channel and optional payload expression.
 data NotifyStmt = NotifyStmt
     { notifyChannel :: !(Located Name)
     , notifyPayload :: !(Maybe (Located Expr))
@@ -103,6 +104,7 @@ data PragmaStmt = PragmaStmt
     }
     deriving (Eq, Show)
 
+-- | PRAGMA value kept as a bare spelling or parsed expression.
 data PragmaValue
     = PragmaBare !(Located ByteString)
     | PragmaValueExpr !(Located Expr)
@@ -116,6 +118,7 @@ data SetStmt = SetStmt
     }
     deriving (Eq, Show)
 
+-- | Explicit session/local/global scope, or no scope keyword.
 data SetScope
     = SetScopeSession
     | SetScopeLocal
@@ -131,6 +134,7 @@ data SetItem = SetItem
     }
     deriving (Eq, Show)
 
+-- | SET/RESET target namespace: ordinary name, user/system variable, or special target.
 data SetTarget
     = SetTargetName !(Located Name)
     | SetTargetUserVar !(Located ByteString)
@@ -178,6 +182,7 @@ data TransactionStmt = TransactionStmt
     }
     deriving (Eq, Ord, Show)
 
+-- | Transaction command normalized across BEGIN/START and COMMIT/END spellings.
 data TransactionCommand
     = TransactionBegin
     | TransactionStart
@@ -189,6 +194,7 @@ data TransactionCommand
     | TransactionEnd
     deriving (Eq, Ord, Show)
 
+-- | Transaction setting; unmodeled mode spelling is retained for conservative analysis.
 data TransactionMode
     = TransactionReadOnly !Bool
     | TransactionBeginLock !ByteString
@@ -202,6 +208,7 @@ data ExplainStmt = ExplainStmt
     }
     deriving (Eq, Show)
 
+-- | EXPLAIN option name and optional source spelling of its value.
 data ExplainOption = ExplainOption
     { explainOptionName :: !(Located ByteString)
     , explainOptionValue :: !(Maybe (Located ByteString))
@@ -217,16 +224,19 @@ data CopyStmt = CopyStmt
     }
     deriving (Eq, Show)
 
+-- | COPY input relation with optional columns, or a query supplying output rows.
 data CopySource
     = CopySourceTable !(Located Name) ![Located NamePart]
     | CopySourceQuery !(Located Query)
     deriving (Eq, Show)
 
+-- | Direction of data flow relative to the COPY statement.
 data CopyDirection
     = CopyFrom
     | CopyTo
     deriving (Eq, Ord, Show)
 
+-- | COPY file, standard stream, or external program endpoint.
 data CopyTarget
     = CopyFile !(Located Literal)
     | CopyStdin
@@ -234,6 +244,7 @@ data CopyTarget
     | CopyProgram !(Located Literal)
     deriving (Eq, Ord, Show)
 
+-- | COPY option name and optional raw value.
 data CopyOption = CopyOption
     { copyOptionName :: !(Located ByteString)
     , copyOptionValue :: !(Maybe (Located ByteString))
@@ -247,6 +258,7 @@ data AnalyzeStmt = AnalyzeStmt
     }
     deriving (Eq, Ord, Show)
 
+-- | ANALYZE target relation and optional selected columns.
 data AnalyzeTable = AnalyzeTable
     { analyzeTableName :: !(Located Name)
     , analyzeTableColumns :: ![Located NamePart]
@@ -292,6 +304,7 @@ data PrepareStmt = PrepareStmt
     }
     deriving (Eq, Show)
 
+-- | Prepared statement body represented as a statement or a dialect expression.
 data PrepareSource
     = PrepareStatement !(Located Statement)
     | PrepareExpression !(Located Expr)

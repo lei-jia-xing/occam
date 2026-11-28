@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedLabels #-}
+
 -- | Reads, data writes, triggers, sequences, foreign-key cascades, refresh.
 module Occam.Dependency.Write (
     processRead,
@@ -22,12 +24,13 @@ module Occam.Dependency.Write (
     processRefresh,
 ) where
 
+import Control.Monad (when)
+import Control.Monad.Trans.State.Strict (State, get, modify')
 import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Lens.Micro ((%~), (&), (.~))
 import Occam.Core.Schema (
     ConflictAction (..),
     DataWrite (..),
@@ -90,19 +93,13 @@ import Occam.Dependency.State (
     addDeps,
     addTouch,
     addTouches,
-    catalogSequencesL,
-    evalCatalogL,
+    ambiguousMutation,
     insertRelation,
     lookupRelation,
-    mutateResolved,
     newRelation,
-    relCardinalityWritesL,
-    relColumnWritesL,
-    relDataWritesL,
-    sequenceNonTxWritesL,
-    sequenceWritesL,
     writeSignature,
  )
+import Optics.Core ((%), (%~), (&))
 
 -- Write-state application.
 -- Online transitive reduction: before 'writeRelation' applies 'applyWriteState',
@@ -117,30 +114,35 @@ import Occam.Dependency.State (
 applyWriteState :: StatementId -> WriteKind -> [Ident] -> RelationState -> RelationState
 applyWriteState sid (InsertWrite _) _ relation =
     relation
-        & relDataWritesL %~ Set.insert sid
-        & relCardinalityWritesL .~ Set.singleton sid
+        { relDataWrites = Set.insert sid (relDataWrites relation)
+        , relCardinalityWrites = Set.singleton sid
+        }
 applyWriteState sid MergeWrite _ relation =
     relation
-        & relDataWritesL %~ Set.insert sid
-        & relCardinalityWritesL .~ Set.singleton sid
+        { relDataWrites = Set.insert sid (relDataWrites relation)
+        , relCardinalityWrites = Set.singleton sid
+        }
 applyWriteState sid (DeleteWrite DeleteAllRows) _ relation =
     relation
-        & relDataWritesL .~ Set.singleton sid
-        & relCardinalityWritesL .~ Set.singleton sid
-        & relColumnWritesL .~ Map.empty
+        { relDataWrites = Set.singleton sid
+        , relCardinalityWrites = Set.singleton sid
+        , relColumnWrites = Map.empty
+        }
 applyWriteState sid (DeleteWrite DeleteFilteredRows) _ relation =
     relation
-        & relDataWritesL %~ Set.insert sid
-        & relCardinalityWritesL .~ Set.singleton sid
+        { relDataWrites = Set.insert sid (relDataWrites relation)
+        , relCardinalityWrites = Set.singleton sid
+        }
 applyWriteState sid (UpdateWrite _) [] relation =
-    relation & relDataWritesL %~ Set.insert sid
+    relation {relDataWrites = Set.insert sid (relDataWrites relation)}
 applyWriteState sid (UpdateWrite _) columns relation =
-    relation & relColumnWritesL %~ insertColumnWrites sid columns
+    relation {relColumnWrites = insertColumnWrites sid columns (relColumnWrites relation)}
 applyWriteState sid TruncateWrite {} _ relation =
     relation
-        & relDataWritesL .~ Set.singleton sid
-        & relCardinalityWritesL .~ Set.singleton sid
-        & relColumnWritesL .~ Map.empty
+        { relDataWrites = Set.singleton sid
+        , relCardinalityWrites = Set.singleton sid
+        , relColumnWrites = Map.empty
+        }
 
 insertColumnWrites ::
     StatementId -> [Ident] -> Map.Map Ident (Set StatementId) -> Map.Map Ident (Set StatementId)
@@ -277,32 +279,34 @@ matchingTriggers catalog key tag =
                 || relKind relation `elem` [ViewRelation, MaterializedViewRelation]
             ]
 
--- | Record read dependencies, write edges, triggers, and FK constraints for a DML 'DataWrite'.
-processDataWrite :: StatementId -> Eval -> DataWrite -> Eval
-processDataWrite sid eval write =
-    let evalReads = Foldable.foldl' processRead eval (dataWriteReads write)
-        session = evalSession evalReads
+processDataWrite :: StatementId -> DataWrite -> State Eval ()
+processDataWrite sid write = do
+    modify' $ \eval -> Foldable.foldl' processRead eval (dataWriteReads write)
+    evalReads <- get
+    let session = evalSession evalReads
         catalog = evalCatalog evalReads
         targetKeys = resolveRelationKeys session catalog (dataWriteTarget write)
         unqualified = dataWriteUnqualifiedColumns write
         writeColumns key =
-            let knownColumns =
-                    maybe Set.empty relColumns (lookupRelation catalog key)
+            let knownColumns = maybe Set.empty relColumns (lookupRelation catalog key)
                 resolved
                     | Set.null knownColumns = unqualified
                     | otherwise = filter (`Set.member` knownColumns) unqualified
              in dataWriteColumns write ++ resolved
-        applyTarget current key =
+        applyTarget key =
             let columns = writeColumns key
              in -- An unqualified assignment that names none of this target's
                 -- columns belongs to a different table in a multi-table update.
                 if null columns && not (null unqualified)
-                    then current
-                    else writeRelation sid current key (dataWriteKind write) columns (dataWriteOnly write)
-     in mutateResolved applyTarget evalReads targetKeys
+                    then pure ()
+                    else writeRelation sid key (dataWriteKind write) columns (dataWriteOnly write)
+    case targetKeys of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> Foldable.foldlM (\() key -> applyTarget key) () targetKeys
 
-writeRelation :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Bool -> Eval
-writeRelation sid eval key kind columns only =
+writeRelation :: StatementId -> RelationKey -> WriteKind -> [Ident] -> Bool -> State Eval ()
+writeRelation sid key kind columns only = do
+    eval <- get
     let session = evalSession eval
         catalog = evalCatalog eval
         relation = fromMaybe (newRelation TableRelation) (lookupRelation catalog key)
@@ -312,47 +316,49 @@ writeRelation sid eval key kind columns only =
         isView = relKind relation `elem` [ViewRelation, MaterializedViewRelation]
         suppressOriginal = isView && not (null insteadOf)
         signature = writeSignature kind columns
-        evalMarked =
-            eval
-                { evalVisitedWrites =
-                    Set.insert (key, signature) (evalVisitedWrites eval)
-                }
-        evalDeps =
-            addTouches
-                (relationTouchKeys key)
-                (addDeps (relationWriteDeps session catalog key kind columns) evalMarked)
-        evalWrite =
-            if suppressOriginal
+    modify' $ \current ->
+        let evalMarked =
+                current
+                    { evalVisitedWrites =
+                        Set.insert (key, signature) (evalVisitedWrites current)
+                    }
+            evalDeps =
+                addTouches
+                    (relationTouchKeys key)
+                    (addDeps (relationWriteDeps session catalog key kind columns) evalMarked)
+         in if suppressOriginal
                 then evalDeps
-                else evalDeps & evalCatalogL %~ insertRelation key (applyWriteState sid kind columns relation)
-        evalTriggers =
-            Foldable.foldl'
-                (\current (triggerKey, _) -> expandTrigger sid current triggerKey)
-                evalWrite
-                matching
-        evalCascades = applyForeignKeys sid evalTriggers key kind columns
-        -- Fan out parent write to partition/inheritance children unless ONLY is specified.
-        evalChildren =
-            if only
-                then evalCascades
                 else
-                    Foldable.foldl'
-                        (writePartitionChild sid kind columns)
-                        evalCascades
-                        ( case kind of
-                            InsertWrite _ -> partitionChildrenOf session catalog key
-                            _ -> childrenOf session catalog key
-                        )
-     in if isView && null insteadOf
-            then addViewWriteBarriers evalChildren key
-            else evalChildren
+                    evalDeps
+                        { evalCatalog =
+                            insertRelation
+                                key
+                                (applyWriteState sid kind columns relation)
+                                (evalCatalog evalDeps)
+                        }
+    Foldable.foldlM (\() (triggerKey, _) -> expandTrigger sid triggerKey) () matching
+    applyForeignKeys sid key kind columns
+    -- Fan out parent write to partition/inheritance children unless ONLY is specified.
+    if only
+        then pure ()
+        else
+            Foldable.foldlM
+                (\() childKey -> writePartitionChild sid kind columns childKey)
+                ()
+                ( case kind of
+                    InsertWrite _ -> partitionChildrenOf session catalog key
+                    _ -> childrenOf session catalog key
+                )
+    when (isView && null insteadOf) $
+        modify' (`addViewWriteBarriers` key)
 
-writePartitionChild :: StatementId -> WriteKind -> [Ident] -> Eval -> RelationKey -> Eval
-writePartitionChild sid kind columns current childKey =
+writePartitionChild :: StatementId -> WriteKind -> [Ident] -> RelationKey -> State Eval ()
+writePartitionChild sid kind columns childKey = do
+    current <- get
     let signature = writeSignature kind columns
-     in if Set.member (childKey, signature) (evalVisitedWrites current)
-            then current
-            else writeRelation sid current childKey kind columns False
+    if Set.member (childKey, signature) (evalVisitedWrites current)
+        then pure ()
+        else writeRelation sid childKey kind columns False
 
 addViewWriteBarriers :: Eval -> RelationKey -> Eval
 addViewWriteBarriers eval key =
@@ -377,46 +383,57 @@ transitiveSources catalog = go Set.empty
             | otherwise = Set.singleton current
 
 -- Triggers and sequences
-expandTrigger :: StatementId -> Eval -> TriggerKey -> Eval
-expandTrigger sid eval triggerKey
-    | Set.member triggerKey (evalVisitedTriggers eval) = eval
-    | Just trigger <- Map.lookup triggerKey (catalogTriggers (evalCatalog eval)) =
-        let tableKey = triggerStateTable trigger
-            eval1 = eval {evalVisitedTriggers = Set.insert triggerKey (evalVisitedTriggers eval)}
-            definitionDeps =
-                Set.fromList (catMaybes [triggerDefinition trigger, triggerRestoredBy trigger])
-            eval2 = addTouches (triggerTouchKeys triggerKey tableKey) (addDeps definitionDeps eval1)
-            eval3 = Foldable.foldl' processRead eval2 (triggerStateWhenReads trigger)
-         in applyTriggerBody sid eval3 (triggerStateBody trigger)
-    | otherwise = eval
+expandTrigger :: StatementId -> TriggerKey -> State Eval ()
+expandTrigger sid triggerKey = do
+    eval <- get
+    case Map.lookup triggerKey (catalogTriggers (evalCatalog eval)) of
+        Just trigger
+            | not (Set.member triggerKey (evalVisitedTriggers eval)) -> do
+                let tableKey = triggerStateTable trigger
+                modify' $ \current ->
+                    let eval1 =
+                            current
+                                { evalVisitedTriggers =
+                                    Set.insert triggerKey (evalVisitedTriggers current)
+                                }
+                     in addTouches
+                            (triggerTouchKeys triggerKey tableKey)
+                            (addDeps (Set.fromList (catMaybes [triggerDefinition trigger, triggerRestoredBy trigger])) eval1)
+                modify' $ \current -> Foldable.foldl' processRead current (triggerStateWhenReads trigger)
+                applyTriggerBody sid (triggerStateBody trigger)
+        _ -> pure ()
 
-applyTriggerBody :: StatementId -> Eval -> TriggerBody -> Eval
-applyTriggerBody sid eval = \case
-    TriggerInline effects -> Foldable.foldl' (processTriggerEffect sid) eval effects
+applyTriggerBody :: StatementId -> TriggerBody -> State Eval ()
+applyTriggerBody sid = \case
+    TriggerInline effects ->
+        Foldable.foldlM (\() effect -> processTriggerEffect sid effect) () effects
     TriggerFunction name _ ->
-        addBarrier
-            ( ScopedBarrier
-                GlobalScope
-                UnsupportedTriggerBodyBarrier
-                (Just ("trigger function " <> nameText name))
+        modify'
+            ( addBarrier
+                ( ScopedBarrier
+                    GlobalScope
+                    UnsupportedTriggerBodyBarrier
+                    (Just ("trigger function " <> nameText name))
+                )
             )
-            eval
     TriggerOpaque ->
-        addBarrier (ScopedBarrier GlobalScope OpaqueTriggerBodyBarrier Nothing) eval
+        modify' (addBarrier (ScopedBarrier GlobalScope OpaqueTriggerBodyBarrier Nothing))
 
-processTriggerEffect :: StatementId -> Eval -> TriggerEffect -> Eval
-processTriggerEffect sid eval effect =
+processTriggerEffect :: StatementId -> TriggerEffect -> State Eval ()
+processTriggerEffect sid effect =
     case effect of
-        TriggerDml event -> processDmlEvent sid eval event
-        TriggerRead readFact -> processRead eval readFact
-        TriggerWriteSequence write -> processSequenceWrite sid eval write
+        TriggerDml event -> processDmlEvent sid event
+        TriggerRead readFact -> modify' (`processRead` readFact)
+        TriggerWriteSequence write -> processSequenceWrite sid write
         TriggerSession sessionEffect ->
-            let (eval', _) = applySessionEffects sid [sessionEffect] eval
-             in eval' {evalSessionTouched = True}
-        TriggerBarrier scoped -> addBarrier scoped eval
+            modify' $ \eval ->
+                let (eval', _) = applySessionEffects sid [sessionEffect] eval
+                 in eval' {evalSessionTouched = True}
+        TriggerBarrier scoped -> modify' (addBarrier scoped)
 
-processDmlEvent :: StatementId -> Eval -> DmlEvent -> Eval
-processDmlEvent sid eval event =
+processDmlEvent :: StatementId -> DmlEvent -> State Eval ()
+processDmlEvent sid event = do
+    eval <- get
     let session = evalSession eval
         catalog = evalCatalog eval
         (target, kind, columns) =
@@ -431,60 +448,62 @@ processDmlEvent sid eval event =
                     (target', DeleteWrite scope, [])
                 DmlTruncate target' behavior ->
                     (target', TruncateWrite behavior ContinueIdentity, [])
-     in mutateResolved
-            -- Trigger-body DML carries no `ONLY` marker: route conservatively.
-            (\current key -> writeRelation sid current key kind columns False)
-            eval
-            (resolveRelationKeys session catalog target)
+        keys = resolveRelationKeys session catalog target
+    case keys of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> Foldable.foldlM (\() key -> writeRelation sid key kind columns False) () keys
 
 -- ----------------------------------------------------------------------------
 -- Sequences
 -- ----------------------------------------------------------------------------
 
-processSequenceWrite :: StatementId -> Eval -> SequenceWrite -> Eval
-processSequenceWrite sid eval write
-    | not transactional && evalTransactionActive eval && null keys =
-        -- Unresolved non-transactional sequence calls inside an active transaction fall back to a barrier.
-        addBarrier
-            ( ScopedBarrier
-                GlobalScope
-                UnsupportedTransactionBarrier
-                (Just "nontransactional sequence values in a transaction")
-            )
-            evalWrites
-    | otherwise = evalWrites
-    where
-        session = evalSession eval
+processSequenceWrite :: StatementId -> SequenceWrite -> State Eval ()
+processSequenceWrite sid write = do
+    eval <- get
+    let session = evalSession eval
         catalog = evalCatalog eval
         keys = resolveSequenceKeys session catalog (sequenceWriteTarget write)
         transactional = sequenceWriteTransactional write
-        evalWrites = mutateResolved stepKey eval keys
-        stepKey current key =
-            current
-                & addTouches (sequenceTouchKeys key)
-                & addDeps deps
-                & evalCatalogL . catalogSequencesL %~ Map.insert key nextState
-            where
-                existing = Map.lookup key (catalogSequences (evalCatalog current))
-                state = fromMaybe (SequenceState Nothing Set.empty Set.empty Nothing transactional) existing
-                nextState =
-                    state
-                        & sequenceWritesL %~ Set.insert sid
-                        & (if transactional then id else sequenceNonTxWritesL %~ Set.insert sid)
-                deps =
-                    Set.fromList (catMaybes [sequenceDefinition state, sequenceRestoredBy state])
-                        `Set.union` sequenceWrites state
+        step key =
+            modify' $ \current ->
+                let existing = Map.lookup key (catalogSequences (evalCatalog current))
+                    state = fromMaybe (SequenceState Nothing Set.empty Set.empty Nothing transactional) existing
+                    nextState =
+                        state
+                            { sequenceWrites = Set.insert sid (sequenceWrites state)
+                            , sequenceNonTxWrites =
+                                if transactional
+                                    then sequenceNonTxWrites state
+                                    else Set.insert sid (sequenceNonTxWrites state)
+                            }
+                    deps =
+                        Set.fromList (catMaybes [sequenceDefinition state, sequenceRestoredBy state])
+                            `Set.union` sequenceWrites state
+                 in addDeps deps (addTouches (sequenceTouchKeys key) current)
+                        & (#evalCatalog % #catalogSequences %~ Map.insert key nextState)
+    case keys of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> Foldable.foldlM (\() key -> step key) () keys
+    when (not transactional && evalTransactionActive eval && null keys) $
+        modify'
+            ( addBarrier
+                ( ScopedBarrier
+                    GlobalScope
+                    UnsupportedTransactionBarrier
+                    (Just "nontransactional sequence values in a transaction")
+                )
+            )
 
 -- Foreign keys
-applyForeignKeys :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-applyForeignKeys sid eval key kind columns
-    | not (sessForeignKeyChecks (evalSession eval)) = eval
-    | Map.null (catalogForeignKeys (evalCatalog eval)) = eval
-    | otherwise =
-        let evalChecks = applyChildChecks eval key kind columns
-            evalActions = applyParentActions sid evalChecks key kind columns
-         in evalActions
-
+applyForeignKeys :: StatementId -> RelationKey -> WriteKind -> [Ident] -> State Eval ()
+applyForeignKeys sid key kind columns = do
+    eval <- get
+    if not (sessForeignKeyChecks (evalSession eval))
+        || Map.null (catalogForeignKeys (evalCatalog eval))
+        then pure ()
+        else do
+            modify' (\current -> applyChildChecks current key kind columns)
+            applyParentActions sid key kind columns
 applyChildChecks :: Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
 applyChildChecks eval key kind _columns = case kind of
     InsertWrite _ -> Foldable.foldl' checkParent eval (allForeignKeys catalog)
@@ -504,61 +523,14 @@ applyChildChecks eval key kind _columns = case kind of
                         | parentKey <- resolveRelationKeys session catalog (foreignKeyParent foreignKey)
                         ]
 
-applyParentActions :: StatementId -> Eval -> RelationKey -> WriteKind -> [Ident] -> Eval
-applyParentActions sid eval key kind columns = case kind of
-    DeleteWrite _ ->
-        Foldable.foldl' (\current item -> parentAction current (DeleteWrite DeleteAllRows) [] item) eval fks
-    UpdateWrite scope ->
-        Foldable.foldl' (\current item -> parentAction current (UpdateWrite scope) columns item) eval fks
-    TruncateWrite TruncateCascade _ ->
-        Foldable.foldl' cascadeTruncate eval fks
-    TruncateWrite {} ->
-        Foldable.foldl' addForeignKeyDep eval fks
-    _ -> eval
-    where
-        catalog = evalCatalog eval
-        session = evalSession eval
+applyParentActions :: StatementId -> RelationKey -> WriteKind -> [Ident] -> State Eval ()
+applyParentActions sid key kind columns = do
+    initial <- get
+    let catalog = evalCatalog initial
+        session = evalSession initial
         fks = allForeignKeys catalog
-
         parentMatches foreignKey =
             key `elem` resolveRelationKeys session catalog (foreignKeyParent foreignKey)
-
-        cascadeTruncate current (_, state, foreignKey)
-            | parentMatches foreignKey =
-                writeChild current (constraintStateTable state) (TruncateWrite TruncateCascade ContinueIdentity) []
-            | otherwise = current
-
-        addForeignKeyDep current (_, state, foreignKey)
-            | parentMatches foreignKey =
-                let childKey = constraintStateTable state
-                    constraintDeps = Set.fromList (catMaybes [constraintDefinition state, constraintRestoredBy state])
-                    childDeps = relationReadDeps session catalog childKey ReadSchema [] False
-                 in addDeps (childDeps `Set.union` constraintDeps) current
-            | otherwise = current
-
-        parentAction current action updatedParentColumns (_, state, foreignKey)
-            | not (parentMatches foreignKey) = current
-            | not (foreignKeyEventMatches action updatedParentColumns foreignKey) = current
-            | otherwise = applyReferentialAction current action (constraintStateTable state) foreignKey
-
-        applyReferentialAction current action childKey foreignKey =
-            case (referentialAction action foreignKey, action) of
-                (Cascade, DeleteWrite _) ->
-                    -- Only matching children are deleted, even when the parent
-                    -- delete is unfiltered (nullable foreign keys can survive).
-                    writeChild current childKey (DeleteWrite DeleteFilteredRows) []
-                (Cascade, UpdateWrite _) ->
-                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
-                (SetNull, _) ->
-                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
-                (SetDefault, _) ->
-                    writeChild current childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
-                (Restrict, _) ->
-                    addDeps (relationReadDeps session catalog childKey ReadData [] False) current
-                (NoAction, _) ->
-                    addDeps (relationReadDeps session catalog childKey ReadData [] False) current
-                _ -> current
-
         foreignKeyEventMatches (DeleteWrite _) _ _ = True
         foreignKeyEventMatches (UpdateWrite _) updatedParentColumns foreignKey =
             null updatedParentColumns
@@ -567,40 +539,86 @@ applyParentActions sid eval key kind columns = case kind of
             where
                 relevant = referencedParentColumns session catalog foreignKey
         foreignKeyEventMatches _ _ _ = False
-
         referentialAction (DeleteWrite _) = foreignKeyOnDelete
         referentialAction (UpdateWrite _) = foreignKeyOnUpdate
         referentialAction _ = const NoAction
-
-        writeChild current childKey childKind childColumns
-            | Set.member (childKey, signature) (evalVisitedWrites current) = current
-            | otherwise = writeRelation sid current childKey childKind childColumns False
-            where
-                signature = writeSignature childKind childColumns
+        writeChild childKey childKind childColumns = do
+            current <- get
+            let signature = writeSignature childKind childColumns
+            if Set.member (childKey, signature) (evalVisitedWrites current)
+                then pure ()
+                else writeRelation sid childKey childKind childColumns False
+        applyReferentialAction action childKey foreignKey =
+            case (referentialAction action foreignKey, action) of
+                (Cascade, DeleteWrite _) ->
+                    -- Only matching children are deleted, even when the parent
+                    -- delete is unfiltered (nullable foreign keys can survive).
+                    writeChild childKey (DeleteWrite DeleteFilteredRows) []
+                (Cascade, UpdateWrite _) ->
+                    writeChild childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (SetNull, _) ->
+                    writeChild childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (SetDefault, _) ->
+                    writeChild childKey (UpdateWrite UpdateFilteredRows) (foreignKeyChildColumns foreignKey)
+                (Restrict, _) ->
+                    modify' (addDeps (relationReadDeps session catalog childKey ReadData [] False))
+                (NoAction, _) ->
+                    modify' (addDeps (relationReadDeps session catalog childKey ReadData [] False))
+                _ -> pure ()
+        parentAction action updatedParentColumns (_, state, foreignKey)
+            | not (parentMatches foreignKey) = pure ()
+            | not (foreignKeyEventMatches action updatedParentColumns foreignKey) = pure ()
+            | otherwise = applyReferentialAction action (constraintStateTable state) foreignKey
+        cascadeTruncate (_, state, foreignKey)
+            | parentMatches foreignKey =
+                writeChild (constraintStateTable state) (TruncateWrite TruncateCascade ContinueIdentity) []
+            | otherwise = pure ()
+        addForeignKeyDep (_, state, foreignKey)
+            | parentMatches foreignKey =
+                let childKey = constraintStateTable state
+                    constraintDeps = Set.fromList (catMaybes [constraintDefinition state, constraintRestoredBy state])
+                    childDeps = relationReadDeps session catalog childKey ReadSchema [] False
+                 in modify' (addDeps (childDeps `Set.union` constraintDeps))
+            | otherwise = pure ()
+        foldActions action updatedParentColumns =
+            Foldable.foldlM (\() item -> parentAction action updatedParentColumns item) () fks
+        foldForeignKeyDeps =
+            Foldable.foldlM (\() item -> addForeignKeyDep item) () fks
+    case kind of
+        DeleteWrite _ -> foldActions (DeleteWrite DeleteAllRows) []
+        UpdateWrite scope -> foldActions (UpdateWrite scope) columns
+        TruncateWrite TruncateCascade _ ->
+            Foldable.foldlM (\() item -> cascadeTruncate item) () fks
+        TruncateWrite {} -> foldForeignKeyDeps
+        _ -> pure ()
 
 -- Refresh
-processRefresh :: StatementId -> Eval -> RefreshOp -> Eval
-processRefresh sid eval refresh =
-    let session = evalSession eval
-        catalog = evalCatalog eval
+processRefresh :: StatementId -> RefreshOp -> State Eval ()
+processRefresh sid refresh = do
+    initial <- get
+    let session = evalSession initial
+        catalog = evalCatalog initial
         keys =
             filter
                 (`Map.member` catalogRelations catalog)
                 (resolveRelationKeys session catalog (refreshTarget refresh))
-        stepKey current key =
+    case keys of
+        _ : _ : _ -> modify' ambiguousMutation
+        [] -> pure ()
+        [key] -> do
+            current <- get
             let currentCatalog = evalCatalog current
                 relation = fromMaybe (newRelation TableRelation) (lookupRelation currentCatalog key)
                 mode = refreshSourceMode refresh
                 deps = relationReadDeps session currentCatalog key ReadSchema [] False
                 sourceReads = [readFact {readMode = mode} | readFact <- relSourceReads relation]
-                evalReads = Foldable.foldl' processRead current sourceReads
                 relation1 =
                     relation
-                        & relDataWritesL .~ Set.singleton sid
-                        & relCardinalityWritesL .~ Set.singleton sid
-                        & relColumnWritesL .~ Map.empty
-             in evalReads
-                    & addTouches (relationTouchKeys key)
-                    & addDeps deps
-                    & evalCatalogL .~ insertRelation key relation1 currentCatalog
-     in mutateResolved stepKey eval keys
+                        { relDataWrites = Set.singleton sid
+                        , relCardinalityWrites = Set.singleton sid
+                        , relColumnWrites = Map.empty
+                        }
+            modify' $ \eval -> Foldable.foldl' processRead eval sourceReads
+            modify' $ \evalReads ->
+                let evalWithDeps = addTouches (relationTouchKeys key) (addDeps deps evalReads)
+                 in evalWithDeps {evalCatalog = insertRelation key relation1 currentCatalog}

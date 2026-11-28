@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Budgeted reduction session orchestration, preflight checking, and validation phases.
 module Occam.Evaluation (
     EvaluationConfig (..),
@@ -24,15 +26,20 @@ module Occam.Evaluation (
     sqlDialectName,
 ) where
 
+import Control.Exception (SomeException)
 import Control.Exception.Safe (displayException, fromException, toException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Occam.AtomicFile (writeAtomicBytes)
-import Occam.Cache (CacheStats (..), nativeCandidateKey)
+import Occam.Cache (
+    CacheStats (cacheHits, cacheJoins, cacheMisses),
+    nativeCandidateKey,
+ )
 import Occam.Evaluation.Execution (
     EvalEnv (..),
     EvalState (..),
@@ -117,23 +124,23 @@ runEvaluatedReductionWithProgress ::
 runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracleCfg preflightObservation logger initialSQL checkpoint action =
     runEvaluationRequest
         EvaluationRequest
-            { requestOnProgress = onProgress
-            , requestMetricsPolicy = metricsPolicy
-            , requestConfig = config
-            , requestDialect = dialect
-            , requestOracleConfig = oracleCfg
-            , requestPreflightObservation = preflightObservation
-            , requestLogger = logger
-            , requestInitialSQL = initialSQL
-            , requestCheckpoint = checkpoint
-            , requestAction = action
-            , requestCollectCurve = True
+            { onProgress = onProgress
+            , metricsPolicy = metricsPolicy
+            , config = config
+            , dialect = dialect
+            , oracleConfig = oracleCfg
+            , preflightObservation = preflightObservation
+            , logger = logger
+            , initialSQL = initialSQL
+            , checkpoint = checkpoint
+            , action = action
+            , collectCurve = True
             }
 
 -- | Run an 'EvaluationRequest' against an external subprocess oracle configuration.
 runEvaluationRequest :: EvaluationRequest OracleConfig -> IO EvaluationResult
 runEvaluationRequest request = do
-    let config = requestOracleConfig request
+    let config = request.oracleConfig
     context <- resolveOracleContext config
     let observe started = observeExternalOracleDetailedWithContext started config context
     runEvaluationRequestWithObserver (oracleTimeoutMicros config) observe request
@@ -156,7 +163,7 @@ runEvaluationRequestWithNativeValidation ::
 runEvaluationRequestWithNativeValidation micros observe validate request =
     runEvaluationRequestWithKey
         True
-        (nativeCandidateKey (nativeOracleCacheKey (requestDialect request)))
+        (nativeCandidateKey (nativeOracleCacheKey request.dialect))
         micros
         observe
         validate
@@ -170,50 +177,44 @@ runEvaluationRequestWithKey ::
     EvaluationObserver ->
     EvaluationRequest oracle ->
     IO EvaluationResult
-runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate EvaluationRequest {..} = do
-    let onProgress = requestOnProgress
-        metricsPolicy = requestMetricsPolicy
-        config = requestConfig
-        dialect = requestDialect
-        preflightObservation = requestPreflightObservation
-        parentLogger = requestLogger
-        initialSQL = requestInitialSQL
-        checkpoint = requestCheckpoint
-        action = requestAction
-        collectCurve = requestCollectCurve
-    when (evaluationJobs config <= 0) $
-        ioError (userError ("Evaluation jobs must be positive, got " ++ show (evaluationJobs config)))
+runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate request = do
+    let onProgress = request.onProgress
+        metricsPolicy = request.metricsPolicy
+        config = request.config
+        dialect = request.dialect
+        preflightObservation = request.preflightObservation
+        parentLogger = request.logger
+        initialSQL = request.initialSQL
+        checkpoint = request.checkpoint
+        action = request.action
+        collectCurve = request.collectCurve
+    when (config.jobs <= 0) $
+        ioError (userError ("Evaluation jobs must be positive, got " ++ show config.jobs))
     startedAt <- ticks
-    let preflightMicros = max 0 (toInteger (evaluationPreflightMicros config))
+    let preflightMicros = max 0 (toInteger config.preflightMicros)
         totalStart = startedAt - preflightMicros * 1000
-    seedCounts <- case evaluationInitialStatements config of
-        Just count -> pure (Map.singleton initialSQL count)
-        Nothing -> do
-            counted <- countStatements dialect initialSQL
-            pure $ case counted of
-                Left _ -> Map.empty
-                Right count -> Map.singleton initialSQL count
+    seedCounts <- seedStatementCounts dialect config.initialStatements initialSQL
     state <- newIORef (initialEvalState initialSQL seedCounts)
     unless (null checkpoint) $ writeAtomicBytes checkpoint initialSQL
     let oracleTimeout = max 1 (toInteger timeoutMicros)
         validationSlack = max 1000 (min 10000 (oracleTimeout `div` 100))
         perValidationReserve = oracleTimeout + validationSlack
         remainingCalls =
-            (\limit -> max 0 (limit - max 0 (evaluationPreflightAttempts config)))
-                <$> evaluationMaxOracleExecutions config
+            (\limit -> max 0 (limit - max 0 config.preflightAttempts))
+                <$> config.maxOracleExecutions
         callsToReserve = maybe 2 (min 2 . max 0 . subtract 1) remainingCalls
-        timeToReserve = fromInteger $ case evaluationTotalTimeoutMicros config of
+        timeToReserve = fromInteger $ case config.totalTimeoutMicros of
             Nothing -> 2
             Just limit ->
                 let remaining = toInteger limit - preflightMicros
                  in min 2 (max 0 (remaining - oracleTimeout) `div` perValidationReserve)
         validationCallReserve = min callsToReserve timeToReserve
-        validationReserve = case evaluationTotalTimeoutMicros config of
+        validationReserve = case config.totalTimeoutMicros of
             Nothing -> 0
             Just _ -> toInteger validationCallReserve * perValidationReserve
         totalDeadline =
             (\limit -> totalStart + max 0 (toInteger limit) * 1000)
-                <$> evaluationTotalTimeoutMicros config
+                <$> config.totalTimeoutMicros
         reductionCallLimit = subtract validationCallReserve <$> remainingCalls
         precomputedObservations =
             maybe Map.empty (Map.singleton initialSQL) preflightObservation
@@ -223,8 +224,8 @@ runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate
         newOraclePoolWithCacheKey
             candidateKey
             PoolConfig
-                { poolJobs = evaluationJobs config
-                , poolCacheEnabled = evaluationCacheEnabled config
+                { poolJobs = config.jobs
+                , poolCacheEnabled = config.cacheEnabled
                 , poolPermits = reductionCallLimit
                 , poolPrecomputed = precomputedObservations
                 , poolMetrics = metricsStore
@@ -256,19 +257,7 @@ runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate
                 costs <- if collectCurve then traverse snapshotMetrics metricsStore else pure Nothing
                 pure (Left (toException (ExecutionBudgetReached ())), 0, costs)
             else runReductionPhase env state pool metricsStore collectCurve reporter action
-    (status, failure, skipValidation) <- case reductionOutcome of
-        Right (Just _) -> pure (EvaluationCompleted, Nothing, False)
-        Right Nothing -> pure (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
-        Left err
-            | Just (ExecutionBudgetReached _) <- fromException err ->
-                pure (EvaluationExecutionBudget, Nothing, False)
-            | Just OracleReapFailed <- fromException err ->
-                pure
-                    ( EvaluationError
-                    , Just "Oracle process group could not be reaped; refusing further oracle executions"
-                    , True
-                    )
-            | otherwise -> pure (EvaluationError, Just (T.pack (displayException err)), False)
+    let (status, failure, skipValidation) = classifyReductionOutcome reductionOutcome
     preValidation <- readIORef state
     let acceptedFinal = evalAccepted preValidation
         auditResult = evalAuditResult preValidation
@@ -308,78 +297,110 @@ runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate
         auditCompleted = evalAuditCompleted st
         auditSkipped = evalAuditSkipped st
     totalEnd <- ticks
-    let finalStatus
-            | status /= EvaluationCompleted = status
-            | not validationPassed && validationRejected = EvaluationValidationFailed
-            | not validationPassed && validationObservations < 2 = EvaluationValidationIncomplete
-            | not validationPassed = EvaluationValidationFailed
-            | otherwise = EvaluationCompleted
+    let finalStatus =
+            finalEvaluationStatus status validationPassed validationRejected validationObservations
         finalFailure =
-            case failure of
-                Just err -> Just err
-                Nothing
-                    | validationRejected ->
-                        Just "Final candidate failed target validation"
-                Nothing
-                    | not validationPassed && validationObservations < 2 ->
-                        Just "Repeated final validation did not complete within the shared limits"
-                Nothing
-                    | not validationPassed ->
-                        Just "Final candidate failed repeated target validation"
-                Nothing -> Nothing
+            finalEvaluationFailure failure validationRejected validationPassed validationObservations
         metrics =
             EvaluationMetrics
-                { evaluationStatus = finalStatus
-                , evaluationFailure = finalFailure
-                , evaluationCacheUsed = evaluationCacheEnabled config
-                , evaluationBudget = config
-                , evaluationTotalSeconds = seconds totalStart totalEnd
-                , evaluationReductionSeconds = reductionSeconds
-                , evaluationOracleSeconds = oracleSeconds
-                , evaluationResetSeconds = resetSeconds
-                , evaluationPreflightResetSeconds =
-                    fmap ((/ 1000000) . fromIntegral) (evaluationPreflightResetMicros config)
-                , evaluationPreflightOracleSeconds =
-                    fmap ((/ 1000000) . fromIntegral) (evaluationPreflightOracleMicros config)
-                , evaluationOracleAttempts = attempts
-                , evaluationDatabaseObservations = database
-                , evaluationCompletedOracleProcesses = completed
-                , evaluationAcceptedObservations = acceptedCount
-                , evaluationRejectedObservations = rejectedCount
-                , evaluationTimedOutObservations = timedOut
-                , evaluationResetFailures = resetFailures
-                , evaluationOracleErrors = errors
-                , evaluationCancelledObservations = cancelled
-                , evaluationOracleOutcomes = outcomes
-                , evaluationCacheHits = cacheHits cacheStats
-                , evaluationCacheMisses = cacheMisses cacheStats
-                , evaluationCacheJoins = cacheJoins cacheStats
-                , evaluationValidationSeconds = validationSeconds
-                , evaluationValidationOracleSeconds = validationOracleSeconds
-                , evaluationValidationResetSeconds = validationResetSeconds
-                , evaluationValidationObservations = validationObservations
-                , evaluationValidationDatabaseObservations = validationDatabase
-                , evaluationValidationErrors = validationErrors
-                , evaluationValidationOutcomes = validationOutcomes
-                , evaluationValidationPassed = validationPassed
-                , evaluationAuditSeconds = auditSeconds
-                , evaluationAuditChecks = auditChecks
-                , evaluationAuditCompleted = auditCompleted
-                , evaluationAuditSkipped = auditSkipped
-                , evaluationMinimalityClaim =
+                { runStatus = finalStatus
+                , failure = finalFailure
+                , cacheUsed = config.cacheEnabled
+                , budget = config
+                , totalSeconds = seconds totalStart totalEnd
+                , reductionSeconds = reductionSeconds
+                , oracleSeconds = oracleSeconds
+                , resetSeconds = resetSeconds
+                , preflightResetSeconds =
+                    fmap ((/ 1000000) . fromIntegral) config.preflightResetMicros
+                , preflightOracleSeconds =
+                    fmap ((/ 1000000) . fromIntegral) config.preflightOracleMicros
+                , oracleAttempts = attempts
+                , databaseObservations = database
+                , completedOracleProcesses = completed
+                , acceptedObservations = acceptedCount
+                , rejectedObservations = rejectedCount
+                , timedOutObservations = timedOut
+                , resetFailures = resetFailures
+                , oracleErrors = errors
+                , cancelledObservations = cancelled
+                , oracleOutcomes = outcomes
+                , cacheHits = cacheStats.cacheHits
+                , cacheMisses = cacheStats.cacheMisses
+                , cacheJoins = cacheStats.cacheJoins
+                , validationSeconds = validationSeconds
+                , validationOracleSeconds = validationOracleSeconds
+                , validationResetSeconds = validationResetSeconds
+                , validationObservations = validationObservations
+                , validationDatabaseObservations = validationDatabase
+                , validationErrors = validationErrors
+                , validationOutcomes = validationOutcomes
+                , validationPassed = validationPassed
+                , auditSeconds = auditSeconds
+                , auditChecks = auditChecks
+                , auditCompleted = auditCompleted
+                , auditSkipped = auditSkipped
+                , minimalityClaim =
                     if validationPassed && auditCompleted && auditResultIsFinal
                         then StatementDeletionOneMinimal
                         else MinimalityNotEstablished
-                , evaluationCurve = if collectCurve then curve else []
-                , evaluationStages = stages
-                , evaluationCostAttribution = costAttribution
+                , curve = if collectCurve then curve else []
+                , stages = stages
+                , costAttribution = costAttribution
                 }
     pure
         EvaluationResult
-            { evaluatedSQL = finalSQL
-            , evaluatedStatements =
+            { sql = finalSQL
+            , statements =
                 if finalSQL == evalAccepted st
                     then evalAcceptedStatements st
                     else Nothing
-            , evaluationMetrics = metrics
+            , metrics = metrics
             }
+seedStatementCounts :: SQLDialect -> Maybe Int -> ByteString -> IO (Map.Map ByteString Int)
+seedStatementCounts dialect maybeCount initialSQL = case maybeCount of
+    Just count -> pure (Map.singleton initialSQL count)
+    Nothing -> do
+        counted <- countStatements dialect initialSQL
+        pure $ case counted of
+            Left _ -> Map.empty
+            Right count -> Map.singleton initialSQL count
+
+classifyReductionOutcome ::
+    Either SomeException (Maybe result) ->
+    (EvaluationStatus, Maybe Text, Bool)
+classifyReductionOutcome outcome = case outcome of
+    Right (Just _) -> (EvaluationCompleted, Nothing, False)
+    Right Nothing -> (EvaluationTimeout, Just "Shared wall-clock budget expired during reduction", False)
+    Left err
+        | Just (ExecutionBudgetReached _) <- fromException err ->
+            (EvaluationExecutionBudget, Nothing, False)
+        | Just OracleReapFailed <- fromException err ->
+            ( EvaluationError
+            , Just "Oracle process group could not be reaped; refusing further oracle executions"
+            , True
+            )
+        | otherwise -> (EvaluationError, Just (T.pack (displayException err)), False)
+
+finalEvaluationStatus :: EvaluationStatus -> Bool -> Bool -> Int -> EvaluationStatus
+finalEvaluationStatus status validationPassed validationRejected validationObservations
+    | status /= EvaluationCompleted = status
+    | not validationPassed && validationRejected = EvaluationValidationFailed
+    | not validationPassed && validationObservations < 2 = EvaluationValidationIncomplete
+    | not validationPassed = EvaluationValidationFailed
+    | otherwise = EvaluationCompleted
+
+finalEvaluationFailure :: Maybe Text -> Bool -> Bool -> Int -> Maybe Text
+finalEvaluationFailure failure validationRejected validationPassed validationObservations =
+    case failure of
+        Just err -> Just err
+        Nothing
+            | validationRejected ->
+                Just "Final candidate failed target validation"
+        Nothing
+            | not validationPassed && validationObservations < 2 ->
+                Just "Repeated final validation did not complete within the shared limits"
+        Nothing
+            | not validationPassed ->
+                Just "Final candidate failed repeated target validation"
+        Nothing -> Nothing

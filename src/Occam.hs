@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 -- | Occam: Dependency-Aware Multi-Statement SQL Test Case Minimizer.
 module Occam (
     module Occam.Version,

@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Benchmark summary computation, attempt-AUC integration, and engine overhead attribution.
 module Occam.Benchmark.Metrics (
     Stats (..),
@@ -118,9 +120,9 @@ computeAttemptAuc initialBytes curve totalAttempts
         let bestAt =
                 IntMap.fromListWith
                     min
-                    [ (pointCallIndex p, pointCandidateBytes p)
+                    [ (p.callIndex, p.candidateBytes)
                     | p <- curve
-                    , pointAccepted p
+                    , p.accepted
                     ]
             step (!best, !area) i =
                 let !curBest = maybe best (min best) (IntMap.lookup i bestAt)
@@ -171,13 +173,13 @@ summarizeStats :: Text -> Stats -> RunSummary
 summarizeStats name stats =
     let parts = parseRunParts name
         m = evaluation_metrics stats
-        curve = evaluationCurve m
-        peak = maximum (0 : [pointCallIndex p | p <- curve])
+        curve = m.curve
+        peak = maximum (0 : [p.callIndex | p <- curve])
         total = max (oracle_attempts stats) peak
         auc = computeAttemptAuc (initial_bytes stats) curve total
-        overhead = engineOverheadMicros (evaluationCostAttribution m)
+        overhead = engineOverheadMicros m.costAttribution
         elapsed =
-            let rSecs = evaluationReductionSeconds m
+            let rSecs = m.reductionSeconds
              in if rSecs > 0 then rSecs else elapsed_seconds stats
      in RunSummary
             { runName = name
@@ -189,7 +191,7 @@ summarizeStats name stats =
             , runReducedStatements = Just (reduced_statements stats)
             , runReductionRatio = Just (reduction_ratio stats)
             , runOracleAttempts = Just (oracle_attempts stats)
-            , runAccepted = Just (evaluationAcceptedObservations m)
+            , runAccepted = Just m.acceptedObservations
             , runCacheHits = Just (cache_hits stats)
             , runAttemptAuc = Just auc
             , runEngineOverheadUs = overhead

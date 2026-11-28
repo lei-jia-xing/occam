@@ -26,6 +26,7 @@ module Occam.Evaluation.Types (
 
 import Data.Aeson (
     FromJSON (..),
+    Options (..),
     ToJSON (..),
     Value,
     defaultOptions,
@@ -40,7 +41,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Generics (Generic)
-import Occam.Json (normalizeJsonFieldNames, snakeCaseOptions)
+import Occam.Json (camelToSnake, normalizeJsonFieldNames, snakeCaseOptions)
 import Occam.Logger (Logger)
 import Occam.Metrics (MetricPolicy (..), MetricsSnapshot)
 import Occam.Oracle (
@@ -59,25 +60,36 @@ import Occam.Reducer (
     reductionSearchPolicy,
  )
 
+evaluationJsonOptions :: Options
+evaluationJsonOptions =
+    snakeCaseOptions
+        { fieldLabelModifier = \field ->
+            "evaluation_" <> camelToSnake (if field == "runStatus" then "status" else field)
+        }
+
+pointJsonOptions :: Options
+pointJsonOptions =
+    snakeCaseOptions {fieldLabelModifier = ("point_" <>) . camelToSnake}
+
 -- | Cache, worker-count, time-budget, and max-execution limits for one evaluation session.
 data EvaluationConfig = EvaluationConfig
-    { evaluationCacheEnabled :: !Bool
-    , evaluationJobs :: !Int
-    , evaluationTotalTimeoutMicros :: !(Maybe Int)
-    , evaluationMaxOracleExecutions :: !(Maybe Int)
-    , evaluationPreflightMicros :: !Int
-    , evaluationPreflightAttempts :: !Int
-    , evaluationPreflightResetMicros :: !(Maybe Int)
-    , evaluationPreflightOracleMicros :: !(Maybe Int)
-    , evaluationInitialStatements :: !(Maybe Int)
+    { cacheEnabled :: !Bool
+    , jobs :: !Int
+    , totalTimeoutMicros :: !(Maybe Int)
+    , maxOracleExecutions :: !(Maybe Int)
+    , preflightMicros :: !Int
+    , preflightAttempts :: !Int
+    , preflightResetMicros :: !(Maybe Int)
+    , preflightOracleMicros :: !(Maybe Int)
+    , initialStatements :: !(Maybe Int)
     }
     deriving (Eq, Show, Generic)
 
 instance ToJSON EvaluationConfig where
-    toJSON = genericToJSON snakeCaseOptions
+    toJSON = genericToJSON evaluationJsonOptions
 
 instance FromJSON EvaluationConfig where
-    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
+    parseJSON = genericParseJSON evaluationJsonOptions . normalizeJsonFieldNames
 
 -- | Terminal status explaining how an evaluation run concluded.
 data EvaluationStatus
@@ -162,78 +174,78 @@ sqlDialectName = dialectName
 
 -- | Single accepted or evaluated candidate sample along the size-vs-time reduction curve.
 data EvaluationPoint = EvaluationPoint
-    { pointElapsedSeconds :: !Double
-    , pointCallIndex :: !Int
-    , pointCandidateBytes :: !Int
-    , pointCandidateStatements :: !(Maybe Int)
-    , pointCacheHit :: !Bool
-    , pointAccepted :: !Bool
+    { elapsedSeconds :: !Double
+    , callIndex :: !Int
+    , candidateBytes :: !Int
+    , candidateStatements :: !(Maybe Int)
+    , cacheHit :: !Bool
+    , accepted :: !Bool
     }
     deriving (Eq, Show, Generic)
 
 instance ToJSON EvaluationPoint where
-    toJSON = genericToJSON snakeCaseOptions
-    toEncoding = genericToEncoding snakeCaseOptions
+    toJSON = genericToJSON pointJsonOptions
+    toEncoding = genericToEncoding pointJsonOptions
 
 instance FromJSON EvaluationPoint where
-    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
+    parseJSON = genericParseJSON pointJsonOptions . normalizeJsonFieldNames
 
 -- | Aggregate resource, cache, timing, and minimality telemetry for one evaluation run.
 data EvaluationMetrics = EvaluationMetrics
-    { evaluationStatus :: !EvaluationStatus
-    , evaluationFailure :: !(Maybe Text)
-    , evaluationCacheUsed :: !Bool
-    , evaluationBudget :: !EvaluationConfig
-    , evaluationTotalSeconds :: !Double
-    , evaluationReductionSeconds :: !Double
-    , evaluationOracleSeconds :: !Double
-    , evaluationResetSeconds :: !Double
-    , evaluationPreflightResetSeconds :: !(Maybe Double)
-    , evaluationPreflightOracleSeconds :: !(Maybe Double)
-    , evaluationOracleAttempts :: !Int
-    , evaluationDatabaseObservations :: !Int
-    , evaluationCompletedOracleProcesses :: !Int
-    , evaluationAcceptedObservations :: !Int
-    , evaluationRejectedObservations :: !Int
-    , evaluationTimedOutObservations :: !Int
-    , evaluationResetFailures :: !Int
-    , evaluationOracleErrors :: !Int
-    , evaluationCancelledObservations :: !Int
-    , evaluationOracleOutcomes :: !(Map OracleStatus Int)
-    , evaluationCacheHits :: !Int
-    , evaluationCacheMisses :: !Int
-    , evaluationCacheJoins :: !Int
-    , evaluationValidationSeconds :: !Double
-    , evaluationValidationOracleSeconds :: !Double
-    , evaluationValidationResetSeconds :: !Double
-    , evaluationValidationObservations :: !Int
-    , evaluationValidationDatabaseObservations :: !Int
-    , evaluationValidationErrors :: !Int
-    , evaluationValidationOutcomes :: !(Map OracleStatus Int)
-    , evaluationValidationPassed :: !Bool
-    , evaluationAuditSeconds :: !Double
-    , evaluationAuditChecks :: !Int
-    , evaluationAuditCompleted :: !Bool
-    , evaluationAuditSkipped :: !Bool
-    , evaluationMinimalityClaim :: !MinimalityClaim
-    , evaluationCurve :: ![EvaluationPoint]
-    , evaluationStages :: ![Value]
-    , evaluationCostAttribution :: !(Maybe MetricsSnapshot)
+    { runStatus :: !EvaluationStatus
+    , failure :: !(Maybe Text)
+    , cacheUsed :: !Bool
+    , budget :: !EvaluationConfig
+    , totalSeconds :: !Double
+    , reductionSeconds :: !Double
+    , oracleSeconds :: !Double
+    , resetSeconds :: !Double
+    , preflightResetSeconds :: !(Maybe Double)
+    , preflightOracleSeconds :: !(Maybe Double)
+    , oracleAttempts :: !Int
+    , databaseObservations :: !Int
+    , completedOracleProcesses :: !Int
+    , acceptedObservations :: !Int
+    , rejectedObservations :: !Int
+    , timedOutObservations :: !Int
+    , resetFailures :: !Int
+    , oracleErrors :: !Int
+    , cancelledObservations :: !Int
+    , oracleOutcomes :: !(Map OracleStatus Int)
+    , cacheHits :: !Int
+    , cacheMisses :: !Int
+    , cacheJoins :: !Int
+    , validationSeconds :: !Double
+    , validationOracleSeconds :: !Double
+    , validationResetSeconds :: !Double
+    , validationObservations :: !Int
+    , validationDatabaseObservations :: !Int
+    , validationErrors :: !Int
+    , validationOutcomes :: !(Map OracleStatus Int)
+    , validationPassed :: !Bool
+    , auditSeconds :: !Double
+    , auditChecks :: !Int
+    , auditCompleted :: !Bool
+    , auditSkipped :: !Bool
+    , minimalityClaim :: !MinimalityClaim
+    , curve :: ![EvaluationPoint]
+    , stages :: ![Value]
+    , costAttribution :: !(Maybe MetricsSnapshot)
     }
     deriving (Eq, Show, Generic)
 
 instance ToJSON EvaluationMetrics where
-    toJSON = genericToJSON snakeCaseOptions
-    toEncoding = genericToEncoding snakeCaseOptions
+    toJSON = genericToJSON evaluationJsonOptions
+    toEncoding = genericToEncoding evaluationJsonOptions
 
 instance FromJSON EvaluationMetrics where
-    parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
+    parseJSON = genericParseJSON evaluationJsonOptions . normalizeJsonFieldNames
 
 -- | Final output produced by running a reduction under bounded evaluation.
 data EvaluationResult = EvaluationResult
-    { evaluatedSQL :: !ByteString
-    , evaluatedStatements :: !(Maybe Int)
-    , evaluationMetrics :: !EvaluationMetrics
+    { sql :: !ByteString
+    , statements :: !(Maybe Int)
+    , metrics :: !EvaluationMetrics
     }
     deriving (Eq, Show)
 
@@ -268,8 +280,8 @@ instance ToJSON Stats where
 
 -- | Reducer result containing reduced SQL and optional fixed-point evidence.
 data ReductionActionResult = ReductionActionResult
-    { actionSQL :: !ByteString
-    , actionEvidence :: !(Maybe ReductionEvidence)
+    { candidateSQL :: !ByteString
+    , evidence :: !(Maybe ReductionEvidence)
     }
     deriving (Eq, Show)
 
@@ -281,17 +293,17 @@ type EvaluationObserver = IO () -> ByteString -> IO OracleObservationDetails
 
 -- | Full request bundle configuring an evaluated reduction run across dialects and oracles.
 data EvaluationRequest oracle = EvaluationRequest
-    { requestOnProgress :: !(EvaluationProgress -> IO ())
-    , requestMetricsPolicy :: !(Maybe MetricPolicy)
-    , requestConfig :: !EvaluationConfig
-    , requestDialect :: !SQLDialect
-    , requestOracleConfig :: !oracle
-    , requestPreflightObservation :: !(Maybe OracleObservation)
-    , requestLogger :: !Logger
-    , requestInitialSQL :: !ByteString
-    , requestCheckpoint :: !FilePath
-    , requestAction :: !ReductionAction
-    , requestCollectCurve :: !Bool
+    { onProgress :: !(EvaluationProgress -> IO ())
+    , metricsPolicy :: !(Maybe MetricPolicy)
+    , config :: !EvaluationConfig
+    , dialect :: !SQLDialect
+    , oracleConfig :: !oracle
+    , preflightObservation :: !(Maybe OracleObservation)
+    , logger :: !Logger
+    , initialSQL :: !ByteString
+    , checkpoint :: !FilePath
+    , action :: !ReductionAction
+    , collectCurve :: !Bool
     }
 
 -- | Monotonic timestamp measured in nanoseconds.

@@ -44,12 +44,14 @@ data InsertOrAction
     | InsertOrReplace
     deriving (Eq, Ord, Show)
 
+-- | INSERT input rows, query, or explicit default-values form.
 data InsertSource
     = InsertValues ![[Located Expr]]
     | InsertQuery !(Located Query)
     | InsertDefaultValues
     deriving (Eq, Show)
 
+-- | Conflict target and optional predicate paired with its resolution action.
 data OnConflictClause = OnConflictClause
     { onConflictConstraint :: !(Maybe (Located NamePart))
     , onConflictKeys :: ![Located IndexKeyPart]
@@ -58,6 +60,7 @@ data OnConflictClause = OnConflictClause
     }
     deriving (Eq, Show)
 
+-- | Conflict outcome: do nothing or update assignments under an optional predicate.
 data OnConflictAction
     = OnConflictDoNothing
     | OnConflictDoUpdate
@@ -121,6 +124,7 @@ data MergeStmt = MergeStmt
     }
     deriving (Eq, Show)
 
+-- | One MERGE WHEN condition and action, with matched/source classification.
 data MergeClause = MergeClause
     { mergeClauseMatched :: !Bool
     , mergeClauseBySource :: !Bool
@@ -129,6 +133,7 @@ data MergeClause = MergeClause
     }
     deriving (Eq, Show)
 
+-- | Action selected by a MERGE clause, including default-value insertion.
 data MergeAction
     = MergeUpdate ![Located Assignment]
     | MergeInsert ![Located NamePart] ![Located Expr]

@@ -53,7 +53,13 @@ from these indexes.
 | `Occam.Frontend.Context` | Per-statement analysis context, identifier normalization, and source slicing. |
 | `Occam.Frontend.Semantics.*` | Pure-Haskell semantic fact extraction (catalog ops, session/tx effects, barriers). |
 | `Occam.Frontend.Edits.*` | Exact-span intra-statement edit generation with typed priority tiers (`EditTier`). |
-| `Occam.Frontend.Columns.*` | Single-point `EditColumn` extraction and atomic cross-statement `ColumnTarget` assembly. |
+| `Occam.Frontend.Columns.Analysis` | Per-unit column geometry, star projection, and unknown-source recovery. |
+| `Occam.Frontend.Columns.Edits` | Single-point `EditColumn` extraction and exact list-item span geometry. |
+| `Occam.Frontend.Columns.Assemble` | Stable facade for script-wide atomic `ColumnTarget` assembly. |
+| `Occam.Frontend.Columns.Assemble.Build` | Single forward pass collecting references and safety fences. |
+| `Occam.Frontend.Columns.Assemble.Scope` | Relation generations, table scopes, and definition planning. |
+| `Occam.Frontend.Columns.Assemble.Target` | Validates candidate sites and constructs atomic column bundles. |
+| `Occam.Frontend.Columns.Assemble.Types` | Shared assembly records and block reasons. |
 | `Occam.Frontend.Pipeline` | Top-level pure-Haskell `parseFrontend` pipeline invoked directly by `Occam.Parser`. |
 
 ## Span and trivia contract

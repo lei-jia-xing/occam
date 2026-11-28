@@ -83,40 +83,56 @@ import Occam.Parser.Types (SQLDialect, defaultServerConfig)
 -- | One @CREATE TABLE@ column list in definition order with optional deletion spans.
 newtype CreateColumns = CreateColumns
     { createColumns :: [(Core.Ident, Maybe (Int, Int))]
+    -- ^ Definition order and optional deletion span for each column.
     }
     deriving (Eq, Show)
 
 -- | Shape of an @INSERT@ statement's data source.
 data InsertShape
-    = ShapePlainValues
-    | ShapeSelectSource
-    | ShapeNeutral
-    | ShapeExotic
+    = -- | Explicit row values with recoverable positional geometry.
+      ShapePlainValues
+    | -- | An INSERT query source, with no direct VALUES positions.
+      ShapeSelectSource
+    | -- | A source that writes no explicit row values.
+      ShapeNeutral
+    | -- | A source or statement shape that cannot be mapped safely.
+      ShapeExotic
     deriving (Eq, Show)
 
+-- | Explicit INSERT target-column order and each resolved column's position.
 data InsertList = InsertList
     { insertListWidth :: !Int
+    -- ^ Number of columns in the explicit list.
     , insertListColumns :: !(Map Core.Ident (Maybe (Int, Maybe (Int, Int))))
-    -- ^ A present key with no position is an ambiguous duplicate name.
+    -- ^ Normalized names map to position and deletion span; a missing position signals duplicate ambiguity.
     }
     deriving (Eq, Show)
 
 -- | One @INSERT@ statement's column geometry.
 data InsertColumns = InsertColumns
     { insertTarget :: !(Maybe Core.NameRef)
+    -- ^ Semantically resolved target relation, when available.
     , insertExplicit :: !(Maybe InsertList)
+    -- ^ Explicit target list and source spans, if written.
     , insertRows :: ![Vector (Maybe (Int, Int))]
+    -- ^ Per-row optional deletion spans by value position.
     , insertRowWidth :: !(Maybe Int)
+    -- ^ Width when every recovered row has the same arity.
     , insertShape :: !InsertShape
+    -- ^ Source form used to decide whether values can be aligned.
     }
     deriving (Eq, Show)
 
 -- | Per-unit intermediate column data consumed by 'Occam.Frontend.Columns.Assemble'.
 data ColumnUnit = ColumnUnit
     { cuCreates :: ![CreateColumns]
+    -- ^ Recovered CREATE TABLE definitions in statement order.
     , cuInserts :: ![InsertColumns]
+    -- ^ Recovered INSERT target and row geometry.
     , cuStars :: ![Core.NameRef]
+    -- ^ Resolved relations whose columns are projected by a star.
     , cuUnknownSource :: !Bool
+    -- ^ Star projection contains a source that could not be resolved.
     }
     deriving (Eq, Show)
 
@@ -142,9 +158,13 @@ collectReads facts = concatMap opReads (Core.factOps facts)
 -- | Pre-parsed AST and token stream supplied by the pipeline to avoid re-parsing.
 data PreParsedUnit = PreParsedUnit
     { ppProfile :: !DialectProfile
+    -- ^ Dialect profile used to parse the statement.
     , ppRules :: !IdentifierRules
+    -- ^ Identifier normalization rules for that dialect.
     , ppTokens :: !(Vector SpannedToken)
+    -- ^ Original token stream with exact byte spans.
     , ppAst :: !AST.Statement
+    -- ^ Parsed AST reused by column recovery.
     }
 
 -- | Reconstruct 'ColumnUnit' for one parsed 'StatementUnit'.
@@ -536,68 +556,78 @@ collectStmtStars dialect rules = walkStmt Set.empty
 
         walkStmt ctes = \case
             AST.StatementQuery (L _ q) -> walkQuery ctes q
-            AST.StatementInsert (L _ ins) ->
-                let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.insertWith ins)
-                    withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.insertWith ins)
-                    srcAcc = case AST.insertSource ins of
-                        AST.InsertQuery (L _ q) -> walkQuery ctes' q
-                        AST.InsertValues rows -> combineStar (concatMap (map (walkExpr ctes' . locValue)) rows)
-                        AST.InsertDefaultValues -> ([], False)
-                    retAcc =
-                        combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.insertReturning ins]
-                 in combineStar [withAcc, srcAcc, retAcc]
-            AST.StatementUpdate (L _ upd) ->
-                let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.updateWith upd)
-                    withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.updateWith upd)
-                    tgtAcc = walkFromSubqueries ctes' (AST.updateTargets upd)
-                    fromAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.updateFrom upd)
-                    assnAcc = combineStar [walkExpr ctes' (locValue (AST.assignValue a)) | L _ a <- AST.updateAssignments upd]
-                    whereAcc = maybe ([], False) (walkExpr ctes' . locValue) (AST.updateWhere upd)
-                    retAcc =
-                        combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.updateReturning upd]
-                 in combineStar [withAcc, tgtAcc, fromAcc, assnAcc, whereAcc, retAcc]
-            AST.StatementDelete (L _ del) ->
-                let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.deleteWith del)
-                    withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.deleteWith del)
-                    fromAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.deleteFromTables del)
-                    usingAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.deleteUsing del)
-                    whereAcc = maybe ([], False) (walkExpr ctes' . locValue) (AST.deleteWhere del)
-                    retAcc =
-                        combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.deleteReturning del]
-                 in combineStar [withAcc, fromAcc, usingAcc, whereAcc, retAcc]
-            AST.StatementMerge (L _ mrg) ->
-                let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.mergeWith mrg)
-                    withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.mergeWith mrg)
-                    srcAcc = walkTableRefSubqueries ctes' (locValue (AST.mergeSource mrg))
-                    onAcc = walkExpr ctes' (locValue (AST.mergeOn mrg))
-                 in combineStar [withAcc, srcAcc, onAcc]
-            AST.StatementCreate (L _ cr) -> case locValue (AST.createObject cr) of
-                AST.CreateTableObject ct ->
-                    maybe ([], False) (walkQuery ctes . locValue) (AST.createTableAs ct)
-                AST.CreateViewObject cv -> case AST.createViewBody cv of
-                    AST.ViewBodyQuery (L _ q) -> walkQuery ctes q
-                    AST.ViewBodyOpaque _ -> ([], False)
-                AST.CreateMacroObject cm -> case AST.createMacroBody cm of
-                    Left (L _ q) -> walkQuery ctes q
-                    Right (L _ e) -> walkExpr ctes e
-                AST.CreateRuleObject rule ->
-                    let wAcc = maybe ([], False) (walkExpr ctes . locValue) (AST.createRuleWhere rule)
-                        aAcc = maybe ([], False) (walkStmt ctes . locValue) (AST.createRuleAction rule)
-                     in combineStar [wAcc, aAcc]
-                AST.CreatePolicyObject pol ->
-                    combineStar
-                        [ maybe ([], False) (walkExpr ctes . locValue) (AST.createPolicyUsing pol)
-                        , maybe ([], False) (walkExpr ctes . locValue) (AST.createPolicyWithCheck pol)
-                        ]
-                AST.CreateTriggerObject tr ->
-                    maybe ([], False) (walkExpr ctes . locValue) (AST.createTriggerWhen tr)
-                _ -> ([], False)
+            AST.StatementInsert (L _ ins) -> walkInsert ctes ins
+            AST.StatementUpdate (L _ upd) -> walkUpdate ctes upd
+            AST.StatementDelete (L _ del) -> walkDelete ctes del
+            AST.StatementMerge (L _ mrg) -> walkMerge ctes mrg
+            AST.StatementCreate (L _ cr) -> walkCreate ctes cr
             AST.StatementAlter (L _ alt) ->
                 combineStar [walkAlterAction ctes a | L _ a <- AST.alterActions alt]
             AST.StatementCopy (L _ cp) -> case AST.copySource cp of
                 AST.CopySourceQuery (L _ q) -> walkQuery ctes q
                 _ -> ([], False)
             AST.StatementExplain (L _ ex) -> walkStmt ctes (locValue (AST.explainStatement ex))
+            _ -> ([], False)
+
+        walkInsert ctes ins =
+            let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.insertWith ins)
+                withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.insertWith ins)
+                srcAcc = case AST.insertSource ins of
+                    AST.InsertQuery (L _ q) -> walkQuery ctes' q
+                    AST.InsertValues rows -> combineStar (concatMap (map (walkExpr ctes' . locValue)) rows)
+                    AST.InsertDefaultValues -> ([], False)
+                retAcc =
+                    combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.insertReturning ins]
+             in combineStar [withAcc, srcAcc, retAcc]
+
+        walkUpdate ctes upd =
+            let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.updateWith upd)
+                withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.updateWith upd)
+                tgtAcc = walkFromSubqueries ctes' (AST.updateTargets upd)
+                fromAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.updateFrom upd)
+                assnAcc = combineStar [walkExpr ctes' (locValue (AST.assignValue a)) | L _ a <- AST.updateAssignments upd]
+                whereAcc = maybe ([], False) (walkExpr ctes' . locValue) (AST.updateWhere upd)
+                retAcc =
+                    combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.updateReturning upd]
+             in combineStar [withAcc, tgtAcc, fromAcc, assnAcc, whereAcc, retAcc]
+
+        walkDelete ctes del =
+            let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.deleteWith del)
+                withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.deleteWith del)
+                fromAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.deleteFromTables del)
+                usingAcc = maybe ([], False) (walkFromSubqueries ctes') (AST.deleteUsing del)
+                whereAcc = maybe ([], False) (walkExpr ctes' . locValue) (AST.deleteWhere del)
+                retAcc =
+                    combineStar [walkExpr ctes' (locValue (AST.selectItemExpr it)) | L _ it <- AST.deleteReturning del]
+             in combineStar [withAcc, fromAcc, usingAcc, whereAcc, retAcc]
+
+        walkMerge ctes mrg =
+            let ctes' = maybe ctes ((`withCteNames` ctes) . locValue) (AST.mergeWith mrg)
+                withAcc = maybe ([], False) (walkWith ctes . locValue) (AST.mergeWith mrg)
+                srcAcc = walkTableRefSubqueries ctes' (locValue (AST.mergeSource mrg))
+                onAcc = walkExpr ctes' (locValue (AST.mergeOn mrg))
+             in combineStar [withAcc, srcAcc, onAcc]
+
+        walkCreate ctes cr = case locValue (AST.createObject cr) of
+            AST.CreateTableObject ct ->
+                maybe ([], False) (walkQuery ctes . locValue) (AST.createTableAs ct)
+            AST.CreateViewObject cv -> case AST.createViewBody cv of
+                AST.ViewBodyQuery (L _ q) -> walkQuery ctes q
+                AST.ViewBodyOpaque _ -> ([], False)
+            AST.CreateMacroObject cm -> case AST.createMacroBody cm of
+                Left (L _ q) -> walkQuery ctes q
+                Right (L _ e) -> walkExpr ctes e
+            AST.CreateRuleObject rule ->
+                let wAcc = maybe ([], False) (walkExpr ctes . locValue) (AST.createRuleWhere rule)
+                    aAcc = maybe ([], False) (walkStmt ctes . locValue) (AST.createRuleAction rule)
+                 in combineStar [wAcc, aAcc]
+            AST.CreatePolicyObject pol ->
+                combineStar
+                    [ maybe ([], False) (walkExpr ctes . locValue) (AST.createPolicyUsing pol)
+                    , maybe ([], False) (walkExpr ctes . locValue) (AST.createPolicyWithCheck pol)
+                    ]
+            AST.CreateTriggerObject tr ->
+                maybe ([], False) (walkExpr ctes . locValue) (AST.createTriggerWhen tr)
             _ -> ([], False)
 
         walkAlterAction ctes = \case

@@ -80,6 +80,7 @@ import Occam.Dependency.State (
     transactionOpener,
  )
 
+-- | Snapshot catalog/session state in a fresh frame and allocate its frame ID.
 createFrame :: ScanState -> Bool -> Maybe StatementId -> (TxFrame, ScanState)
 createFrame state explicit begin =
     let identifier = scanNextFrameId state
@@ -95,6 +96,7 @@ createFrame state explicit begin =
                 }
      in (frame, state {scanNextFrameId = identifier + 1})
 
+-- | Return the active frame, creating one when the transaction stack is empty.
 ensureFrame :: ScanState -> (ScanState, TxFrame)
 ensureFrame state =
     case scanTransactions state of
@@ -104,9 +106,11 @@ ensureFrame state =
                     createFrame state (not (sessAutocommit (scanSession state))) Nothing
              in (state' {scanTransactions = [frame]}, frame)
 
+-- | Ensure a transaction frame exists before applying catalog operations.
 ensureFrameForOps :: ScanState -> ScanState
 ensureFrameForOps = fst . ensureFrame
 
+-- | Close an implicit autocommit frame after a statement or open one when autocommit is off.
 finishStatement :: StatementId -> ScanState -> ScanState
 finishStatement sid state =
     case scanTransactions state of
@@ -121,6 +125,7 @@ finishStatement sid state =
                  in state' {scanTransactions = [frame]}
         _ -> state
 
+-- | Commit or create an implicit frame when a statement changes autocommit mode.
 settleAutocommit :: StatementId -> ScanState -> ScanState -> ScanState
 settleAutocommit sid prior next
     | sessAutocommit (scanSession prior) == sessAutocommit (scanSession next) = next
@@ -160,6 +165,7 @@ applyTxEffects sid effects state = Foldable.foldl' step (state, Set.empty) effec
                 TxSavepoint _ -> opener
                 _ -> Nothing
 
+-- | Apply one transaction effect to scan state.
 applyTxEffect :: StatementId -> ScanState -> TxEffect -> ScanState
 applyTxEffect sid state (TxBegin policy) = applyTxBegin sid policy state
 applyTxEffect sid state (TxCommit chain) = applyTxCommit sid chain state
@@ -203,6 +209,7 @@ applyTxCommit sid chain state = case scanTransactions state of
                      in state'' {scanTransactions = frame : scanTransactions state'}
                 else state'
 
+-- | Save catalog and session snapshots under a named savepoint.
 savepoint :: StatementId -> Ident -> ScanState -> ScanState
 savepoint sid name state =
     let (state1, frame) = ensureFrame state
@@ -216,6 +223,7 @@ savepoint sid name state =
         frame1 = frame {frameSavepoints = saved : frameSavepoints frame}
      in state1 {scanTransactions = frame1 : drop 1 (scanTransactions state1)}
 
+-- | Restore catalog/session state to a savepoint while retaining that savepoint.
 rollbackTo :: StatementId -> Ident -> ScanState -> ScanState
 rollbackTo sid name state =
     case scanTransactions state of
@@ -234,6 +242,7 @@ rollbackTo sid name state =
                             , scanTransactions = frame1 : rest
                             }
 
+-- | Remove a savepoint and all newer savepoints of the current frame.
 releaseSavepoint :: StatementId -> Ident -> ScanState -> ScanState
 releaseSavepoint sid name state =
     case scanTransactions state of
@@ -248,6 +257,7 @@ releaseSavepoint sid name state =
                             then commitFrame sid state1
                             else state1
 
+-- | Commit the top frame, applying its ON COMMIT actions and clearing tx overrides.
 commitFrame :: StatementId -> ScanState -> ScanState
 commitFrame _sid state =
     case scanTransactions state of
@@ -261,6 +271,7 @@ commitFrame _sid state =
                     , scanTransactions = rest
                     }
 
+-- | Roll back the top frame to its snapshot, preserving non-transactional effects.
 rollbackFrame :: StatementId -> ScanState -> ScanState
 rollbackFrame sid state =
     case scanTransactions state of
@@ -274,6 +285,7 @@ rollbackFrame sid state =
                     , scanTransactions = rest
                     }
 
+-- | Apply matching ON COMMIT DELETE ROWS and DROP actions to catalog relations.
 applyOnCommit :: Int -> SessionState -> Catalog -> Catalog
 applyOnCommit transactionId session catalog
     | not (catalogMayHaveOnCommit catalog) = catalog
@@ -303,6 +315,7 @@ applyOnCommit transactionId session catalog
 -- Transactional rollback
 -- ----------------------------------------------------------------------------
 
+-- | Restore catalog contents from a snapshot while preserving non-transactional effects.
 restoreCatalog :: StatementId -> Catalog -> Catalog -> Catalog
 restoreCatalog sid snapshot current =
     let rels = restoreRelationMap sid (catalogRelations snapshot) (catalogRelations current)
@@ -395,6 +408,7 @@ relationRestorePolicy =
         , policyKeepsCurrent = \new -> nonTransactionalRelation (newRelation (relKind new)) new
         }
 
+-- | Restore relation state while preserving changes to non-transactional relations.
 restoreRelationMap ::
     StatementId ->
     Map RelationKey RelationState ->
@@ -402,10 +416,12 @@ restoreRelationMap ::
     Map RelationKey RelationState
 restoreRelationMap = restoreMap relationRestorePolicy
 
+-- | True when either version of a relation is non-transactional.
 nonTransactionalRelation :: RelationState -> RelationState -> Bool
 nonTransactionalRelation left right =
     not (relTransactional left) || not (relTransactional right)
 
+-- | Clear the marker recording which statement restored a relation.
 stripRelationRestored :: RelationState -> RelationState
 stripRelationRestored relation = relation {relRestoredBy = Nothing}
 
@@ -419,6 +435,7 @@ indexRestorePolicy snapshot current =
         , policyKeepsCurrent = not . indexTransactionalIn current
         }
 
+-- | Restore indexes using the transactional status of their owning relations.
 restoreIndexMap ::
     StatementId ->
     Catalog ->
@@ -431,17 +448,20 @@ restoreIndexMap sid snapshot current =
         (catalogIndexes snapshot)
         (catalogIndexes current)
 
+-- | True when either index version belongs to a non-transactional relation.
 nonTransactionalIndex :: Catalog -> Catalog -> IndexState -> IndexState -> Bool
 nonTransactionalIndex snapshot current left right =
     not (indexTransactionalIn snapshot left)
         || not (indexTransactionalIn current right)
 
+-- | Determine whether an index's owning relation is transactional.
 indexTransactionalIn :: Catalog -> IndexState -> Bool
 indexTransactionalIn catalog state =
     case indexStateTable state of
         Nothing -> True
         Just key -> maybe True relTransactional (lookupRelation catalog key)
 
+-- | Clear the marker recording which statement restored an index.
 stripIndexRestored :: IndexState -> IndexState
 stripIndexRestored state = state {indexRestoredBy = Nothing}
 
@@ -455,6 +475,7 @@ triggerRestorePolicy snapshot current =
         , policyKeepsCurrent = not . triggerTransactionalIn current
         }
 
+-- | Restore triggers using the transactional status of their owning relations.
 restoreTriggerMap ::
     StatementId ->
     Catalog ->
@@ -467,24 +488,29 @@ restoreTriggerMap sid snapshot current =
         (catalogTriggers snapshot)
         (catalogTriggers current)
 
+-- | Empty placeholder trigger state for dependency checks without a definition.
 emptyTrigger :: TriggerState
 emptyTrigger =
     TriggerState Nothing Nothing TriggerBefore [] [] TriggerOpaque Nothing
 
+-- | True when either trigger version belongs to a non-transactional relation.
 nonTransactionalTrigger :: Catalog -> Catalog -> TriggerState -> TriggerState -> Bool
 nonTransactionalTrigger snapshot current left right =
     not (triggerTransactionalIn snapshot left)
         || not (triggerTransactionalIn current right)
 
+-- | Determine whether a trigger's owning relation is transactional.
 triggerTransactionalIn :: Catalog -> TriggerState -> Bool
 triggerTransactionalIn catalog state =
     case triggerStateTable state of
         Nothing -> True
         Just key -> maybe True relTransactional (lookupRelation catalog key)
 
+-- | Clear the marker recording which statement restored a trigger.
 stripTriggerRestored :: TriggerState -> TriggerState
 stripTriggerRestored state = state {triggerRestoredBy = Nothing}
 
+-- | Restore sequence state while retaining sequence writes that survive rollback.
 restoreSequenceMap ::
     StatementId ->
     Map SequenceKey SequenceState ->
@@ -526,6 +552,7 @@ restoreSequenceMap sid snapshot current =
                 | otherwise -> Nothing
             (Nothing, Nothing) -> Nothing
 
+-- | Clear the marker recording which statement restored a sequence.
 stripSequenceRestored :: SequenceState -> SequenceState
 stripSequenceRestored state = state {sequenceRestoredBy = Nothing}
 
@@ -539,6 +566,7 @@ constraintRestorePolicy snapshot current =
         , policyKeepsCurrent = not . constraintTransactionalIn current
         }
 
+-- | Restore constraints using the transactional status of their owning relations.
 restoreConstraintMap ::
     StatementId ->
     Catalog ->
@@ -551,15 +579,18 @@ restoreConstraintMap sid snapshot current =
         (catalogConstraints snapshot)
         (catalogConstraints current)
 
+-- | True when either constraint version belongs to a non-transactional relation.
 nonTransactionalConstraint :: Catalog -> Catalog -> ConstraintState -> ConstraintState -> Bool
 nonTransactionalConstraint snapshot current left right =
     not (constraintTransactionalIn snapshot left)
         || not (constraintTransactionalIn current right)
 
+-- | Determine whether a constraint's owning relation is transactional.
 constraintTransactionalIn :: Catalog -> ConstraintState -> Bool
 constraintTransactionalIn catalog state =
     maybe True relTransactional (lookupRelation catalog (constraintStateTable state))
 
+-- | Clear the marker recording which statement restored a constraint.
 stripConstraintRestored :: ConstraintState -> ConstraintState
 stripConstraintRestored state = state {constraintRestoredBy = Nothing}
 
@@ -573,6 +604,7 @@ definitionRestorePolicy =
         , policyKeepsCurrent = const False
         }
 
+-- | Restore type/schema definition states from a transaction snapshot.
 restoreDefinitionMap ::
     StatementId ->
     Map Name DefinitionState ->
@@ -580,5 +612,6 @@ restoreDefinitionMap ::
     Map Name DefinitionState
 restoreDefinitionMap = restoreMap definitionRestorePolicy
 
+-- | Clear the marker recording which statement restored a definition.
 stripDefinitionRestored :: DefinitionState -> DefinitionState
 stripDefinitionRestored state = state {definitionRestoredBy = Nothing}

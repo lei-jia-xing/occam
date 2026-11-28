@@ -1,3 +1,6 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Typed loader for Occam's Dhall-compiled @harness.json@ configuration and SQUIRREL YAML renderer.
 module Occam.Harness.Config (
     DbmsSpec (..),
@@ -55,18 +58,18 @@ import System.Process (readProcessWithExitCode)
 
 -- | Per-DBMS connection, dialect, and container configuration from Dhall.
 data DbmsSpec = DbmsSpec
-    { dbmsId :: !Text
-    , dbmsOccamDialect :: !Text
-    , dbmsSqlancerSubcommand :: !(Maybe Text)
-    , dbmsSqlancerPort :: !(Maybe Int)
-    , dbmsSquirrelDb :: !(Maybe Text)
-    , dbmsContainerImage :: !Text
-    , dbmsContainerLog :: !(Maybe Text)
-    , dbmsServerBased :: !Bool
-    , dbmsDefaultHost :: !(Maybe Text)
-    , dbmsDefaultPort :: !(Maybe Int)
-    , dbmsDefaultUser :: !(Maybe Text)
-    , dbmsDefaultDb :: !Text
+    { identifier :: !Text
+    , occamDialect :: !Text
+    , sqlancerSubcommand :: !(Maybe Text)
+    , sqlancerPort :: !(Maybe Int)
+    , squirrelDb :: !(Maybe Text)
+    , containerImage :: !Text
+    , containerLog :: !(Maybe Text)
+    , serverBased :: !Bool
+    , defaultHost :: !(Maybe Text)
+    , defaultPort :: !(Maybe Int)
+    , defaultUser :: !(Maybe Text)
+    , defaultDb :: !Text
     }
     deriving (Eq, Show)
 
@@ -88,12 +91,12 @@ instance FromJSON DbmsSpec where
 
 -- | Default oracle verification settings shared by batch scripts.
 data OracleDefaults = OracleDefaults
-    { odAllowPsqlMeta :: !Bool
-    , odAllowStderrOnly :: !Bool
-    , odRejectOnSlippage :: !Bool
-    , odStackFrames :: !Int
-    , odTimeoutSecs :: !Double
-    , odVerbose :: !Bool
+    { allowPsqlMeta :: !Bool
+    , allowStderrOnly :: !Bool
+    , rejectOnSlippage :: !Bool
+    , stackFrames :: !Int
+    , timeoutSecs :: !Double
+    , verbose :: !Bool
     }
     deriving (Eq, Show)
 
@@ -110,28 +113,28 @@ instance FromJSON OracleDefaults where
 instance ToJSON OracleDefaults where
     toJSON defaults =
         object
-            [ "allow_psql_meta" .= odAllowPsqlMeta defaults
-            , "allow_stderr_only" .= odAllowStderrOnly defaults
-            , "reject_on_slippage" .= odRejectOnSlippage defaults
-            , "stack_frames" .= odStackFrames defaults
-            , "timeout_secs" .= odTimeoutSecs defaults
-            , "verbose" .= odVerbose defaults
+            [ "allow_psql_meta" .= defaults.allowPsqlMeta
+            , "allow_stderr_only" .= defaults.allowStderrOnly
+            , "reject_on_slippage" .= defaults.rejectOnSlippage
+            , "stack_frames" .= defaults.stackFrames
+            , "timeout_secs" .= defaults.timeoutSecs
+            , "verbose" .= defaults.verbose
             ]
 
 -- | Named batch experiment plan.
 data ExperimentPlan = ExperimentPlan
-    { planName :: !Text
-    , planDbms :: ![Text]
-    , planProfiles :: ![Text]
-    , planRepeats :: !Int
-    , planTimeoutSecs :: !Double
-    , planBudgetSecs :: !(Maybe Double)
-    , planMaxOracleExecutions :: !(Maybe Natural)
-    , planWorkerJobs :: !Int
-    , planOccamJobs :: !Int
-    , planNoCache :: !Bool
-    , planContainerWaitSecs :: !Int
-    , planOracle :: !OracleDefaults
+    { name :: !Text
+    , dbms :: ![Text]
+    , profiles :: ![Text]
+    , repeats :: !Int
+    , timeoutSecs :: !Double
+    , budgetSecs :: !(Maybe Double)
+    , maxOracleExecutions :: !(Maybe Natural)
+    , workerJobs :: !Int
+    , occamJobs :: !Int
+    , noCache :: !Bool
+    , containerWaitSecs :: !Int
+    , oracle :: !OracleDefaults
     }
     deriving (Eq, Show)
 
@@ -154,18 +157,18 @@ instance FromJSON ExperimentPlan where
 instance ToJSON ExperimentPlan where
     toJSON plan =
         object
-            [ "name" .= planName plan
-            , "dbms" .= planDbms plan
-            , "profiles" .= planProfiles plan
-            , "repeats" .= planRepeats plan
-            , "timeout_secs" .= planTimeoutSecs plan
-            , "budget_secs" .= planBudgetSecs plan
-            , "max_oracle_executions" .= planMaxOracleExecutions plan
-            , "worker_jobs" .= planWorkerJobs plan
-            , "occam_jobs" .= planOccamJobs plan
-            , "no_cache" .= planNoCache plan
-            , "container_wait_secs" .= planContainerWaitSecs plan
-            , "oracle" .= planOracle plan
+            [ "name" .= plan.name
+            , "dbms" .= plan.dbms
+            , "profiles" .= plan.profiles
+            , "repeats" .= plan.repeats
+            , "timeout_secs" .= plan.timeoutSecs
+            , "budget_secs" .= plan.budgetSecs
+            , "max_oracle_executions" .= plan.maxOracleExecutions
+            , "worker_jobs" .= plan.workerJobs
+            , "occam_jobs" .= plan.occamJobs
+            , "no_cache" .= plan.noCache
+            , "container_wait_secs" .= plan.containerWaitSecs
+            , "oracle" .= plan.oracle
             ]
 
 -- | Resolve a named plan or load a file, using the smoke plan for omitted fields.
@@ -175,7 +178,7 @@ loadExperimentPlan configPath cfg reference = do
     pure (either (Left . show) id result)
     where
         key = T.strip reference
-        plans = hcPlans cfg
+        plans = cfg.plans
         builtIn = Map.lookup key plans <|> Map.lookup (T.replace "-" "_" key) plans
         generated = takeDirectory configPath
         inPlans dir extension = dir </> "plans" </> T.unpack key <.> extension
@@ -212,10 +215,10 @@ loadExperimentPlan configPath cfg reference = do
 
 -- | Named reduction profile with both CLI flags and Occam JSON patch.
 data ReductionProfile = ReductionProfile
-    { profileKey :: !Text
-    , profileName :: !Text
-    , profileCliFlags :: ![Text]
-    , profileConfig :: !Value
+    { key :: !Text
+    , name :: !Text
+    , cliFlags :: ![Text]
+    , config :: !Value
     }
     deriving (Eq, Show)
 
@@ -229,21 +232,21 @@ instance FromJSON ReductionProfile where
 
 -- | SQUIRREL fuzzing driver configuration template for one DBMS.
 data SquirrelSpec = SquirrelSpec
-    { sqDbms :: !Text
-    , sqDb :: !Text
-    , sqMutatorDbms :: !Text
-    , sqTargetBinRel :: !Text
-    , sqDefaultInputSubdir :: !Text
-    , sqRequired :: ![Text]
-    , sqShouldExist :: ![Text]
-    , sqInitLibRel :: !Text
-    , sqDataLibRel :: !(Maybe Text)
-    , sqPragmaRel :: !(Maybe Text)
-    , sqDefaultHost :: !(Maybe Text)
-    , sqDefaultPort :: !(Maybe Int)
-    , sqDefaultUser :: !(Maybe Text)
-    , sqDefaultDb :: !(Maybe Text)
-    , sqDefaultSocket :: !(Maybe Text)
+    { dbms :: !Text
+    , db :: !Text
+    , mutatorDbms :: !Text
+    , targetBinRel :: !Text
+    , defaultInputSubdir :: !Text
+    , required :: ![Text]
+    , shouldExist :: ![Text]
+    , initLibRel :: !Text
+    , dataLibRel :: !(Maybe Text)
+    , pragmaRel :: !(Maybe Text)
+    , defaultHost :: !(Maybe Text)
+    , defaultPort :: !(Maybe Int)
+    , defaultUser :: !(Maybe Text)
+    , defaultDb :: !(Maybe Text)
+    , defaultSocket :: !(Maybe Text)
     }
     deriving (Eq, Show)
 
@@ -268,12 +271,12 @@ instance FromJSON SquirrelSpec where
 
 -- | Full decoded @config/generated/harness.json@ bundle.
 data HarnessConfig = HarnessConfig
-    { hcDbms :: ![DbmsSpec]
-    , hcOccamDefaults :: !Value
-    , hcOracle :: !OracleDefaults
-    , hcPlans :: !(Map Text ExperimentPlan)
-    , hcProfiles :: ![ReductionProfile]
-    , hcSquirrel :: ![SquirrelSpec]
+    { dbms :: ![DbmsSpec]
+    , occamDefaults :: !Value
+    , oracle :: !OracleDefaults
+    , plans :: !(Map Text ExperimentPlan)
+    , profiles :: ![ReductionProfile]
+    , squirrel :: ![SquirrelSpec]
     }
     deriving (Eq, Show)
 
@@ -289,15 +292,15 @@ instance FromJSON HarnessConfig where
 
 -- | Parameters supplied to SQUIRREL YAML rendering.
 data SquirrelRenderOptions = SquirrelRenderOptions
-    { sroDbms :: !Text
-    , sroSquirrelHome :: !FilePath
-    , sroHost :: !Text
-    , sroPort :: !Int
-    , sroUser :: !Text
-    , sroPassword :: !Text
-    , sroSocket :: !Text
-    , sroDbName :: !Text
-    , sroServerCmd :: !Text
+    { dbms :: !Text
+    , squirrelHome :: !FilePath
+    , host :: !Text
+    , port :: !Int
+    , user :: !Text
+    , password :: !Text
+    , socket :: !Text
+    , dbName :: !Text
+    , serverCmd :: !Text
     }
     deriving (Eq, Show)
 
@@ -305,15 +308,15 @@ data SquirrelRenderOptions = SquirrelRenderOptions
 defaultRenderOptionsForSpec :: SquirrelSpec -> FilePath -> SquirrelRenderOptions
 defaultRenderOptionsForSpec spec squirrelHome =
     SquirrelRenderOptions
-        { sroDbms = sqDbms spec
-        , sroSquirrelHome = squirrelHome
-        , sroHost = fromMaybe "" (sqDefaultHost spec)
-        , sroPort = fromMaybe 0 (sqDefaultPort spec)
-        , sroUser = fromMaybe "" (sqDefaultUser spec)
-        , sroPassword = ""
-        , sroSocket = fromMaybe "" (sqDefaultSocket spec)
-        , sroDbName = fromMaybe "" (sqDefaultDb spec)
-        , sroServerCmd = ""
+        { dbms = spec.dbms
+        , squirrelHome = squirrelHome
+        , host = fromMaybe "" spec.defaultHost
+        , port = fromMaybe 0 spec.defaultPort
+        , user = fromMaybe "" spec.defaultUser
+        , password = ""
+        , socket = fromMaybe "" spec.defaultSocket
+        , dbName = fromMaybe "" spec.defaultDb
+        , serverCmd = ""
         }
 
 -- | Decode strictly from raw @harness.json@ UTF-8 bytes.
@@ -356,69 +359,69 @@ resolveHarnessConfigPath Nothing = do
 
 -- | Look up a DBMS specification by @id@.
 lookupDbmsSpec :: HarnessConfig -> Text -> Maybe DbmsSpec
-lookupDbmsSpec hc name = find ((== name) . dbmsId) (hcDbms hc)
+lookupDbmsSpec hc name = find (\spec -> spec.identifier == name) hc.dbms
 
 -- | Look up a SQUIRREL profile by @dbms@.
 lookupSquirrelSpec :: HarnessConfig -> Text -> Maybe SquirrelSpec
-lookupSquirrelSpec hc name = find ((== name) . sqDbms) (hcSquirrel hc)
+lookupSquirrelSpec hc name = find (\spec -> spec.dbms == name) hc.squirrel
 
 -- | Extract a scalar SQUIRREL template field for the @squirrel-field@ subcommand.
 squirrelFieldText :: SquirrelSpec -> Text -> Maybe Text
 squirrelFieldText spec field = case field of
-    "dbms" -> Just (sqDbms spec)
-    "db" -> Just (sqDb spec)
-    "mutator_dbms" -> Just (sqMutatorDbms spec)
-    "target_bin_rel" -> Just (sqTargetBinRel spec)
-    "default_input_subdir" -> Just (sqDefaultInputSubdir spec)
-    "init_lib_rel" -> Just (sqInitLibRel spec)
-    "data_lib_rel" -> sqDataLibRel spec
-    "pragma_rel" -> sqPragmaRel spec
-    "default_host" -> sqDefaultHost spec
-    "default_port" -> T.pack . show <$> sqDefaultPort spec
-    "default_user" -> sqDefaultUser spec
-    "default_db" -> sqDefaultDb spec
-    "default_socket" -> sqDefaultSocket spec
+    "dbms" -> Just spec.dbms
+    "db" -> Just spec.db
+    "mutator_dbms" -> Just spec.mutatorDbms
+    "target_bin_rel" -> Just spec.targetBinRel
+    "default_input_subdir" -> Just spec.defaultInputSubdir
+    "init_lib_rel" -> Just spec.initLibRel
+    "data_lib_rel" -> spec.dataLibRel
+    "pragma_rel" -> spec.pragmaRel
+    "default_host" -> spec.defaultHost
+    "default_port" -> T.pack . show <$> spec.defaultPort
+    "default_user" -> spec.defaultUser
+    "default_db" -> spec.defaultDb
+    "default_socket" -> spec.defaultSocket
     _ -> Nothing
 
 -- | Render a deterministic YAML config file for SQUIRREL from a typed Dhall profile.
 renderSquirrelYaml :: HarnessConfig -> SquirrelRenderOptions -> Either Text Text
-renderSquirrelYaml hc opts = case lookupSquirrelSpec hc (sroDbms opts) of
-    Nothing -> Left ("Unsupported SQUIRREL DBMS '" <> sroDbms opts <> "'")
+renderSquirrelYaml hc opts = case lookupSquirrelSpec hc opts.dbms of
+    Nothing -> Left ("Unsupported SQUIRREL DBMS '" <> opts.dbms <> "'")
     Just spec -> Right (renderWithSpec spec opts)
 
 renderWithSpec :: SquirrelSpec -> SquirrelRenderOptions -> Text
 renderWithSpec spec opts =
     let baseLines =
             [ "---"
-            , "required: " <> yamlList (sqRequired spec)
-            , "should_exist: " <> yamlList (sqShouldExist spec)
-            , "init_lib: " <> joinQuote (sqInitLibRel spec)
+            , "required: " <> yamlList spec.required
+            , "should_exist: " <> yamlList spec.shouldExist
+            , "init_lib: " <> joinQuote spec.initLibRel
             ]
-                <> optionalLine "data_lib" (sqDataLibRel spec)
-                <> optionalLine "pragma" (sqPragmaRel spec)
-                <> ["db: " <> sqDb spec]
-        dbLines = case sqDb spec of
+                <> optionalLine "data_lib" spec.dataLibRel
+                <> optionalLine "pragma" spec.pragmaRel
+                <> ["db: " <> spec.db]
+        dbLines = case spec.db of
             "postgresql" ->
-                [ "passwd: " <> yamlQuote (sroPassword opts)
-                , "user_name: " <> yamlQuote (sroUser opts)
-                , "db_name: " <> yamlQuote (sroDbName opts)
-                , "host: " <> yamlQuote (sroHost opts)
-                , "port: " <> T.pack (show (sroPort opts))
-                , "startup_cmd: " <> yamlQuote (sroServerCmd opts)
+                [ "passwd: " <> yamlQuote opts.password
+                , "user_name: " <> yamlQuote opts.user
+                , "db_name: " <> yamlQuote opts.dbName
+                , "host: " <> yamlQuote opts.host
+                , "port: " <> T.pack (show opts.port)
+                , "startup_cmd: " <> yamlQuote opts.serverCmd
                 ]
             "mysql" ->
-                [ "passwd: " <> yamlQuote (sroPassword opts)
-                , "user_name: " <> yamlQuote (sroUser opts)
-                , "host: " <> yamlQuote (sroHost opts)
-                , "port: " <> T.pack (show (sroPort opts))
-                , "sock_path: " <> yamlQuote (sroSocket opts)
-                , "db_prefix: " <> yamlQuote (sroDbName opts)
-                , "startup_cmd: " <> yamlQuote (sroServerCmd opts)
+                [ "passwd: " <> yamlQuote opts.password
+                , "user_name: " <> yamlQuote opts.user
+                , "host: " <> yamlQuote opts.host
+                , "port: " <> T.pack (show opts.port)
+                , "sock_path: " <> yamlQuote opts.socket
+                , "db_prefix: " <> yamlQuote opts.dbName
+                , "startup_cmd: " <> yamlQuote opts.serverCmd
                 ]
             _ -> []
      in T.intercalate "\n" (baseLines <> dbLines) <> "\n"
     where
-        joinQuote rel = yamlQuote (T.pack (sroSquirrelHome opts </> T.unpack rel))
+        joinQuote rel = yamlQuote (T.pack (opts.squirrelHome </> T.unpack rel))
         optionalLine key = maybe [] (\rel -> [key <> ": " <> joinQuote rel])
         yamlQuote val = "'" <> T.replace "'" "''" val <> "'"
         yamlList items =

@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Shared DBMS connection resolution, client lookup, and subprocess runner for Reset and Oracle.
 module Occam.Harness.DbmsExec (
     ClientRole (..),
@@ -133,11 +135,11 @@ resolveDbmsConnection cfg dbms overrides = do
         firstNonEmpty keys = Foldable.asum [nonEmptyText (T.pack v) | k <- keys, Just v <- [Map.lookup k envMap]]
         firstPresent keys = Foldable.asum [T.pack <$> Map.lookup k envMap | k <- keys]
         firstPort keys = Foldable.asum [readPositiveInt v | k <- keys, Just v <- [Map.lookup k envMap]]
-        defHost = fromMaybe (fallbackHost dbms) (spec >>= dbmsDefaultHost >>= nonEmptyText)
-        defPort = fromMaybe (fallbackPort dbms) (spec >>= dbmsDefaultPort)
-        defUser = fromMaybe (fallbackUser dbms) (spec >>= dbmsDefaultUser >>= nonEmptyText)
-        defDb = fromMaybe (fallbackDb dbms) (spec >>= nonEmptyText . dbmsDefaultDb)
-        defLog = maybe (defaultContainerLog dbms) T.unpack (dbmsContainerLog =<< spec)
+        defHost = fromMaybe (fallbackHost dbms) (spec >>= \dbmsSpec -> dbmsSpec.defaultHost >>= nonEmptyText)
+        defPort = fromMaybe (fallbackPort dbms) (spec >>= \dbmsSpec -> dbmsSpec.defaultPort)
+        defUser = fromMaybe (fallbackUser dbms) (spec >>= \dbmsSpec -> dbmsSpec.defaultUser >>= nonEmptyText)
+        defDb = fromMaybe (fallbackDb dbms) (spec >>= \dbmsSpec -> nonEmptyText dbmsSpec.defaultDb)
+        defLog = maybe (defaultContainerLog dbms) T.unpack (spec >>= \dbmsSpec -> dbmsSpec.containerLog)
     pure
         DbmsConnection
             { connDbms = dbms

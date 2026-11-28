@@ -67,7 +67,7 @@ data Literal = Literal
     }
     deriving (Eq, Ord, Show)
 
--- | Parameter or variable class.
+-- | Distinguishes positional placeholders from user and system variables.
 data ParamKind
     = ParamPositional
     | ParamUser
@@ -128,6 +128,7 @@ data Expr
     | ExprCollate !(Located Expr) !(Located Name)
     deriving (Eq, Show)
 
+-- | Prefix operator applied to one operand.
 data UnaryOp
     = UnaryNot
     | UnaryNegate
@@ -135,6 +136,7 @@ data UnaryOp
     | UnaryBitNot
     deriving (Eq, Ord, Show)
 
+-- | Binary operator; 'OpCustom' retains the original bytes of other operators.
 data BinaryOp
     = OpOr
     | OpAnd
@@ -171,6 +173,7 @@ data BinaryOp
     | OpCustom !ByteString
     deriving (Eq, Ord, Show)
 
+-- | Pattern-matching operator used by a LIKE-style expression.
 data LikeOp
     = LikeLike
     | LikeILike
@@ -178,12 +181,14 @@ data LikeOp
     | LikeRegexp
     deriving (Eq, Ord, Show)
 
+-- | ANY/ALL/SOME quantifier for a comparison against a query or array.
 data Quantifier
     = QuantAny
     | QuantAll
     | QuantSome
     deriving (Eq, Ord, Show)
 
+-- | Cast syntax, retained so dialect-specific forms remain distinguishable.
 data CastStyle
     = CastDoubleColon
     | CastDotColon
@@ -204,11 +209,13 @@ data FunctionCall = FunctionCall
     }
     deriving (Eq, Show)
 
+-- | Function-call null treatment requested by RESPECT/IGNORE NULLS.
 data NullTreatment
     = NullTreatmentRespect
     | NullTreatmentIgnore
     deriving (Eq, Ord, Show)
 
+-- | Function argument, including star and dialect-specific named arguments.
 data FunctionArg
     = FunctionArgExpr !(Located Expr)
     | FunctionArgStar
@@ -238,6 +245,7 @@ data WindowSpec = WindowSpec
     }
     deriving (Eq, Show)
 
+-- | Window frame unit and its start and optional end boundaries.
 data WindowFrame = WindowFrame
     { windowFrameUnit :: !WindowFrameUnit
     , windowFrameStart :: !WindowBound
@@ -245,12 +253,14 @@ data WindowFrame = WindowFrame
     }
     deriving (Eq, Show)
 
+-- | ROWS, RANGE, or GROUPS frame interpretation.
 data WindowFrameUnit
     = FrameRows
     | FrameRange
     | FrameGroups
     deriving (Eq, Ord, Show)
 
+-- | Window-frame boundary relative to the current row.
 data WindowBound
     = BoundUnboundedPreceding
     | BoundPreceding !(Located Expr)
@@ -267,11 +277,13 @@ data OrderItem = OrderItem
     }
     deriving (Eq, Show)
 
+-- | Explicit sort direction; absence is represented by 'Nothing' in 'OrderItem'.
 data SortDirection
     = SortAscending
     | SortDescending
     deriving (Eq, Ord, Show)
 
+-- | Explicit null placement; absence is represented by 'Nothing' in 'OrderItem'.
 data NullsOrder
     = NullsFirst
     | NullsLast
@@ -286,11 +298,13 @@ data TypeName = TypeName
     }
     deriving (Eq, Show)
 
+-- | Type argument parsed either as a nested type or as an expression.
 data TypeArg
     = TypeArgType !(Located TypeName)
     | TypeArgExpr !(Located Expr)
     deriving (Eq, Show)
 
+-- | Index key expression with optional prefix length and ordering modifiers.
 data IndexKeyPart = IndexKeyPart
     { indexKeyExpr :: !(Located Expr)
     , indexKeyPrefixLength :: !(Maybe (Located Expr))

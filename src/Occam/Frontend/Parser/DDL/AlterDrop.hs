@@ -35,7 +35,7 @@ import Occam.Frontend.Span (Located (..), mergeSpan)
 import Occam.Parser.Dialect (DialectFeature (..))
 import Occam.Parser.Types (SQLDialect (..))
 
--- | Consume @IF EXISTS@ and report whether it was present.
+-- | Consume optional @IF EXISTS@ and report whether it occurred.
 parseIfExists :: P Bool
 parseIfExists = isJust <$> whenWord "IF" (expectWordCI "EXISTS")
 

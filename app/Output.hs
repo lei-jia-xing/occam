@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Atomic output writers, path collision validation, statement counting, and CLI stats summaries.
 module Output (
     computeSessionStats,
@@ -127,7 +129,7 @@ writeReductionOutputs ::
     EvaluationMetrics ->
     IO ()
 writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath statsPath initialSQL reducedSQL stats evaluation = do
-    let canWriteOutput = not (inPlace && not (evaluationValidationPassed evaluation))
+    let canWriteOutput = not evaluation.validationPassed
     unless canWriteOutput do
         let msg = "refusing in-place modification because final candidate failed target validation"
         logError logger "cli" (T.pack msg)
@@ -194,22 +196,22 @@ computeSessionStats initialBytes initialStmts reducedSQL reducedStmts initialSta
         , reduced_statements = reducedStmts
         , oracle_executions = totalOracleExecutions
         , oracle_attempts = totalOracleAttempts
-        , initial_oracle_observations = evaluationPreflightAttempts budgetConfig
+        , initial_oracle_observations = budgetConfig.preflightAttempts
         , cache_hits = totalHits
         , cache_misses = totalMisses
-        , cache_joins = evaluationCacheJoins evaluation
+        , cache_joins = evaluation.cacheJoins
         , cache_hit_ratio = hitRatio
-        , cancelled_observations = evaluationCancelledObservations evaluation
-        , status = evaluationStatus evaluation
+        , cancelled_observations = evaluation.cancelledObservations
+        , status = evaluation.runStatus
         , reduction_settings = reductionSettings cacheEnabled reductionConfig strategy
         , evaluation_budget = budgetConfig
         , evaluation_metrics = evaluation
         , initial_oracle_seconds = initialOracleSeconds
-        , elapsed_seconds = evaluationTotalSeconds evaluation
+        , elapsed_seconds = evaluation.totalSeconds
         }
     where
-        totalHits = evaluationCacheHits evaluation
-        totalMisses = evaluationCacheMisses evaluation
+        totalHits = evaluation.cacheHits
+        totalMisses = evaluation.cacheMisses
         totalLookups = totalHits + totalMisses
         hitRatio =
             if totalLookups > 0
@@ -222,13 +224,13 @@ computeSessionStats initialBytes initialStmts reducedSQL reducedStmts initialSta
                 else 0.0
         initialOracleSeconds = realToFrac (diffUTCTime initialEnd initialStart)
         totalOracleExecutions =
-            evaluationPreflightAttempts budgetConfig
-                + evaluationDatabaseObservations evaluation
-                + evaluationValidationDatabaseObservations evaluation
+            budgetConfig.preflightAttempts
+                + evaluation.databaseObservations
+                + evaluation.validationDatabaseObservations
         totalOracleAttempts =
-            evaluationPreflightAttempts budgetConfig
-                + evaluationOracleAttempts evaluation
-                + evaluationValidationObservations evaluation
+            budgetConfig.preflightAttempts
+                + evaluation.oracleAttempts
+                + evaluation.validationObservations
 
 reductionSettings :: Bool -> ReductionConfig -> ReductionStrategy -> Value
 reductionSettings cacheEnabled ReductionConfig {..} strategy =

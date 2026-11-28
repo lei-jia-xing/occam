@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Stateful execution loop for reduction, validation, and post-reduction statement auditing.
 module Occam.Evaluation.Execution (
     EvalEnv (..),
@@ -177,7 +179,7 @@ runReductionPhase env state pool metricsStore collectCurve reporter action = do
     where
         runAction = do
             result <- action reporter (envLogger env) pool
-            runAuditPhase env state pool reporter (actionEvidence result)
+            runAuditPhase env state pool reporter result.evidence
             pure result
 
 -- | Run statement-deletion audit to confirm 1-minimality on the accepted result.
@@ -394,12 +396,12 @@ retireCandidate onProgress reductionStart checkpoint state collectCurve callInde
                 now <- ticks
                 pure
                     ( EvaluationPoint
-                        { pointElapsedSeconds = seconds reductionStart now
-                        , pointCallIndex = callIndex + 1
-                        , pointCandidateBytes = BS.length candidate
-                        , pointCandidateStatements = statements
-                        , pointCacheHit = hit
-                        , pointAccepted = accepted
+                        { elapsedSeconds = seconds reductionStart now
+                        , callIndex = callIndex + 1
+                        , candidateBytes = BS.length candidate
+                        , candidateStatements = statements
+                        , cacheHit = hit
+                        , accepted = accepted
                         }
                         :
                     )

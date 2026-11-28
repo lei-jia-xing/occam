@@ -64,7 +64,9 @@ import Occam.Frontend.Span (ByteSpan, Located)
 -- DDL
 -- ---------------------------------------------------------------------------
 
--- | CREATE flags plus the concrete object definition.
+{- | CREATE flags and concrete object definition; shared prefix modifiers
+remain independent of the object-specific payload.
+-}
 data CreateStmt = CreateStmt
     { createOrReplace :: !Bool
     , createTemp :: !Bool
@@ -117,12 +119,14 @@ data CreateTable = CreateTable
     }
     deriving (Eq, Show)
 
+-- | Partitioning strategy and key expressions following @PARTITION BY@.
 data PartitionBy = PartitionBy
     { partitionByStrategy :: !(Located ByteString)
     , partitionByExprs :: ![Located Expr]
     }
     deriving (Eq, Show)
 
+-- | PostgreSQL partition bound form, retaining list, range, hash, or DEFAULT values.
 data PartitionBound
     = PartitionBoundDefault
     | PartitionBoundIn ![Located Expr]
@@ -130,12 +134,14 @@ data PartitionBound
     | PartitionBoundWith ![(Located NamePart, Located Expr)]
     deriving (Eq, Show)
 
+-- | Parent relation and bound in a @PARTITION OF@ definition.
 data TablePartition = TablePartition
     { tablePartitionParent :: !(Located Name)
     , tablePartitionBound :: !PartitionBound
     }
     deriving (Eq, Show)
 
+-- | One element of a table body, including dialect-specific inline objects.
 data TableElement
     = TableElementColumn !(Located ColumnDef)
     | TableElementConstraint !(Located TableConstraint)
@@ -143,6 +149,7 @@ data TableElement
     | TableElementSkippingIndex !(Located SkippingIndex)
     deriving (Eq, Show)
 
+-- | ClickHouse inline data-skipping index definition.
 data SkippingIndex = SkippingIndex
     { skippingIndexName :: !(Located NamePart)
     , skippingIndexExpr :: !(Located Expr)
@@ -151,6 +158,7 @@ data SkippingIndex = SkippingIndex
     }
     deriving (Eq, Show)
 
+-- | ClickHouse projection definition containing its defining query.
 data ProjectionDef = ProjectionDef
     { projectionName :: !(Located NamePart)
     , projectionQuery :: !(Located Query)
@@ -189,6 +197,7 @@ data ColumnConstraint
     | ColumnConstraintEphemeral !(Maybe (Located Expr))
     deriving (Eq, Show)
 
+-- | SQLite conflict-resolution algorithm for a column constraint.
 data ColumnConflictAction
     = ColumnConflictRollback
     | ColumnConflictAbort
@@ -211,6 +220,7 @@ data TableConstraint
     | TableConstraintLike !(Located Name) ![Located TableLikeOption]
     deriving (Eq, Show)
 
+-- | Optional names and index method shared by table constraints.
 data ConstraintIndexOptions = ConstraintIndexOptions
     { constraintName :: !(Maybe (Located NamePart))
     , constraintIndexName :: !(Maybe (Located NamePart))
@@ -218,12 +228,14 @@ data ConstraintIndexOptions = ConstraintIndexOptions
     }
     deriving (Eq, Ord, Show)
 
+-- | Whether a @LIKE@ option is included or excluded from the copied table.
 data TableLikeOption = TableLikeOption
     { tableLikeInclude :: !Bool
     , tableLikeOptionName :: !(Located ByteString)
     }
     deriving (Eq, Ord, Show)
 
+-- | Referenced relation, optional key columns, and foreign-key action/timing clauses.
 data ForeignKeyRef = ForeignKeyRef
     { foreignKeyTable :: !(Located Name)
     , foreignKeyColumns :: ![Located NamePart]
@@ -235,14 +247,17 @@ data ForeignKeyRef = ForeignKeyRef
     }
     deriving (Eq, Ord, Show)
 
+-- | Initial timing selected for a deferrable foreign-key constraint.
 data ForeignKeyTiming = ForeignKeyInitiallyDeferred | ForeignKeyInitiallyImmediate
     deriving (Eq, Ord, Show)
 
+-- | Referential action attached to an @ON DELETE@ or @ON UPDATE@ clause.
 data ForeignKeyAction = ForeignKeyAction
     { foreignKeyActionKind :: !ForeignKeyActionKind
     }
     deriving (Eq, Ord, Show)
 
+-- | Normalized action applied when a referenced row is changed or removed.
 data ForeignKeyActionKind
     = ForeignKeyCascade
     | ForeignKeyRestrict
@@ -277,6 +292,7 @@ data CreateView = CreateView
     }
     deriving (Eq, Show)
 
+-- | Parsed view query or an intentionally unparsed body with its source span.
 data ViewBody
     = ViewBodyQuery !(Located Query)
     | ViewBodyOpaque !OpaqueBody
@@ -289,6 +305,7 @@ data OpaqueBody = OpaqueBody
     }
     deriving (Eq, Ord, Show)
 
+-- | Role of a byte range retained without parsing its body grammar.
 data OpaqueKind
     = OpaqueFunctionBody
     | OpaqueProcedureBody
@@ -297,6 +314,7 @@ data OpaqueKind
     | OpaqueViewBody
     deriving (Eq, Ord, Show)
 
+-- | Sequence name and options from a @CREATE SEQUENCE@ statement.
 data CreateSequence = CreateSequence
     { createSequenceName :: !(Located Name)
     , createSequenceIfNotExists :: !Bool
@@ -304,6 +322,7 @@ data CreateSequence = CreateSequence
     }
     deriving (Eq, Show)
 
+-- | Schema name, optional existence guard, and optional authorization owner.
 data CreateSchema = CreateSchema
     { createSchemaName :: !(Maybe (Located Name))
     , createSchemaIfNotExists :: !Bool
@@ -311,6 +330,7 @@ data CreateSchema = CreateSchema
     }
     deriving (Eq, Ord, Show)
 
+-- | Database name, existence guard, and parsed options.
 data CreateDatabase = CreateDatabase
     { createDatabaseName :: !(Located Name)
     , createDatabaseIfNotExists :: !Bool
@@ -318,6 +338,7 @@ data CreateDatabase = CreateDatabase
     }
     deriving (Eq, Show)
 
+-- | Extended statistics target, requested kinds/columns, and optional source table.
 data CreateStatistics = CreateStatistics
     { createStatisticsName :: !(Located Name)
     , createStatisticsIfNotExists :: !Bool
@@ -327,6 +348,7 @@ data CreateStatistics = CreateStatistics
     }
     deriving (Eq, Show)
 
+-- | Scalar or table macro definition with parameters and its parsed body.
 data CreateMacro = CreateMacro
     { createMacroName :: !(Located Name)
     , createMacroParams :: ![Located MacroParam]
@@ -335,12 +357,14 @@ data CreateMacro = CreateMacro
     }
     deriving (Eq, Show)
 
+-- | Macro parameter with an optional default expression.
 data MacroParam = MacroParam
     { macroParamName :: !(Located NamePart)
     , macroParamDefault :: !(Maybe (Located Expr))
     }
     deriving (Eq, Show)
 
+-- | PostgreSQL row-security policy definition and its optional predicates.
 data CreatePolicy = CreatePolicy
     { createPolicyName :: !(Located Name)
     , createPolicyTable :: !(Located Name)
@@ -352,6 +376,7 @@ data CreatePolicy = CreatePolicy
     }
     deriving (Eq, Show)
 
+-- | PostgreSQL rewrite rule, including its event, condition, and optional action.
 data CreateRule = CreateRule
     { createRuleName :: !(Located Name)
     , createRuleEvent :: !(Located ByteString)
@@ -362,6 +387,7 @@ data CreateRule = CreateRule
     }
     deriving (Eq, Show)
 
+-- | Trigger event, timing, granularity, condition, invocation, and opaque body.
 data CreateTrigger = CreateTrigger
     { createTriggerName :: !(Located Name)
     , createTriggerTiming :: !(Maybe (Located ByteString))
@@ -375,9 +401,11 @@ data CreateTrigger = CreateTrigger
     }
     deriving (Eq, Show)
 
+-- | Whether a trigger fires once per affected row or once per statement.
 data TriggerGranularity = TriggerForEachRow | TriggerForEachStatement
     deriving (Eq, Ord, Show)
 
+-- | Function or procedure signature and its intentionally opaque body.
 data CreateRoutine = CreateRoutine
     { createRoutineName :: !(Located Name)
     , createRoutineParams :: ![Located RoutineParam]
@@ -387,6 +415,7 @@ data CreateRoutine = CreateRoutine
     }
     deriving (Eq, Show)
 
+-- | Routine parameter mode, optional name, type, and default expression.
 data RoutineParam = RoutineParam
     { routineParamMode :: !(Maybe ByteString)
     , routineParamName :: !(Maybe (Located NamePart))
@@ -404,6 +433,7 @@ data CreateAggregate = CreateAggregate
     }
     deriving (Eq, Show)
 
+-- | Virtual-table declaration naming its module and module arguments.
 data CreateVirtualTable = CreateVirtualTable
     { createVirtualTableName :: !(Located Name)
     , createVirtualTableIfNotExists :: !Bool
@@ -412,11 +442,13 @@ data CreateVirtualTable = CreateVirtualTable
     }
     deriving (Eq, Show)
 
+-- | Virtual-table argument represented as a declared column or expression.
 data VirtualTableArg
     = VirtualTableColumn !(Located ColumnDef)
     | VirtualTableExpression !(Located Expr)
     deriving (Eq, Show)
 
+-- | Parsed name/value option used by table, sequence, and database definitions.
 data TableOption = TableOption
     { tableOptionName :: ![Located NamePart]
     , tableOptionValue :: !(Maybe (Located Expr))
@@ -435,6 +467,7 @@ data DropStmt = DropStmt
     }
     deriving (Eq, Ord, Show)
 
+-- | Kind of object accepted by @DROP@; object names and modifiers are separate.
 data DropObject
     = DropTable
     | DropIndex
@@ -454,6 +487,7 @@ data DropObject
     | DropMacro
     deriving (Eq, Ord, Show)
 
+-- | Dependency behavior requested when dropping an object with dependents.
 data DropBehavior
     = DropCascade
     | DropRestrict
@@ -470,6 +504,7 @@ data AlterStmt = AlterStmt
     }
     deriving (Eq, Show)
 
+-- | Whether an ALTER target is a table or a view.
 data AlterObject
     = AlterObjectTable
     | AlterObjectView
@@ -512,6 +547,7 @@ data ColumnPosition
     | ColumnPositionAfter !(Located NamePart)
     deriving (Eq, Ord, Show)
 
+-- | Row-level-security mode change requested by @ALTER TABLE@.
 data RlsAction
     = RlsEnable
     | RlsDisable
@@ -519,6 +555,7 @@ data RlsAction
     | RlsNoForce
     deriving (Eq, Ord, Show)
 
+-- | Column-specific default, nullability, type, identity, or option change.
 data AlterColumnAction
     = AlterSetDefault !(Located Expr)
     | AlterDropDefault

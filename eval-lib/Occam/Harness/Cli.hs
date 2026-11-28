@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Command-line dispatcher for the @occam-harness@ helper executable.
 module Occam.Harness.Cli (
     BatchRunArgs (..),
@@ -25,7 +27,7 @@ import Occam.Harness.BatchInputs (BatchInputOptions (..), BatchInputSource (..))
 import Occam.Harness.BatchPlan (
     BatchPlanOptions (..),
     PlanOverrides (..),
-    pbpPreview,
+    PreparedBatchPlan (..),
     prepareBatchPlan,
  )
 import Occam.Harness.Collect (
@@ -515,10 +517,10 @@ runHarnessCommand = \case
         case res of
             Left err -> dieValidation err
             Right summary -> do
-                BSL.putStr (encode (bsPayload summary) <> BSL.pack [10])
-                if bsExitCode summary == 0
+                BSL.putStr (encode summary.payload <> BSL.pack [10])
+                if summary.exitCode == 0
                     then exitSuccess
-                    else exitWith (ExitFailure (bsExitCode summary))
+                    else exitWith (ExitFailure summary.exitCode)
     CmdCollect mCfg options -> do
         cfg <- loadOrDie mCfg
         collectArtifacts cfg options
@@ -528,8 +530,8 @@ runHarnessCommand = \case
         opts <- either dieValidation pure =<< resolveOracleOptions cfg overrides
         sqlBytes <- BS.getContents
         res <- probeCrashOracle cfg opts sqlBytes
-        whenTrue (ooPrintSignature opts) $
-            for_ (odCrashSignature (orDecision res)) \sig ->
+        whenTrue opts.printSignature $
+            for_ (orDecision res).crashSignature \sig ->
                 BSL.putStr (encode sig <> BSL.pack [10])
         if orExitCode res == 0
             then exitSuccess
@@ -552,7 +554,7 @@ runHarnessCommand = \case
         path <- resolveHarnessConfigPath mCfg
         cfg <- loadConfigOrDie path
         prepareBatchPlan path cfg options
-            >>= either dieValidation (\plan -> BSL.putStr (encode (pbpPreview plan) <> BSL.pack [10]))
+            >>= either dieValidation (\plan -> BSL.putStr (encode plan.preview <> BSL.pack [10]))
     CmdSanitizeSqlancer mInput mMetaOut asJson -> do
         rawBytes <- maybe BS.getContents BS.readFile mInput
         let res = sanitizeSqlancerLog rawBytes
@@ -577,13 +579,13 @@ runHarnessCommand = \case
         putStrLn $
             unwords
                 [ "Valid harness config:"
-                , show (length (hcDbms hc))
+                , show (length hc.dbms)
                 , "dbms,"
-                , show (length (hcProfiles hc))
+                , show (length hc.profiles)
                 , "profiles,"
-                , show (Map.size (hcPlans hc))
+                , show (Map.size hc.plans)
                 , "plans,"
-                , show (length (hcSquirrel hc))
+                , show (length hc.squirrel)
                 , "squirrel templates"
                 ]
     where

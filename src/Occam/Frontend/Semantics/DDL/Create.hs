@@ -92,9 +92,11 @@ implicitCommit ctx stmt
         AST.StatementOptimize _ -> True
         _ -> False
 
+-- | This implementation models created indexes in the owning table's schema.
 indexSchemaPlacement :: AnalysisContext -> Core.IndexSchemaPlacement
 indexSchemaPlacement _ = Core.IndexTableSchema
 
+-- | Choose a table-scoped MySQL/MariaDB index reference or a named index reference.
 indexRef :: AnalysisContext -> Core.Name -> Maybe Core.NameRef -> Core.IndexRef
 indexRef ctx name mTable
     | ctxDialect ctx `elem` [MySQL, MariaDB]
@@ -103,6 +105,7 @@ indexRef ctx name mTable
         Core.TableIndex table lastPart
     | otherwise = Core.NamedIndex name
 
+-- | Choose PostgreSQL's table-scoped trigger reference or a standalone name.
 triggerRef :: AnalysisContext -> Core.Name -> Core.NameRef -> Core.TriggerRef
 triggerRef ctx name table
     | ctxDialect ctx == PostgreSQL
@@ -110,12 +113,14 @@ triggerRef ctx name table
         Core.TableTrigger table lastPart
     | otherwise = Core.NamedTrigger name
 
+-- | Preserve the old schema prefix when a rename supplies only a new final name.
 qualifyRename :: Core.Name -> Core.Name -> Core.Name
 qualifyRename old new
     | length (Core.nameParts new) == 1 && length (Core.nameParts old) > 1 =
         Core.Name (init (Core.nameParts old) ++ Core.nameParts new)
     | otherwise = new
 
+-- | Convert an optional parsed foreign-key action, defaulting absence to NO ACTION.
 referentialAction :: Maybe (Located AST.ForeignKeyAction) -> Core.ReferentialAction
 referentialAction Nothing = Core.NoAction
 referentialAction (Just (L _ act)) = case AST.foreignKeyActionKind act of
@@ -125,6 +130,7 @@ referentialAction (Just (L _ act)) = case AST.foreignKeyActionKind act of
     AST.ForeignKeyRestrict -> Core.Restrict
     AST.ForeignKeyNoAction -> Core.NoAction
 
+-- | Convert a parsed foreign-key reference when its parent name resolves.
 foreignKey :: AnalysisContext -> AST.ForeignKeyRef -> [Core.Ident] -> Maybe Core.ForeignKey
 foreignKey ctx fk childCols = do
     parent <- relationRef ctx (locValue (AST.foreignKeyTable fk))
@@ -141,6 +147,7 @@ foreignKey ctx fk childCols = do
             , Core.foreignKeyDeferrable = fromMaybe False (AST.foreignKeyDeferrable fk)
             }
 
+-- | Convert supported table constraints; unsupported/unresolved forms yield 'Nothing'.
 constraintFromTable :: AnalysisContext -> AST.TableConstraint -> Maybe Core.Constraint
 constraintFromTable ctx = \case
     AST.TableConstraintPrimaryKey opts keys ->
@@ -184,6 +191,7 @@ constraintFromTable ctx = \case
     where
         optName opts = fmap (canonicalIdent ctx IdentOther . locValue) (AST.constraintName opts)
 
+-- | Normalize a column and its inline constraints into catalog schema metadata.
 columnDefinition :: AnalysisContext -> AST.ColumnDef -> (Core.ColumnDef, [Core.Constraint])
 columnDefinition ctx col =
     let colName = canonicalIdent ctx IdentColumn (locValue (AST.columnName col))
@@ -230,6 +238,7 @@ columnDefinition ctx col =
                 )
             _ -> acc
 
+-- | Build a normalized table definition, returning 'Nothing' for an unresolvable name.
 tableDefinition ::
     AnalysisContext ->
     AST.CreateStmt ->
@@ -289,6 +298,7 @@ parseOnCommit opts = go (concatMap optWords opts)
         go (_ : rest) = go rest
         go [] = Nothing
 
+-- | Extract CREATE TABLE facts, including schema reads and evaluated CTAS effects.
 createTableFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -380,6 +390,7 @@ createTableFacts analyzeStmt ctx visitor createStmt ct baseFacts =
                     Nothing -> (acc, True)
                 step _ (acc, _) = (acc, True)
 
+-- | Extract view definition/read facts, output lineage, and opaque-body barriers.
 createViewFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -463,6 +474,7 @@ createViewFacts analyzeStmt ctx visitor createStmt cv baseFacts =
                 }
      in if materialized then mergeNested facts1 nested else facts1
 
+-- | Extract an index definition and key-column reads, fencing unknown targets.
 createIndexFacts ::
     AnalysisContext ->
     VisitorState ->
@@ -502,6 +514,7 @@ createIndexFacts ctx visitor createStmt ci baseFacts =
                 (Core.factBarriers baseFacts ++ idxBarriers)
      in baseFacts {Core.factOps = Core.factOps baseFacts ++ ops', Core.factBarriers = barriers'}
 
+-- | Extract trigger definition dependencies from its table, condition, and body.
 createTriggerFacts ::
     (AnalysisContext -> AST.Statement -> Core.SemanticFacts) ->
     AnalysisContext ->
@@ -683,6 +696,7 @@ triggerEffectsFromFacts facts =
                     )
                 ]
 
+-- | Record a sequence definition with dialect-specific transactional behavior.
 createSequenceFacts ::
     AnalysisContext -> AST.CreateStmt -> AST.CreateSequence -> Core.SemanticFacts -> Core.SemanticFacts
 createSequenceFacts ctx createStmt cs baseFacts =
@@ -702,6 +716,7 @@ createSequenceFacts ctx createStmt cs baseFacts =
                         ++ [Core.ScopedBarrier Core.GlobalScope Core.UnknownDDLBarrier (Just (TE.decodeUtf8 (unitSource ctx)))]
                 }
 
+-- | Record a schema definition or a conservative barrier for an unknown name.
 createSchemaFacts :: AnalysisContext -> AST.CreateSchema -> Core.SemanticFacts -> Core.SemanticFacts
 createSchemaFacts ctx cs baseFacts =
     case AST.createSchemaName cs >>= nameFromAST ctx IdentRelation . locValue of
@@ -714,6 +729,7 @@ createSchemaFacts ctx cs baseFacts =
                         ++ [Core.ScopedBarrier Core.GlobalScope Core.UnknownDDLBarrier (Just (TE.decodeUtf8 (unitSource ctx)))]
                 }
 
+-- | Model supported database creation as a schema definition; fence other forms.
 createDatabaseFacts ::
     AnalysisContext -> AST.CreateStmt -> AST.CreateDatabase -> Core.SemanticFacts -> Core.SemanticFacts
 createDatabaseFacts ctx createStmt db baseFacts
@@ -740,6 +756,7 @@ createDatabaseFacts ctx createStmt db baseFacts
                        ]
             }
 
+-- | Retain macro-body reads and barriers for relation sources the visitor cannot model.
 createMacroFacts ::
     AnalysisContext -> VisitorState -> AST.CreateMacro -> Core.SemanticFacts -> Core.SemanticFacts
 createMacroFacts _ctx visitor cm baseFacts =
@@ -751,6 +768,7 @@ createMacroFacts _ctx visitor cm baseFacts =
             , Core.factBarriers = barriers'
             }
 
+-- | Model a virtual table and known SQLite shadow tables, fencing its backing relation.
 createVirtualTableFacts ::
     AnalysisContext ->
     VisitorState ->
@@ -914,6 +932,7 @@ createRuleFacts analyzeStmt ctx visitor crRule baseFacts =
             Core.WriteDataOp w -> Core.dataWriteTarget w : map Core.readSource (Core.dataWriteReads w)
             _ -> []
 
+-- | Extract source reads and a scoped barrier for @CREATE STATISTICS@.
 createStatisticsFacts ::
     AnalysisContext -> AST.CreateStatistics -> Core.SemanticFacts -> Core.SemanticFacts
 createStatisticsFacts ctx cs baseFacts = case AST.createStatisticsFrom cs of

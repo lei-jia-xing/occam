@@ -19,7 +19,7 @@ depends=(
   'haskell-direct-sqlite'
   'haskell-fast-logger'
   'haskell-hashable'
-  'haskell-microlens'
+  'haskell-optics-core'
   'haskell-optparse-applicative'
   'haskell-safe-exceptions'
   'haskell-temporary'

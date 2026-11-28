@@ -103,6 +103,10 @@ library
                     , Occam.Frontend.AST.Statement
                     , Occam.Frontend.Columns.Analysis
                     , Occam.Frontend.Columns.Assemble
+                    , Occam.Frontend.Columns.Assemble.Build
+                    , Occam.Frontend.Columns.Assemble.Scope
+                    , Occam.Frontend.Columns.Assemble.Target
+                    , Occam.Frontend.Columns.Assemble.Types
                     , Occam.Frontend.Columns.Edits
                     , Occam.Frontend.Edits.Core
                     , Occam.Frontend.Edits.DDL
@@ -155,7 +159,6 @@ library
                     , Occam.Dependency.Session
                     , Occam.Dependency.State
                     , Occam.Dependency.State.Catalog
-                    , Occam.Dependency.State.Lenses
                     , Occam.Dependency.Transaction
                     , Occam.Dependency.Write
                     , Occam.Evaluation.Execution
@@ -184,7 +187,7 @@ library
                     , ansi-terminal >= 1.0 && < 1.2
                     , terminal-progress-bar >= 0.4 && < 0.5
                     , base16-bytestring >= 1.0 && < 1.1
-                    , microlens >= 0.4 && < 0.5
+                    , optics-core >= 0.4.2 && < 0.5
                     , safe-exceptions >= 0.1 && < 0.2
                     , temporary >= 1.3 && < 1.4
                     , vector >= 0.13 && < 0.14
@@ -233,13 +236,21 @@ library occam-harness-lib
                     , Occam.Harness.Reset
                     , Occam.Harness.Signature
                     , Occam.Harness.SqlancerSanitize
-    other-modules:    Occam.Harness.Evidence.ClickHouse
+    other-modules:    Occam.Harness.Batch.Jobs
+                    , Occam.Harness.Batch.Runner
+                    , Occam.Harness.Batch.Types
+                    , Occam.Harness.Batch.Workers
+                    , Occam.Harness.Evidence.ClickHouse
                     , Occam.Harness.Evidence.Common
                     , Occam.Harness.Evidence.DuckDB
                     , Occam.Harness.Evidence.Mysql
                     , Occam.Harness.Evidence.Postgres
                     , Occam.Harness.Evidence.Sqlite
                     , Occam.Harness.Signature.StackFrame
+                    , Occam.Harness.Oracle.Config
+                    , Occam.Harness.Oracle.Log
+                    , Occam.Harness.Oracle.Probe
+                    , Occam.Harness.Oracle.Types
     build-depends:    occam
                     , base16-bytestring >= 1.0 && < 1.1
                     , cryptohash-sha256 >= 0.11 && < 0.12
@@ -289,6 +300,13 @@ test-suite occam-test
                     , BatchReportChecks
                     , BatchRunnerChecks
                     , CacheChecks
+                    , BatchRunnerChecks.Collect
+                    , BatchRunnerChecks.Embedded
+                    , BatchRunnerChecks.External
+                    , BatchRunnerChecks.Managed
+                    , BatchRunnerChecks.Plan
+                    , BatchRunnerChecks.Replay
+                    , BatchRunnerChecks.Support
                     , CliChecks
                     , ColumnChecks
                     , CrashEvidenceChecks
@@ -311,6 +329,8 @@ test-suite occam-test
                     , FrontendFacadeChecks
                     , FrontendPipelineChecks
                     , FrontendSeedChecks
+                    , FrontendSeedChecks.Corpus
+                    , FrontendSeedChecks.Mutation
                     , FrontendSeedLoader
                     , FrontendSemanticsChecks
                     , OracleChecks
@@ -329,6 +349,9 @@ test-suite occam-test
                     , SemanticAlignmentChecks
                     , SqliteOracleChecks
                     , SyntaxAlignmentChecks
+                    , SyntaxAlignmentChecks.Corpus
+                    , SyntaxAlignmentChecks.Differential
+                    , SyntaxAlignmentChecks.Engine
     main-is:          Spec.hs
     build-depends:    occam
                     , occam:occam-oracle
@@ -349,6 +372,12 @@ benchmark occam-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench
     other-modules:    ResultBaseline
+                    , ResultBaseline.Basic
+                    , ResultBaseline.Fixtures
+                    , ResultBaseline.Runner
+                    , ResultBaseline.Statement
+                    , ResultBaseline.Syntax
+                    , ResultBaseline.SyntaxFixtures
                     , Paths_occam
     autogen-modules:  Paths_occam
     main-is:          Main.hs

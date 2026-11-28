@@ -1,3 +1,6 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Plan a batch and write its public manifest without starting any workers.
 module Occam.Harness.BatchPlan (
     BatchPlanOptions (..),
@@ -52,64 +55,64 @@ import Text.Read (readMaybe)
 
 -- | High-level options governing batch matrix expansion, replay, and resume behavior.
 data BatchPlanOptions = BatchPlanOptions
-    { planInputs :: !BatchInputOptions
-    , planReference :: !Text
-    , planOutputDir :: !FilePath
-    , planSelectedProfiles :: !(Maybe Text)
-    , planCustomProfiles :: ![Text]
-    , planOverrides :: !PlanOverrides
-    , planExternalContainers :: !(Maybe Text)
-    , planLocalEmbedded :: !Bool
-    , planAllowUnsafeJobs :: !Bool
-    , planReplays :: !Int
-    , planSkipInputReplay :: !Bool
-    , planProbeTimeout :: !Double
-    , planResume :: !Bool
-    , planRerunFailed :: !Bool
+    { inputs :: !BatchInputOptions
+    , reference :: !Text
+    , outputDir :: !FilePath
+    , selectedProfiles :: !(Maybe Text)
+    , customProfiles :: ![Text]
+    , overrides :: !PlanOverrides
+    , externalContainers :: !(Maybe Text)
+    , localEmbedded :: !Bool
+    , allowUnsafeJobs :: !Bool
+    , replays :: !Int
+    , skipInputReplay :: !Bool
+    , probeTimeout :: !Double
+    , resume :: !Bool
+    , rerunFailed :: !Bool
     }
     deriving (Eq, Show)
 
 -- | Explicit CLI\/user overrides layered over reference harness defaults.
 data PlanOverrides = PlanOverrides
-    { overrideRepeats :: !(Maybe Int)
-    , overrideWorkers :: !(Maybe Int)
-    , overrideOccamJobs :: !(Maybe Int)
-    , overrideContainerWait :: !(Maybe Int)
-    , overrideTimeout :: !(Maybe Double)
-    , overrideBudget :: !(Maybe Double)
-    , overrideMaxExecutions :: !(Maybe Integer)
-    , overrideNoCache :: !Bool
-    , overrideRejectSlippage :: !Bool
-    , overrideStackFrames :: !(Maybe Int)
+    { repeats :: !(Maybe Int)
+    , workers :: !(Maybe Int)
+    , occamJobs :: !(Maybe Int)
+    , containerWait :: !(Maybe Int)
+    , timeout :: !(Maybe Double)
+    , budget :: !(Maybe Double)
+    , maxExecutions :: !(Maybe Integer)
+    , noCache :: !Bool
+    , rejectSlippage :: !Bool
+    , stackFrames :: !(Maybe Int)
     }
     deriving (Eq, Show)
 
 -- | Resolved worker concurrency, timeouts, caching, and slippage settings for a batch run.
 data Settings = Settings
-    { workRepeats :: !Int
-    , workWorkers :: !Int
-    , workOccamJobs :: !Int
-    , workContainerWait :: !Int
-    , workTimeout :: !Double
-    , workBudget :: !(Maybe Double)
-    , workMaxExecutions :: !(Maybe Integer)
-    , workNoCache :: !Bool
-    , workRejectSlippage :: !Bool
-    , workStackFrames :: !Int
+    { repeats :: !Int
+    , workers :: !Int
+    , occamJobs :: !Int
+    , containerWait :: !Int
+    , timeout :: !Double
+    , budget :: !(Maybe Double)
+    , maxExecutions :: !(Maybe Integer)
+    , noCache :: !Bool
+    , rejectSlippage :: !Bool
+    , stackFrames :: !Int
     }
 
 instance ToJSON Settings where
     toJSON settings =
         object
-            [ "jobs" .= workWorkers settings
-            , "occam_jobs" .= workOccamJobs settings
-            , "container_wait" .= workContainerWait settings
-            , "timeout" .= workTimeout settings
-            , "budget" .= workBudget settings
-            , "max_oracle_executions" .= workMaxExecutions settings
-            , "no_cache" .= workNoCache settings
-            , "reject_on_slippage" .= workRejectSlippage settings
-            , "stack_frames" .= workStackFrames settings
+            [ "jobs" .= settings.workers
+            , "occam_jobs" .= settings.occamJobs
+            , "container_wait" .= settings.containerWait
+            , "timeout" .= settings.timeout
+            , "budget" .= settings.budget
+            , "max_oracle_executions" .= settings.maxExecutions
+            , "no_cache" .= settings.noCache
+            , "reject_on_slippage" .= settings.rejectSlippage
+            , "stack_frames" .= settings.stackFrames
             ]
 
 -- | Named reducer arm (profile name paired with Occam CLI flags).
@@ -151,14 +154,14 @@ instance ToJSON ExternalContainer where
 
 -- | Typed resolved batch plan returned to CLI preview and native Batch runner.
 data PreparedBatchPlan = PreparedBatchPlan
-    { pbpPlanPath :: !FilePath
-    , pbpOutDir :: !FilePath
-    , pbpSettings :: !Settings
-    , pbpProfiles :: ![Profile]
-    , pbpCases :: ![BatchCase]
-    , pbpJobs :: ![Job]
-    , pbpExternalContainers :: ![ExternalContainer]
-    , pbpPreview :: !Value
+    { planPath :: !FilePath
+    , outDir :: !FilePath
+    , settings :: !Settings
+    , profiles :: ![Profile]
+    , cases :: ![BatchCase]
+    , jobs :: ![Job]
+    , externalContainers :: ![ExternalContainer]
+    , preview :: !Value
     }
 
 -- | Write plan.json atomically and return the strongly-typed 'PreparedBatchPlan'.
@@ -169,24 +172,24 @@ prepareBatchPlan configPath config options = do
     pure (either (Left . show) id result)
     where
         prepare = do
-            experiment <- ExceptT (loadExperimentPlan configPath config (planReference options))
-            let settings = resolveSettings (planOverrides options) experiment
+            experiment <- ExceptT (loadExperimentPlan configPath config options.reference)
+            let settings = resolveSettings options.overrides experiment
             except (validateSettings options settings)
             profiles <- except (resolveProfiles config options experiment)
-            inputs <- ExceptT (loadBatchInputs config (planInputs options))
+            inputs <- ExceptT (loadBatchInputs config options.inputs)
             when (null inputs) (throwE "no matching cases found.")
             containers <- except (validateTargets options settings inputs)
             let jobs =
                     [ Job (batchCaseId item) p repetition
                     | item <- inputs
                     , p <- profiles
-                    , repetition <- [1 .. workRepeats settings]
+                    , repetition <- [1 .. settings.repeats]
                     ]
                 ids = map jobId jobs
             unless
                 (Set.size (Set.fromList ids) == length ids)
                 (throwE "Case and profile names produce duplicate job IDs")
-            out <- lift (makeAbsolute (planOutputDir options))
+            out <- lift (makeAbsolute options.outputDir)
             now <- lift getCurrentTime
             let path = out </> "plan.json"
                 preview = previewJSON path settings inputs jobs
@@ -197,14 +200,14 @@ prepareBatchPlan configPath config options = do
                     (encode (manifestJSON now out options settings profiles inputs jobs) <> BSL.pack [10])
             pure
                 PreparedBatchPlan
-                    { pbpPlanPath = path
-                    , pbpOutDir = out
-                    , pbpSettings = settings
-                    , pbpProfiles = profiles
-                    , pbpCases = inputs
-                    , pbpJobs = jobs
-                    , pbpExternalContainers = containers
-                    , pbpPreview = preview
+                    { planPath = path
+                    , outDir = out
+                    , settings = settings
+                    , profiles = profiles
+                    , cases = inputs
+                    , jobs = jobs
+                    , externalContainers = containers
+                    , preview = preview
                     }
 
 previewJSON :: FilePath -> Settings -> [BatchCase] -> [Job] -> Value
@@ -214,8 +217,8 @@ previewJSON path settings inputs jobs =
         , "plan_path" .= path
         , "case_count" .= length inputs
         , "total_jobs" .= length jobs
-        , "jobs_workers" .= workWorkers settings
-        , "occam_jobs" .= workOccamJobs settings
+        , "jobs_workers" .= settings.workers
+        , "occam_jobs" .= settings.occamJobs
         ]
 
 manifestJSON ::
@@ -225,13 +228,13 @@ manifestJSON now out options settings profiles inputs jobs =
         [ "schema_version" .= (1 :: Int)
         , "created_at" .= now
         , "out_dir" .= out
-        , "jobs_workers" .= workWorkers settings
-        , "occam_jobs" .= workOccamJobs settings
-        , "replays" .= planReplays options
-        , "skip_input_replay" .= planSkipInputReplay options
-        , "reject_on_slippage" .= workRejectSlippage settings
-        , "resume" .= planResume options
-        , "rerun_failed" .= planRerunFailed options
+        , "jobs_workers" .= settings.workers
+        , "occam_jobs" .= settings.occamJobs
+        , "replays" .= options.replays
+        , "skip_input_replay" .= options.skipInputReplay
+        , "reject_on_slippage" .= settings.rejectSlippage
+        , "resume" .= options.resume
+        , "rerun_failed" .= options.rerunFailed
         , "profiles" .= profiles
         , "case_count" .= length inputs
         , "total_jobs" .= length jobs
@@ -241,37 +244,37 @@ manifestJSON now out options settings profiles inputs jobs =
 
 resolveSettings :: PlanOverrides -> ExperimentPlan -> Settings
 resolveSettings overrides experiment =
-    let oracle = planOracle experiment
+    let oracle = experiment.oracle
         pick :: (ExperimentPlan -> a) -> (PlanOverrides -> Maybe a) -> a
         pick defaultValue option = fromMaybe (defaultValue experiment) (option overrides)
      in Settings
-            { workRepeats = pick planRepeats overrideRepeats
-            , workWorkers = pick planWorkerJobs overrideWorkers
-            , workOccamJobs = pick planOccamJobs overrideOccamJobs
-            , workContainerWait = pick planContainerWaitSecs overrideContainerWait
-            , workTimeout = pick planTimeoutSecs overrideTimeout
-            , workBudget = pick planBudgetSecs (fmap Just . overrideBudget)
-            , workMaxExecutions =
-                pick (fmap toInteger . planMaxOracleExecutions) (fmap Just . overrideMaxExecutions)
-            , workNoCache = overrideNoCache overrides || planNoCache experiment
-            , workRejectSlippage = overrideRejectSlippage overrides || odRejectOnSlippage oracle
-            , workStackFrames = fromMaybe (odStackFrames oracle) (overrideStackFrames overrides)
+            { repeats = pick (\plan -> plan.repeats) (\options -> options.repeats)
+            , workers = pick (\plan -> plan.workerJobs) (\options -> options.workers)
+            , occamJobs = pick (\plan -> plan.occamJobs) (\options -> options.occamJobs)
+            , containerWait = pick (\plan -> plan.containerWaitSecs) (\options -> options.containerWait)
+            , timeout = pick (\plan -> plan.timeoutSecs) (\options -> options.timeout)
+            , budget = pick (\plan -> plan.budgetSecs) (\options -> Just <$> options.budget)
+            , maxExecutions =
+                pick (\plan -> fmap toInteger plan.maxOracleExecutions) (\options -> Just <$> options.maxExecutions)
+            , noCache = overrides.noCache || experiment.noCache
+            , rejectSlippage = overrides.rejectSlippage || oracle.rejectOnSlippage
+            , stackFrames = fromMaybe oracle.stackFrames overrides.stackFrames
             }
 
 validateSettings :: BatchPlanOptions -> Settings -> Either String ()
 validateSettings options settings = do
-    positive "--jobs" (workWorkers settings)
-    positive "--occam-jobs" (workOccamJobs settings)
-    positive "--repeats" (workRepeats settings)
-    when (planReplays options < 0) (Left "--replays must be non-negative")
-    positive "--stack-frames" (workStackFrames settings)
-    finite "--timeout" (workTimeout settings)
-    mapM_ (finite "--budget") (workBudget settings)
-    finite "--probe-timeout" (planProbeTimeout options)
-    positive "--container-wait" (workContainerWait settings)
+    positive "--jobs" settings.workers
+    positive "--occam-jobs" settings.occamJobs
+    positive "--repeats" settings.repeats
+    when (options.replays < 0) (Left "--replays must be non-negative")
+    positive "--stack-frames" settings.stackFrames
+    finite "--timeout" settings.timeout
+    mapM_ (finite "--budget") settings.budget
+    finite "--probe-timeout" options.probeTimeout
+    positive "--container-wait" settings.containerWait
     mapM_
         (\count -> when (count <= 0) (Left "--max-oracle-executions must be positive"))
-        (workMaxExecutions settings)
+        settings.maxExecutions
     where
         positive label count = when (count <= 0) (Left (label <> " must be a positive integer"))
         finite label seconds =
@@ -281,22 +284,22 @@ validateSettings options settings = do
 
 validateTargets :: BatchPlanOptions -> Settings -> [BatchCase] -> Either String [ExternalContainer]
 validateTargets options settings inputs = do
-    containers <- maybe (Right []) parseContainers (planExternalContainers options)
-    let serverCases = filter (dbmsServerBased . batchDbms) inputs
+    containers <- maybe (Right []) parseContainers options.externalContainers
+    let serverCases = filter (\item -> (batchDbms item).serverBased) inputs
         hasServer = not (null serverCases)
     when
-        (planLocalEmbedded options && not (null containers))
+        (options.localEmbedded && not (null containers))
         (Left "--local-embedded cannot be used with --containers")
-    when (planLocalEmbedded options && hasServer) $
+    when (options.localEmbedded && hasServer) $
         Left
             ( "--local-embedded supports sqlite/duckdb only, incompatible with server cases: "
                 <> show (map batchCaseId serverCases)
             )
-    when (workOccamJobs settings > 1 && hasServer && not (planAllowUnsafeJobs options)) $
+    when (settings.occamJobs > 1 && hasServer && not options.allowUnsafeJobs) $
         Left
             "--occam-jobs > 1 is unsafe for server DBMSes sharing one database per worker. Use --jobs for isolated workers."
-    when (hasServer && not (null containers) && workWorkers settings > length containers) $
-        Left ("--jobs requires " <> show (workWorkers settings) <> " isolated containers for server DBMSes")
+    when (hasServer && not (null containers) && settings.workers > length containers) $
+        Left ("--jobs requires " <> show settings.workers <> " isolated containers for server DBMSes")
     pure containers
 
 parseContainers :: Text -> Either String [ExternalContainer]
@@ -325,15 +328,15 @@ parseContainers raw = do
 
 resolveProfiles :: HarnessConfig -> BatchPlanOptions -> ExperimentPlan -> Either String [Profile]
 resolveProfiles config options experiment = do
-    custom <- Map.fromList <$> traverse parseCustom (planCustomProfiles options)
+    custom <- Map.fromList <$> traverse parseCustom options.customProfiles
     let builtIn =
-            Map.fromList [(profileKey p, Profile (profileName p) (profileCliFlags p)) | p <- hcProfiles config]
+            Map.fromList [(profile.key, Profile profile.name profile.cliFlags) | profile <- config.profiles]
         available = Map.union custom builtIn
         defaults =
-            if null (planProfiles experiment)
+            if null experiment.profiles
                 then ["Ours-S"]
-                else concatMap splitNames (planProfiles experiment)
-        names = maybe defaults splitNames (planSelectedProfiles options)
+                else concatMap splitNames experiment.profiles
+        names = maybe defaults splitNames options.selectedProfiles
         lookupProfile name = case Map.lookup (T.toLower name) available of
             Just p -> Right p
             Nothing ->

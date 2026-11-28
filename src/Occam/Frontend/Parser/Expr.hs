@@ -776,7 +776,9 @@ parseNullsOrder = evalContT do
             lift (expectWordCI "LAST" $> Just NullsLast)
     pure Nothing
 
--- | Parse @name = expr@ in a SETTINGS list.
+{- | Parse one @name = expr@ setting assignment.
+| Parse @name = expr@ in a SETTINGS list.
+-}
 parseSettingItem :: P (Located SettingItem)
 parseSettingItem = withLocated do
     name <- parseName

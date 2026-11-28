@@ -227,34 +227,15 @@ scanAll profile kwTable bs = do
             -- User / system variables (@user / @@sys) or SQLite @param or operators
             | b0 == 64 = scanAt i
             -- Numbers (starting with digit or '.' followed by digit)
-            | isAsciiDigit b0 = do
-                fieldIndex <-
-                    if i > 0 && hasByteAt (i - 1) 46
-                        then (== TokDot) <$> previousToken
-                        else pure False
-                let !endPos = if fieldIndex then scanWhile isAsciiDigit (i + 1) else scanNumber i
-                emitSpan i endPos (TokLiteral LitNumber (slice i endPos))
+            | isAsciiDigit b0 = scanNumberToken i
             | b0 == 46
             , Just b1 <- byteAt (i + 1)
-            , isAsciiDigit b1 = do
-                prev <- previousToken
-                if blocksLeadingDot prev
-                    then emitSpan i (i + 1) TokDot
-                    else
-                        let !endPos = scanNumberFraction (i + 1)
-                         in emitSpan i endPos (TokLiteral LitNumber (slice i endPos))
+            , isAsciiDigit b1 =
+                scanLeadingDotNumber i
             -- Unquoted identifier or keyword (ASCII start)
-            | isAsciiIdentStart b0 =
-                let !endPos = scanWordCont (i + 1)
-                    !raw = slice i endPos
-                    !mKw = lookupKeyword kwTable raw
-                 in emitSpan i endPos (TokWord (WordToken raw Nothing mKw))
+            | isAsciiIdentStart b0 = scanAsciiIdentifier i
             -- Unquoted Unicode identifier (non-ASCII alphabetic lead byte)
-            | b0 >= 0x80 && isUtf8IdentStart i =
-                let !charLen = utf8CharLen b0
-                    !endPos = scanWordCont (i + charLen)
-                    !raw = slice i endPos
-                 in emitSpan i endPos (TokWord (WordToken raw Nothing Nothing))
+            | b0 >= 0x80 && isUtf8IdentStart i = scanUnicodeIdentifier i
             -- Operators and punctuation
             | otherwise = scanPunctuation i b0
             where
@@ -444,6 +425,33 @@ scanAll profile kwTable bs = do
             | isAsciiIdentCont (at idx) = scanWordCont (idx + 1)
             | at idx >= 0x80 && isUtf8IdentCont idx = scanWordCont (idx + utf8CharLen (at idx))
             | otherwise = idx
+        scanNumberToken !i = do
+            fieldIndex <-
+                if i > 0 && hasByteAt (i - 1) 46
+                    then (== TokDot) <$> previousToken
+                    else pure False
+            let !endPos = if fieldIndex then scanWhile isAsciiDigit (i + 1) else scanNumber i
+            emitSpan i endPos (TokLiteral LitNumber (slice i endPos))
+
+        scanLeadingDotNumber !i = do
+            prev <- previousToken
+            if blocksLeadingDot prev
+                then emitSpan i (i + 1) TokDot
+                else
+                    let !endPos = scanNumberFraction (i + 1)
+                     in emitSpan i endPos (TokLiteral LitNumber (slice i endPos))
+
+        scanAsciiIdentifier !i =
+            let !endPos = scanWordCont (i + 1)
+                !raw = slice i endPos
+                !mKw = lookupKeyword kwTable raw
+             in emitSpan i endPos (TokWord (WordToken raw Nothing mKw))
+
+        scanUnicodeIdentifier !i =
+            let !charLen = utf8CharLen (at i)
+                !endPos = scanWordCont (i + charLen)
+                !raw = slice i endPos
+             in emitSpan i endPos (TokWord (WordToken raw Nothing Nothing))
 
         isUtf8IdentStart !idx =
             let !(ch, _) = decodeUtf8Char bs idx

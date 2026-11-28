@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | CLI reduction orchestration connecting oracle preparation, reduction strategies, and outputs.
 module Runner (
     runOccam,
@@ -216,17 +218,17 @@ runOccamWithLogger logger useColor opts@ValidatedOptions {..} = do
                         runEvaluationRequestWithObserver timeoutMicros (poObserver prepared)
             runEvaluation
                 EvaluationRequest
-                    { requestOnProgress = uiOnProgress ui
-                    , requestMetricsPolicy = metricsPolicy
-                    , requestConfig = poBudgetConfig prepared
-                    , requestDialect = valDialect
-                    , requestOracleConfig = ()
-                    , requestPreflightObservation = Just (detailedObservation (poPreflightDetails prepared))
-                    , requestLogger = logger
-                    , requestInitialSQL = initialSQL
-                    , requestCheckpoint = ""
-                    , requestAction = reductionAction
-                    , requestCollectCurve = isJust valStatsFile
+                    { onProgress = uiOnProgress ui
+                    , metricsPolicy = metricsPolicy
+                    , config = poBudgetConfig prepared
+                    , dialect = valDialect
+                    , oracleConfig = ()
+                    , preflightObservation = Just (detailedObservation (poPreflightDetails prepared))
+                    , logger = logger
+                    , initialSQL = initialSQL
+                    , checkpoint = ""
+                    , action = reductionAction
+                    , collectCurve = isJust valStatsFile
                     }
 
     finalizeReductionSession
@@ -258,10 +260,10 @@ finalizeReductionSession ::
     EvaluationResult ->
     IO ()
 finalizeReductionSession logger ui ValidatedOptions {..} prepared reductionConfig initialSQL initialBytes initialStmts writeToStdout targetMinimalPath statsPath result = do
-    let reducedSQL = evaluatedSQL result
-        evaluation = evaluationMetrics result
+    let reducedSQL = result.sql
+        evaluation = result.metrics
     reducedStmts <-
-        case evaluatedStatements result of
+        case result.statements of
             Just count -> pure count
             Nothing
                 | reducedSQL == initialSQL -> pure initialStmts
@@ -298,15 +300,15 @@ finalizeReductionSession logger ui ValidatedOptions {..} prepared reductionConfi
         logger
         "cli"
         "Reduction session finished"
-        [ ("status", toJSON (evaluationStatus evaluation))
+        [ ("status", toJSON evaluation.runStatus)
         , ("initial_statements", toJSON initialStmts)
         , ("reduced_statements", toJSON reducedStmts)
         , ("initial_bytes", toJSON initialBytes)
         , ("reduced_bytes", toJSON reducedBytes)
-        , ("database_observations", toJSON (oracle_executions stats))
-        , ("cache_hits", toJSON (cache_hits stats))
-        , ("cache_misses", toJSON (cache_misses stats))
-        , ("elapsed_seconds", toJSON (evaluationTotalSeconds evaluation))
+        , ("database_observations", toJSON stats.oracle_executions)
+        , ("cache_hits", toJSON stats.cache_hits)
+        , ("cache_misses", toJSON stats.cache_misses)
+        , ("elapsed_seconds", toJSON evaluation.totalSeconds)
         ]
 
     uiFinish
@@ -359,10 +361,10 @@ prepareSessionOracle ValidatedOptions {..} oracleCmd timeoutMicros reductionConf
                          in Right (details, observe, observe)
     let budgetConfig =
             configuredBudget
-                { evaluationPreflightMicros = preflightMicros
-                , evaluationPreflightAttempts = 1
-                , evaluationPreflightResetMicros = Just (resetElapsedMicros preflightDetails)
-                , evaluationPreflightOracleMicros = oracleElapsedMicros preflightDetails
+                { preflightMicros = preflightMicros
+                , preflightAttempts = 1
+                , preflightResetMicros = Just (resetElapsedMicros preflightDetails)
+                , preflightOracleMicros = oracleElapsedMicros preflightDetails
                 }
     pure
         PreparedOracle
@@ -442,9 +444,9 @@ buildReductionAction valStrategy initialParsed failPrefixCache lookupTrace reduc
             pure (ReductionActionResult sql (Just (ReductionEvidence sql (auditMinimalityConfirmed stats))))
 
 exitEvaluationStatus :: EvaluationMetrics -> IO a
-exitEvaluationStatus evaluation = case evaluationStatus evaluation of
+exitEvaluationStatus evaluation = case evaluation.runStatus of
     EvaluationCompleted
-        | evaluationValidationPassed evaluation -> exitSuccess
+        | evaluation.validationPassed -> exitSuccess
         | otherwise -> exitFailure
     EvaluationTimeout -> exitTimeout
     EvaluationExecutionBudget -> exitTimeout
@@ -530,15 +532,15 @@ buildBudgetConfig ::
     Bool -> Int -> Maybe Double -> Maybe Int -> Int -> EvaluationConfig
 buildBudgetConfig cacheEnabled jobs budgetSecs maxExecutions initialStmts =
     EvaluationConfig
-        { evaluationCacheEnabled = cacheEnabled
-        , evaluationJobs = jobs
-        , evaluationTotalTimeoutMicros = round . (* 1000000) <$> budgetSecs
-        , evaluationMaxOracleExecutions = maxExecutions
-        , evaluationPreflightMicros = 0
-        , evaluationPreflightAttempts = 0
-        , evaluationPreflightResetMicros = Nothing
-        , evaluationPreflightOracleMicros = Nothing
-        , evaluationInitialStatements = Just initialStmts
+        { cacheEnabled = cacheEnabled
+        , jobs = jobs
+        , totalTimeoutMicros = round . (* 1000000) <$> budgetSecs
+        , maxOracleExecutions = maxExecutions
+        , preflightMicros = 0
+        , preflightAttempts = 0
+        , preflightResetMicros = Nothing
+        , preflightOracleMicros = Nothing
+        , initialStatements = Just initialStmts
         }
 
 runPreflight ::

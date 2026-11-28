@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedLabels #-}
+
 -- | Catalog definitions: tables, views, indexes, triggers, sequences, types, schemas.
 module Occam.Dependency.Define (
     tableConstraintValues,
@@ -16,13 +18,13 @@ module Occam.Dependency.Define (
     processDefineSchema,
 ) where
 
+import Control.Monad.Trans.State.Strict (State, get, modify')
 import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Lens.Micro ((%~), (&), (.~), (?~))
 import Occam.Core.Schema (
     ColumnDef (..),
     Constraint (..),
@@ -84,6 +86,7 @@ import Occam.Dependency.State (
     IndexKey (..),
     IndexState (..),
     RelationKey (..),
+    RelationState (..),
     SequenceKey (..),
     SequenceState (..),
     SessionState,
@@ -93,37 +96,18 @@ import Occam.Dependency.State (
     addDeps,
     addTouches,
     ambiguousMutation,
-    catalogIndexesL,
-    catalogSchemasL,
-    catalogSequencesL,
-    catalogTriggersL,
-    catalogTypesL,
     clearRelationObjects,
-    evalCatalogL,
     insertRelation,
     lookupRelation,
     modifyRelation,
-    mutateResolved,
     newRelation,
-    relColumnLineageL,
-    relColumnsL,
-    relConditionColumnsL,
-    relConstraintsL,
-    relDefinitionL,
-    relIndexesL,
-    relInheritParentsL,
-    relOnCommitFrameIdL,
-    relOnCommitL,
-    relPartitionParentsL,
-    relSourceReadsL,
-    relSourcesL,
-    relTransactionalL,
-    relTriggersL,
-    relUnresolvedSourcesL,
  )
 import Occam.Dependency.Write (processRead, processReadWith)
+import Optics.Core ((%), (%~), (&))
 
 -- Shared definition helpers
+
+-- | Combine table-level constraints with inline column foreign-key constraints.
 tableConstraintValues :: TableDef -> [Constraint]
 tableConstraintValues definition =
     tableConstraints definition
@@ -132,6 +116,7 @@ tableConstraintValues definition =
            , foreignKey <- columnReferences column
            ]
 
+-- | Collect catalog dependencies required to resolve foreign-key parent tables.
 foreignKeyParentDeps :: SessionState -> Catalog -> [Constraint] -> Set StatementId
 foreignKeyParentDeps session catalog constraints =
     Set.unions
@@ -154,6 +139,7 @@ resolvedSourceKeysWith resolveFn session catalog readFacts =
         , Map.member key (catalogRelations catalog)
         ]
 
+-- | Resolve read-fact sources to currently present relation keys.
 resolvedSourceKeys :: SessionState -> Catalog -> [ReadFact] -> Set RelationKey
 resolvedSourceKeys = resolvedSourceKeysWith resolveRelationKeys
 
@@ -174,105 +160,114 @@ unresolvedSourceRefsWith resolveFn session catalog readFacts =
             ]
         ]
 
+-- | Return read-fact names that do not resolve to a present relation.
 unresolvedSourceRefs :: SessionState -> Catalog -> [ReadFact] -> Set NameRef
 unresolvedSourceRefs = unresolvedSourceRefsWith resolveRelationKeys
 
 -- Tables, views, indexes
-processDefineTable :: StatementId -> Eval -> TableDef -> Eval
-processDefineTable sid eval definition
-    | tableIfNotExists definition && isJust existing = eval2
-    | otherwise = eval2 & evalCatalogL .~ installTable
-    where
-        session = evalSession eval
-        catalog = evalCatalog eval
-        key =
-            RelationKey
-                (tableTemporary definition)
-                (qualifyDefinitionName session (tableName definition) (tableTemporary definition))
-        existing = lookupRelation catalog key
-        evalReads = Foldable.foldl' processRead eval (tableSources definition)
-        likeDeps =
-            maybe
-                Set.empty
-                ( \reference ->
-                    Set.unions
-                        [ relationReadDeps session catalog source ReadSchema [] False
-                        | source <- resolveRelationKeys session catalog reference
-                        ]
-                )
-                (tableLike definition)
-        existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
-        constraintValues = tableConstraintValues definition
-        parentDeps = foreignKeyParentDeps session catalog constraintValues
-        eval1 =
-            addTouches
-                (relationTouchKeys key)
-                ( addDeps
-                    ( likeDeps
-                        `Set.union` existingDeps
-                        `Set.union` parentDeps
-                        `Set.union` schemaPrefixDeps catalog (relationKeyName key)
+
+-- | Install a table definition, its constraints, source links, and dependencies.
+processDefineTable :: StatementId -> TableDef -> State Eval ()
+processDefineTable sid definition =
+    modify' $ \eval ->
+        let session = evalSession eval
+            catalog = evalCatalog eval
+            key =
+                RelationKey
+                    (tableTemporary definition)
+                    (qualifyDefinitionName session (tableName definition) (tableTemporary definition))
+            existing = lookupRelation catalog key
+            evalReads = Foldable.foldl' processRead eval (tableSources definition)
+            likeDeps =
+                maybe
+                    Set.empty
+                    ( \reference ->
+                        Set.unions
+                            [ relationReadDeps session catalog source ReadSchema [] False
+                            | source <- resolveRelationKeys session catalog reference
+                            ]
                     )
-                    evalReads
-                )
-        unresolved = unresolvedSourceRefs session catalog (tableSources definition)
-        eval2 = addUnresolvedSourceBarriers "table" (tableName definition) unresolved eval1
-        installTable =
-            let catalog1 = insertRelation key (newRelation TableRelation) (clearRelationObjects key catalog)
-                (catalog2, constraintKeys) =
-                    installConstraints session sid key constraintValues catalog1
-                onCommitFrame = case tableOnCommit definition of
-                    Just OnCommitDrop -> evalFrameId eval
-                    _ -> Nothing
-                relation =
-                    newRelation TableRelation
-                        & relDefinitionL ?~ sid
-                        & relColumnsL .~ Set.fromList (map columnName (tableColumns definition))
-                        & relSourcesL .~ resolvedSourceKeys session catalog (tableSources definition)
-                        & relUnresolvedSourcesL .~ unresolved
-                        & relSourceReadsL .~ tableSources definition
-                        & relPartitionParentsL .~ Set.fromList (maybeToList (tablePartitionParent definition))
-                        & relInheritParentsL .~ Set.fromList (tableInheritParents definition)
-                        & relOnCommitL .~ tableOnCommit definition
-                        & relOnCommitFrameIdL .~ onCommitFrame
-                        & relTransactionalL .~ tableTransactional definition
-                        & relConstraintsL .~ constraintKeys
-             in insertRelation key relation catalog2
+                    (tableLike definition)
+            existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
+            constraintValues = tableConstraintValues definition
+            parentDeps = foreignKeyParentDeps session catalog constraintValues
+            eval1 =
+                addTouches
+                    (relationTouchKeys key)
+                    ( addDeps
+                        ( likeDeps
+                            `Set.union` existingDeps
+                            `Set.union` parentDeps
+                            `Set.union` schemaPrefixDeps catalog (relationKeyName key)
+                        )
+                        evalReads
+                    )
+            unresolved = unresolvedSourceRefs session catalog (tableSources definition)
+            eval2 = addUnresolvedSourceBarriers "table" (tableName definition) unresolved eval1
+            installTable =
+                let catalog1 = insertRelation key (newRelation TableRelation) (clearRelationObjects key catalog)
+                    (catalog2, constraintKeys) =
+                        installConstraints session sid key constraintValues catalog1
+                    onCommitFrame = case tableOnCommit definition of
+                        Just OnCommitDrop -> evalFrameId eval
+                        _ -> Nothing
+                    relation =
+                        (newRelation TableRelation)
+                            { relDefinition = Just sid
+                            , relColumns = Set.fromList (map columnName (tableColumns definition))
+                            , relSources = resolvedSourceKeys session catalog (tableSources definition)
+                            , relUnresolvedSources = unresolved
+                            , relSourceReads = tableSources definition
+                            , relPartitionParents = Set.fromList (maybeToList (tablePartitionParent definition))
+                            , relInheritParents = Set.fromList (tableInheritParents definition)
+                            , relOnCommit = tableOnCommit definition
+                            , relOnCommitFrameId = onCommitFrame
+                            , relTransactional = tableTransactional definition
+                            , relConstraints = constraintKeys
+                            }
+                 in insertRelation key relation catalog2
+         in if tableIfNotExists definition && isJust existing
+                then eval2
+                else eval2 {evalCatalog = installTable}
 
-processDefineView :: StatementId -> Eval -> ViewDef -> Eval
-processDefineView sid eval definition
-    | viewIfNotExists definition && isJust existing = eval2
-    | otherwise = eval2 & evalCatalogL .~ insertRelation key relation (clearRelationObjects key catalog)
-    where
-        session = evalSession eval
-        catalog = evalCatalog eval
-        key =
-            RelationKey
-                (viewTemporary definition)
-                (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
-        resolveSource s = resolveViewSourceKeys s (viewTemporary definition)
-        existing = lookupRelation catalog key
-        evalReads = Foldable.foldl' (processReadWith resolveSource) eval (viewSources definition)
-        existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
-        eval1 =
-            addTouches
-                (relationTouchKeys key)
-                (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (relationKeyName key)) evalReads)
-        unresolved = unresolvedSourceRefsWith resolveSource session catalog (viewSources definition)
-        eval2 = addUnresolvedSourceBarriers "view" (viewName definition) unresolved eval1
-        kind
-            | viewMaterialized definition = MaterializedViewRelation
-            | otherwise = ViewRelation
-        relation =
-            newRelation kind
-                & relDefinitionL ?~ sid
-                & relColumnsL .~ Set.fromList (viewColumns definition)
-                & relSourcesL .~ resolvedSourceKeysWith resolveSource session catalog (viewSources definition)
-                & relUnresolvedSourcesL .~ unresolved
-                & relSourceReadsL .~ viewSources definition
-                & relColumnLineageL .~ viewColumnLineage definition
-                & relConditionColumnsL .~ viewConditionColumns definition
+-- | Install a view definition and its source/lineage metadata.
+processDefineView :: StatementId -> ViewDef -> State Eval ()
+processDefineView sid definition =
+    modify' $ \eval ->
+        let session = evalSession eval
+            catalog = evalCatalog eval
+            key =
+                RelationKey
+                    (viewTemporary definition)
+                    (qualifyDefinitionName session (viewName definition) (viewTemporary definition))
+            resolveSource s = resolveViewSourceKeys s (viewTemporary definition)
+            existing = lookupRelation catalog key
+            evalReads = Foldable.foldl' (processReadWith resolveSource) eval (viewSources definition)
+            existingDeps = maybe Set.empty (const (relationAllDeps session catalog key)) existing
+            eval1 =
+                addTouches
+                    (relationTouchKeys key)
+                    (addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (relationKeyName key)) evalReads)
+            unresolved = unresolvedSourceRefsWith resolveSource session catalog (viewSources definition)
+            eval2 = addUnresolvedSourceBarriers "view" (viewName definition) unresolved eval1
+            kind
+                | viewMaterialized definition = MaterializedViewRelation
+                | otherwise = ViewRelation
+            relation =
+                (newRelation kind)
+                    { relDefinition = Just sid
+                    , relColumns = Set.fromList (viewColumns definition)
+                    , relSources = resolvedSourceKeysWith resolveSource session catalog (viewSources definition)
+                    , relUnresolvedSources = unresolved
+                    , relSourceReads = viewSources definition
+                    , relColumnLineage = viewColumnLineage definition
+                    , relConditionColumns = viewConditionColumns definition
+                    }
+         in if viewIfNotExists definition && isJust existing
+                then eval2
+                else eval2 {evalCatalog = insertRelation key relation (clearRelationObjects key catalog)}
 
+-- | Collect view-source barriers after the definition's read dependencies.
 addUnresolvedSourceBarriers :: Text -> Name -> Set NameRef -> Eval -> Eval
 addUnresolvedSourceBarriers kindLabel objName unresolved eval0 =
     Foldable.foldl'
@@ -285,12 +280,11 @@ addUnresolvedSourceBarriers kindLabel objName unresolved eval0 =
         | reference <- Set.toList unresolved
         ]
 
-processDefineIndex :: StatementId -> Eval -> IndexDef -> Eval
-processDefineIndex sid eval definition = case tableKeys of
-    _ : _ : _ -> ambiguousMutation eval
-    _ -> mutateResolved (installDefinedIndex sid definition catalog tableKeys tableDeps) eval indexKeys
-    where
-        session = evalSession eval
+-- | Install an index and associate it with its resolved table.
+processDefineIndex :: StatementId -> IndexDef -> State Eval ()
+processDefineIndex sid definition = do
+    eval <- get
+    let session = evalSession eval
         catalog = evalCatalog eval
         tableKeys = resolveRelationKeys session catalog (indexTable definition)
         -- Resolve unqualified index in table's schema or current schema.
@@ -304,40 +298,59 @@ processDefineIndex sid eval definition = case tableKeys of
                 [ relationReadDeps session catalog tableKey ReadData (indexColumns definition) False
                 | tableKey <- tableKeys
                 ]
+    case tableKeys of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> case indexKeys of
+            [] -> pure ()
+            [indexKey] -> installDefinedIndex sid definition catalog tableKeys tableDeps indexKey
+            _ -> modify' ambiguousMutation
 
 installDefinedIndex ::
-    StatementId -> IndexDef -> Catalog -> [RelationKey] -> Set StatementId -> Eval -> IndexKey -> Eval
-installDefinedIndex sid definition catalog tableKeys tableDeps current indexKey
-    | indexIfNotExists definition && isJust existing = current1
-    | otherwise = current1 & evalCatalogL .~ catalog2
-    where
-        existing = Map.lookup indexKey (catalogIndexes (evalCatalog current))
-        existingDeps =
-            maybe
-                Set.empty
-                (\state -> Set.fromList (catMaybes [indexDefinition state, indexRestoredBy state]))
-                existing
-        ownerName = case indexKey of
-            NamedIndexKey name -> name
-            TableIndexKey table _ -> relationKeyName table
-        current1 =
-            addTouches
-                (indexTouchKeys indexKey (listToMaybe tableKeys))
-                (addDeps (tableDeps `Set.union` existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current)
-        catalog0 =
-            maybe
-                (evalCatalog current1)
-                (\oldKey -> modifyRelation oldKey (relIndexesL %~ Set.delete indexKey) (evalCatalog current1))
-                (existing >>= indexStateTable)
-        newState = IndexState (Just sid) (listToMaybe tableKeys) (indexColumns definition) Nothing
-        catalog1 = catalog0 & catalogIndexesL %~ Map.insert indexKey newState
-        catalog2 =
-            Foldable.foldl'
-                (\cat' tableKey -> modifyRelation tableKey (relIndexesL %~ Set.insert indexKey) cat')
-                catalog1
-                tableKeys
+    StatementId -> IndexDef -> Catalog -> [RelationKey] -> Set StatementId -> IndexKey -> State Eval ()
+installDefinedIndex sid definition catalog tableKeys tableDeps indexKey =
+    modify' $ \current ->
+        let existing = Map.lookup indexKey (catalogIndexes (evalCatalog current))
+            existingDeps =
+                maybe
+                    Set.empty
+                    (\state -> Set.fromList (catMaybes [indexDefinition state, indexRestoredBy state]))
+                    existing
+            ownerName = case indexKey of
+                NamedIndexKey name -> name
+                TableIndexKey table _ -> relationKeyName table
+            current1 =
+                addTouches
+                    (indexTouchKeys indexKey (listToMaybe tableKeys))
+                    (addDeps (tableDeps `Set.union` existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current)
+            catalog0 =
+                maybe
+                    (evalCatalog current1)
+                    ( \oldKey ->
+                        modifyRelation
+                            oldKey
+                            (\relation -> relation {relIndexes = Set.delete indexKey (relIndexes relation)})
+                            (evalCatalog current1)
+                    )
+                    (existing >>= indexStateTable)
+            newState = IndexState (Just sid) (listToMaybe tableKeys) (indexColumns definition) Nothing
+            catalog1 = catalog0 {catalogIndexes = Map.insert indexKey newState (catalogIndexes catalog0)}
+            catalog2 =
+                Foldable.foldl'
+                    ( \cat' tableKey ->
+                        modifyRelation
+                            tableKey
+                            (\relation -> relation {relIndexes = Set.insert indexKey (relIndexes relation)})
+                            cat'
+                    )
+                    catalog1
+                    tableKeys
+         in if indexIfNotExists definition && isJust existing
+                then current1
+                else current1 {evalCatalog = catalog2}
 
 -- Trigger body dependencies
+
+-- | Collect dependencies referenced by inline trigger effects.
 triggerBodyDeps :: SessionState -> Catalog -> TriggerBody -> Set StatementId
 triggerBodyDeps session catalog = \case
     TriggerInline effects -> Set.unions (map effectDeps effects)
@@ -360,6 +373,7 @@ triggerBodyDeps session catalog = \case
             TriggerSession _ -> Set.empty
             TriggerBarrier _ -> Set.empty
 
+-- | Return the target relation for any supported DML event.
 dmlEventTarget :: DmlEvent -> NameRef
 dmlEventTarget = \case
     DmlInsert target _ -> target
@@ -368,6 +382,7 @@ dmlEventTarget = \case
     DmlDelete target _ -> target
     DmlTruncate target _ -> target
 
+-- | Collect sequence-definition and prior-write dependencies for a sequence target.
 sequenceWriteDeps :: SessionState -> Catalog -> NameRef -> Set StatementId
 sequenceWriteDeps session catalog target =
     Set.unions
@@ -378,13 +393,13 @@ sequenceWriteDeps session catalog target =
         ]
 
 -- Triggers, sequences, types, schemas
-processDefineTrigger :: StatementId -> Eval -> TriggerDef -> Eval
-processDefineTrigger sid eval definition = case tableKeys of
-    _ : _ : _ -> ambiguousMutation eval
-    _ -> mutateResolved (installDefinedTrigger sid definition catalog tableKeys) eval1 triggerKeys
-    where
-        session = evalSession eval
-        catalog = evalCatalog eval
+
+-- | Install a trigger and record dependencies from its target, conditions, and body.
+processDefineTrigger :: StatementId -> TriggerDef -> State Eval ()
+processDefineTrigger sid definition = do
+    initial <- get
+    let session = evalSession initial
+        catalog = evalCatalog initial
         triggerKeys = resolveTriggerKeys session catalog (triggerRef definition)
         tableKeys = resolveRelationKeys session catalog (triggerTable definition)
         tableDeps = Set.unions [relationAllDeps session catalog tableKey | tableKey <- tableKeys]
@@ -405,118 +420,147 @@ processDefineTrigger sid eval definition = case tableKeys of
                 | readFact <- triggerWhenReads definition
                 , key <- resolveRelationKeys session catalog (readSource readFact)
                 ]
-        eval0 = case triggerBody definition of
-            TriggerFunction name _ ->
-                -- Opaque function trigger bodies require a barrier.
-                addBarrier
-                    ( ScopedBarrier
-                        GlobalScope
-                        UnsupportedTriggerBodyBarrier
-                        (Just ("trigger function " <> nameText name))
-                    )
-                    eval
-            _ -> eval
-        eval1 =
-            addTouches
-                (concatMap (`triggerTouchKeys` listToMaybe tableKeys) triggerKeys)
-                (addDeps (tableDeps `Set.union` referencedDeps `Set.union` bodyDeps `Set.union` whenDeps) eval0)
+    case tableKeys of
+        _ : _ : _ -> modify' ambiguousMutation
+        _ -> do
+            modify' $ \eval ->
+                let eval0 = case triggerBody definition of
+                        TriggerFunction name _ ->
+                            -- Opaque function trigger bodies require a barrier.
+                            addBarrier
+                                ( ScopedBarrier
+                                    GlobalScope
+                                    UnsupportedTriggerBodyBarrier
+                                    (Just ("trigger function " <> nameText name))
+                                )
+                                eval
+                        _ -> eval
+                 in addTouches
+                        (concatMap (`triggerTouchKeys` listToMaybe tableKeys) triggerKeys)
+                        (addDeps (tableDeps `Set.union` referencedDeps `Set.union` bodyDeps `Set.union` whenDeps) eval0)
+            case triggerKeys of
+                [] -> pure ()
+                [triggerKey] -> installDefinedTrigger sid definition catalog tableKeys triggerKey
+                _ -> modify' ambiguousMutation
 
 installDefinedTrigger ::
-    StatementId -> TriggerDef -> Catalog -> [RelationKey] -> Eval -> TriggerKey -> Eval
-installDefinedTrigger sid definition catalog tableKeys current triggerKey
-    | triggerIfNotExists definition && isJust existing = current1
-    | otherwise = current1 & evalCatalogL .~ catalog2
-    where
-        existing = Map.lookup triggerKey (catalogTriggers (evalCatalog current))
-        existingDeps =
-            maybe
-                Set.empty
-                (\state -> Set.fromList (catMaybes [triggerDefinition state, triggerRestoredBy state]))
-                existing
-        ownerName = case triggerKey of
-            NamedTriggerKey name -> name
-            TableTriggerKey table _ -> relationKeyName table
-        current1 = addDeps (existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current
-        catalog0 =
-            maybe
-                (evalCatalog current1)
-                (\oldKey -> modifyRelation oldKey (relTriggersL %~ Set.delete triggerKey) (evalCatalog current1))
-                (existing >>= triggerStateTable)
-        newState =
-            TriggerState
-                (Just sid)
-                (listToMaybe tableKeys)
-                (triggerTiming definition)
-                (triggerEvents definition)
-                (triggerWhenReads definition)
-                (triggerBody definition)
-                Nothing
-        catalog1 = catalog0 & catalogTriggersL %~ Map.insert triggerKey newState
-        catalog2 =
-            Foldable.foldl'
-                (\cat' tableKey -> modifyRelation tableKey (relTriggersL %~ Set.insert triggerKey) cat')
-                catalog1
-                tableKeys
+    StatementId -> TriggerDef -> Catalog -> [RelationKey] -> TriggerKey -> State Eval ()
+installDefinedTrigger sid definition catalog tableKeys triggerKey =
+    modify' $ \current ->
+        let existing = Map.lookup triggerKey (catalogTriggers (evalCatalog current))
+            existingDeps =
+                maybe
+                    Set.empty
+                    (\state -> Set.fromList (catMaybes [triggerDefinition state, triggerRestoredBy state]))
+                    existing
+            ownerName = case triggerKey of
+                NamedTriggerKey name -> name
+                TableTriggerKey table _ -> relationKeyName table
+            current1 = addDeps (existingDeps `Set.union` schemaPrefixDeps catalog ownerName) current
+            catalog0 =
+                maybe
+                    (evalCatalog current1)
+                    ( \oldKey ->
+                        modifyRelation
+                            oldKey
+                            (\relation -> relation {relTriggers = Set.delete triggerKey (relTriggers relation)})
+                            (evalCatalog current1)
+                    )
+                    (existing >>= triggerStateTable)
+            newState =
+                TriggerState
+                    (Just sid)
+                    (listToMaybe tableKeys)
+                    (triggerTiming definition)
+                    (triggerEvents definition)
+                    (triggerWhenReads definition)
+                    (triggerBody definition)
+                    Nothing
+            catalog1 = catalog0 {catalogTriggers = Map.insert triggerKey newState (catalogTriggers catalog0)}
+            catalog2 =
+                Foldable.foldl'
+                    ( \cat' tableKey ->
+                        modifyRelation
+                            tableKey
+                            (\relation -> relation {relTriggers = Set.insert triggerKey (relTriggers relation)})
+                            cat'
+                    )
+                    catalog1
+                    tableKeys
+         in if triggerIfNotExists definition && isJust existing
+                then current1
+                else current1 {evalCatalog = catalog2}
 
-processDefineSequence :: StatementId -> Eval -> SequenceDef -> Eval
-processDefineSequence sid eval definition =
-    let session = evalSession eval
-        catalog = evalCatalog eval
-        key =
-            SequenceKey
-                (sequenceTemporary definition)
-                (qualifyDefinitionName session (sequenceName definition) (sequenceTemporary definition))
-        existing = Map.lookup key (catalogSequences catalog)
-        existingDeps =
-            maybe
-                Set.empty
-                ( Set.fromList
-                    . catMaybes
-                    . (\sequenceState -> [sequenceDefinition sequenceState, sequenceRestoredBy sequenceState])
-                )
-                existing
-        state =
-            SequenceState
-                (Just sid)
-                Set.empty
-                Set.empty
-                Nothing
-                (sequenceTransactional definition)
-     in eval
-            & addTouches (sequenceTouchKeys key)
-            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (sequenceKeyName key))
-            & evalCatalogL . catalogSequencesL %~ Map.insert key state
+-- | Install sequence state and dependencies for a sequence definition.
+processDefineSequence :: StatementId -> SequenceDef -> State Eval ()
+processDefineSequence sid definition =
+    modify' $ \eval ->
+        let session = evalSession eval
+            catalog = evalCatalog eval
+            key =
+                SequenceKey
+                    (sequenceTemporary definition)
+                    (qualifyDefinitionName session (sequenceName definition) (sequenceTemporary definition))
+            existing = Map.lookup key (catalogSequences catalog)
+            existingDeps =
+                maybe
+                    Set.empty
+                    ( Set.fromList
+                        . catMaybes
+                        . (\sequenceState -> [sequenceDefinition sequenceState, sequenceRestoredBy sequenceState])
+                    )
+                    existing
+            state =
+                SequenceState
+                    (Just sid)
+                    Set.empty
+                    Set.empty
+                    Nothing
+                    (sequenceTransactional definition)
+         in eval
+                & addTouches (sequenceTouchKeys key)
+                & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog (sequenceKeyName key))
+                & (#evalCatalog % #catalogSequences %~ Map.insert key state)
 
-processDefineType :: StatementId -> Eval -> TypeDef -> Eval
-processDefineType sid eval definition =
-    let catalog = evalCatalog eval
-        name = qualifyObjectName (evalSession eval) (typeName definition)
-        existing = Map.lookup name (catalogTypes catalog)
-        existingDeps =
-            maybe
-                Set.empty
-                (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
-                existing
-     in eval
-            & addTouches (typeTouchKeys name)
-            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
-            & evalCatalogL . catalogTypesL %~ Map.insert name (DefinitionState (Just sid) Nothing)
+-- | Install a type definition and depend on any prior definition it replaces.
+processDefineType :: StatementId -> TypeDef -> State Eval ()
+processDefineType sid definition =
+    modify' $ \eval ->
+        let catalog = evalCatalog eval
+            name = qualifyObjectName (evalSession eval) (typeName definition)
+            existing = Map.lookup name (catalogTypes catalog)
+            existingDeps =
+                maybe
+                    Set.empty
+                    (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                    existing
+         in eval
+                & addTouches (typeTouchKeys name)
+                & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
+                & (#evalCatalog % #catalogTypes %~ Map.insert name (DefinitionState (Just sid) Nothing))
 
-processDefineSchema :: StatementId -> Eval -> SchemaDef -> Eval
-processDefineSchema sid eval definition =
-    let catalog = evalCatalog eval
-        name = schemaName definition
-        existing = Map.lookup name (catalogSchemas catalog)
-        existingDeps =
-            maybe
-                Set.empty
-                (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
-                existing
-        catalog1 =
-            if isJust existing
-                then catalog
-                else catalog & catalogSchemasL %~ Map.insert name (DefinitionState (Just sid) Nothing)
-     in eval
-            & addTouches (schemaTouchKeys name)
-            & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
-            & evalCatalogL .~ catalog1
+-- | Install a schema definition and depend on its previous state.
+processDefineSchema :: StatementId -> SchemaDef -> State Eval ()
+processDefineSchema sid definition =
+    modify' $ \eval ->
+        let catalog = evalCatalog eval
+            name = schemaName definition
+            existing = Map.lookup name (catalogSchemas catalog)
+            existingDeps =
+                maybe
+                    Set.empty
+                    (Set.fromList . catMaybes . (\state -> [definitionStatement state, definitionRestoredBy state]))
+                    existing
+            catalog1 =
+                if isJust existing
+                    then catalog
+                    else
+                        catalog
+                            { catalogSchemas = Map.insert name (DefinitionState (Just sid) Nothing) (catalogSchemas catalog)
+                            }
+         in ( eval
+                & addTouches (schemaTouchKeys name)
+                & addDeps (existingDeps `Set.union` schemaPrefixDeps catalog name)
+            )
+                { evalCatalog = catalog1
+                }

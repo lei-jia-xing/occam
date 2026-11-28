@@ -40,6 +40,12 @@ External Predicate (--oracle / --reset)  OR  In-Process Result Oracle (SQLite / 
 - When both unrestricted fallback and closure search are enabled, the reducer tries unrestricted deletion first if the current graph contains a global fence.
 - See [Dialect Semantic Coverage](DIALECTS.md) for per-dialect modeling details and opaque boundaries.
 
+### Evaluation and effect boundaries (`src/Occam/Evaluation.hs`, `src/Occam/Dependency.hs`)
+
+- Catalog operations use strict `State Eval` from `transformers`, dispatched in `CatalogOp` order; pure read and rename helpers remain pure where useful.
+- Keep existing `ExceptT`, `MaybeT`, and `ContT` in their confined IO flows. Their local/shared unlift and continuation scopes are not equivalent to a broad effect runtime.
+- `effectful-core` is available in Stackage LTS 24.68, but adopting it adds dependencies and requires local-versus-shared unlift and continuation-scope choices that do not match the current confined transformer flows. No measured performance benefit is asserted; preserve the specialized lexer/parser loops and ordered pool scheduler without adopting `effectful`.
+
 ### Reduction Stages (`src/Occam/Reducer.hs`)
 
 1. **Root selection & backward slice**: starts from the last result-producing statement observed by `--result-oracle` when engine and frontend statement counts agree, otherwise from the script's last statement. Tests that statement's backward slice and probes prefixes with binary search (a heuristic for nonmonotone predicates; every selected candidate still requires oracle acceptance).

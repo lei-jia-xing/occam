@@ -28,6 +28,7 @@ import Occam.Frontend.Span (ByteSpan, Located (..), mergeSpan)
 import Occam.Parser.Dialect (DialectFeature (..), DialectProfile (..))
 import Occam.Parser.Types (SQLDialect (..))
 
+-- | Parse a dialect-supported @PRAGMA@ assignment with its raw or expression value.
 parsePragma :: P (Located PragmaStmt)
 parsePragma = withLocated do
     tok <- expectWordCI "PRAGMA"
@@ -66,6 +67,7 @@ parsePragmaParenthesized = do
 isBarePragmaValue :: ByteString -> Bool
 isBarePragmaValue = wordIn ["ON", "OFF", "YES", "NO", "TRUE", "FALSE", "MEMORY", "WAL", "DELETE", "TRUNCATE"]
 
+-- | Parse SET scope, targets, values, or transaction modes.
 parseSet :: P (Located SetStmt)
 parseSet = withLocated do
     tok <- expectWordCI "SET"
@@ -265,6 +267,7 @@ commaStartsSetTarget = do
 isBareSetValue :: ByteString -> Bool
 isBareSetValue = wordIn ["ON", "OFF", "YES", "NO", "MEMORY", "ALL", "NONE"]
 
+-- | Parse supported RESET forms, including role/session targets where available.
 parseReset :: P (Located ResetStmt)
 parseReset = withLocated do
     tok <- expectWordCI "RESET"
@@ -289,6 +292,7 @@ parseReset = withLocated do
                 _ -> SetTargetName <$> parseName
             pure (ResetTarget target)
 
+-- | Parse MySQL/MariaDB table-lock declarations and their lock modes.
 parseLockTables :: P (Located LockTablesStmt)
 parseLockTables = withLocated do
     tok <- expectWordCI "LOCK"
@@ -316,6 +320,7 @@ parseLockTableItem = withLocated do
         lift (expectWordCI "WRITE" $> "WRITE")
     pure (LockTableItem table alias lockType)
 
+-- | Parse MySQL/MariaDB @UNLOCK TABLES@.
 parseUnlockTables :: P (Located Statement)
 parseUnlockTables = withLocated do
     tok <- expectWordCI "UNLOCK"
@@ -325,6 +330,7 @@ parseUnlockTables = withLocated do
             >>= maybe (unexpectedHere "expected TABLES or TABLE after UNLOCK") pure
     pure StatementUnlockTables
 
+-- | Parse @GRANT@ or @REVOKE@ according to the supplied selector.
 parseGrant :: Bool -> P (Located GrantStmt)
 parseGrant isRevoke = withLocated do
     tok <- expectWordCI (if isRevoke then "REVOKE" else "GRANT")
@@ -373,6 +379,7 @@ parseGrant isRevoke = withLocated do
                         pure (L fullSpan (Name parts))
                 _ -> parseName
 
+-- | Parse dialect-specific transaction control, savepoints, and transaction modes.
 parseTransaction :: P (Located TransactionStmt)
 parseTransaction = withLocated $ evalContT do
     onWord "BEGIN" do

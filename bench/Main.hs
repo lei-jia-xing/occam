@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
@@ -218,42 +220,42 @@ runNativeAudit sql expected = do
     result <-
         runEvaluationRequestWithNativeValidation timeoutMicros observe validate $
             EvaluationRequest
-                { requestOnProgress = \_ -> pure ()
-                , requestMetricsPolicy = Just (MetricPolicy "audit-only" "off" 1)
-                , requestConfig =
+                { onProgress = \_ -> pure ()
+                , metricsPolicy = Just (MetricPolicy "audit-only" "off" 1)
+                , config =
                     EvaluationConfig
-                        { evaluationCacheEnabled = True
-                        , evaluationJobs = 1
-                        , evaluationTotalTimeoutMicros = Nothing
-                        , evaluationMaxOracleExecutions = Nothing
-                        , evaluationPreflightMicros = fromMaybe 0 (oracleElapsedMicros preflight)
-                        , evaluationPreflightAttempts = 1
-                        , evaluationPreflightResetMicros = Just 0
-                        , evaluationPreflightOracleMicros = oracleElapsedMicros preflight
-                        , evaluationInitialStatements = Nothing
+                        { cacheEnabled = True
+                        , jobs = 1
+                        , totalTimeoutMicros = Nothing
+                        , maxOracleExecutions = Nothing
+                        , preflightMicros = fromMaybe 0 (oracleElapsedMicros preflight)
+                        , preflightAttempts = 1
+                        , preflightResetMicros = Just 0
+                        , preflightOracleMicros = oracleElapsedMicros preflight
+                        , initialStatements = Nothing
                         }
-                , requestDialect = SQLite
-                , requestOracleConfig = ()
-                , requestPreflightObservation = Just (detailedObservation preflight)
-                , requestLogger = nullLogger
-                , requestInitialSQL = sql
-                , requestCheckpoint = ""
-                , requestAction = \_ logger pool -> do
+                , dialect = SQLite
+                , oracleConfig = ()
+                , preflightObservation = Just (detailedObservation preflight)
+                , logger = nullLogger
+                , initialSQL = sql
+                , checkpoint = ""
+                , action = \_ logger pool -> do
                     (reduced, stats) <-
                         statementAuditWithParser logger (parseStatementsFast (poolMetricsStore pool) SQLite) pool sql
                     pure
                         (ReductionActionResult reduced (Just (ReductionEvidence reduced (auditMinimalityConfirmed stats))))
-                , requestCollectCurve = True
+                , collectCurve = True
                 }
-    let metrics = evaluationMetrics result
+    let metrics = result.metrics
     unless
-        ( evaluatedSQL result == expected
-            && evaluationStatus metrics == EvaluationCompleted
-            && evaluationValidationPassed metrics
-            && evaluationMinimalityClaim metrics == StatementDeletionOneMinimal
+        ( result.sql == expected
+            && metrics.runStatus == EvaluationCompleted
+            && metrics.validationPassed
+            && metrics.minimalityClaim == StatementDeletionOneMinimal
         )
         (die "occam-bench: product audit failed its endpoint or validation check")
-    pure (BS.length (evaluatedSQL result))
+    pure (BS.length result.sql)
     where
         timeoutMicros = 5000000
 

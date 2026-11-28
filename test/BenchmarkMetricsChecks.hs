@@ -193,15 +193,15 @@ tests =
 sampleEvaluationBudget :: EvaluationConfig
 sampleEvaluationBudget =
     EvaluationConfig
-        { evaluationCacheEnabled = True
-        , evaluationJobs = 1
-        , evaluationTotalTimeoutMicros = Nothing
-        , evaluationMaxOracleExecutions = Nothing
-        , evaluationPreflightMicros = 0
-        , evaluationPreflightAttempts = 0
-        , evaluationPreflightResetMicros = Nothing
-        , evaluationPreflightOracleMicros = Nothing
-        , evaluationInitialStatements = Just 10
+        { cacheEnabled = True
+        , jobs = 1
+        , totalTimeoutMicros = Nothing
+        , maxOracleExecutions = Nothing
+        , preflightMicros = 0
+        , preflightAttempts = 0
+        , preflightResetMicros = Nothing
+        , preflightOracleMicros = Nothing
+        , initialStatements = Just 10
         }
 
 sampleMetricsSnapshot :: MetricsSnapshot
@@ -220,48 +220,48 @@ sampleMetricsSnapshot =
 sampleEvaluationMetrics :: EvaluationMetrics
 sampleEvaluationMetrics =
     EvaluationMetrics
-        { evaluationStatus = EvaluationCompleted
-        , evaluationFailure = Nothing
-        , evaluationCacheUsed = True
-        , evaluationBudget = sampleEvaluationBudget
-        , evaluationTotalSeconds = 7.25
-        , evaluationReductionSeconds = 7.25
-        , evaluationOracleSeconds = 5.0
-        , evaluationResetSeconds = 0.0
-        , evaluationPreflightResetSeconds = Nothing
-        , evaluationPreflightOracleSeconds = Nothing
-        , evaluationOracleAttempts = 4
-        , evaluationDatabaseObservations = 4
-        , evaluationCompletedOracleProcesses = 4
-        , evaluationAcceptedObservations = 2
-        , evaluationRejectedObservations = 2
-        , evaluationTimedOutObservations = 0
-        , evaluationResetFailures = 0
-        , evaluationOracleErrors = 0
-        , evaluationCancelledObservations = 0
-        , evaluationOracleOutcomes = Map.empty
-        , evaluationCacheHits = 3
-        , evaluationCacheMisses = 1
-        , evaluationCacheJoins = 0
-        , evaluationValidationSeconds = 0.0
-        , evaluationValidationOracleSeconds = 0.0
-        , evaluationValidationResetSeconds = 0.0
-        , evaluationValidationObservations = 0
-        , evaluationValidationDatabaseObservations = 0
-        , evaluationValidationErrors = 0
-        , evaluationValidationOutcomes = Map.empty
-        , evaluationValidationPassed = True
-        , evaluationAuditSeconds = 0.0
-        , evaluationAuditChecks = 0
-        , evaluationAuditCompleted = True
-        , evaluationAuditSkipped = False
-        , evaluationMinimalityClaim = MinimalityNotEstablished
-        , evaluationCurve =
+        { runStatus = EvaluationCompleted
+        , failure = Nothing
+        , cacheUsed = True
+        , budget = sampleEvaluationBudget
+        , totalSeconds = 7.25
+        , reductionSeconds = 7.25
+        , oracleSeconds = 5.0
+        , resetSeconds = 0.0
+        , preflightResetSeconds = Nothing
+        , preflightOracleSeconds = Nothing
+        , oracleAttempts = 4
+        , databaseObservations = 4
+        , completedOracleProcesses = 4
+        , acceptedObservations = 2
+        , rejectedObservations = 2
+        , timedOutObservations = 0
+        , resetFailures = 0
+        , oracleErrors = 0
+        , cancelledObservations = 0
+        , oracleOutcomes = Map.empty
+        , cacheHits = 3
+        , cacheMisses = 1
+        , cacheJoins = 0
+        , validationSeconds = 0.0
+        , validationOracleSeconds = 0.0
+        , validationResetSeconds = 0.0
+        , validationObservations = 0
+        , validationDatabaseObservations = 0
+        , validationErrors = 0
+        , validationOutcomes = Map.empty
+        , validationPassed = True
+        , auditSeconds = 0.0
+        , auditChecks = 0
+        , auditCompleted = True
+        , auditSkipped = False
+        , minimalityClaim = MinimalityNotEstablished
+        , curve =
             [ EvaluationPoint 1.0 1 1000 Nothing False True
             , EvaluationPoint 2.0 2 500 Nothing False True
             , EvaluationPoint 3.0 3 100 Nothing False False
             , EvaluationPoint 4.0 4 200 Nothing False True
             ]
-        , evaluationStages = []
-        , evaluationCostAttribution = Just sampleMetricsSnapshot
+        , stages = []
+        , costAttribution = Just sampleMetricsSnapshot
         }

@@ -1,3 +1,6 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Typed aggregation and decision-log summaries for Occam batch evaluations.
 module Occam.Benchmark.BatchReport (
     AggregatedReport (..),
@@ -105,12 +108,12 @@ instance FromJSON MetricSummary where
 
 -- | Lenient @evaluation_curve@ entry supporting partial test fixtures and legacy camelCase.
 data CurvePointInput = CurvePointInput
-    { cpiElapsedSeconds :: !Double
-    , cpiCallIndex :: !Int
-    , cpiCandidateBytes :: !(Maybe Int)
-    , cpiCandidateStatements :: !(Maybe Int)
-    , cpiCacheHit :: !Bool
-    , cpiAccepted :: !Bool
+    { elapsedSeconds :: !Double
+    , callIndex :: !Int
+    , candidateBytes :: !(Maybe Int)
+    , candidateStatements :: !(Maybe Int)
+    , cacheHit :: !Bool
+    , accepted :: !Bool
     }
     deriving (Eq, Show)
 
@@ -127,12 +130,12 @@ instance FromJSON CurvePointInput where
 toEvaluationPoint :: Int -> CurvePointInput -> EvaluationPoint
 toEvaluationPoint fallbackBytes pt =
     EvaluationPoint
-        { pointElapsedSeconds = cpiElapsedSeconds pt
-        , pointCallIndex = cpiCallIndex pt
-        , pointCandidateBytes = fromMaybe fallbackBytes (cpiCandidateBytes pt)
-        , pointCandidateStatements = cpiCandidateStatements pt
-        , pointCacheHit = cpiCacheHit pt
-        , pointAccepted = cpiAccepted pt
+        { elapsedSeconds = pt.elapsedSeconds
+        , callIndex = pt.callIndex
+        , candidateBytes = fromMaybe fallbackBytes pt.candidateBytes
+        , candidateStatements = pt.candidateStatements
+        , cacheHit = pt.cacheHit
+        , accepted = pt.accepted
         }
 
 -- | Lenient subset of @EvaluationMetrics@ needed for batch reporting.
@@ -606,7 +609,7 @@ collectRunRecord jobRes mStats =
         attempts = stOracleAttempts =<< mStats
         fallbackBytes = fromMaybe 0 initBytesVal
         curve = maybe [] (map (toEvaluationPoint fallbackBytes) . semCurve) mEm
-        peakIdx = Foldable.foldl' (\acc pt -> max acc (pointCallIndex pt)) 0 curve
+        peakIdx = Foldable.foldl' (\acc pt -> max acc pt.callIndex) 0 curve
         totalAucCalls = max (fromMaybe 0 attempts) peakIdx
         attemptAuc = case (mStats, initBytesVal) of
             (Just _, Just ib) | ib /= 0 -> Just (computeAttemptAuc ib curve totalAucCalls)
@@ -690,71 +693,64 @@ aggregateGroup records =
     let completed = filter recIsCompleted records
         censored = filter recIsCensored records
         withCheckpoints =
-            [ r
-            | r <- records
-            , isJust (recReducedBytes r)
-            , recIsCompleted r || recIsCensored r
-            ]
+            filter
+                (\record -> isJust (recReducedBytes record) && (recIsCompleted record || recIsCensored record))
+                records
         replayChecked = filter ((> 0) . recReducedReplayRunsRequired) records
-        replayPassed5 = filter ((== Just True) . recReducedReplayAllPassed) replayChecked
-        replayZeroSlip =
-            [ r
-            | r <- replayChecked
-            , recReducedReplayAllPassed r == Just True
-            , recReducedReplayMatchesBaseline r == Just True
-            ]
-        replaySlipped =
-            [ r
-            | r <- replayChecked
-            , fromMaybe 0 (recReducedReplaySlippageCount r) > 0
-            ]
-        errorCount =
-            length
-                [ r
-                | r <- records
-                , not (recIsCompleted r)
-                , not (recIsCensored r)
-                , recJobState r /= JobSkippedUnstableInput
-                ]
-        skippedUnstable = length (filter ((== JobSkippedUnstableInput) . recJobState) records)
-        validationPassed = length (filter ((== Just True) . recValidationPassed) records)
-        minimality1Min =
-            length (filter ((== Just "statement-deletion-1-minimal") . recMinimalityClaim) records)
+        replayPassed = filter ((== Just True) . recReducedReplayAllPassed) replayChecked
+        zeroSlippageReplay =
+            filter
+                ( \record ->
+                    recReducedReplayAllPassed record == Just True
+                        && recReducedReplayMatchesBaseline record == Just True
+                )
+                replayChecked
+        slippedReplay = filter ((> 0) . fromMaybe 0 . recReducedReplaySlippageCount) replayChecked
      in GroupSummary
             { gsTotalRuns = length records
             , gsCompletedRuns = length completed
             , gsCensoredRuns = length censored
-            , gsErrorOrFailedRuns = errorCount
-            , gsSkippedUnstableRuns = skippedUnstable
-            , gsValidationPassedRuns = validationPassed
-            , gsMinimality1MinimalRuns = minimality1Min
+            , gsErrorOrFailedRuns =
+                length
+                    [ record
+                    | record <- records
+                    , not (recIsCompleted record)
+                    , not (recIsCensored record)
+                    , recJobState record /= JobSkippedUnstableInput
+                    ]
+            , gsSkippedUnstableRuns =
+                length (filter ((== JobSkippedUnstableInput) . recJobState) records)
+            , gsValidationPassedRuns =
+                length (filter ((== Just True) . recValidationPassed) records)
+            , gsMinimality1MinimalRuns =
+                length (filter ((== Just "statement-deletion-1-minimal") . recMinimalityClaim) records)
             , gsReducedReplayCheckedRuns = length replayChecked
-            , gsReducedReplay5of5Runs = length replayPassed5
-            , gsReducedReplayZeroSlippageRuns = length replayZeroSlip
-            , gsReducedReplaySlippedRuns = length replaySlipped
-            , gsCompletedOnly = extractSubset completed
-            , gsAllWithCheckpoints = extractSubset withCheckpoints
+            , gsReducedReplay5of5Runs = length replayPassed
+            , gsReducedReplayZeroSlippageRuns = length zeroSlippageReplay
+            , gsReducedReplaySlippedRuns = length slippedReplay
+            , gsCompletedOnly = aggregateMetricsSubset completed
+            , gsAllWithCheckpoints = aggregateMetricsSubset withCheckpoints
             }
-    where
-        extractSubset subset =
-            MetricsSubset
-                { subCount = length subset
-                , subReducedBytes = metricSummary (mapMaybe (fmap fromIntegral . recReducedBytes) subset)
-                , subReductionRatio = metricSummary (mapMaybe recReductionRatio subset)
-                , subReducedStatements =
-                    metricSummary (mapMaybe (fmap fromIntegral . recReducedStatements) subset)
-                , subStatementReductionRatio = metricSummary (mapMaybe recStatementReductionRatio subset)
-                , subOracleExecutions = metricSummary (mapMaybe (fmap fromIntegral . recOracleExecutions) subset)
-                , subOracleAttempts = metricSummary (mapMaybe (fmap fromIntegral . recOracleAttempts) subset)
-                , subCacheHitRatio = metricSummary (mapMaybe recCacheHitRatio subset)
-                , subElapsedSeconds = metricSummary (mapMaybe recElapsedSeconds subset)
-                , subOracleSeconds = metricSummary (mapMaybe recOracleSeconds subset)
-                , subResetSeconds = metricSummary (mapMaybe recResetSeconds subset)
-                , subAuditSeconds = metricSummary (mapMaybe recAuditSeconds subset)
-                , subValidationSeconds = metricSummary (mapMaybe recValidationSeconds subset)
-                , subAttemptAuc = metricSummary (mapMaybe recAttemptAuc subset)
-                , subEngineOverheadUs = metricSummary (mapMaybe (fmap fromIntegral . recEngineOverheadUs) subset)
-                }
+
+aggregateMetricsSubset :: [BatchRunRecord] -> MetricsSubset
+aggregateMetricsSubset subset =
+    MetricsSubset
+        { subCount = length subset
+        , subReducedBytes = metricSummary (mapMaybe (fmap fromIntegral . recReducedBytes) subset)
+        , subReductionRatio = metricSummary (mapMaybe recReductionRatio subset)
+        , subReducedStatements = metricSummary (mapMaybe (fmap fromIntegral . recReducedStatements) subset)
+        , subStatementReductionRatio = metricSummary (mapMaybe recStatementReductionRatio subset)
+        , subOracleExecutions = metricSummary (mapMaybe (fmap fromIntegral . recOracleExecutions) subset)
+        , subOracleAttempts = metricSummary (mapMaybe (fmap fromIntegral . recOracleAttempts) subset)
+        , subCacheHitRatio = metricSummary (mapMaybe recCacheHitRatio subset)
+        , subElapsedSeconds = metricSummary (mapMaybe recElapsedSeconds subset)
+        , subOracleSeconds = metricSummary (mapMaybe recOracleSeconds subset)
+        , subResetSeconds = metricSummary (mapMaybe recResetSeconds subset)
+        , subAuditSeconds = metricSummary (mapMaybe recAuditSeconds subset)
+        , subValidationSeconds = metricSummary (mapMaybe recValidationSeconds subset)
+        , subAttemptAuc = metricSummary (mapMaybe recAttemptAuc subset)
+        , subEngineOverheadUs = metricSummary (mapMaybe (fmap fromIntegral . recEngineOverheadUs) subset)
+        }
 
 -- | Purely construct the full @AggregatedReport@ from qualifications and run records.
 aggregateReport ::

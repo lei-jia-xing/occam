@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module CliChecks (tests) where
 
 import Control.Exception (SomeException, bracket, finally, try)
@@ -207,8 +209,8 @@ tests =
                                     assertEqual
                                         "Own preflight consumes this run's cap"
                                         1
-                                        (evaluationPreflightAttempts (cliBudget stats))
-                                    assertEqual "Budget result was lost" EvaluationExecutionBudget (evaluationStatus evaluation)
+                                        (cliBudget stats).preflightAttempts
+                                    assertEqual "Budget result was lost" EvaluationExecutionBudget evaluation.runStatus
                                     assertEqual
                                         "Top-level status was lost"
                                         EvaluationExecutionBudget
@@ -216,8 +218,8 @@ tests =
                                     assertEqual
                                         "No reduction call remains after preflight"
                                         0
-                                        (evaluationDatabaseObservations evaluation)
-                                    assertBool "An unchecked checkpoint is not validated" (not (evaluationValidationPassed evaluation))
+                                        evaluation.databaseObservations
+                                    assertBool "An unchecked checkpoint is not validated" (not evaluation.validationPassed)
                                 Left err -> assertFailure ("stats.json did not decode: " ++ err)
                             checkpoint <- BS.readFile outFile
                             assertEqual "Accepted input checkpoint was lost" "SELECT 1; SELECT 2;" checkpoint

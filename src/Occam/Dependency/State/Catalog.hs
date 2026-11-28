@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveGeneric #-}
+
 -- | Catalog keys, relation/object state records, pure catalog operations, and write signatures.
 module Occam.Dependency.State.Catalog (
     -- Canonical catalog keys
@@ -44,6 +46,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import GHC.Generics (Generic)
 import Occam.Core.Schema (
     Constraint (..),
     DeleteScope,
@@ -209,7 +212,7 @@ data Catalog = Catalog
     , catalogNextUnnamedConstraint :: !Int
     -- ^ Monotonic serial for naming unnamed constraints.
     }
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
 
 emptyCatalog :: Catalog
 emptyCatalog =

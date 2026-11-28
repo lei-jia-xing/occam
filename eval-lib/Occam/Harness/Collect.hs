@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Import existing SQL artifacts into an Occam manifest with optional N-replay verification.
 module Occam.Harness.Collect (
     ArtifactSource (..),
@@ -136,8 +138,8 @@ instance ToJSON CollectedCase where
     toJSON item =
         object
             [ "id" .= collectedId item
-            , "dbms" .= dbmsId (collectedDbms item)
-            , "dialect" .= dbmsOccamDialect (collectedDbms item)
+            , "dbms" .= (collectedDbms item).identifier
+            , "dialect" .= (collectedDbms item).occamDialect
             , "file" .= collectedPath item
             , "relative_file" .= collectedRelative item
             , "source_type" .= sourceName (collectedType item)
@@ -182,8 +184,8 @@ collectArtifacts cfg options = do
                 maybe (throwE ("Unsupported DBMS: " <> T.unpack (collectDbms options))) pure $
                     lookupDbmsSpec cfg (normalizeDbms (collectDbms options))
             dbmsKind <-
-                maybe (throwE ("Unsupported DBMS kind: " <> T.unpack (dbmsId dbms))) pure $
-                    parseDbmsKind (dbmsId dbms)
+                maybe (throwE ("Unsupported DBMS kind: " <> T.unpack dbms.identifier)) pure $
+                    parseDbmsKind dbms.identifier
             input <- lift (absolutePath (collectInputDir options))
             output <- lift (absolutePath (collectOutputDir options))
             exists <- lift (doesDirectoryExist input)
@@ -210,7 +212,7 @@ collectArtifacts cfg options = do
             let manifest =
                     object
                         [ "schema_version" .= (1 :: Int)
-                        , "dbms" .= dbmsId dbms
+                        , "dbms" .= dbms.identifier
                         , "source" .= sourceName source
                         , "cases" .= finalCases
                         , "rejected_cases" .= rejectedVals
@@ -334,7 +336,7 @@ verifyAndDedup cfg dbmsKind dbms source output rawSeen byteUnique options = do
                     let rejObj =
                             object
                                 [ "id" .= collectedId item
-                                , "dbms" .= dbmsId dbms
+                                , "dbms" .= dbms.identifier
                                 , "file" .= collectedPath item
                                 , "replay_verification" .= rv
                                 ]
@@ -388,7 +390,7 @@ collectionSummary ::
 collectionSummary raw uniqBytes replaysReq isVerified rejCount collapsed uniqSigs dbms source =
     KM.fromList
         [ "source" .= sourceName source
-        , "dbms" .= dbmsId dbms
+        , "dbms" .= dbms.identifier
         , "raw_candidates_discovered" .= raw
         , "unique_byte_candidates" .= uniqBytes
         , "verified" .= isVerified
@@ -439,7 +441,7 @@ selectArtifacts options dbms files = case collectSource options of
                 && let name = takeFileName path in name /= "README.txt" && not ("." `isPrefixOf` name)
         sqlancerFile path =
             let name = takeFileName path
-                prefix = "sqlancer_" <> T.unpack (dbmsId dbms) <> "_"
+                prefix = "sqlancer_" <> T.unpack dbms.identifier <> "_"
              in ".log" `isSuffixOf` name
                     && not (prefix `isPrefixOf` name || any (`isSuffixOf` name) ["-plan.log", "-reduce.log"])
 

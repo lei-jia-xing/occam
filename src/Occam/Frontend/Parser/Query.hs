@@ -180,6 +180,7 @@ parseQueryTail = execStateT go (QueryTailInfo [] Nothing Nothing Nothing Nothing
             modify' (set val)
             go
 
+-- | Parse LIMIT forms; comma form is gated to dialects that support offset,count.
 parseLimitClause :: P (Located LimitClause)
 parseLimitClause = withLocated do
     first <- parseExpr

@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module BatchReportChecks (tests) where
 
 import Control.Exception.Safe (finally)
@@ -202,14 +204,14 @@ tests =
                     planPath = outDir </> "partial.json"
                 config <- either assertFailure pure =<< loadHarnessConfig configPath
                 named <- either assertFailure pure =<< loadExperimentPlan configPath config "stage2-thesis"
-                assertEqual "named plan repeats" 3 (planRepeats named)
+                assertEqual "named plan repeats" 3 named.repeats
                 BSC.writeFile planPath "{\"repeats\":2,\"budget_secs\":0.25,\"oracle\":{\"stack_frames\":7}}"
                 custom <- either assertFailure pure =<< loadExperimentPlan configPath config (T.pack planPath)
-                assertEqual "custom repeats" 2 (planRepeats custom)
-                assertEqual "custom budget" (Just 0.25) (planBudgetSecs custom)
-                assertEqual "default worker count" 1 (planWorkerJobs custom)
-                assertEqual "custom stack frames" 7 (odStackFrames (planOracle custom))
-                assertEqual "default slippage setting" False (odRejectOnSlippage (planOracle custom))
+                assertEqual "custom repeats" 2 custom.repeats
+                assertEqual "custom budget" (Just 0.25) custom.budgetSecs
+                assertEqual "default worker count" 1 custom.workerJobs
+                assertEqual "custom stack frames" 7 custom.oracle.stackFrames
+                assertEqual "default slippage setting" False custom.oracle.rejectOnSlippage
         , testCase "barrier census reports syntax fallback fences and normalizes dialect aliases" do
             withTempDir "occam-barrier-census-check" \outDir -> do
                 BSC.writeFile (outDir </> "valid.sql") "SELECT 1;"
@@ -326,63 +328,63 @@ tests =
                                     }
                             budget =
                                 EvaluationConfig
-                                    { evaluationCacheEnabled = True
-                                    , evaluationJobs = 2
-                                    , evaluationTotalTimeoutMicros = Nothing
-                                    , evaluationMaxOracleExecutions = Nothing
-                                    , evaluationPreflightMicros = 0
-                                    , evaluationPreflightAttempts = 0
-                                    , evaluationPreflightResetMicros = Nothing
-                                    , evaluationPreflightOracleMicros = Nothing
-                                    , evaluationInitialStatements = Just 10
+                                    { cacheEnabled = True
+                                    , jobs = 2
+                                    , totalTimeoutMicros = Nothing
+                                    , maxOracleExecutions = Nothing
+                                    , preflightMicros = 0
+                                    , preflightAttempts = 0
+                                    , preflightResetMicros = Nothing
+                                    , preflightOracleMicros = Nothing
+                                    , initialStatements = Just 10
                                     }
                             em =
                                 EvaluationMetrics
-                                    { evaluationStatus = st
-                                    , evaluationFailure = Nothing
-                                    , evaluationCacheUsed = True
-                                    , evaluationBudget = budget
-                                    , evaluationTotalSeconds = elapsed
-                                    , evaluationReductionSeconds = elapsed
-                                    , evaluationOracleSeconds = 1.0
-                                    , evaluationResetSeconds = 0.2
-                                    , evaluationPreflightResetSeconds = Nothing
-                                    , evaluationPreflightOracleSeconds = Nothing
-                                    , evaluationOracleAttempts = attempts
-                                    , evaluationDatabaseObservations = attempts
-                                    , evaluationCompletedOracleProcesses = attempts
-                                    , evaluationAcceptedObservations = 2
-                                    , evaluationRejectedObservations = max 0 (attempts - 2)
-                                    , evaluationTimedOutObservations = 0
-                                    , evaluationResetFailures = 0
-                                    , evaluationOracleErrors = 0
-                                    , evaluationCancelledObservations = 0
-                                    , evaluationOracleOutcomes = Map.empty
-                                    , evaluationCacheHits = 1
-                                    , evaluationCacheMisses = 1
-                                    , evaluationCacheJoins = 0
-                                    , evaluationValidationSeconds = 0.1
-                                    , evaluationValidationOracleSeconds = 0.1
-                                    , evaluationValidationResetSeconds = 0.0
-                                    , evaluationValidationObservations = 1
-                                    , evaluationValidationDatabaseObservations = 1
-                                    , evaluationValidationErrors = 0
-                                    , evaluationValidationOutcomes = Map.empty
-                                    , evaluationValidationPassed = st == EvaluationCompleted
-                                    , evaluationAuditSeconds = 0.05
-                                    , evaluationAuditChecks = 1
-                                    , evaluationAuditCompleted = True
-                                    , evaluationAuditSkipped = False
-                                    , evaluationMinimalityClaim =
+                                    { runStatus = st
+                                    , failure = Nothing
+                                    , cacheUsed = True
+                                    , budget = budget
+                                    , totalSeconds = elapsed
+                                    , reductionSeconds = elapsed
+                                    , oracleSeconds = 1.0
+                                    , resetSeconds = 0.2
+                                    , preflightResetSeconds = Nothing
+                                    , preflightOracleSeconds = Nothing
+                                    , oracleAttempts = attempts
+                                    , databaseObservations = attempts
+                                    , completedOracleProcesses = attempts
+                                    , acceptedObservations = 2
+                                    , rejectedObservations = max 0 (attempts - 2)
+                                    , timedOutObservations = 0
+                                    , resetFailures = 0
+                                    , oracleErrors = 0
+                                    , cancelledObservations = 0
+                                    , oracleOutcomes = Map.empty
+                                    , cacheHits = 1
+                                    , cacheMisses = 1
+                                    , cacheJoins = 0
+                                    , validationSeconds = 0.1
+                                    , validationOracleSeconds = 0.1
+                                    , validationResetSeconds = 0.0
+                                    , validationObservations = 1
+                                    , validationDatabaseObservations = 1
+                                    , validationErrors = 0
+                                    , validationOutcomes = Map.empty
+                                    , validationPassed = st == EvaluationCompleted
+                                    , auditSeconds = 0.05
+                                    , auditChecks = 1
+                                    , auditCompleted = True
+                                    , auditSkipped = False
+                                    , minimalityClaim =
                                         if st == EvaluationCompleted
                                             then StatementDeletionOneMinimal
                                             else MinimalityNotEstablished
-                                    , evaluationCurve =
+                                    , curve =
                                         [ EvaluationPoint 0.5 1 200 (Just 10) False True
                                         , EvaluationPoint 1.0 2 redB (Just 2) False True
                                         ]
-                                    , evaluationStages = []
-                                    , evaluationCostAttribution = Just snap
+                                    , stages = []
+                                    , costAttribution = Just snap
                                     }
                             stats =
                                 Stats
@@ -538,33 +540,33 @@ tests =
             assertEqual
                 "six DBMS IDs"
                 ["postgres", "mysql", "mariadb", "clickhouse", "sqlite", "duckdb"]
-                (map dbmsId (hcDbms config))
+                (map (\spec -> spec.identifier) config.dbms)
             assertEqual
                 "PostgreSQL CLI dialect"
                 (Just "postgresql")
-                (dbmsOccamDialect <$> lookupDbmsSpec config "postgres")
+                ((\spec -> spec.occamDialect) <$> lookupDbmsSpec config "postgres")
             assertEqual
                 "MariaDB CLI dialect"
                 (Just "mariadb")
-                (dbmsOccamDialect <$> lookupDbmsSpec config "mariadb")
+                ((\spec -> spec.occamDialect) <$> lookupDbmsSpec config "mariadb")
             assertEqual
                 "built-in profile names"
                 ["audit-only", "ddmin-only", "ours-s", "ours-si", "ours-full", "ours-nodep"]
-                (map profileKey (hcProfiles config))
-            forM_ (hcProfiles config) \profile -> do
-                let key = T.unpack (profileKey profile)
+                (map (\profile -> profile.key) config.profiles)
+            forM_ config.profiles \profile -> do
+                let key = T.unpack profile.key
                 preset <- BSL.readFile (generated </> "profiles" </> (key <> ".json"))
-                assertEqual (key <> " JSON preset") (Just (profileConfig profile)) (decode preset)
-                assertBool (key <> " strategy flag") ("--strategy" `elem` profileCliFlags profile)
+                assertEqual (key <> " JSON preset") (Just profile.config) (decode preset)
+                assertBool (key <> " strategy flag") ("--strategy" `elem` profile.cliFlags)
         , testCase "Harness.Config decodes real config/generated/harness.json and renders SQUIRREL YAML" do
             cfgPath <- resolveHarnessConfigPath Nothing
             exists <- doesFileExist cfgPath
             assertBool ("harness.json missing at " ++ cfgPath) exists
             eCfg <- loadHarnessConfig cfgPath
             hc <- either (\e -> assertFailure e >> error "unreachable") pure eCfg
-            assertBool "dbms non-empty" (not (null (hcDbms hc)))
-            assertBool "profiles non-empty" (not (null (hcProfiles hc)))
-            assertBool "stage2_thesis plan present" (Map.member "stage2_thesis" (hcPlans hc))
+            assertBool "dbms non-empty" (not (null hc.dbms))
+            assertBool "profiles non-empty" (not (null hc.profiles))
+            assertBool "stage2_thesis plan present" (Map.member "stage2_thesis" hc.plans)
             let mariadbSpec = lookupSquirrelSpec hc "mariadb"
             assertEqual
                 "mariadb target_bin_rel"
@@ -572,15 +574,27 @@ tests =
                 (mariadbSpec >>= (`squirrelFieldText` "target_bin_rel"))
             let opts =
                     SquirrelRenderOptions
-                        { sroDbms = "mariadb"
-                        , sroSquirrelHome = "/opt/squirrel"
-                        , sroHost = "127.0.0.1"
-                        , sroPort = 3306
-                        , sroUser = "root"
-                        , sroPassword = "p'w"
-                        , sroSocket = "/tmp/mysql.sock"
-                        , sroDbName = "occam_test"
-                        , sroServerCmd = "/usr/sbin/mariadbd"
+                        { dbms = "mariadb"
+                        , squirrelHome = "/opt/squirrel"
+                        , host = "127.0.0.1"
+                        , port = 3306
+                        , user = "root"
+                        , password = "p'w"
+                        , socket = "/tmp/mysql.sock"
+                        , dbName = "occam_test"
+                        , serverCmd = "/usr/sbin/mariadbd"
+                        }
+                oracleOpts =
+                    SquirrelRenderOptions
+                        { dbms = "oracle"
+                        , squirrelHome = "/opt/squirrel"
+                        , host = "127.0.0.1"
+                        , port = 3306
+                        , user = "root"
+                        , password = "p'w"
+                        , socket = "/tmp/mysql.sock"
+                        , dbName = "occam_test"
+                        , serverCmd = "/usr/sbin/mariadbd"
                         }
             case renderSquirrelYaml hc opts of
                 Left err -> assertFailure (T.unpack err)
@@ -593,7 +607,11 @@ tests =
                         ("init_lib: '/opt/squirrel/data/fuzz_root/mysql_init_lib'" `T.isInfixOf` yamlTxt)
             assertBool
                 "unknown squirrel DBMS fails"
-                (either (const True) (const False) (renderSquirrelYaml hc opts {sroDbms = "oracle"}))
+                ( either
+                    (const True)
+                    (const False)
+                    (renderSquirrelYaml hc oracleOpts)
+                )
         , testCase "sanitizeSqlancerLog strips stacktraces, psql \\c, and DB lifecycle statements" do
             let raw =
                     BSC.unlines
