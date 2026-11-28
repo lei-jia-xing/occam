@@ -25,6 +25,8 @@ module Occam.Pool.Types (
     refundPermit,
     reportCandidateCount,
     reservePermit,
+    recordLookaheadRun,
+    slidingLookahead,
     wallSince,
     withAdaptiveLookahead,
     withCandidateCountCleanup,
@@ -50,9 +52,11 @@ import Control.Exception (
  )
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, newIORef, readIORef)
+import Data.Foldable (for_)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Vector qualified as Vector
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Cache (
@@ -124,7 +128,7 @@ data OraclePool = OraclePool
     , poolAttemptsRef :: !(IORef Int)
     , poolCancelledRef :: !(IORef Int)
     , poolLiveRef :: !(IORef Int)
-    , poolAcceptStreak :: !(Maybe (IORef Int))
+    , poolLookahead :: !(Maybe (IORef Lookahead))
     }
 
 -- | Finished worker observation with its measured execution duration in microseconds.
@@ -135,7 +139,7 @@ data TimedObservation = TimedObservation
 
 data WindowTask
     = TaskImmediate !OracleObservation !Bool
-    | TaskJoined !Int
+    | TaskJoined !(MVar (Either SomeException TimedObservation))
     | TaskDenied
     | TaskPending
         !ThreadId
@@ -186,19 +190,64 @@ newOraclePoolWithCacheKey candidateKey PoolConfig {..}
                 , poolAttemptsRef = attempts
                 , poolCancelledRef = cancelled
                 , poolLiveRef = live
-                , poolAcceptStreak = Nothing
+                , poolLookahead = Nothing
                 }
 
-{- | Native probes can sweep through a succession of immediately accepted
-candidates. After two head acceptances, start the next window serially and
-restore the full width on its first retirement that rejects.
--}
+data Lookahead = Lookahead
+    { lookaheadWidth :: !Int
+    , lookaheadCosts :: !(Vector.Vector Integer)
+    , lookaheadRuns :: !Integer
+    , lookaheadAccepts :: !Integer
+    , lookaheadAcceptedLength :: !Integer
+    }
+
+-- | Adapt the width using the observed stopping positions of fresh runs.
 withAdaptiveLookahead :: OraclePool -> IO OraclePool
 withAdaptiveLookahead pool
     | poolJobsCount pool <= 1 = pure pool
     | otherwise = do
-        streak <- newIORef 0
-        pure pool {poolAcceptStreak = Just streak}
+        state <- newIORef (Lookahead (poolJobsCount pool) Vector.empty 0 0 0)
+        pure pool {poolLookahead = Just state}
+
+slidingLookahead :: OraclePool -> IO Int
+slidingLookahead pool = case poolLookahead pool of
+    Nothing -> pure (poolJobsCount pool)
+    Just ref -> lookaheadWidth <$> readIORef ref
+
+{- | Learn the cost of a constant width from completed, uncached runs.
+A run of n retirements takes ceil(n / w) idealized waves. Acceptance can
+leave the last wave partially useful, while exhaustion leaves no extra
+work. Charge one unit per wave and one per speculative execution.
+-}
+recordLookaheadRun :: OraclePool -> Bool -> Int -> IO ()
+recordLookaheadRun pool accepted retired =
+    when (retired > 0) $ for_ (poolLookahead pool) $ \ref ->
+        modifyIORef' ref update
+    where
+        update state@Lookahead {..} =
+            let known = Vector.length lookaheadCosts
+                limit = min (poolJobsCount pool) (max retired known)
+                costAt index =
+                    let width = index + 1
+                        waves = toInteger ((retired - 1) `quot` width + 1)
+                        unused = if accepted then waves * toInteger width - toInteger retired else 0
+                        -- A previously untracked width fits each old run in one wave.
+                        prior
+                            | index < known = lookaheadCosts Vector.! index
+                            | otherwise = lookaheadRuns + lookaheadAccepts * toInteger width - lookaheadAcceptedLength
+                     in prior + waves + unused
+                costs = Vector.generate limit costAt
+                minimize incumbent index cost
+                    | cost < costs Vector.! incumbent = index
+                    | otherwise = incumbent
+                best = Vector.ifoldl' minimize 0 costs
+             in state
+                    { lookaheadWidth = best + 1
+                    , lookaheadCosts = costs
+                    , lookaheadRuns = lookaheadRuns + 1
+                    , lookaheadAccepts = lookaheadAccepts + if accepted then 1 else 0
+                    , lookaheadAcceptedLength = lookaheadAcceptedLength + if accepted then toInteger retired else 0
+                    }
 
 -- | Cancel and join all active workers in the pool.
 closeOraclePool :: OraclePool -> IO ()

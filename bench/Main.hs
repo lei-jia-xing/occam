@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, forM_, unless)
 import Data.ByteString (ByteString)
@@ -10,6 +11,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Cache (
     CacheMode (..),
     cacheCompleteInflight,
@@ -37,7 +39,13 @@ import Occam.Evaluation (
     ReductionActionResult (..),
     runEvaluationRequestWithNativeValidation,
  )
-import Occam.Facts (StatementFacts (..), StatementUnit (..))
+import Occam.Facts (
+    EditTier (TierDefault),
+    ParserEdit (..),
+    ParserEditCategory (EditExpression),
+    StatementFacts (..),
+    StatementUnit (..),
+ )
 import Occam.Frontend.OracleProof (oracleCacheKey)
 import Occam.Frontend.Splitter (countSQLStatements)
 import Occam.Logger (nullLogger)
@@ -59,7 +67,13 @@ import Occam.Parser (
     dialectProfile,
     parseSQLTimed,
  )
-import Occam.Pool (poolMetricsStore, withPredicatePool)
+import Occam.Pool (
+    poolAttempts,
+    poolMetricsStore,
+    testOrdered,
+    withAdaptiveLookahead,
+    withPredicatePool,
+ )
 import Occam.Reducer (
     AuditStats (..),
     ReductionConfig (..),
@@ -72,6 +86,7 @@ import Occam.Reducer (
     reduceSQLWithConfig,
     reduceSQLWithEvidence,
     replaceSpan,
+    selectIndependentEdits,
     statementAuditWithLogger,
     statementAuditWithParser,
  )
@@ -134,7 +149,25 @@ import Test.Tasty.Bench (
     whnf,
     whnfIO,
  )
+import Text.Printf (printf)
 import Text.Read (readMaybe)
+
+deletionEdit :: Int -> Int -> ParserEdit
+deletionEdit start end = ParserEdit start end "" EditExpression TierDefault "delete" False False False False
+
+overlappingEdits :: Int -> [ParserEdit]
+overlappingEdits index =
+    [ deletionEdit (start + 2) (start + 8)
+    , deletionEdit start (start + 4)
+    , deletionEdit (start + 6) (start + 10)
+    ]
+    where
+        start = index * 12
+
+selectedBytesSaved :: [ParserEdit] -> Int
+selectedBytesSaved = sum . map saved . selectIndependentEdits
+    where
+        saved edit = parserEditEnd edit - parserEditStart edit - BS.length (parserEditReplacement edit)
 
 genScale :: Int -> ByteString
 genScale n =
@@ -393,6 +426,7 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
+        ["--lookahead-baseline"] -> runLookaheadBaseline
         ["--result-baseline", count, out]
             | Just pairs <- readMaybe count
             , pairs >= 2
@@ -411,6 +445,44 @@ main = do
                 die
                     ("Usage: occam-bench " ++ mode ++ " EVEN_PAIRS (unlimited|CALLS >= 4|wall:SECONDS >= 20) OUTPUT.json")
         _ -> runTimingBenchmarks
+
+runLookaheadBaseline :: IO ()
+runLookaheadBaseline = do
+    putStrLn "jobs,workload,policy,wall_ms,speculative_starts,wall_plus_speculation_ms"
+    forM_ [4, 8] $ \jobs ->
+        forM_ workloads $ \(name, decisions) -> do
+            measure jobs name decisions "fixed" pure
+            measure jobs name decisions "adaptive" withAdaptiveLookahead
+    where
+        count = 20 :: Int
+        latency = 2500
+        workloads =
+            [ ("fourth-accept", replicate 48 (Just 3))
+            , ("early-accept", take 48 (cycle [Just 0, Just 1, Just 0]))
+            , ("all-reject", replicate 48 Nothing)
+            ] ::
+                [(String, [Maybe Int])]
+        measure jobs name decisions policy configure =
+            withPredicatePool jobs True runProbe $ \base -> do
+                pool <- configure base
+                start <- getMonotonicTimeNSec
+                lengths <- forM (zip [1 :: Int ..] decisions) $ \(roundId, target) -> do
+                    let candidate ordinal =
+                            BSC.pack ((if target == Just ordinal then 'A' else 'R') : show roundId ++ "/" ++ show ordinal)
+                        expected =
+                            maybe (replicate count OracleRejected) (\i -> replicate i OracleRejected ++ [OracleAccepted]) target
+                    outcomes <- testOrdered pool (map candidate [0 .. count - 1])
+                    unless (map fst outcomes == expected) (die "lookahead baseline changed the ordered verdicts")
+                    pure (length outcomes)
+                end <- getMonotonicTimeNSec
+                starts <- poolAttempts pool
+                let wasted = starts - sum lengths
+                    wallMs = fromIntegral (end - start) / 1000000 :: Double
+                    pricedMs = wallMs + fromIntegral (latency * wasted) / 1000
+                printf "%d,%s,%s,%.1f,%d,%.1f\n" jobs name (policy :: String) wallMs wasted pricedMs
+        runProbe sql = do
+            threadDelay latency
+            pure (BSC.head sql == 'A')
 
 searchModes :: [(String, Int -> Maybe Int -> Maybe Int -> FilePath -> IO ())]
 searchModes =
@@ -628,6 +700,12 @@ runTimingBenchmarks = do
                         whnf
                             (\start -> byteChecksum (replaceSpan start (start + 896) ("/* trimmed */" :: ByteString) sql512))
                             (128 :: Int)
+                ]
+          , bgroup
+                "edit-selection"
+                [ bench "disjoint-4096" $
+                    whnf selectedBytesSaved [deletionEdit (i * 10) (i * 10 + 5) | i <- [0 .. 4095]]
+                , bench "overlapping-4095" $ whnf selectedBytesSaved (concatMap overlappingEdits [0 .. 1364])
                 ]
           , bgroup
                 "cache"

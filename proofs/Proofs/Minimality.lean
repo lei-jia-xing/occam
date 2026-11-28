@@ -547,6 +547,30 @@ theorem lastStatementResult_append_all_none {Result : Type}
     rw [hor]
     exact ih init hxs
 
+/-- A rejected result prefix stays rejected through padding that emits no
+    observations. The byte certificate checks that the added suffix is inert. -/
+theorem result_prefix_rejects_with_inert_padding {Result : Type} [DecidableEq Result]
+    (expected : Result) (prefixObs paddingObs : List (Option Result))
+    (hPrefix : nativeContractAccepts expected (.ok prefixObs) = false)
+    (hPadding : ∀ obs ∈ paddingObs, obs = none) :
+    nativeContractAccepts expected (.ok (prefixObs ++ paddingObs)) = false := by
+  simpa only [nativeContractAccepts,
+    lastStatementResult_append_all_none prefixObs paddingObs hPadding] using hPrefix
+
+/-- In a set with a satisfied singleton definition requirement, deleting one
+    statement loses the required definition exactly when it is that definer. -/
+theorem singleton_definer_missing_iff_removed (kept : List StmtId)
+    (definer deleted : StmtId) (hPresent : definer ∈ kept) :
+    definer ∉ removeStmt deleted kept ↔ definer = deleted := by
+  simp [removeStmt, hPresent]
+
+/-- A surviving witness lets the audit skip the other possible definers. -/
+theorem retained_definer_satisfies_requirement (kept definers : List StmtId)
+    (witness : StmtId) (hWitness : witness ∈ definers) (hPresent : witness ∈ kept) :
+    ¬ (∀ definer ∈ definers, definer ∉ kept) := by
+  intro hMissing
+  exact hMissing witness hWitness hPresent
+
 /-- Soundness of `EarlyRejectColumnArityMismatch`: if the final result-producing
     statement produces a result `res` whose column arity differs from
     `arity expected` and all trailing statements produce `none`, the script is
@@ -566,3 +590,58 @@ theorem column_arity_mismatch_rejects {Result : Type} [DecidableEq Result]
   rw [hLast]
   have hNe : actual ≠ expected := fun hEq => hArity (congrArg arity hEq)
   simp [hNe]
+
+/-! ## Transaction block projection -/
+
+/-- Project block membership through the positional correspondence established
+    by a statement-preserving reparse. -/
+def projectTransactionMembers (oldIds newIds block : List StmtId) : List StmtId :=
+  if oldIds.length = newIds.length then block.filterMap (fun id => (oldIds.zip newIds).lookup id)
+  else []
+
+theorem project_transaction_members_of_length_mismatch (oldIds newIds block : List StmtId)
+    (hLength : oldIds.length ≠ newIds.length) :
+    projectTransactionMembers oldIds newIds block = [] := by
+  simp [projectTransactionMembers, hLength]
+
+private theorem transaction_lookup_eq_some_iff_mem
+    (pairs : List (StmtId × StmtId)) (oldId newId : StmtId)
+    (unique : (pairs.map Prod.fst).Nodup) :
+    pairs.lookup oldId = some newId ↔ (oldId, newId) ∈ pairs := by
+  induction pairs with
+  | nil => simp
+  | cons pair rest ih =>
+    obtain ⟨firstOld, firstNew⟩ := pair
+    obtain ⟨hAbsent, hUnique⟩ := List.nodup_cons.mp unique
+    by_cases hFirst : oldId = firstOld
+    · subst firstOld
+      have absent : (oldId, newId) ∉ rest := by
+        intro hmem
+        exact hAbsent (List.mem_map.mpr ⟨(oldId, newId), hmem, rfl⟩)
+      simp [absent, eq_comm]
+    · have hFalse : (oldId == firstOld) = false := by simpa using hFirst
+      simp [List.lookup_cons, hFalse, hFirst, ih hUnique]
+
+/-- With distinct original IDs, a projected member comes from exactly the
+    positional map that is used after removing transaction wrappers. -/
+theorem project_transaction_members_iff_position
+    (oldIds newIds block : List StmtId) (newId : StmtId)
+    (hLength : oldIds.length = newIds.length) (unique : oldIds.Nodup) :
+    newId ∈ projectTransactionMembers oldIds newIds block ↔
+      ∃ (i : Nat) (hIndex : i < oldIds.length),
+        oldIds[i] ∈ block ∧ newIds[i]'(hLength ▸ hIndex) = newId := by
+  have hKeys : ((oldIds.zip newIds).map Prod.fst).Nodup := by
+    rw [List.map_fst_zip (Nat.le_of_eq hLength)]
+    exact unique
+  have zipLength : (oldIds.zip newIds).length = oldIds.length := by
+    simp [List.length_zip, ← hLength]
+  rw [projectTransactionMembers, ite_eq_left hLength]
+  simp only [List.mem_filterMap,
+    transaction_lookup_eq_some_iff_mem _ _ _ hKeys, List.mem_iff_getElem (l := oldIds.zip newIds)]
+  constructor
+  · rintro ⟨oldId, hBlock, i, hIndex, hPair⟩
+    rw [List.getElem_zip] at hPair
+    have hParts := Prod.mk.inj hPair
+    exact ⟨i, zipLength ▸ hIndex, hParts.1.symm ▸ hBlock, hParts.2⟩
+  · rintro ⟨i, hIndex, hBlock, hNew⟩
+    exact ⟨oldIds[i], hBlock, i, zipLength.symm ▸ hIndex, by simp [List.getElem_zip, hNew]⟩

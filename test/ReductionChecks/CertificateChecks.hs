@@ -13,6 +13,7 @@ import Occam.Certificate (
     EarlyRejectCertifier (..),
     buildEarlyRejectCertifier,
     checkEarlyRejection,
+    checkEarlyRejectionBytes,
     checkEarlyRejectionIds,
     newEarlyRejectTracker,
     prepareDeletionCertificateCheck,
@@ -22,6 +23,7 @@ import Occam.Core (
     OracleOutcome (..),
     ResultStatement (..),
     ResultTrace (..),
+    Span (..),
     Statement (..),
     StatementId (..),
  )
@@ -41,6 +43,7 @@ import Occam.Oracle.Sqlite (
     generateSqliteContract,
     generateSqliteContractWithTrace,
     sqliteContractOracle,
+    sqliteContractOracleTimeout,
  )
 import Occam.Parser (ParsedSQL (..), SQLDialect (..), defaultParseOptions, parseSQL)
 import Occam.Reducer (
@@ -121,6 +124,88 @@ checks =
             outcome4 <- sqliteContractOracle contract (prefixBytes 4)
             assertEqual "prefix 3 actually matches native SQLite" OracleAccepted outcome3
             assertEqual "prefix 4 actually matches native SQLite" OracleAccepted outcome4
+    , testCase "SQLite reuses a rejected prefix through ordinary comments and empty statements" $ do
+        let paddedPrefix = "SELECT 0 AS answer; -- SELECT 42;\r\n/* ordinary ; */;\t"
+            seed = "SELECT 6 * 7 AS answer WHERE TRUE AND TRUE AND TRUE AND TRUE AND TRUE AND TRUE;"
+            sql = paddedPrefix <> seed
+            timeoutMicros = 2000000
+        (contract, trace) <-
+            generateSqliteContractWithTrace timeoutMicros sql >>= either (assertFailure . show) pure
+        parsed <- parseSQL (defaultParseOptions SQLite) sql >>= either (assertFailure . show) pure
+        let units = parsedUnits parsed
+            cert = buildEarlyRejectCertifier sql units (Just trace)
+            stmts = map unitStatement units
+            prefixIds = IntSet.singleton 1
+        assertEqual
+            "statement cutting keeps the original padding"
+            paddedPrefix
+            (cutRemovedStatementInts sql stmts prefixIds)
+        assertEqual
+            "certified by bytes"
+            (Just EarlyRejectExactPrefix)
+            (checkEarlyRejectionBytes cert paddedPrefix)
+        assertEqual
+            "certified before rendering"
+            (Just EarlyRejectExactPrefix)
+            (checkEarlyRejectionIds cert prefixIds)
+        assertEqual "native SQLite agrees" OracleRejected
+            =<< sqliteContractOracleTimeout timeoutMicros contract paddedPrefix
+        let run enabled = do
+                attempts <- newIORef []
+                pool <- outcomePool $ \candidate -> do
+                    modifyIORef' attempts (candidate :)
+                    sqliteContractOracleTimeout timeoutMicros contract candidate
+                let config =
+                        (defaultReductionConfigFor SQLite)
+                            { reductionGroupProposals = False
+                            , reductionUnrestricted = False
+                            , reductionEarlyReject = enabled
+                            }
+                    observe candidate = pure (if candidate == sql then Just trace else Nothing)
+                ReductionResult reduced _ <-
+                    reduceSQLWithResultTrace observe (const (pure ())) config nullLogger pool sql
+                probed <- readIORef attempts
+                pure (reduced, length (filter (== paddedPrefix) probed))
+        assertEqual "baseline executes the padded prefix" (seed, 1) =<< run False
+        assertEqual "certificate saves the physical probe" (seed, 0) =<< run True
+    , testCase "Prefix padding excludes conditional comments and nested comment openers" $ do
+        let prefix = "SELECT 0 AS answer;"
+            seed = "SELECT 42 AS answer;"
+        forM_ ["/*! SELECT 42; */\n", "/*+ hint */\n", "/* /* nested */\n"] $ \padding -> do
+            let sql = prefix <> padding <> seed
+            (_, trace) <- generateSqliteContractWithTrace 2000000 sql >>= either (assertFailure . show) pure
+            parsed <- parseSQL (defaultParseOptions SQLite) sql >>= either (assertFailure . show) pure
+            let cert = buildEarlyRejectCertifier sql (parsedUnits parsed) (Just trace)
+            assertEqual
+                "the native extent itself is certified"
+                (Just EarlyRejectExactPrefix)
+                (checkEarlyRejectionBytes cert prefix)
+            assertEqual
+                "the extended extent requires an engine probe"
+                Nothing
+                (checkEarlyRejectionBytes cert (prefix <> padding))
+    , testCase "Bare carriage return cannot hide an executable SQLite prefix suffix" $ do
+        let prefix = "SELECT 0 AS answer;"
+            candidate = prefix <> "-- line\r/*\nSELECT 42 AS answer; -- */\n"
+            sql = candidate <> "SELECT 42 AS answer;"
+            timeoutMicros = 2000000
+        (contract, trace) <-
+            generateSqliteContractWithTrace timeoutMicros sql >>= either (assertFailure . show) pure
+        parsed <- parseSQL (defaultParseOptions SQLite) sql >>= either (assertFailure . show) pure
+        -- Verify the gap even when the splitter reports the right statement
+        -- count with a misplaced next-statement boundary.
+        case parsedUnits parsed of
+            first : second : rest -> do
+                let statement = unitStatement second
+                    misplaced = statement {stmtSpan = (stmtSpan statement) {spanStartByte = BS.length candidate}}
+                    cert = buildEarlyRejectCertifier sql (first : second {unitStatement = misplaced} : rest) (Just trace)
+                assertEqual "native SQLite executes the SELECT after LF" OracleAccepted
+                    =<< sqliteContractOracleTimeout timeoutMicros contract candidate
+                assertEqual
+                    "the executable suffix cannot certify a rejection"
+                    Nothing
+                    (checkEarlyRejectionBytes cert candidate)
+            _ -> assertFailure "expected at least two SQLite statements"
     , testCase "Nondeterministic SQLite scripts disable exact-prefix certification" $ do
         let scripts =
                 [ "CREATE TABLE t(x INT); SELECT random();"

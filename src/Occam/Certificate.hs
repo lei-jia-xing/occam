@@ -129,8 +129,9 @@ tracked dynamically per native run):
 1. 'EarlyRejectExactPrefix': When the native run was deterministic and recorded
    exact engine statement end byte offsets, any proper prefix @0..k@ whose
    latest result did not match the contract is certified rejected. Trailing
-   ASCII-whitespace-only padding up to the next statement start is also
-   included so exact byte slices from statement cutting match directly.
+   padding up to the next statement start is also included when it contains
+   only whitespace or, after a terminator, ordinary comments and empty
+   statements.
 
 2. 'EarlyRejectNoResultStatement': When engine and parser statement counts agree
    with zero parse errors and the script produced a required result set, any
@@ -200,18 +201,20 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
             | IntSet.member k (tracePrefixMatchIndices trace) = collectPrefixes rest byteLensAcc lensAcc
             | otherwise =
                 let !byteLens1 = IntSet.insert endByte byteLensAcc
-                    (!byteLens2, !lens2) = extendWithWhitespace k endByte mNextStart byteLens1 lensAcc
+                    (!byteLens2, !lens2) = extendWithPadding k endByte mNextStart byteLens1 lensAcc
                  in collectPrefixes rest byteLens2 lens2
 
-        extendWithWhitespace k endByte (Just nextStart) !byteLens1 !lensAcc
+        extendWithPadding k endByte (Just nextStart) !byteLens1 !lensAcc
             | countsMatch
             , endByte <= nextStart
             , nextStart <= baseLen
-            , isAsciiWhitespace (BS.take (nextStart - endByte) (BS.drop endByte baseSQL)) =
+            , let padding = BS.take (nextStart - endByte) (BS.drop endByte baseSQL)
+            , BS.all isAsciiWhitespace padding
+                || (endByte > 0 && BS.index baseSQL (endByte - 1) == 59 && isInertPadding padding) =
                 ( IntSet.insert nextStart byteLens1
                 , if contiguousIds then IntSet.insert (k + 1) lensAcc else lensAcc
                 )
-        extendWithWhitespace _ _ _ !byteLens1 !lensAcc = (byteLens1, lensAcc)
+        extendWithPadding _ _ _ !byteLens1 !lensAcc = (byteLens1, lensAcc)
 
         nonResultReady =
             countsMatch
@@ -247,11 +250,33 @@ buildEarlyRejectCertifier baseSQL units (Just trace) =
                 || not (IntMap.null missingDefReqs)
                 || isJust protectedResultIndex
 
-isAsciiWhitespace :: ByteString -> Bool
-isAsciiWhitespace = BS.all isWsByte
+isAsciiWhitespace :: Word8 -> Bool
+isAsciiWhitespace b = b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d
+
+-- The native result dialects share these ordinary comments and separators.
+-- Accept LF and CRLF for line comments. A bare CR can be part of a SQLite
+-- comment. Use only complete, nonnested block comments.
+isInertPadding :: ByteString -> Bool
+isInertPadding = scan . BS.dropWhile isAsciiWhitespace
     where
-        isWsByte :: Word8 -> Bool
-        isWsByte b = b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d
+        scan bytes
+            | BS.null bytes = True
+            | BS.head bytes == 59 = isInertPadding (BS.tail bytes)
+            | Just line <- BS.stripPrefix "--" bytes =
+                case BS.uncons (BS.dropWhile (\b -> b /= 10 && b /= 13) line) of
+                    Nothing -> True
+                    Just (10, rest) -> isInertPadding rest
+                    Just (13, rest) -> maybe False isInertPadding (BS.stripPrefix "\n" rest)
+                    _ -> False
+            | Just block <- BS.stripPrefix "/*" bytes
+            , not (BS.null block)
+            , BS.head block /= 33
+            , BS.head block /= 43
+            , let (body, rest) = BS.breakSubstring "*/" block
+            , not (BS.null rest)
+            , not ("/*" `BS.isInfixOf` body) =
+                isInertPadding (BS.drop 2 rest)
+            | otherwise = False
 
 uniqueDefiner :: Int -> IntSet -> Maybe Int
 uniqueDefiner sid req

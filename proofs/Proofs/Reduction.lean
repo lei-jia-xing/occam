@@ -472,3 +472,102 @@ theorem renderSegments_retained_lower_bound (leading : List UInt8) (segments : L
         simp only [List.sum_cons]
         omega
   exact Nat.le_trans (hsum _ _ hweight) (Nat.le_add_left _ _)
+
+/-- Replace a half-open byte span, modeling `replaceSpan`. -/
+def spliceByteSpan (startByte endByte : Nat) (replacement source : List UInt8) : List UInt8 :=
+  source.take startByte ++ replacement ++ source.drop endByte
+
+private theorem spliceByteSpan_segment (before original after replacement : List UInt8) :
+    spliceByteSpan before.length (before.length + original.length) replacement
+      (before ++ original ++ after) = before ++ replacement ++ after := by
+  simp [spliceByteSpan, List.drop_append]
+
+/-- Position of an offset at or after the end of a replaced span. -/
+def shiftByteOffset (startByte endByte replacementLength offset : Nat) : Nat :=
+  startByte + replacementLength + (offset - endByte)
+
+theorem shiftByteOffset_eq_add_delta (startByte endByte replacementLength offset : Nat)
+    (hEnd : endByte ≤ offset) :
+    (shiftByteOffset startByte endByte replacementLength offset : Int) =
+      (offset : Int) + ((replacementLength : Int) - ((endByte : Int) - (startByte : Int))) := by
+  unfold shiftByteOffset
+  omega
+
+private theorem disjoint_byte_splices
+    (before first between second after firstReplacement secondReplacement : List UInt8) :
+    let source := before ++ first ++ between ++ second ++ after
+    let firstEnd := before.length + first.length
+    let secondStart := firstEnd + between.length
+    let secondEnd := secondStart + second.length
+    let shift := shiftByteOffset before.length firstEnd firstReplacement.length
+    let batch := before ++ firstReplacement ++ between ++ secondReplacement ++ after
+    spliceByteSpan (shift secondStart) (shift secondEnd) secondReplacement
+        (spliceByteSpan before.length firstEnd firstReplacement source) = batch ∧
+      spliceByteSpan before.length firstEnd firstReplacement
+        (spliceByteSpan secondStart secondEnd secondReplacement source) = batch := by
+  dsimp
+  have hFirst := spliceByteSpan_segment before first (between ++ second ++ after) firstReplacement
+  have hSecond := spliceByteSpan_segment (before ++ first ++ between) second after secondReplacement
+  have hFirstAfterSecond := spliceByteSpan_segment before first (between ++ secondReplacement ++ after) firstReplacement
+  have hSecondAfterFirst := spliceByteSpan_segment (before ++ firstReplacement ++ between) second after secondReplacement
+  simp only [List.length_append, Nat.add_assoc, List.append_assoc] at hFirst hSecond hFirstAfterSecond hSecondAfterFirst
+  have hShiftStart :
+      shiftByteOffset before.length (before.length + first.length) firstReplacement.length
+        (before.length + first.length + between.length) =
+        before.length + (firstReplacement.length + between.length) := by
+    unfold shiftByteOffset
+    omega
+  have hShiftEnd :
+      shiftByteOffset before.length (before.length + first.length) firstReplacement.length
+        (before.length + first.length + between.length + second.length) =
+        before.length + (firstReplacement.length + (between.length + second.length)) := by
+    unfold shiftByteOffset
+    omega
+  simp only [List.append_assoc]
+  constructor
+  · rw [hFirst, hShiftStart, hShiftEnd, hSecondAfterFirst]
+  · simp only [Nat.add_assoc, hSecond, hFirstAfterSecond]
+
+/-- Valid disjoint byte spans yield the same batch bytes in either application order. -/
+theorem disjoint_byte_splices_eq_batch (source leftReplacement rightReplacement : List UInt8)
+    (leftStart leftEnd rightStart rightEnd : Nat)
+    (hLeft : leftStart ≤ leftEnd) (hGap : leftEnd ≤ rightStart)
+    (hRight : rightStart ≤ rightEnd) (hEnd : rightEnd ≤ source.length) :
+    let middle := (source.drop leftEnd).take (rightStart - leftEnd)
+    let batch := source.take leftStart ++ leftReplacement ++ middle ++ rightReplacement ++ source.drop rightEnd
+    let shift := shiftByteOffset leftStart leftEnd leftReplacement.length
+    spliceByteSpan (shift rightStart) (shift rightEnd) rightReplacement
+        (spliceByteSpan leftStart leftEnd leftReplacement source) = batch ∧
+      spliceByteSpan leftStart leftEnd leftReplacement
+        (spliceByteSpan rightStart rightEnd rightReplacement source) = batch := by
+  let before := source.take leftStart
+  let left := (source.drop leftStart).take (leftEnd - leftStart)
+  let middle := (source.drop leftEnd).take (rightStart - leftEnd)
+  let right := (source.drop rightStart).take (rightEnd - rightStart)
+  let after := source.drop rightEnd
+  have split (startByte endByte : Nat) (hle : startByte ≤ endByte) :
+      (source.drop startByte).take (endByte - startByte) ++ source.drop endByte =
+        source.drop startByte := by
+    simpa only [List.drop_drop, Nat.add_sub_of_le hle] using
+      List.take_append_drop (endByte - startByte) (source.drop startByte)
+  have parts : before ++ left ++ middle ++ right ++ after = source := by
+    simp only [before, left, middle, right, after, List.append_assoc,
+      split rightStart rightEnd hRight, split leftEnd rightStart hGap,
+      split leftStart leftEnd hLeft, List.take_append_drop]
+  have lenBefore : before.length = leftStart := by
+    simp only [before, List.length_take]
+    omega
+  have lenLeft : left.length = leftEnd - leftStart := by
+    simp only [left, List.length_take, List.length_drop]
+    omega
+  have lenMiddle : middle.length = rightStart - leftEnd := by
+    simp only [middle, List.length_take, List.length_drop]
+    omega
+  have lenRight : right.length = rightEnd - rightStart := by
+    simp only [right, List.length_take, List.length_drop]
+    omega
+  have splices := disjoint_byte_splices before left middle right after leftReplacement rightReplacement
+  dsimp at splices
+  rw [parts, lenBefore, lenLeft, Nat.add_sub_of_le hLeft, lenMiddle, Nat.add_sub_of_le hGap,
+    lenRight, Nat.add_sub_of_le hRight] at splices
+  exact splices

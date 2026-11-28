@@ -19,6 +19,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Foldable qualified as Foldable
 import Data.List (partition, sortOn)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Ord (Down (..))
 import Occam.Core (Span (..), Statement (..))
@@ -95,22 +96,35 @@ applySpans spans source = case spans of
                     (BS.take (start - previousEnd) (BS.drop previousEnd source) : acc)
                     (removed + (end - start))
 
--- | Select maximal non-interfering edits with disjoint, non-gluing spans.
+data EditSelection = EditSelection !Int [ParserEdit]
+
+-- At shared byte boundaries, an earlier end is compatible with a later
+-- start if either edit deletes its span.
+editStartKey :: ParserEdit -> (Int, Bool)
+editStartKey e = (parserEditStart e, BS.null (parserEditReplacement e))
+
+editEndKey :: ParserEdit -> (Int, Bool)
+editEndKey e = (parserEditEnd e, not (BS.null (parserEditReplacement e)))
+
+-- | Maximize bytes saved by disjoint, non-gluing edits in O(k log k) time.
 selectIndependentEdits :: [ParserEdit] -> [ParserEdit]
-selectIndependentEdits =
-    sortOn parserEditStart
-        . Foldable.foldl' pick []
-        . sortOn (\e -> (Down (literalSavings e), parserEditStart e))
+selectIndependentEdits edits = reverse selected
     where
-        pick acc edit
-            | literalSavings edit <= 0 = acc
-            | any (interferes edit) acc = acc
-            | otherwise = edit : acc
-        interferes a b =
-            overlaps a b
-                || (adjacent a b && not (BS.null (parserEditReplacement a) || BS.null (parserEditReplacement b)))
-        overlaps a b = parserEditStart a < parserEditEnd b && parserEditStart b < parserEditEnd a
-        adjacent a b = parserEditEnd a == parserEditStart b || parserEditEnd b == parserEditStart a
+        emptySelection = EditSelection 0 []
+        ordered = sortOn editEndKey (filter ((> 0) . literalSavings) edits)
+        (_, EditSelection _ selected) = Foldable.foldl' choose (Map.empty, emptySelection) ordered
+
+        -- Each map entry records an improvement in the best schedule ending
+        -- at or before its key. Keep the earlier finish on equal scores.
+        choose (!prefixes, best@(EditSelection bestSavings _)) edit =
+            let EditSelection earlierSavings earlier =
+                    maybe emptySelection snd (Map.lookupLE (editStartKey edit) prefixes)
+                savings = earlierSavings + literalSavings edit
+             in if savings > bestSavings
+                    then
+                        let selection = EditSelection savings (edit : earlier)
+                         in (Map.insert (editEndKey edit) selection prefixes, selection)
+                    else (prefixes, best)
 
 -- | Build independent edit batches (>= 2 edits) grouped by semantic rank/category.
 independentEditBatches :: ParserEditCategory -> [ParserEdit] -> [[ParserEdit]]
@@ -155,11 +169,7 @@ applyParserEdits source edits = case sortOn parserEditStart edits of
              in if BS.length candidate < sourceLen then Just candidate else Nothing
         go prev (e : more) acc
             | not (validEdit e) = Nothing
-            | parserEditStart e < parserEditEnd prev = Nothing
-            | parserEditStart e == parserEditEnd prev
-            , not (BS.null (parserEditReplacement prev))
-            , not (BS.null (parserEditReplacement e)) =
-                Nothing
+            | editEndKey prev > editStartKey e = Nothing
             | otherwise =
                 let gap = BS.take (parserEditStart e - parserEditEnd prev) (BS.drop (parserEditEnd prev) source)
                  in go e more (parserEditReplacement e : gap : acc)

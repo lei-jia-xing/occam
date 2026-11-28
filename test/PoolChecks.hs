@@ -23,8 +23,9 @@ import Control.Exception (
     try,
     uninterruptibleMask_,
  )
-import Control.Monad (replicateM_)
+import Control.Monad (replicateM_, when)
 import Data.ByteString (ByteString)
+import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
@@ -96,9 +97,10 @@ tests =
             assertEqual "no physical probes beyond the known decision" 3 =<< poolAttempts pool
         , testCase "reap failure in an unselected worker stops the pool" $ do
             poolRef <- newEmptyMVar
+            failingWorkerStarted <- newEmptyMVar
             let execute candidate
-                    | candidate == "fails-reap" = throwIO OracleReapFailed
-                    | otherwise = pure acceptDetails
+                    | candidate == "fails-reap" = putMVar failingWorkerStarted () >> throwIO OracleReapFailed
+                    | otherwise = readMVar failingWorkerStarted >> pure acceptDetails
                 retire _ _ _ _ = do
                     pool <- readMVar poolRef
                     let waitForWorkers = do
@@ -184,6 +186,42 @@ tests =
             case denied of
                 Left _ -> pure ()
                 Right _ -> assertFailure "exhausted budget admitted another physical start"
+        , testCase "an in-flight join retires in serial order without reserving another permit" $ do
+            serialRetired <- newIORef []
+            windowRetired <- newIORef []
+            pulledUncachedTail <- newEmptyMVar
+            releaseOwner <- newEmptyMVar
+            let candidates = ["head", "owner", "owner", "budget-miss"]
+                record ref index sql outcome hit = modifyIORef' ref ((index, sql, outcome, hit) :)
+                bill = const (pure ())
+                execute sql
+                    | sql == "owner" = readMVar releaseOwner >> pure rejectDetails
+                    | otherwise = pure rejectDetails
+                next [] = pure Nothing
+                next (sql : rest) = do
+                    when (sql == "budget-miss") (putMVar pulledUncachedTail ())
+                    pure (Just ((TagUnknown, sql, ()), rest))
+                retire _ _ _ _ = pure ()
+            serial <- testPool 1 (Just 2) (const (pure rejectDetails)) bill (record serialRetired)
+            serialResult <- try (testOrdered serial candidates)
+            case serialResult of
+                Left (ExecutionBudgetReached ()) -> pure ()
+                Right _ -> assertFailure "serial execution should stop at the uncached tail"
+            window <- testPool 4 (Just 2) execute bill (record windowRetired)
+            outcome <- newEmptyMVar
+            _ <- forkIO (try (testOrderedGenerated window next retire () candidates) >>= putMVar outcome)
+            reached <- timeout 5000000 (readMVar pulledUncachedTail)
+            putMVar releaseOwner ()
+            assertEqual "the duplicate is dispatched while its owner is still running" (Just ()) reached
+            windowResult <- timeout 5000000 (readMVar outcome)
+            case windowResult of
+                Just (Left (ExecutionBudgetReached ())) -> pure ()
+                _ -> assertFailure "window execution should stop at the uncached tail"
+            expected <- readIORef serialRetired
+            assertEqual "ordered retirements and cache-hit flags match serial execution" expected
+                =<< readIORef windowRetired
+            assertEqual "the joined worker starts physically only once" 2 =<< poolAttempts window
+            assertEqual "one in-flight join" 1 . cacheJoins =<< poolCacheStats window
         , testCase "at most jobs physical executions run concurrently" $ do
             activeVar <- newMVar (0 :: Int, 0 :: Int)
             gate <- newEmptyMVar
@@ -235,7 +273,7 @@ tests =
             case result of
                 Nothing -> assertFailure "ordered window forced the unbounded tail"
                 Just outcomes -> assertEqual "decision stops at the head" [OracleAccepted] (map fst outcomes)
-        , testCase "adaptive lookahead pulls one SQL candidate after consecutive acceptances" $ do
+        , testCase "adaptive lookahead narrows after a fresh acceptance" $ do
             let execute candidate = pure (if candidate == "reject" then rejectDetails else acceptDetails)
                 collect results payload _ (outcome, _) = pure ((payload, outcome) : results)
                 next False = pure (Just ((TagUnknown, "generated", "head" :: String), True))
@@ -244,16 +282,44 @@ tests =
                 testPool 4 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
                     >>= withAdaptiveLookahead
             _ <- testOrdered pool ["warm-1"]
-            _ <- testOrdered pool ["warm-2"]
             retired <- testOrderedGenerated pool next collect [] False
             assertEqual "retirement carries the producer's payload" [("head", OracleAccepted)] retired
             attempts <- poolAttempts pool
-            assertEqual "two warmups and one generated probe" 3 attempts
+            assertEqual "one warmup and one generated probe" 2 attempts
             widened <- testOrdered pool ["reject", "next"]
             assertEqual
                 "head rejection resumes the scan in order"
                 [OracleRejected, OracleAccepted]
                 (map fst widened)
+        , testCase "adaptive lookahead uses an intermediate width from fresh retirements" $ do
+            release <- newEmptyMVar
+            pulled <- newIORef (0 :: Int)
+            let execute candidate
+                    | candidate == "accept-sample" = pure acceptDetails
+                    | "gated-" `BSC.isPrefixOf` candidate = readMVar release >> pure rejectDetails
+                    | otherwise = pure rejectDetails
+                next n = do
+                    writeIORef pulled (n + 1)
+                    pure $
+                        if n < (8 :: Int)
+                            then Just ((TagUnknown, BSC.pack ("gated-" <> show n), ()), n + 1)
+                            else Nothing
+                collect n _ _ _ = pure (n + 1)
+                awaitWidth scheduler =
+                    threadStatus scheduler >>= \case
+                        ThreadBlocked BlockedOnMVar -> readIORef pulled
+                        _ -> threadDelay 1000 >> awaitWidth scheduler
+            pool <- testPool 8 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ()) >>= withAdaptiveLookahead
+            _ <- testOrdered pool ["reject-1", "reject-2", "reject-3", "reject-4", "accept-sample"]
+            replicateM_ 5 $ do
+                _ <- testOrdered pool ["accept-sample"]
+                pure ()
+            result <- newEmptyMVar
+            scheduler <- forkIO (testOrderedGenerated pool next collect (0 :: Int) 0 >>= putMVar result)
+            width <- timeout 5000000 (awaitWidth scheduler)
+            putMVar release ()
+            assertEqual "an acceptance at the fifth fresh probe yields width five" (Just 5) width
+            assertEqual "every candidate eventually retires" (Just 8) =<< timeout 5000000 (readMVar result)
         , testCase "concurrent windows serialize on the shared gate" $ do
             let execute _ = pure rejectDetails
             pool <- testPool 2 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())

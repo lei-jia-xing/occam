@@ -27,9 +27,8 @@ import Control.Exception (
  )
 import Control.Monad (when)
 import Data.ByteString (ByteString)
-import Data.Foldable (for_, toList)
+import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.IntMap.Strict qualified as IntMap
 import Data.Map.Strict qualified as Map
 import Data.Sequence qualified as Seq
 import Data.Word (Word64)
@@ -68,10 +67,14 @@ import Occam.Pool.Types (
     admitObservation,
     checkReapFailure,
     outcomeVerdict,
+    recordLookaheadRun,
     refundPermit,
     reservePermit,
+    slidingLookahead,
     wallSince,
  )
+
+type ActiveTask payload = (FamilyTag, ByteString, payload, Int, WindowTask)
 
 {- | Bounded sliding-window ordered scheduler: keeps up to @jobs@ candidates in
 flight simultaneously while strictly retiring decisions in input order and
@@ -88,6 +91,7 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
     activeRef <- newIORef Seq.empty
     retiredThrough <- newIORef (-1 :: Int)
     firstDecisiveRef <- newIORef (Nothing :: Maybe Int)
+    width <- slidingLookahead pool
     let markDecisive !ord =
             atomicModifyIORef' firstDecisiveRef \prev -> (Just (maybe ord (min ord) prev), ())
         settleRemaining = do
@@ -98,12 +102,11 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
         fill !nextOrd Nothing = pure (nextOrd, Nothing)
         fill !nextOrd (Just pending) = do
             cur <- readIORef activeRef
-            width <- slidingLookahead pool
             decisive <- readIORef firstDecisiveRef
             if Seq.length cur >= width || maybe False (< nextOrd) decisive
                 then pure (nextOrd, Just pending)
-                else pullNext nextOrd pending
-        pullNext !nextOrd pending =
+                else pullNext cur nextOrd pending
+        pullNext active !nextOrd pending =
             restore (next pending) >>= \case
                 Nothing -> pure (nextOrd, Nothing)
                 Just ((tag, candidate, payload), rest) -> do
@@ -111,73 +114,76 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
                     if maybe False (< nextOrd) published
                         then pure (nextOrd, Nothing)
                         else do
-                            task <- launchTask pool nextOrd tag candidate markDecisive
+                            task <- launchTask pool active nextOrd tag candidate markDecisive
                             modifyIORef' activeRef (Seq.|> (tag, candidate, payload, nextOrd, task))
                             fill (nextOrd + 1) (Just rest)
-        go !nextOrd pending prefix earlier = do
+        finish accepted fresh prefix = do
+            checkReapFailure pool
+            mapM_ (recordLookaheadRun pool accepted) fresh
+            pure prefix
+        go !nextOrd pending prefix !fresh = do
             (nextOrd', pending') <- fill nextOrd pending
             cur <- readIORef activeRef
             case Seq.viewl cur of
-                Seq.EmptyL -> pure prefix
+                Seq.EmptyL -> finish False fresh prefix
                 (tag, candidate, payload, ordinal, task) Seq.:< restSeq -> do
-                    (observation, hit) <- restore (resolveSlidingTask earlier task)
+                    (observation, hit) <- restore (resolveSlidingTask task)
                     let outcome = observationOutcome observation
+                        fresh' = case fresh of
+                            Just n | not hit -> let !count = n + 1 in Just count
+                            _ -> Nothing
                     -- Commit retirement before invoking callback and retire this worker cleanly.
                     recordRetired (poolMetricsData pool) tag (outcomeVerdict outcome)
-                    for_ (poolAcceptStreak pool) $ \streak ->
-                        modifyIORef' streak (\prior -> if outcome == OracleAccepted then min 2 (prior + 1) else 0)
                     writeIORef retiredThrough ordinal
                     writeIORef activeRef restSeq
                     settleOne pool ordinal (ordinal, task)
                     index <- atomicModifyIORef' (poolIndexRef pool) (\n -> (n + 1, n))
                     restore (poolRetireFn pool index candidate outcome hit)
                     !prefix' <- restore (retire prefix payload candidate (outcome, hit))
-                    -- A join is created only while its owner is in the same window, so no
-                    -- remaining task can need an older result after retiring this ordinal.
-                    let earlier' =
-                            IntMap.insert ordinal observation (IntMap.delete (ordinal - poolJobsCount pool) earlier)
                     case outcome of
-                        OracleAccepted -> settleRemaining >> pure prefix'
+                        OracleAccepted -> do
+                            settleRemaining
+                            finish True fresh' prefix'
                         OracleInconclusive -> settleRemaining >> throwIO OracleInconclusiveError
                         OracleRejected -> do
                             atomicModifyIORef' firstDecisiveRef (\m -> if m == Just ordinal then (Nothing, ()) else (m, ()))
-                            go nextOrd' pending' prefix' earlier'
-    outcomes <- go 0 (Just initial) initialResult IntMap.empty `onException` settleRemaining
-    checkReapFailure pool
-    pure outcomes
+                            go nextOrd' pending' prefix' fresh'
+    go 0 (Just initial) initialResult (0 <$ poolLookahead pool) `onException` settleRemaining
 
-slidingLookahead :: OraclePool -> IO Int
-slidingLookahead pool = case poolAcceptStreak pool of
-    Nothing -> pure (poolJobsCount pool)
-    Just streak -> do
-        accepts <- readIORef streak
-        pure (if accepts >= 2 then 1 else poolJobsCount pool)
-
-resolveSlidingTask ::
-    IntMap.IntMap OracleObservation ->
-    WindowTask ->
-    IO (OracleObservation, Bool)
-resolveSlidingTask earlier task = case task of
+resolveSlidingTask :: WindowTask -> IO (OracleObservation, Bool)
+resolveSlidingTask task = case task of
     TaskImmediate observation hit -> pure (observation, hit)
-    TaskJoined owner -> case IntMap.lookup owner earlier of
-        Just observation -> pure (observation, True)
-        Nothing -> ioError (userError "OraclePool join owner retired out of order")
+    TaskJoined result -> readObservation True result
     TaskDenied -> throwIO (ExecutionBudgetReached ())
-    TaskPending _ result _ _ _ _ -> do
-        published <- readMVar result
-        case published of
-            Right timed -> pure (detailedObservation (timedDetails timed), False)
-            Left err -> throwIO err
+    TaskPending _ result _ _ _ _ -> readObservation False result
+    where
+        readObservation hit result =
+            readMVar result >>= \case
+                Right timed -> pure (detailedObservation (timedDetails timed), hit)
+                Left err -> throwIO err
 
-launchTask :: OraclePool -> Int -> FamilyTag -> ByteString -> (Int -> IO ()) -> IO WindowTask
-launchTask pool ordinal tag candidate markDecisive = do
+launchTask ::
+    OraclePool ->
+    Seq.Seq (ActiveTask payload) ->
+    Int ->
+    FamilyTag ->
+    ByteString ->
+    (Int -> IO ()) ->
+    IO WindowTask
+launchTask pool active ordinal tag candidate markDecisive = do
     key <- poolCandidateKey pool candidate
     look <- cacheLookupKey (poolCacheData pool) (poolCacheModeData pool) key
     case look of
         LookupHit observation -> do
             when (observationOutcome observation /= OracleRejected) (markDecisive ordinal)
             pure (TaskImmediate observation True)
-        LookupJoin owner -> pure (TaskJoined owner)
+        LookupJoin owner ->
+            -- Active ordinals are contiguous. The in-flight entry belongs to
+            -- an active worker, and its result remains readable after retirement.
+            case Seq.lookup (owner - (ordinal - Seq.length active)) active of
+                Just (_, _, _, ownerOrdinal, TaskPending _ result _ _ _ _)
+                    | ownerOrdinal == owner -> pure (TaskJoined result)
+                _ -> ioError (userError "OraclePool join owner is not an active worker")
         LookupMiss -> launchFreshTask pool ordinal tag key candidate markDecisive
 
 launchFreshTask ::

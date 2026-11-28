@@ -6,7 +6,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (elemIndex)
+import Data.List (elemIndex, subsequences)
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text.Encoding qualified as TE
@@ -199,6 +199,36 @@ checks =
                     (BS.length reducedBatch <= BS.length reducedControl)
             )
             [SQLite, PostgreSQL, MySQL, DuckDB]
+    , testCase "AST batch selection maximizes byte savings instead of individual edit size" $ do
+        let delete start end = ParserEdit start end "" EditExpression TierDefault "delete" False False False False
+            large = delete 2 8
+            left = delete 0 4
+            right = delete 6 10
+            selected = selectIndependentEdits [large, right, left]
+        assertEqual "both smaller deletions fit together" [left, right] selected
+        assertEqual "the pair saves eight bytes" (Just "ef") (applyParserEdits "abcdefghij" selected)
+    , testCase "AST interval selection matches exhaustive byte savings with adjacent replacements" $ do
+        let source = "abcdefghijkl" :: ByteString
+            edit start end replacement =
+                ParserEdit start end replacement EditExpression TierDefault "test" False False False False
+            edits =
+                [ edit 8 12 "Z"
+                , edit 4 8 ""
+                , edit 0 4 "X"
+                , edit 4 8 "Y"
+                , edit 1 9 "AB"
+                , edit 0 4 "AB"
+                , edit 8 11 ""
+                , edit 8 9 "N"
+                ]
+            renderedSavings = fmap ((BS.length source -) . BS.length) . applyParserEdits source
+        forM_ (subsequences edits) $ \available -> do
+            let selected = selectIndependentEdits available
+                best =
+                    maximum
+                        (0 : [saved | editsToApply <- subsequences available, Just saved <- [renderedSavings editsToApply]])
+                actual = if null selected then Just 0 else renderedSavings selected
+            assertEqual ("available edits: " <> show available) (Just best) actual
     , testCase "ColumnAtomic refreshes bundles cleanly after EditList and AST batching in same statement" $ do
         let sql =
                 BSC.unlines
