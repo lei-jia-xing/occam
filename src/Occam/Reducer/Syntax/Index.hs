@@ -299,8 +299,6 @@ phaseCandidates category index = phaseCandidatesFrom category index 0
 
 isPrimaryLiteralEdit :: LiteralDeferralMode -> Set (Int, Int) -> ParserEdit -> Bool
 isPrimaryLiteralEdit DeferLiteralsOff _ _ = True
-isPrimaryLiteralEdit DeferLiteralsPrimaryOne seenLitSpans edit =
-    not (Set.member (parserEditStart edit, parserEditEnd edit) seenLitSpans)
 isPrimaryLiteralEdit DeferLiteralsZeroOne _ edit =
     not (parserEditLowYield edit)
 

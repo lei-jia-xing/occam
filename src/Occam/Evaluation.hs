@@ -90,7 +90,6 @@ import Occam.Pool (
     poolAttempts,
     poolCacheStats,
     poolCancelled,
-    withAdaptiveLookahead,
     withCandidateCountCleanup,
  )
 
@@ -149,7 +148,7 @@ runEvaluationRequest request = do
 runEvaluationRequestWithObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
 runEvaluationRequestWithObserver micros observe =
-    runEvaluationRequestWithKey False pure micros observe observe
+    runEvaluationRequestWithKey pure micros observe observe
 
 -- | Run an 'EvaluationRequest' using an in-process native observer and native cache-key canonicalization.
 runEvaluationRequestWithNativeObserver ::
@@ -162,7 +161,6 @@ runEvaluationRequestWithNativeValidation ::
     Int -> EvaluationObserver -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
 runEvaluationRequestWithNativeValidation micros observe validate request =
     runEvaluationRequestWithKey
-        True
         (nativeCandidateKey (nativeOracleCacheKey request.dialect))
         micros
         observe
@@ -170,14 +168,13 @@ runEvaluationRequestWithNativeValidation micros observe validate request =
         request
 
 runEvaluationRequestWithKey ::
-    Bool ->
     (ByteString -> IO ByteString) ->
     Int ->
     EvaluationObserver ->
     EvaluationObserver ->
     EvaluationRequest oracle ->
     IO EvaluationResult
-runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate request = do
+runEvaluationRequestWithKey candidateKey timeoutMicros observe validate request = do
     let onProgress = request.onProgress
         metricsPolicy = request.metricsPolicy
         config = request.config
@@ -237,9 +234,8 @@ runEvaluationRequestWithKey adaptive candidateKey timeoutMicros observe validate
                     Just
                         (\bytes count -> modifyEvalState state (\s -> s {evalCounts = Map.insert bytes count (evalCounts s)}))
                 }
-    configuredPool <- if adaptive then withAdaptiveLookahead rawPool else pure rawPool
     let pool =
-            withCandidateCountCleanup (modifyEvalState state (\s -> s {evalCounts = seedCounts})) configuredPool
+            withCandidateCountCleanup (modifyEvalState state (\s -> s {evalCounts = seedCounts})) rawPool
         env =
             EvalEnv
                 { envDialect = dialect

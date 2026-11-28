@@ -25,11 +25,10 @@ import Control.Exception (
  )
 import Control.Monad (replicateM_, when)
 import Data.ByteString (ByteString)
-import Data.ByteString.Char8 qualified as BSC
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
-import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Occam.Cache (CacheStats (..))
 import Occam.Core (OracleInconclusiveError, OracleOutcome (..))
 import Occam.Metrics (FamilyTag (TagUnknown))
@@ -47,7 +46,6 @@ import Occam.Pool (
     poolLiveWorkers,
     testOrdered,
     testOrderedGenerated,
-    withAdaptiveLookahead,
  )
 import System.Exit (ExitCode (..))
 import System.Timeout (timeout)
@@ -273,53 +271,6 @@ tests =
             case result of
                 Nothing -> assertFailure "ordered window forced the unbounded tail"
                 Just outcomes -> assertEqual "decision stops at the head" [OracleAccepted] (map fst outcomes)
-        , testCase "adaptive lookahead narrows after a fresh acceptance" $ do
-            let execute candidate = pure (if candidate == "reject" then rejectDetails else acceptDetails)
-                collect results payload _ (outcome, _) = pure ((payload, outcome) : results)
-                next False = pure (Just ((TagUnknown, "generated", "head" :: String), True))
-                next True = assertFailure "a serial accept must leave the generator's tail untouched"
-            pool <-
-                testPool 4 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())
-                    >>= withAdaptiveLookahead
-            _ <- testOrdered pool ["warm-1"]
-            retired <- testOrderedGenerated pool next collect [] False
-            assertEqual "retirement carries the producer's payload" [("head", OracleAccepted)] retired
-            attempts <- poolAttempts pool
-            assertEqual "one warmup and one generated probe" 2 attempts
-            widened <- testOrdered pool ["reject", "next"]
-            assertEqual
-                "head rejection resumes the scan in order"
-                [OracleRejected, OracleAccepted]
-                (map fst widened)
-        , testCase "adaptive lookahead uses an intermediate width from fresh retirements" $ do
-            release <- newEmptyMVar
-            pulled <- newIORef (0 :: Int)
-            let execute candidate
-                    | candidate == "accept-sample" = pure acceptDetails
-                    | "gated-" `BSC.isPrefixOf` candidate = readMVar release >> pure rejectDetails
-                    | otherwise = pure rejectDetails
-                next n = do
-                    writeIORef pulled (n + 1)
-                    pure $
-                        if n < (8 :: Int)
-                            then Just ((TagUnknown, BSC.pack ("gated-" <> show n), ()), n + 1)
-                            else Nothing
-                collect n _ _ _ = pure (n + 1)
-                awaitWidth scheduler =
-                    threadStatus scheduler >>= \case
-                        ThreadBlocked BlockedOnMVar -> readIORef pulled
-                        _ -> threadDelay 1000 >> awaitWidth scheduler
-            pool <- testPool 8 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ()) >>= withAdaptiveLookahead
-            _ <- testOrdered pool ["reject-1", "reject-2", "reject-3", "reject-4", "accept-sample"]
-            replicateM_ 5 $ do
-                _ <- testOrdered pool ["accept-sample"]
-                pure ()
-            result <- newEmptyMVar
-            scheduler <- forkIO (testOrderedGenerated pool next collect (0 :: Int) 0 >>= putMVar result)
-            width <- timeout 5000000 (awaitWidth scheduler)
-            putMVar release ()
-            assertEqual "an acceptance at the fifth fresh probe yields width five" (Just 5) width
-            assertEqual "every candidate eventually retires" (Just 8) =<< timeout 5000000 (readMVar result)
         , testCase "concurrent windows serialize on the shared gate" $ do
             let execute _ = pure rejectDetails
             pool <- testPool 2 Nothing execute (const (pure ())) (\_ _ _ _ -> pure ())

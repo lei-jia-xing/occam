@@ -3,10 +3,11 @@ module ResultBaseline.Fixtures (
     Fixture (..),
     fixtures,
     searchFixtures,
+    columnModeCohort,
     requiredValuesFixture,
     statementFixtures,
     statementFixture,
-    projectionCohort,
+    closureRankedCohort,
     lanePreferenceCohort,
     fallbackQualificationCohort,
     fallbackNoLocCohort,
@@ -104,6 +105,83 @@ searchFixtures =
     ]
         ++ map requiredValuesFixture [8, 64]
         ++ map removableValuesFixture [8, 64]
+
+columnModeCohort :: [Fixture]
+columnModeCohort =
+    [ columnFixture
+        "column-explicit-joint"
+        SQLite
+        [ "CREATE TABLE t(a INT, b INT);"
+        , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+        , "SELECT a FROM t ORDER BY a;"
+        ]
+        "SELECT 1 AS a UNION ALL SELECT 2 AS a;"
+        "SELECT 0 AS a;"
+    , columnFixture
+        "column-implicit-joint"
+        SQLite
+        [ "CREATE TABLE t(a INT, b INT);"
+        , "INSERT INTO t VALUES (1, 10), (2, 20);"
+        , "SELECT a FROM t ORDER BY a;"
+        ]
+        "SELECT 1 AS a UNION ALL SELECT 2 AS a;"
+        "SELECT 0 AS a;"
+    , columnFixture
+        "column-star"
+        SQLite
+        [ "CREATE TABLE t(a INT, b INT);"
+        , "INSERT INTO t VALUES (1, 10), (2, 20);"
+        , "SELECT * FROM t ORDER BY a;"
+        ]
+        "SELECT 1 AS a, 10 AS b UNION ALL SELECT 2 AS a, 20 AS b;"
+        "SELECT 1 AS a, 10 AS b;"
+    , columnFixture
+        "column-wide-explicit"
+        SQLite
+        [ "CREATE TABLE t(a INT, b INT, c INT, d INT, e INT, f INT, g INT, h INT);"
+        , "INSERT INTO t VALUES (1, 2, 3, 4, 5, 6, 7, 8), (2, 3, 4, 5, 6, 7, 8, 9);"
+        , "SELECT a FROM t ORDER BY a;"
+        ]
+        "SELECT 1 AS a UNION ALL SELECT 2 AS a;"
+        "SELECT 0 AS a;"
+    , fencedColumnFixture
+        "column-fenced-aggregate"
+        SQLite
+        [ "CREATE TABLE t(a INT, b INT, c INT);"
+        , "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200);"
+        , "SELECT sum(a) AS answer FROM t;"
+        ]
+        "SELECT 3 AS answer;"
+        "SELECT 0 AS answer;"
+    , columnFixture
+        "column-duckdb-explicit"
+        DuckDB
+        [ "CREATE TABLE t(a INTEGER, b INTEGER);"
+        , "INSERT INTO t(a, b) VALUES (1, 10), (2, 20);"
+        , "SELECT a FROM t ORDER BY a;"
+        ]
+        "SELECT 1::INTEGER AS a UNION ALL SELECT 2::INTEGER AS a;"
+        "SELECT 0::INTEGER AS a;"
+    ]
+    where
+        columnFixture name dialect input expected changed =
+            Fixture
+                name
+                dialect
+                (BSC.pack (unlines input))
+                (BSC.pack expected)
+                (BSC.pack changed)
+                (ResultStatement 3 2)
+                False
+        fencedColumnFixture name dialect input expected changed =
+            Fixture
+                name
+                dialect
+                (BSC.pack (unlines input))
+                (BSC.pack expected)
+                (BSC.pack changed)
+                (ResultStatement 3 2)
+                True
 
 requiredValuesFixture :: Int -> Fixture
 requiredValuesFixture size =
@@ -398,8 +476,8 @@ requiredTxBlocksFixture size =
             (ResultStatement total (total - 1))
             True
 
-projectionCohort :: [Fixture]
-projectionCohort =
+closureRankedCohort :: [Fixture]
+closureRankedCohort =
     statementFixtures
         ++ [statementFixture False False 128, statementFixture True False 32, statementFixture True True 32]
         ++ fixtures

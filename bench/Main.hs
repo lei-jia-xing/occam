@@ -2,7 +2,6 @@
 
 module Main (main) where
 
-import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, catch)
 import Control.Monad (forM, forM_, unless)
 import Data.ByteString (ByteString)
@@ -13,7 +12,6 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
-import GHC.Clock (getMonotonicTimeNSec)
 import Occam.Cache (
     CacheMode (..),
     cacheCompleteInflight,
@@ -70,10 +68,7 @@ import Occam.Parser (
     parseSQLTimed,
  )
 import Occam.Pool (
-    poolAttempts,
     poolMetricsStore,
-    testOrdered,
-    withAdaptiveLookahead,
     withPredicatePool,
  )
 import Occam.Reducer (
@@ -95,9 +90,10 @@ import Occam.Reducer (
 import Occam.Slicer (backwardSlice)
 import Paths_occam qualified
 import ResultBaseline (
+    runAstBatchingBaseline,
+    runColumnModeBaseline,
     runCombinedSyntaxBaseline,
     runDeferLiteralVariants01Baseline,
-    runDeferLiteralVariantsBaseline,
     runDeferRecursiveBaseline,
     runDistributedCap16Vs32Baseline,
     runDistributedCap8Vs16Baseline,
@@ -121,8 +117,6 @@ import ResultBaseline (
     runStatementLanePrefQuota2Baseline,
     runStatementLanePrefQuota8Baseline,
     runStatementOrderBaseline,
-    runStatementProjectedRankBaseline,
-    runStatementProjectionScoreBaseline,
     runStatementRankBaseline,
     runStatementRankedBaseline,
     runStatementRankedGraphFreeBaseline,
@@ -130,11 +124,6 @@ import ResultBaseline (
     runStatementRankedResumeTiesBaseline,
     runStatementResumeMonoBaseline,
     runStatementWeightBaseline,
-    runStatementWindowCrossVsLaneBaseline,
-    runStatementWindowPrefetchBaseline,
-    runStatementWindowSize16Baseline,
-    runStatementWindowSize4Baseline,
-    runStatementWindowWithinLaneBaseline,
     runStatementYieldBaseline,
     runValuesScheduleBaseline,
     runWorkerBaseline,
@@ -151,7 +140,6 @@ import Test.Tasty.Bench (
     whnf,
     whnfIO,
  )
-import Text.Printf (printf)
 import Text.Read (readMaybe)
 
 deletionEdit :: Int -> Int -> ParserEdit
@@ -428,7 +416,6 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
-        ["--lookahead-baseline"] -> runLookaheadBaseline
         ["--result-baseline", count, out]
             | Just pairs <- readMaybe count
             , pairs >= 2
@@ -448,50 +435,14 @@ main = do
                     ("Usage: occam-bench " ++ mode ++ " EVEN_PAIRS (unlimited|CALLS >= 4|wall:SECONDS >= 20) OUTPUT.json")
         _ -> runTimingBenchmarks
 
-runLookaheadBaseline :: IO ()
-runLookaheadBaseline = do
-    putStrLn "jobs,workload,policy,wall_ms,speculative_starts,wall_plus_speculation_ms"
-    forM_ [4, 8] $ \jobs ->
-        forM_ workloads $ \(name, decisions) -> do
-            measure jobs name decisions "fixed" pure
-            measure jobs name decisions "adaptive" withAdaptiveLookahead
-    where
-        count = 20 :: Int
-        latency = 2500
-        workloads =
-            [ ("fourth-accept", replicate 48 (Just 3))
-            , ("early-accept", take 48 (cycle [Just 0, Just 1, Just 0]))
-            , ("all-reject", replicate 48 Nothing)
-            ] ::
-                [(String, [Maybe Int])]
-        measure jobs name decisions policy configure =
-            withPredicatePool jobs True runProbe $ \base -> do
-                pool <- configure base
-                start <- getMonotonicTimeNSec
-                lengths <- forM (zip [1 :: Int ..] decisions) $ \(roundId, target) -> do
-                    let candidate ordinal =
-                            BSC.pack ((if target == Just ordinal then 'A' else 'R') : show roundId ++ "/" ++ show ordinal)
-                        expected =
-                            maybe (replicate count OracleRejected) (\i -> replicate i OracleRejected ++ [OracleAccepted]) target
-                    outcomes <- testOrdered pool (map candidate [0 .. count - 1])
-                    unless (map fst outcomes == expected) (die "lookahead baseline changed the ordered verdicts")
-                    pure (length outcomes)
-                end <- getMonotonicTimeNSec
-                starts <- poolAttempts pool
-                let wasted = starts - sum lengths
-                    wallMs = fromIntegral (end - start) / 1000000 :: Double
-                    pricedMs = wallMs + fromIntegral (latency * wasted) / 1000
-                printf "%d,%s,%s,%.1f,%d,%.1f\n" jobs name (policy :: String) wallMs wasted pricedMs
-        runProbe sql = do
-            threadDelay latency
-            pure (BSC.head sql == 'A')
-
 searchModes :: [(String, Int -> Maybe Int -> Maybe Int -> FilePath -> IO ())]
 searchModes =
     [ ("--search-baseline", runSearchBaseline)
     , ("--literal-batch-baseline", runLiteralBatchBaseline)
     , ("--values-schedule-baseline", runValuesScheduleBaseline)
     , ("--combined-syntax-baseline", runCombinedWithCorpus)
+    , ("--ast-batching-baseline", runAstBatchingBaseline)
+    , ("--column-mode-baseline", runColumnModeBaseline)
     , ("--statement-yield-baseline", runStatementYieldBaseline)
     , ("--statement-order-baseline", runStatementOrderBaseline)
     , ("--statement-weight-baseline", runStatementWeightBaseline)
@@ -501,13 +452,6 @@ searchModes =
     , ("--statement-interleave-ablation", runStatementInterleaveBaseline)
     , ("--statement-ranked-resume-ablation", runStatementRankedResumeBaseline)
     , ("--statement-ranked-resume-ties-ablation", runStatementRankedResumeTiesBaseline)
-    , ("--statement-projected-rank-baseline", runStatementProjectedRankBaseline)
-    , ("--statement-projection-score-baseline", runStatementProjectionScoreBaseline)
-    , ("--statement-window-prefetch-baseline", runStatementWindowPrefetchBaseline)
-    , ("--statement-window-within-lane-baseline", runStatementWindowWithinLaneBaseline)
-    , ("--statement-window-cross-vs-lane-baseline", runStatementWindowCrossVsLaneBaseline)
-    , ("--statement-window-size-4-baseline", runStatementWindowSize4Baseline)
-    , ("--statement-window-size-16-baseline", runStatementWindowSize16Baseline)
     , ("--statement-bounded-pref-closure-baseline", runStatementBoundedPrefClosureBaseline)
     , ("--statement-resume-mono-baseline", runStatementResumeMonoBaseline)
     , ("--statement-lane-pref-baseline", runStatementLanePrefBaseline)
@@ -527,7 +471,6 @@ searchModes =
     , ("--distributed-min16-vs-32-baseline", runDistributedMin16Vs32Baseline)
     , ("--distributed-cap8-vs-16-baseline", runDistributedCap8Vs16Baseline)
     , ("--distributed-cap16-vs-32-baseline", runDistributedCap16Vs32Baseline)
-    , ("--defer-literal-variants-baseline", runDeferLiteralsWithCorpus runDeferLiteralVariantsBaseline)
     ,
         ( "--defer-literal-variants-01-baseline"
         , runDeferLiteralsWithCorpus runDeferLiteralVariants01Baseline

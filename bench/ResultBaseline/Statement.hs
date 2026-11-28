@@ -9,13 +9,6 @@ module ResultBaseline.Statement (
     runStatementInterleaveBaseline,
     runStatementRankedResumeBaseline,
     runStatementRankedResumeTiesBaseline,
-    runStatementProjectedRankBaseline,
-    runStatementProjectionScoreBaseline,
-    runStatementWindowPrefetchBaseline,
-    runStatementWindowWithinLaneBaseline,
-    runStatementWindowCrossVsLaneBaseline,
-    runStatementWindowSize4Baseline,
-    runStatementWindowSize16Baseline,
     runStatementBoundedPrefClosureBaseline,
     runStatementResumeMonoBaseline,
     runStatementLanePrefBaseline,
@@ -31,8 +24,6 @@ module ResultBaseline.Statement (
 import Occam.Reducer (
     LaneOrdering (..),
     LaneScheduling (..),
-    ProjectionWindow (..),
-    ProjectionWindowOrder (..),
     RankedScheduleConfig (..),
     ReductionConfig (..),
     SingletonResume (..),
@@ -166,67 +157,11 @@ runStatementRankedResumeTiesBaseline :: Int -> Maybe Int -> Maybe Int -> FilePat
 runStatementRankedResumeTiesBaseline =
     runRankedAblation (rankedPolicy (\c -> c {rankedSingletonResume = ResumeWeightStableTies}))
 
-runStatementProjectedRankBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementProjectedRankBaseline =
-    runProjectionPair
-        "estimated-bytes"
-        statementRanked
-        "projected-bytes"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
-
-runStatementProjectionScoreBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementProjectionScoreBaseline =
-    runProjectionPair
-        "window-estimated-bytes"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossEstimated}))
-        "projected-bytes"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
-
-runStatementWindowPrefetchBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementWindowPrefetchBaseline =
-    runProjectionPair
-        "unwindowed"
-        statementRanked
-        "window-8-preserve"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderPreserve}))
-
-runStatementWindowWithinLaneBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementWindowWithinLaneBaseline =
-    runProjectionPair
-        "window-8-preserve"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderPreserve}))
-        "window-8-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
-
-runStatementWindowCrossVsLaneBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementWindowCrossVsLaneBaseline =
-    runProjectionPair
-        "window-8-cross-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
-        "window-8-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
-
-runStatementWindowSize4Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementWindowSize4Baseline =
-    runProjectionPair
-        "window-4-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 4 WindowOrderWithinLaneProjected}))
-        "window-8-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
-
-runStatementWindowSize16Baseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
-runStatementWindowSize16Baseline =
-    runProjectionPair
-        "window-16-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 16 WindowOrderWithinLaneProjected}))
-        "window-8-within-lane-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected}))
-
 runStatementBoundedPrefClosureBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
 runStatementBoundedPrefClosureBaseline =
-    runProjectionPair
-        "window-8-cross-projected"
-        (rankedPolicy (\c -> c {rankedProjectionWindow = ProjectionWindow 8 WindowOrderCrossProjected}))
+    runClosurePair
+        "ranked-unwindowed"
+        statementRanked
         "bounded-lane-pref-4"
         (StatementRankedWith (boundedPrefConfig 4))
 
@@ -372,7 +307,7 @@ runEarlyRejectBaseline pairs wallLimit callLimit out =
         )
         earlyRejectCohort
 
-runProjectionPair ::
+runClosurePair ::
     String ->
     StatementSearchPolicy ->
     String ->
@@ -382,7 +317,7 @@ runProjectionPair ::
     Maybe Int ->
     FilePath ->
     IO ()
-runProjectionPair controlName control treatmentName treatment pairs wallLimit callLimit out =
+runClosurePair controlName control treatmentName treatment pairs wallLimit callLimit out =
     runComparison
         pairs
         out
@@ -390,7 +325,7 @@ runProjectionPair controlName control treatmentName treatment pairs wallLimit ca
         callLimit
         (searchCensoredStatuses wallLimit callLimit)
         (arm controlName control, arm treatmentName treatment)
-        projectionCohort
+        closureRankedCohort
     where
         arm name policy =
             serialArm

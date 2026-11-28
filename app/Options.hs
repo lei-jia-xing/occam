@@ -158,13 +158,12 @@ parseStatementOrder s = case map toLower s of
     "byte-weighted" -> Right StatementByteWeighted
     _ -> Left "Expected ranked-fallback, ranked, byte-weighted, complement-first, or subset-first"
 
--- | Parse a CLI @--column-mode@ string (@off@, @single@, or @atomic@).
+-- | Parse a CLI @--column-mode@ string (@off@ or @atomic@).
 parseColumnMode :: String -> Either String ColumnMode
 parseColumnMode s = case map toLower s of
     "off" -> Right ColumnOff
-    "single" -> Right ColumnSingle
     "atomic" -> Right ColumnAtomic
-    _ -> Left "Expected off, single, or atomic"
+    _ -> Left "Expected off or atomic"
 
 -- | Parse a CLI @--strategy@ string (@full@, @ddmin-only@, or @audit-only@).
 parseStrategy :: String -> Either String ReductionStrategy
@@ -497,7 +496,7 @@ validateCliOptions opts@RawOptions {..} = do
             Explicit enabled -> enabled
     when (colMode /= ColumnOff && not intra) $
         Left
-            "--column-mode single|atomic requires --intra-statement to be enabled (add '--intra-statement')"
+            "--column-mode atomic requires --intra-statement to be enabled (add '--intra-statement')"
     mapM_
         (uncurry (requireIntraFlag intra))
         [ ("--literal-batches", rawLiteralBatches)

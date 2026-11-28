@@ -68,10 +68,8 @@ import Occam.Pool.Types (
     admitObservation,
     checkReapFailure,
     outcomeVerdict,
-    recordLookaheadRun,
     refundPermit,
     reservePermit,
-    slidingLookahead,
     wallSince,
  )
 
@@ -92,7 +90,6 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
     activeRef <- newIORef Seq.empty
     retiredThrough <- newIORef (-1 :: Int)
     firstDecisiveRef <- newIORef (Nothing :: Maybe Int)
-    width <- slidingLookahead pool
     let markDecisive !ord =
             atomicModifyIORef' firstDecisiveRef \prev -> (Just (maybe ord (min ord) prev), ())
         settleRemaining = do
@@ -100,6 +97,7 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
             rt <- readIORef retiredThrough
             writeIORef activeRef Seq.empty
             settleAll pool [(ord, task) | (_, _, _, ord, task) <- toList remSeq] rt
+        width = poolJobsCount pool
         fill !nextOrd Nothing = pure (nextOrd, Nothing)
         fill !nextOrd (Just pending) = do
             cur <- readIORef activeRef
@@ -118,21 +116,17 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
                             task <- launchTask pool active nextOrd tag candidate markDecisive
                             modifyIORef' activeRef (Seq.|> (tag, candidate, payload, nextOrd, task))
                             fill (nextOrd + 1) (Just rest)
-        finish accepted fresh prefix = do
+        finish prefix = do
             checkReapFailure pool
-            mapM_ (recordLookaheadRun pool accepted) fresh
             pure prefix
-        go !nextOrd pending prefix !fresh = do
+        go !nextOrd pending prefix = do
             (nextOrd', pending') <- fill nextOrd pending
             cur <- readIORef activeRef
             case Seq.viewl cur of
-                Seq.EmptyL -> finish False fresh prefix
+                Seq.EmptyL -> finish prefix
                 (tag, candidate, payload, ordinal, task) Seq.:< restSeq -> do
                     (observation, hit) <- restore (resolveSlidingTask task)
                     let outcome = observationOutcome observation
-                        fresh' = case fresh of
-                            Just n | not hit -> let !count = n + 1 in Just count
-                            _ -> Nothing
                     -- Commit retirement before invoking callback and retire this worker cleanly.
                     recordRetired (poolMetricsData pool) tag (outcomeVerdict outcome)
                     writeIORef retiredThrough ordinal
@@ -144,12 +138,12 @@ runSlidingWindow pool next retire initialResult initial = mask \restore -> do
                     case outcome of
                         OracleAccepted -> do
                             settleRemaining
-                            finish True fresh' prefix'
+                            finish prefix'
                         OracleInconclusive -> settleRemaining >> throwIO OracleInconclusiveError
                         OracleRejected -> do
                             atomicModifyIORef' firstDecisiveRef (\m -> if m == Just ordinal then (Nothing, ()) else (m, ()))
-                            go nextOrd' pending' prefix' fresh'
-    go 0 (Just initial) initialResult (0 <$ poolLookahead pool) `onException` settleRemaining
+                            go nextOrd' pending' prefix'
+    go 0 (Just initial) initialResult `onException` settleRemaining
 
 resolveSlidingTask :: WindowTask -> IO (OracleObservation, Bool)
 resolveSlidingTask task = case task of

@@ -275,7 +275,7 @@ tests =
                         exists <- doesFileExist outFile
                         assertBool "reduction started with bad --column-mode" (not exists)
                     )
-                    ["bogus", "single-atomic"]
+                    ["bogus", "single"]
         , testCase "CLI requires --intra-statement for column modes and starts no oracle" $
             withCLIInput "SELECT 1;" $ \input outFile ->
                 withCLIInput "" $ \calls _ -> do
@@ -300,7 +300,7 @@ tests =
                             exists <- doesFileExist outFile
                             assertBool "reduction started without --intra-statement" (not exists)
                         )
-                        ["single", "atomic"]
+                        ["atomic"]
                     observed <- BSC.readFile calls
                     assertEqual "oracle ran before validation" "" observed
         , testCase "help starts with a compact usage line and points to the dialect list" $ do
@@ -369,8 +369,9 @@ tests =
 
             (mCode, mOut, _) <- runOccamCLI ["--list-column-modes"]
             assertEqual "--list-column-modes exit code" ExitSuccess mCode
-            assertBool "missing single in --list-column-modes" ("single" `isInfixOf` mOut)
+            assertBool "missing off in --list-column-modes" ("off" `isInfixOf` mOut)
             assertBool "missing atomic in --list-column-modes" ("atomic" `isInfixOf` mOut)
+            assertBool "retired single remains in --list-column-modes" (not ("single" `isInfixOf` mOut))
 
             (sCode, sOut, _) <- runOccamCLI ["--list-strategies"]
             assertEqual "--list-strategies exit code" ExitSuccess sCode
@@ -536,7 +537,7 @@ tests =
                     ]
             assertEqual "column-mode completion exit code" ExitSuccess cmCode
             assertBool "completion includes off" ("off" `isInfixOf` cmOut)
-            assertBool "completion includes single" ("single" `isInfixOf` cmOut)
+            assertBool "completion retains retired single" (not ("single" `isInfixOf` cmOut))
             assertBool "completion includes atomic" ("atomic" `isInfixOf` cmOut)
 
             -- Shell completion case-insensitivity and invalid shell rejection

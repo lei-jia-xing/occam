@@ -37,11 +37,10 @@ tests =
     testGroup
         "Column reduction"
         [ testCase "atomic drops the unused column" testAtomicJoint
-        , testCase "single keeps the joint column" testSingleKeeps
         , testCase "permuted explicit order binds by list position" testPermuted
         , testCase "implicit order binds by definition order" testImplicit
         , testCase "quoted multibyte identifiers round-trip" testUtf8
-        , testCase "atomic includes the single-only column" testSingleOnly
+        , testCase "atomic includes single-point column sites" testAtomicSinglePoint
         , testCase "atomic drops despite add-column on another column" testAtomicAlterAddOther
         , testCase "atomic drops despite rename of another column" testAtomicRenameColumnOther
         , testCase "atomic follows a table rename" testAtomicRenameFollow
@@ -169,12 +168,6 @@ testAtomicJoint = do
     reduced <- reduceWith ColumnAtomic pool explicitScript
     assertSchemaAndRows reduced ["a"] "1\n2\n"
 
-testSingleKeeps :: IO ()
-testSingleKeeps = do
-    pool <- testPoolWith (sqliteOracle "1\n2\n")
-    reduced <- reduceWith ColumnSingle pool explicitScript
-    assertSchemaAndRows reduced ["a", "b"] "1\n2\n"
-
 -- | The list order, not the definition order, binds explicit rows.
 testPermuted :: IO ()
 testPermuted = do
@@ -212,18 +205,15 @@ testUtf8 = do
     reduced <- reduceWith ColumnAtomic pool script
     assertSchemaAndRows reduced ["a"] "1\n2\n"
 
--- Single-site column without bundle drops via single-point move.
-testSingleOnly :: IO ()
-testSingleOnly = do
+-- Atomic mode retains single-point column moves as well as joint bundles.
+testAtomicSinglePoint :: IO ()
+testAtomicSinglePoint = do
     let script =
             BSC.unlines
                 [ "CREATE TABLE t(a INT, b INT);"
                 , "INSERT INTO t(a) VALUES (1), (2);"
                 , "SELECT a FROM t ORDER BY a;"
                 ]
-    singlePool <- testPoolWith (sqliteOracle "1\n2\n")
-    singleReduced <- reduceWith ColumnSingle singlePool script
-    assertSchemaAndRows singleReduced ["a"] "1\n2\n"
     atomicPool <- testPoolWith (sqliteOracle "1\n2\n")
     atomicReduced <- reduceWith ColumnAtomic atomicPool script
     assertSchemaAndRows atomicReduced ["a"] "1\n2\n"

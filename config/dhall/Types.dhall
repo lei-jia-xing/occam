@@ -10,7 +10,7 @@ let Strategy = < full | ddmin-only | audit-only >
 let StatementOrder =
       < ranked-fallback | ranked | byte-weighted | complement-first | subset-first >
 
-let ColumnMode = < off | single | atomic >
+let ColumnMode = < off | atomic >
 
 let LogLevel = < debug | info | warn | error >
 

@@ -87,7 +87,7 @@ let statementOrderText =
 
 let columnModeText =
       \(m : T.ColumnMode) ->
-        merge { off = "off", single = "single", atomic = "atomic" } m
+        merge { off = "off", atomic = "atomic" } m
 
 let optTextFlag =
       \(flag : Text) ->

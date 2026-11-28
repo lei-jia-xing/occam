@@ -64,7 +64,6 @@ runAction ActionListDialects = do
 runAction ActionListColumnModes = do
     putStrLn "Supported column co-reduction modes:"
     putStrLn "  off       Disable column co-reduction (default)"
-    putStrLn "  single    List per-column single sites (requires --intra-statement)"
     putStrLn "  atomic    List per-column sites and joint bundles (requires --intra-statement)"
     exitSuccess
 runAction ActionListStrategies = do

@@ -8,7 +8,6 @@ module ResultBaseline.Syntax (
     runDistributedMin16Vs32Baseline,
     runDistributedCap8Vs16Baseline,
     runDistributedCap16Vs32Baseline,
-    runDeferLiteralVariantsBaseline,
     runDeferLiteralVariants01Baseline,
     runDeferRecursiveBaseline,
 ) where
@@ -186,28 +185,6 @@ runDistributedCap16Vs32Baseline =
         defaultDistributedBatchConfig {distributedMaxBatchSize = 16}
         "dist-cap-32"
         defaultDistributedBatchConfig {distributedMaxBatchSize = 32}
-runDeferLiteralVariantsBaseline ::
-    (ByteString, ByteString, ByteString, ByteString, ByteString, ByteString) ->
-    Int ->
-    Maybe Int ->
-    Maybe Int ->
-    FilePath ->
-    IO ()
-runDeferLiteralVariantsBaseline corpus pairs wallLimit callLimit out =
-    runComparison
-        pairs
-        out
-        wallLimit
-        callLimit
-        (searchCensoredStatuses wallLimit callLimit)
-        ( serialArm "defer-literals-off" plainSyntax True
-        , serialArm
-            "defer-literals-primary-one"
-            (\c -> (plainSyntax c) {reductionDeferLiteralVariants = DeferLiteralsPrimaryOne})
-            True
-        )
-        (deferLiteralFixtures corpus)
-
 runDeferLiteralVariants01Baseline ::
     (ByteString, ByteString, ByteString, ByteString, ByteString, ByteString) ->
     Int ->

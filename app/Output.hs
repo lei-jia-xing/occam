@@ -23,6 +23,7 @@ import Occam.AtomicFile (writeAtomicBytes, writeAtomicBytesWithPermissionsOf, wr
 import Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
+    EvaluationStatus (..),
     Stats (..),
     sqlDialectName,
  )
@@ -129,9 +130,11 @@ writeReductionOutputs ::
     EvaluationMetrics ->
     IO ()
 writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath statsPath initialSQL reducedSQL stats evaluation = do
-    let canWriteOutput = not evaluation.validationPassed
+    let canWriteOutput =
+            evaluation.validationPassed
+                || evaluation.runStatus `elem` [EvaluationTimeout, EvaluationExecutionBudget]
     unless canWriteOutput do
-        let msg = "refusing in-place modification because final candidate failed target validation"
+        let msg = "refusing to write output because final candidate failed target validation"
         logError logger "cli" (T.pack msg)
         hPutStrLn stderr ("error: " ++ msg)
 

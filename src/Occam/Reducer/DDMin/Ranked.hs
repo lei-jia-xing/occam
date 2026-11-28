@@ -1,25 +1,21 @@
--- | Ranked lane scheduling and bounded projected-window execution for DDMin.
+-- | Ranked lane scheduling and unwindowed execution for DDMin.
 module Occam.Reducer.DDMin.Ranked (
     buildRankedSchedule,
 ) where
 
-import Control.Monad (forM)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
-import Data.IORef (newIORef, readIORef)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.List (sortOn)
-import Data.Maybe (catMaybes, listToMaybe)
+import Data.Maybe (listToMaybe)
 import Data.Ord (Down (..))
 import Occam.Core.Oracle (OracleOutcome (..))
 import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Metrics (
     FamilyTag (..),
     recordAcceptedBytesSaved,
-    recordGeneratedSkipped,
  )
 import Occam.Pool (
     poolJobCount,
@@ -30,8 +26,6 @@ import Occam.Pool (
 import Occam.Reducer.Config (
     LaneOrdering (..),
     LaneScheduling (..),
-    ProjectionWindow (..),
-    ProjectionWindowOrder (..),
     RankedScheduleConfig (..),
     SingletonResume (..),
     StatementLane (..),
@@ -39,7 +33,6 @@ import Occam.Reducer.Config (
 import Occam.Reducer.DDMin.Core (
     DDMinEnv (..),
     DDMinOutcome,
-    Feedback (..),
     LaneState (..),
     SeedToken (..),
     classifyDDMinSeed,
@@ -47,14 +40,6 @@ import Occam.Reducer.DDMin.Core (
     recordDDMinVerdict,
  )
 import Occam.Reducer.Statement (statementIdsInt)
-
-data WindowCandidate = WindowCandidate
-    { wcLane :: !StatementLane
-    , wcTag :: !FamilyTag
-    , wcEstimatedSaved :: !Int
-    , wcProjectedSaved :: !Int
-    , wcToken :: !SeedToken
-    }
 
 type ScheduledSeed = (StatementLane, FamilyTag, IntSet.IntSet)
 type MixedBatchItem = (StatementLane, FamilyTag, [Statement], Int, ByteString)
@@ -71,25 +56,8 @@ mergeWeightedLanes = go False []
             ([], _) -> go progressed acc rest
             (taken, remaining) -> taken ++ go True ((q, remaining) : acc) rest
 
-orderWindowCandidates :: ProjectionWindowOrder -> [WindowCandidate] -> [WindowCandidate]
-orderWindowCandidates WindowOrderPreserve items = items
-orderWindowCandidates WindowOrderCrossEstimated items = sortOn (Down . wcEstimatedSaved) items
-orderWindowCandidates WindowOrderCrossProjected items = sortOn (Down . wcProjectedSaved) items
-orderWindowCandidates WindowOrderWithinLaneProjected items =
-    refill (map wcLane items) sortedC sortedD sortedS
-    where
-        sortedFor lane = sortOn (Down . wcProjectedSaved) [c | c <- items, wcLane c == lane]
-        sortedC = sortedFor LaneComplement
-        sortedD = sortedFor LaneSingleton
-        sortedS = sortedFor LaneSubset
-        refill [] _ _ _ = []
-        refill (LaneComplement : rest) (c : cs) ds ss = c : refill rest cs ds ss
-        refill (LaneSingleton : rest) cs (d : ds) ss = d : refill rest cs ds ss
-        refill (LaneSubset : rest) cs ds (s : ss) = s : refill rest cs ds ss
-        refill (_ : rest) cs ds ss = refill rest cs ds ss
-
 {- | Unified ranked scheduler: orthogonal lane ordering, lane quota scheduling,
-singleton resumption, and optional bounded projection window.
+and singleton resumption.
 -}
 buildRankedSchedule ::
     DDMinEnv ->
@@ -102,12 +70,7 @@ buildRankedSchedule ::
     [[[Statement]]] ->
     [(Int, Bool, IO DDMinOutcome)]
 buildRankedSchedule env cfg laneState current currentInts weights currentLen partitions =
-    case (ddClosureAware env, rankedProjectionWindow cfg) of
-        (True, ProjectionWindow w order) ->
-            [ (2, resumes, tryProjectedWindow env w order retainedBytes current currentInts currentLen scheduled)
-            ]
-        _ ->
-            [(2, resumes, tryScheduledStream env current currentInts currentLen scheduled)]
+    [(2, resumes, tryScheduledStream env current currentInts currentLen scheduled)]
     where
         resumes = rankedSingletonResume cfg /= ResumeNone
         weightOf sid = IntMap.findWithDefault 0 sid weights
@@ -210,66 +173,6 @@ tryScheduledStream env current currentInts currentLen = pull
                         collect (n - 1) ((lane, tag, kept, count, sql) : acc) (HashSet.insert sql seen) rest
         testAndContinue batch rest barrier =
             resolveMixedBatch env currentLen batch barrier (pull rest)
-
--- Bound speculative projection and rendering to a fixed window of W seeds.
--- Deduplicates projected IntSets before rendering and isolates window ordering.
-tryProjectedWindow ::
-    DDMinEnv ->
-    Int ->
-    ProjectionWindowOrder ->
-    (IntSet.IntSet -> Int) ->
-    [Statement] ->
-    IntSet.IntSet ->
-    Int ->
-    [ScheduledSeed] ->
-    IO DDMinOutcome
-tryProjectedWindow env rawSize order retainedBytes current currentInts currentLen = search
-    where
-        wSize = max 1 rawSize
-        jobs = poolJobCount (ddPool env)
-        search [] = pure Nothing
-        search seeds = do
-            let (window, remaining) = splitAt wSize seeds
-            seenProjected <- newIORef HashSet.empty
-            classified <- forM window (classifyWindowSeed seenProjected)
-            runWindow remaining (orderWindowCandidates order (catMaybes classified))
-        classifyWindowSeed seenProjected (lane, tag, seed) = do
-            token <- classifyDDMinSeed env (Just seenProjected) tag current currentInts currentLen seed
-            pure (fmap (mkWindowCandidate lane tag seed) token)
-        mkWindowCandidate lane tag seed cand =
-            WindowCandidate
-                { wcLane = lane
-                , wcTag = tag
-                , wcEstimatedSaved = currentLen - retainedBytes seed
-                , wcProjectedSaved = seedSavedBytes currentLen cand
-                , wcToken = cand
-                }
-        runWindow remaining [] = search remaining
-        runWindow remaining items = collectWindow remaining jobs [] HashSet.empty items
-        collectWindow remaining _ acc _ [] = testWindow remaining (reverse acc) [] Nothing
-        collectWindow remaining 0 acc _ rest = testWindow remaining (reverse acc) rest Nothing
-        collectWindow remaining n acc seen (cand : rest) = case wcToken cand of
-            SeedAccepted kept saved ->
-                testWindow remaining (reverse acc) rest (Just (wcLane cand, wcTag cand, kept, saved))
-            SeedFresh kept count sql -> do
-                tested <- readIORef (fbEvaluated (ddFeedback env))
-                if HashMap.member sql tested || HashSet.member sql seen
-                    then do
-                        recordGeneratedSkipped (poolMetricsStore (ddPool env)) "projected-window-duplicate"
-                        collectWindow remaining n acc seen rest
-                    else
-                        collectWindow
-                            remaining
-                            (n - 1)
-                            ((wcLane cand, wcTag cand, kept, count, sql) : acc)
-                            (HashSet.insert sql seen)
-                            rest
-        testWindow remaining batch rest barrier =
-            resolveMixedBatch env currentLen batch barrier (runWindow remaining rest)
-
-seedSavedBytes :: Int -> SeedToken -> Int
-seedSavedBytes _ (SeedAccepted _ saved) = saved
-seedSavedBytes currentLen (SeedFresh _ _ sql) = currentLen - BS.length sql
 
 resolveMixedBatch ::
     DDMinEnv -> Int -> [MixedBatchItem] -> Maybe MixedBarrier -> IO DDMinOutcome -> IO DDMinOutcome

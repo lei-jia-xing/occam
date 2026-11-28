@@ -14,7 +14,6 @@ module Occam.Reducer.Support (
     reuseLatestSQL,
     reuseLatestSQLWithSeed,
     syntaxParseOptions,
-    columnSingleParseOptions,
     columnAtomicParseOptions,
     columnParseOptions,
     recordEarlyRejectSkip,
@@ -171,10 +170,6 @@ syntaxParseOptions dialect =
         , parseSyntaxOnly = True
         }
 
--- | Single-point column sites only: no bundle planning or payload.
-columnSingleParseOptions :: SQLDialect -> ParseOptions
-columnSingleParseOptions dialect = (syntaxParseOptions dialect) {parseColumnIR = True, parseSyntaxOnly = False}
-
 -- | Full atomic bundles; implies single-point geometry.
 columnAtomicParseOptions :: SQLDialect -> ParseOptions
 columnAtomicParseOptions dialect =
@@ -186,7 +181,6 @@ columnAtomicParseOptions dialect =
 
 columnParseOptions :: ColumnMode -> SQLDialect -> ParseOptions
 columnParseOptions ColumnOff = syntaxParseOptions
-columnParseOptions ColumnSingle = columnSingleParseOptions
 columnParseOptions ColumnAtomic = columnAtomicParseOptions
 
 recordEarlyRejectSkip :: Maybe MetricsStore -> EarlyRejectReason -> IO ()

@@ -2,7 +2,6 @@
 -- Import modules here that should be built as part of the library.
 import Proofs.DAG
 import Proofs.EditIntervals
-import Proofs.EmpiricalLookahead
 import Proofs.Reduction
 import Proofs.Minimality
 import Proofs.OrderedWindow

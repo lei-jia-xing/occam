@@ -57,7 +57,7 @@ External Predicate (--oracle / --reset)  OR  In-Process Result Oracle (SQLite / 
    - Rejections or non-shrinking edits advance the cursor; an accepted strict shrink reparses and resumes at the accepted ordinal. Earlier edits (including shifted/new ones) are revisited in the next cycle, repeating until a full unchanged cycle completes.
    - Within **List**, comma-separated lists offer coarse-to-fine contiguous chunk deletions (halves, quarters, ...) leaving at least one survivor before single-item deletions. Only the syntax pass materializes chunks.
    - Conservative by design: every accepted edit must strictly shrink bytes (equal-length canonicalizations such as `1` → `0` are unsupported). Forward priority differs from restart-from-zero scheduling and can reach a different checkpoint under a finite budget.
-   - **Column co-reduction (`--column-mode off|single|atomic`, requires `--intra-statement`)**: `single` adds per-occurrence column deletions (`CREATE TABLE` definitions, `INSERT` column items, `VALUES` items); `atomic` also attempts one joint bundle per column across exact, unambiguous, fence-free table scopes (skipping with a recorded cause rather than partially applying).
+   - **Column co-reduction (`--column-mode off|atomic`, requires `--intra-statement`)**: `atomic` includes per-occurrence column deletions (`CREATE TABLE` definitions, `INSERT` column items, `VALUES` items) and attempts one joint bundle per column across exact, unambiguous, fence-free table scopes (skipping with a recorded cause rather than partially applying).
 
 All stages provide **local minimality guarantees**, not a global minimum.
 
@@ -66,22 +66,12 @@ All stages provide **local minimality guarantees**, not a global minimum.
 ## 2. Ordered Scheduler & Caching (`src/Occam/Pool.hs`, `src/Occam/Cache.hs`)
 
 - Every search phase uses ordered retirement under the `--jobs N` concurrency cap, which defaults to one. The audit and syntax sweeps build candidate SQL as slots become available.
-- The scheduler reserves cache entries and execution permits in candidate order before forking. Native probes choose a width at the start of each window from the stopping positions of previous completed runs.
+- The scheduler reserves cache entries and execution permits in candidate order before forking. Each window uses the fixed `--jobs` width.
 - Retirement commits the earliest acceptance, surfaces the earliest inconclusive result or budget denial, then cancels and reaps losers. Completed-but-unselected physical work remains billed; killed tasks are counted as cancelled.
 - When a launched candidate has already published a decisive result, the scheduler leaves later slots empty while it retires the earlier candidates in order.
 - Progress, curve, and checkpoint updates occur only at ordered retirement, and every window drains fully before reparse, phase transition, or serial final validation.
 - With caching enabled (default), duplicate candidate bytes single-flight onto one in-flight execution (`cache_joins`). Timeouts, errors, and cancellations are never cached and never converted into rejections.
 - Native SQLite and DuckDB result oracles can also share a key for ordinary whitespace variations of explicitly aliased literal SELECTs. The Haskell lexer preserves the original token bytes, and the oracle receives the original candidate.
-
-### Adaptive native lookahead
-
-A finished run contributes a sample `(n, accepted)` when all `n` retired candidates used fresh oracle executions. Runs that hit or join the cache, exhaust the execution budget, or end inconclusively leave the estimate unchanged. The configured width is used until the first sample.
-
-In the cost model, `n` ordered decisions take `b = ceil(n / w)` equal-duration waves at width `w`. The model charges `b + γ(bw − n)` when a candidate accepts and `b` when the source exhausts. The acceptance cost prices every unused slot in the final wave as a speculative start. The scheduler uses `γ = 1` and selects the smallest width with minimum cumulative cost. A width larger than every observed run fits every sample in one wave and can only increase the predicted waste. The table therefore stores at most `--jobs` scores and updates them once per completed sample.
-
-With independent candidates, a stationary acceptance probability `p > 0`, and an available tail, the expected number of waves is `1 / (1 − (1 − p)^w)`. Expected cost per retired probe is then `p(1 + γw) / (1 − (1 − p)^w) − γ`. Keeping the stopping positions also covers workloads where the same marginal acceptance rate concentrates at particular ordinals.
-
-For independent, identically distributed completed runs of length at most `N`, let `K` be the configured maximum width and `B = N + γ(K − 1)` bound the loss for any width. At `m` samples, each width's empirical loss has variance at most `B² / (4m)`. Bounding the maximum estimation error by the Euclidean norm and comparing the empirical and true minimizers gives expected excess loss at most `B sqrt(K / m)` for the next sample. Summing over `T` updates gives `O(B sqrt(KT))` regret against the best fixed width in this model. Real sliding windows can also refill before a full wave finishes, and execution durations can change across phases.
 
 ---
 

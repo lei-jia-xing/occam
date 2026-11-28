@@ -75,7 +75,18 @@ Use `--values-schedule-baseline` to compare the coarse-to-fine VALUES
 schedule with deferred fine chunks. Use `--combined-syntax-baseline`
 to compare both experimental policies together with the current schedule.
 That mode adds scale-064, deep expressions, and views/aggregates with
-explicit reference results.
+explicit reference results. Use `--ast-batching-baseline` to isolate independent
+AST edit batching with intra-statement reduction enabled in both arms. A local
+four-pair AB/BA run reduced unlimited physical calls from 4344 to 3556 (-18.1%)
+with byte-identical endpoints; capped runs at 64 and 128 calls improved 11.5%
+and 11.9% respectively.
+
+Use `--column-mode-baseline` to compare column co-reduction off with atomic
+bundles on explicit, implicit, star, wide, fenced, and DuckDB fixtures. A local
+four-pair AB/BA run recorded 304 calls for off and 412 for atomic; atomic reduced
+four of six endpoints (for example, wide explicit 162→71 B) while matching the
+other two. The retired single-site mode used 664 calls with no size improvement
+and has been removed.
 
 Use `--statement-yield-baseline` for graph-free ddmin versus the current
 statement reducer on 8- and 32-row scripts with interleaved noise statements.

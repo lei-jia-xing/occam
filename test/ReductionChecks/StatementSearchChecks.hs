@@ -40,8 +40,6 @@ import Occam.Proposals (
  )
 import Occam.Reducer (
     LaneScheduling (..),
-    ProjectionWindow (..),
-    ProjectionWindowOrder (..),
     RankedScheduleConfig (..),
     ReductionConfig (..),
     ReductionResult (..),
@@ -497,7 +495,7 @@ checks =
                 ++ ")"
             )
             (callsMono < callsStable)
-    , testCase "Within-lane projected window preserves complement-before-subset slot order" $ do
+    , testCase "Unwindowed ranked closure search preserves complement-before-subset slot order" $ do
         let original =
                 BSC.concat
                     [ "CREATE TABLE a(x INT);"
@@ -511,7 +509,6 @@ checks =
                 StatementRankedWith
                     defaultRankedScheduleConfig
                         { rankedLaneScheduling = LaneBoundedPreference 4
-                        , rankedProjectionWindow = ProjectionWindow 8 WindowOrderWithinLaneProjected
                         }
         parsed <- parseSQL (defaultParseOptions SQLite) original
         case parsed of

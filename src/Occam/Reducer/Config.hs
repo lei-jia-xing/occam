@@ -7,8 +7,6 @@ module Occam.Reducer.Config (
     LaneOrdering (..),
     SingletonResume (..),
     LaneScheduling (..),
-    ProjectionWindowOrder (..),
-    ProjectionWindow (..),
     RankedScheduleConfig (..),
     defaultRankedScheduleConfig,
     convergedRankedScheduleConfig,
@@ -45,18 +43,16 @@ import Data.ByteString (ByteString)
 import Data.Text qualified as T
 import Occam.Parser.Types (SQLDialect)
 
--- | Column co-reduction mode: disabled, single-site, or atomic multi-site bundles.
-data ColumnMode = ColumnOff | ColumnSingle | ColumnAtomic
+-- | Column co-reduction mode: disabled or atomic multi-site bundles.
+data ColumnMode = ColumnOff | ColumnAtomic
     deriving (Eq, Show)
 
 columnModeName :: ColumnMode -> T.Text
 columnModeName ColumnOff = "off"
-columnModeName ColumnSingle = "single"
 columnModeName ColumnAtomic = "atomic"
 
 syntaxPolicyName :: ColumnMode -> T.Text
 syntaxPolicyName ColumnOff = "phase-forward-sweep-list-chunks"
-syntaxPolicyName ColumnSingle = "phase-forward-sweep-list-chunks+column-single"
 syntaxPolicyName ColumnAtomic = "phase-forward-sweep-list-chunks+column-atomic"
 
 -- | Total policy description for the given reduction configuration.
@@ -109,7 +105,6 @@ distributedLiteralBatchPolicy True = "+distributed-literal-batches"
 
 deferLiteralVariantsPolicy :: LiteralDeferralMode -> T.Text
 deferLiteralVariantsPolicy DeferLiteralsOff = ""
-deferLiteralVariantsPolicy DeferLiteralsPrimaryOne = "+defer-literal-variants"
 deferLiteralVariantsPolicy DeferLiteralsZeroOne = "+defer-literal-variants-01"
 
 deferRecursivePredicatesPolicy :: Bool -> T.Text
@@ -156,26 +151,11 @@ data LaneScheduling
     | LaneBoundedPreference !Int
     deriving (Eq, Show)
 
--- | Candidate ordering within a fixed-size closure-projection lookahead window.
-data ProjectionWindowOrder
-    = WindowOrderPreserve
-    | WindowOrderCrossEstimated
-    | WindowOrderCrossProjected
-    | WindowOrderWithinLaneProjected
-    deriving (Eq, Show)
-
--- | Optional bounded lookahead window for closure projection before probing.
-data ProjectionWindow
-    = NoProjectionWindow
-    | ProjectionWindow !Int !ProjectionWindowOrder
-    deriving (Eq, Show)
-
 -- | Orthogonal configuration for generalized ranked statement scheduling.
 data RankedScheduleConfig = RankedScheduleConfig
     { rankedLaneOrdering :: !LaneOrdering
     , rankedLaneScheduling :: !LaneScheduling
     , rankedSingletonResume :: !SingletonResume
-    , rankedProjectionWindow :: !ProjectionWindow
     , rankedFallbackMinStatements :: !Int
     , rankedFallbackMaxShrinkPct :: !Int
     }
@@ -187,13 +167,12 @@ defaultRankedScheduleConfig =
         { rankedLaneOrdering = LaneOrderEstimatedBytes
         , rankedLaneScheduling = LaneRoundRobin
         , rankedSingletonResume = ResumeNone
-        , rankedProjectionWindow = NoProjectionWindow
         , rankedFallbackMinStatements = 8
         , rankedFallbackMaxShrinkPct = 0
         }
 
 rankedSchedulePolicyTag :: RankedScheduleConfig -> T.Text
-rankedSchedulePolicyTag cfg = base <> resumeTag <> windowTag
+rankedSchedulePolicyTag cfg = base <> resumeTag
     where
         base = case (rankedLaneOrdering cfg, rankedLaneScheduling cfg) of
             (LaneOrderPartition, _) -> "interleaved-statements"
@@ -206,16 +185,6 @@ rankedSchedulePolicyTag cfg = base <> resumeTag <> windowTag
             ResumeCursorOnly -> "-resume"
             ResumeWeightStableTies -> "-resume-ties"
             ResumeWeightMonotonic -> "-resume-mono"
-        windowTag = case rankedProjectionWindow cfg of
-            NoProjectionWindow -> ""
-            ProjectionWindow w order ->
-                "-win"
-                    <> T.pack (show w)
-                    <> case order of
-                        WindowOrderPreserve -> "-preserve"
-                        WindowOrderCrossEstimated -> "-est"
-                        WindowOrderCrossProjected -> "-proj"
-                        WindowOrderWithinLaneProjected -> "-lane-proj"
 
 -- | Decide whether post-slicing fallback should switch from byte-weighted ddmin to ranked search.
 shouldActivateRankedFallback :: RankedScheduleConfig -> Bool -> Int -> Int -> Int -> Bool
@@ -270,7 +239,6 @@ statementSearchPolicyName (StatementRankedFallback cfg)
 -- | Which literal replacement variants run in the regular sweep before stalling.
 data LiteralDeferralMode
     = DeferLiteralsOff
-    | DeferLiteralsPrimaryOne
     | DeferLiteralsZeroOne
     deriving (Eq, Show)
 

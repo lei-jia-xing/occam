@@ -5,6 +5,8 @@ module ResultBaseline.Basic (
     runLiteralBatchBaseline,
     runValuesScheduleBaseline,
     runCombinedSyntaxBaseline,
+    runAstBatchingBaseline,
+    runColumnModeBaseline,
     runReparseBaseline,
     runWorkerBaseline,
 ) where
@@ -12,8 +14,8 @@ module ResultBaseline.Basic (
 import Data.ByteString (ByteString)
 import Occam.Core (ResultStatement (..))
 import Occam.Parser (SQLDialect (..))
-import Occam.Reducer (ReductionConfig (..))
-import ResultBaseline.Fixtures (Fixture (..), fixtures, searchFixtures)
+import Occam.Reducer (ColumnMode (..), ReductionConfig (..))
+import ResultBaseline.Fixtures (Fixture (..), columnModeCohort, fixtures, searchFixtures)
 import ResultBaseline.Runner (Arm (..), runComparison, searchCensoredStatuses, serialArm)
 import ResultBaseline.Syntax (runSyntaxPolicyBaseline)
 
@@ -89,6 +91,42 @@ runCombinedSyntaxBaseline (scale, deep, views) =
         "syntax-current"
         "syntax-batches-and-deferred-values"
         (\config -> config {reductionLiteralBatches = True, reductionAdaptiveValues = True})
+
+runAstBatchingBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runAstBatchingBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        ( serialArm
+            "ast-singles"
+            (\config -> config {reductionIntraStatement = True, reductionAstBatching = False})
+            True
+        , serialArm
+            "ast-batches"
+            (\config -> config {reductionIntraStatement = True, reductionAstBatching = True})
+            True
+        )
+        (searchFixtures ++ fixtures)
+
+runColumnModeBaseline :: Int -> Maybe Int -> Maybe Int -> FilePath -> IO ()
+runColumnModeBaseline pairs wallLimit callLimit out =
+    runComparison
+        pairs
+        out
+        wallLimit
+        callLimit
+        (searchCensoredStatuses wallLimit callLimit)
+        (columnArm "column-off" ColumnOff, columnArm "column-atomic" ColumnAtomic)
+        columnModeCohort
+    where
+        columnArm name mode =
+            serialArm
+                name
+                (\config -> config {reductionIntraStatement = True, reductionColumnMode = mode})
+                True
 
 optimizedSyntax :: ReductionConfig -> ReductionConfig
 optimizedSyntax config =

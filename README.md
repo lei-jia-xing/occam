@@ -122,7 +122,7 @@ Run `occam --help` for the full flag list, or use `--list-dialects`, `--list-str
 | `-j, --jobs N` | Max concurrent oracle/reset executions (`1` default; caller must isolate DB state) |
 | `--strategy STRATEGY` | `full` (default), `ddmin-only`, or `audit-only` |
 | `--config FILE` | Load JSON option presets (e.g. from `config/generated/profiles/*.json`); explicit CLI flags override |
-| `--intra-statement` / `--column-mode MODE` | Opt-in exact-span intra-statement reduction and column co-reduction (`off`\|`single`\|`atomic`) |
+| `--intra-statement` / `--column-mode MODE` | Opt-in exact-span intra-statement reduction and atomic column co-reduction (`off`\|`atomic`) |
 | `--completion bash\|zsh\|fish` | Emit shell completion script |
 
 **Exit codes**: `0` completed & validated · `1` initial predicate failed or runtime error · `2` CLI usage/validation error · `124` time or execution budget exhausted (last accepted checkpoint preserved).

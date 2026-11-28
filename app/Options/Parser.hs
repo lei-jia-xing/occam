@@ -316,8 +316,8 @@ columnModeParser =
         (Explicit <$> eitherReader parseColumnMode)
         ( long "column-mode"
             <> metavar "MODE"
-            <> help "off (default). Other modes need --intra-statement."
-            <> completeWith ["off", "single", "atomic"]
+            <> help "off (default). Atomic bundles need --intra-statement."
+            <> completeWith ["off", "atomic"]
         )
         <|> pure (rawColumnMode defaultRawOptions)
 
