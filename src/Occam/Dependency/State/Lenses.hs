@@ -36,16 +36,16 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Lens.Micro (Lens', lens, (%~), (&))
-import Occam.Core (
+import Occam.Core.Schema (
     Ident,
     Name,
     NameRef,
     OnCommitAction,
     ReadFact,
     SourceColumn,
-    StatementId,
     ViewColumnLineage,
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.State.Catalog (
     Catalog (..),
     ConstraintKey,

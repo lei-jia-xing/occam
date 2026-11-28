@@ -24,16 +24,13 @@ import Occam.Certificate (
     emptyEarlyRejectCertifier,
     newEarlyRejectTracker,
  )
-import Occam.Core (
+import Occam.Core.Oracle (oracleAccepts)
+import Occam.Core.Semantics (
     BarrierScope (GlobalScope),
-    ResultStatement (..),
     ScopedBarrier (barrierScope),
     SemanticFacts (factBarriers),
-    Span (..),
-    Statement (..),
-    StatementId (..),
-    oracleAccepts,
  )
+import Occam.Core.Types (ResultStatement (..), Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..))
 import Occam.Logger (Logger, logDebug', logInfo')
 import Occam.Metrics (recordGeneratedSkipped)
@@ -59,12 +56,14 @@ findInterestingPrefix ::
 findInterestingPrefix pool baseSQL statements =
     findInterestingPrefixThrough pool baseSQL statements (length statements)
 
+-- | Binary search for the shortest interesting prefix within the first @limit@ statements.
 findInterestingPrefixThrough ::
     OraclePool -> ByteString -> [Statement] -> Int -> IO (Maybe (Statement, ByteString, Int), Int)
 findInterestingPrefixThrough pool baseSQL statements limit = do
     tracker <- newEarlyRejectTracker
     findInterestingPrefixThroughWithCert tracker emptyEarlyRejectCertifier pool baseSQL statements limit
 
+-- | Like 'findInterestingPrefixThrough', applying an 'EarlyRejectTracker' and 'EarlyRejectCertifier'.
 findInterestingPrefixThroughWithCert ::
     EarlyRejectTracker ->
     EarlyRejectCertifier ->

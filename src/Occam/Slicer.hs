@@ -1,3 +1,4 @@
+-- | Backward graph slicing and dependency-closure routines over statement IDs.
 module Occam.Slicer (
     backwardSlice,
     backwardSliceMany,
@@ -14,7 +15,7 @@ import Data.IntSet qualified as IntSet
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (StatementId (..))
+import Occam.Core.Types (StatementId (..))
 import Occam.Dependency (DependencyGraph (..))
 
 -- | Computes the backward slice reachable from a target statement.
@@ -58,6 +59,7 @@ backwardSliceManyFast roots DependencyGraph {..}
          in IntSet.fromList (map unStatementId (Set.toList legacyVisited))
     | otherwise = visitPredecessors graphFastEdges roots roots
 
+-- | Reverse an adjacency map so each node points to the statements that depend on it.
 successorIndex :: IntMap IntSet -> IntMap IntSet
 successorIndex = IntMap.foldlWithKey' addEdges IntMap.empty
     where

@@ -1,6 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Low-level @direct-sqlite@ connection helpers, timeouts, and authorizer configuration.
 module Occam.Oracle.Sqlite.FFI (
     SqliteCache,
     SqliteConn (..),
@@ -50,8 +51,10 @@ import Foreign.C.Types (CInt (..), CSize (..))
 import GHC.Clock (getMonotonicTimeNSec)
 import System.IO.Unsafe (unsafePerformIO)
 
+-- | Phantom tag representing an opaque C @occam_sqlite_cache@ handle.
 data SqliteCache
 
+-- | Reusable in-memory SQLite connection paired with its template DB, C authorizer dirty flag, and checkpoint cache.
 data SqliteConn = SqliteConn
     { scDb :: !Direct.Database
     , scTemplate :: !Direct.Database
@@ -182,6 +185,7 @@ splitStatements sql = go (BSC.lines sql) "" []
 openFreshMemoryDb :: IO Direct.Database
 openFreshMemoryDb = open ":memory:"
 
+-- | Allocate a reusable 'SqliteConn' paired with its template database, authorizer, and checkpoint cache.
 createSqliteConn :: IO SqliteConn
 createSqliteConn = do
     db <- openFreshMemoryDb
@@ -214,6 +218,7 @@ createSqliteConn = do
                     , scDmlTainted = dmlTainted
                     }
 
+-- | Tear down a 'SqliteConn', freeing its C caches, dirty-flag buffer, and database handles.
 destroySqliteConn :: SqliteConn -> IO ()
 destroySqliteConn SqliteConn {..} = do
     let Direct.Database dbPtr = scDb
@@ -223,6 +228,7 @@ destroySqliteConn SqliteConn {..} = do
     close scTemplate
     close scDb
 
+-- | Restore a pooled 'SqliteConn' back to its clean template snapshot.
 resetSqliteConn :: SqliteConn -> IO Bool
 resetSqliteConn SqliteConn {..} = do
     let Direct.Database dbPtr = scDb
@@ -249,6 +255,7 @@ releaseSqliteConn True conn = do
                     else pure (conns, False)
             unless returned (destroySqliteConn conn)
 
+-- | Borrow a pooled 'SqliteConn', resetting and returning it when the callback yields @True@.
 withPooledSqliteConn :: (SqliteConn -> IO (Bool, a)) -> IO a
 withPooledSqliteConn action = mask $ \restore -> do
     conn <- acquireSqliteConn

@@ -320,7 +320,7 @@ This harness executes untrusted SQL and is **not a sandbox**.
 
 ```bash
 # Haskell oracle, reset, collect, N-replay, and batch orchestration suites
-cabal test occam-test --ghc-options=-Werror
+cabal test occam-test
 
 # Fuzzer bash driver & shellcheck suite
 make harness-check

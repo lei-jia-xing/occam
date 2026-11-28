@@ -23,14 +23,13 @@ import Occam.Certificate (
     newEarlyRejectTracker,
     prepareDeletionCertificateCheck,
  )
-import Occam.Core (
+import Occam.Core.Oracle (OracleOutcome (..), oracleAccepts)
+import Occam.Core.Types (
     EarlyRejectReason,
-    OracleOutcome (..),
     ResultTrace,
     Span (spanStartByte),
     Statement (..),
     StatementId (..),
-    oracleAccepts,
  )
 import Occam.Facts (StatementUnit (..))
 import Occam.Logger (Logger, logDebug', logInfo', nullLogger)

@@ -16,6 +16,10 @@ module Occam.Harness.Oracle (
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception.Safe (IOException, try)
+import Control.Monad (guard, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (ContT (..), runContT)
+import Control.Monad.Trans.Except (runExceptT, throwE)
 import Crypto.Hash.SHA256 qualified as SHA256
 import Data.Aeson (FromJSON (..), ToJSON (..), Value (..), encode, object, (.=))
 import Data.ByteString qualified as BS
@@ -94,6 +98,7 @@ data OracleVerdict
     | VerdictTimeout
     deriving (Eq, Show)
 
+-- | Canonical lowercase string encoding of an 'OracleVerdict' for JSON logs.
 verdictText :: OracleVerdict -> Text
 verdictText = \case
     VerdictAccepted -> "accepted"
@@ -119,6 +124,7 @@ data OracleClassification
     | ClassMissingEvidence
     deriving (Eq, Show)
 
+-- | Canonical lowercase string encoding of an 'OracleClassification' for JSON logs.
 classificationText :: OracleClassification -> Text
 classificationText = \case
     ClassConfirmedFault -> "confirmed_fault"
@@ -220,6 +226,7 @@ data OracleOptions = OracleOptions
     }
     deriving (Eq, Show)
 
+-- | Default 'OracleOptions' with 5 stack frames, zero timeout, and strict evidence checks.
 defaultOracleOptions :: DbmsKind -> OracleOptions
 defaultOracleOptions dbms =
     OracleOptions
@@ -259,6 +266,7 @@ data OracleOverrides = OracleOverrides
     }
     deriving (Eq, Show)
 
+-- | Empty 'OracleOverrides' leaving all configuration fields unspecified.
 emptyOracleOverrides :: OracleOverrides
 emptyOracleOverrides =
     OracleOverrides
@@ -278,81 +286,70 @@ emptyOracleOverrides =
         , ovVerbose = False
         }
 
+-- | Resolve 'OracleOptions' from CLI overrides, environment variables, and Dhall defaults.
 resolveOracleOptions :: HarnessConfig -> OracleOverrides -> IO (Either String OracleOptions)
-resolveOracleOptions cfg ov = do
+resolveOracleOptions cfg ov = runExceptT do
     let defs = hcOracle cfg
-    envDbms <- lookupEnv "DBMS"
-    dbms <- case ovDbms ov <|> (envDbms >>= parseDbmsKind . T.pack) of
-        Just d -> pure (Right d)
+    envDbms <- liftIO (lookupEnv "DBMS")
+    dbmsKind <- case ovDbms ov <|> (envDbms >>= parseDbmsKind . T.pack) of
+        Just d -> pure d
         Nothing -> case envDbms of
-            Just raw | not (null raw) -> pure (Left ("Unsupported DBMS in DBMS env: " <> raw))
-            _ -> pure (Right DbmsPostgres)
-    case dbms of
-        Left err -> pure (Left err)
-        Right dbmsKind -> do
-            expSig <- maybe (maybe "" T.pack <$> lookupEnv "EXPECTED_SIGNATURE") pure (ovExpectedSignature ov)
-            baseSig <- maybe (maybe "" T.pack <$> lookupEnv "BASELINE_SIGNATURE") pure (ovBaselineSignature ov)
-            envReject <- envFlag "ORACLE_REJECT_ON_SLIPPAGE"
-            envFrames <- envInt "ORACLE_STACK_FRAMES"
-            envTimeout <- envDouble "ORACLE_TIMEOUT"
-            envAllowStderr <- envFlag "ORACLE_ALLOW_STDERR_ONLY"
-            envAllowMeta <- envFlag "ORACLE_ALLOW_PSQL_META"
-            envVerbose <- envFlag "ORACLE_VERBOSE"
-            envDecLog <- nonEmptyStr <$> lookupEnv "ORACLE_DECISION_LOG"
-            envWorkdir <- nonEmptyStr <$> lookupEnv "OCCAM_WORKDIR"
+            Just raw | not (null raw) -> throwE ("Unsupported DBMS in DBMS env: " <> raw)
+            _ -> pure DbmsPostgres
+    expSig <-
+        liftIO $ maybe (maybe "" T.pack <$> lookupEnv "EXPECTED_SIGNATURE") pure (ovExpectedSignature ov)
+    baseSig <-
+        liftIO $ maybe (maybe "" T.pack <$> lookupEnv "BASELINE_SIGNATURE") pure (ovBaselineSignature ov)
+    envReject <- liftIO (envFlag "ORACLE_REJECT_ON_SLIPPAGE")
+    envFrames <- liftIO (envRead "ORACLE_STACK_FRAMES")
+    envTimeout <- liftIO (envRead "ORACLE_TIMEOUT")
+    envAllowStderr <- liftIO (envFlag "ORACLE_ALLOW_STDERR_ONLY")
+    envAllowMeta <- liftIO (envFlag "ORACLE_ALLOW_PSQL_META")
+    envVerbose <- liftIO (envFlag "ORACLE_VERBOSE")
+    envDecLog <- nonEmptyStr <$> liftIO (lookupEnv "ORACLE_DECISION_LOG")
+    envWorkdir <- nonEmptyStr <$> liftIO (lookupEnv "OCCAM_WORKDIR")
 
-            let stackFrames = fromMaybe (odStackFrames defs) (ovStackFrames ov <|> envFrames)
-                timeoutSecs = fromMaybe (odTimeoutSecs defs) (ovTimeoutSeconds ov <|> envTimeout)
-            if isNaN timeoutSecs || isInfinite timeoutSecs || timeoutSecs < 0
-                then pure (Left "--timeout must be a finite non-negative number")
-                else
-                    if stackFrames <= 0
-                        then pure (Left "--stack-frames must be a positive integer")
-                        else do
-                            mLogFile <- traverse expandAbsPath (nonEmptyJust (ovLogFile ov))
-                            mDecLog <- traverse expandAbsPath (nonEmptyJust (ovDecisionLog ov) <|> envDecLog)
-                            mWorkdir <- case envWorkdir of
-                                Just d -> do
-                                    isDir <- doesDirectoryExist d
-                                    pure (if isDir then Just d else Nothing)
-                                Nothing -> pure Nothing
-                            pure $
-                                Right
-                                    OracleOptions
-                                        { ooDbms = dbmsKind
-                                        , ooConnection = ovConnection ov
-                                        , ooExpectedSignature = expSig
-                                        , ooBaselineSignature = baseSig
-                                        , ooRejectOnSlippage = ovRejectOnSlippage ov || envReject || odRejectOnSlippage defs
-                                        , ooStackFrames = stackFrames
-                                        , ooPrintSignature = ovPrintSignature ov
-                                        , ooLogFile = mLogFile
-                                        , ooContainerLog = nonEmptyJust (ovContainerLog ov)
-                                        , ooDecisionLog = mDecLog
-                                        , ooTimeoutSeconds = timeoutSecs
-                                        , ooAllowStderrOnly = ovAllowStderrOnly ov || envAllowStderr || odAllowStderrOnly defs
-                                        , ooAllowPsqlMeta = ovAllowPsqlMeta ov || envAllowMeta || odAllowPsqlMeta defs
-                                        , ooVerbose = ovVerbose ov || envVerbose || odVerbose defs
-                                        , ooWorkdir = mWorkdir
-                                        }
+    let stackFrames = fromMaybe (odStackFrames defs) (ovStackFrames ov <|> envFrames)
+        timeoutSecs = fromMaybe (odTimeoutSecs defs) (ovTimeoutSeconds ov <|> envTimeout)
+    when (isNaN timeoutSecs || isInfinite timeoutSecs || timeoutSecs < 0) $
+        throwE "--timeout must be a finite non-negative number"
+    when (stackFrames <= 0) $
+        throwE "--stack-frames must be a positive integer"
+
+    mLogFile <- liftIO $ traverse expandAbsPath (nonEmptyStr (ovLogFile ov))
+    mDecLog <- liftIO $ traverse expandAbsPath (nonEmptyStr (ovDecisionLog ov) <|> envDecLog)
+    mWorkdir <- liftIO case envWorkdir of
+        Nothing -> pure Nothing
+        Just d -> do
+            isDir <- doesDirectoryExist d
+            pure (d <$ guard isDir)
+    pure
+        OracleOptions
+            { ooDbms = dbmsKind
+            , ooConnection = ovConnection ov
+            , ooExpectedSignature = expSig
+            , ooBaselineSignature = baseSig
+            , ooRejectOnSlippage = ovRejectOnSlippage ov || envReject || odRejectOnSlippage defs
+            , ooStackFrames = stackFrames
+            , ooPrintSignature = ovPrintSignature ov
+            , ooLogFile = mLogFile
+            , ooContainerLog = nonEmptyStr (ovContainerLog ov)
+            , ooDecisionLog = mDecLog
+            , ooTimeoutSeconds = timeoutSecs
+            , ooAllowStderrOnly = ovAllowStderrOnly ov || envAllowStderr || odAllowStderrOnly defs
+            , ooAllowPsqlMeta = ovAllowPsqlMeta ov || envAllowMeta || odAllowPsqlMeta defs
+            , ooVerbose = ovVerbose ov || envVerbose || odVerbose defs
+            , ooWorkdir = mWorkdir
+            }
     where
-        nonEmptyStr (Just s) | not (null s) = Just s
-        nonEmptyStr _ = Nothing
-
-        nonEmptyJust (Just s) | not (null s) = Just s
-        nonEmptyJust _ = Nothing
+        nonEmptyStr m = m >>= \s -> s <$ guard (not (null s))
 
         envFlag name = do
             mv <- lookupEnv name
             pure $ maybe False (\v -> map toLower (trimStr v) `elem` ["1", "true", "yes", "on"]) mv
 
-        envInt name = do
-            mv <- lookupEnv name
-            pure (mv >>= readMaybe)
-
-        envDouble name = do
-            mv <- lookupEnv name
-            pure (mv >>= readMaybe)
+        envRead :: (Read a) => String -> IO (Maybe a)
+        envRead name = (>>= readMaybe) <$> lookupEnv name
 
         trimStr = T.unpack . T.strip . T.pack
 
@@ -362,6 +359,7 @@ expandAbsPath ('~' : '/' : rest) = do
     makeAbsolute (home </> rest)
 expandAbsPath path = makeAbsolute path
 
+-- | Active server/container log observation transport for an oracle probe.
 data LogMode
     = ModeEmbeddedLocal
     | ModeEmbeddedContainer !Text
@@ -370,6 +368,7 @@ data LogMode
     | ModeStderr
     deriving (Eq, Show)
 
+-- | Machine-readable label recorded in @OracleDecision.odLogMode@.
 logModeLabel :: LogMode -> Text
 logModeLabel = \case
     ModeEmbeddedLocal -> "embedded_local"
@@ -382,6 +381,15 @@ logModeLabel = \case
 probeCrashOracle :: HarnessConfig -> OracleOptions -> BS.ByteString -> IO OracleResult
 probeCrashOracle cfg opts candidateSql =
     snd <$> probeCrashOracleCancellable cfg Nothing opts candidateSql
+
+-- | Internal continuation outcome tuple: @(wasInterrupted, exitCode, decision)@.
+type ProbeOutcome = (Bool, Int, OracleDecision)
+
+-- | Continuation monad allowing early probe termination without manual CPS threading.
+type ProbeM = ContT ProbeOutcome IO
+
+exitProbe :: Bool -> Int -> OracleDecision -> ProbeM a
+exitProbe interrupted code dec = ContT \_ -> pure (interrupted, code, dec)
 
 -- | Interruptible variant of 'probeCrashOracle' supporting an @IORef Bool@ stop flag.
 probeCrashOracleCancellable ::
@@ -420,129 +428,92 @@ probeCrashOracleCancellable cfg mStopRef opts candidateSql = do
                 , odHint = Nothing
                 }
         sqlTxt = TE.decodeUtf8With TEE.lenientDecode candidateSql
-    if T.null (T.strip sqlTxt)
-        then
-            finish
-                1
-                ( baseDec
-                    { odVerdict = VerdictRejected
-                    , odClassification = ClassHealthyNoFault
-                    , odReason = "empty-sql"
-                    }
-                )
-        else
-            if ooDbms opts == DbmsPostgres && not (ooAllowPsqlMeta opts) && hasPsqlMetaCommand sqlTxt
-                then
-                    finish
-                        1
-                        ( baseDec
-                            { odVerdict = VerdictRejected
-                            , odClassification = ClassHealthyNoFault
-                            , odReason = "psql-meta-command"
-                            }
-                        )
-                else runWithSource baseDec
-    where
-        emitAndReturn interrupted code dec = do
-            emitDecisionLog (ooDecisionLog opts) dec
-            whenVerbose (ooVerbose opts) dec
-            pure (interrupted, OracleResult code dec)
+        mTimeout = ooTimeoutSeconds opts <$ guard (ooTimeoutSeconds opts > 0)
 
-        finish = emitAndReturn False
-        finishInterrupted = emitAndReturn True 130
+    (interrupted, code, dec) <- (`runContT` pure) do
+        when (T.null (T.strip sqlTxt)) $
+            exitProbe False 1 baseDec {odReason = "empty-sql"}
+        when (ooDbms opts == DbmsPostgres && not (ooAllowPsqlMeta opts) && hasPsqlMetaCommand sqlTxt) $
+            exitProbe False 1 baseDec {odReason = "psql-meta-command"}
 
-        runWithSource baseDec = do
-            conn <- resolveDbmsConnection cfg (ooDbms opts) (ooConnection opts)
-            let internalLog = fromMaybe (connContainerLog conn) (ooContainerLog opts)
-            sourceOrErr <- acquireLogSource opts conn internalLog
-            case sourceOrErr of
-                Left errDec -> finish 1 (errDec baseDec)
-                Right (mode, initOffset, initInode, sinceIso) ->
-                    executeAndClassify conn mode internalLog initOffset initInode sinceIso baseDec
+        conn <- liftIO (resolveDbmsConnection cfg (ooDbms opts) (ooConnection opts))
+        let internalLog = fromMaybe (connContainerLog conn) (ooContainerLog opts)
+        (mode, initOffset, initInode, sinceIso) <-
+            liftIO (acquireLogSource opts conn internalLog)
+                >>= either (\f -> exitProbe False 1 (f baseDec)) pure
 
-        executeAndClassify conn mode internalLog initOffset initInode sinceIso baseDec = do
-            let modeLabel = logModeLabel mode
-                mTimeout =
-                    if ooTimeoutSeconds opts > 0
-                        then Just (ooTimeoutSeconds opts)
-                        else Nothing
-            cmdEither <- buildDbmsCommand conn RoleProbe =<< currentEnvMap
-            case cmdEither of
-                Left err ->
-                    finish
-                        1
-                        ( baseDec
-                            { odVerdict = VerdictRejected
-                            , odClassification = ClassMissingEvidence
-                            , odReason = "execution-error"
-                            , odHint = Just (T.pack err)
-                            , odLogMode = Just modeLabel
-                            }
-                        )
-                Right (cmd, args, childEnv) -> do
-                    res <- tryExec cmd args childEnv mTimeout
-                    case res of
-                        Left exc ->
-                            finish
+        let modeLabel = logModeLabel mode
+            execError :: Text -> ProbeM a
+            execError decHint =
+                exitProbe
+                    False
+                    1
+                    baseDec
+                        { odVerdict = VerdictRejected
+                        , odClassification = ClassMissingEvidence
+                        , odReason = "execution-error"
+                        , odHint = Just decHint
+                        , odLogMode = Just modeLabel
+                        }
+        (cmd, args, childEnv) <-
+            liftIO (buildDbmsCommand conn RoleProbe =<< currentEnvMap) >>= either (execError . T.pack) pure
+        execRes <-
+            liftIO (tryExec cmd args childEnv mTimeout) >>= either (execError . T.pack . show) pure
+        case execRes of
+            (True, _, _, _, _) ->
+                exitProbe
+                    True
+                    130
+                    baseDec
+                        { odVerdict = VerdictRejected
+                        , odClassification = ClassMissingEvidence
+                        , odReason = "interrupted"
+                        , odLogMode = Just modeLabel
+                        }
+            (False, True, _, _, _) ->
+                exitProbe
+                    False
+                    124
+                    baseDec
+                        { odVerdict = VerdictTimeout
+                        , odClassification = ClassMissingEvidence
+                        , odReason = "client-timeout"
+                        , odTimeoutSeconds = Just (ooTimeoutSeconds opts)
+                        , odLogMode = Just modeLabel
+                        }
+            (False, False, retcode, _, stderrBs) -> do
+                let stderrTxt = TE.decodeUtf8With TEE.lenientDecode stderrBs
+                case mode of
+                    ModeEmbeddedContainer _
+                        | retcode `elem` [125, 126, 127] ->
+                            exitProbe
+                                False
                                 1
-                                ( baseDec
+                                baseDec
                                     { odVerdict = VerdictRejected
                                     , odClassification = ClassMissingEvidence
-                                    , odReason = "execution-error"
-                                    , odHint = Just (T.pack (show exc))
+                                    , odReason = "container-exec-failed"
+                                    , odRetcode = Just retcode
                                     , odLogMode = Just modeLabel
+                                    , odHint = Just (T.take 512 stderrTxt)
                                     }
-                                )
-                        Right (True, _, _, _, _) ->
-                            finishInterrupted
-                                ( baseDec
-                                    { odVerdict = VerdictRejected
-                                    , odClassification = ClassMissingEvidence
-                                    , odReason = "interrupted"
-                                    , odLogMode = Just modeLabel
-                                    }
-                                )
-                        Right (False, True, _, _, _) ->
-                            finish
-                                124
-                                ( baseDec
-                                    { odVerdict = VerdictTimeout
-                                    , odClassification = ClassMissingEvidence
-                                    , odReason = "client-timeout"
-                                    , odTimeoutSeconds = Just (ooTimeoutSeconds opts)
-                                    , odLogMode = Just modeLabel
-                                    }
-                                )
-                        Right (False, False, retcode, _, stderrBs) -> do
-                            let stderrTxt = TE.decodeUtf8With TEE.lenientDecode stderrBs
-                            case mode of
-                                ModeEmbeddedContainer _
-                                    | retcode `elem` [125, 126, 127] ->
-                                        finish
-                                            1
-                                            ( baseDec
-                                                { odVerdict = VerdictRejected
-                                                , odClassification = ClassMissingEvidence
-                                                , odReason = "container-exec-failed"
-                                                , odRetcode = Just retcode
-                                                , odLogMode = Just modeLabel
-                                                , odHint = Just (T.take 512 stderrTxt)
-                                                }
-                                            )
-                                _ ->
-                                    evaluateProbeOutcome
-                                        opts
-                                        mode
-                                        modeLabel
-                                        internalLog
-                                        initOffset
-                                        initInode
-                                        sinceIso
-                                        retcode
-                                        stderrTxt
-                                        baseDec
-                                        finish
+                    _ ->
+                        evaluateProbeOutcome
+                            opts
+                            mode
+                            modeLabel
+                            internalLog
+                            initOffset
+                            initInode
+                            sinceIso
+                            retcode
+                            stderrTxt
+                            baseDec
 
+    emitDecisionLog (ooDecisionLog opts) dec
+    whenVerbose (ooVerbose opts) dec
+    pure (interrupted, OracleResult code dec)
+    where
         tryExec ::
             FilePath ->
             [String] ->
@@ -577,34 +548,32 @@ evaluateProbeOutcome ::
     Int ->
     Text ->
     OracleDecision ->
-    (Int -> OracleDecision -> IO (Bool, OracleResult)) ->
-    IO (Bool, OracleResult)
-evaluateProbeOutcome opts mode modeLabel internalLog initOffset initInode sinceIso retcode stderrTxt baseDec finish = do
-    let dbms = ooDbms opts
-        connLost = any (`T.isInfixOf` stderrTxt) (connectionLostPhrasesForDbms dbms)
-        possibleCrash = connLost || retcode /= 0
-        isEmbedded = not (isServerDbmsKind dbms)
+    ProbeM ProbeOutcome
+evaluateProbeOutcome opts mode modeLabel internalLog initOffset initInode sinceIso retcode stderrTxt baseDec =
     case mode of
-        ModeStderr -> evaluateStderrMode dbms connLost retcode stderrTxt
+        ModeStderr -> pure $ evaluateStderrMode dbms connLost retcode stderrTxt
         _ -> do
-            (logReadOk, serverLogTxt) <- case mode of
+            (logReadOk, serverLogTxt) <- liftIO case mode of
                 ModeFile path -> pollLogs possibleCrash (pollFileReader path)
                 ModeContainer cname _ -> pollLogs possibleCrash (pollContainerReader cname internalLog sinceIso)
                 _ -> pure (True, "")
-            if isFileOrContainer mode && not logReadOk && T.null serverLogTxt
-                then
-                    finish
-                        1
-                        ( baseDec
-                            { odVerdict = VerdictRejected
-                            , odClassification = ClassMissingEvidence
-                            , odReason = "log-read-failed"
-                            , odLogMode = Just modeLabel
-                            , odLogFile = modeLogFilePath mode
-                            }
-                        )
-                else classifyFullEvidence dbms isEmbedded connLost retcode serverLogTxt stderrTxt
+            when (isFileOrContainer mode && not logReadOk && T.null serverLogTxt) $
+                exitProbe
+                    False
+                    1
+                    baseDec
+                        { odVerdict = VerdictRejected
+                        , odClassification = ClassMissingEvidence
+                        , odReason = "log-read-failed"
+                        , odLogMode = Just modeLabel
+                        , odLogFile = modeLogFilePath mode
+                        }
+            classifyFullEvidence dbms isEmbedded connLost retcode serverLogTxt stderrTxt
     where
+        dbms = ooDbms opts
+        connLost = any (`T.isInfixOf` stderrTxt) (connectionLostPhrasesForDbms dbms)
+        possibleCrash = connLost || retcode /= 0
+        isEmbedded = not (isServerDbmsKind dbms)
         expSig = ooExpectedSignature opts
         stackN = ooStackFrames opts
 
@@ -616,15 +585,19 @@ evaluateProbeOutcome opts mode modeLabel internalLog initOffset initInode sinceI
         modeLogFilePath (ModeContainer _ p) = Just p
         modeLogFilePath _ = Nothing
 
-        pollLogs possibleCrash stepReader = do
+        pollLogs ::
+            Bool ->
+            (Integer -> Maybe Integer -> Text -> IO (Bool, Integer, Maybe Integer, Text, Text)) ->
+            IO (Bool, Text)
+        pollLogs maybeCrash stepReader = do
             now <- getCurrentTime
-            let waitSecs = if possibleCrash then logWaitSeconds else 0.0
+            let waitSecs = if maybeCrash then logWaitSeconds else 0.0
                 go curOff curInode accFile = do
                     (ok, nxtOff, nxtInode, combinedTxt, nextFile) <- stepReader curOff curInode accFile
                     if not ok
                         then pure (False, combinedTxt)
                         else do
-                            let ev = extractDbmsEvidence (ooDbms opts) combinedTxt stderrTxt retcode
+                            let ev = extractDbmsEvidence dbms combinedTxt stderrTxt retcode
                                 faults = erFaults ev
                                 cands = erCandidateLines ev
                                 doneMatch
@@ -640,92 +613,73 @@ evaluateProbeOutcome opts mode modeLabel internalLog initOffset initInode sinceI
                                     go nxtOff nxtInode nextFile
             go initOffset initInode ""
 
-        evaluateStderrMode dbms connLost rc errTxt = do
-            let ev = extractDbmsEvidence dbms errTxt errTxt rc
+        evaluateStderrMode targetDbms hasConnLost rc errTxt
+            | not (T.null expSig) =
+                let (matched, rValid) = matchExpectedSignature expSig errTxt
+                 in ( False
+                    , if matched then 0 else 1
+                    , baseDec
+                        { odVerdict = if matched then VerdictAccepted else VerdictRejected
+                        , odClassification = ClassMissingEvidence
+                        , odReason = if matched then "stderr-signature-unsafe" else "stderr-signature-mismatch"
+                        , odRegexValid = Just rValid
+                        , odCrashSignature = mSig
+                        , odLogMode = Just modeLabel
+                        }
+                    )
+            | hasConnLost || not (null faults) =
+                ( False
+                , 0
+                , baseDec
+                    { odVerdict = VerdictAccepted
+                    , odClassification = ClassMissingEvidence
+                    , odReason = "stderr-crash-unsafe"
+                    , odFaultEvents = Just faults
+                    , odConnectionLost = Just hasConnLost
+                    , odCrashSignature = mSig
+                    , odLogMode = Just modeLabel
+                    }
+                )
+            | otherwise =
+                ( False
+                , 1
+                , baseDec
+                    { odVerdict = VerdictRejected
+                    , odClassification = ClassMissingEvidence
+                    , odReason = "no-crash"
+                    , odConnectionLost = Just hasConnLost
+                    , odLogMode = Just modeLabel
+                    }
+                )
+            where
+                ev = extractDbmsEvidence targetDbms errTxt errTxt rc
                 faults = erFaults ev
                 cands = erCandidateLines ev
-                mSig = buildCrashSignature dbms faults cands rc stackN
-            if not (T.null expSig)
-                then
-                    let (matched, rValid) = matchExpectedSignature expSig errTxt
-                     in if matched
-                            then
-                                finish
-                                    0
-                                    ( baseDec
-                                        { odVerdict = VerdictAccepted
-                                        , odClassification = ClassMissingEvidence
-                                        , odReason = "stderr-signature-unsafe"
-                                        , odRegexValid = Just rValid
-                                        , odCrashSignature = mSig
-                                        , odLogMode = Just modeLabel
-                                        }
-                                    )
-                            else
-                                finish
-                                    1
-                                    ( baseDec
-                                        { odVerdict = VerdictRejected
-                                        , odClassification = ClassMissingEvidence
-                                        , odReason = "stderr-signature-mismatch"
-                                        , odRegexValid = Just rValid
-                                        , odCrashSignature = mSig
-                                        , odLogMode = Just modeLabel
-                                        }
-                                    )
-                else
-                    if connLost || not (null faults)
-                        then
-                            finish
-                                0
-                                ( baseDec
-                                    { odVerdict = VerdictAccepted
-                                    , odClassification = ClassMissingEvidence
-                                    , odReason = "stderr-crash-unsafe"
-                                    , odFaultEvents = Just faults
-                                    , odConnectionLost = Just connLost
-                                    , odCrashSignature = mSig
-                                    , odLogMode = Just modeLabel
-                                    }
-                                )
-                        else
-                            finish
-                                1
-                                ( baseDec
-                                    { odVerdict = VerdictRejected
-                                    , odClassification = ClassMissingEvidence
-                                    , odReason = "no-crash"
-                                    , odConnectionLost = Just connLost
-                                    , odLogMode = Just modeLabel
-                                    }
-                                )
+                mSig = buildCrashSignature targetDbms faults cands rc stackN
 
-        classifyFullEvidence dbms isEmbedded connLost rc srvTxt errTxt = do
-            let ev = extractDbmsEvidence dbms srvTxt errTxt rc
+        classifyFullEvidence targetDbms embedded hasConnLost rc srvTxt errTxt = do
+            let ev = extractDbmsEvidence targetDbms srvTxt errTxt rc
                 faults = erFaults ev
                 cands = erCandidateLines ev
                 corr = erCorroboration ev
                 indicators = map feDetail faults
-                mSig = buildCrashSignature dbms faults cands rc stackN
+                mSig = buildCrashSignature targetDbms faults cands rc stackN
             mBaseline <-
-                if T.null (T.strip (ooBaselineSignature opts))
-                    then pure Nothing
-                    else loadBaselineRef (ooBaselineSignature opts)
+                liftIO
+                    if T.null (T.strip (ooBaselineSignature opts))
+                        then pure Nothing
+                        else loadBaselineRef (ooBaselineSignature opts)
             let mSlip = evaluateSlippage <$> mBaseline <*> mSig
                 slippedReject = ooRejectOnSlippage opts && maybe False svSlipped mSlip
                 noCrashReason
                     | corOom corr =
-                        if corOomCause corr == Just "oom_kill_signal_9"
-                            then "oom-kill"
-                            else "oom"
+                        if corOomCause corr == Just "oom_kill_signal_9" then "oom-kill" else "oom"
                     | corSqliteAbort corr = "sqlite-abort"
                     | corExternalKill corr = "external-kill"
                     | otherwise = "no-crash"
                 (sigMatched, regexOk)
                     | T.null expSig = (True, Nothing)
-                    | null faults =
-                        let (_, rValid) = matchExpectedSignature expSig ""
-                         in (False, Just rValid)
+                    | null faults = (False, Just (snd (matchExpectedSignature expSig "")))
                     | otherwise =
                         let scopeTxt = T.intercalate "\n" (indicators <> cands)
                             (matched, rValid) = matchExpectedSignature expSig scopeTxt
@@ -735,172 +689,138 @@ evaluateProbeOutcome opts mode modeLabel internalLog initOffset initInode sinceI
                         { odIndicators = Just indicators
                         , odFaultEvents = Just faults
                         , odCorroboration = Just corr
-                        , odConnectionLost = Just connLost
+                        , odConnectionLost = Just hasConnLost
                         , odRetcode = Just rc
                         , odRegexValid = regexOk
                         , odCrashSignature = mSig
                         , odSlippage = mSlip
                         , odLogMode = Just modeLabel
                         }
-            if not (T.null expSig)
-                then
-                    if not (not (null faults) && sigMatched)
-                        then
-                            finish
-                                1
-                                ( withEvidence
-                                    ( baseDec
-                                        { odVerdict = VerdictRejected
-                                        , odClassification = ClassHealthyNoFault
-                                        , odReason = if null faults then noCrashReason else "signature-mismatch"
-                                        }
-                                    )
-                                )
-                        else
-                            if slippedReject
-                                then
-                                    finish
-                                        1
-                                        ( withEvidence
-                                            ( baseDec
-                                                { odVerdict = VerdictRejected
-                                                , odClassification = ClassConfirmedFault
-                                                , odReason = "signature-slippage"
-                                                }
-                                            )
-                                        )
-                                else
-                                    finish
-                                        0
-                                        ( withEvidence
-                                            ( baseDec
-                                                { odVerdict = VerdictAccepted
-                                                , odClassification = ClassConfirmedFault
-                                                , odReason = "crash-signature"
-                                                }
-                                            )
-                                        )
-                else
-                    if not (null faults)
-                        then
-                            if slippedReject
-                                then
-                                    finish
-                                        1
-                                        ( withEvidence
-                                            ( baseDec
-                                                { odVerdict = VerdictRejected
-                                                , odClassification = ClassConfirmedFault
-                                                , odReason = "signature-slippage"
-                                                }
-                                            )
-                                        )
-                                else
-                                    finish
-                                        0
-                                        ( withEvidence
-                                            ( baseDec
-                                                { odVerdict = VerdictAccepted
-                                                , odClassification = ClassConfirmedFault
-                                                , odReason = "crash-indicator"
-                                                }
-                                            )
-                                        )
-                        else
-                            if connLost && ooAllowStderrOnly opts && not isEmbedded
-                                then
-                                    finish
-                                        0
-                                        ( baseDec
-                                            { odVerdict = VerdictAccepted
-                                            , odClassification = ClassMissingEvidence
-                                            , odReason = "connection-loss-stderr-unsafe"
-                                            , odConnectionLost = Just True
-                                            , odRetcode = Just rc
-                                            , odLogMode = Just modeLabel
-                                            }
-                                        )
-                                else
-                                    finish
-                                        1
-                                        ( baseDec
-                                            { odVerdict = VerdictRejected
-                                            , odClassification = ClassHealthyNoFault
-                                            , odReason = noCrashReason
-                                            , odCorroboration = Just corr
-                                            , odConnectionLost = Just connLost
-                                            , odRetcode = Just rc
-                                            , odLogMode = Just modeLabel
-                                            }
-                                        )
 
+            when (not (T.null expSig) && (null faults || not sigMatched)) $
+                exitProbe
+                    False
+                    1
+                    ( withEvidence
+                        baseDec
+                            { odVerdict = VerdictRejected
+                            , odClassification = ClassHealthyNoFault
+                            , odReason = if null faults then noCrashReason else "signature-mismatch"
+                            }
+                    )
+            when (T.null expSig && null faults && hasConnLost && ooAllowStderrOnly opts && not embedded) $
+                exitProbe
+                    False
+                    0
+                    baseDec
+                        { odVerdict = VerdictAccepted
+                        , odClassification = ClassMissingEvidence
+                        , odReason = "connection-loss-stderr-unsafe"
+                        , odConnectionLost = Just True
+                        , odRetcode = Just rc
+                        , odLogMode = Just modeLabel
+                        }
+            when (T.null expSig && null faults) $
+                exitProbe
+                    False
+                    1
+                    baseDec
+                        { odVerdict = VerdictRejected
+                        , odClassification = ClassHealthyNoFault
+                        , odReason = noCrashReason
+                        , odCorroboration = Just corr
+                        , odConnectionLost = Just hasConnLost
+                        , odRetcode = Just rc
+                        , odLogMode = Just modeLabel
+                        }
+            when slippedReject $
+                exitProbe
+                    False
+                    1
+                    ( withEvidence
+                        baseDec
+                            { odVerdict = VerdictRejected
+                            , odClassification = ClassConfirmedFault
+                            , odReason = "signature-slippage"
+                            }
+                    )
+            pure
+                ( False
+                , 0
+                , withEvidence
+                    baseDec
+                        { odVerdict = VerdictAccepted
+                        , odClassification = ClassConfirmedFault
+                        , odReason = if T.null expSig then "crash-indicator" else "crash-signature"
+                        }
+                )
+
+-- | Locate and stat the initial crash evidence source (file, container log, or stderr fallback).
 acquireLogSource ::
     OracleOptions ->
     DbmsConnection ->
     FilePath ->
     IO (Either (OracleDecision -> OracleDecision) (LogMode, Integer, Maybe Integer, Text))
-acquireLogSource opts conn internalLog = do
-    sinceIso <- formatIsoUtc <$> getCurrentTime
+acquireLogSource opts conn internalLog = runExceptT do
+    sinceIso <- formatIsoUtc <$> liftIO getCurrentTime
     if not (isServerDbmsKind (ooDbms opts))
         then pure $ case connContainer conn of
-            Just cname -> Right (ModeEmbeddedContainer cname, 0, Nothing, sinceIso)
-            Nothing -> Right (ModeEmbeddedLocal, 0, Nothing, sinceIso)
+            Just cname -> (ModeEmbeddedContainer cname, 0, Nothing, sinceIso)
+            Nothing -> (ModeEmbeddedLocal, 0, Nothing, sinceIso)
         else case (ooLogFile opts, connContainer conn) of
-            (Just path, mContainer) -> do
-                readable <- waitForReadableFile path logWaitSeconds
-                if readable
-                    then do
-                        stRes <- try (getFileStatus path) :: IO (Either IOException FileStatus)
-                        case stRes of
-                            Right st ->
-                                pure (Right (ModeFile path, fromIntegral (fileSize st), Just (fromIntegral (fileID st)), sinceIso))
-                            Left _ ->
-                                pure $
-                                    Left \d ->
-                                        d
-                                            { odVerdict = VerdictRejected
-                                            , odClassification = ClassMissingEvidence
-                                            , odReason = "log-stat-failed"
-                                            , odLogFile = Just path
-                                            }
-                    else case mContainer of
-                        Just cname -> acquireContainer cname sinceIso
-                        Nothing ->
-                            pure $
-                                Left \d ->
-                                    d
-                                        { odVerdict = VerdictRejected
-                                        , odClassification = ClassMissingEvidence
-                                        , odReason = "log-unreadable"
-                                        , odLogFile = Just path
-                                        , odHint = Just "mount the log readably or pass --container-name"
-                                        }
+            (Just path, mContainer) -> acquireHostLog path mContainer sinceIso
             (Nothing, Just cname) -> acquireContainer cname sinceIso
             (Nothing, Nothing)
-                | ooAllowStderrOnly opts -> pure (Right (ModeStderr, 0, Nothing, sinceIso))
+                | ooAllowStderrOnly opts -> pure (ModeStderr, 0, Nothing, sinceIso)
                 | otherwise ->
-                    pure $
-                        Left \d ->
-                            d
-                                { odVerdict = VerdictRejected
-                                , odClassification = ClassMissingEvidence
-                                , odReason = "log-source-required"
-                                , odHint = Just "pass --log-file or --container-name (or --allow-stderr-only)"
-                                }
+                    throwE \d ->
+                        d
+                            { odVerdict = VerdictRejected
+                            , odClassification = ClassMissingEvidence
+                            , odReason = "log-source-required"
+                            , odHint = Just "pass --log-file or --container-name (or --allow-stderr-only)"
+                            }
     where
-        acquireContainer cname sinceIso = do
-            mState <- getContainerLogState cname internalLog
-            case mState of
-                Just (sz, ino) -> pure (Right (ModeContainer cname internalLog, sz, Just ino, sinceIso))
-                Nothing ->
-                    pure $
-                        Left \d ->
+        acquireHostLog path mContainer sinceIso = do
+            readable <- liftIO (waitForReadableFile path logWaitSeconds)
+            if not readable
+                then case mContainer of
+                    Just cname -> acquireContainer cname sinceIso
+                    Nothing ->
+                        throwE \d ->
                             d
                                 { odVerdict = VerdictRejected
                                 , odClassification = ClassMissingEvidence
-                                , odReason = "container-log-unavailable"
-                                , odLogFile = Just internalLog
+                                , odReason = "log-unreadable"
+                                , odLogFile = Just path
+                                , odHint = Just "mount the log readably or pass --container-name"
                                 }
+                else do
+                    stRes <- liftIO (try (getFileStatus path) :: IO (Either IOException FileStatus))
+                    case stRes of
+                        Right st ->
+                            pure (ModeFile path, fromIntegral (fileSize st), Just (fromIntegral (fileID st)), sinceIso)
+                        Left _ ->
+                            throwE \d ->
+                                d
+                                    { odVerdict = VerdictRejected
+                                    , odClassification = ClassMissingEvidence
+                                    , odReason = "log-stat-failed"
+                                    , odLogFile = Just path
+                                    }
+
+        acquireContainer cname sinceIso = do
+            mState <- liftIO (getContainerLogState cname internalLog)
+            case mState of
+                Just (sz, ino) -> pure (ModeContainer cname internalLog, sz, Just ino, sinceIso)
+                Nothing ->
+                    throwE \d ->
+                        d
+                            { odVerdict = VerdictRejected
+                            , odClassification = ClassMissingEvidence
+                            , odReason = "container-log-unavailable"
+                            , odLogFile = Just internalLog
+                            }
 
 waitForReadableFile :: FilePath -> Double -> IO Bool
 waitForReadableFile path waitSecs = do
@@ -919,12 +839,17 @@ waitForReadableFile path waitSecs = do
                             threadDelay logPollIntervalMicros
                             go start
 
+-- | Abstract incremental tail cursor shared between host log files and Docker container logs.
 data LogCursor = LogCursor
     { lcStat :: !(IO (Maybe (Integer, Integer)))
+    -- ^ Query current @(sizeBytes, inode)@ of the active log target.
     , lcReadSlice :: !(Integer -> Integer -> IO (Maybe Text))
+    -- ^ Read up to @count@ bytes starting at byte offset @start@.
     , lcReadExtra :: !(IO Text)
+    -- ^ Optional secondary output stream (such as @docker logs --since@).
     }
 
+-- | Poll a 'LogCursor' incrementally from @(curOff, curInode)@, handling log rotation/truncation.
 pollLogCursor ::
     LogCursor -> Integer -> Maybe Integer -> Text -> IO (Bool, Integer, Maybe Integer, Text, Text)
 pollLogCursor cursor curOff curInode accFile = do

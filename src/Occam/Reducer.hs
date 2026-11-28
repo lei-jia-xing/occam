@@ -68,11 +68,8 @@ module Occam.Reducer (
 
 import Data.ByteString (ByteString)
 import Occam.Certificate (FailingPrefixCache)
-import Occam.Core (
-    ResultStatement,
-    ResultTrace,
-    SessionInit,
- )
+import Occam.Core.Semantics (SessionInit)
+import Occam.Core.Types (ResultStatement, ResultTrace)
 import Occam.Logger (Logger, nullLogger)
 import Occam.Parser (SQLDialect, StatementUnit)
 import Occam.Pool (OraclePool)

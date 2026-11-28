@@ -17,16 +17,15 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (
+import Occam.Core.Semantics (
     BarrierReason (..),
     BarrierScope (..),
     CatalogOp (..),
     ScopedBarrier (..),
     SemanticFacts (..),
     SessionInit,
-    Statement (..),
-    StatementId (..),
  )
+import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Dependency.Alter (
     processAlterTable,
     processAttachInherit,

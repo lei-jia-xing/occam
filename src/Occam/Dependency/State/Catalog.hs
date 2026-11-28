@@ -44,7 +44,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (
+import Occam.Core.Schema (
     Constraint (..),
     DeleteScope,
     ForeignKey,
@@ -55,48 +55,52 @@ import Occam.Core (
     ReadFact,
     RelationKind,
     SourceColumn (..),
-    StatementId,
-    TriggerBody,
-    TriggerEvent,
-    TriggerTiming,
     ViewColumnLineage (..),
     WriteKind (..),
  )
+import Occam.Core.Semantics (TriggerBody, TriggerEvent, TriggerTiming)
+import Occam.Core.Types (StatementId)
 
--- Canonical catalog keys
+-- | Canonical key identifying a relation alongside whether it lives in a temporary namespace.
 data RelationKey = RelationKey
     { relationKeyTemp :: !Bool
     , relationKeyName :: !Name
     }
     deriving (Eq, Ord, Show)
 
+-- | Canonical key for a standalone named index or an index scoped to a table.
 data IndexKey
     = NamedIndexKey !Name
     | TableIndexKey !RelationKey !Ident
     deriving (Eq, Ord, Show)
 
+-- | Canonical key for a standalone named trigger or a trigger attached to a table.
 data TriggerKey
     = NamedTriggerKey !Name
     | TableTriggerKey !RelationKey !Ident
     deriving (Eq, Ord, Show)
 
+-- | Canonical key identifying a sequence and whether it is session-temporary.
 data SequenceKey = SequenceKey
     { sequenceKeyTemp :: !Bool
     , sequenceKeyName :: !Name
     }
     deriving (Eq, Ord, Show)
 
+-- | Explicit constraint identifier or synthetic positional key for unnamed table constraints.
 data ConstraintIdentity
     = NamedConstraint !Ident
     | UnnamedConstraint !StatementId !Int
     deriving (Eq, Ord, Show)
 
+-- | Canonical key identifying a constraint belonging to a relation.
 data ConstraintKey = ConstraintKey
     { constraintKeyTable :: !RelationKey
     , constraintKeyIdentity :: !ConstraintIdentity
     }
     deriving (Eq, Ord, Show)
 
+-- | Sum of catalog object keys tracked by statement dependency edges.
 data ObjectKey
     = BarrierRelationKey !RelationKey
     | BarrierIndexKey !IndexKey
@@ -107,6 +111,7 @@ data ObjectKey
     | BarrierConstraintKey !ConstraintKey
     deriving (Eq, Ord, Show)
 
+-- | Barrier scope keys enforcing ordering across global, session, transaction, relation, schema, or variable mutations.
 data BarrierKey
     = GlobalBarrierKey
     | SessionBarrierKey
@@ -117,7 +122,7 @@ data BarrierKey
     | UserVariableBarrierKey !Ident
     deriving (Eq, Ord, Show)
 
--- Catalog state
+-- | Tracked catalog metadata and defining statement IDs for a relation.
 data RelationState = RelationState
     { relKind :: !RelationKind
     , relDefinition :: !(Maybe StatementId)

@@ -34,11 +34,8 @@ import Occam.Certificate (
     checkEarlyRejectionBytesTracked,
     checkEarlyRejectionIdsTracked,
  )
-import Occam.Core (
-    OracleOutcome (..),
-    Statement (..),
-    StatementId (..),
- )
+import Occam.Core.Oracle (OracleOutcome (..))
+import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Metrics (
     FamilyTag (..),
     recordAcceptedBytesSaved,
@@ -104,8 +101,10 @@ data DDMinEnv = DDMinEnv
     , ddAllStatements :: ![Statement]
     }
 
+-- | Result yielded by a DDMin scheduling pass: winning lane, surviving statements, and bytes saved.
 type DDMinOutcome = Maybe (StatementLane, [Statement], Int)
 
+-- | Deduplicate a list of 'IntSet's while preserving first-seen order.
 dedupIntSets :: [IntSet.IntSet] -> [IntSet.IntSet]
 dedupIntSets = go HashSet.empty
     where
@@ -114,6 +113,7 @@ dedupIntSets = go HashSet.empty
             | HashSet.member s seen = go seen rest
             | otherwise = s : go (HashSet.insert s seen) rest
 
+-- | Record saved-byte telemetry when accepting an already-validated seed candidate.
 commitSeedAcceptance ::
     OraclePool ->
     StatementLane ->
@@ -124,12 +124,14 @@ commitSeedAcceptance pool lane tag (kept, saved) = do
     recordAcceptedBytesSaved (poolMetricsStore pool) tag saved
     pure (lane, kept, saved)
 
+-- | Memoize an oracle outcome for @sql@ in the DDMin run's feedback table.
 recordDDMinVerdict :: DDMinEnv -> ByteString -> OracleOutcome -> IO ()
 recordDDMinVerdict env sql outcome =
     modifyIORef' (fbEvaluated (ddFeedback env)) (HashMap.insert sql verdict)
     where
         verdict = if outcome == OracleAccepted then CandidateAccepted else CandidateRejected
 
+-- | Project, early-reject, deduplicate, and classify one candidate seed before oracle testing.
 classifyDDMinSeed ::
     DDMinEnv ->
     Maybe (IORef (HashSet.HashSet IntSet.IntSet)) ->
@@ -202,6 +204,7 @@ classifyDDMinSeed env maybeSeen tag current currentInts currentLen seedInts
         let count = IntSet.size (IntSet.intersection currentInts projected)
         pure (Just (SeedFresh kept count candidateSQL))
 
+-- | Atomically check and record @projected@ in a per-window seen set to avoid duplicate projection tests.
 checkAndInsertSeenProjection ::
     Maybe (IORef (HashSet.HashSet IntSet.IntSet)) -> IntSet.IntSet -> IO Bool
 checkAndInsertSeenProjection Nothing _ = pure False

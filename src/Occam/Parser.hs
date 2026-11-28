@@ -48,7 +48,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable qualified as Foldable
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam.Core (SemanticFacts (..))
+import Occam.Core.Semantics (SemanticFacts (..))
 import Occam.Facts (
     ClauseTier (..),
     ColumnSite (..),

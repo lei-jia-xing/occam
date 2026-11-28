@@ -22,14 +22,14 @@ module Occam.Dependency.Resolve (
 import Data.List (find)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Occam.Core (
+import Occam.Core.Schema (
     ConstraintRef (..),
     IndexRef (..),
     Name (..),
     NameRef (..),
     TriggerRef (..),
  )
-import Occam.Core qualified as Core
+import Occam.Core.Semantics qualified as Core
 import Occam.Dependency.State (
     Catalog (..),
     ConstraintIdentity (..),
@@ -46,6 +46,7 @@ import Occam.Dependency.State (
     nameSuffix,
  )
 
+-- | Qualify a newly defined object name according to session namespace prefix and @search_path@.
 qualifyDefinitionName :: SessionState -> Name -> Bool -> Name
 qualifyDefinitionName session name@(Name parts) temporary
     | length parts /= 1 = name
@@ -60,24 +61,29 @@ qualifyDefinitionName session name@(Name parts) temporary
                         Name searchParts : _ | not (null searchParts) -> Name (searchParts ++ parts)
                         _ -> name
 
+-- | Qualify a permanent object name using active session schema rules.
 qualifyObjectName :: SessionState -> Name -> Name
 qualifyObjectName session name = qualifyDefinitionName session name False
 
+-- | Alias for 'qualifyObjectName' when resolving object references.
 qualifyReferenceName :: SessionState -> Name -> Name
 qualifyReferenceName = qualifyObjectName
 
+-- | Qualify the target name of a @RENAME@ operation, preserving the old schema when unqualified.
 qualifyRenameName :: Name -> Name -> Name
 qualifyRenameName (Name oldParts) newName@(Name newParts)
     | length oldParts > 1 && length newParts == 1 =
         Name (init oldParts ++ newParts)
     | otherwise = newName
 
+-- | Fallback 'RelationKey' derived solely from session rules when no matching catalog entry exists.
 relationFallbackKey :: SessionState -> NameRef -> RelationKey
 relationFallbackKey session (NameRef name temporary)
     | length (nameParts name) > 1 = RelationKey temporary name
     | temporary = RelationKey True (qualifyDefinitionName session name True)
     | otherwise = RelationKey False (qualifyReferenceName session name)
 
+-- | Fallback 'SequenceKey' derived solely from session rules when no matching sequence exists.
 sequenceFallbackKey :: SessionState -> NameRef -> SequenceKey
 sequenceFallbackKey session (NameRef name temporary)
     | length (nameParts name) > 1 = SequenceKey temporary name
@@ -181,21 +187,26 @@ resolveRelationWildcard catalog name =
                     , nameSuffix name (relationKeyName key)
                     ]
 
+-- | Resolve all matching permanent and temporary relation keys in the catalog.
 resolveRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
 resolveRelationKeys = resolveNamespacedKeys True catalogRelations resolveRelationWildcard relationFallbackKey
 
+-- | Resolve only permanent (non-temporary) relation keys in the catalog.
 resolvePermanentRelationKeys :: SessionState -> Catalog -> NameRef -> [RelationKey]
 resolvePermanentRelationKeys = resolveNamespacedKeys False catalogRelations resolveRelationWildcard relationFallbackKey
 
+-- | Resolve relation references inside a view definition, honoring temp-shadowing rules.
 resolveViewSourceKeys :: SessionState -> Bool -> Catalog -> NameRef -> [RelationKey]
 resolveViewSourceKeys session viewIsTemp catalog ref
     | not viewIsTemp && sessPermViewIgnoresTemp session =
         resolvePermanentRelationKeys session catalog ref
     | otherwise = resolveRelationKeys session catalog ref
 
+-- | Resolve all matching temporary and permanent sequence keys in the catalog.
 resolveSequenceKeys :: SessionState -> Catalog -> NameRef -> [SequenceKey]
 resolveSequenceKeys = resolveNamespacedKeys True catalogSequences (wildcardScan catalogSequences) sequenceFallbackKey
 
+-- | Resolve index references (named or table-qualified) against catalog metadata.
 resolveIndexKeys :: SessionState -> Catalog -> IndexRef -> [IndexKey]
 resolveIndexKeys session catalog indexRef =
     case indexRef of
@@ -208,6 +219,7 @@ resolveIndexKeys session catalog indexRef =
             | relationKey <- resolveRelationKeys session catalog table
             ]
 
+-- | Resolve trigger references (named or table-qualified) against catalog metadata.
 resolveTriggerKeys :: SessionState -> Catalog -> TriggerRef -> [TriggerKey]
 resolveTriggerKeys session catalog triggerRef =
     case triggerRef of

@@ -17,12 +17,12 @@ import Occam.Certificate (
     FailingPrefixCache,
     newEarlyRejectTrackerWithFailures,
  )
-import Occam.Core (
+import Occam.Core.Oracle (oracleAccepts)
+import Occam.Core.Semantics (SessionInit)
+import Occam.Core.Types (
     ResultStatement,
     ResultTrace,
-    SessionInit,
     Statement,
-    oracleAccepts,
     traceResultStatement,
  )
 import Occam.Dependency (DependencyGraph (..))
@@ -62,14 +62,17 @@ import Occam.Reducer.Support (
  )
 import Occam.Reducer.Syntax (reduceSyntaxWithDialect)
 
+-- | Execution evidence obtained from the initial result-oracle run (count-only or full trace).
 data ObservedResultEvidence
     = ObservedStatementOnly !ResultStatement
     | ObservedFullTrace !ResultTrace
 
+-- | Project the trailing 'ResultStatement' summary out of 'ObservedResultEvidence'.
 evidenceResultStatement :: ObservedResultEvidence -> ResultStatement
 evidenceResultStatement (ObservedStatementOnly rs) = rs
 evidenceResultStatement (ObservedFullTrace tr) = traceResultStatement tr
 
+-- | Extract the full 'ResultTrace' when statement-by-statement tracing was enabled.
 evidenceResultTrace :: ObservedResultEvidence -> Maybe ResultTrace
 evidenceResultTrace (ObservedStatementOnly _) = Nothing
 evidenceResultTrace (ObservedFullTrace tr) = Just tr
@@ -88,6 +91,7 @@ data IterationEnv = IterationEnv
 sameEvidenceBytes :: ByteString -> Maybe ReductionEvidence -> Bool
 sameEvidenceBytes sql = maybe False ((== sql) . evidenceBytes)
 
+-- | Full reduction pipeline variant accepting pre-parsed initial SQL and optional failing-prefix cache.
 reduceSQLWithObservedResultSeeded ::
     Maybe (ByteString, (SessionInit, [StatementUnit])) ->
     Maybe FailingPrefixCache ->

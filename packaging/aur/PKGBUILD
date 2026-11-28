@@ -75,7 +75,7 @@ build() {
     _check_flag="--enable-tests"
   fi
 
-  runhaskell Setup.hs configure -O \
+  runhaskell Setup.hs configure -O2 \
     --enable-shared \
     --enable-executable-dynamic \
     --disable-library-vanilla \

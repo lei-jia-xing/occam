@@ -54,8 +54,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Vector (Vector)
-import Occam.Core qualified as Core
-import Occam.Frontend.AST qualified as AST
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Types qualified as Core
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Lexer (SpannedToken)
 import Occam.Frontend.Span (
     ByteSpan (..),

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Stateful DuckDB prefix checkpointing and read-only replay acceleration.
 module Occam.Oracle.DuckDB.Replay (
     prepareDuckDBReplayRunner,
 ) where

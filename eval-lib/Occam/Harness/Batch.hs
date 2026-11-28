@@ -18,7 +18,11 @@ import Control.Concurrent (
     withMVar,
  )
 import Control.Exception.Safe (IOException, SomeException, bracket, catch, finally, try)
-import Control.Monad (forM, unless, void, when)
+import Control.Monad (forM, guard, unless, void, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Cont (ContT (..), evalContT, runContT)
+import Control.Monad.Trans.Except (ExceptT (..), runExceptT, withExceptT)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Crypto.Hash.SHA256 qualified as SHA256
 import Data.Aeson (Value (..), eitherDecodeStrict', encode, object, (.=))
 import Data.ByteString qualified as BS
@@ -121,16 +125,19 @@ data BatchSummary = BatchSummary
     }
     deriving (Eq, Show)
 
+-- | Container coordinates tracked for dynamically spawned batch worker containers.
 data ManagedContainer = ManagedContainer
     { mcName :: !Text
     , mcHostLog :: !(Maybe FilePath)
     }
 
+-- | Execution backend assigned to an individual batch worker slot.
 data WorkerBackend
     = BackendLocalEmbedded !(Maybe FilePath)
     | BackendExternal !ExternalContainer
     | BackendManaged !(Maybe ManagedContainer)
 
+-- | Resolved endpoint attributes bound to a worker's active DBMS instance.
 data WorkerEndpointSpec = WorkerEndpointSpec
     { wesContainer :: !(Maybe Text)
     , wesHostLog :: !(Maybe FilePath)
@@ -139,6 +146,7 @@ data WorkerEndpointSpec = WorkerEndpointSpec
     , wesDbName :: !(Maybe Text)
     }
 
+-- | Mutable per-worker state protected by an 'MVar' inside 'WorkerHandle'.
 data WorkerState = WorkerState
     { wsWorkerId :: !Int
     , wsRunTag :: !Text
@@ -150,6 +158,7 @@ data WorkerState = WorkerState
     , wsEndpoint :: !(Maybe WorkerEndpointSpec)
     }
 
+-- | Concurrent worker handle passed across qualification and reduction tasks.
 data WorkerHandle = WorkerHandle
     { whState :: !(MVar WorkerState)
     , whSpawned :: !(MVar (Set Text))
@@ -169,25 +178,22 @@ runBatch cfg opts
                     , "overview" .= aggOverview agg
                     ]
         pure (Right (BatchSummary 0 payload))
-    | otherwise = do
-        ePlan <- prepareBatchPlan (boConfigPath opts) cfg (boPlan opts)
-        case ePlan of
-            Left err -> pure (Left err)
-            Right plan
-                | boDryRun opts -> pure (Right (BatchSummary 0 (pbpPreview plan)))
-                | otherwise -> do
-                    eBins <- resolveBatchBinaries opts
-                    case eBins of
-                        Left err -> pure (Left err)
-                        Right (occamBin, harnessBin) ->
-                            Right <$> executePreparedBatch cfg opts plan occamBin harnessBin
+    | otherwise = runExceptT do
+        plan <- ExceptT (prepareBatchPlan (boConfigPath opts) cfg (boPlan opts))
+        if boDryRun opts
+            then pure (BatchSummary 0 (pbpPreview plan))
+            else do
+                (occamBin, harnessBin) <- ExceptT (resolveBatchBinaries opts)
+                liftIO (executePreparedBatch cfg opts plan occamBin harnessBin)
 
+-- | Locate the @occam@ and @occam-harness@ binaries required for batch execution.
 resolveBatchBinaries :: BatchOptions -> IO (Either String (FilePath, FilePath))
 resolveBatchBinaries opts = do
     eOccam <- resolveRepoBinary (boOccamBin opts) "OCCAM_BIN" "occam"
     eHarness <- resolveRepoBinary (boHarnessBin opts) "OCCAM_HARNESS_BIN" "occam-harness"
     pure $ (,) <$> eOccam <*> eHarness
 
+-- | Execute qualification and reduction across the prepared batch plan with signal-safe container cleanup.
 executePreparedBatch ::
     HarnessConfig ->
     BatchOptions ->
@@ -199,80 +205,65 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
     let outDir = pbpOutDir plan
         settings = pbpSettings plan
         pOpts = boPlan opts
-    runTag <- case boRunTag opts of
-        Just tag | not (T.null tag) -> pure tag
-        _ -> do
-            pid <- getProcessID
-            epoch <- floor <$> getPOSIXTime :: IO Integer
-            pure ("b" <> T.pack (show epoch) <> "_" <> T.pack (show pid))
+    runTag <- resolveRunTag (boRunTag opts)
     stopRef <- newIORef False
     sigNumRef <- newIORef Nothing
     spawnedRef <- newMVar Set.empty
     workerErrsRef <- newIORef []
-    withSignalHandlers stopRef sigNumRef $
-        finally
-            ( do
-                workers <- initWorkers cfg opts plan runTag stopRef spawnedRef
-                -- Phase 1: Qualification (lazy container startup!)
-                priorQuals <-
-                    if planResume pOpts
-                        then
-                            selectReusableQualifications
-                                outDir
-                                (planReplays pOpts)
-                                (workStackFrames settings)
-                                (planSkipInputReplay pOpts)
-                                (pbpCases plan)
-                        else pure Map.empty
-                let missingCases = filter (\bc -> Map.notMember (batchCaseId bc) priorQuals) (pbpCases plan)
-                runWorkerPool stopRef workers workerErrsRef missingCases \wh bc ->
-                    qualifyCaseOnWorker wh opts plan bc
-                stopped1 <- readIORef stopRef
-                qualsMap <-
-                    if stopped1
-                        then pure priorQuals
-                        else
-                            if planResume pOpts
-                                then
-                                    selectReusableQualifications
-                                        outDir
-                                        (planReplays pOpts)
-                                        (workStackFrames settings)
-                                        (planSkipInputReplay pOpts)
-                                        (pbpCases plan)
-                                else loadQualMapFromDisk outDir (pbpCases plan)
-
-                -- Phase 2: Reduction + Reduced Replay Verification
-                stopped2 <- readIORef stopRef
-                unless stopped2 do
-                    let qualLookup cid = Map.lookup cid qualsMap
-                        caseById = Map.fromList [(batchCaseId bc, bc) | bc <- pbpCases plan]
-                        jobItems =
-                            [ (j, bc, computeRunConfigHash settings pOpts bc prof)
-                            | j@(Job cid prof _) <- pbpJobs plan
-                            , Just bc <- [Map.lookup cid caseById]
-                            ]
-                        jobChecks =
-                            [ JobCheck
-                                { jcJobId = jobId j
-                                , jcJob = j
-                                , jcCase = bc
-                                , jcConfigHash = cfgHash
-                                , jcAllowUnstable = False
-                                , jcSkipInputReplay = planSkipInputReplay pOpts
-                                , jcInputQualified = maybe False qrQualified (qualLookup (batchCaseId bc))
-                                }
-                            | (j, bc, cfgHash) <- jobItems
-                            ]
-                    reusableIds <-
+    evalContT do
+        ContT (\k -> withSignalHandlers stopRef sigNumRef (k ()))
+        ContT (\k -> k () `finally` cleanupSpawnedContainers spawnedRef)
+        liftIO do
+            workers <- initWorkers cfg opts plan runTag stopRef spawnedRef
+            -- Phase 1: Qualification (lazy container startup!)
+            priorQuals <- loadPriorQuals outDir pOpts settings
+            let missingCases = filter (\bc -> Map.notMember (batchCaseId bc) priorQuals) (pbpCases plan)
+            runWorkerPool stopRef workers workerErrsRef missingCases \wh bc ->
+                qualifyCaseOnWorker wh opts plan bc
+            stopped1 <- readIORef stopRef
+            qualsMap <-
+                if stopped1
+                    then pure priorQuals
+                    else
                         if planResume pOpts
-                            then selectReusableJobs outDir (planRerunFailed pOpts) jobChecks
-                            else pure Set.empty
-                    let pendingJobs = filter (\(j, _, _) -> Set.notMember (jobId j) reusableIds) jobItems
-                    runWorkerPool stopRef workers workerErrsRef pendingJobs \wh (j, bc, cfgHash) ->
-                        runJobOnWorker wh opts plan occamBin harnessBin bc j cfgHash (qualLookup (batchCaseId bc))
-            )
-            (cleanupSpawnedContainers spawnedRef)
+                            then
+                                selectReusableQualifications
+                                    outDir
+                                    (planReplays pOpts)
+                                    (workStackFrames settings)
+                                    (planSkipInputReplay pOpts)
+                                    (pbpCases plan)
+                            else loadQualMapFromDisk outDir (pbpCases plan)
+
+            -- Phase 2: Reduction + Reduced Replay Verification
+            stopped2 <- readIORef stopRef
+            unless stopped2 do
+                let qualLookup cid = Map.lookup cid qualsMap
+                    caseById = Map.fromList [(batchCaseId bc, bc) | bc <- pbpCases plan]
+                    jobItems =
+                        [ (j, bc, computeRunConfigHash settings pOpts bc prof)
+                        | j@(Job cid prof _) <- pbpJobs plan
+                        , Just bc <- [Map.lookup cid caseById]
+                        ]
+                    jobChecks =
+                        [ JobCheck
+                            { jcJobId = jobId j
+                            , jcJob = j
+                            , jcCase = bc
+                            , jcConfigHash = cfgHash
+                            , jcAllowUnstable = False
+                            , jcSkipInputReplay = planSkipInputReplay pOpts
+                            , jcInputQualified = maybe False qrQualified (qualLookup (batchCaseId bc))
+                            }
+                        | (j, bc, cfgHash) <- jobItems
+                        ]
+                reusableIds <-
+                    if planResume pOpts
+                        then selectReusableJobs outDir (planRerunFailed pOpts) jobChecks
+                        else pure Set.empty
+                let pendingJobs = filter (\(j, _, _) -> Set.notMember (jobId j) reusableIds) jobItems
+                runWorkerPool stopRef workers workerErrsRef pendingJobs \wh (j, bc, cfgHash) ->
+                    runJobOnWorker wh opts plan occamBin harnessBin bc j cfgHash (qualLookup (batchCaseId bc))
 
     interrupted <- readIORef stopRef
     mSig <- readIORef sigNumRef
@@ -295,6 +286,22 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
                 ]
     pure (BatchSummary code payload)
     where
+        resolveRunTag (Just tag) | not (T.null tag) = pure tag
+        resolveRunTag _ = do
+            pid <- getProcessID
+            epoch <- floor <$> getPOSIXTime :: IO Integer
+            pure ("b" <> T.pack (show epoch) <> "_" <> T.pack (show pid))
+
+        loadPriorQuals outDir pOpts settings
+            | planResume pOpts =
+                selectReusableQualifications
+                    outDir
+                    (planReplays pOpts)
+                    (workStackFrames settings)
+                    (planSkipInputReplay pOpts)
+                    (pbpCases plan)
+            | otherwise = pure Map.empty
+
         loadQualMapFromDisk outDir cases = do
             pairs <- forM cases \bc -> do
                 let qPath = outDir </> "qualified" </> T.unpack (batchCaseId bc) </> "input_replay.json"
@@ -305,12 +312,13 @@ executePreparedBatch cfg opts plan occamBin harnessBin = do
         tryReadJson :: FilePath -> IO (Maybe QualificationResult)
         tryReadJson p = do
             exists <- doesFileExist p
-            if exists
-                then do
+            if not exists
+                then pure Nothing
+                else do
                     res <- try (BS.readFile p) :: IO (Either IOException BS.ByteString)
                     pure (either (const Nothing) (either (const Nothing) Just . eitherDecodeStrict') res)
-                else pure Nothing
 
+-- | Temporarily install SIGINT/SIGTERM handlers setting @stopRef@ and recording the signal number.
 withSignalHandlers :: IORef Bool -> IORef (Maybe Int) -> IO a -> IO a
 withSignalHandlers stopRef sigNumRef action =
     bracket install restore (const action)
@@ -327,6 +335,7 @@ withSignalHandlers stopRef sigNumRef action =
             writeIORef sigNumRef (Just (fromIntegral n))
             writeIORef stopRef True
 
+-- | Initialize isolated 'WorkerHandle' slots mapped to embedded, external, or managed backends.
 initWorkers ::
     HarnessConfig ->
     BatchOptions ->
@@ -361,6 +370,7 @@ initWorkers cfg opts plan runTag stopRef spawnedRef = do
         mv <- newMVar st
         pure (WorkerHandle mv spawnedRef cfg stopRef)
 
+-- | Drain @items@ across parallel worker threads, capturing per-worker exceptions into @errsRef@.
 runWorkerPool ::
     IORef Bool ->
     [WorkerHandle] ->
@@ -377,109 +387,150 @@ runWorkerPool stopRef workers errsRef items action = do
         pure done
     mapM_ takeMVar dones
     where
-        loop wh queue = do
-            stopped <- readIORef stopRef
-            if stopped
-                then pure ()
-                else do
-                    mNext <- modifyMVar queue \case
-                        [] -> pure ([], Nothing)
-                        (x : xs) -> pure (xs, Just x)
-                    case mNext of
-                        Nothing -> pure ()
-                        Just item -> do
-                            action wh item
-                            loop wh queue
+        loop wh queue =
+            void $ runMaybeT do
+                liftIO (readIORef stopRef) >>= guard . not
+                item <- MaybeT $ modifyMVar queue \case
+                    [] -> pure ([], Nothing)
+                    (x : xs) -> pure (xs, Just x)
+                liftIO (action wh item)
+                liftIO (loop wh queue)
+
         onWorkerErr :: SomeException -> IO ()
         onWorkerErr exc = atomicModifyIORef' errsRef (\es -> (T.pack (show exc) : es, ()))
 
-qualifyCaseOnWorker :: WorkerHandle -> BatchOptions -> PreparedBatchPlan -> BatchCase -> IO ()
-qualifyCaseOnWorker wh opts plan bc = do
-    stopped <- readIORef (whStopRef wh)
-    unless stopped do
-        let pOpts = boPlan opts
-            settings = pbpSettings plan
-            outDir = pbpOutDir plan
-            cid = batchCaseId bc
-            qualDir = outDir </> "qualified" </> T.unpack cid
-            qualPath = qualDir </> "input_replay.json"
-            decLog = qualDir </> "input_replay_decisions.jsonl"
-        createDirectoryIfMissing True qualDir
-        dbmsKind <- requireDbmsKind (dbmsId (batchDbms bc))
-        if planSkipInputReplay pOpts
-            then do
-                let rv =
-                        ReplayVerification
-                            { rvRunsRequired = planReplays pOpts
-                            , rvRunsPassed = 0
-                            , rvAllPassed = True
-                            , rvConsistentSignature = True
-                            , rvBaselineSignature = attrBaseline (batchAttributes bc)
-                            , rvMatchesBaseline = Nothing
-                            , rvSlippageCount = 0
-                            , rvObservedSignatures = maybeToList (attrBaseline (batchAttributes bc))
-                            , rvObservedSignatureIds = maybe [] (\s -> [csId s]) (attrBaseline (batchAttributes bc))
-                            , rvInterrupted = False
-                            , rvRuns = []
-                            }
-                    qr =
-                        QualificationResult
-                            { qrCaseId = cid
-                            , qrDbms = dbmsKind
-                            , qrDialect = batchDialect bc
-                            , qrSqlSha256 = batchSqlSha256 bc
-                            , qrExpectedSignature = batchSignature bc
-                            , qrStackFrames = workStackFrames settings
-                            , qrSkipped = True
-                            , qrQualified = True
-                            , qrBaselineSignature = attrBaseline (batchAttributes bc)
-                            , qrSignatureSlippageAgainstBaseline = Nothing
-                            , qrReplay = rv
-                            }
-                writeAtomicLazyBytes qualPath (encode qr <> BSL.pack [10])
-            else do
-                sqlBytes <- BS.readFile (batchFile bc)
-                ensureWorkerTarget wh False dbmsKind (batchDbms bc) (batchImage bc)
-                let rCfg =
-                        (defaultReplayConfig dbmsKind emptyConnectionOverrides)
-                            { rcEndpoint = workerEndpoint wh dbmsKind
-                            , rcResetFn = Just (resetWorker wh dbmsKind)
-                            , rcExpectedSignature = batchSignature bc
-                            , rcRejectOnSlippage = False
-                            , rcStackFrames = workStackFrames settings
-                            , rcDecisionLog = Just decLog
-                            , rcProbeTimeout = planProbeTimeout pOpts
-                            , rcMaxWaitReset = workContainerWait settings
-                            , rcResetBeforeRun = True
-                            , rcRequireConsistent = True
-                            }
-                rv <-
-                    runReplayVerification (whHarnessConfig wh) (Just (whStopRef wh)) rCfg (planReplays pOpts) sqlBytes
-                unless (rvInterrupted rv) do
-                    stoppedAfter <- readIORef (whStopRef wh)
-                    unless stoppedAfter do
-                        let qualified = rvAllPassed rv && rvConsistentSignature rv
-                            chosenSig = rvBaselineSignature rv
-                            metaBase = attrBaseline (batchAttributes bc)
-                            slipVsMeta = case (chosenSig, metaBase) of
-                                (Just obs, Just base) -> Just (csId obs /= csId base && csHash obs /= csHash base)
-                                _ -> Nothing
-                            qr =
-                                QualificationResult
-                                    { qrCaseId = cid
-                                    , qrDbms = dbmsKind
-                                    , qrDialect = batchDialect bc
-                                    , qrSqlSha256 = batchSqlSha256 bc
-                                    , qrExpectedSignature = batchSignature bc
-                                    , qrStackFrames = workStackFrames settings
-                                    , qrSkipped = False
-                                    , qrQualified = qualified
-                                    , qrBaselineSignature = chosenSig
-                                    , qrSignatureSlippageAgainstBaseline = slipVsMeta
-                                    , qrReplay = rv
-                                    }
-                        writeAtomicLazyBytes qualPath (encode qr <> BSL.pack [10])
+abortWorker :: ContT () IO a
+abortWorker = ContT \_ -> pure ()
 
+guardNotStopped :: WorkerHandle -> ContT () IO ()
+guardNotStopped wh = do
+    stopped <- liftIO (readIORef (whStopRef wh))
+    when stopped abortWorker
+
+-- | Qualify a single batch input via N-replay and write @qualified/<case_id>/input_replay.json@.
+qualifyCaseOnWorker :: WorkerHandle -> BatchOptions -> PreparedBatchPlan -> BatchCase -> IO ()
+qualifyCaseOnWorker wh opts plan bc = (`runContT` pure) do
+    guardNotStopped wh
+    let pOpts = boPlan opts
+        settings = pbpSettings plan
+        outDir = pbpOutDir plan
+        cid = batchCaseId bc
+        qualDir = outDir </> "qualified" </> T.unpack cid
+        qualPath = qualDir </> "input_replay.json"
+        decLog = qualDir </> "input_replay_decisions.jsonl"
+    liftIO (createDirectoryIfMissing True qualDir)
+    dbmsKind <- liftIO (requireDbmsKind (dbmsId (batchDbms bc)))
+
+    when (planSkipInputReplay pOpts) do
+        let rv =
+                ReplayVerification
+                    { rvRunsRequired = planReplays pOpts
+                    , rvRunsPassed = 0
+                    , rvAllPassed = True
+                    , rvConsistentSignature = True
+                    , rvBaselineSignature = attrBaseline (batchAttributes bc)
+                    , rvMatchesBaseline = Nothing
+                    , rvSlippageCount = 0
+                    , rvObservedSignatures = maybeToList (attrBaseline (batchAttributes bc))
+                    , rvObservedSignatureIds = maybe [] (\s -> [csId s]) (attrBaseline (batchAttributes bc))
+                    , rvInterrupted = False
+                    , rvRuns = []
+                    }
+            qr =
+                QualificationResult
+                    { qrCaseId = cid
+                    , qrDbms = dbmsKind
+                    , qrDialect = batchDialect bc
+                    , qrSqlSha256 = batchSqlSha256 bc
+                    , qrExpectedSignature = batchSignature bc
+                    , qrStackFrames = workStackFrames settings
+                    , qrSkipped = True
+                    , qrQualified = True
+                    , qrBaselineSignature = attrBaseline (batchAttributes bc)
+                    , qrSignatureSlippageAgainstBaseline = Nothing
+                    , qrReplay = rv
+                    }
+        liftIO (writeAtomicLazyBytes qualPath (encode qr <> BSL.pack [10]))
+        abortWorker
+
+    sqlBytes <- liftIO (BS.readFile (batchFile bc))
+    liftIO (ensureWorkerTarget wh False dbmsKind (batchDbms bc) (batchImage bc))
+    let rCfg =
+            (defaultReplayConfig dbmsKind emptyConnectionOverrides)
+                { rcEndpoint = workerEndpoint wh dbmsKind
+                , rcResetFn = Just (resetWorker wh dbmsKind)
+                , rcExpectedSignature = batchSignature bc
+                , rcRejectOnSlippage = False
+                , rcStackFrames = workStackFrames settings
+                , rcDecisionLog = Just decLog
+                , rcProbeTimeout = planProbeTimeout pOpts
+                , rcMaxWaitReset = workContainerWait settings
+                , rcResetBeforeRun = True
+                , rcRequireConsistent = True
+                }
+    rv <-
+        liftIO
+            (runReplayVerification (whHarnessConfig wh) (Just (whStopRef wh)) rCfg (planReplays pOpts) sqlBytes)
+    when (rvInterrupted rv) abortWorker
+    guardNotStopped wh
+    let qualified = rvAllPassed rv && rvConsistentSignature rv
+        chosenSig = rvBaselineSignature rv
+        metaBase = attrBaseline (batchAttributes bc)
+        slipVsMeta = case (chosenSig, metaBase) of
+            (Just obs, Just base) -> Just (csId obs /= csId base && csHash obs /= csHash base)
+            _ -> Nothing
+        qr =
+            QualificationResult
+                { qrCaseId = cid
+                , qrDbms = dbmsKind
+                , qrDialect = batchDialect bc
+                , qrSqlSha256 = batchSqlSha256 bc
+                , qrExpectedSignature = batchSignature bc
+                , qrStackFrames = workStackFrames settings
+                , qrSkipped = False
+                , qrQualified = qualified
+                , qrBaselineSignature = chosenSig
+                , qrSignatureSlippageAgainstBaseline = slipVsMeta
+                , qrReplay = rv
+                }
+    liftIO (writeAtomicLazyBytes qualPath (encode qr <> BSL.pack [10]))
+
+-- | Construct a baseline 'BatchJobResult' template parameterized by outcome state.
+baseJobResult ::
+    Job ->
+    BatchCase ->
+    DbmsKind ->
+    Text ->
+    Bool ->
+    Maybe CrashSignature ->
+    JobState ->
+    BatchJobResult
+baseJobResult j@(Job _ prof repetition) bc dbmsKind cfgHash inputQualified baselineSig state =
+    BatchJobResult
+        { bjrJobId = jobId j
+        , bjrCaseId = batchCaseId bc
+        , bjrDbms = dbmsKindName dbmsKind
+        , bjrDialect = batchDialect bc
+        , bjrProfile = profile prof
+        , bjrRepeat = repetition
+        , bjrState = state
+        , bjrEvalStatus = Nothing
+        , bjrInitialBytes = batchByteCount bc
+        , bjrSqlSha256 = batchSqlSha256 bc
+        , bjrProfileHash = profileFlagsHash prof
+        , bjrConfigHash = Just cfgHash
+        , bjrInputQualified = inputQualified
+        , bjrRanOccam = False
+        , bjrBaselineSignature = baselineSig
+        , bjrStatsPath = Nothing
+        , bjrReducedReplayVerification = Nothing
+        , bjrOracleDecisionsSummary = Nothing
+        , bjrExitCode = Nothing
+        , bjrElapsedSeconds = Nothing
+        , bjrError = Nothing
+        }
+
+-- | Run one reduction job (reset, @occam@ execution, reduced N-replay verification) and publish @job_result.json@.
 runJobOnWorker ::
     WorkerHandle ->
     BatchOptions ->
@@ -491,76 +542,116 @@ runJobOnWorker ::
     Text ->
     Maybe QualificationResult ->
     IO ()
-runJobOnWorker wh opts plan occamBin harnessBin bc j@(Job _ prof repetition) cfgHash mQr = do
-    stopped <- readIORef (whStopRef wh)
-    unless stopped do
-        let jid = jobId j
-            outDir = pbpOutDir plan
-            jobDir = outDir </> "runs" </> T.unpack jid
-            jobResPath = jobDir </> "job_result.json"
-            pOpts = boPlan opts
-            inputQualified = maybe True qrQualified mQr
-            baselineSig = (mQr >>= qrBaselineSignature) `altMaybe` attrBaseline (batchAttributes bc)
-        dbmsKind <- requireDbmsKind (dbmsId (batchDbms bc))
-        cleanPartialDir jobDir
-        if not (planSkipInputReplay pOpts) && not inputQualified
-            then do
-                let res =
-                        BatchJobResult
-                            { bjrJobId = jid
-                            , bjrCaseId = batchCaseId bc
-                            , bjrDbms = dbmsKindName dbmsKind
-                            , bjrDialect = batchDialect bc
-                            , bjrProfile = profile prof
-                            , bjrRepeat = repetition
-                            , bjrState = JobSkippedUnstableInput
-                            , bjrEvalStatus = Nothing
-                            , bjrInitialBytes = batchByteCount bc
-                            , bjrSqlSha256 = batchSqlSha256 bc
-                            , bjrProfileHash = profileFlagsHash prof
-                            , bjrConfigHash = Just cfgHash
-                            , bjrInputQualified = False
-                            , bjrRanOccam = False
-                            , bjrBaselineSignature = baselineSig
-                            , bjrStatsPath = Nothing
-                            , bjrReducedReplayVerification = Nothing
-                            , bjrOracleDecisionsSummary = Nothing
-                            , bjrExitCode = Nothing
-                            , bjrElapsedSeconds = Nothing
-                            , bjrError = Nothing
-                            }
-                writeAtomicLazyBytes jobResPath (encode res <> BSL.pack [10])
-            else do
-                ensureWorkerTarget wh False dbmsKind (batchDbms bc) (batchImage bc)
-                resetRes <- resetWorker wh dbmsKind
-                case resetRes of
-                    Left err -> do
-                        let res =
-                                BatchJobResult
-                                    { bjrJobId = jid
-                                    , bjrCaseId = batchCaseId bc
-                                    , bjrDbms = dbmsKindName dbmsKind
-                                    , bjrDialect = batchDialect bc
-                                    , bjrProfile = profile prof
-                                    , bjrRepeat = repetition
-                                    , bjrState = JobInfraError
-                                    , bjrEvalStatus = Nothing
-                                    , bjrInitialBytes = batchByteCount bc
-                                    , bjrSqlSha256 = batchSqlSha256 bc
-                                    , bjrProfileHash = profileFlagsHash prof
-                                    , bjrConfigHash = Just cfgHash
-                                    , bjrInputQualified = inputQualified
-                                    , bjrRanOccam = False
-                                    , bjrBaselineSignature = baselineSig
-                                    , bjrStatsPath = Nothing
-                                    , bjrReducedReplayVerification = Nothing
-                                    , bjrOracleDecisionsSummary = Nothing
-                                    , bjrExitCode = Nothing
-                                    , bjrElapsedSeconds = Nothing
-                                    , bjrError = Just ("Pre-run reset failed: " <> T.pack err)
-                                    }
-                        writeAtomicLazyBytes jobResPath (encode res <> BSL.pack [10])
-                    Right () -> runOccamPhase dbmsKind jid jobDir jobResPath inputQualified baselineSig
+runJobOnWorker wh opts plan occamBin harnessBin bc j@(Job _ prof _) cfgHash mQr = (`runContT` pure) do
+    guardNotStopped wh
+    let outDir = pbpOutDir plan
+        jobDir = outDir </> "runs" </> T.unpack (jobId j)
+        jobResPath = jobDir </> "job_result.json"
+        pOpts = boPlan opts
+        inputQualified = maybe True qrQualified mQr
+        baselineSig = (mQr >>= qrBaselineSignature) `altMaybe` attrBaseline (batchAttributes bc)
+        writeResult res = liftIO (writeAtomicLazyBytes jobResPath (encode res <> BSL.pack [10]))
+
+    dbmsKind <- liftIO (requireDbmsKind (dbmsId (batchDbms bc)))
+    liftIO (cleanPartialDir jobDir)
+    let mkRes = baseJobResult j bc dbmsKind cfgHash inputQualified baselineSig
+
+    when (not (planSkipInputReplay pOpts) && not inputQualified) do
+        writeResult (mkRes JobSkippedUnstableInput)
+        abortWorker
+
+    liftIO (ensureWorkerTarget wh False dbmsKind (batchDbms bc) (batchImage bc))
+    ep <-
+        liftIO
+            ( runExceptT do
+                withExceptT ("Pre-run reset failed: " <>) (ExceptT (resetWorker wh dbmsKind))
+                ExceptT (workerEndpoint wh dbmsKind)
+            )
+            >>= either
+                (\err -> writeResult ((mkRes JobInfraError) {bjrError = Just (T.pack err)}) >> abortWorker)
+                pure
+
+    let outStats = jobDir </> "stats.json"
+        minimalPath = jobDir </> "minimal.sql"
+        decLog = jobDir </> "oracle_decisions.jsonl"
+        replayDecLog = jobDir </> "replay_decisions.jsonl"
+        stderrLogPath = jobDir </> "occam.stderr.log"
+        settings = pbpSettings plan
+    oracleCmd <-
+        liftIO (buildSubCmd "oracle" ep dbmsKind (Just decLog) (batchSignature bc) baselineSig settings)
+    resetCmd <- liftIO (buildSubCmd "reset" ep dbmsKind Nothing "" Nothing settings)
+    let occamArgs =
+            [ batchFile bc
+            , "--oracle"
+            , oracleCmd
+            , "--reset"
+            , resetCmd
+            , "--dialect"
+            , T.unpack (batchDialect bc)
+            , "--timeout"
+            , show (workTimeout settings)
+            , "--jobs"
+            , show (workOccamJobs settings)
+            , "--out"
+            , minimalPath
+            , "--stats"
+            , outStats
+            ]
+                <> maybe [] (\b -> ["--budget", show b]) (workBudget settings)
+                <> maybe [] (\m -> ["--max-oracle-executions", show m]) (workMaxExecutions settings)
+                <> ["--no-cache" | workNoCache settings]
+                <> map T.unpack (flags prof)
+        hardTimeout = (\b -> b + max 60.0 (workTimeout settings * 4.0)) <$> workBudget settings
+    childEnv <- liftIO isolatedSubprocessEnv
+    t0 <- liftIO getCurrentTime
+    (interrupted, timedOut, procRc, _, stderrBs) <-
+        liftIO $
+            runProcessCaptureCancellable
+                True
+                (Just (whStopRef wh))
+                Nothing
+                (Just childEnv)
+                hardTimeout
+                occamBin
+                occamArgs
+                BS.empty
+    t1 <- liftIO getCurrentTime
+    when interrupted abortWorker
+
+    let wallSecs = realToFrac (diffUTCTime t1 t0) :: Double
+    liftIO (BS.writeFile stderrLogPath stderrBs)
+    mStats <- liftIO (readStatsJson outStats)
+    replayRes <- liftIO (runReducedReplay dbmsKind minimalPath replayDecLog baselineSig)
+    guardNotStopped wh
+    when (maybe False rvInterrupted replayRes) abortWorker
+
+    decSum <- liftIO (summarizeDecisionLog decLog)
+    let evalStatus = mStats >>= stStatus
+        valPassed = mStats >>= stEvaluationMetrics >>= semValidationPassed
+        state
+            | evalStatus == Just "completed" && procRc == 0 && fromMaybe True valPassed = JobCompleted
+            | evalStatus `elem` [Just "timeout", Just "execution-budget"] = JobCensored
+            | evalStatus `elem` [Just "validation-failed", Just "validation-incomplete"]
+                || (evalStatus == Just "completed" && valPassed == Just False) =
+                JobValidationFailed
+            | otherwise = JobError
+        errNote
+            | timedOut = Just "occam hard wall-clock timeout exceeded"
+            | state == JobError =
+                Just (T.take 512 (TE.decodeUtf8With TEE.lenientDecode stderrBs))
+            | otherwise = Nothing
+        res =
+            (mkRes state)
+                { bjrEvalStatus = evalStatus
+                , bjrRanOccam = True
+                , bjrStatsPath = outStats <$ guard (isJust mStats)
+                , bjrReducedReplayVerification = replayRes
+                , bjrOracleDecisionsSummary = Just decSum
+                , bjrExitCode = Just procRc
+                , bjrElapsedSeconds = Just wallSecs
+                , bjrError = errNote
+                }
+    writeResult res
     where
         altMaybe (Just a) _ = Just a
         altMaybe Nothing b = b
@@ -570,164 +661,29 @@ runJobOnWorker wh opts plan occamBin harnessBin bc j@(Job _ prof repetition) cfg
             when exists $ void (try (removeDirectoryRecursive dir) :: IO (Either IOException ()))
             createDirectoryIfMissing True dir
 
-        runOccamPhase dbmsKind jid jobDir jobResPath inputQualified baselineSig = do
-            let outStats = jobDir </> "stats.json"
-                minimalPath = jobDir </> "minimal.sql"
-                decLog = jobDir </> "oracle_decisions.jsonl"
-                replayDecLog = jobDir </> "replay_decisions.jsonl"
-                stderrLogPath = jobDir </> "occam.stderr.log"
-                settings = pbpSettings plan
-            eEp <- workerEndpoint wh dbmsKind
-            case eEp of
-                Left err -> writeInfraErr jid jobResPath dbmsKind inputQualified baselineSig err
-                Right ep -> do
-                    oracleCmd <- buildSubCmd "oracle" ep dbmsKind (Just decLog) (batchSignature bc) baselineSig settings
-                    resetCmd <- buildSubCmd "reset" ep dbmsKind Nothing "" Nothing settings
-                    let occamArgs =
-                            [ batchFile bc
-                            , "--oracle"
-                            , oracleCmd
-                            , "--reset"
-                            , resetCmd
-                            , "--dialect"
-                            , T.unpack (batchDialect bc)
-                            , "--timeout"
-                            , show (workTimeout settings)
-                            , "--jobs"
-                            , show (workOccamJobs settings)
-                            , "--out"
-                            , minimalPath
-                            , "--stats"
-                            , outStats
-                            ]
-                                <> maybe [] (\b -> ["--budget", show b]) (workBudget settings)
-                                <> maybe [] (\m -> ["--max-oracle-executions", show m]) (workMaxExecutions settings)
-                                <> ["--no-cache" | workNoCache settings]
-                                <> map T.unpack (flags prof)
-                        hardTimeout = (\b -> b + max 60.0 (workTimeout settings * 4.0)) <$> workBudget settings
-                    childEnv <- isolatedSubprocessEnv
-                    t0 <- getCurrentTime
-                    (interrupted, timedOut, procRc, _, stderrBs) <-
-                        runProcessCaptureCancellable
-                            True
-                            (Just (whStopRef wh))
-                            Nothing
-                            (Just childEnv)
-                            hardTimeout
-                            occamBin
-                            occamArgs
-                            BS.empty
-                    t1 <- getCurrentTime
-                    let wallSecs = realToFrac (diffUTCTime t1 t0) :: Double
-                    if interrupted
-                        then pure ()
-                        else do
-                            BS.writeFile stderrLogPath stderrBs
-                            mStats <- readStatsJson outStats
-                            replayRes <- runReducedReplay dbmsKind minimalPath replayDecLog baselineSig
-                            let stopCheck = readIORef (whStopRef wh)
-                            isStoppedNow <- stopCheck
-                            if isStoppedNow || maybe False rvInterrupted replayRes
-                                then pure ()
-                                else do
-                                    decSum <- summarizeDecisionLog decLog
-                                    let evalStatus = mStats >>= stStatus
-                                        valPassed = mStats >>= stEvaluationMetrics >>= semValidationPassed
-                                        state
-                                            | evalStatus == Just "completed" && procRc == 0 && fromMaybe True valPassed = JobCompleted
-                                            | evalStatus `elem` [Just "timeout", Just "execution-budget"] = JobCensored
-                                            | evalStatus `elem` [Just "validation-failed", Just "validation-incomplete"]
-                                                || (evalStatus == Just "completed" && valPassed == Just False) =
-                                                JobValidationFailed
-                                            | otherwise = JobError
-                                        errNote
-                                            | timedOut = Just "occam hard wall-clock timeout exceeded"
-                                            | state == JobError =
-                                                Just (T.take 512 (TE.decodeUtf8With TEE.lenientDecode stderrBs))
-                                            | otherwise = Nothing
-                                        res =
-                                            BatchJobResult
-                                                { bjrJobId = jid
-                                                , bjrCaseId = batchCaseId bc
-                                                , bjrDbms = dbmsKindName dbmsKind
-                                                , bjrDialect = batchDialect bc
-                                                , bjrProfile = profile prof
-                                                , bjrRepeat = repetition
-                                                , bjrState = state
-                                                , bjrEvalStatus = evalStatus
-                                                , bjrInitialBytes = batchByteCount bc
-                                                , bjrSqlSha256 = batchSqlSha256 bc
-                                                , bjrProfileHash = profileFlagsHash prof
-                                                , bjrConfigHash = Just cfgHash
-                                                , bjrInputQualified = inputQualified
-                                                , bjrRanOccam = True
-                                                , bjrBaselineSignature = baselineSig
-                                                , bjrStatsPath = if isJust mStats then Just outStats else Nothing
-                                                , bjrReducedReplayVerification = replayRes
-                                                , bjrOracleDecisionsSummary = Just decSum
-                                                , bjrExitCode = Just procRc
-                                                , bjrElapsedSeconds = Just wallSecs
-                                                , bjrError = errNote
-                                                }
-                                    writeAtomicLazyBytes jobResPath (encode res <> BSL.pack [10])
-
-        writeInfraErr jid jobResPath dbmsKind inputQualified baselineSig err = do
-            let res =
-                    BatchJobResult
-                        { bjrJobId = jid
-                        , bjrCaseId = batchCaseId bc
-                        , bjrDbms = dbmsKindName dbmsKind
-                        , bjrDialect = batchDialect bc
-                        , bjrProfile = profile prof
-                        , bjrRepeat = repetition
-                        , bjrState = JobInfraError
-                        , bjrEvalStatus = Nothing
-                        , bjrInitialBytes = batchByteCount bc
-                        , bjrSqlSha256 = batchSqlSha256 bc
-                        , bjrProfileHash = profileFlagsHash prof
-                        , bjrConfigHash = Just cfgHash
-                        , bjrInputQualified = inputQualified
-                        , bjrRanOccam = False
-                        , bjrBaselineSignature = baselineSig
-                        , bjrStatsPath = Nothing
-                        , bjrReducedReplayVerification = Nothing
-                        , bjrOracleDecisionsSummary = Nothing
-                        , bjrExitCode = Nothing
-                        , bjrElapsedSeconds = Nothing
-                        , bjrError = Just (T.pack err)
-                        }
-            writeAtomicLazyBytes jobResPath (encode res <> BSL.pack [10])
-
-        runReducedReplay dbmsKind minimalPath replayDecLog baselineSig = do
+        runReducedReplay dbmsKind minimalPath replayDecLog baselineSig = runMaybeT do
             let pOpts = boPlan opts
                 settings = pbpSettings plan
-            if planReplays pOpts <= 0
-                then pure Nothing
-                else do
-                    exists <- doesFileExist minimalPath
-                    if not exists
-                        then pure Nothing
-                        else do
-                            sqlBytes <- BS.readFile minimalPath
-                            if BS.null sqlBytes
-                                then pure Nothing
-                                else do
-                                    let rCfg =
-                                            (defaultReplayConfig dbmsKind emptyConnectionOverrides)
-                                                { rcEndpoint = workerEndpoint wh dbmsKind
-                                                , rcResetFn = Just (resetWorker wh dbmsKind)
-                                                , rcExpectedSignature = batchSignature bc
-                                                , rcBaselineSignature = csId <$> baselineSig
-                                                , rcRejectOnSlippage = False
-                                                , rcStackFrames = workStackFrames settings
-                                                , rcDecisionLog = Just replayDecLog
-                                                , rcProbeTimeout = planProbeTimeout pOpts
-                                                , rcMaxWaitReset = workContainerWait settings
-                                                , rcResetBeforeRun = True
-                                                , rcRequireConsistent = True
-                                                }
-                                    Just
-                                        <$> runReplayVerification (whHarnessConfig wh) (Just (whStopRef wh)) rCfg (planReplays pOpts) sqlBytes
+            guard (planReplays pOpts > 0)
+            liftIO (doesFileExist minimalPath) >>= guard
+            sqlBytes <- liftIO (BS.readFile minimalPath)
+            guard (not (BS.null sqlBytes))
+            let rCfg =
+                    (defaultReplayConfig dbmsKind emptyConnectionOverrides)
+                        { rcEndpoint = workerEndpoint wh dbmsKind
+                        , rcResetFn = Just (resetWorker wh dbmsKind)
+                        , rcExpectedSignature = batchSignature bc
+                        , rcBaselineSignature = csId <$> baselineSig
+                        , rcRejectOnSlippage = False
+                        , rcStackFrames = workStackFrames settings
+                        , rcDecisionLog = Just replayDecLog
+                        , rcProbeTimeout = planProbeTimeout pOpts
+                        , rcMaxWaitReset = workContainerWait settings
+                        , rcResetBeforeRun = True
+                        , rcRequireConsistent = True
+                        }
+            liftIO
+                (runReplayVerification (whHarnessConfig wh) (Just (whStopRef wh)) rCfg (planReplays pOpts) sqlBytes)
 
         readStatsJson path = do
             exists <- doesFileExist path
@@ -758,6 +714,7 @@ runJobOnWorker wh opts plan occamBin harnessBin bc j@(Job _ prof repetition) cfg
             pure
                 (unwords (map shellQuote (harnessBin : sub : "--config" : boConfigPath opts : connArgs <> roleArgs)))
 
+-- | Ensure the worker's backend (local embedded, external container, or managed container) targets @(dbmsKind, image)@.
 ensureWorkerTarget :: WorkerHandle -> Bool -> DbmsKind -> DbmsSpec -> Text -> IO ()
 ensureWorkerTarget wh forceRecreate dbmsKind dbmsSpec image =
     modifyMVar_ (whState wh) \st ->
@@ -807,6 +764,7 @@ ensureWorkerTarget wh forceRecreate dbmsKind dbmsSpec image =
                     pure st
             BackendManaged _ -> spawnManagedContainer wh st dbmsKind dbmsSpec image
 
+-- | Spawn a fresh worker-scoped Docker container with mapped ports and log bind-mount, then wait until ready.
 spawnManagedContainer ::
     WorkerHandle -> WorkerState -> DbmsKind -> DbmsSpec -> Text -> IO WorkerState
 spawnManagedContainer wh st0 dbmsKind dbmsSpec image = do
@@ -886,6 +844,7 @@ spawnManagedContainer wh st0 dbmsKind dbmsSpec image = do
             modifyMVar_ spawnedMv (pure . Set.delete oldCname)
         cleanupManaged _ _ = pure ()
 
+-- | Force-remove any Docker containers registered in @spawnedMv@ on batch exit or interruption.
 cleanupSpawnedContainers :: MVar (Set Text) -> IO ()
 cleanupSpawnedContainers spawnedMv = do
     names <- modifyMVar spawnedMv (\s -> pure (Set.empty, Set.toList s))
@@ -895,6 +854,7 @@ cleanupSpawnedContainers spawnedMv = do
         )
         names
 
+-- | Query @docker port@ to obtain the host ephemeral port bound to @cport@ in container @cname@.
 resolveDockerPort :: Text -> Int -> IO (Maybe Int)
 resolveDockerPort cname cport = do
     (_, rc, outBs, _) <-
@@ -914,6 +874,7 @@ resolveDockerPort cname cport = do
                 (_, portTxt) = T.breakOnEnd ":" firstLine
             pure (readMaybe (T.unpack portTxt))
 
+-- | Project active worker backend coordinates into 'ConnectionOverrides' for reset and oracle commands.
 connectionOverridesForState :: WorkerState -> ConnectionOverrides
 connectionOverridesForState st = case wsBackend st of
     BackendLocalEmbedded mEngBin ->
@@ -927,6 +888,7 @@ connectionOverridesForState st = case wsBackend st of
                 , coContainer = mEp >>= wesContainer
                 }
 
+-- | Read the live 'ReplayEndpoint' for the given worker, validating host log visibility.
 workerEndpoint :: WorkerHandle -> DbmsKind -> IO (Either String ReplayEndpoint)
 workerEndpoint wh _dbmsKind = withMVar (whState wh) \st -> do
     mHostLog <- case wsEndpoint st >>= wesHostLog of
@@ -934,6 +896,7 @@ workerEndpoint wh _dbmsKind = withMVar (whState wh) \st -> do
         Nothing -> pure Nothing
     pure (Right (ReplayEndpoint (connectionOverridesForState st) mHostLog Nothing))
 
+-- | Reset the worker's database, recreating managed containers if database reset fails.
 resetWorker :: WorkerHandle -> DbmsKind -> IO (Either String ())
 resetWorker wh dbmsKind = do
     st0 <- withMVar (whState wh) pure
@@ -990,6 +953,7 @@ containerLogDirAndFile dbms =
                 (_, rest) = break (== '/') rev
              in reverse (dropWhile (== '/') rest)
 
+-- | Compute the deterministic 16-hex SHA-256 cache key governing incremental job resume.
 computeRunConfigHash :: Settings -> BatchPlanOptions -> BatchCase -> Profile -> Text
 computeRunConfigHash settings pOpts bc prof =
     let payload =

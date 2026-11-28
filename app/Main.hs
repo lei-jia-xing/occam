@@ -1,3 +1,4 @@
+-- | Executable entry point for the @occam@ SQL test-case reducer CLI.
 module Main (main) where
 
 import Completion (generateCompletion)
@@ -36,6 +37,7 @@ import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (tryIOError)
 
+-- | Parse CLI arguments with compact usage formatting and dispatch the selected action.
 main :: IO ()
 main = do
     args <- getArgs

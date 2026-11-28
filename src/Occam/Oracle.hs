@@ -1,3 +1,4 @@
+-- | External subprocess oracle execution, timeout handling, and outcome classification.
 module Occam.Oracle (
     OracleConfig (..),
     shellOracleConfig,
@@ -42,7 +43,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Occam.Core (OracleOutcome (..))
+import Occam.Core.Oracle (OracleOutcome (..))
 import Occam.Oracle.Process (
     OracleContext (..),
     OracleReapFailed (..),
@@ -63,6 +64,7 @@ import System.Directory (getCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.Process (CmdSpec (..), CreateProcess (env), shell)
 
+-- | External subprocess observation paired with microsecond total\/reset\/oracle durations.
 data OracleObservationDetails = OracleObservationDetails
     { detailedObservation :: !OracleObservation
     , totalElapsedMicros :: !Int
@@ -71,6 +73,7 @@ data OracleObservationDetails = OracleObservationDetails
     }
     deriving (Eq, Show)
 
+-- | Pre-resolve oracle\/reset executables and capture the base environment once per run.
 resolveOracleContext :: OracleConfig -> IO OracleContext
 resolveOracleContext OracleConfig {..} = do
     spec <- case oracleSpec of
@@ -89,10 +92,12 @@ resolveOracleContext OracleConfig {..} = do
             , contextOriginalDir = originalDir
             }
 
+-- | Run an external oracle check on candidate bytes and return the coarse 'OracleObservation'.
 observeExternalOracle :: OracleConfig -> ByteString -> IO OracleObservation
 observeExternalOracle cfg sql =
     detailedObservation <$> observeExternalOracleDetailed cfg sql
 
+-- | Run an external oracle check and capture timing breakdown in 'OracleObservationDetails'.
 observeExternalOracleDetailed :: OracleConfig -> ByteString -> IO OracleObservationDetails
 observeExternalOracleDetailed = observeExternalOracleDetailedWith (pure ())
 
@@ -210,10 +215,12 @@ runOracleCommandStep onOracleStarted context childEnv sql remainingMicros resetE
                     _ -> Nothing
             pure (obs, resetElapsed, mOracleElapsed)
 
+-- | Return 'True' iff an external oracle process exited with status 0.
 oracleObservationMatches :: OracleObservation -> Bool
 oracleObservationMatches (OracleFinished ExitSuccess) = True
 oracleObservationMatches _ = False
 
+-- | High-level disposition mapped from raw subprocess observations.
 data OracleStatus
     = Accepted
     | Rejected
@@ -257,6 +264,7 @@ instance FromJSONKey OracleStatus where
     fromJSONKey = FromJSONKeyTextParser \name ->
         maybe (fail ("unknown oracle status: " <> T.unpack name)) pure (parseOracleStatusName name)
 
+-- | Map a raw 'OracleObservation' into a classified 'OracleStatus'.
 classifyOracleObservation :: OracleObservation -> OracleStatus
 classifyOracleObservation observation = case observation of
     OracleTimedOut -> TimedOut
@@ -278,6 +286,7 @@ observationOutcome observation = case classifyOracleObservation observation of
 -- External interestingness predicate
 -- ----------------------------------------------------------------------------
 
+-- | Configuration for executing an external interestingness oracle process.
 data OracleConfig = OracleConfig
     { oracleSpec :: !CmdSpec
     , oracleTimeoutMicros :: !Int

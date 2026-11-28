@@ -23,7 +23,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Data (Data)
-import Occam.Core (Span (..))
+import Occam.Core.Types (Span (..))
 
 -- | Half-open 0-based UTF-8 byte range @[spanStart, spanEnd)@.
 data ByteSpan = ByteSpan

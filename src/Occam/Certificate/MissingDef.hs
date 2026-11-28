@@ -13,10 +13,7 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Core (
-    BarrierReason (..),
-    BarrierScope (..),
-    CatalogOp (..),
+import Occam.Core.Schema (
     DataWrite (..),
     Ident (..),
     Name (..),
@@ -24,15 +21,19 @@ import Occam.Core (
     ReadFact (..),
     ReadMode (..),
     RenameOp (..),
-    ScopedBarrier (..),
-    SemanticFacts (..),
     SequenceDef (..),
-    Statement (..),
-    StatementId (..),
     TableDef (..),
-    TxEffect (..),
     ViewDef (..),
  )
+import Occam.Core.Semantics (
+    BarrierReason (..),
+    BarrierScope (..),
+    CatalogOp (..),
+    ScopedBarrier (..),
+    SemanticFacts (..),
+    TxEffect (..),
+ )
+import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 
 data MissingDefAcc = MissingDefAcc

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | In-process DuckDB result oracle: contract serialization, trace generation, and replay observers.
 module Occam.Oracle.DuckDB (
     DuckDBContract (..),
     DuckDBError (..),
@@ -58,6 +59,7 @@ import Occam.Oracle.DuckDB.Result (encodeExpectedRows, matchResult, observeRows)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Exit (ExitCode (..))
 
+-- | Serializable oracle contract capturing expected DuckDB result rows, columns, types, and optional state hash.
 data DuckDBContract = DuckDBContract
     { contractExpectedRows :: ![[Value]]
     , contractExpectedColumns :: ![Text]
@@ -87,18 +89,22 @@ instance ToJSON DuckDBContract where
             , "check_state" .= contractCheckState contract
             ]
 
+-- | Decode a JSON 'DuckDBContract' file from disk.
 loadDuckDBContract :: FilePath -> IO (Either String DuckDBContract)
 loadDuckDBContract path = do
     bytes <- BS.readFile path
     pure (eitherDecodeStrict' bytes)
 
+-- | Default per-candidate timeout in microseconds (100ms) for in-memory DuckDB execution.
 defaultDuckDBCandidateTimeoutMicros :: Int
 defaultDuckDBCandidateTimeoutMicros = 100000
 
+-- | Execute DuckDB SQL with an explicit timeout and return rows or a typed 'DuckDBError'.
 executeDuckDBCandidateDetailedTimeout :: Int -> ByteString -> IO (Either DuckDBError [[Value]])
 executeDuckDBCandidateDetailedTimeout micros sql =
     fmap (maybe [] (resultRows . fst)) <$> executeDuckDBResult micros sql
 
+-- | Execute DuckDB SQL with an explicit timeout and render any failure as 'Text'.
 executeDuckDBCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeDuckDBCandidateTimeout micros sql = do
     res <- executeDuckDBCandidateDetailedTimeout micros sql
@@ -109,21 +115,26 @@ executeDuckDBCandidateTimeout micros sql = do
         Left (DuckDBInfrastructureError err) -> Left ("infrastructure error: " <> err)
         Right rows -> Right rows
 
+-- | Execute DuckDB SQL using 'defaultDuckDBCandidateTimeoutMicros'.
 executeDuckDBCandidate :: ByteString -> IO (Either Text [[Value]])
 executeDuckDBCandidate = executeDuckDBCandidateTimeout defaultDuckDBCandidateTimeoutMicros
 
+-- | Generate a DuckDB contract using 'defaultDuckDBCandidateTimeoutMicros'.
 generateDuckDBContract :: ByteString -> IO (Either Text DuckDBContract)
 generateDuckDBContract = generateDuckDBContractTimeout defaultDuckDBCandidateTimeoutMicros
 
+-- | Generate a DuckDB contract under an explicit microsecond timeout.
 generateDuckDBContractTimeout :: Int -> ByteString -> IO (Either Text DuckDBContract)
 generateDuckDBContractTimeout micros sql =
     fmap fst <$> generateDuckDBContractWithTrace micros sql
 
+-- | Generate a DuckDB contract together with a 'ResultStatement' summary.
 generateDuckDBContractWithResultStatement ::
     Int -> ByteString -> IO (Either Text (DuckDBContract, ResultStatement))
 generateDuckDBContractWithResultStatement micros sql =
     fmap (second traceResultStatement) <$> generateDuckDBContractWithTrace micros sql
 
+-- | Generate a DuckDB contract together with its full execution 'ResultTrace'.
 generateDuckDBContractWithTrace ::
     Int -> ByteString -> IO (Either Text (DuckDBContract, ResultTrace))
 generateDuckDBContractWithTrace micros sql = do
@@ -146,25 +157,31 @@ generateDuckDBContractWithTrace micros sql = do
                 , trace
                 )
 
+-- | Convert a 'DuckDBContract' into a primitive 'Oracle' with an explicit timeout.
 duckdbContractOracleTimeout :: Int -> DuckDBContract -> Oracle
 duckdbContractOracleTimeout micros contract candidate =
     observationOutcome <$> duckdbContractObservationTimeout micros contract candidate
 
+-- | Convert a 'DuckDBContract' into a primitive 'Oracle' using 'defaultDuckDBCandidateTimeoutMicros'.
 duckdbContractOracle :: DuckDBContract -> Oracle
 duckdbContractOracle = duckdbContractOracleTimeout defaultDuckDBCandidateTimeoutMicros
 
+-- | Observe a candidate against a 'DuckDBContract' using 'defaultDuckDBCandidateTimeoutMicros'.
 duckdbContractObservation :: DuckDBContract -> ByteString -> IO OracleObservation
 duckdbContractObservation = duckdbContractObservationTimeout defaultDuckDBCandidateTimeoutMicros
 
+-- | Observe a candidate against a 'DuckDBContract' under an explicit timeout.
 duckdbContractObservationTimeout :: Int -> DuckDBContract -> ByteString -> IO OracleObservation
 duckdbContractObservationTimeout micros contract candidate =
     fst <$> duckdbContractObservationWithTrace micros contract candidate
 
+-- | Observe a candidate against a 'DuckDBContract' and summarize any resulting 'ResultStatement'.
 duckdbContractObservationWithResultStatement ::
     Int -> DuckDBContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
 duckdbContractObservationWithResultStatement micros contract candidate =
     second (fmap traceResultStatement) <$> duckdbContractObservationWithTrace micros contract candidate
 
+-- | Observe a candidate against a 'DuckDBContract' and optionally capture its full 'ResultTrace'.
 duckdbContractObservationWithTrace ::
     Int -> DuckDBContract -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
 duckdbContractObservationWithTrace = prepareDuckDBContractObserver

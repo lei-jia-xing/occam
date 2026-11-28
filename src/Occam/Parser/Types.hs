@@ -1,3 +1,4 @@
+-- | Configuration, diagnostic, and output types for SQL parsing and analysis.
 module Occam.Parser.Types (
     SQLDialect (..),
     dialectName,
@@ -14,7 +15,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Word (Word8)
-import Occam.Core (SessionInit)
+import Occam.Core.Semantics (SessionInit)
 import Occam.Facts (ColumnTarget, StatementUnit)
 
 -- | Supported SQL dialects matching the 6 target DBMS harnesses.
@@ -45,6 +46,7 @@ data ServerConfig = ServerConfig
     }
     deriving (Eq, Show)
 
+-- | Default session assumptions (e.g. autocommit, FK checks) when dialect overrides are absent.
 defaultServerConfig :: ServerConfig
 defaultServerConfig =
     ServerConfig
@@ -59,6 +61,8 @@ defaultServerConfig =
         , serverColumnNamesCaseSensitive = Nothing
         , serverQuotedIdentifiersCaseSensitive = Nothing
         }
+
+-- | Options controlling SQL parsing and optional analysis/edit extraction passes.
 data ParseOptions = ParseOptions
     { parseDialect :: !SQLDialect
     , parseServerConfig :: !ServerConfig
@@ -85,6 +89,7 @@ defaultParseOptions dialect =
         , parseSpanOnly = False
         }
 
+-- | Machine-readable failure category reported by the frontend parser.
 data ParserErrorKind
     = ParserInvalidArguments
     | ParserInvalidConfig
@@ -93,12 +98,14 @@ data ParserErrorKind
     | ParserInvalidEditRange
     deriving (Eq, Show)
 
+-- | Structured frontend parse error with error kind and diagnostic text.
 data ParserError = ParserError
     { parserErrorKind :: !ParserErrorKind
     , parserErrorMessage :: !Text
     }
     deriving (Eq, Show)
 
+-- | Complete parsed seed result containing session init, statement units, and column bundles.
 data ParsedSQL = ParsedSQL
     { parsedInitialSession :: !SessionInit
     , parsedUnits :: ![StatementUnit]
@@ -106,6 +113,7 @@ data ParsedSQL = ParsedSQL
     }
     deriving (Eq, Show)
 
+-- | Render a 'SQLDialect' as its lowercase canonical identifier string.
 dialectName :: SQLDialect -> Text
 dialectName PostgreSQL = "postgresql"
 dialectName MySQL = "mysql"

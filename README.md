@@ -149,6 +149,15 @@ make test         # Run Haskell test & fuzz suites (-Werror)
 make check        # Full gate: fmt, hlint, build, tests, harness tests, Lean 4 proofs
 ```
 
+`cabal.project` applies `-Werror` consistently and sets package optimization to
+`2` for normal and CI builds. For faster local incremental builds, create an
+ignored `cabal.project.local` with:
+
+```cabal
+package occam
+  optimization: 0
+```
+
 ---
 
 ## Documentation

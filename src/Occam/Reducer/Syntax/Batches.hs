@@ -17,7 +17,7 @@ import Data.Map.Strict qualified as Map
 import Data.Ord (Down (..))
 import Data.Set qualified as Set
 import Occam.Certificate (checkEarlyRejectionBytesTracked)
-import Occam.Core (Span (..), Statement (..), StatementId (..))
+import Occam.Core.Types (Span (..), Statement (..), StatementId (..))
 import Occam.Logger (logInfo')
 import Occam.Metrics (FamilyTag (..), recordCandidateBuildTiming)
 import Occam.Parser (
@@ -51,6 +51,7 @@ import Occam.Reducer.Syntax.Snapshot (
     updateSyntaxSnapshot,
  )
 
+-- | Execute batch rewrite sweeps (independent AST batches or speculative literal batches) for one edit category.
 runCategoryBatches ::
     SyntaxContext ->
     IORef SyntaxStats ->

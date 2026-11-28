@@ -1,3 +1,4 @@
+-- | Speculative sliding-window parallel and ordered-serial oracle execution pool.
 module Occam.Pool (
     OraclePool,
     PoolConfig (..),
@@ -63,7 +64,7 @@ import Occam.Cache (
     cacheInsertDoneKey,
     cacheLookupKey,
  )
-import Occam.Core (Oracle, OracleInconclusiveError (..), OracleOutcome (..))
+import Occam.Core.Oracle (Oracle, OracleInconclusiveError (..), OracleOutcome (..))
 import Occam.Metrics (
     FamilyTag (..),
     recordCanceled,

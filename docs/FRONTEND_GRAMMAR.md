@@ -38,7 +38,12 @@ from these indexes.
 | `Occam.Frontend.Span` | Half-open UTF-8 `ByteSpan`, `Located`, merge/slice, UTF-8 boundary validation. |
 | `Occam.Frontend.Lexer` | Single-pass tokenizer; preserves whitespace/comments as trivia and exact source spans. |
 | `Occam.Frontend.Splitter` | Splits top-level statements on the active delimiter at nesting depth zero; keeps compound routine/trigger/CASE blocks whole. |
-| `Occam.Frontend.AST` | Span-annotated syntax tree; names retain raw spelling and quotedness. |
+| `Occam.Frontend.AST` | Public re-export facade for the syntax-tree domain modules below; names retain raw spelling and exact spans. |
+| `Occam.Frontend.AST.Expr` | Names, literals, expressions, type names, ordering, and index-key nodes. |
+| `Occam.Frontend.AST.Query` | Query, CTE, SELECT, FROM/JOIN, and query-tail nodes. |
+| `Occam.Frontend.AST.DML` | INSERT, UPDATE, DELETE, and MERGE nodes. |
+| `Occam.Frontend.AST.DDL` | CREATE, DROP, ALTER, and schema-object nodes. |
+| `Occam.Frontend.AST.Statement` | Statement sum type and session/utility statement nodes. |
 | `Occam.Frontend.Parser` | Entry points `parseUnit`/`parseScript`; handles trivia stripping, delimiter directives, and statement-end checks. |
 | `Occam.Frontend.Parser.Core` | `P` monad, token/name primitives, list combinators, dialect gates, opaque-body scanners. |
 | `Occam.Frontend.Parser.Expr` | Pratt expressions, type names, windows, ordering, index keys. |
@@ -325,9 +330,9 @@ Dockerfiles and zero test-oracle linkage in production binaries.
 - `test/FrontendCorpusChecks.hs` runs pure-Haskell corpus regression checks
   across all 71 `benchmarks/real_fuzz_corpus/*.sql` cases, `benchmarks/corpus/*.sql`,
   and the 528 regression SQL cases in `test/seeds/regression_cases.sql`.
-- `cabal test occam-fuzz` runs generated reduction properties for all six
+- `cabal test occam-test --test-options='-p "Fuzz"'` runs generated reduction properties for all six
   dialects. The properties check statement counts, syntax, predicate
   preservation, size monotonicity, distractor removal, and fixed points.
-- Run `cabal build all --enable-tests --ghc-options=-Werror` and
-  `make syntax-check` (or `nix develop .#syntax --command cabal test occam-test --ghc-options=-Werror`)
+- Run `cabal build all --enable-tests` and
+  `make syntax-check` (or `nix develop .#syntax --command cabal test occam-test`)
   for the full six-engine verification suite.

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | SQLite result-value decoding and deterministic 'ResultSet' \/ 'ResultTrace' conversion.
 module Occam.Oracle.Sqlite.Result (
     SqliteError (..),
     SqliteRun (..),
@@ -99,6 +100,7 @@ data SqliteError
     | SqliteInfrastructureError !Text
     deriving (Eq, Show)
 
+-- | Raw result sequence, statement count, determinism flag, and end offsets from a SQLite run.
 data SqliteRun = SqliteRun
     { srLastResult :: !ResultSet
     , srLastIndex :: !Int
@@ -108,6 +110,7 @@ data SqliteRun = SqliteRun
     , srEndOffsets :: !(Maybe [Int])
     }
 
+-- | Convert a native @direct-sqlite@ 'SQLData' value to the contract's canonical JSON representation.
 sqlDataToValue :: SQLData -> Value
 sqlDataToValue (SQLInteger n) = Number (fromIntegral n)
 sqlDataToValue (SQLFloat f) = object ["float64_bits" .= castDoubleToWord64 f]
@@ -136,6 +139,7 @@ classifySqliteException err =
              in SqliteExecutionError (if T.null context then message else context <> ": " <> message)
         Nothing -> SqliteInfrastructureError (T.pack (displayException err))
 
+-- | Convert a completed 'SqliteRun' and SQL buffer into a 'ResultTrace' summary.
 buildSqliteTrace :: ByteString -> ResultSet -> SqliteRun -> IO ResultTrace
 buildSqliteTrace sql expected SqliteRun {..} = do
     deterministic <-
@@ -167,6 +171,7 @@ buildSqliteTrace sql expected SqliteRun {..} = do
                     | matched = k : prefixMatches (k + 1) matched results
                     | otherwise = prefixMatches (k + 1) matched results
 
+-- | Execute SQL on a pooled/reusable 'SqliteConn' under a microsecond timeout.
 runCandidateOnConn ::
     Int ->
     ByteString ->
@@ -211,12 +216,14 @@ runCandidateOnConn micros sql conn = do
                     }
             )
 
+-- | Execute SQL on a fresh/pooled in-memory SQLite instance under a microsecond timeout.
 executeSqliteRun ::
     Int -> ByteString -> IO (Either SqliteError (Maybe SqliteRun))
 executeSqliteRun micros sql =
     withSqliteDeadline micros (Left SqliteTimeout) $ \remaining ->
         executeSqliteRunWithin False remaining sql
 
+-- | Execute SQL inside an existing deadline callback, optionally forcing a fresh connection.
 executeSqliteRunWithin ::
     Bool -> IO Int -> ByteString -> IO (Either SqliteError (Maybe SqliteRun))
 executeSqliteRunWithin fresh remaining sql = do

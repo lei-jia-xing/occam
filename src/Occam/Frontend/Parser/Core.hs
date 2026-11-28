@@ -104,15 +104,10 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Vector (Vector)
 import Data.Vector qualified as V
-import Occam.Frontend.AST (
-    Alias (..),
-    Name (..),
-    NamePart (..),
-    OpaqueBody (..),
-    OpaqueKind,
-    Query,
-    Statement,
- )
+import Occam.Frontend.AST.DDL (OpaqueBody (..), OpaqueKind)
+import Occam.Frontend.AST.Expr (Alias (..), Name (..), NamePart (..))
+import Occam.Frontend.AST.Query (Query)
+import Occam.Frontend.AST.Statement (Statement)
 import Occam.Frontend.Lexer (
     SpannedToken,
     Token (..),

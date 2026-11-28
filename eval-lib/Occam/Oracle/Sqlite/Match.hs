@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Pooled SQLite execution, checkpoint replay, and C-backed binary result-set matching.
 module Occam.Oracle.Sqlite.Match (
     buildSqliteCheckpoints,
     prepareSqliteResultObserver,
@@ -72,6 +73,7 @@ data SqliteMatchCall = SqliteMatchCall
     , smcFailEnd :: !Int
     }
 
+-- | Populate C-level checkpoint snapshots for deterministic multi-statement SQLite replay.
 buildSqliteCheckpoints :: IO Int -> ByteString -> ByteString -> Int -> SqliteConn -> IO Bool
 buildSqliteCheckpoints remaining expectedBytes sql count conn = do
     current <- readIORef (scCheckpointContract conn)
@@ -101,6 +103,7 @@ buildSqliteCheckpoints remaining expectedBytes sql count conn = do
                         (fromIntegral count)
                         (fromIntegral budget)
 
+-- | Build an observer comparing SQLite candidate execution against pre-encoded contract bytes.
 prepareSqliteResultObserver ::
     Bool ->
     Bool ->

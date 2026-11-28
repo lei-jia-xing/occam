@@ -23,9 +23,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Lens.Micro ((%~), (&), (.~), (?~))
-import Occam.Core (
-    BarrierReason (..),
-    BarrierScope (..),
+import Occam.Core.Schema (
     ColumnDef (..),
     Constraint (..),
     DmlEvent (..),
@@ -40,18 +38,22 @@ import Occam.Core (
     ReadMode (..),
     RelationKind (..),
     SchemaDef (..),
-    ScopedBarrier (..),
     SequenceDef (..),
     SequenceWrite (..),
-    StatementId,
     TableDef (..),
-    TriggerBody (..),
-    TriggerDef (..),
-    TriggerEffect (..),
     TypeDef (..),
     ViewDef (..),
     nameText,
  )
+import Occam.Core.Semantics (
+    BarrierReason (..),
+    BarrierScope (..),
+    ScopedBarrier (..),
+    TriggerBody (..),
+    TriggerDef (..),
+    TriggerEffect (..),
+ )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Barrier (
     indexTouchKeys,
     relationTouchKeys,

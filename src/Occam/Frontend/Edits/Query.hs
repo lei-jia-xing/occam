@@ -20,7 +20,9 @@ import Data.Maybe (isJust, isNothing, maybeToList)
 import Data.Text (Text)
 import Data.Vector qualified as V
 import Occam.Facts (ClauseTier (..), ExprTier (..), ParserEditCategory (..))
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (AnalysisContext (..), IdentifierClass (..), canonicalIdentText)
 import Occam.Frontend.Edits.Core (
     EditM,

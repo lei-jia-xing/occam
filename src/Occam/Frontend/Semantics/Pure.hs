@@ -18,17 +18,22 @@ module Occam.Frontend.Semantics.Pure (
     exprValue,
     pragmaBool,
     pragmaSessionValue,
+    dedupPreserve,
 ) where
 
 import Control.Monad (guard)
 import Data.ByteString qualified as BS
 import Data.Char (isDigit)
+import Data.Foldable qualified as Foldable
 import Data.Maybe (isNothing)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Occam.Core qualified as Core
-import Occam.Frontend.AST qualified as AST
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Semantics qualified as Core
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (
     AnalysisContext (..),
     IdentifierClass (..),
@@ -387,3 +392,11 @@ pragmaSessionValue (AST.PragmaValueExpr (L _ expr)) = case expr of
         sessionInteger value
             | T.all isDigit (T.dropWhile (== '-') value) = Core.SessionInteger <$> readMaybe (T.unpack value)
             | otherwise = Nothing
+
+-- | Deduplicate a list while preserving the first-seen element order.
+dedupPreserve :: (Ord a) => [a] -> [a]
+dedupPreserve = reverse . fst . Foldable.foldl' step ([], Set.empty)
+    where
+        step (acc, seen) x
+            | Set.member x seen = (acc, seen)
+            | otherwise = (x : acc, Set.insert x seen)

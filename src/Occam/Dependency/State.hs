@@ -109,17 +109,16 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Lens.Micro (Lens', lens, (%~), (&))
-import Occam.Core (
+import Occam.Core.Schema (Ident, Name (..))
+import Occam.Core.Semantics (
     BarrierReason (..),
     BarrierScope (..),
-    Ident,
-    Name (..),
     ScopedBarrier (..),
     SearchPathEntry (..),
     SessionInit (..),
     SessionValue (..),
-    StatementId,
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.State.Catalog
 import Occam.Dependency.State.Lenses
 

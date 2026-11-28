@@ -43,12 +43,14 @@ import System.FilePath (
     (</>),
  )
 
+-- | Validated corpus seed case loaded with its dialect and SQL payload.
 data CorpusCase = CorpusCase
     { corpusId :: !Text
     , corpusDialect :: !SQLDialect
     , corpusSql :: !ByteString
     }
 
+-- | Load and validate all @.sql@ \/ @.meta.json@ seed pairs from a real-fuzz corpus directory.
 loadRealFuzzCorpus :: FilePath -> IO (Either String [CorpusCase])
 loadRealFuzzCorpus dir = do
     result <- try (runExceptT load) :: IO (Either IOException (Either String [CorpusCase]))
@@ -104,6 +106,7 @@ absolutePath path = do
         step [] ".." = []
         step parts name = name : parts
 
+-- | Normalize dialect aliases (e.g. @"postgresql"@, @"sqlite3"@) into canonical corpus DBMS names.
 normalizeDbms :: Text -> Text
 normalizeDbms raw = case T.toLower (T.strip raw) of
     "postgresql" -> "postgres"
@@ -111,6 +114,7 @@ normalizeDbms raw = case T.toLower (T.strip raw) of
     "sqlite3" -> "sqlite"
     other -> other
 
+-- | Compute the lowercase hex SHA-256 digest of SQL seed bytes.
 sqlSha256 :: ByteString -> Text
 sqlSha256 = decodeUtf8 . Base16.encode . SHA256.hash
 

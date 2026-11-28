@@ -132,6 +132,7 @@ withLogger rawCfg action = do
         let logger = newFastLogger cfg timeCache lset
         action logger `finally` loggerFlush logger
 
+-- | Construct a synchronous buffered stderr 'Logger' from config, timestamp source, and 'LoggerSet'.
 newFastLogger :: LogConfig -> IO FormattedTime -> LoggerSet -> Logger
 newFastLogger cfg@LogConfig {..} getTime lset =
     Logger

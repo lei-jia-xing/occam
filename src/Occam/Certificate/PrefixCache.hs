@@ -113,9 +113,11 @@ data FailingPrefixCache = FailingPrefixCache
 maxFailingPrefixes :: Int
 maxFailingPrefixes = 512
 
+-- | Allocate an empty bounded 'FailingPrefixCache'.
 newFailingPrefixCache :: IO FailingPrefixCache
 newFailingPrefixCache = FailingPrefixCache <$> newIORef TrieEmpty <*> newIORef 0
 
+-- | Record a semicolon-terminated failing SQL prefix up to the cache bound (512 entries).
 recordFailingPrefix :: FailingPrefixCache -> ByteString -> IO ()
 recordFailingPrefix FailingPrefixCache {..} prefix
     | BS.null prefix = pure ()
@@ -130,6 +132,7 @@ recordFailingPrefix FailingPrefixCache {..} prefix
                 when inserted $
                     atomicModifyIORef' fpCountRef (\n -> (n + 1, ()))
 
+-- | Return 'True' iff @candidate@ begins with any previously recorded failing prefix.
 checkFailingPrefix :: FailingPrefixCache -> ByteString -> IO Bool
 checkFailingPrefix FailingPrefixCache {..} candidate = do
     trie <- readIORef fpTrieRef

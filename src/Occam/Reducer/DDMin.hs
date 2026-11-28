@@ -24,13 +24,8 @@ import Occam.Certificate (
     EarlyRejectTracker,
     newEarlyRejectTracker,
  )
-import Occam.Core (
-    OracleOutcome (..),
-    ResultTrace,
-    Statement (..),
-    StatementId (..),
-    oracleAccepts,
- )
+import Occam.Core.Oracle (OracleOutcome (..), oracleAccepts)
+import Occam.Core.Types (ResultTrace, Statement (..), StatementId (..))
 import Occam.Facts (StatementUnit (..))
 import Occam.Metrics (FamilyTag (..))
 import Occam.Parser.Types (SQLDialect)

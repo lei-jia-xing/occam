@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | In-process SQLite result oracle: contract serialization, trace construction, and fast matching.
 module Occam.Oracle.Sqlite (
     SqliteContract (..),
     SqliteError (..),
@@ -65,6 +66,7 @@ import Occam.Oracle.Sqlite.Result (
     sqlDataToValue,
  )
 
+-- | Serializable oracle contract capturing expected SQLite result rows, columns, and optional state hash.
 data SqliteContract = SqliteContract
     { contractExpectedRows :: ![[Value]]
     , contractExpectedColumns :: ![Text]
@@ -91,6 +93,7 @@ instance ToJSON SqliteContract where
             , "check_state" .= contractCheckState contract
             ]
 
+-- | Decode a JSON 'SqliteContract' file from disk.
 loadSqliteContract :: FilePath -> IO (Either String SqliteContract)
 loadSqliteContract path = do
     bytes <- BS.readFile path
@@ -105,6 +108,7 @@ executeSqliteCandidateDetailedTimeout :: Int -> ByteString -> IO (Either SqliteE
 executeSqliteCandidateDetailedTimeout micros sql =
     fmap (maybe [] (resultRows . srLastResult)) <$> executeSqliteRun micros sql
 
+-- | Execute SQLite SQL with an explicit timeout and return the final result rows or an error message.
 executeSqliteCandidateTimeout :: Int -> ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidateTimeout micros sql = do
     res <- executeSqliteCandidateDetailedTimeout micros sql
@@ -114,6 +118,7 @@ executeSqliteCandidateTimeout micros sql = do
         Left (SqliteInfrastructureError err) -> Left ("infrastructure error: " <> err)
         Right rows -> Right rows
 
+-- | Execute SQLite SQL using 'defaultCandidateTimeoutMicros'.
 executeSqliteCandidate :: ByteString -> IO (Either Text [[Value]])
 executeSqliteCandidate = executeSqliteCandidateTimeout defaultCandidateTimeoutMicros
 
@@ -121,15 +126,18 @@ executeSqliteCandidate = executeSqliteCandidateTimeout defaultCandidateTimeoutMi
 generateSqliteContract :: ByteString -> IO (Either Text SqliteContract)
 generateSqliteContract = generateSqliteContractTimeout defaultCandidateTimeoutMicros
 
+-- | Generate a SQLite contract under an explicit microsecond timeout.
 generateSqliteContractTimeout :: Int -> ByteString -> IO (Either Text SqliteContract)
 generateSqliteContractTimeout micros sql =
     fmap fst <$> generateSqliteContractWithTrace micros sql
 
+-- | Generate a SQLite contract together with a 'ResultStatement' summary.
 generateSqliteContractWithResultStatement ::
     Int -> ByteString -> IO (Either Text (SqliteContract, ResultStatement))
 generateSqliteContractWithResultStatement micros sql =
     fmap (second traceResultStatement) <$> generateSqliteContractWithTrace micros sql
 
+-- | Generate a SQLite contract together with a full execution 'ResultTrace' and checkpoints.
 generateSqliteContractWithTrace ::
     Int -> ByteString -> IO (Either Text (SqliteContract, ResultTrace))
 generateSqliteContractWithTrace micros sql =
@@ -170,6 +178,7 @@ prepareSqliteContractObserver ::
     (ByteString -> IO (OracleObservation, Maybe ResultTrace))
 prepareSqliteContractObserver = prepareSqliteContractObserverWithTrace True
 
+-- | Prepare an observer yielding 'OracleObservation' and optionally a 'ResultTrace', defaulting to tracing enabled.
 prepareSqliteContractObserverWithTrace ::
     Bool ->
     Int ->
@@ -178,6 +187,7 @@ prepareSqliteContractObserverWithTrace ::
     (ByteString -> IO (OracleObservation, Maybe ResultTrace))
 prepareSqliteContractObserverWithTrace = prepareSqliteObserver False
 
+-- | Prepare a stateless observer creating a fresh database per invocation (used for validation).
 prepareFreshSqliteContractObserver :: Int -> SqliteContract -> ByteString -> IO OracleObservation
 prepareFreshSqliteContractObserver micros contract =
     fmap fst . prepareSqliteObserver True False micros contract (const (pure ()))
@@ -199,25 +209,31 @@ prepareSqliteObserver fresh needTrace micros contract onFailingPrefix
     where
         expected = ResultSet (contractExpectedColumns contract) [] (contractExpectedRows contract)
 
+-- | Convert a 'SqliteContract' into a primitive 'Oracle' under an explicit timeout.
 sqliteContractOracleTimeout :: Int -> SqliteContract -> Oracle
 sqliteContractOracleTimeout micros contract candidate =
     observationOutcome <$> sqliteContractObservationTimeout micros contract candidate
 
+-- | Convert a 'SqliteContract' into a primitive 'Oracle' using 'defaultCandidateTimeoutMicros'.
 sqliteContractOracle :: SqliteContract -> Oracle
 sqliteContractOracle = sqliteContractOracleTimeout defaultCandidateTimeoutMicros
 
+-- | Observe a candidate against a 'SqliteContract' using 'defaultCandidateTimeoutMicros'.
 sqliteContractObservation :: SqliteContract -> ByteString -> IO OracleObservation
 sqliteContractObservation = sqliteContractObservationTimeout defaultCandidateTimeoutMicros
 
+-- | Observe a candidate against a 'SqliteContract' under an explicit timeout.
 sqliteContractObservationTimeout :: Int -> SqliteContract -> ByteString -> IO OracleObservation
 sqliteContractObservationTimeout micros contract candidate =
     fst <$> prepareSqliteContractObserverWithTrace False micros contract (const (pure ())) candidate
 
+-- | Observe a candidate against a 'SqliteContract' and summarize its final 'ResultStatement'.
 sqliteContractObservationWithResultStatement ::
     Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultStatement)
 sqliteContractObservationWithResultStatement micros contract candidate =
     second (fmap traceResultStatement) <$> sqliteContractObservationWithTrace micros contract candidate
 
+-- | Observe a candidate against a 'SqliteContract' and optionally return a full 'ResultTrace'.
 sqliteContractObservationWithTrace ::
     Int -> SqliteContract -> ByteString -> IO (OracleObservation, Maybe ResultTrace)
 sqliteContractObservationWithTrace micros contract =

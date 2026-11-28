@@ -52,6 +52,7 @@ data JobState
     | JobValidationFailed
     deriving (Eq, Ord, Show)
 
+-- | Render a 'JobState' as its snake_case checkpoint status string.
 jobStateText :: JobState -> Text
 jobStateText = \case
     JobCompleted -> "completed"
@@ -62,6 +63,7 @@ jobStateText = \case
     JobInfraError -> "infra_error"
     JobValidationFailed -> "validation_failed"
 
+-- | Parse a snake_case checkpoint status string into 'JobState'.
 parseJobState :: Text -> Maybe JobState
 parseJobState = \case
     "completed" -> Just JobCompleted
@@ -93,6 +95,7 @@ data DecisionSummary = DecisionSummary
     }
     deriving (Eq, Show)
 
+-- | Initial zeroed 'DecisionSummary' accumulator.
 emptyDecisionSummary :: DecisionSummary
 emptyDecisionSummary = DecisionSummary 0 0 0 0 0 0 []
 

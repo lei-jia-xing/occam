@@ -22,7 +22,7 @@ import Occam.Certificate (
     emptyEarlyRejectCertifier,
     newEarlyRejectTracker,
  )
-import Occam.Core (Statement (..), StatementId (..))
+import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..))
 import Occam.Logger (Logger, logDebug', logInfo', nullLogger)
 import Occam.Pool (OraclePool)

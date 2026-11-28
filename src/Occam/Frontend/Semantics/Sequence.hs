@@ -19,8 +19,11 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Occam.Core qualified as Core
-import Occam.Frontend.AST qualified as AST
+import Occam.Core.Schema qualified as Core
+import Occam.Frontend.AST.DDL qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (
     AnalysisContext (..),
     IdentifierRules,

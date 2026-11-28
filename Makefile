@@ -6,16 +6,16 @@ build:
 	cabal build
 
 build-check:
-	cabal build all --enable-tests --ghc-options=-Werror
+	cabal build all --enable-tests
 
 test:
-	cabal test all --ghc-options=-Werror
+	cabal test all
 
 syntax-check:
 	@if [ -n "$$OCCAM_CLICKHOUSE_BIN" ] && [ -n "$$OCCAM_MYSQLD_BIN" ] && [ -n "$$OCCAM_MARIADBD_BIN" ]; then \
-		cabal test occam-test --ghc-options=-Werror; \
+		cabal test occam-test; \
 	else \
-		nix develop .#syntax --command cabal test occam-test --ghc-options=-Werror; \
+		nix develop .#syntax --command cabal test occam-test; \
 	fi
 
 bench:

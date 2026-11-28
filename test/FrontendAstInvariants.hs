@@ -1,3 +1,7 @@
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
+
 {- | Structural span and raw-byte invariants for parsed frontend statements.
 
 The walk is driven by the derived 'Data' instances of the AST.  It treats
@@ -28,7 +32,7 @@ import Data.List (intercalate)
 import Data.Maybe (mapMaybe)
 import Data.Typeable (Typeable, cast)
 import Data.Word (Word8)
-import Occam.Frontend.AST (Expr (ExprLiteral), Literal (..), NamePart (..), Statement)
+import Occam.Frontend.AST
 import Occam.Frontend.Lexer (asciiUpperBS)
 import Occam.Frontend.Span (
     ByteSpan (..),
@@ -39,6 +43,161 @@ import Occam.Frontend.Span (
     spanStart,
  )
 import Test.Tasty.HUnit (Assertion, assertFailure)
+
+deriving instance Data NamePart
+deriving instance Data Name
+deriving instance Data Alias
+deriving instance Data Literal
+deriving instance Data ParamKind
+deriving instance Data Expr
+deriving instance Data UnaryOp
+deriving instance Data BinaryOp
+deriving instance Data LikeOp
+deriving instance Data Quantifier
+deriving instance Data CastStyle
+deriving instance Data FunctionCall
+deriving instance Data NullTreatment
+deriving instance Data FunctionArg
+deriving instance Data CaseExpr
+deriving instance Data WindowRef
+deriving instance Data WindowSpec
+deriving instance Data WindowFrame
+deriving instance Data WindowFrameUnit
+deriving instance Data WindowBound
+deriving instance Data TypeName
+deriving instance Data TypeArg
+deriving instance Data IndexKeyPart
+deriving instance Data OrderItem
+deriving instance Data SortDirection
+deriving instance Data NullsOrder
+deriving instance Data Query
+deriving instance Data WithClause
+deriving instance Data Cte
+deriving instance Data CteBody
+deriving instance Data MaterializedHint
+deriving instance Data QueryBody
+deriving instance Data SetOperator
+deriving instance Data SetQuantifier
+deriving instance Data SelectCore
+deriving instance Data SelectInto
+deriving instance Data SelectIntoScope
+deriving instance Data SelectQuantifier
+deriving instance Data SelectItem
+deriving instance Data GroupByItem
+deriving instance Data FromClause
+deriving instance Data TableRef
+deriving instance Data TableSample
+deriving instance Data TableSource
+deriving instance Data JoinClause
+deriving instance Data JoinKind
+deriving instance Data JoinTarget
+deriving instance Data ArrayJoinItem
+deriving instance Data JoinConstraint
+deriving instance Data LimitClause
+deriving instance Data FetchClause
+deriving instance Data ForClause
+deriving instance Data ForStrength
+deriving instance Data WindowDef
+deriving instance Data SettingItem
+deriving instance Data Statement
+deriving instance Data NotifyStmt
+deriving instance Data InsertStmt
+deriving instance Data InsertOrAction
+deriving instance Data InsertSource
+deriving instance Data OnConflictClause
+deriving instance Data OnConflictAction
+deriving instance Data Assignment
+deriving instance Data UpdateStmt
+deriving instance Data DeleteStmt
+deriving instance Data DeleteTarget
+deriving instance Data MergeStmt
+deriving instance Data MergeClause
+deriving instance Data MergeAction
+deriving instance Data CreateStmt
+deriving instance Data CreateObject
+deriving instance Data CreateExtension
+deriving instance Data CreateTable
+deriving instance Data PartitionBy
+deriving instance Data PartitionBound
+deriving instance Data TablePartition
+deriving instance Data TableElement
+deriving instance Data SkippingIndex
+deriving instance Data ProjectionDef
+deriving instance Data ColumnDef
+deriving instance Data ColumnConstraint
+deriving instance Data ColumnConflictAction
+deriving instance Data TableConstraint
+deriving instance Data ConstraintIndexOptions
+deriving instance Data TableLikeOption
+deriving instance Data ForeignKeyRef
+deriving instance Data ForeignKeyTiming
+deriving instance Data ForeignKeyAction
+deriving instance Data ForeignKeyActionKind
+deriving instance Data CreateIndex
+deriving instance Data CreateView
+deriving instance Data ViewBody
+deriving instance Data OpaqueBody
+deriving instance Data OpaqueKind
+deriving instance Data CreateSequence
+deriving instance Data CreateSchema
+deriving instance Data CreateDatabase
+deriving instance Data CreateStatistics
+deriving instance Data CreateMacro
+deriving instance Data MacroParam
+deriving instance Data CreatePolicy
+deriving instance Data CreateRule
+deriving instance Data CreateTrigger
+deriving instance Data TriggerGranularity
+deriving instance Data CreateRoutine
+deriving instance Data RoutineParam
+deriving instance Data CreateAggregate
+deriving instance Data CreateVirtualTable
+deriving instance Data VirtualTableArg
+deriving instance Data TableOption
+deriving instance Data DropStmt
+deriving instance Data DropObject
+deriving instance Data DropBehavior
+deriving instance Data AlterStmt
+deriving instance Data AlterObject
+deriving instance Data AlterAction
+deriving instance Data ColumnPosition
+deriving instance Data RlsAction
+deriving instance Data AlterColumnAction
+deriving instance Data GenericOption
+deriving instance Data PragmaStmt
+deriving instance Data PragmaValue
+deriving instance Data SetStmt
+deriving instance Data SetScope
+deriving instance Data SetItem
+deriving instance Data SetTarget
+deriving instance Data ResetStmt
+deriving instance Data LockTablesStmt
+deriving instance Data LockTableItem
+deriving instance Data GrantStmt
+deriving instance Data TransactionStmt
+deriving instance Data TransactionCommand
+deriving instance Data TransactionMode
+deriving instance Data ExplainStmt
+deriving instance Data ExplainOption
+deriving instance Data CopyStmt
+deriving instance Data CopySource
+deriving instance Data CopyDirection
+deriving instance Data CopyTarget
+deriving instance Data CopyOption
+deriving instance Data AnalyzeStmt
+deriving instance Data AnalyzeTable
+deriving instance Data VacuumStmt
+deriving instance Data AttachStmt
+deriving instance Data DetachStmt
+deriving instance Data PrepareStmt
+deriving instance Data PrepareSource
+deriving instance Data ExecuteStmt
+deriving instance Data DeallocateStmt
+deriving instance Data TruncateStmt
+deriving instance Data PivotStmt
+deriving instance Data OptimizeStmt
+deriving instance Data ShowStmt
+deriving instance Data RefreshMaterializedViewStmt
 
 data Box = forall a. (Data a) => Box a
 

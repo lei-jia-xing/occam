@@ -31,7 +31,9 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Occam.Core qualified as Core
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Semantics qualified as Core
+import Occam.Core.Types qualified as Core
 import Occam.Facts (
     ColumnSite (..),
     ColumnSiteKind (..),

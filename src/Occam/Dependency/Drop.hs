@@ -20,7 +20,7 @@ import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Lens.Micro ((%~), (&), (.~))
-import Occam.Core (
+import Occam.Core.Schema (
     DropMode (..),
     DropObject (..),
     DropOp (..),
@@ -29,9 +29,9 @@ import Occam.Core (
     Name (..),
     NameRef,
     RelationKind (..),
-    StatementId,
     TriggerRef,
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Barrier (
     indexTouchKeys,
     relationTouchKeys,

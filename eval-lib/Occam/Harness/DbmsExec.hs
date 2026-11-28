@@ -20,6 +20,10 @@ module Occam.Harness.DbmsExec (
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay, tryTakeMVar)
 import Control.Exception.Safe (IOException, bracketOnError, catch, finally, throwIO, try)
+import Control.Monad (guard)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (runExceptT, throwE)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString qualified as BS
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit, isSpace)
 import Data.Foldable qualified as Foldable
@@ -156,6 +160,7 @@ resolveDbmsConnection cfg dbms overrides = do
             Just n | n > 0 -> Just n
             _ -> Nothing
 
+-- | Default in-container server error/diagnostic log path for a DBMS engine.
 defaultContainerLog :: DbmsKind -> FilePath
 defaultContainerLog = \case
     DbmsPostgres -> "/var/log/postgresql/postgresql.log"
@@ -165,12 +170,14 @@ defaultContainerLog = \case
     DbmsSqlite -> ""
     DbmsDuckDb -> ""
 
+-- | Default TCP hostname when connecting to a DBMS server without overrides or env vars.
 fallbackHost :: DbmsKind -> Text
 fallbackHost = \case
     DbmsSqlite -> ""
     DbmsDuckDb -> ""
     _ -> "127.0.0.1"
 
+-- | Default TCP port for a DBMS server, or @0@ for embedded engines.
 fallbackPort :: DbmsKind -> Int
 fallbackPort = \case
     DbmsPostgres -> 5432
@@ -180,6 +187,7 @@ fallbackPort = \case
     DbmsSqlite -> 0
     DbmsDuckDb -> 0
 
+-- | Default client username for a DBMS server, or empty for embedded engines.
 fallbackUser :: DbmsKind -> Text
 fallbackUser = \case
     DbmsPostgres -> "postgres"
@@ -189,12 +197,14 @@ fallbackUser = \case
     DbmsSqlite -> ""
     DbmsDuckDb -> ""
 
+-- | Default database identifier for a DBMS engine (@occam_test@ for servers, @:memory:@ for embedded).
 fallbackDb :: DbmsKind -> Text
 fallbackDb = \case
     DbmsSqlite -> ":memory:"
     DbmsDuckDb -> ":memory:"
     _ -> "occam_test"
 
+-- | DBMS-specific environment variable lookup keys @(host, port, user, password, db, socket, bin)@.
 dbmsEnvKeys :: DbmsKind -> ([String], [String], [String], [String], [String], [String], [String])
 dbmsEnvKeys = \case
     DbmsPostgres ->
@@ -496,60 +506,57 @@ decodeExitCode (ExitFailure c)
 
 -- | Locate an executable by explicit path, env var, sibling of current binary, PATH, or @cabal list-bin@.
 resolveRepoBinary :: Maybe FilePath -> String -> String -> IO (Either String FilePath)
-resolveRepoBinary (Just explicit) _ binName = do
-    p' <- expandTilde explicit
-    ok <- isExecutableFile p'
-    pure $
-        if ok
-            then Right p'
-            else Left (binName <> " executable not found or not executable: " <> explicit)
-resolveRepoBinary Nothing envVar binName = do
-    mEnv <- lookupEnv envVar
+resolveRepoBinary (Just explicit) _ binName = runExceptT do
+    p' <- liftIO (expandTilde explicit)
+    ok <- liftIO (isExecutableFile p')
+    if ok
+        then pure p'
+        else throwE (binName <> " executable not found or not executable: " <> explicit)
+resolveRepoBinary Nothing envVar binName = runExceptT do
+    mEnv <- liftIO (lookupEnv envVar)
     case mEnv of
         Just p | not (null p) -> do
-            p' <- expandTilde p
-            ok <- isExecutableFile p'
+            p' <- liftIO (expandTilde p)
+            ok <- liftIO (isExecutableFile p')
             if ok
-                then pure (Right p')
-                else pure (Left (envVar <> " points to missing/non-executable binary: " <> p))
+                then pure p'
+                else throwE (envVar <> " points to missing/non-executable binary: " <> p)
         _ -> do
-            exe <- getExecutablePath
-            let dirs = splitDirectories exe
-                sameDir = takeDirectory exe </> binName
-                nixSib = takeDirectory (takeDirectory (takeDirectory exe)) </> binName </> binName
-                cabalSib = joinPath (replaceSub binName dirs)
-                distBuild = "dist" </> "build" </> binName </> binName
-            firstValid [sameDir, nixSib, cabalSib, distBuild] >>= \case
-                Just found -> pure (Right found)
-                Nothing -> do
-                    mPath <- findExecutable binName
-                    case mPath of
-                        Just found -> pure (Right found)
-                        Nothing -> do
-                            (_, rc, outBs, _) <-
-                                runProcessCapture
-                                    Nothing
-                                    Nothing
-                                    (Just 15.0)
-                                    "cabal"
-                                    ["list-bin", "exe:" <> binName]
-                                    BS.empty
-                            let listed =
-                                    dropWhile
-                                        isSpace
-                                        (reverse (dropWhile isSpace (reverse (T.unpack (TE.decodeUtf8With TEE.lenientDecode outBs)))))
-                            ok <- if rc == 0 && not (null listed) then isExecutableFile listed else pure False
-                            pure $
-                                if ok
-                                    then Right listed
-                                    else
-                                        Left
-                                            ("Could not locate " <> binName <> " executable; pass --" <> binName <> "-bin or set " <> envVar)
+            mFound <-
+                liftIO $
+                    runMaybeT $
+                        findViaSiblings <|> MaybeT (findExecutable binName) <|> findViaCabal
+            maybe
+                ( throwE
+                    ("Could not locate " <> binName <> " executable; pass --" <> binName <> "-bin or set " <> envVar)
+                )
+                pure
+                mFound
     where
-        firstValid [] = pure Nothing
-        firstValid (p : ps) = do
-            ok <- isExecutableFile p
-            if ok then pure (Just p) else firstValid ps
+        findViaSiblings = do
+            exe <- liftIO getExecutablePath
+            let dirs = splitDirectories exe
+                candidates =
+                    [ takeDirectory exe </> binName
+                    , takeDirectory (takeDirectory (takeDirectory exe)) </> binName </> binName
+                    , joinPath (replaceSub binName dirs)
+                    , "dist" </> "build" </> binName </> binName
+                    ]
+            MaybeT (findFirstCandidate candidates)
+
+        findViaCabal = do
+            (_, rc, outBs, _) <-
+                liftIO $
+                    runProcessCapture Nothing Nothing (Just 15.0) "cabal" ["list-bin", "exe:" <> binName] BS.empty
+            guard (rc == 0)
+            let listed =
+                    dropWhile
+                        isSpace
+                        (reverse (dropWhile isSpace (reverse (T.unpack (TE.decodeUtf8With TEE.lenientDecode outBs)))))
+            guard (not (null listed))
+            ok <- liftIO (isExecutableFile listed)
+            guard ok
+            pure listed
 
         replaceSub _ [] = []
         replaceSub target ("t" : _ : rest) = "x" : target : replaceSub target rest

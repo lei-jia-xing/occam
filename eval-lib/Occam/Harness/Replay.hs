@@ -10,7 +10,11 @@ module Occam.Harness.Replay (
 ) where
 
 import Control.Exception.Safe (IOException, try)
-import Control.Monad (void, when)
+import Control.Monad (foldM, void, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Cont (ContT (..), runContT)
+import Control.Monad.Trans.Except (ExceptT (..), runExceptT, withExceptT)
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, readIORef)
@@ -192,6 +196,7 @@ data ReplayConfig = ReplayConfig
     , rcRequireConsistent :: !Bool
     }
 
+-- | Default 'ReplayConfig' targeting the given DBMS and connection overrides.
 defaultReplayConfig :: DbmsKind -> ConnectionOverrides -> ReplayConfig
 defaultReplayConfig dbms connOv =
     ReplayConfig
@@ -210,6 +215,14 @@ defaultReplayConfig dbms connOv =
         , rcResetBeforeRun = True
         , rcRequireConsistent = True
         }
+
+data ReplayState = ReplayState
+    { rsPassed :: !Int
+    , rsSlips :: !Int
+    , rsSeenIds :: !(Set.Set Text)
+    , rsRevSigs :: ![CrashSignature]
+    , rsRevRuns :: ![ReplayRunRecord]
+    }
 
 -- | Replay @sqlBytes@ @replays@ times using in-process 'resetDb' + 'probeCrashOracleCancellable'.
 runReplayVerification ::
@@ -237,139 +250,130 @@ runReplayVerification hc mStopRef rcfg replays sqlBytes
                 }
     | otherwise = do
         removeFileIfExists (rcDecisionLog rcfg)
-        go 1 0 0 Set.empty [] [] False
+        let initState = ReplayState 0 0 Set.empty [] []
+        (`runContT` (pure . (`finalize` False))) $
+            foldM runReplayAttempt initState [1 .. replays]
     where
         hasBaseline = maybe False (not . T.null . T.strip) (rcBaselineSignature rcfg)
         dbms = rcDbms rcfg
-
         isStopped = maybe (pure False) readIORef mStopRef
+
+        abortNow :: ReplayState -> ContT ReplayVerification IO a
+        abortNow st = ContT \_ -> pure (finalize st True)
+
+        abortIfStopped :: ReplayState -> ContT ReplayVerification IO ()
+        abortIfStopped st = do
+            stopped <- liftIO isStopped
+            when stopped (abortNow st)
+
+        runReplayAttempt :: ReplayState -> Int -> ContT ReplayVerification IO ReplayState
+        runReplayAttempt st idx = do
+            outcome <- runExceptT do
+                lift (abortIfStopped st)
+                when (rcResetBeforeRun rcfg) $
+                    withExceptT (failedRecord idx "reset-failed") (ExceptT (liftIO performReset))
+                lift (abortIfStopped st)
+                ep <- withExceptT (failedRecord idx "endpoint-error") (ExceptT (liftIO (rcEndpoint rcfg)))
+                (wasInterrupted, oRes) <-
+                    liftIO (probeCrashOracleCancellable hc mStopRef (oracleOptsFor ep) sqlBytes)
+                when wasInterrupted $ lift (abortNow st)
+                pure oRes
+            pure $ either (recordOnly st) (applyProbeResult st idx) outcome
+
+        performReset :: IO (Either String ())
+        performReset = case rcResetFn rcfg of
+            Just fn -> fn
+            Nothing -> rcEndpoint rcfg >>= either (pure . Left) defaultReset
+
+        defaultReset ep =
+            resetDb hc (ResetOptions dbms (reConnection ep) (rcMaxWaitReset rcfg))
+
+        oracleOptsFor ep =
+            (defaultOracleOptions dbms)
+                { ooConnection = reConnection ep
+                , ooExpectedSignature = rcExpectedSignature rcfg
+                , ooBaselineSignature = fromMaybe "" (rcBaselineSignature rcfg)
+                , ooRejectOnSlippage = rcRejectOnSlippage rcfg
+                , ooStackFrames = rcStackFrames rcfg
+                , ooLogFile = reLogFile ep
+                , ooContainerLog = reContainerLog ep
+                , ooDecisionLog = rcDecisionLog rcfg
+                , ooTimeoutSeconds = rcProbeTimeout rcfg
+                , ooAllowStderrOnly = rcAllowStderrOnly rcfg
+                , ooAllowPsqlMeta = rcAllowPsqlMeta rcfg
+                , ooVerbose = False
+                , ooWorkdir = Nothing
+                }
+
+        failedRecord idx prefix err =
+            ReplayRunRecord
+                { rrRun = idx
+                , rrAccepted = False
+                , rrClassification = ClassMissingEvidence
+                , rrReason = prefix <> ": " <> T.take 200 (T.pack err)
+                , rrSignatureId = Nothing
+                , rrSignatureHash = Nothing
+                , rrSlipped = Nothing
+                }
+
+        recordOnly st rec = st {rsRevRuns = rec : rsRevRuns st}
+
+        applyProbeResult st idx oRes =
+            let dec = orDecision oRes
+                accepted = orExitCode oRes == 0 && odVerdict dec == VerdictAccepted
+                mSig = odCrashSignature dec
+                mSlipped = svSlipped <$> odSlippage dec
+                slippedThis = fromMaybe False mSlipped
+                (seenIds', revSigs') = case mSig of
+                    Just sig
+                        | Set.notMember (csId sig) (rsSeenIds st) ->
+                            (Set.insert (csId sig) (rsSeenIds st), sig : rsRevSigs st)
+                    _ -> (rsSeenIds st, rsRevSigs st)
+                rec =
+                    ReplayRunRecord
+                        { rrRun = idx
+                        , rrAccepted = accepted
+                        , rrClassification = odClassification dec
+                        , rrReason = odReason dec
+                        , rrSignatureId = csId <$> mSig
+                        , rrSignatureHash = csHash <$> mSig
+                        , rrSlipped = if hasBaseline then mSlipped else Nothing
+                        }
+             in st
+                    { rsPassed = rsPassed st + if accepted then 1 else 0
+                    , rsSlips = rsSlips st + if hasBaseline && slippedThis then 1 else 0
+                    , rsSeenIds = seenIds'
+                    , rsRevSigs = revSigs'
+                    , rsRevRuns = rec : rsRevRuns st
+                    }
 
         removeFileIfExists Nothing = pure ()
         removeFileIfExists (Just path) = do
             exists <- doesFileExist path
             when exists $ void (try (removeFile path) :: IO (Either IOException ()))
 
-        defaultReset ep =
-            resetDb hc (ResetOptions dbms (reConnection ep) (rcMaxWaitReset rcfg))
-
-        go idx passed slips seenIds revSigs revRuns interrupted
-            | interrupted || idx > replays =
-                pure (finalize passed slips revSigs revRuns interrupted)
-            | otherwise = do
-                stop0 <- isStopped
-                if stop0
-                    then pure (finalize passed slips revSigs revRuns True)
-                    else do
-                        resetRes <-
-                            if rcResetBeforeRun rcfg
-                                then case rcResetFn rcfg of
-                                    Just fn -> fn
-                                    Nothing -> do
-                                        eEp <- rcEndpoint rcfg
-                                        case eEp of
-                                            Left err -> pure (Left err)
-                                            Right ep -> defaultReset ep
-                                else pure (Right ())
-                        stop1 <- isStopped
-                        if stop1
-                            then pure (finalize passed slips revSigs revRuns True)
-                            else case resetRes of
-                                Left err ->
-                                    let rec =
-                                            ReplayRunRecord
-                                                { rrRun = idx
-                                                , rrAccepted = False
-                                                , rrClassification = ClassMissingEvidence
-                                                , rrReason = "reset-failed: " <> T.take 200 (T.pack err)
-                                                , rrSignatureId = Nothing
-                                                , rrSignatureHash = Nothing
-                                                , rrSlipped = Nothing
-                                                }
-                                     in go (idx + 1) passed slips seenIds revSigs (rec : revRuns) False
-                                Right () -> runOneProbe idx passed slips seenIds revSigs revRuns
-
-        runOneProbe idx passed slips seenIds revSigs revRuns = do
-            eEp <- rcEndpoint rcfg
-            case eEp of
-                Left err ->
-                    let rec =
-                            ReplayRunRecord
-                                { rrRun = idx
-                                , rrAccepted = False
-                                , rrClassification = ClassMissingEvidence
-                                , rrReason = "endpoint-error: " <> T.take 200 (T.pack err)
-                                , rrSignatureId = Nothing
-                                , rrSignatureHash = Nothing
-                                , rrSlipped = Nothing
-                                }
-                     in go (idx + 1) passed slips seenIds revSigs (rec : revRuns) False
-                Right ep -> do
-                    let baseOpts = defaultOracleOptions dbms
-                        opts =
-                            baseOpts
-                                { ooConnection = reConnection ep
-                                , ooExpectedSignature = rcExpectedSignature rcfg
-                                , ooBaselineSignature = fromMaybe "" (rcBaselineSignature rcfg)
-                                , ooRejectOnSlippage = rcRejectOnSlippage rcfg
-                                , ooStackFrames = rcStackFrames rcfg
-                                , ooLogFile = reLogFile ep
-                                , ooContainerLog = reContainerLog ep
-                                , ooDecisionLog = rcDecisionLog rcfg
-                                , ooTimeoutSeconds = rcProbeTimeout rcfg
-                                , ooAllowStderrOnly = rcAllowStderrOnly rcfg
-                                , ooAllowPsqlMeta = rcAllowPsqlMeta rcfg
-                                , ooVerbose = False
-                                , ooWorkdir = Nothing
-                                }
-                    (wasInterrupted, oRes) <- probeCrashOracleCancellable hc mStopRef opts sqlBytes
-                    if wasInterrupted
-                        then pure (finalize passed slips revSigs revRuns True)
-                        else
-                            let dec = orDecision oRes
-                                accepted = orExitCode oRes == 0 && odVerdict dec == VerdictAccepted
-                                mSig = odCrashSignature dec
-                                mSlipped = svSlipped <$> odSlippage dec
-                                slippedThis = fromMaybe False mSlipped
-                                passed' = if accepted then passed + 1 else passed
-                                slips' = if hasBaseline && slippedThis then slips + 1 else slips
-                                (seenIds', revSigs') = case mSig of
-                                    Just sig
-                                        | Set.notMember (csId sig) seenIds ->
-                                            (Set.insert (csId sig) seenIds, sig : revSigs)
-                                    _ -> (seenIds, revSigs)
-                                rec =
-                                    ReplayRunRecord
-                                        { rrRun = idx
-                                        , rrAccepted = accepted
-                                        , rrClassification = odClassification dec
-                                        , rrReason = odReason dec
-                                        , rrSignatureId = csId <$> mSig
-                                        , rrSignatureHash = csHash <$> mSig
-                                        , rrSlipped = if hasBaseline then mSlipped else Nothing
-                                        }
-                             in go (idx + 1) passed' slips' seenIds' revSigs' (rec : revRuns) False
-
-        finalize passed slips revSigs revRuns interrupted =
-            let obsSigs = reverse revSigs
+        finalize st interrupted =
+            let obsSigs = reverse (rsRevSigs st)
                 obsIds = map csId obsSigs
-                allPassed = not interrupted && replays > 0 && passed == replays
+                allPassed = not interrupted && replays > 0 && rsPassed st == replays
                 consistentSig = allPassed && length obsSigs == 1
                 chosenBaseline
                     | allPassed && (not (rcRequireConsistent rcfg) || consistentSig) = listToMaybe obsSigs
                     | otherwise = Nothing
                 matchesBase
                     | not hasBaseline = Nothing
-                    | otherwise = Just (allPassed && (not (rcRequireConsistent rcfg) || consistentSig) && slips == 0)
+                    | otherwise =
+                        Just (allPassed && (not (rcRequireConsistent rcfg) || consistentSig) && rsSlips st == 0)
              in ReplayVerification
                     { rvRunsRequired = replays
-                    , rvRunsPassed = passed
+                    , rvRunsPassed = rsPassed st
                     , rvAllPassed = allPassed
                     , rvConsistentSignature = consistentSig
                     , rvBaselineSignature = chosenBaseline
                     , rvMatchesBaseline = matchesBase
-                    , rvSlippageCount = slips
+                    , rvSlippageCount = rsSlips st
                     , rvObservedSignatures = obsSigs
                     , rvObservedSignatureIds = obsIds
                     , rvInterrupted = interrupted
-                    , rvRuns = reverse revRuns
+                    , rvRuns = reverse (rsRevRuns st)
                     }

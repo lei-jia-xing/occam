@@ -8,7 +8,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, newIORef, readIORef)
 import Occam.Certificate (EarlyRejectTracker, emptyEarlyRejectCertifier)
-import Occam.Core (ResultTrace)
+import Occam.Core.Types (ResultTrace)
 import Occam.Logger (Logger, logDebug', logInfo')
 import Occam.Parser (
     ColumnTarget,
@@ -50,6 +50,7 @@ import Occam.Reducer.Syntax.Index (
  )
 import Occam.Reducer.Syntax.Snapshot (parseSyntaxSnapshot)
 
+-- | Intra-statement AST\/syntax rewrite pass honoring column bundles, deferral policies, and early rejection.
 reduceSyntaxWithDialect ::
     ReductionConfig ->
     EarlyRejectTracker ->

@@ -50,6 +50,7 @@ import System.Directory (createDirectoryIfMissing, makeAbsolute)
 import System.FilePath ((</>))
 import Text.Read (readMaybe)
 
+-- | High-level options governing batch matrix expansion, replay, and resume behavior.
 data BatchPlanOptions = BatchPlanOptions
     { planInputs :: !BatchInputOptions
     , planReference :: !Text
@@ -68,6 +69,7 @@ data BatchPlanOptions = BatchPlanOptions
     }
     deriving (Eq, Show)
 
+-- | Explicit CLI\/user overrides layered over reference harness defaults.
 data PlanOverrides = PlanOverrides
     { overrideRepeats :: !(Maybe Int)
     , overrideWorkers :: !(Maybe Int)
@@ -82,6 +84,7 @@ data PlanOverrides = PlanOverrides
     }
     deriving (Eq, Show)
 
+-- | Resolved worker concurrency, timeouts, caching, and slippage settings for a batch run.
 data Settings = Settings
     { workRepeats :: !Int
     , workWorkers :: !Int
@@ -109,9 +112,11 @@ instance ToJSON Settings where
             , "stack_frames" .= workStackFrames settings
             ]
 
+-- | Named reducer arm (profile name paired with Occam CLI flags).
 data Profile = Profile {profile :: !Text, flags :: ![Text]}
     deriving (Eq, Show)
 
+-- | Deterministic 16-hex-char SHA-256 hash identifying a reducer 'Profile' configuration.
 profileFlagsHash :: Profile -> Text
 profileFlagsHash (Profile name fs) =
     TE.decodeUtf8 (BS.take 16 (Base16.encode (SHA256.hash (BSL.toStrict (encode (name, fs))))))
@@ -119,9 +124,11 @@ profileFlagsHash (Profile name fs) =
 instance ToJSON Profile where
     toJSON p = object ["name" .= profile p, "flags" .= flags p]
 
+-- | Single scheduled execution unit pairing a case ID, reducer profile, and repetition index.
 data Job = Job !Text !Profile !Int
     deriving (Eq, Show)
 
+-- | Canonical string identifier @case__profile__rN@ for a 'Job'.
 jobId :: Job -> Text
 jobId (Job cid p repetition) = cid <> "__" <> profile p <> "__r" <> T.pack (show repetition)
 
@@ -135,6 +142,7 @@ instance ToJSON Job where
             , "repeat" .= repetition
             ]
 
+-- | Connection specification for an externally managed container instance.
 data ExternalContainer = ExternalContainer !Text !Text !(Maybe Int)
     deriving (Eq, Show)
 

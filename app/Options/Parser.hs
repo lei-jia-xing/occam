@@ -1,3 +1,4 @@
+-- | @optparse-applicative@ command-line option parser and shell-completion definitions.
 module Options.Parser (
     actionParser,
     optsInfo,
@@ -53,6 +54,7 @@ import Options.Applicative (
     (<**>),
  )
 
+-- | Top-level parser choosing between info subcommands (@--list-*@) and normal reduction options.
 actionParser :: Parser Action
 actionParser =
     (ActionNormal <$> rawOptionsParser)
@@ -86,6 +88,7 @@ actionParser =
                     )
             )
 
+-- | Top-level @optparse-applicative@ parser for @--completion@ or normal reduction options.
 rawOptionsParser :: Parser RawOptions
 rawOptionsParser =
     RawOptions
@@ -335,6 +338,7 @@ versionOption =
             <> help "Show version information"
         )
 
+-- | Top-level CLI 'ParserInfo' including help banner, version flag, and action parser.
 optsInfo :: ParserInfo Action
 optsInfo =
     info (actionParser <**> versionOption <**> helper) fullDesc

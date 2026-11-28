@@ -1,3 +1,4 @@
+-- | Sliding-window concurrent scheduler enforcing lookahead limits and serial retirement.
 module Occam.Pool.Window (
     runSlidingWindow,
 ) where
@@ -41,7 +42,7 @@ import Occam.Cache (
     cacheInstallInflightKey,
     cacheLookupKey,
  )
-import Occam.Core (OracleInconclusiveError (..), OracleOutcome (..))
+import Occam.Core.Oracle (OracleInconclusiveError (..), OracleOutcome (..))
 import Occam.Metrics (
     FamilyTag (..),
     recordCanceled,

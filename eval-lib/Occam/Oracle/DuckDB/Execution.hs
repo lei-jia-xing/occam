@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | DuckDB statement execution engine with query timeout interrupts and trace emission.
 module Occam.Oracle.DuckDB.Execution (
     ExecutionResult,
     ObserveResult,
@@ -60,25 +61,30 @@ import Occam.Oracle.DuckDB.Result (observeRows)
 import Occam.Oracle.Result (ResultSet (..))
 import System.Timeout (timeout)
 
+-- | Callback computing a typed result observation directly from a native @duckdb_result@.
 type ObserveResult a = DuckDBAPI -> Ptr DuckDBResult -> IO (Either DuckDBError a)
 
+-- | Result of a timed DuckDB execution: an observed value paired with its 'ResultTrace' when a result set was produced.
 type ExecutionResult a = Either DuckDBError (Maybe (a, ResultTrace))
 
--- The callback receives the complete native statement count, the failing
--- ordinal and a native extraction check for a proposed prefix boundary.
+-- | Hook invoked when a prefix or statement fails; receives total statement count, failing ordinal, native prefix check, and error text.
 type StatementFailure = Int -> Int -> (ByteString -> IO Bool) -> Text -> IO ()
 
+-- | Default no-op 'StatementFailure' callback.
 ignoreStatementFailure :: StatementFailure
 ignoreStatementFailure _ _ _ _ = pure ()
 
+-- | Execute SQL against a fresh in-memory DuckDB database and decode the final 'ResultSet' and 'ResultTrace'.
 executeDuckDBResult ::
     Int -> ByteString -> IO (Either DuckDBError (Maybe (ResultSet, ResultTrace)))
 executeDuckDBResult = executeDuckDBResultWith observeRows
 
+-- | Execute SQL on a fresh in-memory DuckDB instance using a custom result observer.
 executeDuckDBResultWith :: ObserveResult a -> Int -> ByteString -> IO (ExecutionResult a)
 executeDuckDBResultWith observe =
     executeDuckDBResultWithReplay observe Nothing ignoreStatementFailure
 
+-- | Execute SQL using an optional checkpoint database and failing-statement callback under a microsecond timeout.
 executeDuckDBResultWithReplay ::
     ObserveResult a ->
     Maybe (Bool, DuckdbDatabase) ->
@@ -94,6 +100,7 @@ executeDuckDBResultWithReplay observe db onFailure micros sql
             Left err -> pure (Left err)
             Right api -> executeWithAPI api observe db onFailure micros sql
 
+-- | Execute SQL given an already-loaded 'DuckDBAPI' dispatch table.
 executeWithAPI ::
     DuckDBAPI ->
     ObserveResult a ->

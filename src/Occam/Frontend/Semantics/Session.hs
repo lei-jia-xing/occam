@@ -16,8 +16,10 @@ import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Occam.Core qualified as Core
-import Occam.Frontend.AST qualified as AST
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Semantics qualified as Core
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (
     AnalysisContext (..),
     IdentifierClass (..),
@@ -33,6 +35,7 @@ import Occam.Frontend.Context (
     unsafeSliceSource,
  )
 import Occam.Frontend.Lexer (LiteralKind (..))
+import Occam.Frontend.Semantics.Nested (analyzeNested, mergeNested)
 import Occam.Frontend.Semantics.Pure (
     decodeStringLiteral,
     exprBool,
@@ -43,8 +46,6 @@ import Occam.Frontend.Semantics.Pure (
 import Occam.Frontend.Semantics.Query (
     VisitorState,
     addUnmodeledBarriers,
-    analyzeNested,
-    mergeNested,
     visitorReads,
  )
 import Occam.Frontend.Span (ByteSpan (..), Located (..))

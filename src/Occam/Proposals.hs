@@ -27,10 +27,8 @@ import Data.Ord (Down (..))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Core (
+import Occam.Core.Schema (
     AlterTable (alterTableTarget),
-    BarrierScope (GlobalScope),
-    CatalogOp (..),
     DataWrite (dataWriteTarget),
     DropObject (DropRelation),
     DropOp (dropObjects),
@@ -42,22 +40,24 @@ import Occam.Core (
     ReadFact (readSource),
     RefreshOp (refreshTarget),
     RenameOp (..),
-    ResultStatement (..),
-    ScopedBarrier (barrierScope),
-    SemanticFacts (..),
-    SessionInit,
-    Span (..),
-    Statement (..),
-    StatementId (..),
     TableDef (tableName),
-    TriggerDef (triggerTable),
-    TxEffect (..),
     ViewDef (viewName),
     nameText,
  )
+import Occam.Core.Semantics (
+    BarrierScope (GlobalScope),
+    CatalogOp (..),
+    ScopedBarrier (barrierScope),
+    SemanticFacts (..),
+    SessionInit,
+    TriggerDef (triggerTable),
+    TxEffect (..),
+ )
+import Occam.Core.Types (ResultStatement (..), Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..), buildGraph)
 import Occam.Slicer (backwardSliceFast)
 
+-- | Category classifying a coordinated multi-statement deletion group proposal.
 data ProposalGroupKind
     = GroupWeakComponent
     | GroupWeakRelation
@@ -66,6 +66,7 @@ data ProposalGroupKind
     | GroupIndirectRelation
     deriving (Eq, Ord, Show)
 
+-- | Single candidate group deletion proposal spanning multiple dependent statements.
 data DeletionProposalGroup = DeletionProposalGroup
     { proposalKind :: !ProposalGroupKind
     , proposalLabel :: !Text
@@ -76,6 +77,7 @@ data DeletionProposalGroup = DeletionProposalGroup
     }
     deriving (Eq, Show)
 
+-- | Stratified plan of group deletion proposals ordered from weak\/local to indirect couplings.
 data GroupProposalPlan = GroupProposalPlan
     { planWeakGroups :: ![DeletionProposalGroup]
     , planWeakTxBlocks :: ![DeletionProposalGroup]
@@ -312,6 +314,7 @@ canonName = T.toLower . nameText
 type TxGroupState =
     ([(Int, Int, Bool)], [(Text, Int, Int, Bool)], [(Text, IntSet)], [(Text, IntSet)])
 
+-- | Extract contiguous transaction blocks and minimal BEGIN\/COMMIT wrapper pairs.
 extractTransactionGroups ::
     [Statement] ->
     DependencyGraph ->

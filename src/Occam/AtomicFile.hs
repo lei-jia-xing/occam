@@ -23,11 +23,13 @@ import Data.Bits ((.&.))
 import System.Posix.Files (accessModes, fileMode, getFileStatus, setFileMode)
 #endif
 
+-- | Return 'True' for OS device pseudo-files such as @\/dev\/null@ or @NUL@.
 isSpecialDevice :: FilePath -> Bool
 isSpecialDevice path =
     map toLower path
         `elem` ["/dev/null", "/dev/stdout", "/dev/stderr", "nul", "\\\\.\\nul", "con", "conout$"]
 
+-- | Atomically write strict bytes to @path@ via temp-file rename (direct write on OS special devices).
 writeAtomicBytes :: FilePath -> BS.ByteString -> IO ()
 writeAtomicBytes path content
     | isSpecialDevice path = BS.writeFile path content
@@ -46,6 +48,7 @@ writeAtomicBytesWithPermissionsOf source path content =
         setFileMode temporary (mode .&. accessModes)
 #endif
 
+-- | Atomically write lazy bytes to @path@ via temp-file rename (direct write on OS special devices).
 writeAtomicLazyBytes :: FilePath -> BSL.ByteString -> IO ()
 writeAtomicLazyBytes path content
     | isSpecialDevice path = BSL.writeFile path content

@@ -1,3 +1,4 @@
+-- | CLI option types, JSON configuration file loading, and semantic option validation.
 module Options (
     Action (..),
     ColorMode (..),
@@ -62,10 +63,12 @@ data Specified a
     | Explicit a
     deriving (Eq, Show, Functor)
 
+-- | Return 'True' if an option value was explicitly overridden by CLI flags or config.
 isExplicit :: Specified a -> Bool
 isExplicit (Explicit _) = True
 isExplicit (Default _) = False
 
+-- | Unwrap the underlying value from 'Specified' regardless of source.
 getSpecified :: Specified a -> a
 getSpecified (Default x) = x
 getSpecified (Explicit x) = x
@@ -74,9 +77,11 @@ getSpecified (Explicit x) = x
 -- Color Mode
 -- ----------------------------------------------------------------------------
 
+-- | Terminal ANSI color policy selected via @--color@.
 data ColorMode = ColorAuto | ColorAlways | ColorNever
     deriving (Eq, Show)
 
+-- | Parse a CLI @--color@ flag string (@auto@, @always@, or @never@).
 parseColorMode :: String -> Either String ColorMode
 parseColorMode s = case map toLower s of
     "auto" -> Right ColorAuto
@@ -84,6 +89,7 @@ parseColorMode s = case map toLower s of
     "never" -> Right ColorNever
     _ -> Left "Expected 'auto', 'always', or 'never'"
 
+-- | Resolve whether ANSI color escapes should be emitted given 'ColorMode', TTY status, and @NO_COLOR@.
 resolveColor :: ColorMode -> Bool -> IO Bool
 resolveColor ColorAlways _ = pure True
 resolveColor ColorNever _ = pure False
@@ -91,11 +97,13 @@ resolveColor ColorAuto isTTY = do
     noColor <- isJust <$> lookupEnv "NO_COLOR"
     pure (isTTY && not noColor)
 
+-- | Render a 'ColorMode' as its CLI\/JSON flag string.
 colorModeName :: ColorMode -> Text
 colorModeName ColorAuto = "auto"
 colorModeName ColorAlways = "always"
 colorModeName ColorNever = "never"
 
+-- | Render a 'LogFormat' as @"text"@ or @"json"@.
 logFormatName :: LogFormat -> Text
 logFormatName FormatText = "text"
 logFormatName FormatJSON = "json"
@@ -104,6 +112,7 @@ logFormatName FormatJSON = "json"
 -- Actions and Options ADTs
 -- ----------------------------------------------------------------------------
 
+-- | Dispatched CLI sub-command derived from parsed arguments.
 data Action
     = ActionCompletion !ShellType
     | ActionListDialects
@@ -112,14 +121,17 @@ data Action
     | ActionPrintDefaults
     | ActionNormal !RawOptions
 
+-- | Top-level reduction workflow strategy selected by @--strategy@.
 data ReductionStrategy = StrategyFull | StrategyDdminOnly | StrategyAuditOnly
     deriving (Eq, Show)
 
+-- | Render a 'ReductionStrategy' as its CLI\/stats keyword.
 strategyName :: ReductionStrategy -> T.Text
 strategyName StrategyFull = "full"
 strategyName StrategyDdminOnly = "ddmin-only"
 strategyName StrategyAuditOnly = "audit-only"
 
+-- | Parse a CLI @--log-level@ flag string.
 parseLogLevel :: String -> Either String LogLevel
 parseLogLevel s = case map toLower s of
     "debug" -> Right LevelDebug
@@ -129,12 +141,14 @@ parseLogLevel s = case map toLower s of
     "error" -> Right LevelError
     _ -> Left "Expected debug, info, warn, or error"
 
+-- | Parse a CLI @--log-format@ flag string.
 parseLogFormat :: String -> Either String LogFormat
 parseLogFormat s = case map toLower s of
     "text" -> Right FormatText
     "json" -> Right FormatJSON
     _ -> Left "Expected text or json"
 
+-- | Parse a CLI @--statement-order@ search policy string.
 parseStatementOrder :: String -> Either String StatementSearchPolicy
 parseStatementOrder s = case map toLower s of
     "ranked-fallback" -> Right statementRankedFallback
@@ -144,6 +158,7 @@ parseStatementOrder s = case map toLower s of
     "byte-weighted" -> Right StatementByteWeighted
     _ -> Left "Expected ranked-fallback, ranked, byte-weighted, complement-first, or subset-first"
 
+-- | Parse a CLI @--column-mode@ string (@off@, @single@, or @atomic@).
 parseColumnMode :: String -> Either String ColumnMode
 parseColumnMode s = case map toLower s of
     "off" -> Right ColumnOff
@@ -151,6 +166,7 @@ parseColumnMode s = case map toLower s of
     "atomic" -> Right ColumnAtomic
     _ -> Left "Expected off, single, or atomic"
 
+-- | Parse a CLI @--strategy@ string (@full@, @ddmin-only@, or @audit-only@).
 parseStrategy :: String -> Either String ReductionStrategy
 parseStrategy s = case map toLower s of
     "full" -> Right StrategyFull
@@ -158,6 +174,7 @@ parseStrategy s = case map toLower s of
     "audit-only" -> Right StrategyAuditOnly
     _ -> Left "Expected full, ddmin-only, or audit-only"
 
+-- | Unvalidated CLI option record before applying JSON config defaults and conflict checks.
 data RawOptions = RawOptions
     { rawInputFile :: !FilePath
     , rawOracleCmd :: !(Maybe String)
@@ -342,9 +359,11 @@ instance FromJSON ConfigPatch where
             <*> obj .:? "quiet"
             <*> optEnum parseColorMode "color" obj "color"
 
+-- | Decode a JSON config file into a partial 'ConfigPatch'.
 parseConfigPatch :: ByteString -> Either String ConfigPatch
 parseConfigPatch = eitherDecodeStrict'
 
+-- | Merge JSON config defaults behind explicit CLI flags after validating the standalone config patch.
 applyConfigPatch :: ConfigPatch -> RawOptions -> Either String RawOptions
 applyConfigPatch patch cliOpts = do
     -- Validate internal consistency of options originating solely from the config file.
@@ -439,6 +458,7 @@ data ValidatedOptions = ValidatedOptions
 -- Two-Phase Validation
 -- ----------------------------------------------------------------------------
 
+-- | Validate merged CLI and config-file options into a total 'ValidatedOptions' record.
 validateCliOptions :: RawOptions -> Either String ValidatedOptions
 validateCliOptions opts@RawOptions {..} = do
     dialect <- maybe (Left "Missing required --dialect (see --list-dialects)") Right rawDialect

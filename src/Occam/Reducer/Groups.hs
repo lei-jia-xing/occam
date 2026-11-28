@@ -22,12 +22,8 @@ import Occam.Certificate (
     checkEarlyRejectionBytesTracked,
     checkEarlyRejectionIdsTracked,
  )
-import Occam.Core (
-    OracleOutcome (..),
-    ResultStatement,
-    Statement (..),
-    StatementId (..),
- )
+import Occam.Core.Oracle (OracleOutcome (..))
+import Occam.Core.Types (ResultStatement, Statement (..), StatementId (..))
 import Occam.Logger (Logger, logInfo')
 import Occam.Metrics (FamilyTag (..), recordAcceptedBytesSaved)
 import Occam.Pool (

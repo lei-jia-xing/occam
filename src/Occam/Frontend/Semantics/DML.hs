@@ -14,11 +14,15 @@ module Occam.Frontend.Semantics.DML (
 import Control.Applicative ((<|>))
 import Data.Foldable qualified as Foldable
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
-import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
-import Occam.Core qualified as Core
-import Occam.Frontend.AST qualified as AST
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Semantics qualified as Core
+import Occam.Frontend.AST.DDL qualified as AST (DropBehavior (..))
+import Occam.Frontend.AST.DML qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (
     AnalysisContext (..),
     IdentifierClass (..),
@@ -32,15 +36,14 @@ import Occam.Frontend.Context (
     unsafeSliceSource,
  )
 import Occam.Frontend.Semantics.Expr (conflictExprColumns, duplicateExprColumns)
-import Occam.Frontend.Semantics.Pure (isValuesMarker)
+import Occam.Frontend.Semantics.Nested (analyzeNested, mergeNested)
+import Occam.Frontend.Semantics.Pure (dedupPreserve, isValuesMarker)
 import Occam.Frontend.Semantics.Query (
     TableSource (..),
     VisitorState (..),
     addUnmodeledBarriers,
-    analyzeNested,
     findSource,
     fromSources,
-    mergeNested,
     sourceFromName,
     tableFactorSource,
     tableWithJoinsSources,
@@ -547,10 +550,3 @@ copyFacts analyzeStmt ctx visitor cp baseFacts =
         isExternal (AST.CopyFile _) = True
         isExternal (AST.CopyProgram _) = True
         isExternal _ = False
-
-dedupPreserve :: (Ord a) => [a] -> [a]
-dedupPreserve = reverse . fst . Foldable.foldl' step ([], Set.empty)
-    where
-        step (acc, seen) x
-            | Set.member x seen = (acc, seen)
-            | otherwise = (x : acc, Set.insert x seen)

@@ -28,7 +28,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (
+import Occam.Core.Schema (
     Constraint (..),
     DeleteScope (..),
     ForeignKey (..),
@@ -42,11 +42,11 @@ import Occam.Core (
     ReadMode (..),
     RelationKind (..),
     SourceColumn (..),
-    StatementId,
     UpdateScope (..),
     ViewColumnLineage (..),
     WriteKind (..),
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Resolve (resolveIndexKeys, resolveRelationKeys, resolveViewSourceKeys)
 import Occam.Dependency.State (
     Catalog (..),
@@ -64,6 +64,8 @@ import Occam.Dependency.State (
  )
 
 -- Relation dependency queries
+
+-- | Statement IDs that defined, schema-wrote, or restored @key@.
 relationDefinitionDeps :: Catalog -> RelationKey -> Set StatementId
 relationDefinitionDeps catalog key =
     case lookupRelation catalog key of
@@ -77,6 +79,7 @@ relationDefinitionDeps catalog key =
                 )
                 `Set.union` relSchemaWrites relation
 
+-- | Dependency edges from writes touching any column in @columns@ (transitive over composite constraints\/FKs).
 relationColumnWriteDeps ::
     SessionState -> Catalog -> RelationKey -> RelationState -> [Ident] -> Set StatementId
 relationColumnWriteDeps session catalog key relation columns
@@ -123,6 +126,7 @@ coupledForeignKeyColumnSets session catalog key =
                 foreignKeyChildColumns foreignKey ++ referencedParentColumns session catalog foreignKey
             | otherwise = referencedParentColumns session catalog foreignKey
 
+-- | All local column names explicitly referenced by a 'Constraint'.
 constraintColumnsOf :: Constraint -> [Ident]
 constraintColumnsOf constraint =
     case constraint of
@@ -152,6 +156,7 @@ referencedParentColumns session catalog foreignKey
             , PrimaryKeyConstraint _ keyColumns <- [constraintValue state]
             ]
 
+-- | Dependency edges for all indexes currently attached to @relation@.
 relationIndexDeps :: Catalog -> RelationState -> Set StatementId
 relationIndexDeps catalog relation =
     Set.unions
@@ -160,6 +165,7 @@ relationIndexDeps catalog relation =
         , Just index <- [Map.lookup key (catalogIndexes catalog)]
         ]
 
+-- | Dependency edges for all triggers currently attached to @relation@.
 relationTriggerDeps :: Catalog -> RelationState -> Set StatementId
 relationTriggerDeps catalog relation =
     Set.unions
@@ -278,6 +284,7 @@ buildLineageReqs session catalog viewIsTemp relation collectedSCs =
                 col = sourceColumnName sc
              in Foldable.foldl' (\acc k -> Map.insertWith combineViewReq k (Just (Set.singleton col)) acc) m keys
 
+-- | Transitive dependency edges for reading @key@ (including views and child partitions unless @only@).
 relationReadDeps ::
     SessionState -> Catalog -> RelationKey -> ReadMode -> [Ident] -> Bool -> Set StatementId
 relationReadDeps session catalog key mode columns only =
@@ -334,6 +341,7 @@ readModeDataDeps session catalog current relation mode cols = case mode of
                 relDataWrites relation
                     `Set.union` relationColumnWriteDeps session catalog current relation (Set.toList cs)
 
+-- | Transitive dependency edges required to perform a DML write on @key@.
 relationWriteDeps ::
     SessionState -> Catalog -> RelationKey -> WriteKind -> [Ident] -> Set StatementId
 relationWriteDeps session catalog key kind columns

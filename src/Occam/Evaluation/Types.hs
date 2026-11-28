@@ -1,3 +1,4 @@
+-- | Configuration, progress, metrics, and minimality types for bounded reduction evaluation.
 module Occam.Evaluation.Types (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -58,6 +59,7 @@ import Occam.Reducer (
     reductionSearchPolicy,
  )
 
+-- | Cache, worker-count, time-budget, and max-execution limits for one evaluation session.
 data EvaluationConfig = EvaluationConfig
     { evaluationCacheEnabled :: !Bool
     , evaluationJobs :: !Int
@@ -77,6 +79,7 @@ instance ToJSON EvaluationConfig where
 instance FromJSON EvaluationConfig where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
+-- | Terminal status explaining how an evaluation run concluded.
 data EvaluationStatus
     = EvaluationCompleted
     | EvaluationTimeout
@@ -86,6 +89,7 @@ data EvaluationStatus
     | EvaluationValidationIncomplete
     deriving (Eq, Ord, Show)
 
+-- | Render an 'EvaluationStatus' as its lowercase kebab-case wire name.
 evaluationStatusName :: EvaluationStatus -> Text
 evaluationStatusName EvaluationCompleted = "completed"
 evaluationStatusName EvaluationTimeout = "timeout"
@@ -94,6 +98,7 @@ evaluationStatusName EvaluationError = "error"
 evaluationStatusName EvaluationValidationFailed = "validation-failed"
 evaluationStatusName EvaluationValidationIncomplete = "validation-incomplete"
 
+-- | Parse a kebab-case 'EvaluationStatus' string.
 parseEvaluationStatusName :: Text -> Maybe EvaluationStatus
 parseEvaluationStatusName "completed" = Just EvaluationCompleted
 parseEvaluationStatusName "timeout" = Just EvaluationTimeout
@@ -111,21 +116,25 @@ instance FromJSON EvaluationStatus where
     parseJSON = withText "EvaluationStatus" \name ->
         maybe (fail ("unknown evaluation status: " <> T.unpack name)) pure (parseEvaluationStatusName name)
 
+-- | Incremental progress event pushed to UI \/ observer callbacks during reduction.
 data EvaluationProgress
     = ProgressStage !Text
     | ProgressCandidateTested !Int !Bool !Bool
     | ProgressCandidateAccepted !Int !(Maybe Int)
     deriving (Eq, Show)
 
+-- | Minimality guarantee achieved by the completed reduction run.
 data MinimalityClaim
     = StatementDeletionOneMinimal
     | MinimalityNotEstablished
     deriving (Eq, Ord, Show)
 
+-- | Render a 'MinimalityClaim' as its kebab-case serialization token.
 minimalityClaimName :: MinimalityClaim -> Text
 minimalityClaimName StatementDeletionOneMinimal = "statement-deletion-1-minimal"
 minimalityClaimName MinimalityNotEstablished = "not-established"
 
+-- | Parse a kebab-case 'MinimalityClaim' token.
 parseMinimalityClaimName :: Text -> Maybe MinimalityClaim
 parseMinimalityClaimName "statement-deletion-1-minimal" = Just StatementDeletionOneMinimal
 parseMinimalityClaimName "not-established" = Just MinimalityNotEstablished
@@ -139,6 +148,7 @@ instance FromJSON MinimalityClaim where
     parseJSON = withText "MinimalityClaim" \name ->
         maybe (fail ("unknown minimality claim: " <> T.unpack name)) pure (parseMinimalityClaimName name)
 
+-- | Parse a CLI or config dialect name string into 'SQLDialect'.
 parseSQLDialect :: String -> Either String SQLDialect
 parseSQLDialect value =
     case lookupDialectByName (T.pack value) of
@@ -150,6 +160,7 @@ parseSQLDialect value =
 sqlDialectName :: SQLDialect -> Text
 sqlDialectName = dialectName
 
+-- | Single accepted or evaluated candidate sample along the size-vs-time reduction curve.
 data EvaluationPoint = EvaluationPoint
     { pointElapsedSeconds :: !Double
     , pointCallIndex :: !Int
@@ -167,6 +178,7 @@ instance ToJSON EvaluationPoint where
 instance FromJSON EvaluationPoint where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
+-- | Aggregate resource, cache, timing, and minimality telemetry for one evaluation run.
 data EvaluationMetrics = EvaluationMetrics
     { evaluationStatus :: !EvaluationStatus
     , evaluationFailure :: !(Maybe Text)
@@ -217,6 +229,7 @@ instance ToJSON EvaluationMetrics where
 instance FromJSON EvaluationMetrics where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
+-- | Final output produced by running a reduction under bounded evaluation.
 data EvaluationResult = EvaluationResult
     { evaluatedSQL :: !ByteString
     , evaluatedStatements :: !(Maybe Int)
@@ -260,11 +273,13 @@ data ReductionActionResult = ReductionActionResult
     }
     deriving (Eq, Show)
 
+-- | Parameterized reduction callback invoked once a bounded 'OraclePool' is ready.
 type ReductionAction = StageReporter -> Logger -> OraclePool -> IO ReductionActionResult
 
--- | All inputs for one evaluated reduction run.
+-- | Observer callback executing a candidate with an on-start hook for timing attribution.
 type EvaluationObserver = IO () -> ByteString -> IO OracleObservationDetails
 
+-- | Full request bundle configuring an evaluated reduction run across dialects and oracles.
 data EvaluationRequest oracle = EvaluationRequest
     { requestOnProgress :: !(EvaluationProgress -> IO ())
     , requestMetricsPolicy :: !(Maybe MetricPolicy)
@@ -279,11 +294,14 @@ data EvaluationRequest oracle = EvaluationRequest
     , requestCollectCurve :: !Bool
     }
 
+-- | Monotonic timestamp measured in nanoseconds.
 type Ticks = Integer
 
+-- | Read the current monotonic clock in nanoseconds.
 ticks :: IO Ticks
 ticks = toInteger <$> getMonotonicTimeNSec
 
+-- | Convert a start/end 'Ticks' pair into elapsed seconds.
 seconds :: Ticks -> Ticks -> Double
 seconds start end = fromIntegral (end - start) / 1000000000
 

@@ -1,4 +1,4 @@
-module Fuzz (fuzzTests, generativeFuzzTests, main) where
+module Fuzz (fuzzTests, generativeFuzzTests) where
 
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
@@ -27,7 +27,7 @@ import Test.QuickCheck (
     vectorOf,
  )
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
-import Test.Tasty (TestTree, defaultMain, localOption, testGroup)
+import Test.Tasty (TestTree, localOption, testGroup)
 import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
 import TestSupport (checkParserValidity)
 
@@ -573,5 +573,3 @@ fuzzTests =
         , mutationalFuzzTests
         , DialectFuzz.tests
         ]
-main :: IO ()
-main = defaultMain fuzzTests

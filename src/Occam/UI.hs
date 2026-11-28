@@ -1,3 +1,4 @@
+-- | Terminal progress rendering and summary formatting for CLI reduction runs.
 module Occam.UI (
     UIConfig (..),
     UI (..),
@@ -44,6 +45,7 @@ import System.ProgressBar (
     updateProgress,
  )
 
+-- | Visual and verbosity settings controlling terminal UI progress output.
 data UIConfig = UIConfig
     { uiTargetFile :: !FilePath
     , uiInitialBytes :: !Int
@@ -81,6 +83,7 @@ data FinishSummary = FinishSummary
     , finishStatsPath :: !FilePath
     }
 
+-- | Callbacks consuming reduction progress updates and final run summaries.
 data UI = UI
     { uiOnProgress :: !(EvaluationProgress -> IO ())
     , uiFinish :: !(FinishSummary -> IO ())

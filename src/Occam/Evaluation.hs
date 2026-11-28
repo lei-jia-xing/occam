@@ -1,3 +1,4 @@
+-- | Budgeted reduction session orchestration, preflight checking, and validation phases.
 module Occam.Evaluation (
     EvaluationConfig (..),
     EvaluationMetrics (..),
@@ -100,6 +101,7 @@ runEvaluatedReduction ::
     IO EvaluationResult
 runEvaluatedReduction = runEvaluatedReductionWithProgress (\_ -> pure ())
 
+-- | Execute an evaluated reduction session while streaming 'EvaluationProgress' callbacks.
 runEvaluatedReductionWithProgress ::
     (EvaluationProgress -> IO ()) ->
     Maybe MetricPolicy ->
@@ -128,6 +130,7 @@ runEvaluatedReductionWithProgress onProgress metricsPolicy config dialect oracle
             , requestCollectCurve = True
             }
 
+-- | Run an 'EvaluationRequest' against an external subprocess oracle configuration.
 runEvaluationRequest :: EvaluationRequest OracleConfig -> IO EvaluationResult
 runEvaluationRequest request = do
     let config = requestOracleConfig request
@@ -135,16 +138,19 @@ runEvaluationRequest request = do
     let observe started = observeExternalOracleDetailedWithContext started config context
     runEvaluationRequestWithObserver (oracleTimeoutMicros config) observe request
 
+-- | Run an 'EvaluationRequest' with a caller-supplied 'EvaluationObserver'.
 runEvaluationRequestWithObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
 runEvaluationRequestWithObserver micros observe =
     runEvaluationRequestWithKey False pure micros observe observe
 
+-- | Run an 'EvaluationRequest' using an in-process native observer and native cache-key canonicalization.
 runEvaluationRequestWithNativeObserver ::
     Int -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
 runEvaluationRequestWithNativeObserver micros observe =
     runEvaluationRequestWithNativeValidation micros observe observe
 
+-- | Like 'runEvaluationRequestWithNativeObserver', supplying a separate clean observer for final validation.
 runEvaluationRequestWithNativeValidation ::
     Int -> EvaluationObserver -> EvaluationObserver -> EvaluationRequest oracle -> IO EvaluationResult
 runEvaluationRequestWithNativeValidation micros observe validate request =

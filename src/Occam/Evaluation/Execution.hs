@@ -1,3 +1,4 @@
+-- | Stateful execution loop for reduction, validation, and post-reduction statement auditing.
 module Occam.Evaluation.Execution (
     EvalEnv (..),
     EvalState (..),
@@ -22,7 +23,7 @@ import Data.IORef (IORef, atomicModifyIORef', readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Occam.AtomicFile (writeAtomicBytes)
-import Occam.Core (OracleOutcome (..))
+import Occam.Core.Oracle (OracleOutcome (..))
 import Occam.Evaluation.Types (
     EvaluationObserver,
     EvaluationPoint (..),
@@ -91,6 +92,7 @@ data EvalState = EvalState
     }
     deriving (Eq, Show)
 
+-- | Construct initial 'EvalState' seeded with the original SQL input and cached statement counts.
 initialEvalState :: ByteString -> Map ByteString Int -> EvalState
 initialEvalState initialSQL seedCounts =
     EvalState
@@ -126,6 +128,7 @@ initialEvalState initialSQL seedCounts =
         , evalAuditResult = Nothing
         }
 
+-- | Atomically apply a pure state transition to the shared 'EvalState' reference.
 modifyEvalState :: IORef EvalState -> (EvalState -> EvalState) -> IO ()
 modifyEvalState ref f = atomicModifyIORef' ref (\s -> (f s, ()))
 
@@ -139,6 +142,7 @@ data EvalEnv = EvalEnv
     , envValidationReserve :: !Integer
     }
 
+-- | Clamp a microsecond budget safely into the @Int@ range expected by 'System.Timeout.timeout'.
 boundedTimeout :: Integer -> Int
 boundedTimeout micros =
     fromInteger (max 0 (min micros (toInteger (maxBound :: Int))))

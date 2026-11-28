@@ -26,14 +26,20 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector (Vector)
 import Data.Vector qualified as V
-import Occam.Core qualified as Core
+import Occam.Core.Schema qualified as Core
+import Occam.Core.Semantics qualified as Core
+import Occam.Core.Types qualified as Core
 import Occam.Facts (
     ParserEdit (..),
     ParserEditCategory (..),
     StatementFacts (..),
     StatementUnit (..),
  )
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.DDL qualified as AST
+import Occam.Frontend.AST.DML qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Columns.Edits (
     buildTokenTable,
     columnDefSpans,

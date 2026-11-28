@@ -22,7 +22,7 @@ import Data.List (partition, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Ord (Down (..))
-import Occam.Core (Span (..), Statement (..))
+import Occam.Core.Types (Span (..), Statement (..))
 import Occam.Metrics (recordGeneratedSkipped)
 import Occam.Parser (
     ColumnSite (..),
@@ -51,6 +51,7 @@ import Occam.Reducer.Syntax.Index (
     unwrappedExpressionRank,
  )
 
+-- | Splice a replacement byte slice over the half-open byte interval @[start, end)@.
 replaceSpan :: Int -> Int -> ByteString -> ByteString -> ByteString
 replaceSpan start end replacement source
     | BS.null replacement =
@@ -64,6 +65,7 @@ replaceSpan start end replacement source
     | otherwise =
         BS.concat [BS.take start source, replacement, BS.drop end source]
 
+-- | Apply a single shrinking 'ParserEdit', returning 'Nothing' if the replacement does not shrink the buffer.
 singleBytes :: ByteString -> ParserEdit -> Maybe ByteString
 singleBytes currentSQL edit
     | BS.length (parserEditReplacement edit) >= parserEditEnd edit - parserEditStart edit = Nothing
@@ -71,6 +73,7 @@ singleBytes currentSQL edit
         Just
             (replaceSpan (parserEditStart edit) (parserEditEnd edit) (parserEditReplacement edit) currentSQL)
 
+-- | Delete every 'ColumnSite' in a 'ColumnTarget' bundle in one coordinated byte edit.
 bundleBytes :: ByteString -> ColumnTarget -> Maybe ByteString
 bundleBytes currentSQL target =
     applySpans [(siteStart site, siteEnd site) | site <- targetSites target] currentSQL

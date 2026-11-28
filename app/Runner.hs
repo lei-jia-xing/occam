@@ -1,3 +1,4 @@
+-- | CLI reduction orchestration connecting oracle preparation, reduction strategies, and outputs.
 module Runner (
     runOccam,
 ) where
@@ -100,6 +101,7 @@ import System.Exit (exitFailure, exitSuccess)
 import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
 import System.Timeout (timeout)
 
+-- | Initialized oracle callbacks, preflight timing, budget config, and optional result trace lookup.
 data PreparedOracle = PreparedOracle
     { poInitialStart :: !UTCTime
     , poInitialEnd :: !UTCTime
@@ -121,6 +123,7 @@ resolveLogLevel ValidatedOptions {..}
             | valLogFormat == FormatJSON -> LevelInfo
             | otherwise -> defLvl
 
+-- | Run the full CLI reduction pipeline from validated options.
 runOccam :: ValidatedOptions -> IO ()
 runOccam opts@ValidatedOptions {..} = do
     isStderrTTY <- hIsTerminalDevice stderr

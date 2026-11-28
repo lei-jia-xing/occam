@@ -6,6 +6,7 @@ module Occam.Oracle.Result (ResultSet (..)) where
 import Data.Aeson (Value)
 import Data.Text (Text)
 
+-- | Query result schema (column names, engine column types, and decoded row values).
 data ResultSet = ResultSet
     { resultColumns :: ![Text]
     , resultColumnTypes :: ![Int]

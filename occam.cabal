@@ -21,7 +21,6 @@ common warnings
     ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
                  -Wincomplete-uni-patterns -Wmissing-export-lists
                  -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
-                 -O2
 
 common language
     default-language: GHC2021
@@ -95,6 +94,13 @@ library
     other-modules:    Paths_occam
                     , Occam.Core.Schema
                     , Occam.Core.Semantics
+                    , Occam.Core.Oracle
+                    , Occam.Core.Types
+                    , Occam.Frontend.AST.DDL
+                    , Occam.Frontend.AST.DML
+                    , Occam.Frontend.AST.Expr
+                    , Occam.Frontend.AST.Query
+                    , Occam.Frontend.AST.Statement
                     , Occam.Frontend.Columns.Analysis
                     , Occam.Frontend.Columns.Assemble
                     , Occam.Frontend.Columns.Edits
@@ -104,18 +110,31 @@ library
                     , Occam.Frontend.Edits.Query
                     , Occam.Frontend.Edits.Stmt
                     , Occam.Frontend.Edits.Tokens
+                    , Occam.Frontend.Lexer.Keyword
+                    , Occam.Frontend.Lexer.Scan
+                    , Occam.Frontend.Lexer.Token
                     , Occam.Frontend.Parser.Core
                     , Occam.Frontend.Parser.DDL
+                    , Occam.Frontend.Parser.DDL.AlterDrop
+                    , Occam.Frontend.Parser.DDL.CreateObject
+                    , Occam.Frontend.Parser.DDL.CreateTable
                     , Occam.Frontend.Parser.Expr
                     , Occam.Frontend.Parser.Query
                     , Occam.Frontend.Parser.Stmt
+                    , Occam.Frontend.Parser.Stmt.DML
+                    , Occam.Frontend.Parser.Stmt.Session
+                    , Occam.Frontend.Parser.Stmt.Utility
                     , Occam.Frontend.Semantics.DDL
+                    , Occam.Frontend.Semantics.DDL.AlterDrop
+                    , Occam.Frontend.Semantics.DDL.Create
                     , Occam.Frontend.Semantics.DML
+                    , Occam.Frontend.Semantics.Nested
                     , Occam.Frontend.Semantics.Expr
                     , Occam.Frontend.Semantics.Pure
                     , Occam.Frontend.Semantics.Query
                     , Occam.Frontend.Semantics.Sequence
                     , Occam.Frontend.Semantics.Session
+                    , Occam.Frontend.Splitter.Delimiter
                     , Occam.Certificate.MissingDef
                     , Occam.Certificate.PrefixCache
                     , Occam.Json
@@ -171,16 +190,10 @@ library
                     , vector >= 0.13 && < 0.14
     hs-source-dirs:   src
 
-executable occam
+library occam-oracle
     import:           warnings, language, core-deps, io-deps
-    main-is:          Main.hs
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
-    other-modules:    Completion
-                    , Options
-                    , Options.Parser
-                    , Output
-                    , Runner
-                    , Occam.Oracle.Inline
+    visibility:       private
+    exposed-modules:  Occam.Oracle.Inline
                     , Occam.Oracle.Result
                     , Occam.Oracle.Sqlite
                     , Occam.Oracle.Sqlite.FFI
@@ -192,19 +205,16 @@ executable occam
                     , Occam.Oracle.DuckDB.Replay
                     , Occam.Oracle.DuckDB.Result
     build-depends:    occam
-                    , time
-                    , optparse-applicative >= 0.17 && < 0.20
                     , direct-sqlite >= 2.3 && < 2.4
                     , safe-exceptions >= 0.1 && < 0.2
+    hs-source-dirs:   eval-lib
     c-sources:        eval-lib/cbits/duckdb_result.c
                       eval-lib/cbits/sqlite_authorizer.c
-    hs-source-dirs:   app eval-lib
 
-executable occam-harness
+library occam-harness-lib
     import:           warnings, language, core-deps, io-deps
-    main-is:          HarnessMain.hs
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
-    other-modules:    Occam.Benchmark.BatchReport
+    visibility:       private
+    exposed-modules:  Occam.Benchmark.BatchReport
                     , Occam.Benchmark.Metrics
                     , Occam.Harness.BarrierCensus
                     , Occam.Harness.Batch
@@ -223,6 +233,13 @@ executable occam-harness
                     , Occam.Harness.Reset
                     , Occam.Harness.Signature
                     , Occam.Harness.SqlancerSanitize
+    other-modules:    Occam.Harness.Evidence.ClickHouse
+                    , Occam.Harness.Evidence.Common
+                    , Occam.Harness.Evidence.DuckDB
+                    , Occam.Harness.Evidence.Mysql
+                    , Occam.Harness.Evidence.Postgres
+                    , Occam.Harness.Evidence.Sqlite
+                    , Occam.Harness.Signature.StackFrame
     build-depends:    occam
                     , base16-bytestring >= 1.0 && < 1.1
                     , cryptohash-sha256 >= 0.11 && < 0.12
@@ -230,30 +247,37 @@ executable occam-harness
                     , process >= 1.6 && < 1.7
                     , safe-exceptions >= 0.1 && < 0.2
                     , time
-    hs-source-dirs:   app eval-lib
+    hs-source-dirs:   eval-lib
 
-test-suite occam-fuzz
-    import:           warnings, language, core-deps, rts-threaded
-    type:             exitcode-stdio-1.0
-    hs-source-dirs:   test
-    other-modules:    DialectFuzz
-                    , Fuzz
-                    , MutationalFuzz
-                    , TestSupport
-    main-is:          FuzzMain.hs
+executable occam
+    import:           warnings, language, core-deps, io-deps
+    main-is:          Main.hs
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
+    other-modules:    Completion
+                    , Options
+                    , Options.Parser
+                    , Output
+                    , Runner
     build-depends:    occam
-                    , directory
-                    , tasty
-                    , tasty-quickcheck
-                    , QuickCheck >= 2.14
+                    , occam:occam-oracle
+                    , time
+                    , optparse-applicative >= 0.17 && < 0.20
+    hs-source-dirs:   app
+
+executable occam-harness
+    import:           warnings, language
+    main-is:          HarnessMain.hs
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -A16m"
+    build-depends:    base >= 4.18 && < 5
+                    , occam:occam-harness-lib
+    hs-source-dirs:   app
 
 test-suite occam-test
     import:           warnings, language, core-deps, io-deps, rts-threaded
     type:             exitcode-stdio-1.0
-    c-sources:        eval-lib/cbits/duckdb_result.c
-                      eval-lib/cbits/sqlite_authorizer.c
-                      test/cbits/pg_query_shim.c
-    hs-source-dirs:   test eval-lib
+    ghc-options:      -O0
+    c-sources:        test/cbits/pg_query_shim.c
+    hs-source-dirs:   test
     other-modules:    DialectFuzz
                     , ExtraEngineOracles
                     , Fuzz
@@ -291,6 +315,8 @@ test-suite occam-test
                     , FrontendSemanticsChecks
                     , OracleChecks
                     , ParserChecks
+                    , ParserChecks.AstAndScriptChecks
+                    , ParserChecks.Support
                     , PoolChecks
                     , PoolMetricsChecks
                     , PropertyChecks
@@ -303,40 +329,10 @@ test-suite occam-test
                     , SemanticAlignmentChecks
                     , SqliteOracleChecks
                     , SyntaxAlignmentChecks
-                    , Occam.Oracle.Inline
-                    , Occam.Oracle.Result
-                    , Occam.Oracle.Sqlite
-                    , Occam.Oracle.Sqlite.FFI
-                    , Occam.Oracle.Sqlite.Match
-                    , Occam.Oracle.Sqlite.Result
-                    , Occam.Oracle.DuckDB
-                    , Occam.Oracle.DuckDB.Execution
-                    , Occam.Oracle.DuckDB.FFI
-                    , Occam.Oracle.DuckDB.Replay
-                    , Occam.Oracle.DuckDB.Result
-                    , Occam.Benchmark.BatchReport
-                    , Occam.Benchmark.Metrics
-                    , Occam.Harness.BarrierCensus
-                    , Occam.Harness.Batch
-                    , Occam.Harness.BatchInputs
-                    , Occam.Harness.BatchPlan
-                    , Occam.Harness.Checkpoints
-                    , Occam.Harness.Cli
-                    , Occam.Harness.Collect
-                    , Occam.Harness.Config
-                    , Occam.Harness.Corpus
-                    , Occam.Harness.DbmsExec
-                    , Occam.Harness.Evidence
-                    , Occam.Harness.Oracle
-                    , Occam.Harness.Regex
-                    , Occam.Harness.Replay
-                    , Occam.Harness.Reset
-                    , Occam.Harness.Signature
-                    , Occam.Harness.SqlancerSanitize
     main-is:          Spec.hs
     build-depends:    occam
-                    , base16-bytestring >= 1.0 && < 1.1
-                    , cryptohash-sha256 >= 0.11 && < 0.12
+                    , occam:occam-oracle
+                    , occam:occam-harness-lib
                     , process
                     , optparse-applicative
                     , tasty
@@ -351,25 +347,11 @@ test-suite occam-test
 benchmark occam-bench
     import:           warnings, language, core-deps, io-deps, rts-bench
     type:             exitcode-stdio-1.0
-    c-sources:        eval-lib/cbits/duckdb_result.c
-                      eval-lib/cbits/sqlite_authorizer.c
-    hs-source-dirs:   bench eval-lib
-    other-modules:    Occam.Oracle.Result
-                    , Occam.Oracle.Inline
-                    , ResultBaseline
-                    , Occam.Oracle.Sqlite
-                    , Occam.Oracle.Sqlite.FFI
-                    , Occam.Oracle.Sqlite.Match
-                    , Occam.Oracle.Sqlite.Result
-                    , Occam.Oracle.DuckDB
-                    , Occam.Oracle.DuckDB.Execution
-                    , Occam.Oracle.DuckDB.FFI
-                    , Occam.Oracle.DuckDB.Replay
-                    , Occam.Oracle.DuckDB.Result
+    hs-source-dirs:   bench
+    other-modules:    ResultBaseline
                     , Paths_occam
     autogen-modules:  Paths_occam
     main-is:          Main.hs
     build-depends:    occam
+                    , occam:occam-oracle
                     , tasty-bench >= 0.3 && < 0.6
-                    , direct-sqlite >= 2.3 && < 2.4
-                    , safe-exceptions >= 0.1 && < 0.2

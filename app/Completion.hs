@@ -1,3 +1,4 @@
+-- | Shell-completion script generation (@--completion bash|zsh|fish@).
 module Completion (
     ShellType (..),
     parseShellType,

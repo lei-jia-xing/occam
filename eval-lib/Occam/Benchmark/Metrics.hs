@@ -1,3 +1,4 @@
+-- | Benchmark summary computation, attempt-AUC integration, and engine overhead attribution.
 module Occam.Benchmark.Metrics (
     Stats (..),
     RunSummary (..),
@@ -136,6 +137,7 @@ engineOverheadMicros (Just MetricsSnapshot {..}) =
         candidateBuild = sum [candidateBuildMicros c | c <- Map.elems snapshotFamilies]
      in Just (ffi + decode + candidateBuild)
 
+-- | Components parsed from a structured @case__arm__rep@ benchmark run identifier.
 data RunNameParts = RunNameParts
     { partCase :: !(Maybe Text)
     , partArm :: !(Maybe Text)

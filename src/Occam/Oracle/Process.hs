@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 
+-- | POSIX process-group isolation, environment scrubbing, and bounded subprocess execution.
 module Occam.Oracle.Process (
     OracleContext (..),
     OracleReapFailed (..),
@@ -230,14 +231,17 @@ parseDirectCommand cmd
             , "while"
             ]
 
+-- | Convert a 'CmdSpec' to a 'CreateProcess' description without modifying IO handles.
 cmdSpecToProcess :: CmdSpec -> CreateProcess
 cmdSpecToProcess (ShellCommand cmd) = shell cmd
 cmdSpecToProcess (RawCommand bin args) = proc bin args
 
+-- | Execute a subprocess in its own process group with a timeout and stdin payload.
 runProcessGroup :: Int -> CreateProcess -> ByteString -> IO (Maybe ExitCode)
 runProcessGroup timeoutMicros command input =
     snd <$> runProcessGroupWithStart (pure ()) timeoutMicros command input
 
+-- | Like 'runProcessGroup', invoking a callback once the child starts and returning whether it started.
 runProcessGroupWithStart ::
     IO () ->
     Int ->
@@ -343,6 +347,7 @@ cleanupOwnedGroup _ ph reaper = do
 isCandidateOverrideKey :: String -> Bool
 isCandidateOverrideKey k = map toUpper k `elem` candidateOverrideKeys
 
+-- | Return 'ShellCommand' directly on Windows hosts.
 resolveShellCommand :: String -> IO CmdSpec
 resolveShellCommand = pure . ShellCommand
 #else
@@ -459,15 +464,18 @@ writePipe h bytes =
         )
         `finally` ignoreIOException (hClose h)
 
+-- | Run an 'IO' action catching any 'IOException' into @Either@.
 tryIOException :: IO a -> IO (Either IOException a)
 tryIOException = try
 
 ignoreIOException :: IO () -> IO ()
 ignoreIOException = handle (\(_ :: IOException) -> pure ())
 
+-- | Run an action inside a fresh temporary directory matching @occam-candidate-*@.
 withCandidateWorkdir :: (FilePath -> IO a) -> IO a
 withCandidateWorkdir = withSystemTempDirectory "occam-candidate-"
 
+-- | Resolve a command path relative to @PATH@ or the current working directory.
 resolveExecutable :: FilePath -> IO FilePath
 resolveExecutable executablePath
     | isAbsolute executablePath || any isPathSeparator executablePath = makeAbsolute executablePath
@@ -487,19 +495,23 @@ candidateOverrides workDir originalDir =
     , ("TEMP", workDir)
     ]
 
+-- | Capture the current process environment stripped of Occam candidate override variables.
 baseEnvironment :: IO [(String, String)]
 baseEnvironment =
     filter (not . isCandidateOverrideKey . fst) <$> getEnvironment
 
+-- | Build an isolated candidate subprocess environment backed by @workDir@.
 candidateEnvironment :: FilePath -> IO [(String, String)]
 candidateEnvironment workDir = do
     base <- baseEnvironment
     originalDir <- getCurrentDirectory
     pure (candidateOverrides workDir originalDir ++ base)
 
+-- | Build a candidate subprocess environment from a pre-captured 'OracleContext'.
 candidateEnvironmentWith :: OracleContext -> FilePath -> [(String, String)]
 candidateEnvironmentWith OracleContext {..} workDir =
     candidateOverrides workDir contextOriginalDir ++ contextBaseEnvironment
 
+-- | Compute elapsed microseconds between two monotonic nanosecond timestamps.
 elapsedMicros :: Word64 -> Word64 -> Int
 elapsedMicros start end = fromIntegral ((end - start) `div` 1000)

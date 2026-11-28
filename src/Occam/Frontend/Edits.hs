@@ -8,7 +8,7 @@ module Occam.Frontend.Edits (
 ) where
 
 import Occam.Facts (ParserEdit)
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (AnalysisContext (..))
 import Occam.Frontend.Edits.Core (runEditM)
 import Occam.Frontend.Edits.Stmt (visitStatement)

@@ -43,18 +43,15 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (
+import Occam.Core.Schema (DropMode (..), Ident, Name (..), OnCommitAction (..))
+import Occam.Core.Semantics (
     BeginPolicy (..),
-    DropMode (..),
-    Ident,
-    Name (..),
-    OnCommitAction (..),
     SessionValue (..),
-    StatementId,
     TriggerBody (..),
     TriggerTiming (..),
     TxEffect (..),
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Drop (removeRelationCascade)
 import Occam.Dependency.State (
     Catalog (..),

@@ -23,7 +23,7 @@ import Data.IntSet qualified as IntSet
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Occam.Core (Span (..), Statement (..), StatementId (..))
+import Occam.Core.Types (Span (..), Statement (..), StatementId (..))
 import Occam.Dependency (DependencyGraph (..))
 import Occam.Slicer (backwardSliceMany, backwardSliceManyFast)
 
@@ -89,6 +89,7 @@ cutRemovedStatementInts baseSQL allStatements keptInts =
                             else id
                  in prefix (chunks nextStart rest)
 
+-- | Rebuild minimal SQL retaining @keptStatements@ (list wrapper over 'cutRemovedStatementInts').
 cutRemovedStatements :: ByteString -> [Statement] -> [Statement] -> ByteString
 cutRemovedStatements baseSQL allStatements keptStatements =
     cutRemovedStatementInts baseSQL allStatements (statementIdsInt keptStatements)
@@ -116,6 +117,7 @@ partitionStatementsByBytes groups statements =
         [(s, statementSpanBytes s) | s <- statements]
         (sum (map statementSpanBytes statements))
 
+-- | Partition statements into contiguous groups balanced by supplied integer weights.
 partitionStatementsByWeights :: Int -> [(Statement, Int)] -> Int -> [[Statement]]
 partitionStatementsByWeights groups statementsWithWeights totalBytes =
     go groups (length statementsWithWeights) totalBytes statementsWithWeights
@@ -134,11 +136,13 @@ partitionStatementsByWeights groups statementsWithWeights totalBytes =
                 consume target (slots - 1) (nextStmt : taken) (consumed + 1) (weight + nextWeight) rest
         consume _ _ taken consumed weight rest = (reverse taken, rest, consumed, weight)
 
+-- | UTF-8 byte span length covered by one statement.
 statementSpanBytes :: Statement -> Int
 statementSpanBytes statement =
     let Span start end = stmtSpan statement
      in end - start
 
+-- | Collect statement IDs as a 'Set StatementId'.
 statementIds :: [Statement] -> Set StatementId
 statementIds = Set.fromList . map stmtId
 

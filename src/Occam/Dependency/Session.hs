@@ -12,16 +12,14 @@ import Data.Foldable qualified as Foldable
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Occam.Core (
-    Ident,
-    Name (..),
+import Occam.Core.Schema (Ident, Name (..), nameText)
+import Occam.Core.Semantics (
     SearchPathValue (..),
     SessionEffect (..),
     SessionScope (..),
     SessionValue (..),
-    StatementId,
-    nameText,
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Query (namespaceDeps)
 import Occam.Dependency.State (
     BarrierKey (..),
@@ -33,6 +31,7 @@ import Occam.Dependency.State (
     effectiveSessionUser,
  )
 
+-- | Apply a statement's ordered 'SessionEffect' list, recording dependencies and whether session state changed.
 applySessionEffects :: StatementId -> [SessionEffect] -> Eval -> (Eval, Bool)
 applySessionEffects _ effects eval =
     let eval' =
@@ -65,6 +64,7 @@ applySessionEffects _ effects eval =
         searchPathDeps current session =
             Set.unions [namespaceDeps (evalCatalog current) parts | Name parts <- effectiveSearchPath session]
 
+-- | Purely apply one 'SessionEffect' transition to 'SessionState'.
 applySessionEffect :: SessionEffect -> SessionState -> SessionState
 applySessionEffect effect session =
     case effect of
@@ -128,6 +128,7 @@ applySessionEffect effect session =
                         , sessTxVariables = Map.empty
                         }
 
+-- | Update session-local or transaction-local schema @search_path@.
 setSearchPath :: SessionScope -> SearchPathValue -> SessionState -> SessionState
 setSearchPath scope path session =
     case scope of
@@ -156,6 +157,7 @@ setSessionUser scope user session =
                 , sessTxCurrentUser = Just user
                 }
 
+-- | Update @current_user@ (e.g. via @SET ROLE@) in the target scope.
 setCurrentUser :: SessionScope -> Maybe Ident -> SessionState -> SessionState
 setCurrentUser scope user session =
     case scope of
@@ -163,6 +165,7 @@ setCurrentUser scope user session =
         ScopeGlobal -> session
         _ -> session {sessTxCurrentUser = Just user}
 
+-- | Bind or reset a session\/transaction configuration variable.
 setVariable :: SessionScope -> Text -> SessionValue -> SessionState -> SessionState
 setVariable scope key value session =
     let update current =

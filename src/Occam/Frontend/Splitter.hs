@@ -9,7 +9,6 @@ module Occam.Frontend.Splitter (
 import Control.Monad (guard)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.ByteString.Unsafe qualified as BSU
 import Data.Vector (Vector)
 import Data.Vector qualified as V
 import Occam.Frontend.Lexer (
@@ -17,7 +16,6 @@ import Occam.Frontend.Lexer (
     LexError (..),
     LexErrorKind (..),
     LexResult (..),
-    LiteralKind (..),
     SpannedToken,
     Token (..),
     WordToken (..),
@@ -26,8 +24,113 @@ import Occam.Frontend.Lexer (
     lexSQL,
  )
 import Occam.Frontend.Span (ByteSpan (..), Located (..), unsafeSliceSpan)
+import Occam.Frontend.Splitter.Delimiter (
+    attachedDelimiter,
+    isDelimiterWord,
+    matchCustomDelimiter,
+    parseDelimiterDirective,
+ )
 import Occam.Parser.Dialect (DialectProfile (..), LexicalProfile (..))
 import Occam.Parser.Types (SQLDialect (..))
+
+isNonCompoundCreateTarget :: Keyword -> Bool
+isNonCompoundCreateTarget kw =
+    kw
+        `elem` [ KwTable
+               , KwView
+               , KwIndex
+               , KwSchema
+               , KwDatabase
+               , KwSequence
+               , KwRule
+               , KwConversion
+               , KwStatistics
+               ]
+
+isNonCompoundCreateWord :: ByteString -> Bool
+isNonCompoundCreateWord raw =
+    any
+        (asciiEqCI raw)
+        [ "POLICY"
+        , "TYPE"
+        , "DOMAIN"
+        , "EXTENSION"
+        , "AGGREGATE"
+        , "OPERATOR"
+        , "CAST"
+        , "FOREIGN"
+        , "USER"
+        , "ROLE"
+        , "TABLESPACE"
+        , "COLLATION"
+        , "PUBLICATION"
+        , "SUBSCRIPTION"
+        , "TEXT"
+        ]
+
+isPrevKeyword :: Keyword -> Maybe Token -> Bool
+isPrevKeyword expected = \case
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) -> kw == expected
+    _ -> False
+
+isBeginExcludedPrev :: Maybe Token -> Bool
+isBeginExcludedPrev mPrev =
+    isPrevKeyword KwAs mPrev || isPrevKeyword KwOn mPrev
+
+isCompoundStmtStart :: Maybe Token -> Bool
+isCompoundStmtStart = \case
+    Just TokSemicolon -> True
+    Just TokColon -> True
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) ->
+        kw `elem` [KwBegin, KwThen, KwElse, KwDo, KwLoop, KwRepeat, KwAtomic]
+    _ -> False
+
+isTransactionBegin :: (Maybe Token, Maybe Token) -> Bool
+isTransactionBegin (first, second) = case first of
+    Nothing -> True
+    Just TokSemicolon -> True
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) ->
+        kw
+            `elem` [ KwTransaction
+                   , KwWork
+                   , KwDeferred
+                   , KwImmediate
+                   , KwExclusive
+                   , KwIsolation
+                   , KwRead
+                   , KwDeferrable
+                   ]
+            || (kw == KwNot && splitIsUnquotedKeyword KwDeferrable second)
+    _ -> False
+
+splitIsUnquotedKeyword :: Keyword -> Maybe Token -> Bool
+splitIsUnquotedKeyword expected = \case
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) -> kw == expected
+    _ -> False
+
+isDdlOrFuncIf :: (Maybe Token, Maybe Token) -> Bool
+isDdlOrFuncIf (first, second) = case first of
+    Just TokLParen -> True
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwExists}) -> True
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwNot}) ->
+        splitIsUnquotedKeyword KwExists second
+    _ -> False
+
+isClauseFor :: Maybe Token -> Bool
+isClauseFor = \case
+    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) ->
+        kw `elem` [KwEach, KwUpdate, KwShare, KwKey, KwNo, KwSystemTime]
+    _ -> False
+
+closesBlock :: SQLDialect -> Keyword -> BlockKind -> Bool
+closesBlock dialect kw block = case kw of
+    KwIf -> block == BlockIf
+    KwLoop -> block == BlockLoop || (dialect == PostgreSQL && block `elem` [BlockWhile, BlockFor])
+    KwWhile -> block == BlockWhile
+    KwRepeat -> block == BlockRepeat
+    KwFor -> block == BlockFor
+    KwCase -> block == BlockCase
+    _ -> False
 
 -- | A top-level statement slice produced prior to full grammar parsing.
 data SplitUnit = SplitUnit
@@ -155,11 +258,11 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             | ssDelimiter st == ";" && tok == TokSemicolon =
                 go (i + 1) st {ssLastTopLevelEndIdx = i + 1}
             | ssDelimiter st /= ";"
-            , Just (!nextIdx, _) <- matchCustomDelimiter i (ssDelimiter st) =
+            , Just (!nextIdx, _) <- matchCustomDelimiter sql sqlLen vec n i (ssDelimiter st) =
                 go nextIdx st {ssLastTopLevelEndIdx = nextIdx}
             | supportsDelimiter
             , isDelimiterWord tok
-            , Just (!delimEndByte, !newDelim, !afterArgIdx) <- parseDelimiterDirective i =
+            , Just (!delimEndByte, !newDelim, !afterArgIdx) <- parseDelimiterDirective sql sqlLen vec n i =
                 let !startByte = spanStart (locSpan (tokAt i))
                     unit =
                         SplitUnit
@@ -198,22 +301,12 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             | let delimiter = ssDelimiter st
             , delimiter /= ";"
             , outsideGrouping st =
-                case matchCustomDelimiter i delimiter of
+                case matchCustomDelimiter sql sqlLen vec n i delimiter of
                     Just (nextIdx, delimSpan) -> emitUnit sIdx delimSpan Nothing nextIdx st
-                    Nothing -> case attachedDelimiter i tok delimiter of
+                    Nothing -> case attachedDelimiter tok (locSpan (tokAt i)) delimiter of
                         Just delimSpan -> emitUnit sIdx delimSpan (Just i) (i + 1) st
                         Nothing -> stepToken isFirst i tok st
             | otherwise = stepToken isFirst i tok st
-
-        -- A client delimiter can be part of a lexically valid bare identifier.
-        -- Keep the ordinary tokenization until the delimiter is actually active.
-        attachedDelimiter !i tok delimiter = case tok of
-            TokWord WordToken {wordQuote = Nothing, wordRaw = raw}
-                | BS.length raw > BS.length delimiter
-                , BS.isSuffixOf delimiter raw ->
-                    let !wordEnd = spanEnd (locSpan (tokAt i))
-                     in Just (ByteSpan (wordEnd - BS.length delimiter) wordEnd)
-            _ -> Nothing
 
         emitUnit !sIdx !delimSpan !clippedWord !nextIdx !st =
             let unit =
@@ -289,39 +382,6 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
                     _ -> st
                 _ -> st
 
-        isNonCompoundCreateTarget kw =
-            kw
-                `elem` [ KwTable
-                       , KwView
-                       , KwIndex
-                       , KwSchema
-                       , KwDatabase
-                       , KwSequence
-                       , KwRule
-                       , KwConversion
-                       , KwStatistics
-                       ]
-
-        isNonCompoundCreateWord raw =
-            any
-                (asciiEqCI raw)
-                [ "POLICY"
-                , "TYPE"
-                , "DOMAIN"
-                , "EXTENSION"
-                , "AGGREGATE"
-                , "OPERATOR"
-                , "CAST"
-                , "FOREIGN"
-                , "USER"
-                , "ROLE"
-                , "TABLESPACE"
-                , "COLLATION"
-                , "PUBLICATION"
-                , "SUBSCRIPTION"
-                , "TEXT"
-                ]
-
         {-# INLINE advance #-}
         advance !nextIdx !lastTok !st =
             go
@@ -343,7 +403,7 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
                     <$ guard
                         ( if null stack
                             then
-                                (isFirst && dialect == MariaDB && not (isTransactionBegin (i + 1)))
+                                (isFirst && dialect == MariaDB && not (isTransactionBegin (nextTwoNonTriviaToks (i + 1))))
                                     || ( ssHeaderKind st == HeaderAllowCompound
                                             && (not (isBeginExcludedPrev prev) || startsBodyAfterAs prev (i + 1))
                                        )
@@ -353,23 +413,16 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             KwCase ->
                 BlockCase
                     <$ guard ((isFirst || not (null stack)) && not (isPrevKeyword KwAs prev))
-            KwIf -> BlockIf <$ guard (nestedStart && not (isDdlOrFuncIf (i + 1)))
+            KwIf -> BlockIf <$ guard (nestedStart && not (isDdlOrFuncIf (nextTwoNonTriviaToks (i + 1))))
             KwLoop -> BlockLoop <$ guard nestedStart
             KwWhile -> BlockWhile <$ guard nestedStart
             KwRepeat -> BlockRepeat <$ guard (nestedStart && nextNonTriviaTok (i + 1) /= Just TokLParen)
-            KwFor -> BlockFor <$ guard (nestedStart && not (isClauseFor (i + 1)))
+            KwFor -> BlockFor <$ guard (nestedStart && not (isClauseFor (nextNonTriviaTok (i + 1))))
             _ -> Nothing
             where
                 stack = ssBlockStack st
                 prev = ssPrevNonTrivia st
                 nestedStart = not (null stack) && isCompoundStmtStart prev
-
-        isPrevKeyword expected = \case
-            Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) -> kw == expected
-            _ -> False
-
-        isBeginExcludedPrev mPrev =
-            isPrevKeyword KwAs mPrev || isPrevKeyword KwOn mPrev
 
         startsBodyAfterAs prev !afterIdx =
             isPrevKeyword KwAs prev && case nextNonTriviaTok afterIdx of
@@ -383,52 +436,11 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwAtomic}) -> True
             _ -> False
 
-        isCompoundStmtStart = \case
-            Just TokSemicolon -> True
-            Just TokColon -> True
-            Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) ->
-                kw `elem` [KwBegin, KwThen, KwElse, KwDo, KwLoop, KwRepeat, KwAtomic]
-            _ -> False
-
-        isTransactionBegin !afterIdx = case nextTwoNonTriviaToks afterIdx of
-            (Nothing, _) -> True
-            (Just TokSemicolon, _) -> True
-            (Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}), mNext2) ->
-                kw
-                    `elem` [ KwTransaction
-                           , KwWork
-                           , KwDeferred
-                           , KwImmediate
-                           , KwExclusive
-                           , KwIsolation
-                           , KwRead
-                           , KwDeferrable
-                           ]
-                    || (kw == KwNot && isUnquotedKw KwDeferrable mNext2)
-            _ -> False
-            where
-                isUnquotedKw expected = \case
-                    Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) -> kw == expected
-                    _ -> False
-
-        isDdlOrFuncIf !afterIdx = case nextTwoNonTriviaToks afterIdx of
-            (Just TokLParen, _) -> True
-            (Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwExists}), _) -> True
-            ( Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwNot})
-                , Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just KwExists})
-                ) -> True
-            _ -> False
-
-        isClauseFor !afterIdx = case nextNonTriviaTok afterIdx of
-            Just (TokWord WordToken {wordQuote = Nothing, wordKeyword = Just kw}) ->
-                kw `elem` [KwEach, KwUpdate, KwShare, KwKey, KwNo, KwSystemTime]
-            _ -> False
-
         handleEnd !i !tok !st = case ssBlockStack st of
             top : rest
                 | Just nextIdx <- nextNonTriviaFrom (i + 1)
                 , TokWord WordToken {wordQuote = Nothing, wordKeyword = Just nextKw} <- locValue (tokAt nextIdx)
-                , closesBlock nextKw top
+                , closesBlock dialect nextKw top
                 , startsClosure || top `elem` [BlockCase, BlockRepeat] ->
                     advance (nextIdx + 1) (locValue (tokAt nextIdx)) st {ssBlockStack = rest}
                 | top == BlockCase || (top == BlockBegin && startsClosure) ->
@@ -436,69 +448,6 @@ runSplit profile sql vec mErr emitStatement emitDirective initial = go 0 initSta
             _ -> advance (i + 1) tok st
             where
                 startsClosure = isCompoundStmtStart (ssPrevNonTrivia st)
-
-        closesBlock kw block = case kw of
-            KwIf -> block == BlockIf
-            KwLoop -> block == BlockLoop || (dialect == PostgreSQL && block `elem` [BlockWhile, BlockFor])
-            KwWhile -> block == BlockWhile
-            KwRepeat -> block == BlockRepeat
-            KwFor -> block == BlockFor
-            KwCase -> block == BlockCase
-            _ -> False
-
-        matchCustomDelimiter !i !delim = do
-            guard (not (BS.null delim))
-            guard (not (isQuotedLitOrIdent (locValue (tokAt i))))
-            let !startByte = spanStart (locSpan (tokAt i))
-                !dLen = BS.length delim
-                !endByte = startByte + dLen
-            guard (endByte <= sqlLen)
-            guard (BS.isPrefixOf delim (BSU.unsafeDrop startByte sql))
-            nextIdx <- consumeDelimTokens i endByte
-            pure (nextIdx, ByteSpan startByte endByte)
-
-        isQuotedLitOrIdent (TokLiteral LitNumber _) = False
-        isQuotedLitOrIdent (TokLiteral {}) = True
-        isQuotedLitOrIdent (TokWord WordToken {wordQuote = Just _}) = True
-        isQuotedLitOrIdent _ = False
-
-        consumeDelimTokens !k !targetEnd = do
-            guard (k < n)
-            guard (not (isTriviaToken (locValue (tokAt k))))
-            let !e = spanEnd (locSpan (tokAt k))
-            if e == targetEnd
-                then pure (k + 1)
-                else guard (e < targetEnd) *> consumeDelimTokens (k + 1) targetEnd
-
-        isDelimiterWord (TokWord WordToken {wordQuote = Nothing, wordRaw = raw}) =
-            BS.length raw == 9 && asciiEqCI raw "DELIMITER"
-        isDelimiterWord _ = False
-
-        parseDelimiterDirective !i = do
-            let !afterKw = spanEnd (locSpan (tokAt i))
-                !argStart = skipHorizSpace afterKw
-            guard (argStart > afterKw && argStart < sqlLen)
-            let !argEnd = scanDelimArg argStart
-            guard (argEnd > argStart)
-            let !newDelim = unsafeSliceSpan (ByteSpan argStart argEnd) sql
-                !afterArg = skipToksBefore argEnd (i + 1)
-            pure (argEnd, newDelim, afterArg)
-
-        skipHorizSpace !p
-            | p < sqlLen && (b == 32 || b == 9) = skipHorizSpace (p + 1)
-            | otherwise = p
-            where
-                b = BSU.unsafeIndex sql p
-
-        scanDelimArg !p
-            | p < sqlLen && b /= 32 && b /= 9 && b /= 10 && b /= 13 = scanDelimArg (p + 1)
-            | otherwise = p
-            where
-                b = BSU.unsafeIndex sql p
-
-        skipToksBefore !bytePos !k
-            | k < n && spanStart (locSpan (tokAt k)) < bytePos = skipToksBefore bytePos (k + 1)
-            | otherwise = k
 
         finalize !st = case mErr of
             Just err ->

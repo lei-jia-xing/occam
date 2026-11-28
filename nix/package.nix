@@ -66,6 +66,7 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   enableSeparateDataOutput = false;
+  configureFlags = [ "-O2" ];
 
   libraryHaskellDepends = [
     aeson
@@ -74,11 +75,14 @@ mkDerivation {
     base16-bytestring
     bytestring
     containers
+    cryptohash-sha256
+    direct-sqlite
     directory
     fast-logger
     filepath
     hashable
     microlens
+    optparse-applicative
     process
     safe-exceptions
     temporary
@@ -93,16 +97,11 @@ mkDerivation {
   executableHaskellDepends = [
     aeson
     base
-    base16-bytestring
     bytestring
     containers
-    cryptohash-sha256
-    direct-sqlite
     directory
     filepath
     optparse-applicative
-    process
-    safe-exceptions
     text
     time
     transformers
@@ -115,10 +114,8 @@ mkDerivation {
   testHaskellDepends = [
     aeson
     base
-    base16-bytestring
     bytestring
     containers
-    cryptohash-sha256
     direct-sqlite
     directory
     filepath
@@ -148,10 +145,8 @@ mkDerivation {
     base
     bytestring
     containers
-    direct-sqlite
     directory
     filepath
-    safe-exceptions
     tasty-bench
     text
     transformers

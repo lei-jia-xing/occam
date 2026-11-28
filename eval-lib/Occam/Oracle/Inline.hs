@@ -1,3 +1,4 @@
+-- | Unified in-process result-oracle facade dispatching SQLite and DuckDB contract evaluators.
 module Occam.Oracle.Inline (
     newResultStatementTracker,
     newResultTraceTracker,
@@ -31,6 +32,7 @@ import Occam.Oracle.Sqlite (
 import Occam.Parser (SQLDialect (..))
 import System.Exit (ExitCode (ExitSuccess))
 
+-- | Allocate a length-bounded cache mapping candidate SQL bytes to their last 'ResultStatement'.
 newResultStatementTracker ::
     Bool ->
     IO (BS.ByteString -> ResultStatement -> IO (), BS.ByteString -> IO (Maybe ResultStatement))
@@ -47,6 +49,7 @@ newResultStatementTracker True = do
                 )
     pure (rememberResult, takeResult)
 
+-- | Allocate a size-indexed tracker storing full 'ResultTrace' evidence for current candidates.
 newResultTraceTracker ::
     Bool ->
     IO (BS.ByteString -> ResultTrace -> IO (), BS.ByteString -> IO (Maybe ResultTrace))
@@ -66,6 +69,7 @@ newResultTraceTracker True = do
                     )
     pure (rememberTrace, lookupTrace)
 
+-- | Prepare an in-process result oracle reporting trailing 'ResultStatement' summaries.
 prepareResultOracle ::
     (BS.ByteString -> ResultStatement -> IO ()) ->
     SQLDialect ->
@@ -75,6 +79,7 @@ prepareResultOracle ::
 prepareResultOracle rememberResult =
     prepareResultOracleWithTrace (\sql trace -> rememberResult sql (traceResultStatement trace))
 
+-- | Prepare an in-process result oracle emitting full 'ResultTrace' evidence on every evaluation.
 prepareResultOracleWithTrace ::
     (BS.ByteString -> ResultTrace -> IO ()) ->
     SQLDialect ->
@@ -83,6 +88,7 @@ prepareResultOracleWithTrace ::
     IO (Either Text (OracleObservationDetails, EvaluationObserver))
 prepareResultOracleWithTrace = prepareResultOracleWithTraceAndFailures True Nothing
 
+-- | Variant of 'prepareResultOracleWithTrace' allowing trace opt-out and failing-prefix tracking.
 prepareResultOracleWithTraceAndFailures ::
     Bool ->
     Maybe FailingPrefixCache ->
@@ -95,6 +101,7 @@ prepareResultOracleWithTraceAndFailures needTrace mFailCache rememberTrace diale
     fmap (\(details, observe, _) -> (details, observe))
         <$> prepareResultOracleWithValidation needTrace mFailCache rememberTrace dialect micros sql
 
+-- | Prepare both the search-time observer and a clean validation-time observer along with initial details.
 prepareResultOracleWithValidation ::
     Bool ->
     Maybe FailingPrefixCache ->

@@ -18,7 +18,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Lens.Micro ((%~), (&), (.~))
-import Occam.Core (
+import Occam.Core.Schema (
     Constraint (..),
     DmlEvent (..),
     ForeignKey (..),
@@ -30,11 +30,10 @@ import Occam.Core (
     RelationKind (..),
     RenameOp (..),
     SourceColumn (..),
-    StatementId,
-    TriggerBody (..),
-    TriggerEffect (..),
     ViewColumnLineage (..),
  )
+import Occam.Core.Semantics (TriggerBody (..), TriggerEffect (..))
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Query (relationAllDeps, relationConstraintDeps, schemaPrefixDeps)
 import Occam.Dependency.Resolve (
@@ -106,6 +105,8 @@ renameConstraintChildColumns rename constraint =
         OtherConstraint name -> OtherConstraint name
 
 -- RENAME
+
+-- | Apply a 'RenameOp' (@RENAME TABLE@, @RENAME PERMANENT TABLE@, or @RENAME COLUMN@) to the catalog and graph.
 processRename :: StatementId -> Eval -> RenameOp -> Eval
 processRename sid eval (RenameRelation from to placement) =
     renameRelationWith sid resolveRelationKeys eval from to placement
@@ -212,6 +213,7 @@ renameCatalogColumns session currentCatalog key renameColumn
                 state {indexStateColumns = map renameColumn (indexStateColumns state)}
             | otherwise = state
 
+-- | Re-key attached indexes and triggers when renaming a relation to @newKey@.
 moveRelationObjects ::
     IndexSchemaPlacement ->
     StatementId ->

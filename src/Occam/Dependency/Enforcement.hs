@@ -12,10 +12,9 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Core (
+import Occam.Core.Schema (
     AlterChange (..),
     AlterTable (..),
-    CatalogOp (..),
     ColumnDef (..),
     Constraint (..),
     DataWrite (..),
@@ -28,17 +27,19 @@ import Occam.Core (
     NameRef (..),
     ReferentialAction (..),
     RenameOp (..),
+    TableDef (..),
+    UpdateScope (..),
+    WriteKind (..),
+ )
+import Occam.Core.Semantics (
+    CatalogOp (..),
     SearchPathEntry (..),
     SemanticFacts (..),
     SessionEffect (..),
     SessionInit (..),
     SessionScope (..),
-    Statement (..),
-    StatementId,
-    TableDef (..),
-    UpdateScope (..),
-    WriteKind (..),
  )
+import Occam.Core.Types (Statement (..), StatementId)
 import Occam.Dependency.State (initialScanState, transactionActive)
 import Occam.Dependency.Transaction (applyTxEffects, finishStatement)
 import Occam.Facts (StatementFacts (..), StatementUnit (..))

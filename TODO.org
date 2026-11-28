@@ -102,6 +102,36 @@ Eliminate ad-hoc hardcoded config dicts, env parsing, and bash YAML heredocs acr
   In a local three-phase probe with eight workers, median speculative starts dropped from 143 to 10 on SQLite and from 137 to 10 on DuckDB. With four workers, SQLite's median total starts dropped from 177 to 143 while wall time rose from 305 to 508 ms.
 - [ ] Extend `EarlyRejectCertifier` for recurring DDMin or audit probes when a sound rejection rule demonstrably reduces physical oracle calls on representative native workloads.
 
+** TODO [#B] Incremental Compilation, Code Readability & Modern Haskell Refactoring
+*** Phase 1: Cabal Sublibraries & Build-Profile Hygiene (Incremental Compilation)
+- [X] Extract `eval-lib/` into Cabal internal sublibraries in `occam.cabal` (`library occam-oracle` for `Occam.Oracle.*` + `eval-lib/cbits/*.c`; `library occam-harness-lib` for `Occam.Harness.*` and `Occam.Benchmark.*`), eliminating the 71-module / 3x C-source duplicate compilation across `exe:occam`, `exe:occam-harness`, `test:occam-test`, and `bench:occam-bench`. Simplify `hie.yaml` cradles (removing the `eval-lib` `test:occam-test` pin and stale `Setup.hs` entry) and verify `nix/package.nix` compatibility.
+- [X] Decouple dev optimization from `occam.cabal`: remove hardcoded `-O2` from `common warnings` so `cabal.project` controls release/CI `optimization: 2`, use `-O0`/`-O1` for `test-suite` components, and support fast local `cabal.project.local` (`optimization: 0`) incremental builds.
+- [X] Eliminate flag-churn rebuilds in `Makefile` (`build` vs `build-check`/`test` toggling `--ghc-options=-Werror` on the CLI, which invalidates Cabal component hashes) by unifying `-Werror` in project/CI config.
+- [X] Consolidate `occam-fuzz` into `occam-test` (removing `test/FuzzMain.hs`, duplicate compilation of `Fuzz`/`DialectFuzz`/`MutationalFuzz`/`TestSupport`, and the special-case `hie.yaml` cradle; invoke fuzz checks via `cabal test occam-test --test-options='-p "Fuzz"'`).
+
+*** Phase 2: High-Fan-In Hub & Monolith Decomposition
+- [X] Split `src/Occam/Frontend/AST.hs` (1,593 LOC, 154 types, 9.1 MB `.o` / 2.7 MB `.hi`) into domain submodules (`AST.Expr`, `AST.Query`, `AST.DML`, `AST.DDL`, `AST.Statement` + `Statement.hs-boot`) behind a thin `Occam.Frontend.AST` facade, and migrate internal consumers to narrow imports.
+- [X] Strip unused `Data` deriving from `Occam.Frontend.AST` (moved via `StandaloneDeriving` + `-Wno-orphans` into `test/FrontendAstInvariants.hs`) and prune unnecessary `Ord` instances on large recursive AST types to shrink `.hi` unfoldings and downstream recompilation.
+- [X] Split `Occam.Core` (85 transitive `src/` dependents) to separate runtime/oracle types (`ResultTrace`, `EarlyRejectReason`, `OracleOutcome`, `Statement`) into `Occam.Core.Oracle` / `Occam.Core.Types` away from frontend schema/semantics types (`Occam.Core.Schema`, `Occam.Core.Semantics`).
+- [X] Split major implementation and test monoliths for readability and 8-core `ghc -j` parallelism:
+  - `src/Occam/Frontend/Parser/DDL.hs` into `CreateTable`, `CreateObject`, `AlterDrop`
+  - `src/Occam/Frontend/Semantics/Query.hs` (`analyzeNested` -> `Semantics.Nested`) & `Semantics.DDL` (`DDL.Create`, `DDL.AlterDrop`)
+  - `src/Occam/Frontend/Lexer.hs` into `Keyword`, `Scan`, `Token` & `Splitter.hs` -> `Splitter.Delimiter`
+  - `src/Occam/Frontend/Parser/Stmt.hs` into `DML`, `Session`, `Utility`
+  - `eval-lib/Occam/Harness/Evidence.hs` into `Common` + per-DBMS modules, `Signature.hs` -> `Signature.StackFrame` + `Signature`, and `test/ParserChecks.hs` into `ParserChecks`, `ParserChecks.Support`, `ParserChecks.AstAndScriptChecks`
+- [ ] Split remaining oversized modules/suites (`src/Occam/Frontend/Columns/Assemble.hs`, `eval-lib/Occam/Harness/{Batch,Oracle}.hs`, `bench/ResultBaseline.hs`, `test/{BatchRunnerChecks,FrontendSeedChecks,SyntaxAlignmentChecks}.hs`).
+
+*** Phase 3: Haddock Docstrings & Readability Hygiene
+- [X] Complete module-header Haddock coverage across `src/`, `eval-lib/`, and `app/`, Priority 1 core public APIs (`Occam.Core.*`, `Occam.Facts`, `Occam.Proposals`, `Occam.Slicer`, `Occam.Json`, `Occam.AtomicFile`, `Occam.Logger`, `Occam.Cache`, `Occam.Evaluation*`, `Occam.Oracle*`, `Occam.Pool*`, `Occam.Metrics`, `Occam.UI`, `Occam.Certificate*`, `Occam.Parser.Types`, `Occam.Reducer.{Pipeline,Slice,Statement,DDMin.*,Syntax*}`, `Occam.Dependency.{Barrier,Query,Rename,Resolve,Session,State.Catalog,Write}`), Priority 3 `Occam.Oracle.*`, `Occam.Benchmark.Metrics`, `Occam.Harness.{BatchInputs,BatchPlan,Checkpoints,Corpus,Evidence.Common,Signature*}`, and `app/{Main,Completion,Options*,Output,Runner}`.
+- [ ] Finish remaining Priority 2 internal helpers (`Occam.Frontend.AST*`, `Parser.*`, `Semantics.*`, `Columns.*`, `Occam.Dependency.{Alter,Define,Drop,State,Transaction}`) and remaining `eval-lib/Occam/Harness/{Batch,Oracle}` exported docs.
+- [X] Hoist duplicated shared helpers (`dedupPreserve` in `Occam.Frontend.Semantics.Pure` across `DML`/`Query`/`DDL`; `skipWs1` in `Occam.Harness.Signature.StackFrame` across `Evidence.Common`/`SqlancerSanitize`).
+- [ ] Factor remaining long `where`-heavy functions (`scanAll`, `runSplit`, `collectStmtStars`, `runEvaluationRequestWithKey`, `evaluateProbeOutcome`, `aggregateGroup`).
+
+*** Phase 4: Modern Haskell Ergonomics (Performance- & Compile-Time-Safe)
+- [ ] Replace `microlens` + manual boilerplate in `Occam.Dependency.State.Lenses` with `optics-core` (no `optics-th` to avoid TH compile-time tax; use `OverloadedLabels` / `Generic` only on the compact `Dependency.State` records, never on `AST`), and thread `Occam.Dependency.*` (`Define`, `Write`, `Alter`, `Drop`) via `State Eval` instead of manual `eval1`/`eval2`/`catalog1`/`catalog2` plumbing.
+- [ ] Enable GHC 9.10 `OverloadedRecordDot` (+ `DuplicateRecordFields` / `NoFieldSelectors` in new or refactored modules) across `app/`, `Occam.Evaluation`, and `eval-lib/Occam/Harness/*` to remove Hungarian field prefixes (`bo*`, `sess*`, `ts*`, `cpi*`) with zero runtime or dependency overhead.
+- [ ] Evaluate replacing `ExceptT`/`MaybeT`/`ContT` + explicit `Env` threading in orchestration/harness layers (`Occam.Harness.*`, `Occam.Reducer.*`, `Occam.Evaluation`) with `effectful` (manual smart constructors, no `effectful-th`, `UnliftIO`-safe concurrency; avoid `polysemy` due to free-monad allocation + TH/plugin compile overhead and `fused-effects` due to carrier-inlining `.hi` bloat). Keep hot loops (`Lexer` `ST`, `Parser` `P`, `Pool.Window` `IO`/`mask`) on their specialized concrete monads.
+
 * Completed Milestones
 - **Core Reducer, Dependency Engine & Certificates** [2026-11]: 4-stage pipeline (backward slice -> closure ddmin -> audit -> unrestricted fallback), `Occam.Dependency` 11-module split, column co-reduction (`--column-mode off|single|atomic`), noncontiguous deletion proposals (`src/Occam/Proposals.hs`), `StatementRankedFallback` (`--statement-order`), distributed cross-statement literal batching, deferred low-yield literals & recursive CTE predicates, and 5 sound native-oracle early-rejection certificates.
 - **Formal Verification (Lean 4)** [2026-11]: Proved DAG acyclicity, backward-slice reachability soundness, reduction monotonic convergence, 1-minimality, and early-rejection certificate soundness in `proofs/` (0 `sorry`).

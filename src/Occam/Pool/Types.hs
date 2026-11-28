@@ -1,3 +1,4 @@
+-- | Worker pool configuration, synchronization primitives, and lookahead scheduling types.
 module Occam.Pool.Types (
     ExecutionBudgetReached (..),
     OraclePool (..),
@@ -70,7 +71,7 @@ import Occam.Cache (
     newCache,
     observationAdmission,
  )
-import Occam.Core (OracleOutcome (..))
+import Occam.Core.Oracle (OracleOutcome (..))
 import Occam.Metrics (
     FamilyTag (..),
     MetricsStore,
@@ -83,11 +84,13 @@ import Occam.Oracle (
  )
 import System.Exit (ExitCode (..))
 
+-- | Exception thrown when the pool reaches @--max-oracle-executions@.
 data ExecutionBudgetReached = ExecutionBudgetReached ()
     deriving (Show)
 
 instance Exception ExecutionBudgetReached
 
+-- | Configuration used to construct an 'OraclePool'.
 data PoolConfig = PoolConfig
     { poolJobs :: !Int
     , poolCacheEnabled :: !Bool
@@ -108,6 +111,7 @@ data WorkerEntry = WorkerEntry
     , entryCancel :: !(IO ())
     }
 
+-- | Bounded worker pool executing candidate oracle checks serially or via a sliding window.
 data OraclePool = OraclePool
     { poolJobsCount :: !Int
     , poolGate :: !(MVar ())
@@ -137,6 +141,7 @@ data TimedObservation = TimedObservation
     , timedExecWallMicros :: !Int
     }
 
+-- | Candidate task state queued inside a sliding execution window.
 data WindowTask
     = TaskImmediate !OracleObservation !Bool
     | TaskJoined !(MVar (Either SomeException TimedObservation))
@@ -149,9 +154,11 @@ data WindowTask
         !FamilyTag
         !(IORef (Maybe Word64))
 
+-- | Allocate an 'OraclePool' keyed by raw candidate SQL bytes.
 newOraclePool :: PoolConfig -> IO OraclePool
 newOraclePool = newOraclePoolWithCacheKey pure
 
+-- | Allocate an 'OraclePool' with a custom candidate cache-key projection (e.g. statement-count normalization).
 newOraclePoolWithCacheKey :: (ByteString -> IO ByteString) -> PoolConfig -> IO OraclePool
 newOraclePoolWithCacheKey candidateKey PoolConfig {..}
     | poolJobs <= 0 = ioError (userError ("OraclePool jobs must be positive, got " ++ show poolJobs))
@@ -209,6 +216,7 @@ withAdaptiveLookahead pool
         state <- newIORef (Lookahead (poolJobsCount pool) Vector.empty 0 0 0)
         pure pool {poolLookahead = Just state}
 
+-- | Return the current adaptive or fixed lookahead concurrency window width for @pool@.
 slidingLookahead :: OraclePool -> IO Int
 slidingLookahead pool = case poolLookahead pool of
     Nothing -> pure (poolJobsCount pool)
@@ -261,11 +269,13 @@ closeOraclePool pool = drain >> checkReapFailure pool
                 mapM_ (deregWorker pool) (Map.keys snapshot)
                 drain
 
+-- | Fail immediately if background process reaping raised an unhandled failure.
 checkReapFailure :: OraclePool -> IO ()
 checkReapFailure pool = do
     failed <- readIORef (poolReapFailed pool)
     when failed (throwIO OracleReapFailed)
 
+-- | Remove an exited worker thread from the active pool registry.
 deregWorker :: OraclePool -> ThreadId -> IO ()
 deregWorker pool tid = modifyMVar_ (poolRegistry pool) (pure . Map.delete tid)
 
@@ -313,24 +323,31 @@ mapPoolRetire ::
     OraclePool
 mapPoolRetire f pool = pool {poolRetireFn = f (poolRetireFn pool)}
 
+-- | Attach a candidate-count map cleanup callback run on pool shutdown.
 withCandidateCountCleanup :: IO () -> OraclePool -> OraclePool
 withCandidateCountCleanup cleanup pool = pool {poolCleanupCounts = cleanup}
 
+-- | Configured maximum parallel worker count for the pool.
 poolJobCount :: OraclePool -> Int
 poolJobCount = poolJobsCount
 
+-- | Snapshot cumulative cache hit\/miss\/join metrics from the pool's cache.
 poolCacheStats :: OraclePool -> IO CacheStats
 poolCacheStats = cacheStats . poolCacheData
 
+-- | Total number of physical oracle executions attempted by this pool.
 poolAttempts :: OraclePool -> IO Int
 poolAttempts = readIORef . poolAttemptsRef
 
+-- | Total number of speculative oracle executions cancelled before retirement.
 poolCancelled :: OraclePool -> IO Int
 poolCancelled = readIORef . poolCancelledRef
 
+-- | Current number of active worker threads running in the pool.
 poolLiveWorkers :: OraclePool -> IO Int
 poolLiveWorkers = readIORef . poolLiveRef
 
+-- | Lift a bare 'OracleObservation' into 'OracleObservationDetails' with zero timing breakdown.
 observationDetails :: OracleObservation -> OracleObservationDetails
 observationDetails observation =
     OracleObservationDetails
@@ -340,22 +357,26 @@ observationDetails observation =
         , oracleElapsedMicros = Nothing
         }
 
+-- | Lift a boolean predicate into a pool-compatible 'OracleObservationDetails' callback.
 predicateDetails :: (ByteString -> IO Bool) -> ByteString -> IO OracleObservationDetails
 predicateDetails predicate candidate = do
     accepted <- predicate candidate
     pure
         (observationDetails (if accepted then OracleFinished ExitSuccess else OracleFinished (ExitFailure 1)))
 
+-- | Convert a coarse 'OracleOutcome' into a metrics 'RetiredVerdict'.
 outcomeVerdict :: OracleOutcome -> RetiredVerdict
 outcomeVerdict OracleAccepted = RetiredAccept
 outcomeVerdict OracleRejected = RetiredReject
 outcomeVerdict OracleInconclusive = RetiredInconclusive
 
+-- | Filter an 'OracleObservation' to @Just@ only when it may be permanently cached.
 admitObservation :: OracleObservation -> Maybe OracleObservation
 admitObservation observation = case observationAdmission observation of
     CacheAdmit -> Just observation
     CacheReject -> Nothing
 
+-- | Try to reserve one execution permit from @--max-oracle-executions@, returning @False@ when exhausted.
 reservePermit :: MVar (Maybe Int) -> IO Bool
 reservePermit permits = modifyMVar permits reserve
     where
@@ -364,6 +385,7 @@ reservePermit permits = modifyMVar permits reserve
             | n > 0 = pure (Just (n - 1), True)
             | otherwise = pure (Just 0, False)
 
+-- | Uninterruptibly restore a reserved execution permit when an attempt was skipped or cancelled early.
 refundPermit :: MVar (Maybe Int) -> IO ()
 refundPermit permits =
     uninterruptibleMask_ $

@@ -4,3 +4,4 @@ benchmarks: True
 
 package occam
   optimization: 2
+  ghc-options: -Werror

@@ -60,12 +60,14 @@ import System.FilePath (
     (</>),
  )
 
+-- | Origin of SQL seed inputs for a batch benchmark run.
 data BatchInputSource
     = CorpusDirectory !FilePath
     | ManifestFile !FilePath
     | SqlFiles !(NonEmpty FilePath)
     deriving (Eq, Show)
 
+-- | Input discovery and target-selection flags supplied to 'loadBatchInputs'.
 data BatchInputOptions = BatchInputOptions
     { inputSource :: !BatchInputSource
     , inputDbms :: !Text
@@ -78,6 +80,7 @@ data BatchInputOptions = BatchInputOptions
 
 data Entry = Entry !Text !FilePath !Object
 
+-- | Normalized manifest/directory attributes for a corpus test case.
 data Attributes = Attributes
     { attrDbms :: !(Maybe Text)
     , attrDialect :: !(Maybe Text)
@@ -87,6 +90,7 @@ data Attributes = Attributes
     , attrBaseline :: !(Maybe CrashSignature)
     }
 
+-- | Fully resolved benchmark case ready for planning and crash-oracle evaluation.
 data BatchCase = BatchCase
     { batchCaseId :: !Text
     , batchFile :: !FilePath

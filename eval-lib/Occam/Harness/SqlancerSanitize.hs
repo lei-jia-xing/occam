@@ -18,6 +18,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
+import Occam.Harness.Signature.StackFrame (skipWs1)
 
 -- | Extracted header comments preserved from a SQLancer log.
 data SqlancerMeta = SqlancerMeta
@@ -293,11 +294,6 @@ stripPrefixCI prefix txt
     | otherwise =
         let (hd, tl) = T.splitAt (T.length prefix) txt
          in if T.map toLower hd == T.map toLower prefix then Just tl else Nothing
-
-skipWs1 :: Text -> Maybe Text
-skipWs1 txt = case T.uncons txt of
-    Just (c, _) | isSpace c -> Just (T.dropWhile isSpace txt)
-    _ -> Nothing
 
 isWordChar :: Char -> Bool
 isWordChar c = isAsciiLower c || isAsciiUpper c || isDigit c || c == '_'

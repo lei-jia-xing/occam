@@ -1,3 +1,4 @@
+-- | Bounded concurrent candidate oracle-outcome cache supporting in-flight deduplication.
 module Occam.Cache (
     CacheMode (..),
     CacheAdmission (..),
@@ -36,12 +37,15 @@ import Data.Map.Strict qualified as Map
 import GHC.Generics (Generic)
 import Occam.Oracle (OracleObservation (..))
 
+-- | Controls whether non-precomputed oracle results are stored in the cache.
 data CacheMode = CacheEnabled | CacheDisabled
     deriving (Eq, Show)
 
+-- | Policy deciding whether a completed 'OracleObservation' may be cached permanently.
 data CacheAdmission = CacheAdmit | CacheReject
     deriving (Eq, Show)
 
+-- | Snapshot of cumulative cache hit, miss, and in-flight join counters.
 data CacheStats = CacheStats
     { cacheHits :: !Int
     , cacheMisses :: !Int
@@ -83,6 +87,7 @@ data CacheEntry
     | CacheInflight !Int
     deriving (Eq, Show)
 
+-- | Thread-safe candidate observation cache supporting in-flight owner deduplication.
 data Cache = Cache
     { cacheEntries :: !(MVar (HashMap CacheKey CacheEntry))
     , cacheHitsRef :: !(IORef Int)
@@ -90,12 +95,14 @@ data Cache = Cache
     , cacheJoinsRef :: !(IORef Int)
     }
 
+-- | Outcome of querying 'Cache' for a candidate key.
 data LookupResult
     = LookupHit !OracleObservation
     | LookupJoin !Int
     | LookupMiss
     deriving (Eq, Show)
 
+-- | Allocate a 'Cache' pre-seeded with known initial oracle observations.
 newCache :: Map ByteString OracleObservation -> IO Cache
 newCache precomputed = do
     entries <-
@@ -145,9 +152,11 @@ cacheLookupKey cache mode !k = do
             atomicModifyIORef' (cacheHitsRef cache) (\n -> (n + 1, ()))
             pure (LookupHit res)
 
+-- | Mark a candidate byte string as actively running under window ordinal @ordinal@.
 cacheInstallInflight :: Cache -> ByteString -> Int -> IO ()
 cacheInstallInflight cache = cacheInstallInflightKey cache . makeKey
 
+-- | Variant of 'cacheInstallInflight' keyed by a precomputed 'CacheKey'.
 cacheInstallInflightKey :: Cache -> CacheKey -> Int -> IO ()
 cacheInstallInflightKey cache !key ordinal =
     modifyMVar_ (cacheEntries cache) \entries ->

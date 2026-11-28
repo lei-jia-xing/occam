@@ -50,12 +50,8 @@ import Occam.Certificate (
     readEarlyRejectStats,
     recordEarlyRejectBuildNanos,
  )
-import Occam.Core (
-    EarlyRejectReason (..),
-    ResultTrace,
-    SessionInit,
-    Statement,
- )
+import Occam.Core.Semantics (SessionInit)
+import Occam.Core.Types (EarlyRejectReason (..), ResultTrace, Statement)
 import Occam.Dependency (DependencyGraph (..), analyzeStatements)
 import Occam.Logger (Logger, logDebug', logInfo')
 import Occam.Metrics (

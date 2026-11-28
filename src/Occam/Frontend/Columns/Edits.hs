@@ -27,7 +27,10 @@ import Data.Vector qualified as V
 import Data.Vector.Mutable qualified as MV
 import Data.Word (Word8)
 import Occam.Facts (EditTier (..), ParserEdit (..), ParserEditCategory (..))
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.DDL qualified as AST
+import Occam.Frontend.AST.DML qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (
     AnalysisContext (..),
     unwrapExplainAnalyze,

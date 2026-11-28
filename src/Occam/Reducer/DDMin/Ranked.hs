@@ -14,11 +14,8 @@ import Data.IntSet qualified as IntSet
 import Data.List (sortOn)
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Ord (Down (..))
-import Occam.Core (
-    OracleOutcome (..),
-    Statement (..),
-    StatementId (..),
- )
+import Occam.Core.Oracle (OracleOutcome (..))
+import Occam.Core.Types (Statement (..), StatementId (..))
 import Occam.Metrics (
     FamilyTag (..),
     recordAcceptedBytesSaved,
@@ -91,8 +88,9 @@ orderWindowCandidates WindowOrderWithinLaneProjected items =
         refill (LaneSubset : rest) cs ds (s : ss) = s : refill rest cs ds ss
         refill (_ : rest) cs ds ss = refill rest cs ds ss
 
--- Unified ranked scheduler: orthogonal lane ordering, lane quota
--- scheduling, singleton resumption, and optional bounded projection window.
+{- | Unified ranked scheduler: orthogonal lane ordering, lane quota scheduling,
+singleton resumption, and optional bounded projection window.
+-}
 buildRankedSchedule ::
     DDMinEnv ->
     RankedScheduleConfig ->

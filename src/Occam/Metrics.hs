@@ -1,3 +1,4 @@
+-- | Per-family speculation, parse latency, and cancellation telemetry store and snapshot types.
 module Occam.Metrics (
     MetricPolicy (..),
     FamilyTag (..),
@@ -50,6 +51,7 @@ import GHC.Generics (Generic)
 import Occam.Facts (ParserEditCategory)
 import Occam.Json (normalizeJsonFieldNames, snakeCaseOptions)
 
+-- | Reducer configuration metadata recorded into serialized metrics snapshots.
 data MetricPolicy = MetricPolicy
     { metricSearchPolicy :: !Text
     , metricColumnMode :: !Text
@@ -63,6 +65,7 @@ instance ToJSON MetricPolicy where
 instance FromJSON MetricPolicy where
     parseJSON = genericParseJSON snakeCaseOptions . normalizeJsonFieldNames
 
+-- | Candidate generator family label used to attribute speculation and cancellation cost.
 data FamilyTag
     = TagUnknown
     | TagStatement
@@ -101,6 +104,7 @@ instance FromJSON FamilyTag where
             "bundle" -> TagBundle <$> objectValue .: "label"
             _ -> fail ("unknown metrics family kind: " <> T.unpack kind)
 
+-- | Category of a parser invocation recorded for parse latency telemetry.
 data ParseKind = ParseStatementOnly | ParseSyntaxChunks | ParseColumnIR
     deriving (Eq, Ord, Show, Generic)
 
@@ -134,9 +138,11 @@ instance FromJSONKey ParseKind where
     fromJSONKey = FromJSONKeyTextParser \name ->
         maybe (fail ("unknown metrics parse kind: " <> T.unpack name)) pure (parseKindKey name)
 
+-- | Outcome classification recorded when a candidate retires in window order.
 data RetiredVerdict = RetiredAccept | RetiredReject | RetiredInconclusive
     deriving (Eq, Show)
 
+-- | Accumulated execution counts and microsecond timings for a single 'FamilyTag'.
 data FamilyCounters = FamilyCounters
     { physicalStarts :: !Int
     , retiredAccept :: !Int
@@ -182,6 +188,7 @@ instance FromJSON FamilyEntry where
             <$> objectValue .: "tag"
             <*> objectValue .: "counters"
 
+-- | Immutable snapshot of all per-family counters and parse timings emitted into run telemetry.
 data MetricsSnapshot = MetricsSnapshot
     { snapshotPolicy :: !MetricPolicy
     , snapshotFamilies :: !(Map FamilyTag FamilyCounters)
@@ -225,6 +232,7 @@ data MetricsStore = MetricsStore
     , storeParseDecode :: !(IORef (Map ParseKind Int))
     }
 
+-- | Allocate an empty 'MetricsStore' parameterized by the reduction's 'MetricPolicy'.
 newMetricsStore :: MetricPolicy -> IO MetricsStore
 newMetricsStore policy =
     MetricsStore policy
@@ -242,6 +250,7 @@ snapshotMetrics MetricsStore {..} =
         <*> readIORef storeParseFfi
         <*> readIORef storeParseDecode
 
+-- | Zero-initialized 'FamilyCounters' value.
 emptyFamilyCounters :: FamilyCounters
 emptyFamilyCounters =
     FamilyCounters
@@ -276,11 +285,13 @@ withMetricsStore :: Maybe MetricsStore -> (MetricsStore -> IO ()) -> IO ()
 withMetricsStore Nothing _ = pure ()
 withMetricsStore (Just store) action = action store
 
+-- | Increment the physical execution attempt counter for a candidate family.
 recordPhysicalStart :: Maybe MetricsStore -> FamilyTag -> IO ()
 recordPhysicalStart metricsStore tag =
     withMetricsStore metricsStore \store ->
         bumpFamily store tag \counters -> counters {physicalStarts = physicalStarts counters + 1}
 
+-- | Record the final retired verdict (accept, reject, or inconclusive) for a candidate family.
 recordRetired :: Maybe MetricsStore -> FamilyTag -> RetiredVerdict -> IO ()
 recordRetired metricsStore tag verdict =
     withMetricsStore metricsStore \store ->
@@ -290,11 +301,13 @@ recordRetired metricsStore tag verdict =
             RetiredInconclusive ->
                 counters {retiredInconclusive = retiredInconclusive counters + 1}
 
+-- | Increment the completed physical execution counter for a candidate family.
 recordPhysicalCompletion :: Maybe MetricsStore -> FamilyTag -> IO ()
 recordPhysicalCompletion metricsStore tag =
     withMetricsStore metricsStore \store ->
         bumpFamily store tag \counters -> counters {physicalCompletions = physicalCompletions counters + 1}
 
+-- | Record a speculative candidate that finished execution after an earlier winner already retired.
 recordCompletedUnselected :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordCompletedUnselected metricsStore tag wallMicros =
     withMetricsStore metricsStore \store ->
@@ -306,6 +319,7 @@ recordCompletedUnselected metricsStore tag wallMicros =
     where
         loserWall = completedUnselectedInteractionWallMicros
 
+-- | Record a speculative candidate cancelled in flight and accumulate its wall time.
 recordCanceled :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordCanceled metricsStore tag wallMicros =
     withMetricsStore metricsStore \store ->
@@ -315,6 +329,7 @@ recordCanceled metricsStore tag wallMicros =
                 , canceledInteractionWallMicros = canceledInteractionWallMicros counters + wallMicros
                 }
 
+-- | Record a candidate whose execution raised an unexpected error and accumulate its wall time.
 recordFailed :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordFailed metricsStore tag wallMicros =
     withMetricsStore metricsStore \store ->
@@ -324,21 +339,25 @@ recordFailed metricsStore tag wallMicros =
                 , failedInteractionWallMicros = failedInteractionWallMicros counters + wallMicros
                 }
 
+-- | Increment the count of candidate generation skips keyed by skip reason.
 recordGeneratedSkipped :: Maybe MetricsStore -> Text -> IO ()
 recordGeneratedSkipped metricsStore reason =
     withMetricsStore metricsStore \store -> bumpKey (storeSkipped store) reason 1
 
+-- | Accumulate frontend parse and decode durations for the given 'ParseKind'.
 recordParseTiming :: Maybe MetricsStore -> ParseKind -> Int -> Int -> IO ()
 recordParseTiming metricsStore kind ffiMicros decodeMicros =
     withMetricsStore metricsStore \store -> do
         bumpKey (storeParseFfi store) kind ffiMicros
         bumpKey (storeParseDecode store) kind decodeMicros
 
+-- | Accumulate candidate-building duration in microseconds for a candidate family.
 recordCandidateBuildTiming :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordCandidateBuildTiming metricsStore tag micros =
     withMetricsStore metricsStore \store ->
         bumpFamily store tag \counters -> counters {candidateBuildMicros = candidateBuildMicros counters + micros}
 
+-- | Accumulate total UTF-8 bytes eliminated by accepted candidates in a family.
 recordAcceptedBytesSaved :: Maybe MetricsStore -> FamilyTag -> Int -> IO ()
 recordAcceptedBytesSaved metricsStore tag bytes =
     withMetricsStore metricsStore \store ->

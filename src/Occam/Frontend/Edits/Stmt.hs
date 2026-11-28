@@ -8,7 +8,10 @@ import Data.ByteString qualified as BS
 import Data.Foldable (traverse_)
 import Data.Vector qualified as V
 import Occam.Facts (ClauseTier (..), ParserEditCategory (..))
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.DML qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
+import Occam.Frontend.AST.Statement qualified as AST
 import Occam.Frontend.Context (AnalysisContext (..))
 import Occam.Frontend.Edits.Core (
     EditM,

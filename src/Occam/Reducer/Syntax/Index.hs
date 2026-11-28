@@ -38,7 +38,7 @@ import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Word (Word64)
 import Occam.Certificate (EarlyRejectCertifier, EarlyRejectTracker)
-import Occam.Core (ResultTrace, Span (..), Statement (..))
+import Occam.Core.Types (ResultTrace, Span (..), Statement (..))
 import Occam.Facts (ClauseTier (..), EditTier (..), ExprTier (..), editCategoryName)
 import Occam.Logger (Logger)
 import Occam.Metrics (MetricsStore)
@@ -118,6 +118,7 @@ clauseEditRank edit = case classifyClauseEdit edit of
     StructuralClause -> structuralClauseRank
     FragileClause -> fragileClauseRank
 
+-- | Priority ranking for expression edits (preferring unwrap transforms before aggressive replacements).
 expressionEditRank :: ParserEdit -> Int
 expressionEditRank edit = case classifyExpressionEdit edit of
     UnwrapExpr -> unwrappedExpressionRank
@@ -128,10 +129,11 @@ syntaxCategoryOrder :: ColumnMode -> [ParserEditCategory]
 syntaxCategoryOrder ColumnOff = filter (/= EditColumn) allEditCategories
 syntaxCategoryOrder _ = allEditCategories
 
+-- | Comma-separated canonical names of the active rewrite categories for telemetry logging.
 syntaxCategoryOrderName :: ColumnMode -> T.Text
 syntaxCategoryOrderName = T.intercalate "," . map editCategoryName . syntaxCategoryOrder
 
--- Priority buckets preserve category ordering across statement boundaries.
+-- | Priority buckets preserving category ordering across statement boundaries.
 data EditBucket
     = SafeClauses
     | StructuralClauses
@@ -147,6 +149,7 @@ data EditBucket
     | DeferredRecursivePredicates
     deriving (Eq, Ord, Enum)
 
+-- | Per-statement map from 'EditBucket' ordinal to queued syntax edits.
 type IndexedUnitEdits = IntMap.IntMap (Seq ParserEdit)
 
 {- | A fixed-shape tree of statement units. Branches cache edit counts for
@@ -158,6 +161,7 @@ data SyntaxIndex
     | IndexedUnit !Int !IndexedUnitEdits
     | IndexedUnits !Int !Int !(IntMap.IntMap Int) !SyntaxIndex !SyntaxIndex
 
+-- | Bucket all syntax edits extracted from a single statement unit.
 indexUnitEdits :: SyntaxContext -> StatementUnit -> IndexedUnitEdits
 indexUnitEdits context unit =
     IntMap.mapWithKey finalize (fst (Foldable.foldl' insertEdit (IntMap.empty, Set.empty) filtered))
@@ -196,6 +200,7 @@ indexUnitEdits context unit =
                 AggressiveExpr -> AggressiveExpressions
             EditLiteral -> PrimaryLiterals
 
+-- | Construct a balanced 'SyntaxIndex' segment tree over parsed statement units.
 buildSyntaxIndex :: SyntaxContext -> [StatementUnit] -> SyntaxIndex
 buildSyntaxIndex context = build . Seq.fromList
     where

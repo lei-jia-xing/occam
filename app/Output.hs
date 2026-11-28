@@ -1,3 +1,4 @@
+-- | Atomic output writers, path collision validation, statement counting, and CLI stats summaries.
 module Output (
     computeSessionStats,
     countStatementsForCLI,
@@ -44,9 +45,11 @@ import System.Directory (canonicalizePath, doesFileExist)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 
+-- | Terminate immediately with exit status @2@ for CLI usage\/validation failures.
 exitCliError :: IO a
 exitCliError = exitWith (ExitFailure 2)
 
+-- | Terminate immediately with exit status @124@ when reduction hits timeout\/budget limits.
 exitTimeout :: IO a
 exitTimeout = exitWith (ExitFailure 124)
 
@@ -96,6 +99,7 @@ validateStatsPath input _ inPlace inputPath targetPath stats = do
         backupPath <- Just <$> canonicalizePath (input ++ ".bak")
         rejectPathCollision statsPath backupPath "--stats path must differ from the in-place backup path"
 
+-- | Ensure output and @--stats@ paths do not collide with the input file, backup, or each other.
 resolveOutputTargets ::
     FilePath ->
     Maybe FilePath ->
@@ -109,6 +113,7 @@ resolveOutputTargets inputFile outputFile inPlace statsFile = do
     validateOutputPaths inputFile targetMinimalPath writeToStdout inPlace statsFile
     pure (writeToStdout, targetMinimalPath, statsPath)
 
+-- | Atomically write reduced SQL, optional @.bak@ backup, and optional @stats.json@ output.
 writeReductionOutputs ::
     Logger ->
     FilePath ->
@@ -142,6 +147,7 @@ writeReductionOutputs logger inputFile inPlace writeToStdout targetMinimalPath s
         BS.putStr reducedSQL
         hFlush stdout
 
+-- | Read the initial SQL input from stdin (@-@) or a file, exiting with a CLI error if missing.
 readInputBytes :: Maybe Logger -> FilePath -> IO BS.ByteString
 readInputBytes _ "-" = BS.getContents
 readInputBytes mLogger inputFile = do
@@ -153,6 +159,7 @@ readInputBytes mLogger inputFile = do
         exitFailure
     BS.readFile inputFile
 
+-- | Count statements in a SQL buffer for CLI reporting, exiting cleanly on parse failure.
 countStatementsForCLI :: Logger -> SQLDialect -> BS.ByteString -> IO Int
 countStatementsForCLI logger dialect sql = do
     result <- countStatements dialect sql
@@ -164,6 +171,7 @@ countStatementsForCLI logger dialect sql = do
             exitFailure
         Right count -> pure count
 
+-- | Assemble the serialized 'Stats' report for a completed reduction session.
 computeSessionStats ::
     Int ->
     Int ->
@@ -239,6 +247,7 @@ reductionSettings cacheEnabled ReductionConfig {..} strategy =
         , "strategy" .= strategyName strategy
         ]
 
+-- | Parse the input SQL and print per-statement frontend facts and edits to stdout (@--dump-facts@).
 dumpStatementFacts :: SQLDialect -> Bool -> FilePath -> IO ()
 dumpStatementFacts dialect fkOn inputFile = do
     sql <- readInputBytes Nothing inputFile

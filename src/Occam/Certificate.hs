@@ -42,7 +42,7 @@ import Occam.Certificate.PrefixCache (
     newFailingPrefixCache,
     recordFailingPrefix,
  )
-import Occam.Core (
+import Occam.Core.Types (
     EarlyRejectReason (..),
     ResultTrace (..),
     Span (..),
@@ -96,24 +96,30 @@ data EarlyRejectStats = EarlyRejectStats
     }
     deriving (Eq, Show)
 
+-- | Zeroed 'EarlyRejectStats' counter record.
 emptyEarlyRejectStats :: EarlyRejectStats
 emptyEarlyRejectStats = EarlyRejectStats 0 0 0 0 0 0 0
 
+-- | Thread-safe accumulator of early-rejection statistics paired with an optional failing-prefix cache.
 data EarlyRejectTracker = EarlyRejectTracker
     { trackerStatsRef :: !(IORef EarlyRejectStats)
     , trackerFailures :: !(Maybe FailingPrefixCache)
     }
 
+-- | Create a standalone 'EarlyRejectTracker' with no failing-prefix cache.
 newEarlyRejectTracker :: IO EarlyRejectTracker
 newEarlyRejectTracker = newEarlyRejectTrackerWithFailures Nothing
 
+-- | Create an 'EarlyRejectTracker' sharing an optional dynamic failing-prefix cache.
 newEarlyRejectTrackerWithFailures :: Maybe FailingPrefixCache -> IO EarlyRejectTracker
 newEarlyRejectTrackerWithFailures mFailures =
     EarlyRejectTracker <$> newIORef emptyEarlyRejectStats <*> pure mFailures
 
+-- | Snapshot cumulative early-rejection counts and timing from the tracker.
 readEarlyRejectStats :: EarlyRejectTracker -> IO EarlyRejectStats
 readEarlyRejectStats = readIORef . trackerStatsRef
 
+-- | Add certificate-construction nanoseconds into the tracker telemetry total.
 recordEarlyRejectBuildNanos :: EarlyRejectTracker -> Word64 -> IO ()
 recordEarlyRejectBuildNanos tracker nanos =
     modifyIORef'
@@ -367,6 +373,7 @@ checkEarlyRejection cert keptInts candidateSQL =
         hit@(Just _) -> hit
         Nothing -> checkEarlyRejectionBytes cert candidateSQL
 
+-- | Check a statement-ID subset against the certifier while recording hit\/miss telemetry.
 checkEarlyRejectionIdsTracked ::
     EarlyRejectTracker -> EarlyRejectCertifier -> IntSet -> IO (Maybe EarlyRejectReason)
 checkEarlyRejectionIdsTracked tracker cert kept =
@@ -440,6 +447,7 @@ trackIdCheck tracker cert result
         recordCheck (trackerStatsRef tracker) True res (t1 - t0)
         pure res
 
+-- | Check rendered SQL bytes against exact-prefix and dynamic failing-prefix caches, updating telemetry.
 checkEarlyRejectionBytesTracked ::
     EarlyRejectTracker -> EarlyRejectCertifier -> Bool -> ByteString -> IO (Maybe EarlyRejectReason)
 checkEarlyRejectionBytesTracked tracker cert countChecked candidateSQL
@@ -460,6 +468,7 @@ checkFailingPrefixReason (Just fpCache) candidateSQL = do
     failed <- checkFailingPrefix fpCache candidateSQL
     pure (if failed then Just EarlyRejectFailingPrefix else Nothing)
 
+-- | Check a top-level syntax edit against the protected result index and record telemetry.
 checkEarlyRejectionSyntaxEditTracked ::
     EarlyRejectTracker ->
     [StatementUnit] ->

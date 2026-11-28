@@ -8,12 +8,9 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Core (
+import Occam.Core.Schema (
     AlterChange (..),
     AlterTable (..),
-    BarrierReason (..),
-    BarrierScope (..),
-    CatalogOp (..),
     ConflictAction (..),
     ConstraintRef (..),
     DataWrite (..),
@@ -26,7 +23,6 @@ import Occam.Core (
     IndexRef (..),
     Name,
     NameRef (..),
-    ObjectRef (..),
     PartitionLink (..),
     ReadFact (..),
     ReadMode (..),
@@ -34,25 +30,29 @@ import Occam.Core (
     RelationKind (..),
     RenameOp (..),
     SchemaDef (..),
-    ScopedBarrier (..),
-    SemanticFacts (..),
     SequenceDef (..),
     SequenceWrite (..),
-    SessionEffect (..),
-    Span (..),
-    Statement (..),
-    StatementId,
     TableDef (..),
-    TriggerBody (..),
-    TriggerDef (..),
-    TriggerEffect (..),
     TriggerRef (..),
-    TxEffect (..),
     TypeDef (..),
     ViewDef (..),
     WriteKind (..),
     nameText,
  )
+import Occam.Core.Semantics (
+    BarrierReason (..),
+    BarrierScope (..),
+    CatalogOp (..),
+    ObjectRef (..),
+    ScopedBarrier (..),
+    SemanticFacts (..),
+    SessionEffect (..),
+    TriggerBody (..),
+    TriggerDef (..),
+    TriggerEffect (..),
+    TxEffect (..),
+ )
+import Occam.Core.Types (Span (..), Statement (..), StatementId)
 import Occam.Dependency.Enforcement (cascadeWrites)
 import Occam.Facts (StatementFacts (..), StatementUnit (..))
 import Occam.Parser.Types (ParsedSQL (..), SQLDialect (..), dialectName)

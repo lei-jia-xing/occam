@@ -29,7 +29,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Occam.Core (BeginPolicy (..))
+import Occam.Core.Semantics (BeginPolicy (..))
 import Occam.Parser.Types (SQLDialect (..), dialectName)
 
 -- | Identifier case-folding transformation applied per dialect and quote status.

@@ -2,6 +2,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Low-level C FFI bindings to the embedded DuckDB C API and custom chunk readers.
 module Occam.Oracle.DuckDB.FFI (
     DuckDBAPI (..),
     DuckDBDecimalAPI (..),
@@ -69,14 +70,25 @@ import System.Posix.DynamicLinker (
  )
 #endif
 
+-- | Opaque pointer to an embedded @duckdb_database@ handle.
 type DuckdbDatabase = Ptr ()
+
+-- | Opaque pointer to a @duckdb_connection@ session handle.
 type DuckdbConnection = Ptr ()
+
 type DuckdbConfig = Ptr ()
 type DuckdbLogicalType = Ptr ()
+
+-- | Opaque pointer to a @duckdb_prepared_statement@ handle.
 type DuckdbPreparedStatement = Ptr ()
+
+-- | Opaque pointer to a @duckdb_extracted_statements@ batch handle.
 type DuckdbExtractedStatements = Ptr ()
+
+-- | Unsigned index\/size type (@idx_t@) used across the DuckDB C API.
 type IdxT = Word64
 
+-- | Phantom tag denoting a native @duckdb_result@ struct pointer.
 data DuckDBResult
 
 foreign import ccall unsafe "occam_duckdb_result_size"
@@ -190,6 +202,7 @@ data DuckDBConfigOpen = DuckDBConfigOpen
     , apiDestroyConfig :: !FnDestroyConfig
     }
 
+-- | Optional DECIMAL logical-type inspection symbols resolved from @libduckdb@.
 data DuckDBDecimalAPI = DuckDBDecimalAPI
     { apiColumnLogicalType :: !FnColumnLogicalType
     , apiDecimalWidth :: !FnDecimalDimension
@@ -198,6 +211,7 @@ data DuckDBDecimalAPI = DuckDBDecimalAPI
     , apiDestroyLogicalType :: !FnDestroyLogicalType
     }
 
+-- | Dynamic C function-pointer dispatch table loaded from @libduckdb@.
 data DuckDBAPI = DuckDBAPI
     { apiOpen :: !FnOpen
     , apiConfigOpen :: !(Maybe DuckDBConfigOpen)
@@ -230,6 +244,7 @@ data DuckDBAPI = DuckDBAPI
     , apiStringData :: !(FunPtr FnStringData)
     }
 
+-- | Errors returned by embedded DuckDB loading, execution, timeout, or type-check paths.
 data DuckDBError
     = DuckDBTimeout
     | DuckDBExecutionError !Text
@@ -425,6 +440,7 @@ loadSymbols libPath = do
     pure DuckDBAPI{..}
 #endif
 
+-- | Lazily load and cache the dynamic 'DuckDBAPI' symbol table from @libduckdb@.
 getDuckDBAPI :: IO (Either DuckDBError DuckDBAPI)
 getDuckDBAPI = do
     cached <- readIORef duckdbApiCache
@@ -435,6 +451,7 @@ getDuckDBAPI = do
             writeIORef duckdbApiCache (Just res)
             pure res
 
+-- | Return 'True' iff @libduckdb@ can be dynamically loaded in the current environment.
 isDuckDBAvailable :: IO Bool
 isDuckDBAvailable = do
     res <- getDuckDBAPI
@@ -467,11 +484,13 @@ openMemoryDb api dbPtr = case apiConfigOpen api of
                 _ <- setOption "lock_configuration" "true"
                 liftIO $ apiOpenExt nullPtr dbPtr cfg nullPtr
 
+-- | Dereference an error C string returned by DuckDB, falling back to @fallback@ when null.
 duckdbErrorText :: Text -> IO CString -> IO Text
 duckdbErrorText fallback action = do
     message <- action
     if message == nullPtr then pure fallback else T.pack <$> peekCString message
 
+-- | Open a restricted in-memory DuckDB instance (1 thread, external access disabled).
 openFreshDatabase :: DuckDBAPI -> IO DuckdbDatabase
 openFreshDatabase api = evalContT do
     dbPtr <- ContT alloca
@@ -481,8 +500,10 @@ openFreshDatabase api = evalContT do
             then fail "Failed to initialize in-memory DuckDB database"
             else peek dbPtr
 
+-- | Close and destroy an open @duckdb_database@ handle.
 closeDatabase :: DuckDBAPI -> DuckdbDatabase -> IO ()
 closeDatabase api db = with db (apiClose api)
 
+-- | Format a list of unsupported DuckDB column type IDs into an error message.
 unsupportedResultTypes :: [Int] -> Text
 unsupportedResultTypes types = "Unsupported DuckDB result column types " <> T.pack (show types)

@@ -21,7 +21,7 @@ import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Lens.Micro ((%~), (&), (.~))
-import Occam.Core (
+import Occam.Core.Schema (
     AlterChange (..),
     AlterTable (..),
     ColumnDef (..),
@@ -34,8 +34,8 @@ import Occam.Core (
     PartitionLink (..),
     ReadMode (..),
     RelationKind (..),
-    StatementId,
  )
+import Occam.Core.Types (StatementId)
 import Occam.Dependency.Barrier (relationTouchKeys)
 import Occam.Dependency.Drop (removeRelationCascade)
 import Occam.Dependency.Query (

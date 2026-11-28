@@ -9,7 +9,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
 import Data.IntMap.Strict qualified as IntMap
-import Occam.Core (Span (..), Statement (..))
+import Occam.Core.Types (Span (..), Statement (..))
 import Occam.Facts (
     ColumnSite (..),
     ColumnTarget (..),

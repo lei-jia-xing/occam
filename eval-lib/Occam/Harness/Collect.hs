@@ -7,9 +7,11 @@ module Occam.Harness.Collect (
 ) where
 
 import Control.Exception.Safe (IOException, try)
-import Control.Monad (foldM, forM, unless, when)
+import Control.Monad (foldM, forM, guard, unless, when)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Aeson (Object, ToJSON (..), Value (..), decodeStrict', encode, object, (.=))
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
@@ -48,15 +50,18 @@ import System.Directory (
  )
 import System.FilePath (makeRelative, takeDirectory, takeFileName, (<.>), (</>))
 
+-- | Upstream fuzzer or manual corpus format ingested by 'collectArtifacts'.
 data ArtifactSource = Raw | Sqlsmith | Sqlancer | Squirrel
     deriving (Eq, Show)
 
+-- | Canonical string identifier stored in manifest provenance metadata.
 sourceName :: ArtifactSource -> Text
 sourceName Raw = "raw"
 sourceName Sqlsmith = "sqlsmith"
 sourceName Sqlancer = "sqlancer"
 sourceName Squirrel = "squirrel"
 
+-- | Options configuring artifact discovery, sanitization, optional N-replay qualification, and deduplication.
 data CollectOptions = CollectOptions
     { collectSource :: !ArtifactSource
     , collectDbms :: !Text
@@ -80,6 +85,7 @@ data CollectOptions = CollectOptions
     }
     deriving (Eq, Show)
 
+-- | Default 'CollectOptions' enabling 5-run replay and signature deduplication when @collectVerify@ is set.
 defaultCollectOptions :: ArtifactSource -> Text -> FilePath -> FilePath -> CollectOptions
 defaultCollectOptions source dbms inputDir outputDir =
     CollectOptions
@@ -104,8 +110,10 @@ defaultCollectOptions source dbms inputDir outputDir =
         , collectStackFrames = 5
         }
 
+-- | Parsed candidate SQL payload and normalized provenance metadata prior to deduplication.
 data Candidate = Candidate !Text !BS.ByteString !Object
 
+-- | Content-addressed artifact record written into @manifest.json@.
 data CollectedCase = CollectedCase
     { collectedId :: !Text
     , collectedDbms :: !DbmsSpec
@@ -145,6 +153,7 @@ instance ToJSON CollectedCase where
             , "signature_duplicates" .= collectedSigDuplicates item
             ]
 
+-- | Stateful accumulator for SHA-256 deduplicated artifact imports.
 data Collection = Collection
     { byHash :: !(Map.Map Text CollectedCase)
     , hashesInReverseOrder :: ![Text]
@@ -152,6 +161,7 @@ data Collection = Collection
     , candidatesSeen :: !Int
     }
 
+-- | Import monad carrying validation or content-mismatch errors via 'ExceptT'.
 type Import = ExceptT String IO
 
 -- | Write content-addressed cases, optionally run N-replay verification, then publish manifest.json atomically.
@@ -213,54 +223,55 @@ collectArtifacts cfg options = do
             pure (Object (KM.insert "manifest_path" (toJSON path) summary))
 
         importFile input output dbms collection path = do
-            candidate <- lift (readCandidate input source path)
-            case candidate of
-                Nothing -> pure collection
-                Just (Candidate name payload meta) -> do
-                    let digest = sqlSha256 payload
-                        observed = collection {candidatesSeen = candidatesSeen collection + 1}
-                    case Map.lookup digest (byHash observed) of
-                        Just previous ->
-                            pure
-                                observed
-                                    { byHash =
-                                        Map.insert
-                                            digest
-                                            (previous {collectedDuplicateCount = collectedDuplicateCount previous + 1})
-                                            (byHash observed)
-                                    }
-                        Nothing -> do
-                            let cid = uniqueCaseId (usedIds observed) name
-                                relative = "cases" </> T.unpack digest <.> "sql"
-                                artifactPath = output </> relative
-                                signature
-                                    | T.null (collectExpectedSignature options) = signatureFrom meta
-                                    | otherwise = collectExpectedSignature options
-                                item =
-                                    CollectedCase
-                                        cid
-                                        dbms
-                                        source
-                                        digest
-                                        artifactPath
-                                        relative
-                                        path
-                                        (BS.length payload)
-                                        signature
-                                        meta
-                                        0
-                                        Nothing
-                                        Nothing
-                                        Nothing
-                                        []
-                            store artifactPath payload
-                            pure
-                                observed
-                                    { byHash = Map.insert digest item (byHash observed)
-                                    , hashesInReverseOrder = digest : hashesInReverseOrder observed
-                                    , usedIds = Set.insert cid (usedIds observed)
-                                    }
+            mCand <- lift (readCandidate input source path)
+            maybe (pure collection) (recordCandidate output dbms path collection) mCand
 
+        recordCandidate output dbms path collection (Candidate name payload meta) =
+            let digest = sqlSha256 payload
+                observed = collection {candidatesSeen = candidatesSeen collection + 1}
+             in case Map.lookup digest (byHash observed) of
+                    Just previous ->
+                        pure
+                            observed
+                                { byHash =
+                                    Map.insert
+                                        digest
+                                        (previous {collectedDuplicateCount = collectedDuplicateCount previous + 1})
+                                        (byHash observed)
+                                }
+                    Nothing -> do
+                        let cid = uniqueCaseId (usedIds observed) name
+                            relative = "cases" </> T.unpack digest <.> "sql"
+                            artifactPath = output </> relative
+                            signature
+                                | T.null (collectExpectedSignature options) = signatureFrom meta
+                                | otherwise = collectExpectedSignature options
+                            item =
+                                CollectedCase
+                                    cid
+                                    dbms
+                                    source
+                                    digest
+                                    artifactPath
+                                    relative
+                                    path
+                                    (BS.length payload)
+                                    signature
+                                    meta
+                                    0
+                                    Nothing
+                                    Nothing
+                                    Nothing
+                                    []
+                        store artifactPath payload
+                        pure
+                            observed
+                                { byHash = Map.insert digest item (byHash observed)
+                                , hashesInReverseOrder = digest : hashesInReverseOrder observed
+                                , usedIds = Set.insert cid (usedIds observed)
+                                }
+
+-- | Qualify unique byte candidates via N-replay and collapse duplicate crash signatures when enabled.
 verifyAndDedup ::
     HarnessConfig ->
     DbmsKind ->
@@ -277,23 +288,21 @@ verifyAndDedup cfg dbmsKind dbms source output rawSeen byteUnique options = do
     (revOrder, byKeptId, rejectedRev, collapsedCount, seenSigs) <-
         foldM (stepOne verifyDir) ([], Map.empty, [], 0, Map.empty) byteUnique
     let kept = reverse (mapMaybe (`Map.lookup` byKeptId) revOrder)
-        uniqCount = Map.size seenSigs
-        rejectedCount = length rejectedRev
         summary0 =
             collectionSummary
                 rawSeen
                 (length byteUnique)
                 (collectReplays options)
                 True
-                rejectedCount
+                (length rejectedRev)
                 collapsedCount
-                uniqCount
+                (Map.size seenSigs)
                 dbms
                 source
         summary = KM.insert "manifest_case_count" (toJSON (length kept)) summary0
     pure (kept, reverse rejectedRev, summary)
     where
-        stepOne verifyDir (revOrder, byKeptId, rejectedRev, collapsed, seenSigs) item = do
+        stepOne verifyDir acc@(revOrder, byKeptId, rejectedRev, collapsed, seenSigs) item = do
             sqlBytes <- BS.readFile (collectedPath item)
             let decPath = verifyDir </> T.unpack (collectedId item) <> "_decisions.jsonl"
                 rCfg =
@@ -317,31 +326,10 @@ verifyAndDedup cfg dbmsKind dbms source output rawSeen byteUnique options = do
                         , rcRequireConsistent = True
                         }
             rv <- runReplayVerification cfg Nothing rCfg (collectReplays options) sqlBytes
-            let stable = rvAllPassed rv && rvConsistentSignature rv
-            case (stable, rvBaselineSignature rv) of
-                (True, Just baseSig) ->
-                    let sigKey = csId baseSig
-                     in case Map.lookup sigKey seenSigs of
-                            Just keeperCid
-                                | collectDedupBySignature options ->
-                                    let updater prev =
-                                            prev {collectedSigDuplicates = collectedSigDuplicates prev <> [collectedId item]}
-                                     in pure (revOrder, Map.adjust updater keeperCid byKeptId, rejectedRev, collapsed + 1, seenSigs)
-                            _ ->
-                                let accepted =
-                                        item
-                                            { collectedBaselineSignature = Just baseSig
-                                            , collectedQualified = Just True
-                                            , collectedReplay = Just rv
-                                            }
-                                    cid = collectedId item
-                                 in pure
-                                        ( cid : revOrder
-                                        , Map.insert cid accepted byKeptId
-                                        , rejectedRev
-                                        , collapsed
-                                        , Map.insertWith (\_ old -> old) sigKey cid seenSigs
-                                        )
+            pure $ case rvBaselineSignature rv of
+                Just baseSig
+                    | rvAllPassed rv && rvConsistentSignature rv ->
+                        recordAccepted acc item rv baseSig
                 _ ->
                     let rejObj =
                             object
@@ -350,9 +338,32 @@ verifyAndDedup cfg dbmsKind dbms source output rawSeen byteUnique options = do
                                 , "file" .= collectedPath item
                                 , "replay_verification" .= rv
                                 ]
-                     in pure (revOrder, byKeptId, rejObj : rejectedRev, collapsed, seenSigs)
+                     in (revOrder, byKeptId, rejObj : rejectedRev, collapsed, seenSigs)
 
--- A path that is already present in a published manifest must keep its bytes.
+        recordAccepted (revOrder, byKeptId, rejectedRev, collapsed, seenSigs) item rv baseSig =
+            let sigKey = csId baseSig
+                cid = collectedId item
+             in case Map.lookup sigKey seenSigs of
+                    Just keeperCid
+                        | collectDedupBySignature options ->
+                            let appendDup prev =
+                                    prev {collectedSigDuplicates = collectedSigDuplicates prev <> [cid]}
+                             in (revOrder, Map.adjust appendDup keeperCid byKeptId, rejectedRev, collapsed + 1, seenSigs)
+                    _ ->
+                        let accepted =
+                                item
+                                    { collectedBaselineSignature = Just baseSig
+                                    , collectedQualified = Just True
+                                    , collectedReplay = Just rv
+                                    }
+                         in ( cid : revOrder
+                            , Map.insert cid accepted byKeptId
+                            , rejectedRev
+                            , collapsed
+                            , Map.insertWith (\_ old -> old) sigKey cid seenSigs
+                            )
+
+-- | Store a content-addressed SQL artifact atomically, validating existing bytes on collision.
 store :: FilePath -> BS.ByteString -> Import ()
 store path payload = do
     exists <- lift (doesFileExist path)
@@ -362,6 +373,7 @@ store path payload = do
             unless (existing == payload) (throwE ("Content-addressed SQL file has unexpected bytes: " <> path))
         else lift (writeAtomicBytes path payload)
 
+-- | Build summary statistics JSON fields for a collection manifest.
 collectionSummary ::
     Int ->
     Int ->
@@ -387,6 +399,7 @@ collectionSummary raw uniqBytes replaysReq isVerified rejCount collapsed uniqSig
         , "manifest_case_count" .= uniqBytes
         ]
 
+-- | Recursively list regular files below @dir@, skipping symlinked directories and excluded paths.
 walkFiles :: [FilePath] -> FilePath -> IO [FilePath]
 walkFiles excluded = walk
     where
@@ -396,20 +409,22 @@ walkFiles excluded = walk
                 then pure []
                 else do
                     entries <- sort <$> listDirectory dir
-                    classified <- forM entries \name -> do
-                        let path = dir </> name
-                        directory <- doesDirectoryExist path
-                        if directory
-                            then do
-                                link <- pathIsSymbolicLink path
-                                pure ([], [path | not link])
-                            else do
-                                file <- doesFileExist path
-                                pure ([path | file], [])
+                    classified <- forM entries (classifyEntry . (dir </>))
                     let (files, subdirs) = unzip classified
                     nested <- traverse walk (concat subdirs)
                     pure (concat files <> concat nested)
 
+        classifyEntry path = do
+            directory <- doesDirectoryExist path
+            if directory
+                then do
+                    link <- pathIsSymbolicLink path
+                    pure ([], maybe [] pure (path <$ guard (not link)))
+                else do
+                    file <- doesFileExist path
+                    pure (maybe [] pure (path <$ guard file), [])
+
+-- | Filter discovered candidate file paths according to the selected 'ArtifactSource' conventions.
 selectArtifacts :: CollectOptions -> DbmsSpec -> [FilePath] -> [FilePath]
 selectArtifacts options dbms files = case collectSource options of
     Squirrel -> filter squirrelFile files
@@ -428,38 +443,39 @@ selectArtifacts options dbms files = case collectSource options of
              in ".log" `isSuffixOf` name
                     && not (prefix `isPrefixOf` name || any (`isSuffixOf` name) ["-plan.log", "-reduce.log"])
 
+-- | Read and sanitize a single candidate artifact file into SQL bytes plus provenance JSON.
 readCandidate :: FilePath -> ArtifactSource -> FilePath -> IO (Maybe Candidate)
 readCandidate root source path = do
     raw <- BS.readFile path
     let stem = T.pack (takeDirectoryRelativeStem root path)
         sourceField = "fuzzer" .= sourceName source
         blank = BS.all (\byte -> byte == 32 || (byte >= 9 && byte <= 13)) raw
-    case source of
+    runMaybeT case source of
         Sqlancer -> do
             let SqlancerSanitizeResult sql meta = sanitizeSqlancerLog raw
                 significant line = let stripped = T.strip line in not (T.null stripped || "--" `T.isPrefixOf` stripped)
                 provenance = uncurry KM.insert sourceField (metaToObject meta)
-            pure
-                ( if any significant (T.lines (TE.decodeUtf8 sql))
-                    then Just (Candidate ("sqlancer_" <> stem) sql provenance)
-                    else Nothing
-                )
-        _ | blank -> pure Nothing
+            guard (any significant (T.lines (TE.decodeUtf8 sql)))
+            pure (Candidate ("sqlancer_" <> stem) sql provenance)
         Squirrel -> do
+            guard (not blank)
             let worker = T.pack (takeFileName (takeDirectory (takeDirectory path)))
                 name = "squirrel_" <> worker <> "_" <> T.pack (takeFileName path)
                 sql = if BS.isSuffixOf "\n" raw then raw else BS.snoc raw 10
-            pure (Just (Candidate name sql (KM.fromList [sourceField, "worker_id" .= worker])))
+            pure (Candidate name sql (KM.fromList [sourceField, "worker_id" .= worker]))
         _ -> do
-            meta <- readSidecar (takeDirectory path </> fileStem path <.> "meta.json")
-            pure (Just (Candidate stem raw (KM.union meta (KM.fromList [sourceField]))))
+            guard (not blank)
+            meta <- liftIO (readSidecar (takeDirectory path </> fileStem path <.> "meta.json"))
+            pure (Candidate stem raw (KM.union meta (KM.fromList [sourceField])))
 
+-- | Return the path stem relative to @root@ preserving subdirectory prefixes when present.
 takeDirectoryRelativeStem :: FilePath -> FilePath -> FilePath
 takeDirectoryRelativeStem root path =
     let relative = makeRelative root path
         parent = takeDirectory relative
      in if parent == "." then fileStem relative else parent </> fileStem relative
 
+-- | Load optional JSON sidecar metadata adjacent to a @raw@/@sqlsmith@ SQL input.
 readSidecar :: FilePath -> IO Object
 readSidecar path = do
     result <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
@@ -467,6 +483,7 @@ readSidecar path = do
         Just (Object meta) -> meta
         _ -> KM.empty
 
+-- | Extract @crash_signature.expected_signature@ from provenance metadata when present.
 signatureFrom :: Object -> Text
 signatureFrom meta = case KM.lookup "crash_signature" meta of
     Just (Object info) | Just (String expected) <- KM.lookup "expected_signature" info -> expected

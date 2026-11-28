@@ -13,9 +13,8 @@ module MutationalFuzz (
     -- * Properties
     prop_mutationRecovery,
 
-    -- * Test Tree & Runner
+    -- * Test Tree
     mutationalFuzzTests,
-    main,
 ) where
 
 import Control.Monad (foldM, unless, when)
@@ -40,7 +39,7 @@ import Test.QuickCheck (
     frequency,
  )
 import Test.QuickCheck.Monadic (assert, monadicIO, monitor, run)
-import Test.Tasty (TestTree, defaultMain, localOption, testGroup)
+import Test.Tasty (TestTree, localOption, testGroup)
 import Test.Tasty.QuickCheck (QuickCheckTests (..), testProperty)
 import TestSupport (checkParserValidity)
 
@@ -507,6 +506,3 @@ mutationalFuzzTests =
                 "Composite mutation recovery preserves predicate, syntax, and bounds"
                 prop_mutationRecovery
         ]
-
-main :: IO ()
-main = defaultMain mutationalFuzzTests

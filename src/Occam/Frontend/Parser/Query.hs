@@ -20,7 +20,9 @@ import Data.Either (partitionEithers)
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.Maybe (fromMaybe, isJust, isNothing)
-import Occam.Frontend.AST
+import Occam.Frontend.AST.Expr
+import Occam.Frontend.AST.Query
+import Occam.Frontend.AST.Statement
 import Occam.Frontend.Lexer hiding (LiteralKind)
 import Occam.Frontend.Parser.Core
 import Occam.Frontend.Parser.Expr

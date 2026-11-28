@@ -1,3 +1,4 @@
+-- | Per-statement dependency semantics, structural parser edits, and column-analysis bundles.
 module Occam.Facts (
     StatementUnit (..),
     StatementFacts (..),
@@ -18,7 +19,9 @@ import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
-import Occam.Core (Ident (..), Name (..), SemanticFacts (..), Statement (..))
+import Occam.Core.Schema (Ident (..), Name (..))
+import Occam.Core.Semantics (SemanticFacts (..))
+import Occam.Core.Types (Statement (..))
 
 -- | One parsed statement together with the facts the frontend extracted.
 data StatementUnit = StatementUnit
@@ -29,12 +32,14 @@ data StatementUnit = StatementUnit
     }
     deriving (Eq, Show)
 
+-- | Per-statement dependency semantics and candidate syntax\/column rewrite edits.
 data StatementFacts = StatementFacts
     { factSemantics :: !SemanticFacts
     , factEdits :: ![ParserEdit]
     }
     deriving (Eq, Show)
 
+-- | Structural pass category ordering intra-statement parser edits during reduction.
 data ParserEditCategory
     = EditExpression
     | EditClause
@@ -52,6 +57,7 @@ instance FromJSON ParserEditCategory where
     parseJSON = withText "ParserEditCategory" \name ->
         maybe (fail ("unknown parser edit category: " <> T.unpack name)) pure (parseEditCategoryName name)
 
+-- | Render a 'ParserEditCategory' as its lowercase wire\/JSON identifier.
 editCategoryName :: ParserEditCategory -> Text
 editCategoryName EditExpression = "expression"
 editCategoryName EditClause = "clause"
@@ -61,6 +67,7 @@ editCategoryName EditColumn = "column"
 editCategoryName EditType = "type"
 editCategoryName EditLiteral = "literal"
 
+-- | Parse a lowercase wire\/JSON string into 'ParserEditCategory'.
 parseEditCategoryName :: Text -> Maybe ParserEditCategory
 parseEditCategoryName "expression" = Just EditExpression
 parseEditCategoryName "clause" = Just EditClause
@@ -91,6 +98,7 @@ data EditTier
     | TierExpr !ExprTier
     deriving (Eq, Ord, Show, Generic)
 
+-- | Byte-span rewrite candidate emitted by the frontend AST analysis.
 data ParserEdit = ParserEdit
     { parserEditStart :: !Int
     , parserEditEnd :: !Int
@@ -105,12 +113,14 @@ data ParserEdit = ParserEdit
     }
     deriving (Eq, Show)
 
+-- | Role of a span within a column bundle (@CREATE@ definition, @INSERT@ column list, or @VALUES@ item).
 data ColumnSiteKind
     = CreateDefSite
     | InsertListSite
     | ValuesItemSite
     deriving (Eq, Ord, Show, Generic)
 
+-- | Source span corresponding to one coordinated site of a column deletion bundle.
 data ColumnSite = ColumnSite
     { siteStmt :: !Int
     , siteStart :: !Int

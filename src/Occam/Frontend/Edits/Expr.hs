@@ -16,7 +16,8 @@ import Data.Foldable (traverse_)
 import Data.Maybe (catMaybes, isJust, isNothing)
 import Data.Vector qualified as V
 import Occam.Facts (ClauseTier (..), EditTier (..), ExprTier (..), ParserEditCategory (..))
-import Occam.Frontend.AST qualified as AST
+import Occam.Frontend.AST.Expr qualified as AST
+import Occam.Frontend.AST.Query qualified as AST
 import Occam.Frontend.Context (AnalysisContext (..))
 import Occam.Frontend.Edits.Core (
     EditM,

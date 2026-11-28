@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | DuckDB column-type support checks and typed cell\/chunk observation helpers.
 module Occam.Oracle.DuckDB.Result (
     DuckDBColumnType (..),
     contractTypeTag,
@@ -61,17 +62,18 @@ import Occam.Oracle.DuckDB.FFI (
  )
 import Occam.Oracle.Result (ResultSet (..))
 
+-- | Supported DuckDB result column storage representation.
 data DuckDBColumnType
     = ScalarColumn !CInt
     | DecimalColumn !Word8 !Word8 !CInt
 
--- Decimal contracts store the native tag in the low byte, width in the
--- next byte, and scale in the third byte. Scalar tags retain their format.
+-- | Pack a column type into a compact contract tag; decimal columns pack width and scale alongside base tag @19@.
 contractTypeTag :: DuckDBColumnType -> Int
 contractTypeTag (ScalarColumn ty) = fromIntegral ty
 contractTypeTag (DecimalColumn width scale _) =
     19 + (fromIntegral width `shiftL` 8) + (fromIntegral scale `shiftL` 16)
 
+-- | Inspect a DuckDB column type and metadata, returning 'Nothing' if unsupported for result comparison.
 readColumnType :: DuckDBAPI -> Ptr DuckDBResult -> (CInt, IdxT) -> IO (Maybe DuckDBColumnType)
 readColumnType api result (ty, column)
     | supportedType ty = pure (Just (ScalarColumn ty))
@@ -92,8 +94,7 @@ readColumnType api result (ty, column)
                             pure (DecimalColumn width scale storage)
     | otherwise = pure Nothing
 
--- NOTE: DuckDB's legacy string accessors truncate at embedded NULs. Read
--- chunk vectors here, including for scalars, to preserve complete values.
+-- | Read a typed value from a DuckDB chunk vector (preserving full strings with embedded NULs).
 convertCell :: DuckDBAPI -> (DuckDBColumnType, Ptr (), Ptr Word64) -> IdxT -> IO Value
 convertCell api (colType, values, validity) row = do
     valid <- if validity == nullPtr then pure 1 else apiRowValid api validity row
@@ -151,6 +152,7 @@ convertCell api (colType, values, validity) row = do
                 size <- peek sizePtr
                 if size == 0 then pure BS.empty else BS.packCStringLen (ptr, fromIntegral size)
 
+-- | Read column names and native column type IDs from an executed @duckdb_result@.
 readResultColumns :: DuckDBAPI -> Ptr DuckDBResult -> IO ([Text], [CInt])
 readResultColumns api ptr = do
     count <- apiColumnCount api ptr
@@ -163,9 +165,11 @@ readResultColumns api ptr = do
     types <- mapM (apiColumnType api ptr) columns
     pure (names, types)
 
+-- | Return 'True' for scalar DuckDB column type IDs supported by C-side binary encoding.
 supportedType :: (Integral a) => a -> Bool
 supportedType ty = (ty >= 1 && ty <= 11) || ty `elem` [16, 17, 18, 32, 36]
 
+-- | Extract and decode all rows and column metadata from a native @duckdb_result@.
 observeRows :: DuckDBAPI -> Ptr DuckDBResult -> IO (Either DuckDBError ResultSet)
 observeRows api ptr = do
     (names, types) <- readResultColumns api ptr
@@ -199,12 +203,14 @@ observeRows api ptr = do
                 Nothing -> pure (concat (reverse accumulated))
                 Just rows -> readChunks columnTypes (rows : accumulated)
 
+-- | Compare a @duckdb_result@ header and encoded rows directly in C without materializing Haskell values.
 matchResult ::
     [CInt] -> [Text] -> ByteString -> DuckDBAPI -> Ptr DuckDBResult -> IO (Either DuckDBError Bool)
 matchResult types names expected api ptr = do
     (actualNames, actualTypes) <- readResultColumns api ptr
     matchResultWithHeader types names expected api ptr actualNames actualTypes
 
+-- | Variant of 'matchResult' accepting already-read column names and types.
 matchResultWithHeader ::
     [CInt] ->
     [Text] ->
@@ -241,6 +247,7 @@ matchResultWithHeader types names expected api ptr actualNames actualTypes
                 -1 -> Left (DuckDBInfrastructureError "Could not allocate DuckDB result matcher")
                 _ -> Right (result == 1)
 
+-- | Pre-encode an authoritative 'ResultSet' into the binary layout consumed by 'matchResult'.
 encodeExpectedRows :: ResultSet -> Maybe ByteString
 encodeExpectedRows (ResultSet columns types rows)
     | length types /= length columns || not (all supportedType types) = Nothing

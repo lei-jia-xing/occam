@@ -1,3 +1,4 @@
+-- | Shared Aeson field-naming conventions converting camelCase record fields to snake_case JSON keys.
 module Occam.Json (
     camelToSnake,
     normalizeJsonFieldNames,

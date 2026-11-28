@@ -26,7 +26,8 @@ import Occam.Certificate (
     checkEarlyRejectionBytesTracked,
     checkEarlyRejectionSyntaxEditTracked,
  )
-import Occam.Core (Ident (..), OracleOutcome (..), nameText)
+import Occam.Core.Oracle (OracleOutcome (..))
+import Occam.Core.Schema (Ident (..), nameText)
 import Occam.Logger (logInfo')
 import Occam.Metrics (
     FamilyTag (..),
@@ -83,6 +84,7 @@ exhaustSyntaxCategory context stats sql units phases bundles category =
         (Just category)
         (\buckets targets -> initialSyntaxStream context buckets targets category)
 
+-- | Repeatedly sweep a dynamically regenerated 'SyntaxCandidate' stream until a fixpoint is reached.
 exhaustSyntaxStream ::
     SyntaxContext ->
     IORef SyntaxStats ->
@@ -159,6 +161,7 @@ testSyntaxWindow context currentCount windowTasks = do
             ]
         )
 
+-- | Accumulate attempt count, acceptance count, and elapsed time into 'SyntaxStats'.
 recordSyntaxTest :: Int -> Word64 -> Maybe a -> SyntaxStats -> SyntaxStats
 recordSyntaxTest tested elapsed accepted stats =
     stats
@@ -183,9 +186,7 @@ initialSyntaxStream context phases bundles category ordinal
         map SingleCandidate (drop ordinal (valuesChunkEdits False (phaseCandidates category phases)))
     | otherwise = map SingleCandidate (phaseCandidatesFrom category phases ordinal)
 
--- The frontend emits each VALUES list's chunks coarse-to-fine, then singles.
--- Leave its coarse pair in the regular sweep and revisit the finer candidates
--- only when an entire cycle finds no reductions.
+-- | Filter @VALUES@ chunk edits for the initial coarse pass (@deferred=False@) or deferred fine pass (@deferred=True@).
 valuesChunkEdits :: Bool -> [ParserEdit] -> [ParserEdit]
 valuesChunkEdits _ [] = []
 valuesChunkEdits deferred edits@(edit : rest)
